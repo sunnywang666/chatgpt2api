@@ -27,6 +27,58 @@ class ConversationBindingError(RuntimeError):
 
 
 class ConversationBindingService:
+    def read_text(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Read an already-issued cursor on its bound account; never send a message."""
+        keys = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
+                "conversation_id", "parent_message_id")
+        if any(not isinstance(body.get(key), str) or not body[key].strip() for key in keys):
+            raise ConversationBindingError("original text cursor is required", code="CONVERSATION_BINDING_CONTRACT_INVALID")
+        binding_id = body["provider_binding_id"]
+        if account_service.get_bound_account_identity(binding_id) != body["provider_account_identity"]:
+            raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
+        token = account_service.get_bound_text_access_token(binding_id, model="auto")
+        with account_service.conversation_binding_lock(binding_id, body["client_conversation_id"]):
+            backend = OpenAIBackendAPI(access_token=token)
+            try:
+                return self._read_text_result(backend, body)
+            finally:
+                backend.close()
+
+    @staticmethod
+    def _read_text_result(backend: OpenAIBackendAPI, cursor: dict[str, Any]) -> dict[str, Any]:
+        document = backend._get_conversation(cursor["conversation_id"])
+        if document.get("conversation_id", cursor["conversation_id"]) != cursor["conversation_id"]:
+            raise ConversationBindingError("conversation identity changed", code="CONVERSATION_BINDING_MISMATCH")
+        mapping = document.get("mapping") or {}
+        current = str(document.get("current_node") or "")
+        node_id = current
+        visited: set[str] = set()
+        while node_id and node_id not in visited:
+            visited.add(node_id)
+            node = mapping.get(node_id) or {}
+            if node_id == cursor["parent_message_id"]:
+                break
+            # A later user turn is not the result of the original request.
+            if (node.get("message") or {}).get("author", {}).get("role") == "user":
+                raise ConversationBindingError("original turn was superseded", code="CONVERSATION_BINDING_MISMATCH")
+            node_id = str(node.get("parent") or "")
+        if node_id != cursor["parent_message_id"]:
+            raise ConversationBindingError("original turn is not on the active branch", code="CONVERSATION_BINDING_MISMATCH")
+        message = (mapping.get(current) or {}).get("message") or {}
+        result = {key: cursor[key] for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id", "parent_message_id")}
+        if (message.get("id") != current or message.get("author", {}).get("role") != "assistant"
+                or message.get("status") != "finished_successfully" or message.get("end_turn") is not True
+                or message.get("channel") not in (None, "final")):
+            return {**result, "binding_status": "unknown", "status": "running"}
+        content = message.get("content") or {}
+        parts = content.get("parts")
+        if content.get("content_type") != "text" or not isinstance(parts, list) or not parts or not all(isinstance(part, str) for part in parts):
+            return {**result, "binding_status": "unknown", "status": "running"}
+        text = "".join(parts).strip()
+        if not text:
+            return {**result, "binding_status": "unknown", "status": "running"}
+        return {**result, "binding_status": "bound", "status": "succeeded", "parent_message_id": current, "content": text}
+
     def complete_text(self, body: dict[str, Any]) -> dict[str, Any]:
         binding_id = str(body.get("provider_binding_id") or "").strip()
         account_identity = str(body.get("provider_account_identity") or "").strip()
@@ -153,6 +205,18 @@ class ConversationBindingService:
                         recovered_parent = backend.get_conversation_parent_message_id(
                             returned_conversation_id
                         )
+                        # A stream timeout may happen after the answer was saved.
+                        # Read that turn once, never regenerate it or accept an old continuation answer.
+                        if recovered_parent and not conversation_id:
+                            recovered = self._read_text_result(backend, {
+                                "provider_binding_id": binding_id,
+                                "provider_account_identity": account_identity,
+                                "client_conversation_id": client_conversation_id,
+                                "conversation_id": returned_conversation_id,
+                                "parent_message_id": recovered_parent,
+                            })
+                            if recovered.get("status") == "succeeded":
+                                return recovered
                     except Exception:
                         pass
                 raise ConversationBindingError(

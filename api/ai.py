@@ -169,6 +169,26 @@ def create_router() -> APIRouter:
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_response.handle, payload)
 
+    @router.get("/api/conversation-bindings/text")
+    async def read_bound_text(
+            provider_binding_id: str, provider_account_identity: str,
+            client_conversation_id: str, conversation_id: str, parent_message_id: str,
+            authorization: str | None = Header(default=None),
+    ):
+        require_identity(authorization)
+        try:
+            return await run_in_threadpool(conversation_binding_service.read_text, {
+                "provider_binding_id": provider_binding_id,
+                "provider_account_identity": provider_account_identity,
+                "client_conversation_id": client_conversation_id,
+                "conversation_id": conversation_id,
+                "parent_message_id": parent_message_id,
+            })
+        except ConversationBindingError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail={"code": "CONVERSATION_READ_UNAVAILABLE"}) from exc
+
     @router.post("/api/conversation-bindings/text")
     async def continue_bound_text(
             body: ConversationBindingTextRequest,

@@ -382,5 +382,94 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         self.assertEqual(captured.exception.conversation_id, "conversation-1")
 
 
+class TextResultRecoveryTests(unittest.TestCase):
+    cursor = {
+        "provider_binding_id": "binding-one", "provider_account_identity": "account-one",
+        "client_conversation_id": "client-one", "conversation_id": "conversation-one",
+        "parent_message_id": "user-one",
+    }
+
+    def document(self):
+        return {"conversation_id": "conversation-one", "current_node": "answer-one", "mapping": {
+            "user-one": {"parent": None, "message": {"id": "user-one", "author": {"role": "user"}}},
+            "answer-one": {"parent": "user-one", "message": {"id": "answer-one", "author": {"role": "assistant"},
+                "status": "finished_successfully", "end_turn": True, "channel": "final",
+                "content": {"content_type": "text", "parts": ['{"name_ru":"Набор"}']}}},
+        }}
+
+    def test_read_only_completed_answer_and_scope_checks(self):
+        backend = mock.Mock()
+        backend._get_conversation.return_value = self.document()
+        result = ConversationBindingService._read_text_result(backend, self.cursor)
+        self.assertEqual(result["content"], '{"name_ru":"Набор"}')
+        self.assertEqual(result["parent_message_id"], "answer-one")
+        backend._get_conversation.assert_called_once_with("conversation-one")
+        backend.stream_conversation.assert_not_called()
+        for mutate in ("foreign", "branch", "new-user"):
+            document = self.document()
+            if mutate == "foreign": document["conversation_id"] = "other"
+            elif mutate == "branch": document["mapping"]["answer-one"]["parent"] = "other"
+            else: document["mapping"]["answer-one"]["message"]["author"]["role"] = "user"
+            backend._get_conversation.return_value = document
+            with self.assertRaises(ConversationBindingError):
+                ConversationBindingService._read_text_result(backend, self.cursor)
+
+    def test_partial_analysis_and_unfinished_text_are_not_success(self):
+        for patch in ({"channel": "analysis"}, {"end_turn": False}, {"status": "in_progress"}, {"content": {"content_type": "text", "parts": []}}):
+            document = self.document()
+            document["mapping"]["answer-one"]["message"].update(patch)
+            backend = mock.Mock()
+            backend._get_conversation.return_value = document
+            result = ConversationBindingService._read_text_result(backend, self.cursor)
+            self.assertEqual(result["status"], "running")
+            self.assertNotIn("content", result)
+
+    def test_stream_timeout_reads_saved_answer_without_a_second_generation(self):
+        def timed_out(*_args, **_kwargs):
+            yield {"type": "conversation.event", "conversation_id": "conversation-one"}
+            raise TimeoutError("stream timeout")
+        backend = mock.Mock()
+        backend.get_conversation_parent_message_id.return_value = "user-one"
+        backend._get_conversation.return_value = self.document()
+        with (
+            mock.patch("services.conversation_binding_service.account_service.create_conversation_binding", return_value=("binding-one", "account-one", "synthetic-token")),
+            mock.patch("services.conversation_binding_service.account_service.release_image_slot"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+            mock.patch("services.conversation_binding_service.conversation_events", side_effect=timed_out) as generation,
+        ):
+            result = ConversationBindingService().complete_text({"client_conversation_id": "client-one", "messages": [{"role": "user", "content": "copy"}]})
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(generation.call_count, 1)
+        backend._get_conversation.assert_called_once_with("conversation-one")
+
+    def test_get_route_authenticates_then_reads_the_same_bound_account(self):
+        from fastapi import FastAPI, HTTPException
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        app = FastAPI()
+        app.include_router(create_router())
+        backend = mock.Mock()
+        backend._get_conversation.return_value = self.document()
+        with (
+            mock.patch("api.ai.require_identity", return_value={}) as identity,
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+        ):
+            with TestClient(app) as client:
+                result = client.get("/api/conversation-bindings/text", params=self.cursor, headers={"Authorization": "synthetic"})
+                self.assertEqual(result.status_code, 200, result.text)
+                self.assertEqual(result.json()["status"], "succeeded")
+                identity.assert_called_with("synthetic")
+                wrong = client.get("/api/conversation-bindings/text", params={**self.cursor, "provider_account_identity": "other"})
+                self.assertEqual(wrong.status_code, 409)
+                identity.side_effect = HTTPException(status_code=401)
+                self.assertEqual(client.get("/api/conversation-bindings/text", params=self.cursor).status_code, 401)
+        backend._get_conversation.assert_called_once_with("conversation-one")
+
+
 if __name__ == "__main__":
     unittest.main()
