@@ -1116,15 +1116,19 @@ class AccountService:
                 self._image_slot_condition.wait(timeout=1.0)
 
     def get_bound_text_access_token(self, binding_id: str, *, model: str) -> str:
+        # Model lookup reads this account pool and may refresh its catalog in
+        # other threads. Never hold the pool lock across that lookup.
+        route = None
+        if model and model != "auto":
+            from services.model_service import model_catalog_service
+
+            route = model_catalog_service.route_for_model(model)
         with self._lock:
             access_token = self._bound_token_locked(binding_id)
             account = self._accounts.get(access_token) or {}
             if account.get("status") in {"禁用", "异常"}:
                 raise RuntimeError("conversation binding unavailable: bound account cannot serve text")
-            if model and model != "auto":
-                from services.model_service import model_catalog_service
-
-                route = model_catalog_service.route_for_model(model)
+            if route is not None:
                 if self._normalize_account_type(account.get("type")) not in route.account_types:
                     raise RuntimeError("conversation binding unavailable: bound account cannot serve model")
         refreshed = self.refresh_access_token(access_token, event="conversation_binding_text")
