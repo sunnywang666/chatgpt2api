@@ -162,6 +162,7 @@ class ConversationBindingService:
 
         with account_service.conversation_binding_lock(binding_id, client_conversation_id):
             backend = OpenAIBackendAPI(access_token=access_token)
+            backend.retain_bound_conversation = True
             backend.text_request_message_id = str(body.get("_request_message_id") or "")
             try:
                 parts: list[str] = []

@@ -1394,6 +1394,7 @@ def _generate_bound_single_image(
             backend = OpenAIBackendAPI(access_token=token)
             # Request-owned model selection; never mutate the shared pool
             # default used by Content or other callers.
+            backend.retain_bound_conversation = True
             backend.image_upstream_model = request.upstream_model
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
@@ -1535,6 +1536,7 @@ def _generate_single_image(
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
+            backend.retain_bound_conversation = True
             backend.image_upstream_model = request.upstream_model
             outputs: list[ImageOutput] = []
             last_conversation_id = ""

@@ -146,6 +146,14 @@ class TextTaskTests(unittest.TestCase):
             result = ConversationBindingService().read_text_request(receipt)
             self.assertEqual(result["content"], "new copy")
 
+    def test_bound_text_keeps_chat_history_while_unbound_behavior_is_unchanged(self):
+        from services.openai_backend_api import OpenAIBackendAPI
+        backend = object.__new__(OpenAIBackendAPI)
+        args = ([{"role": "user", "content": "gallery"}], "gpt-5-6-instant", "UTC")
+        self.assertTrue(backend._conversation_payload(*args)["history_and_training_disabled"])
+        backend.retain_bound_conversation = True
+        self.assertFalse(backend._conversation_payload(*args)["history_and_training_disabled"])
+
 
 if __name__ == "__main__":
     unittest.main()

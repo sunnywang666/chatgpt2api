@@ -547,7 +547,7 @@ class OpenAIBackendAPI:
             "force_paragen_model_slug": "",
             "force_rate_limit": False,
             "force_use_sse": True,
-            "history_and_training_disabled": True,
+            "history_and_training_disabled": not getattr(self, "retain_bound_conversation", False),
             "reset_rate_limits": False,
             "suggestions": [],
             "supported_encodings": [],
@@ -908,6 +908,8 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
+        if getattr(self, "retain_bound_conversation", False):
+            payload["history_and_training_disabled"] = False
         if thinking_effort:
             payload["thinking_effort"] = thinking_effort
         if conversation_id:
@@ -1064,6 +1066,8 @@ class OpenAIBackendAPI:
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
+        if getattr(self, "retain_bound_conversation", False):
+            payload["history_and_training_disabled"] = False
         if thinking_effort:
             payload["thinking_effort"] = thinking_effort
         if conversation_id:

@@ -202,6 +202,7 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
             def get_conversation_parent_message_id(self, conversation_id: str) -> str:
                 self.test_case.assertEqual(conversation_id, "conversation-1")
                 self.test_case.assertEqual(self.image_upstream_model, "gpt-5-6-instant")
+                self.test_case.assertTrue(self.retain_bound_conversation)
                 return "message-2"
 
             def close(self) -> None:
