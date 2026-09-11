@@ -35,6 +35,46 @@ class AccountCapabilityTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "supports both"):
                     service.create_conversation_binding(image_model="gpt-image-2", text_model="unavailable")
 
+    def test_product_messages_never_use_free_even_when_model_allows_it(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([
+                {"access_token": "free", "type": "Free", "status": "正常", "quota": 100},
+                {"access_token": "pro", "type": "Pro", "status": "正常", "quota": 100},
+            ])
+            service.fetch_remote_info = lambda token, event="": service.get_account(token)
+            service.refresh_access_token = lambda token, event="": token
+            for model in ("auto", "free-compatible"):
+                with patch("services.model_service.model_catalog_service.route_for_model", return_value=SimpleNamespace(account_types=frozenset({"free", "Pro"}))):
+                    binding, _, token = service.create_conversation_binding(image_model="gpt-image-2", text_model=model)
+                    self.assertEqual(token, "pro")
+                    service.release_image_slot(token)
+            # A subscription downgrade / legacy Free binding cannot send a
+            # continuation or image, but original answers remain readable.
+            service.update_account("pro", {"type": "Free"})
+            self.assertEqual(service.get_bound_text_access_token(binding, model="auto"), "pro")
+            with self.assertRaisesRegex(RuntimeError, "paid account required"):
+                service.get_bound_text_access_token(binding, model="auto", for_message=True)
+            with self.assertRaisesRegex(RuntimeError, "cannot generate images"):
+                service.acquire_bound_image_access_token(binding, image_model="gpt-image-2")
+            with self.assertRaises(RuntimeError):
+                service.create_conversation_binding(image_model="gpt-image-2")
+            self.assertFalse(any(service._image_inflight.values()))
+
+    def test_free_account_transport_rejects_messages_but_allows_result_queries(self):
+        from services.account_request_pacing import pace_account_session, AccountRequestClock
+        from unittest.mock import Mock
+        send = Mock(return_value="original-result")
+        session = SimpleNamespace(request=send)
+        with patch.object(AccountRequestClock, "request", side_effect=lambda fn, method, url, **kw: fn(method, url, **kw)):
+            pace_account_session(session, {"type": "Free"}, "free-test-token")
+            for path in ("/backend-api/f/conversation", "/backend-api/conversation", "/backend-api/f/conversation/prepare", "/backend-api/codex/responses"):
+                with self.assertRaisesRegex(RuntimeError, "Free account messages are disabled"):
+                    session.request("POST", "https://chatgpt.com" + path)
+            send.assert_not_called()
+            self.assertEqual(session.request("GET", "https://chatgpt.com/backend-api/conversation/original"), "original-result")
+            self.assertEqual(send.call_count, 1)
+
     def test_conversation_binding_pins_one_account_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))

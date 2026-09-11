@@ -208,6 +208,11 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
         # Object-storage downloads are not ChatGPT account API calls.
         if urlparse(str(url)).hostname != "chatgpt.com":
             return send(method, url, **kwargs)
+        path = urlparse(str(url)).path.rstrip("/")
+        if (str(method).upper() == "POST"
+                and (path.endswith("/conversation") or path.endswith("/conversation/prepare") or path.endswith("/responses"))
+                and str(account.get("type") or "").strip().lower() == "free"):
+            raise RuntimeError("Free account messages are disabled")
         return clock.request(send, method, url, **kwargs)
 
     session.request = paced_request

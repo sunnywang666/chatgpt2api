@@ -1076,6 +1076,12 @@ class AccountService:
 
     def create_conversation_binding(self, *, image_model: str, text_model: str = "auto") -> tuple[str, str, str]:
         plan_type, source_type, plan_types = self._image_route(image_model)
+        # Product conversations must never fall back to a Free account.
+        paid_types = {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
+        plan_types = ({self._normalize_account_type(value) for value in plan_types}
+                      if plan_types else paid_types) & paid_types
+        if not plan_types or (plan_type and self._normalize_account_type(plan_type) not in plan_types):
+            raise RuntimeError("conversation binding unavailable: paid account required")
         if text_model and text_model != "auto":
             from services.model_service import model_catalog_service
             supported = model_catalog_service.route_for_model(text_model).account_types
@@ -1114,6 +1120,7 @@ class AccountService:
                 account = self._accounts.get(access_token) or {}
                 if (
                         not self._is_image_account_available(account)
+                        or self._normalize_account_type(account.get("type")) not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
                         or not self._account_matches_plan_type(account, plan_type)
                         or not self._account_matches_any_plan_type(account, plan_types)
                         or not self._account_matches_source_type(account, source_type)
@@ -1124,7 +1131,7 @@ class AccountService:
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
 
-    def get_bound_text_access_token(self, binding_id: str, *, model: str) -> str:
+    def get_bound_text_access_token(self, binding_id: str, *, model: str, for_message: bool = False) -> str:
         # Model lookup reads this account pool and may refresh its catalog in
         # other threads. Never hold the pool lock across that lookup.
         route = None
@@ -1135,6 +1142,8 @@ class AccountService:
         with self._lock:
             access_token = self._bound_token_locked(binding_id)
             account = self._accounts.get(access_token) or {}
+            if for_message and self._normalize_account_type(account.get("type")) not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}:
+                raise RuntimeError("conversation binding unavailable: paid account required")
             if account.get("status") in {"禁用", "异常"}:
                 raise RuntimeError("conversation binding unavailable: bound account cannot serve text")
             if route is not None:

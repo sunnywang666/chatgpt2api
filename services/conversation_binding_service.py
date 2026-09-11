@@ -169,6 +169,7 @@ class ConversationBindingService:
             access_token = account_service.get_bound_text_access_token(
                 binding_id,
                 model=model,
+                for_message=True,
             )
         except RuntimeError as exc:
             raise ConversationBindingError(str(exc)) from exc
