@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import time
+import threading
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -28,6 +29,53 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
+    def test_four_unknown_generations_keep_slots_and_fifth_waits_until_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch(
+            "services.image_task_service.config", image_account_concurrency=4
+        ):
+            calls = []
+            def handler(payload):
+                calls.append(payload["prompt"])
+                error = RuntimeError("query round expired")
+                error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+                error.conversation_id = payload["conversation_id"]
+                raise error
+            path = Path(tmp_dir) / "images.json"
+            service = self.make_service(path, handler)
+            for number in range(4):
+                service.submit_generation(OWNER, client_task_id=str(number), prompt=str(number),
+                    model="gpt-image-2", size=None, provider_binding_id="binding",
+                    provider_account_identity="account", client_conversation_id=str(number),
+                    conversation_id="chat-" + str(number), parent_message_id="parent", retain_conversation=True)
+                wait_for_task(service, OWNER, str(number), "error")
+            restarted = self.make_service(path, handler)
+            self.assertEqual(sum(t["upstream_unfinished"] for t in restarted._tasks.values()), 4)
+            restarted.submit_generation(OWNER, client_task_id="fifth", prompt="fifth",
+                model="gpt-image-2", size=None, provider_binding_id="binding",
+                provider_account_identity="account", client_conversation_id="fifth",
+                conversation_id="chat-fifth", parent_message_id="parent", retain_conversation=True)
+            time.sleep(0.05)
+            self.assertEqual(calls, ["0", "1", "2", "3"])
+            self.assertEqual(restarted.list_tasks(OWNER, ["fifth"])["items"][0]["status"], "queued")
+            restarted._update_task("owner-1:0", status="success", upstream_unfinished=False)
+            wait_for_task(restarted, OWNER, "fifth", "error")
+            self.assertEqual(calls, ["0", "1", "2", "3", "fifth"])
+
+    def test_unknown_receipt_is_not_deleted_by_retention_and_poll_cooldown_survives_restart(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "images.json"
+            path.write_text(json.dumps({"tasks": [{"id":"old", "owner_id":"owner-1",
+                "status":"error", "provider_binding_id":"binding", "provider_account_identity":"account",
+                "client_conversation_id":"product", "conversation_id":"chat", "parent_message_id":"parent",
+                "error_code":"CONVERSATION_OUTCOME_UNKNOWN", "updated_at":"2020-01-01 00:00:00",
+                "next_poll_at":time.time()+600}]}))
+            service = self.make_service(path)
+            with mock.patch("services.image_task_service.threading.Thread") as thread:
+                receipt = service.resume_poll(OWNER, "old")
+                self.assertEqual(receipt["status"], "error")
+                self.assertTrue(receipt["upstream_unfinished"])
+                thread.assert_not_called()
+
     def test_request_owned_model_is_durable_and_cannot_change_on_duplicate_submit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             captured = []
@@ -203,7 +251,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             with (
                 mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account_opaque_a"),
-                mock.patch("services.account_service.account_service.acquire_bound_image_access_token", return_value="bound-token") as acquire,
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="bound-token") as acquire,
                 mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()) as binding_lock,
                 mock.patch("services.account_service.account_service.release_image_slot") as release,
                 mock.patch("services.openai_backend_api.OpenAIBackendAPI", FakeBackend),
@@ -212,13 +260,10 @@ class ImageTaskServiceTests(unittest.TestCase):
                 resumed = service.resume_poll(OWNER, "unknown-task", 30, "http://content-provider")
                 self.assertIn(resumed["status"], {"running", "success"}, resumed)
                 task = wait_for_task(service, OWNER, "unknown-task", "success")
-                deadline = time.time() + 1
-                while not release.called and time.time() < deadline:
-                    time.sleep(0.01)
 
-            acquire.assert_called_once_with("cb_account_a", image_model="gpt-image-2")
+            acquire.assert_called_once_with("cb_account_a", model="auto")
             binding_lock.assert_called_once_with("cb_account_a", "workbench-conversation-1")
-            release.assert_called_once_with("bound-token")
+            release.assert_not_called()
             self.assertEqual(task["image_session_id"], "conversation-1")
             self.assertEqual(task["image_session_parent_id"], "message-2")
             self.assertEqual(task["data"], [{"url": "http://content-provider/images/result.png"}])
@@ -297,7 +342,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             with (
                 mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account_opaque_a"),
-                mock.patch("services.account_service.account_service.acquire_bound_image_access_token", return_value="bound-token"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="bound-token"),
                 mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
                 mock.patch("services.account_service.account_service.release_image_slot"),
                 mock.patch("services.openai_backend_api.OpenAIBackendAPI", FakeBackend),
