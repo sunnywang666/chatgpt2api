@@ -1112,6 +1112,23 @@ class OpenAIBackendAPI:
             raise RuntimeError("upstream conversation has no authoritative current_node")
         return parent_message_id
 
+    def archive_conversation(self, conversation_id: str, parent_message_id: str) -> Dict[str, Any]:
+        """Archive the completed product chat, preserving its history and images."""
+        document = self._get_conversation(conversation_id)
+        if parent_message_id not in (document.get("mapping") or {}):
+            raise RuntimeError("original product turn is missing")
+        if document.get("is_archived") is True:
+            return {"archived": True}
+        path = f"/backend-api/conversation/{conversation_id}"
+        response = self.session.patch(self.base_url + path,
+            headers=self._headers(path, {"Accept": "application/json", "Content-Type": "application/json"}),
+            json={"is_archived": True}, timeout=60)
+        ensure_ok(response, path)
+        # A timeout on PATCH is safe to recover by reading this exact chat first.
+        if self._get_conversation(conversation_id).get("is_archived") is not True:
+            raise RuntimeError("archive readback is not confirmed")
+        return {"archived": True}
+
     def delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """删除本地对话记录。"""
         path = f"/backend-api/conversation/{conversation_id}"

@@ -27,6 +27,19 @@ class ConversationBindingError(RuntimeError):
 
 
 class ConversationBindingService:
+    def archive(self, body: dict[str, Any]) -> dict[str, Any]:
+        binding = body["provider_binding_id"]
+        if account_service.get_bound_account_identity(binding) != body["provider_account_identity"]:
+            raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
+        token = account_service.get_bound_text_access_token(binding, model="auto")
+        with account_service.conversation_binding_lock(binding, body["client_conversation_id"]):
+            backend = OpenAIBackendAPI(access_token=token)
+            try:
+                result = backend.archive_conversation(body["conversation_id"], body["parent_message_id"])
+                return {**body, **result}
+            finally:
+                backend.close()
+
     def read_text_request(self, receipt: dict[str, Any]) -> dict[str, Any]:
         """Recover only the answer descending from this request's own user turn."""
         binding = receipt["provider_binding_id"]

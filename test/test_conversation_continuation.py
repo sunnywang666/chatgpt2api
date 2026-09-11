@@ -625,3 +625,31 @@ class TextResultRecoveryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ProductConversationArchiveTests(unittest.TestCase):
+    def backend(self, documents):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.com"
+        backend._get_conversation = mock.Mock(side_effect=documents)
+        backend._headers = mock.Mock(return_value={})
+        backend.session = mock.Mock()
+        backend.session.patch.return_value.status_code = 200
+        return backend
+
+    def test_archive_preserves_chat_and_checks_authoritative_readback(self):
+        backend = self.backend([{"mapping": {"original": {}}, "is_archived": False}, {"is_archived": True}])
+        result = backend.archive_conversation("chat-a", "original")
+        self.assertTrue(result["archived"])
+        self.assertEqual(backend.session.patch.call_args.kwargs["json"], {"is_archived": True})
+        self.assertEqual(backend._get_conversation.call_count, 2)
+
+    def test_recovery_reads_already_archived_chat_without_repeating_patch(self):
+        backend = self.backend([{"mapping": {"original": {}}, "is_archived": True}])
+        self.assertTrue(backend.archive_conversation("chat-a", "original")["archived"])
+        backend.session.patch.assert_not_called()
+
+    def test_missing_original_turn_never_archives_a_different_chat(self):
+        backend = self.backend([{"mapping": {"other": {}}}])
+        with self.assertRaises(RuntimeError):
+            backend.archive_conversation("chat-a", "original")
+        backend.session.patch.assert_not_called()

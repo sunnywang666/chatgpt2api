@@ -70,6 +70,15 @@ class ConversationBindingTextRequest(BaseModel):
     parent_message_id: str | None = None
 
 
+class ConversationArchiveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    provider_binding_id: str = Field(min_length=1)
+    provider_account_identity: str = Field(min_length=1)
+    client_conversation_id: str = Field(min_length=1)
+    conversation_id: str = Field(pattern=r"^[a-zA-Z0-9-]+$")
+    parent_message_id: str = Field(min_length=1)
+
+
 class AnthropicMessageRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str | None = None
@@ -170,6 +179,17 @@ def create_router() -> APIRouter:
         )
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_response.handle, payload)
+
+    @router.post("/api/conversation-bindings/archive")
+    async def archive_bound_conversation(body: ConversationArchiveRequest,
+            authorization: str | None = Header(default=None)):
+        require_identity(authorization)
+        try:
+            return await run_in_threadpool(conversation_binding_service.archive, body.model_dump())
+        except ConversationBindingError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail={"code": "CONVERSATION_ARCHIVE_UNCONFIRMED"}) from exc
 
     @router.get("/api/conversation-bindings/text")
     async def read_bound_text(

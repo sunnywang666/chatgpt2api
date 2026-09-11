@@ -601,6 +601,7 @@ class ImageTaskService:
                 "created_ts": item.get("created_ts"),
                 "updated_ts": item.get("updated_ts"),
                 "started_ts": item.get("started_ts"),
+                "progress": item.get("progress"),
                 "duration_ms": item.get("duration_ms"),
                 "provider_binding_id": _clean(item.get("provider_binding_id")),
                 "provider_account_identity": _clean(item.get("provider_account_identity")),
