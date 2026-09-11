@@ -71,6 +71,14 @@ class FakeImageTaskService:
 
 
 class ImageTasksApiTests(unittest.TestCase):
+    def test_b_edit_passes_request_owned_model_without_a_global_setting_write(self):
+        response = self.client.post("/api/image-tasks/edits", headers=AUTH_HEADERS, json={
+            "client_task_id": "b-chat-image", "prompt": "edit product", "model": "gpt-image-2",
+            "images": [{"url": DATA_IMAGE_URL}], "upstream_model": "gpt-5-6-instant",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.fake_service.edit_calls[0][1]["upstream_model"], "gpt-5-6-instant")
+
     def setUp(self):
         self.fake_service = FakeImageTaskService()
         self.service_patcher = mock.patch.object(image_tasks_module, "image_task_service", self.fake_service)

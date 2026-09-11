@@ -319,6 +319,7 @@ class ConversationRequest:
     conversation_id: str = ""
     parent_message_id: str = ""
     retain_conversation: bool = False
+    upstream_model: str = ""
 
 
 @dataclass
@@ -1391,6 +1392,9 @@ def _generate_bound_single_image(
     try:
         with account_service.conversation_binding_lock(binding_id, request.client_conversation_id):
             backend = OpenAIBackendAPI(access_token=token)
+            # Request-owned model selection; never mutate the shared pool
+            # default used by Content or other callers.
+            backend.image_upstream_model = request.upstream_model
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             try:
@@ -1531,6 +1535,7 @@ def _generate_single_image(
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
+            backend.image_upstream_model = request.upstream_model
             outputs: list[ImageOutput] = []
             last_conversation_id = ""
             try:

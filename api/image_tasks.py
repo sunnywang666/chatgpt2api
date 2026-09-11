@@ -23,6 +23,7 @@ class ImageGenerationTaskRequest(BaseModel):
     conversation_id: str = ""
     parent_message_id: str = ""
     retain_conversation: bool = False
+    upstream_model: str = ""
 
 
 class ResumePollRequest(BaseModel):
@@ -76,6 +77,7 @@ def create_router() -> APIRouter:
                 conversation_id=body.conversation_id,
                 parent_message_id=body.parent_message_id,
                 retain_conversation=body.retain_conversation,
+                upstream_model=body.upstream_model,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
@@ -113,6 +115,7 @@ def create_router() -> APIRouter:
                 conversation_id=str(payload.get("conversation_id") or ""),
                 parent_message_id=str(payload.get("parent_message_id") or ""),
                 retain_conversation=bool(payload.get("retain_conversation")),
+                upstream_model=str(payload.get("upstream_model") or ""),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc

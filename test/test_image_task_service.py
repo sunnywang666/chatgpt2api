@@ -28,6 +28,23 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
+    def test_request_owned_model_is_durable_and_cannot_change_on_duplicate_submit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            captured = []
+            def handler(payload):
+                captured.append(payload["upstream_model"])
+                return {"data": [{"url": "https://example.test/image.png"}]}
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            request = dict(client_task_id="b-instant", prompt="product", model="gpt-image-2", size=None,
+                           upstream_model="gpt-5-6-instant")
+            service.submit_generation(OWNER, **request)
+            task = wait_for_task(service, OWNER, "b-instant", "success")
+            self.assertEqual(task["upstream_model"], "gpt-5-6-instant")
+            service.submit_generation(OWNER, **request)
+            with self.assertRaisesRegex(ValueError, "different immutable request"):
+                service.submit_generation(OWNER, **{**request, "upstream_model": "gpt-5.6-sol-wm"})
+            self.assertEqual(captured, ["gpt-5-6-instant"])
+
     def test_image_task_creates_an_independent_session_on_the_bound_account(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             captured = {}

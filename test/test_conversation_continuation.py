@@ -3,6 +3,9 @@ from __future__ import annotations
 import unittest
 from contextlib import nullcontext
 from unittest import mock
+from types import SimpleNamespace
+
+from services import account_request_pacing as pacing
 
 from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
 from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
@@ -14,7 +17,97 @@ from services.protocol.conversation import (
 )
 
 
+class AccountRequestPacingTests(unittest.TestCase):
+    def setUp(self):
+        pacing._clocks.clear()
+        self.now = 1000.0
+        self.calls = []
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(pacing.time, "monotonic", side_effect=lambda: self.now).start()
+        mock.patch.object(pacing.time, "sleep", side_effect=self.advance).start()
+        mock.patch.object(pacing, "config", SimpleNamespace(
+            account_request_interval_secs=5.0, account_message_interval_secs=30.0)).start()
+
+    def advance(self, delay):
+        self.now += delay
+
+    def session(self, account_id="account-a", token="token", statuses=None):
+        replies = iter(statuses or [(200, {})] * 10)
+
+        def send(method, url, **kwargs):
+            self.calls.append((account_id, self.now, method, url))
+            code, headers = next(replies)
+            return SimpleNamespace(status_code=code, headers=headers)
+
+        session = SimpleNamespace(request=send)
+        pacing.pace_account_session(session, {"account_id": account_id}, token)
+        return session
+
+    def test_text_image_and_poll_share_one_clock_across_clients_and_refreshed_tokens(self):
+        first = self.session(token="old-token")
+        second = self.session(token="new-token")
+        first.request("POST", "https://chatgpt.com/backend-api/conversation")
+        second.request("GET", "https://chatgpt.com/backend-api/tasks")
+        second.request("POST", "https://chatgpt.com/backend-api/f/conversation")
+        first.request("GET", "https://chatgpt.com/backend-api/conversation/original")
+        self.assertEqual([row[1] for row in self.calls], [1000, 1005, 1030, 1035])
+
+    def test_429_cools_down_other_clients_honors_retry_after_and_never_replays(self):
+        first = self.session(statuses=[(429, {"Retry-After": "120"})])
+        second = self.session()
+        response = first.request("POST", "https://chatgpt.com/backend-api/conversation")
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(len(self.calls), 1)
+        second.request("GET", "https://chatgpt.com/backend-api/tasks")
+        self.assertEqual(self.calls[-1][1], 1120)
+
+    def test_repeated_limits_increase_cooldown_instead_of_immediate_retry(self):
+        session = self.session(statuses=[(429, {}), (429, {}), (200, {})])
+        for _ in range(3):
+            session.request("GET", "https://chatgpt.com/backend-api/tasks")
+        self.assertEqual([row[1] for row in self.calls], [1000, 1060, 1180])
+
+    def test_other_account_and_object_storage_are_not_blocked_by_account_cooldown(self):
+        first = self.session(statuses=[(429, {}), (200, {})])
+        second = self.session(account_id="account-b")
+        first.request("GET", "https://chatgpt.com/backend-api/tasks")
+        second.request("GET", "https://chatgpt.com/backend-api/tasks")
+        first.request("GET", "https://storage.example.test/image.png")
+        self.assertEqual([row[1] for row in self.calls], [1000, 1000, 1000])
+
+    def test_invalid_retry_after_does_not_disable_cooldown(self):
+        for value in (None, "NaN", "Infinity", "-1", "bad"):
+            self.assertEqual(pacing.retry_after_seconds(value), 0)
+        self.assertGreater(pacing.retry_after_seconds("Fri, 01 Jan 2100 00:00:00 GMT"), 0)
+
+    def test_actual_backend_session_get_and_post_use_shared_account_pacing(self):
+        def send(_session, method, url, **kwargs):
+            self.calls.append((method, self.now))
+            return SimpleNamespace(status_code=200, headers={})
+        with mock.patch("services.openai_backend_api.account_service.get_account", return_value={"account_id":"same-account"}), \
+                mock.patch("services.openai_backend_api.requests.Session.request", new=send):
+            first = OpenAIBackendAPI(access_token="token-1")
+            second = OpenAIBackendAPI(access_token="token-2")
+            try:
+                first.session.post("https://chatgpt.com/backend-api/conversation")
+                second.session.get("https://chatgpt.com/backend-api/tasks")
+                second.session.post("https://chatgpt.com/backend-api/f/conversation")
+            finally:
+                first.close()
+                second.close()
+        self.assertEqual(self.calls, [("POST",1000), ("GET",1005), ("POST",1030)])
+
+
 class ConversationContinuationPayloadTests(unittest.TestCase):
+    def test_b_request_uses_chat_instant_without_changing_content_pool_default(self):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.image_upstream_model = "gpt-5-6-instant"
+        with mock.patch("services.openai_backend_api.config", SimpleNamespace(
+            default_upstream_model_name="gpt-5.6-sol-wm", default_thinking_effort="extended")):
+            self.assertEqual(backend._image_model_settings("gpt-image-2"), ("gpt-5-6-instant", ""))
+            content_backend = object.__new__(OpenAIBackendAPI)
+            self.assertEqual(content_backend._image_model_settings("gpt-image-2"), ("gpt-5.6-sol-wm", "extended"))
+
     def test_image_conversation_falls_back_from_removed_f_route(self) -> None:
         class FakeResponse:
             def __init__(self, status_code: int) -> None:
@@ -98,6 +191,7 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
             conversation_id="conversation-1",
             parent_message_id="message-1",
             retain_conversation=True,
+            upstream_model="gpt-5-6-instant",
         )
 
         class FakeBackend:
@@ -107,6 +201,7 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
 
             def get_conversation_parent_message_id(self, conversation_id: str) -> str:
                 self.test_case.assertEqual(conversation_id, "conversation-1")
+                self.test_case.assertEqual(self.image_upstream_model, "gpt-5-6-instant")
                 return "message-2"
 
             def close(self) -> None:

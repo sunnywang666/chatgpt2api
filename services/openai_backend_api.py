@@ -21,6 +21,7 @@ from curl_cffi import requests
 from PIL import Image
 
 from services.account_service import account_service
+from services.account_request_pacing import pace_account_session
 from services.config import config
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
@@ -214,6 +215,7 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+        pace_account_session(self.session, self.account, self.access_token)
 
     def close(self) -> None:
         if getattr(self, "_closed", False):
@@ -575,7 +577,7 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto", ""
         if base_model == "gpt-image-2":
-            upstream_model = config.default_upstream_model_name
+            upstream_model = getattr(self, "image_upstream_model", "") or config.default_upstream_model_name
         elif base_model == CODEX_IMAGE_MODEL:
             upstream_model = base_model
         else:
@@ -583,7 +585,8 @@ class OpenAIBackendAPI:
         model_name, separator, suffix = upstream_model.rpartition("-")
         if separator and suffix.lower() in {"standard", "extended", "max"}:
             return model_name, suffix.lower()
-        return upstream_model, self._normalize_thinking_effort(config.default_thinking_effort)
+        # Instant does not inherit the global Work extended reasoning setting.
+        return upstream_model, "" if upstream_model.endswith("-instant") else self._normalize_thinking_effort(config.default_thinking_effort)
 
     def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
             Dict[str, str]:

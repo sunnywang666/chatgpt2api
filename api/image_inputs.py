@@ -82,6 +82,7 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         "client_conversation_id",
         "conversation_id",
         "parent_message_id",
+        "upstream_model",
     ):
         if field in fields:
             payload[field] = _clean(fields.get(field))

@@ -87,6 +87,9 @@ def _request_hash(mode: str, payload: dict[str, Any]) -> str:
         "image_sha256": image_hashes,
         "mask_sha256": mask_hashes,
     }
+    # Keep old task fingerprints unchanged when the caller has no override.
+    if _clean(payload.get("upstream_model")):
+        contract["upstream_model"] = _clean(payload.get("upstream_model"))
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -146,6 +149,7 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "client_conversation_id",
         "binding_status",
         "error_code",
+        "upstream_model",
     ):
         if task.get(field):
             item[field] = task.get(field)
@@ -210,6 +214,7 @@ class ImageTaskService:
         conversation_id: str = "",
         parent_message_id: str = "",
         retain_conversation: bool = False,
+        upstream_model: str = "",
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -225,6 +230,7 @@ class ImageTaskService:
             "conversation_id": conversation_id,
             "parent_message_id": parent_message_id,
             "retain_conversation": retain_conversation,
+            "upstream_model": upstream_model,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
 
@@ -246,6 +252,7 @@ class ImageTaskService:
         conversation_id: str = "",
         parent_message_id: str = "",
         retain_conversation: bool = False,
+        upstream_model: str = "",
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -263,6 +270,7 @@ class ImageTaskService:
             "conversation_id": conversation_id,
             "parent_message_id": parent_message_id,
             "retain_conversation": retain_conversation,
+            "upstream_model": upstream_model,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
@@ -320,6 +328,7 @@ class ImageTaskService:
                 "status": TASK_STATUS_QUEUED,
                 "mode": mode,
                 "model": _clean(payload.get("model"), "gpt-image-2"),
+                "upstream_model": _clean(payload.get("upstream_model")),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
                 "base_url": _clean(payload.get("base_url")),
