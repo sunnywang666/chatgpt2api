@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 import threading
+import tempfile
+from pathlib import Path
 from contextlib import nullcontext
 from unittest import mock
 from types import SimpleNamespace
@@ -24,7 +26,11 @@ class AccountRequestPacingTests(unittest.TestCase):
         self.now = 1000.0
         self.calls = []
         self.addCleanup(mock.patch.stopall)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        mock.patch.object(pacing, "DATA_DIR", Path(directory.name)).start()
         mock.patch.object(pacing.time, "monotonic", side_effect=lambda: self.now).start()
+        mock.patch.object(pacing.time, "time", side_effect=lambda: 1000000 + self.now).start()
         mock.patch.object(pacing.time, "sleep", side_effect=self.advance).start()
         mock.patch.object(pacing, "config", SimpleNamespace(
             account_request_interval_secs=5.0, account_message_interval_secs=30.0)).start()
@@ -80,6 +86,25 @@ class AccountRequestPacingTests(unittest.TestCase):
         for value in (None, "NaN", "Infinity", "-1", "bad"):
             self.assertEqual(pacing.retry_after_seconds(value), 0)
         self.assertGreater(pacing.retry_after_seconds("Fri, 01 Jan 2100 00:00:00 GMT"), 0)
+
+    def test_restart_preserves_message_interval_and_shared_cooldown(self):
+        first = self.session(statuses=[(429, {"Retry-After": "120"})])
+        first.request("POST", "https://chatgpt.com/backend-api/conversation")
+        self.advance(10)
+        pacing._clocks.clear()
+        restarted = self.session(token="refreshed", statuses=[(429, {}), (200, {})])
+        restarted.request("GET", "https://chatgpt.com/backend-api/tasks")
+        restarted.request("POST", "https://chatgpt.com/backend-api/conversation")
+        self.assertEqual([row[1] for row in self.calls], [1000, 1120, 1240])
+        self.assertEqual(next(iter(pacing._clocks.values())).rate_failures, 2)
+
+    def test_restart_after_unknown_send_does_not_reset_reserved_message_interval(self):
+        first = self.session()
+        first.request("POST", "https://chatgpt.com/backend-api/conversation")
+        self.advance(10)
+        pacing._clocks.clear()
+        self.session().request("POST", "https://chatgpt.com/backend-api/conversation")
+        self.assertEqual([row[1] for row in self.calls], [1000, 1030])
 
     def test_successful_poll_does_not_reset_generation_rate_backoff(self):
         session = self.session(statuses=[(429, {}), (200, {}), (429, {}), (200, {})])

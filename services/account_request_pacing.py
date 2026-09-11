@@ -8,19 +8,22 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import threading
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
-from services.config import config
+from services.config import DATA_DIR, config
 from utils.log import logger
 
 
 class AccountRequestClock:
-    def __init__(self, account_key="") -> None:
+    def __init__(self, account_key="", state_path: Path | None = None) -> None:
         self.account_key = account_key
+        self.state_path = state_path
         self.lock = threading.Lock()
         self.turn_lock = threading.Lock()
         self.next_request = 0.0
@@ -29,6 +32,38 @@ class AccountRequestClock:
         self.rate_failures = 0
         self.last_rate_limit = 0.0
         self.last_turn_started = None
+        self._load()
+
+    def _load(self):
+        if self.state_path is None or not self.state_path.exists():
+            return
+        saved = json.loads(self.state_path.read_text())
+        offset = time.time() - time.monotonic()
+        for field in ("next_request", "next_turn", "cooldown_until", "last_rate_limit"):
+            value = float(saved[field])
+            if not math.isfinite(value):
+                raise ValueError("Invalid saved account request clock")
+            setattr(self, field, value - offset)
+        self.rate_failures = max(0, int(saved["rate_failures"]))
+        started = saved.get("last_turn_started")
+        if started is not None:
+            self.last_turn_started = float(started) - offset
+
+    def _save(self):
+        if self.state_path is None:
+            return
+        offset = time.time() - time.monotonic()
+        saved = {field: getattr(self, field) + offset for field in
+                 ("next_request", "next_turn", "cooldown_until", "last_rate_limit")}
+        saved["rate_failures"] = self.rate_failures
+        saved["last_turn_started"] = None if self.last_turn_started is None else self.last_turn_started + offset
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_suffix(".tmp")
+        with temporary.open("w") as handle:
+            json.dump(saved, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(self.state_path)
 
     def limited(self, retry_after=0.0):
         # A successful metadata GET does not prove that generation capacity has
@@ -37,6 +72,7 @@ class AccountRequestClock:
         self.last_rate_limit = time.monotonic()
         fallback = min(900.0, 60.0 * (2 ** min(self.rate_failures - 1, 4)))
         self.cooldown_until = self.last_rate_limit + max(fallback, retry_after)
+        self._save()
         logger.warning({"event": "account_rate_limited", "account": self.account_key,
                         "consecutive_limits": self.rate_failures,
                         "retry_after_secs": retry_after, "cooldown_secs": max(fallback, retry_after)})
@@ -76,6 +112,9 @@ class AccountRequestClock:
                                  "since_previous_secs": None if self.last_turn_started is None else round(now - self.last_turn_started, 3),
                                  "minimum_interval_secs": min(300.0, config.account_message_interval_secs * factor)})
                     self.last_turn_started = now
+                # Reserve the interval before sending. Restarting after an
+                # unknown response must not erase the account's wait period.
+                self._save()
                 response = send(method, url, **kwargs)
                 if response.status_code == 429:
                     self.limited(retry_after_seconds(response.headers.get("Retry-After")))
@@ -159,7 +198,10 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
     identity = str(account.get("account_id") or account.get("provider_account_identity") or access_token)
     key = hashlib.sha256(identity.encode()).hexdigest()
     with _clocks_lock:
-        clock = _clocks.setdefault(key, AccountRequestClock(key[:12]))
+        clock = _clocks.get(key)
+        if clock is None:
+            clock = AccountRequestClock(key[:12], DATA_DIR / "account_request_clocks" / f"{key}.json")
+            _clocks[key] = clock
     send = session.request
 
     def paced_request(method, url, **kwargs):
