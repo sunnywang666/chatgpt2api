@@ -1074,8 +1074,17 @@ class AccountService:
             ("plus", "team", "pro") if codex_model and not plan_type else None,
         )
 
-    def create_conversation_binding(self, *, image_model: str) -> tuple[str, str, str]:
+    def create_conversation_binding(self, *, image_model: str, text_model: str = "auto") -> tuple[str, str, str]:
         plan_type, source_type, plan_types = self._image_route(image_model)
+        if text_model and text_model != "auto":
+            from services.model_service import model_catalog_service
+            supported = model_catalog_service.route_for_model(text_model).account_types
+            allowed = {self._normalize_account_type(value) for value in supported}
+            if plan_types:
+                allowed &= {self._normalize_account_type(value) for value in plan_types}
+            if not allowed or (plan_type and self._normalize_account_type(plan_type) not in allowed):
+                raise RuntimeError("conversation binding unavailable: no account supports both text and images")
+            plan_types = allowed
         access_token = self.get_available_access_token(
             plan_type=plan_type,
             source_type=source_type,

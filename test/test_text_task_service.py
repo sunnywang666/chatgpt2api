@@ -97,6 +97,22 @@ class TextTaskTests(unittest.TestCase):
         restarted.submit("owner", self.body)
         self.assertEqual(len(self.queue.calls), 1)
 
+    def test_legacy_account_rejection_before_any_chat_reuses_the_original_request(self):
+        def rejected(body, on_cursor):
+            on_cursor({"provider_binding_id": "wrong-plan", "provider_account_identity": "free"})
+            raise ConversationBindingError("bound account cannot serve model")
+        service = TextTaskService(self.path, rejected, self.queue)
+        original = service.submit("owner", self.body)
+        self.queue.run()
+        self.assertEqual(service.read("owner", "attempt-1")["status"], "not_started")
+        service.runner = lambda body, on_cursor: {"content": "done", "conversation_id": "new-product-chat"}
+        service.submit("owner", self.body)
+        self.queue.run()
+        self.assertEqual(service.read("owner", "attempt-1")["request_message_id"], original["request_message_id"])
+        self.assertEqual(service.read("owner", "attempt-1")["status"], "succeeded")
+        service._update("owner", "attempt-1", status="failed", error_code="CONVERSATION_BINDING_UNAVAILABLE")
+        self.assertEqual(service.read("owner", "attempt-1")["status"], "failed", "existing chats cannot be reclassified as never sent")
+
     def test_ready_continuation_precedes_queued_new_products(self):
         executor = ContinuationExecutor(max_workers=1)
         started, finish = threading.Event(), threading.Event()

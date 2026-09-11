@@ -155,7 +155,7 @@ class ConversationBindingService:
         else:
             try:
                 binding_id, account_identity, image_token = account_service.create_conversation_binding(
-                    image_model=image_model
+                    image_model=image_model, text_model=model
                 )
                 account_service.release_image_slot(image_token)
             except RuntimeError as exc:

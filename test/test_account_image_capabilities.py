@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
@@ -17,6 +18,23 @@ from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
+    def test_product_binding_requires_one_account_capable_of_text_and_images(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([
+                {"access_token": "free", "type": "Free", "status": "正常", "quota": 100},
+                {"access_token": "pro", "type": "Pro", "status": "正常", "quota": 100},
+            ])
+            service.fetch_remote_info = lambda token, event="": service.get_account(token)
+            with patch("services.model_service.model_catalog_service.route_for_model", return_value=SimpleNamespace(account_types=frozenset({"Pro"}))):
+                for _ in range(4):
+                    _, _, token = service.create_conversation_binding(image_model="gpt-image-2", text_model="gpt-5-6-instant")
+                    self.assertEqual(token, "pro")
+                    service.release_image_slot(token)
+            with patch("services.model_service.model_catalog_service.route_for_model", return_value=SimpleNamespace(account_types=frozenset())):
+                with self.assertRaisesRegex(RuntimeError, "supports both"):
+                    service.create_conversation_binding(image_model="gpt-image-2", text_model="unavailable")
+
     def test_conversation_binding_pins_one_account_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
