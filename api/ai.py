@@ -13,6 +13,7 @@ from services.conversation_binding_service import (
     conversation_binding_service,
 )
 from services.editable_file_task_service import editable_file_task_service
+from services.text_task_service import text_task_service
 from services.log_service import LoggedCall
 from services.protocol import (
     anthropic_v1_messages,
@@ -64,6 +65,7 @@ class ConversationBindingTextRequest(BaseModel):
     provider_binding_id: str | None = None
     provider_account_identity: str | None = None
     client_conversation_id: str
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=200)
     conversation_id: str | None = None
     parent_message_id: str | None = None
 
@@ -189,6 +191,11 @@ def create_router() -> APIRouter:
         except Exception as exc:
             raise HTTPException(status_code=503, detail={"code": "CONVERSATION_READ_UNAVAILABLE"}) from exc
 
+    @router.get("/api/conversation-bindings/text-requests/{request_id}")
+    async def read_bound_text_request(request_id: str, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        return await run_in_threadpool(text_task_service.read, str(identity.get("id") or "anonymous"), request_id)
+
     @router.post("/api/conversation-bindings/text")
     async def continue_bound_text(
             body: ConversationBindingTextRequest,
@@ -208,6 +215,8 @@ def create_router() -> APIRouter:
             request_preview,
         )
         try:
+            if body.client_request_id:
+                return await run_in_threadpool(text_task_service.submit, str(identity.get("id") or "anonymous"), payload)
             return await run_in_threadpool(conversation_binding_service.complete_text, payload)
         except ConversationBindingError as exc:
             detail = {"code": exc.code, "error": str(exc)}

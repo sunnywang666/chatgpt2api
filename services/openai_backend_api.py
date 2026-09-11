@@ -507,6 +507,12 @@ class OpenAIBackendAPI:
                     } for ref in uploaded],
                 },
             })
+        request_message_id = getattr(self, "text_request_message_id", "")
+        if request_message_id:
+            for message in reversed(conversation_messages):
+                if message["author"]["role"] == "user":
+                    message["id"] = request_message_id
+                    break
         return conversation_messages
 
     @staticmethod

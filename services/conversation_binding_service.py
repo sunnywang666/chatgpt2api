@@ -27,6 +27,22 @@ class ConversationBindingError(RuntimeError):
 
 
 class ConversationBindingService:
+    def read_text_request(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Recover only the answer descending from this request's own user turn."""
+        binding = receipt["provider_binding_id"]
+        if account_service.get_bound_account_identity(binding) != receipt["provider_account_identity"]:
+            raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
+        token = account_service.get_bound_text_access_token(binding, model="auto")
+        with account_service.conversation_binding_lock(binding, receipt["client_conversation_id"]):
+            backend = OpenAIBackendAPI(access_token=token)
+            try:
+                # The existing reader checks branch ancestry and refuses a
+                # later user turn; anchoring at OUR user message excludes the
+                # previous assistant answer and any unrelated newer answer.
+                return self._read_text_result(backend, {**receipt, "parent_message_id": receipt["request_message_id"]})
+            finally:
+                backend.close()
+
     def read_text(self, body: dict[str, Any]) -> dict[str, Any]:
         """Read an already-issued cursor on its bound account; never send a message."""
         keys = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
@@ -79,7 +95,7 @@ class ConversationBindingService:
             return {**result, "binding_status": "unknown", "status": "running"}
         return {**result, "binding_status": "bound", "status": "succeeded", "parent_message_id": current, "content": text}
 
-    def complete_text(self, body: dict[str, Any]) -> dict[str, Any]:
+    def complete_text(self, body: dict[str, Any], *, on_cursor=None) -> dict[str, Any]:
         binding_id = str(body.get("provider_binding_id") or "").strip()
         account_identity = str(body.get("provider_account_identity") or "").strip()
         client_conversation_id = str(body.get("client_conversation_id") or "").strip()
@@ -132,6 +148,10 @@ class ConversationBindingService:
             except RuntimeError as exc:
                 raise ConversationBindingError(str(exc)) from exc
 
+        if on_cursor:
+            on_cursor({"provider_binding_id": binding_id, "provider_account_identity": account_identity,
+                       "client_conversation_id": client_conversation_id,
+                       **({"conversation_id": conversation_id, "parent_message_id": parent_message_id} if conversation_id else {})})
         try:
             access_token = account_service.get_bound_text_access_token(
                 binding_id,
@@ -142,6 +162,7 @@ class ConversationBindingService:
 
         with account_service.conversation_binding_lock(binding_id, client_conversation_id):
             backend = OpenAIBackendAPI(access_token=access_token)
+            backend.text_request_message_id = str(body.get("_request_message_id") or "")
             try:
                 parts: list[str] = []
                 returned_conversation_id = ""
@@ -153,9 +174,12 @@ class ConversationBindingService:
                     conversation_id=conversation_id,
                     parent_message_id=parent_message_id,
                 ):
+                    old_conversation_id = returned_conversation_id
                     returned_conversation_id = str(
                         event.get("conversation_id") or returned_conversation_id
                     )
+                    if on_cursor and returned_conversation_id and returned_conversation_id != old_conversation_id:
+                        on_cursor({"conversation_id": returned_conversation_id})
                     if event.get("type") == "conversation.delta":
                         delta = str(event.get("delta") or "")
                         if delta:

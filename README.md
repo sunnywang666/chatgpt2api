@@ -171,6 +171,12 @@ environment:
   </tr>
 </table>
 
+### 绑定文本请求的异步恢复
+
+`POST /api/conversation-bindings/text` 可携带调用方生成的 `client_request_id`。服务先在 `data/text_tasks.sqlite3` 保存请求记录，立即返回 `request_id` 和 `queued/running` 状态，再处理图片上传与对话；不携带该字段时保留原同步响应。
+
+使用相同身份调用 `GET /api/conversation-bindings/text-requests/{request_id}` 查询进度、原账号和对话、完成结果。相同请求编号与相同输入只执行一次，输入改变返回冲突；查询不会重新生成。记录不保存访问令牌、请求提示词或上传图片字节。重启后结果不明的记录只按原用户消息编号查询，不能把上一轮回答当成本轮结果，也不自动重发未知请求。调用方对明确失败负责有限退避重试，成功阶段继续复用。
+
 ## API
 
 所有 AI 接口都需要请求头：
