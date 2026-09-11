@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from services.conversation_binding_service import ConversationBindingError
-from services.text_task_service import TextTaskService
+from services.text_task_service import TextTaskService, ContinuationExecutor
 
 
 class QueuedExecutor:
@@ -63,14 +63,61 @@ class TextTaskTests(unittest.TestCase):
             raise ConversationBindingError("disconnected", code="CONVERSATION_OUTCOME_UNKNOWN")
         service = TextTaskService(self.path, runner, self.queue)
         service.submit("owner", self.body)
+        self.queue.run()
         restarted = TextTaskService(self.path, runner, self.queue)
         self.assertEqual(restarted.read("owner", "attempt-1")["status"], "unknown")
-        self.queue.run()
         result = restarted.read("owner", "attempt-1")
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(result["conversation_id"], "same-chat")
         restarted.submit("owner", self.body)
         self.assertEqual(len(self.queue.calls), 0)
+
+    def test_restart_replays_only_unstarted_requests_with_same_input_and_message_identity(self):
+        writes = []
+        service = TextTaskService(self.path, lambda body, on_cursor: writes.append(body) or {"content": "ok"}, self.queue)
+        first = service.submit("owner", self.body)
+        restarted = TextTaskService(self.path, service.runner, self.queue)
+        self.assertEqual(restarted.read("owner", "attempt-1")["status"], "not_started")
+        with self.assertRaises(ConversationBindingError):
+            restarted.submit("owner", {**self.body, "model": "changed"})
+        restarted.submit("owner", self.body)
+        self.queue.run()  # Old process cannot later run a transferred queued receipt.
+        self.assertEqual(writes, [])
+        self.queue.run()
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0]["_request_message_id"], first["request_message_id"])
+        self.assertEqual(restarted.read("owner", "attempt-1")["status"], "succeeded")
+
+    def test_running_request_after_restart_remains_unknown_and_never_resubmits(self):
+        service = TextTaskService(self.path, executor=self.queue)
+        service.submit("owner", self.body)
+        service._update("owner", "attempt-1", status="running")
+        restarted = TextTaskService(self.path, executor=self.queue)
+        self.assertEqual(restarted.read("owner", "attempt-1")["status"], "unknown")
+        restarted.submit("owner", self.body)
+        self.assertEqual(len(self.queue.calls), 1)
+
+    def test_ready_continuation_precedes_queued_new_products(self):
+        executor = ContinuationExecutor(max_workers=1)
+        started, finish = threading.Event(), threading.Event()
+        order = []
+        def run(body):
+            order.append(body["id"])
+            if body["id"] == "first":
+                started.set()
+                finish.wait(3)
+        try:
+            first = executor.submit(run, {"id": "first"})
+            self.assertTrue(started.wait(1))
+            gallery = executor.submit(run, {"id": "new-gallery"})
+            copy = executor.submit(run, {"id": "ready-copy", "conversation_id": "same-chat"})
+            finish.set()
+            for future in (first, gallery, copy):
+                future.result(timeout=3)
+            self.assertEqual(order, ["first", "ready-copy", "new-gallery"])
+        finally:
+            finish.set()
+            executor.shutdown()
 
     def test_known_rejection_is_terminal_and_other_request_can_continue(self):
         def runner(body, on_cursor):
