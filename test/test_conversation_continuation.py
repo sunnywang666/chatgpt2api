@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import threading
 from contextlib import nullcontext
 from unittest import mock
 from types import SimpleNamespace
@@ -79,6 +80,61 @@ class AccountRequestPacingTests(unittest.TestCase):
         for value in (None, "NaN", "Infinity", "-1", "bad"):
             self.assertEqual(pacing.retry_after_seconds(value), 0)
         self.assertGreater(pacing.retry_after_seconds("Fri, 01 Jan 2100 00:00:00 GMT"), 0)
+
+    def test_successful_poll_does_not_reset_generation_rate_backoff(self):
+        session = self.session(statuses=[(429, {}), (200, {}), (429, {}), (200, {})])
+        session.request("POST", "https://chatgpt.com/backend-api/conversation")
+        session.request("GET", "https://chatgpt.com/backend-api/tasks")
+        session.request("POST", "https://chatgpt.com/backend-api/conversation")
+        session.request("GET", "https://chatgpt.com/backend-api/tasks")
+        self.assertEqual([row[1] for row in self.calls], [1000, 1060, 1070, 1190])
+
+    def test_message_stream_serializes_other_turn_but_allows_original_result_read(self):
+        clock = pacing.AccountRequestClock()
+        entered = threading.Event()
+        attempted = threading.Event()
+        first = SimpleNamespace(status_code=200, headers={}, close=lambda: None, iter_lines=lambda: iter([]))
+        clock.request(lambda *a, **k: first, "POST", "https://chatgpt.com/backend-api/conversation", stream=True)
+        def send(*args, **kwargs):
+            entered.set()
+            return SimpleNamespace(status_code=200, headers={})
+        def second_turn():
+            attempted.set()
+            clock.request(send, "POST", "https://chatgpt.com/backend-api/f/conversation")
+        worker = threading.Thread(target=second_turn)
+        worker.start()
+        try:
+            self.assertTrue(attempted.wait(1))
+            clock.request(lambda *a, **k: SimpleNamespace(status_code=200, headers={}), "GET", "https://chatgpt.com/backend-api/conversation/original")
+            self.assertFalse(entered.is_set(), "HTTP headers alone cannot release the account turn")
+            first.close()
+            first.close()  # Watchdog and generator cleanup can both close it.
+            self.assertTrue(entered.wait(1))
+        finally:
+            first.close()
+            worker.join(1)
+        self.assertFalse(worker.is_alive())
+
+    def test_http_200_stream_rate_error_cools_whole_account_and_releases_turn(self):
+        clock = pacing.AccountRequestClock()
+        response = SimpleNamespace(status_code=200, headers={}, close=lambda: None,
+            iter_lines=lambda: iter([b'data: {"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}']))
+        clock.request(lambda *a, **k: response, "POST", "https://chatgpt.com/backend-api/conversation", stream=True)
+        list(response.iter_lines())
+        self.assertEqual(clock.rate_failures, 1)
+        self.assertEqual(clock.cooldown_until, 1060)
+        self.assertTrue(clock.turn_lock.acquire(blocking=False))
+        clock.turn_lock.release()
+        self.assertFalse(pacing.rate_limited_event('data: {"message":{"content":"Too many requests"}}'))
+
+    def test_failed_request_does_not_leak_account_turn_lock_or_replay(self):
+        clock = pacing.AccountRequestClock()
+        send = mock.Mock(side_effect=TimeoutError("no response"))
+        with self.assertRaises(TimeoutError):
+            clock.request(send, "POST", "https://chatgpt.com/backend-api/conversation", stream=True)
+        self.assertEqual(send.call_count, 1)
+        self.assertTrue(clock.turn_lock.acquire(blocking=False))
+        clock.turn_lock.release()
 
     def test_actual_backend_session_get_and_post_use_shared_account_pacing(self):
         def send(_session, method, url, **kwargs):
