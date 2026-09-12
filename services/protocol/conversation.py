@@ -39,6 +39,7 @@ class ImageGenerationError(Exception):
         provider_binding_id: str = "",
         provider_account_identity: str = "",
         parent_message_id: str = "",
+        request_message_id: str = "",
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -50,6 +51,7 @@ class ImageGenerationError(Exception):
         self.provider_binding_id = provider_binding_id
         self.provider_account_identity = provider_account_identity
         self.parent_message_id = parent_message_id
+        self.request_message_id = request_message_id
 
     def to_openai_error(self) -> dict[str, Any]:
         error_dict = {
@@ -906,6 +908,7 @@ def stream_image_outputs(
             )
 
     conversation_id = str(last.get("conversation_id") or "")
+    request_message_id = str(getattr(backend, "image_request_message_id", "") or "")
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
     message = str(last.get("text") or "").strip()
@@ -1003,6 +1006,7 @@ def stream_image_outputs(
     try:
         image_urls = backend.resolve_conversation_image_urls(
             conversation_id, file_ids, sediment_ids, poll_timeout_secs=poll_timeout,
+            request_message_id=request_message_id,
         )
     except (ImageContentPolicyError, ImagePollTimeoutError) as exc:
         # 当检测到文本回复时，task error 不应直接判定为内容策略违规，
@@ -1087,6 +1091,7 @@ def stream_image_outputs(
                         retry_poll_timeout,
                         file_ids,
                         sediment_ids,
+                        request_message_id=request_message_id,
                     )
                     file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                     sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
@@ -1125,6 +1130,7 @@ def stream_image_outputs(
             if file_ids or sediment_ids:
                 image_urls = backend.resolve_conversation_image_urls(
                     conversation_id, file_ids, sediment_ids, poll=False,
+                    request_message_id=request_message_id,
                 )
                 if image_urls:
                     if request.progress_callback:
@@ -1199,6 +1205,7 @@ def stream_image_outputs(
                     retry_poll_timeout,
                     file_ids,
                     sediment_ids,
+                    request_message_id=request_message_id,
                 )
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
@@ -1237,6 +1244,7 @@ def stream_image_outputs(
         if file_ids or sediment_ids:
             image_urls = backend.resolve_conversation_image_urls(
                 conversation_id, file_ids, sediment_ids, poll=False,
+                request_message_id=request_message_id,
             )
             if image_urls:
                 if request.progress_callback:
@@ -1450,6 +1458,7 @@ def _generate_bound_single_image(
                 account_service.mark_image_result(token, False)
                 conversation_id = str(getattr(exc, "conversation_id", "") or last_conversation_id)
                 parent_message_id = str(getattr(exc, "parent_message_id", "") or "")
+                request_message_id = str(getattr(backend, "image_request_message_id", "") or "")
                 if conversation_id and backend is not None and not parent_message_id:
                     try:
                         parent_message_id = backend.get_conversation_parent_message_id(conversation_id)
@@ -1460,6 +1469,7 @@ def _generate_bound_single_image(
                     exc.provider_account_identity = account_identity
                     exc.conversation_id = conversation_id
                     exc.parent_message_id = parent_message_id
+                    exc.request_message_id = request_message_id
                     raise
                 raise ImageGenerationError(
                     image_stream_error_message(str(exc)),
@@ -1469,6 +1479,7 @@ def _generate_bound_single_image(
                     provider_account_identity=account_identity,
                     conversation_id=conversation_id,
                     parent_message_id=parent_message_id,
+                    request_message_id=request_message_id,
                 ) from exc
     finally:
         if backend is not None:

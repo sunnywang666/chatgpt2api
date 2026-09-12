@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 from services.config import config
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import ImageContentPolicyError, OpenAIBackendAPI, _is_content_policy_error
 from services.protocol.conversation import ImageOutput, extract_conversation_ids
 from services.protocol.openai_v1_response import stream_image_response
 
@@ -17,8 +17,14 @@ def _conversation(file_ids: list[str], sediment_ids: list[str] | None = None) ->
     ]
     parts.extend(f"sediment://{sediment_id}" for sediment_id in (sediment_ids or []))
     return {
+        "current_node": "tool",
         "mapping": {
+            "request": {
+                "parent": "prior-turn",
+                "message": {"author": {"role": "user"}},
+            },
             "tool": {
+                "parent": "request",
                 "message": {
                     "author": {"role": "tool"},
                     "create_time": 1,
@@ -104,7 +110,10 @@ class MultiImageResultTests(unittest.TestCase):
             }
         }
 
-        records = backend._extract_image_tool_records(conversation)
+        conversation["current_node"] = "assistant"
+        conversation["mapping"]["tool"]["parent"] = "user"
+        conversation["mapping"]["assistant"]["parent"] = "tool"
+        records = backend._extract_image_tool_records(conversation, "user")
         file_ids = [file_id for record in records for file_id in record["file_ids"]]
         sediment_ids = [sediment_id for record in records for sediment_id in record["sediment_ids"]]
 
@@ -119,10 +128,18 @@ class MultiImageResultTests(unittest.TestCase):
         ])
 
         with (
-            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0, "image_poll_interval_secs": 0.5}),
+            mock.patch.dict(config.data, {
+                "image_poll_initial_wait_secs": 0,
+                "image_poll_interval_secs": 0.5,
+                "image_check_before_hit_enabled": True,
+                "image_settle_enabled": True,
+                "image_settle_secs": 0.5,
+            }),
             mock.patch("services.openai_backend_api.time.sleep", lambda _seconds: None),
         ):
-            file_ids, sediment_ids = backend._poll_image_results("conv-1", timeout_secs=10)
+            file_ids, sediment_ids = backend._poll_image_results(
+                "conv-1", timeout_secs=10, request_message_id="request",
+            )
 
         self.assertEqual(file_ids, ["file-one", "file-two"])
         self.assertEqual(sediment_ids, ["sed-one"])
@@ -150,9 +167,98 @@ class MultiImageResultTests(unittest.TestCase):
         backend._get_conversation = mock.Mock(side_effect=RuntimeError("poll failed"))
 
         with mock.patch("services.openai_backend_api.time.sleep", lambda _seconds: None):
-            urls = backend.resolve_conversation_image_urls("conv-1", ["file-one"], [], poll=True)
+            urls = backend.resolve_conversation_image_urls(
+                "conv-1", ["file-one"], [], poll=True, request_message_id="request",
+            )
 
         self.assertEqual(urls, ["https://files.test/one.png"])
+
+    def test_policy_detection_requires_an_explicit_refusal(self) -> None:
+        self.assertFalse(_is_content_policy_error('{"reason":"delivery_return_policy"}'))
+        self.assertTrue(_is_content_policy_error("This request violates our content policy."))
+
+    def test_poll_uses_only_the_current_request_branch(self) -> None:
+        backend = FakeBackend([{
+            "current_node": "current-image",
+            "mapping": {
+                "old-request": {"parent": "root", "message": {"author": {"role": "user"}}},
+                "old-rejection": {
+                    "parent": "old-request",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"parts": ['{"reason":"delivery_return_policy"}']},
+                    },
+                },
+                "old-image": {
+                    "parent": "old-rejection",
+                    "message": {
+                        "author": {"role": "tool"},
+                        "create_time": 1,
+                        "metadata": {"async_task_type": "image_gen"},
+                        "content": {"parts": [
+                            {"content_type": "image_asset_pointer", "asset_pointer": "file-service://file-old"},
+                        ]},
+                    },
+                },
+                "current-request": {"parent": "root", "message": {"author": {"role": "user"}}},
+                "current-image": {
+                    "parent": "current-request",
+                    "message": {
+                        "author": {"role": "tool"},
+                        "create_time": 2,
+                        "metadata": {"async_task_type": "image_gen"},
+                        "content": {"parts": [
+                            {"content_type": "image_asset_pointer", "asset_pointer": "file-service://file-current"},
+                        ]},
+                    },
+                },
+                "parallel-image": {
+                    "parent": "current-request",
+                    "message": {
+                        "author": {"role": "tool"},
+                        "create_time": 3,
+                        "metadata": {"async_task_type": "image_gen"},
+                        "content": {"parts": [
+                            {"content_type": "image_asset_pointer", "asset_pointer": "file-service://file-parallel"},
+                        ]},
+                    },
+                },
+            },
+        }])
+
+        with (
+            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0, "image_check_before_hit_enabled": False}),
+            mock.patch("services.openai_backend_api.time.sleep", lambda _seconds: None),
+        ):
+            file_ids, sediment_ids = backend._poll_image_results(
+                "conv-1", timeout_secs=10, request_message_id="current-request",
+            )
+
+        self.assertEqual(file_ids, ["file-current"])
+        self.assertEqual(sediment_ids, [])
+
+    def test_poll_requires_the_submitted_message_id(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "submitted message id missing"):
+            FakeBackend()._poll_image_results("conv-1", timeout_secs=1)
+
+    def test_poll_preserves_a_current_request_policy_rejection(self) -> None:
+        backend = FakeBackend([{
+            "current_node": "rejection",
+            "mapping": {
+                "request": {"parent": "root", "message": {"author": {"role": "user"}}},
+                "rejection": {
+                    "parent": "request",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"parts": ["This request violates our content policy."]},
+                    },
+                },
+            },
+        }])
+
+        with mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0}):
+            with self.assertRaises(ImageContentPolicyError):
+                backend._poll_image_results("conv-1", timeout_secs=10, request_message_id="request")
 
     def test_responses_stream_emits_all_image_output_items(self) -> None:
         first = base64.b64encode(b"first").decode("ascii")

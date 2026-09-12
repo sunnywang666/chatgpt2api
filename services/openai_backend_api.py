@@ -114,7 +114,8 @@ CODEX_RESPONSES_INSTRUCTIONS = (
 # 内容政策违规错误关键词（上游拒绝生成图片的各种表述）
 _CONTENT_POLICY_KEYWORDS = (
     # 明确的内容政策违规
-    "内容政策", "防护限制", "违反", "moderation", "policy", "blocked",
+    "内容政策", "防护限制", "违反内容", "moderation", "content policy",
+    "content_policy", "policy violation", "safety policy",
     # 拒绝生成类
     "不能生成", "无法生成", "不能帮助", "无法帮助",
     # 敏感内容类
@@ -1034,10 +1035,12 @@ class OpenAIBackendAPI:
                 "width": item["width"],
                 "height": item["height"],
             } for item in references]
+        request_message_id = new_uuid()
+        self.image_request_message_id = request_message_id
         payload = {
             "action": "next",
             "messages": [{
-                "id": new_uuid(),
+                "id": request_message_id,
                 "author": {"role": "user"},
                 "create_time": time.time(),
                 "content": content,
@@ -2143,11 +2146,48 @@ class OpenAIBackendAPI:
             return any(cls._has_image_asset_pointer(item) for item in payload)
         return False
 
-    def _extract_image_tool_records(self, data: Dict[str, Any]) -> list[Dict[str, Any]]:
-        """从 conversation 明细里提取图片工具输出记录。"""
+    @staticmethod
+    def _current_message_branch_ids(data: Dict[str, Any], request_message_id: str) -> set[str]:
+        """Return the committed current branch from its leaf back to this request.
+
+        A retained product conversation contains outputs from prior stages. A
+        generated asset or refusal is attributable to the request being polled
+        only when its submitted user message is on the authoritative
+        ``current_node`` parent chain. Missing or divergent links are not
+        guessed from timestamps or the newest image.
+        """
         mapping = data.get("mapping") or {}
+        current_node = str(data.get("current_node") or "").strip()
+        request_message_id = str(request_message_id or "").strip()
+        if not isinstance(mapping, dict) or not current_node or not request_message_id:
+            return set()
+
+        branch_ids: set[str] = set()
+        message_id = current_node
+        while message_id and message_id not in branch_ids:
+            node = mapping.get(message_id)
+            if not isinstance(node, dict):
+                return set()
+            branch_ids.add(message_id)
+            if message_id == request_message_id:
+                return branch_ids
+            message_id = str(node.get("parent") or "").strip()
+        return set()
+
+    def _extract_image_tool_records(
+            self,
+            data: Dict[str, Any],
+            request_message_id: str,
+    ) -> list[Dict[str, Any]]:
+        """Extract image records only from this submitted request's current branch."""
+        mapping = data.get("mapping") or {}
+        branch_ids = self._current_message_branch_ids(data, request_message_id)
+        if not branch_ids:
+            return []
         records = []
         for message_id, node in mapping.items():
+            if message_id not in branch_ids:
+                continue
             message = (node or {}).get("message") or {}
             author = message.get("author") or {}
             metadata = message.get("metadata") or {}
@@ -2168,15 +2208,16 @@ class OpenAIBackendAPI:
         return sorted(records, key=lambda item: item["create_time"])
 
     @staticmethod
-    def _find_content_policy_error_in_conversation(data: Dict[str, Any]) -> str:
-        """从对话文档中查找内容政策违规错误消息。
-
-        上游拒绝生成图片时，错误消息会出现在 assistant 消息的文本中。
-        本方法遍历所有 assistant/tool 消息，检查是否包含内容政策违规关键词，
-        如果匹配则返回该消息文本（截断至 500 字符），否则返回空字符串。
-        """
+    def _find_content_policy_error_in_conversation(
+            data: Dict[str, Any], request_message_id: str,
+    ) -> str:
+        """Find a policy rejection only on the submitted request's current branch."""
         mapping = data.get("mapping") or {}
-        for node in mapping.values():
+        branch_ids = OpenAIBackendAPI._current_message_branch_ids(data, request_message_id)
+        if not branch_ids:
+            return ""
+        for message_id in branch_ids:
+            node = mapping.get(message_id)
             message = (node or {}).get("message") or {}
             author = message.get("author") or {}
             role = str(author.get("role") or "").strip().lower()
@@ -2207,6 +2248,7 @@ class OpenAIBackendAPI:
             timeout_secs: float = 120.0,
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
+            request_message_id: str = "",
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
@@ -2219,6 +2261,9 @@ class OpenAIBackendAPI:
           (capped at 16s, +jitter) honoring Retry-After when present.
         - All sleeps stay within timeout_secs; on exhaustion raises ImagePollTimeoutError.
         """
+        request_message_id = str(request_message_id or "").strip()
+        if not request_message_id:
+            raise RuntimeError("image result boundary unavailable: submitted message id missing")
         start = time.time()
         attempt = 0
         interval = float(config.image_poll_interval_secs)
@@ -2239,6 +2284,7 @@ class OpenAIBackendAPI:
             "interval_secs": interval,
             "initial_file_ids": file_ids,
             "initial_sediment_ids": sediment_ids,
+            "request_message_id": request_message_id,
         })
 
         def _remaining() -> float:
@@ -2318,7 +2364,7 @@ class OpenAIBackendAPI:
                     continue
                 break
 
-            for record in self._extract_image_tool_records(conversation):
+            for record in self._extract_image_tool_records(conversation, request_message_id):
                 for file_id in record["file_ids"]:
                     if file_id not in file_ids:
                         file_ids.append(file_id)
@@ -2331,7 +2377,7 @@ class OpenAIBackendAPI:
             # 而非 /backend-api/tasks/ 的 task error 结构中。
             # 如果在没有找到图片文件 ID 的同时检测到内容政策违规，立即中断轮询。
             if not file_ids and not sediment_ids:
-                policy_msg = self._find_content_policy_error_in_conversation(conversation)
+                policy_msg = self._find_content_policy_error_in_conversation(conversation, request_message_id)
                 if policy_msg:
                     logger.warning({
                         "event": "image_poll_conversation_text_policy_violation",
@@ -2563,6 +2609,7 @@ class OpenAIBackendAPI:
             sediment_ids: list[str],
             poll: bool = True,
             poll_timeout_secs: float | None = None,
+            request_message_id: str = "",
     ) -> list[str]:
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
@@ -2592,6 +2639,7 @@ class OpenAIBackendAPI:
                     timeout,
                     file_ids,
                     sediment_ids,
+                    request_message_id=request_message_id,
                 )
             except ImagePollTimeoutError as exc:
                 # 如果轮询超时且有 task error（如 moderation 拦截），抛出 ImageContentPolicyError

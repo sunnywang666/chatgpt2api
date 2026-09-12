@@ -208,6 +208,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             error.provider_account_identity = "account_opaque_a"
             error.conversation_id = "conversation-1"
             error.parent_message_id = "message-1"
+            error.request_message_id = "request-message-1"
 
             def handler(_payload):
                 raise error
@@ -227,17 +228,21 @@ class ImageTaskServiceTests(unittest.TestCase):
             wait_for_task(service, OWNER, "unknown-task", "error")
 
             class FakeBackend:
+                poll_calls = []
+
                 def __init__(self, access_token=None, proxy_url=None):
                     self.access_token = access_token
 
-                def _poll_image_results(self, conversation_id, timeout):
-                    self.poll = (conversation_id, timeout)
+                def _poll_image_results(self, conversation_id, timeout, request_message_id=""):
+                    self.poll = (conversation_id, timeout, request_message_id)
+                    self.poll_calls.append(self.poll)
                     return ["file-1"], []
 
                 def _get_conversation(self, _conversation_id):
                     return {"current_node": "assistant-1", "mapping": {"assistant-1": {"message": {"status": "in_progress"}}}}
 
-                def resolve_conversation_image_urls(self, conversation_id, file_ids, sediment_ids, poll=False):
+                def resolve_conversation_image_urls(self, conversation_id, file_ids, sediment_ids, poll=False,
+                                                    request_message_id=""):
                     return ["https://provider.example/image.png"]
 
                 def download_image_bytes(self, _urls):
@@ -267,12 +272,18 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["image_session_id"], "conversation-1")
             self.assertEqual(task["image_session_parent_id"], "message-2")
             self.assertEqual(task["data"], [{"url": "http://content-provider/images/result.png"}])
+            self.assertEqual(FakeBackend.poll_calls, [("conversation-1", 30, "request-message-1")])
 
     def test_authoritative_finished_image_failure_is_terminal(self):
         document = {
             "current_node": "assistant-1",
             "mapping": {
+                "request-1": {
+                    "parent": "prior-turn",
+                    "message": {"author": {"role": "user"}},
+                },
                 "assistant-1": {
+                    "parent": "request-1",
                     "message": {
                         "author": {"role": "assistant"},
                         "status": "finished_successfully",
@@ -286,11 +297,41 @@ class ImageTaskServiceTests(unittest.TestCase):
             },
         }
         self.assertEqual(
-            _authoritative_image_failure(document),
+            _authoritative_image_failure(document, "request-1"),
             "Something went wrong while generating your image. Sorry about that.",
         )
         document["mapping"]["assistant-1"]["message"]["status"] = "in_progress"
-        self.assertEqual(_authoritative_image_failure(document), "")
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+    def test_resume_without_the_submitted_message_boundary_stays_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            error = RuntimeError("ChatGPT 生图超时")
+            error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+            error.provider_binding_id = "cb_account_a"
+            error.provider_account_identity = "account_opaque_a"
+            error.conversation_id = "conversation-1"
+            error.parent_message_id = "message-1"
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json", lambda _payload: (_ for _ in ()).throw(error),
+            )
+            service.submit_generation(
+                OWNER,
+                client_task_id="missing-boundary-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                provider_binding_id="cb_account_a",
+                provider_account_identity="account_opaque_a",
+                client_conversation_id="workbench-conversation-1",
+                retain_conversation=True,
+            )
+            wait_for_task(service, OWNER, "missing-boundary-task", "error")
+
+            service.resume_poll(OWNER, "missing-boundary-task", 30, "http://content-provider")
+            task = wait_for_task(service, OWNER, "missing-boundary-task", "error")
+
+        self.assertEqual(task["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+        self.assertEqual(task["binding_status"], "unknown")
 
     def test_unknown_resume_maps_authoritative_finished_failure_to_terminal_code(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -300,6 +341,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             error.provider_account_identity = "account_opaque_a"
             error.conversation_id = "conversation-1"
             error.parent_message_id = "message-1"
+            error.request_message_id = "request-1"
 
             service = self.make_service(Path(tmp_dir) / "image_tasks.json", lambda _payload: (_ for _ in ()).throw(error))
             service.submit_generation(
@@ -323,7 +365,12 @@ class ImageTaskServiceTests(unittest.TestCase):
                     return {
                         "current_node": "assistant-1",
                         "mapping": {
+                            "request-1": {
+                                "parent": "prior-turn",
+                                "message": {"author": {"role": "user"}},
+                            },
                             "assistant-1": {
+                                "parent": "request-1",
                                 "message": {
                                     "author": {"role": "assistant"},
                                     "status": "finished_successfully",

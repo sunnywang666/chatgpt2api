@@ -108,11 +108,25 @@ class AuthoritativeImageTaskFailure(RuntimeError):
     code = "NO_IMAGE_GENERATED"
 
 
-def _authoritative_image_failure(document: object) -> str:
+def _authoritative_image_failure(document: object, request_message_id: str) -> str:
     if not isinstance(document, dict):
         return ""
     current_node = _clean(document.get("current_node"))
     mapping = document.get("mapping")
+    if not current_node or not request_message_id or not isinstance(mapping, dict):
+        return ""
+    branch_ids: set[str] = set()
+    message_id = current_node
+    while message_id and message_id not in branch_ids:
+        node = mapping.get(message_id)
+        if not isinstance(node, dict):
+            return ""
+        branch_ids.add(message_id)
+        if message_id == request_message_id:
+            break
+        message_id = _clean(node.get("parent"))
+    if request_message_id not in branch_ids:
+        return ""
     node = mapping.get(current_node) if current_node and isinstance(mapping, dict) else None
     message = node.get("message") if isinstance(node, dict) else None
     if not isinstance(message, dict):
@@ -470,6 +484,7 @@ class ImageTaskService:
                 or payload.get("provider_account_identity")
             )
             parent_message_id = _clean(getattr(exc, "parent_message_id", ""))
+            request_message_id = _clean(getattr(exc, "request_message_id", ""))
             error_code = _clean(getattr(exc, "code", ""))
             # Only explicit terminal rejections prove there is no generation
             # left upstream. An unclassified transport exception does not.
@@ -487,6 +502,7 @@ class ImageTaskService:
                               **({"provider_account_identity": provider_account_identity} if provider_account_identity else {}),
                               **({"conversation_id": conversation_id} if conversation_id else {}),
                               **({"parent_message_id": parent_message_id} if parent_message_id else {}),
+                              **({"request_message_id": request_message_id} if request_message_id else {}),
                               **(
                                   {
                                       "binding_status": (
@@ -608,6 +624,7 @@ class ImageTaskService:
                 "client_conversation_id": _clean(item.get("client_conversation_id")),
                 "conversation_id": _clean(item.get("conversation_id")),
                 "parent_message_id": _clean(item.get("parent_message_id")),
+                "request_message_id": _clean(item.get("request_message_id")),
                 "binding_status": _clean(item.get("binding_status"), "unbound"),
                 "error_code": _clean(item.get("error_code")),
                 "request_hash": _clean(item.get("request_hash")),
@@ -745,7 +762,8 @@ class ImageTaskService:
                 binding_id = _clean(task.get("provider_binding_id")) if task else ""
                 account_identity = _clean(task.get("provider_account_identity")) if task else ""
                 client_conversation_id = _clean(task.get("client_conversation_id")) if task else ""
-            if not binding_id or not account_identity or not client_conversation_id:
+                request_message_id = _clean(task.get("request_message_id")) if task else ""
+            if not binding_id or not account_identity or not client_conversation_id or not request_message_id:
                 raise RuntimeError("conversation binding unavailable: task authority missing")
             authoritative_identity = account_service.get_bound_account_identity(binding_id)
             if authoritative_identity != account_identity:
@@ -754,12 +772,15 @@ class ImageTaskService:
             access_token = account_service.get_bound_text_access_token(binding_id, model="auto")
             with account_service.conversation_binding_lock(binding_id, client_conversation_id):
                 backend = OpenAIBackendAPI(access_token=access_token)
-                authoritative_failure = _authoritative_image_failure(backend._get_conversation(conversation_id))
+                authoritative_failure = _authoritative_image_failure(
+                    backend._get_conversation(conversation_id), request_message_id,
+                )
                 if authoritative_failure:
                     raise AuthoritativeImageTaskFailure(authoritative_failure)
                 file_ids, sediment_ids = backend._poll_image_results(
                     conversation_id,
                     extra_timeout_secs,
+                    request_message_id=request_message_id,
                 )
                 if not file_ids and not sediment_ids:
                     raise RuntimeError(
@@ -768,6 +789,7 @@ class ImageTaskService:
 
                 image_urls = backend.resolve_conversation_image_urls(
                     conversation_id, file_ids, sediment_ids, poll=False,
+                    request_message_id=request_message_id,
                 )
                 if not image_urls:
                     raise RuntimeError("图片 URL 解析失败")
