@@ -916,6 +916,11 @@ def stream_image_outputs(
                 conversation_id=str(event.get("conversation_id") or ""),
             )
 
+    submitted_request_message_id = str(
+        getattr(backend, "image_request_message_id", "") or "",
+    ).strip()
+    if submitted_request_message_id:
+        request_message_id = submitted_request_message_id
     conversation_id = str(last.get("conversation_id") or "")
     if conversation_id and callable(record_conversation_id):
         record_conversation_id(conversation_id)

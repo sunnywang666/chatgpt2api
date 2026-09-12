@@ -6,6 +6,7 @@ from unittest import mock
 
 from services.config import config
 from services.openai_backend_api import ImageContentPolicyError, OpenAIBackendAPI, _is_content_policy_error
+from services.protocol import openai_v1_image_generations
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -181,7 +182,10 @@ class MultiImageResultTests(unittest.TestCase):
     def test_policy_detection_requires_an_explicit_refusal(self) -> None:
         self.assertFalse(_is_content_policy_error('{"reason":"delivery_return_policy"}'))
         self.assertFalse(_is_content_policy_error("I cannot help with this color adjustment."))
+        self.assertFalse(_is_content_policy_error("Generated without content policy violations."))
+        self.assertFalse(_is_content_policy_error("No content policy violation."))
         self.assertTrue(_is_content_policy_error("This request violates our content policy."))
+        self.assertTrue(_is_content_policy_error("I can't generate that because it violates our content policy."))
 
     def test_poll_uses_only_the_current_request_branch(self) -> None:
         backend = FakeBackend([{
@@ -304,6 +308,53 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual(backend.image_request_message_id, "request-before-post")
         self.assertEqual(backend.started_with_request_id, "request-before-post")
+
+    def test_unbound_generation_uses_the_request_id_written_by_the_provider_post(self) -> None:
+        observed = {}
+
+        class Backend:
+            def __init__(self, access_token=None):
+                self.access_token = access_token
+
+            def stream_conversation(self, **_kwargs):
+                self.image_request_message_id = "request-written-by-post"
+                yield '{"conversation_id":"conversation-from-sse"}'
+                yield "[DONE]"
+
+            def resolve_conversation_image_urls(
+                    self, conversation_id, _file_ids, _sediment_ids, **kwargs,
+            ):
+                observed["conversation_id"] = conversation_id
+                observed["request_message_id"] = kwargs.get("request_message_id")
+                return ["https://images.test/result.png"]
+
+            def _query_backend_tasks(self, **_kwargs):
+                return []
+
+            def download_image_bytes(self, _urls):
+                return [b"generated-image"]
+
+            def close(self):
+                return None
+
+        with (
+            mock.patch("services.protocol.conversation.account_service.get_available_access_token", return_value="token"),
+            mock.patch("services.protocol.conversation.account_service.get_account", return_value={"email": "account@example.test"}),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", Backend),
+            mock.patch("services.protocol.conversation._remove_image_conversation_later"),
+        ):
+            result = openai_v1_image_generations.handle({
+                "prompt": "cat",
+                "model": "gpt-image-2",
+                "n": 1,
+            })
+
+        self.assertEqual(observed, {
+            "conversation_id": "conversation-from-sse",
+            "request_message_id": "request-written-by-post",
+        })
+        self.assertEqual(len(result["data"]), 1)
 
     def test_poll_requires_the_submitted_message_id(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "submitted message id missing"):

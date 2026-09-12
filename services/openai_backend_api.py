@@ -119,8 +119,16 @@ _CONTENT_POLICY_CONTEXT = (
 _CONTENT_POLICY_REFUSAL = (
     "不能", "无法", "拒绝", "不允许", "抱歉", "cannot", "can't", "unable", "refuse", "decline",
 )
+_CONTENT_POLICY_VIOLATION = (
+    "违反", "违规", "violate", "violation", "breach", "blocked by", "rejected by",
+)
 _CONTENT_POLICY_SENSITIVE_SUBJECTS = (
     "裸体", "裸露", "色情", "性内容", "未成年", "sexual", "nudity", "minor",
+)
+_CONTENT_POLICY_NEGATION_RE = re.compile(
+    r"\b(?:no|without)\s+(?:any\s+)?content[\s_-]+policy\s+violations?\b"
+    r"|\b(?:do|does|did)\s+not\s+violate\s+(?:our\s+)?content[\s_-]+policy\b",
+    re.IGNORECASE,
 )
 
 
@@ -128,8 +136,14 @@ def _is_content_policy_error(error_msg: str) -> bool:
     """检查错误消息是否为内容政策违规。"""
     if not error_msg:
         return False
-    msg_lower = error_msg.lower()
-    if any(keyword in msg_lower for keyword in _CONTENT_POLICY_CONTEXT):
+    msg_lower = _CONTENT_POLICY_NEGATION_RE.sub("", error_msg.lower())
+    if (
+        any(keyword in msg_lower for keyword in _CONTENT_POLICY_CONTEXT)
+        and (
+            any(keyword in msg_lower for keyword in _CONTENT_POLICY_REFUSAL)
+            or any(keyword in msg_lower for keyword in _CONTENT_POLICY_VIOLATION)
+        )
+    ):
         return True
     return (
         any(keyword in msg_lower for keyword in _CONTENT_POLICY_REFUSAL)
