@@ -11,7 +11,12 @@ from unittest import mock
 
 from services.image_task_service import ImageTaskService, _authoritative_image_failure
 from services.openai_backend_api import ImageContentPolicyError
-from services.protocol.conversation import ConversationRequest, ImageGenerationError, _generate_bound_single_image
+from services.protocol.conversation import (
+    ConversationRequest,
+    ImageGenerationError,
+    ImageOutput,
+    _generate_bound_single_image,
+)
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -426,6 +431,122 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "content_policy_violation")
         self.assertEqual(raised.exception.request_message_id, "request-message-1")
         self.assertEqual(raised.exception.conversation_id, "conversation-1")
+
+    def test_bound_image_slot_is_settled_once_when_a_waiter_acquires_after_release(self):
+        class Backend:
+            image_request_message_id = "request-message-1"
+
+            def __init__(self, access_token=None):
+                self.access_token = access_token
+
+            def get_conversation_parent_message_id(self, _conversation_id):
+                return "message-after-result"
+
+            def close(self):
+                return None
+
+        scenarios = (
+            ("success", None, [True], None),
+            (
+                "policy",
+                ImageContentPolicyError("This request violates our content policy.", "conversation-1"),
+                [False],
+                "content_policy_violation",
+            ),
+            (
+                "unknown",
+                RuntimeError("stream interrupted after provider POST"),
+                [False],
+                "CONVERSATION_OUTCOME_UNKNOWN",
+            ),
+            ("initialization", None, [], None),
+        )
+        for name, stream_error, expected_marks, expected_code in scenarios:
+            with self.subTest(name=name):
+                slot = {"inflight": 1, "releases": 0}
+                slot_lock = threading.Lock()
+                first_release = threading.Event()
+                waiter_acquired = threading.Event()
+
+                def waiter():
+                    if not first_release.wait(timeout=1):
+                        return
+                    with slot_lock:
+                        slot["inflight"] += 1
+                    waiter_acquired.set()
+
+                waiting_thread = threading.Thread(target=waiter)
+                waiting_thread.start()
+
+                def release_image_slot(access_token):
+                    self.assertEqual(access_token, "bound-token")
+                    with slot_lock:
+                        slot["releases"] += 1
+                        slot["inflight"] -= 1
+                        release_number = slot["releases"]
+                    if release_number == 1:
+                        first_release.set()
+                        self.assertTrue(waiter_acquired.wait(timeout=1))
+
+                marks = []
+
+                def mark_image_result(access_token, success):
+                    marks.append(success)
+                    release_image_slot(access_token)
+
+                request = ConversationRequest(
+                    model="gpt-image-2",
+                    prompt="cat",
+                    provider_binding_id="cb_account_a",
+                    provider_account_identity="account_opaque_a",
+                    client_conversation_id="workbench-conversation-1",
+                    conversation_id="conversation-1",
+                    parent_message_id="message-before-request",
+                    retain_conversation=True,
+                )
+                output = ImageOutput(
+                    kind="result",
+                    model="gpt-image-2",
+                    index=1,
+                    total=1,
+                    data=[{"b64_json": "image"}],
+                    conversation_id="conversation-1",
+                )
+
+                def get_account(_access_token):
+                    if name == "initialization":
+                        raise RuntimeError("account initialization failed")
+                    return {"email": "account@example.test"}
+
+                def stream_outputs(*_args, **_kwargs):
+                    if stream_error is not None:
+                        raise stream_error
+                    return iter([output])
+
+                with (
+                    mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", return_value="account_opaque_a"),
+                    mock.patch("services.protocol.conversation.account_service.acquire_bound_image_access_token", return_value="bound-token"),
+                    mock.patch("services.protocol.conversation.account_service.get_account", side_effect=get_account),
+                    mock.patch("services.protocol.conversation.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.protocol.conversation.account_service.mark_image_result", side_effect=mark_image_result),
+                    mock.patch("services.protocol.conversation.account_service.release_image_slot", side_effect=release_image_slot),
+                    mock.patch("services.protocol.conversation.OpenAIBackendAPI", Backend),
+                    mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream_outputs),
+                ):
+                    if name == "success":
+                        self.assertEqual(_generate_bound_single_image(request, 1, 1), [output])
+                    else:
+                        with self.assertRaises(Exception) as raised:
+                            _generate_bound_single_image(request, 1, 1)
+                        if expected_code:
+                            self.assertIsInstance(raised.exception, ImageGenerationError)
+                            self.assertEqual(raised.exception.code, expected_code)
+
+                waiting_thread.join(timeout=1)
+                self.assertFalse(waiting_thread.is_alive())
+                self.assertEqual(marks, expected_marks)
+                self.assertEqual(slot["releases"], 1)
+                self.assertEqual(slot["inflight"], 1)
 
     def test_unknown_resume_maps_authoritative_finished_failure_to_terminal_code(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

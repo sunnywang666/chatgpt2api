@@ -1348,12 +1348,15 @@ def _generate_bound_single_image(
             parent_message_id=request.parent_message_id,
         ) from exc
 
-    account = account_service.get_account(token) or {}
-    account_email = str(account.get("email") or "").strip()
+    slot_acquired = bool(token)
+    image_result_marked = False
+    account_email = ""
     backend: OpenAIBackendAPI | None = None
     outputs: list[ImageOutput] = []
     last_conversation_id = request.conversation_id
     try:
+        account = account_service.get_account(token) or {}
+        account_email = str(account.get("email") or "").strip()
         with account_service.conversation_binding_lock(binding_id, request.client_conversation_id):
             backend = OpenAIBackendAPI(access_token=token)
             # Request-owned model selection; never mutate the shared pool
@@ -1408,10 +1411,13 @@ def _generate_bound_single_image(
                     output.provider_account_identity = account_identity
                     output.conversation_id = last_conversation_id
                     output.parent_message_id = next_parent_message_id
+                image_result_marked = True
                 account_service.mark_image_result(token, True)
                 return outputs
             except Exception as exc:
-                account_service.mark_image_result(token, False)
+                if not image_result_marked:
+                    image_result_marked = True
+                    account_service.mark_image_result(token, False)
                 conversation_id = str(getattr(exc, "conversation_id", "") or last_conversation_id)
                 parent_message_id = str(getattr(exc, "parent_message_id", "") or "")
                 request_message_id = str(getattr(backend, "image_request_message_id", "") or "")
@@ -1451,9 +1457,12 @@ def _generate_bound_single_image(
                     request_message_id=request_message_id,
                 ) from exc
     finally:
-        if backend is not None:
-            backend.close()
-        account_service.release_image_slot(token)
+        try:
+            if backend is not None:
+                backend.close()
+        finally:
+            if slot_acquired and not image_result_marked:
+                account_service.release_image_slot(token)
 
 
 def _generate_single_image(
