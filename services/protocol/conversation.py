@@ -872,6 +872,12 @@ def stream_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
+    request_message_id = str(
+        getattr(request.progress_callback, "request_message_id", "") or "",
+    )
+    if request_message_id:
+        backend.image_request_message_id = request_message_id
+    record_conversation_id = getattr(request.progress_callback, "record_conversation_id", None)
     last: dict[str, Any] = {}
     for event in conversation_events(
             backend,
@@ -884,6 +890,9 @@ def stream_image_outputs(
             parent_message_id=request.parent_message_id,
     ):
         last = event
+        event_conversation_id = str(event.get("conversation_id") or "")
+        if event_conversation_id and callable(record_conversation_id):
+            record_conversation_id(event_conversation_id)
         if event.get("type") == "conversation.delta":
             yield ImageOutput(
                 kind="progress",
@@ -908,7 +917,8 @@ def stream_image_outputs(
             )
 
     conversation_id = str(last.get("conversation_id") or "")
-    request_message_id = str(getattr(backend, "image_request_message_id", "") or "")
+    if conversation_id and callable(record_conversation_id):
+        record_conversation_id(conversation_id)
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
     message = str(last.get("text") or "").strip()
@@ -943,28 +953,6 @@ def stream_image_outputs(
             "conversation_id": conversation_id,
             "message_preview": message[:200],
         })
-
-    # 当检测到文本回复但 conversation_id 丢失时，尝试从最近对话列表中恢复
-    # SSE 流太短时（模型返回文本而非触发图片工具），conversation_id 可能未被捕获，
-    # 但图片已在上游异步生成。通过列出最近对话来恢复 conversation_id。
-    if is_text_reply and not conversation_id:
-        try:
-            import time as _time
-            recovered_id = backend.find_conversation_by_prompt(
-                request.prompt, _time.time(), timeout_secs=5.0,
-            )
-            if recovered_id:
-                conversation_id = recovered_id
-                logger.info({
-                    "event": "image_conversation_id_recovered",
-                    "conversation_id": conversation_id,
-                    "message_preview": message[:200],
-                })
-        except Exception as exc:
-            logger.warning({
-                "event": "image_conversation_id_recovery_failed",
-                "error": repr(exc)[:300],
-            })
 
     # 在轮询图片之前，先检查 /backend-api/tasks/ 是否有 moderation 拦截
     # 这样可以避免不必要的长时间轮询超时
@@ -1055,25 +1043,6 @@ def stream_image_outputs(
         # 检测模型是否返回了文本描述（含 referenced_image_ids）而非实际生成图片
         # 这说明模型已发起图片生成工具调用，但 SSE 在工具完成前断开。
         # 此时应再尝试轮询图片结果，而不是直接把文本当作最终输出。
-        # 当 is_text_reply 但 conversation_id 丢失时，尝试从最近对话列表恢复
-        if is_text_reply and not conversation_id:
-            try:
-                import time as _time
-                recovered_id = backend.find_conversation_by_prompt(
-                    request.prompt, _time.time(), timeout_secs=5.0,
-                )
-                if recovered_id:
-                    conversation_id = recovered_id
-                    logger.info({
-                        "event": "image_text_reply_conversation_id_recovered",
-                        "conversation_id": conversation_id,
-                        "message_preview": message[:200],
-                    })
-            except Exception as exc:
-                logger.warning({
-                    "event": "image_text_reply_conversation_id_recovery_failed",
-                    "error": repr(exc)[:300],
-                })
         if is_text_reply and conversation_id:
             logger.info({
                 "event": "image_model_text_reply_retry_poll",
@@ -1167,24 +1136,6 @@ def stream_image_outputs(
         "sediment_ids": sediment_ids,
         "should_poll_for_image": should_poll_for_image,
     })
-    # 当 should_poll_for_image 为 True 但 conversation_id 丢失时，尝试恢复
-    if should_poll_for_image and not conversation_id:
-        try:
-            import time as _time
-            recovered_id = backend.find_conversation_by_prompt(
-                request.prompt, _time.time(), timeout_secs=5.0,
-            )
-            if recovered_id:
-                conversation_id = recovered_id
-                logger.info({
-                    "event": "image_fallback_conversation_id_recovered",
-                    "conversation_id": conversation_id,
-                })
-        except Exception as exc:
-            logger.warning({
-                "event": "image_fallback_conversation_id_recovery_failed",
-                "error": repr(exc)[:300],
-            })
     if should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
         # 使用 300s 超时并允许多次重试，避免因临时网络问题或图片尚未提交而提前退出。
@@ -1471,6 +1422,19 @@ def _generate_bound_single_image(
                     exc.parent_message_id = parent_message_id
                     exc.request_message_id = request_message_id
                     raise
+                if isinstance(exc, ImageContentPolicyError):
+                    raise ImageGenerationError(
+                        str(exc),
+                        status_code=400,
+                        error_type="invalid_request_error",
+                        code="content_policy_violation",
+                        account_email=account_email,
+                        provider_binding_id=binding_id,
+                        provider_account_identity=account_identity,
+                        conversation_id=conversation_id,
+                        parent_message_id=parent_message_id,
+                        request_message_id=request_message_id,
+                    ) from exc
                 raise ImageGenerationError(
                     image_stream_error_message(str(exc)),
                     code="CONVERSATION_OUTCOME_UNKNOWN" if conversation_id else "CONVERSATION_BINDING_UNAVAILABLE",

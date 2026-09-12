@@ -112,16 +112,15 @@ CODEX_RESPONSES_INSTRUCTIONS = (
 )
 
 # 内容政策违规错误关键词（上游拒绝生成图片的各种表述）
-_CONTENT_POLICY_KEYWORDS = (
-    # 明确的内容政策违规
+_CONTENT_POLICY_CONTEXT = (
     "内容政策", "防护限制", "违反内容", "moderation", "content policy",
-    "content_policy", "policy violation", "safety policy",
-    # 拒绝生成类
-    "不能生成", "无法生成", "不能帮助", "无法帮助",
-    # 敏感内容类
-    "裸体", "裸露", "色情", "性内容", "未成年",
-    # 通用拒绝
-    "抱歉，我不能",
+    "content_policy", "policy violation", "safety policy", "safety system",
+)
+_CONTENT_POLICY_REFUSAL = (
+    "不能", "无法", "拒绝", "不允许", "抱歉", "cannot", "can't", "unable", "refuse", "decline",
+)
+_CONTENT_POLICY_SENSITIVE_SUBJECTS = (
+    "裸体", "裸露", "色情", "性内容", "未成年", "sexual", "nudity", "minor",
 )
 
 
@@ -130,7 +129,12 @@ def _is_content_policy_error(error_msg: str) -> bool:
     if not error_msg:
         return False
     msg_lower = error_msg.lower()
-    return any(keyword in msg_lower for keyword in _CONTENT_POLICY_KEYWORDS)
+    if any(keyword in msg_lower for keyword in _CONTENT_POLICY_CONTEXT):
+        return True
+    return (
+        any(keyword in msg_lower for keyword in _CONTENT_POLICY_REFUSAL)
+        and any(keyword in msg_lower for keyword in _CONTENT_POLICY_SENSITIVE_SUBJECTS)
+    )
 
 
 @dataclass
@@ -1035,7 +1039,7 @@ class OpenAIBackendAPI:
                 "width": item["width"],
                 "height": item["height"],
             } for item in references]
-        request_message_id = new_uuid()
+        request_message_id = str(getattr(self, "image_request_message_id", "") or "").strip() or new_uuid()
         self.image_request_message_id = request_message_id
         payload = {
             "action": "next",
@@ -2162,17 +2166,28 @@ class OpenAIBackendAPI:
         if not isinstance(mapping, dict) or not current_node or not request_message_id:
             return set()
 
-        branch_ids: set[str] = set()
+        reversed_path: list[str] = []
         message_id = current_node
-        while message_id and message_id not in branch_ids:
+        while message_id and message_id not in reversed_path:
             node = mapping.get(message_id)
             if not isinstance(node, dict):
                 return set()
-            branch_ids.add(message_id)
+            reversed_path.append(message_id)
             if message_id == request_message_id:
-                return branch_ids
+                break
             message_id = str(node.get("parent") or "").strip()
-        return set()
+        if request_message_id not in reversed_path:
+            return set()
+
+        path = list(reversed(reversed_path))
+        request_index = path.index(request_message_id)
+        for message_id in path[request_index + 1:]:
+            node = mapping.get(message_id) or {}
+            message = node.get("message") if isinstance(node, dict) else {}
+            author = message.get("author") if isinstance(message, dict) else {}
+            if str(author.get("role") or "").strip().lower() == "user":
+                return set(path[request_index:path.index(message_id)])
+        return set(path[request_index:])
 
     def _extract_image_tool_records(
             self,

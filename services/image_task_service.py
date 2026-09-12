@@ -4,6 +4,7 @@ import json
 import hashlib
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -115,18 +116,26 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
     mapping = document.get("mapping")
     if not current_node or not request_message_id or not isinstance(mapping, dict):
         return ""
-    branch_ids: set[str] = set()
+    reversed_path: list[str] = []
     message_id = current_node
-    while message_id and message_id not in branch_ids:
+    while message_id and message_id not in reversed_path:
         node = mapping.get(message_id)
         if not isinstance(node, dict):
             return ""
-        branch_ids.add(message_id)
+        reversed_path.append(message_id)
         if message_id == request_message_id:
             break
         message_id = _clean(node.get("parent"))
-    if request_message_id not in branch_ids:
+    if request_message_id not in reversed_path:
         return ""
+    path = list(reversed(reversed_path))
+    request_index = path.index(request_message_id)
+    for message_id in path[request_index + 1:]:
+        node = mapping.get(message_id) or {}
+        message = node.get("message") if isinstance(node, dict) else {}
+        author = message.get("author") if isinstance(message, dict) else {}
+        if _clean(author.get("role")).lower() == "user":
+            return ""
     node = mapping.get(current_node) if current_node and isinstance(mapping, dict) else None
     message = node.get("message") if isinstance(node, dict) else None
     if not isinstance(message, dict):
@@ -406,11 +415,24 @@ class ImageTaskService:
                 self._update_task(key, upstream_unfinished=True)
         started = time.time()
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        with self._lock:
+            task = self._tasks.get(key) or {}
+            request_message_id = _clean(task.get("request_message_id"))
+        if not request_message_id:
+            request_message_id = str(uuid.uuid4())
+            self._update_task(key, request_message_id=request_message_id)
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
             if step == "image_stream_resolve_start":
                 self._update_task(key, started_ts=time.time())
             self._update_task(key, progress=step)
+        progress_callback.request_message_id = request_message_id
+
+        def record_conversation_id(conversation_id: str) -> None:
+            conversation_id = _clean(conversation_id)
+            if conversation_id:
+                self._update_task(key, conversation_id=conversation_id)
+        progress_callback.record_conversation_id = record_conversation_id
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:

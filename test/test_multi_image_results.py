@@ -6,7 +6,12 @@ from unittest import mock
 
 from services.config import config
 from services.openai_backend_api import ImageContentPolicyError, OpenAIBackendAPI, _is_content_policy_error
-from services.protocol.conversation import ImageOutput, extract_conversation_ids
+from services.protocol.conversation import (
+    ConversationRequest,
+    ImageOutput,
+    extract_conversation_ids,
+    stream_image_outputs,
+)
 from services.protocol.openai_v1_response import stream_image_response
 
 
@@ -175,6 +180,7 @@ class MultiImageResultTests(unittest.TestCase):
 
     def test_policy_detection_requires_an_explicit_refusal(self) -> None:
         self.assertFalse(_is_content_policy_error('{"reason":"delivery_return_policy"}'))
+        self.assertFalse(_is_content_policy_error("I cannot help with this color adjustment."))
         self.assertTrue(_is_content_policy_error("This request violates our content policy."))
 
     def test_poll_uses_only_the_current_request_branch(self) -> None:
@@ -236,6 +242,68 @@ class MultiImageResultTests(unittest.TestCase):
 
         self.assertEqual(file_ids, ["file-current"])
         self.assertEqual(sediment_ids, [])
+
+    def test_request_branch_stops_before_a_later_user_turn(self) -> None:
+        backend = FakeBackend()
+        conversation = {
+            "current_node": "later-image",
+            "mapping": {
+                "request": {"parent": "root", "message": {"author": {"role": "user"}}},
+                "request-image": {
+                    "parent": "request",
+                    "message": {
+                        "author": {"role": "tool"}, "create_time": 1,
+                        "metadata": {"async_task_type": "image_gen"},
+                        "content": {"parts": [
+                            {"content_type": "image_asset_pointer", "asset_pointer": "file-service://file-request"},
+                        ]},
+                    },
+                },
+                "later-user": {"parent": "request-image", "message": {"author": {"role": "user"}}},
+                "later-rejection": {
+                    "parent": "later-user",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"parts": ["This request violates our content policy."]},
+                    },
+                },
+                "later-image": {
+                    "parent": "later-rejection",
+                    "message": {
+                        "author": {"role": "tool"}, "create_time": 2,
+                        "metadata": {"async_task_type": "image_gen"},
+                        "content": {"parts": [
+                            {"content_type": "image_asset_pointer", "asset_pointer": "file-service://file-later"},
+                        ]},
+                    },
+                },
+            },
+        }
+
+        records = backend._extract_image_tool_records(conversation, "request")
+
+        self.assertEqual([record["file_ids"] for record in records], [["file-request"]])
+        self.assertEqual(backend._find_content_policy_error_in_conversation(conversation, "request"), "")
+
+    def test_stream_sets_persisted_request_id_before_the_backend_starts(self) -> None:
+        class Backend:
+            def stream_conversation(self, **_kwargs):
+                self.started_with_request_id = self.image_request_message_id
+                return iter(["[DONE]"])
+
+            def resolve_conversation_image_urls(self, *_args, **_kwargs):
+                return []
+
+        callback = lambda _step: None
+        callback.request_message_id = "request-before-post"
+        backend = Backend()
+        list(stream_image_outputs(
+            backend,
+            ConversationRequest(prompt="cat", model="gpt-image-2", progress_callback=callback),
+        ))
+
+        self.assertEqual(backend.image_request_message_id, "request-before-post")
+        self.assertEqual(backend.started_with_request_id, "request-before-post")
 
     def test_poll_requires_the_submitted_message_id(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "submitted message id missing"):

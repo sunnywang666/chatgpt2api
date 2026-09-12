@@ -10,6 +10,8 @@ from pathlib import Path
 from unittest import mock
 
 from services.image_task_service import ImageTaskService, _authoritative_image_failure
+from services.openai_backend_api import ImageContentPolicyError
+from services.protocol.conversation import ConversationRequest, ImageGenerationError, _generate_bound_single_image
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -303,6 +305,25 @@ class ImageTaskServiceTests(unittest.TestCase):
         document["mapping"]["assistant-1"]["message"]["status"] = "in_progress"
         self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
 
+        document["mapping"]["assistant-1"]["message"]["status"] = "finished_successfully"
+        document["mapping"]["later-user"] = {
+            "parent": "assistant-1", "message": {"author": {"role": "user"}},
+        }
+        document["mapping"]["later-failure"] = {
+            "parent": "later-user",
+            "message": {
+                "author": {"role": "assistant"},
+                "status": "finished_successfully",
+                "end_turn": True,
+                "content": {
+                    "content_type": "text",
+                    "parts": ["Something went wrong while generating your image. Sorry about that."],
+                },
+            },
+        }
+        document["current_node"] = "later-failure"
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
     def test_resume_without_the_submitted_message_boundary_stays_unknown(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             error = RuntimeError("ChatGPT 生图超时")
@@ -332,6 +353,79 @@ class ImageTaskServiceTests(unittest.TestCase):
 
         self.assertEqual(task["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
         self.assertEqual(task["binding_status"], "unknown")
+
+    def test_task_persists_request_and_observed_conversation_before_handler_returns(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            observed = {}
+
+            def handler(payload):
+                callback = payload["progress_callback"]
+                observed["request_message_id"] = callback.request_message_id
+                callback.record_conversation_id("new-conversation-1")
+                raise RuntimeError("stream interrupted after provider POST")
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="pre-post-boundary-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                provider_binding_id="cb_account_a",
+                provider_account_identity="account_opaque_a",
+                client_conversation_id="workbench-conversation-1",
+                retain_conversation=True,
+            )
+            wait_for_task(service, OWNER, "pre-post-boundary-task", "error")
+            stored = next(task for task in service._tasks.values() if task["id"] == "pre-post-boundary-task")
+
+        self.assertTrue(observed["request_message_id"])
+        self.assertEqual(stored["request_message_id"], observed["request_message_id"])
+        self.assertEqual(stored["conversation_id"], "new-conversation-1")
+        self.assertEqual(stored["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+
+    def test_bound_policy_rejection_stays_terminal_and_keeps_request_id(self):
+        class Backend:
+            image_request_message_id = "request-message-1"
+
+            def __init__(self, access_token=None):
+                self.access_token = access_token
+
+            def get_conversation_parent_message_id(self, _conversation_id):
+                return "message-after-rejection"
+
+            def close(self):
+                return None
+
+        request = ConversationRequest(
+            model="gpt-image-2",
+            prompt="cat",
+            provider_binding_id="cb_account_a",
+            provider_account_identity="account_opaque_a",
+            client_conversation_id="workbench-conversation-1",
+            conversation_id="conversation-1",
+            parent_message_id="message-before-request",
+            retain_conversation=True,
+        )
+        with (
+            mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", return_value="account_opaque_a"),
+            mock.patch("services.protocol.conversation.account_service.acquire_bound_image_access_token", return_value="bound-token"),
+            mock.patch("services.protocol.conversation.account_service.get_account", return_value={"email": "account@example.test"}),
+            mock.patch("services.protocol.conversation.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.account_service.release_image_slot"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", Backend),
+            mock.patch(
+                "services.protocol.conversation.stream_image_outputs",
+                side_effect=ImageContentPolicyError("This request violates our content policy.", "conversation-1"),
+            ),
+        ):
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_bound_single_image(request, 1, 1)
+
+        self.assertEqual(raised.exception.code, "content_policy_violation")
+        self.assertEqual(raised.exception.request_message_id, "request-message-1")
+        self.assertEqual(raised.exception.conversation_id, "conversation-1")
 
     def test_unknown_resume_maps_authoritative_finished_failure_to_terminal_code(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
