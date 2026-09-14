@@ -81,6 +81,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 receipt = service.resume_poll(OWNER, "old")
                 self.assertEqual(receipt["status"], "error")
                 self.assertTrue(receipt["upstream_unfinished"])
+                self.assertEqual(receipt["recovery_status"], "request_message_id_required")
                 thread.assert_not_called()
 
     def test_request_owned_model_is_durable_and_cannot_change_on_duplicate_submit(self):
@@ -281,6 +282,136 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["data"], [{"url": "http://content-provider/images/result.png"}])
             self.assertEqual(FakeBackend.poll_calls, [("conversation-1", 30, "request-message-1")])
 
+    def test_unknown_resume_keeps_404_and_empty_final_without_images_unknown(self):
+        scenarios = ("conversation-404", "empty-final-and-tasks")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp_dir:
+                error = RuntimeError("ChatGPT 生图超时")
+                error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+                error.provider_binding_id = "cb_account_a"
+                error.provider_account_identity = "account_opaque_a"
+                error.conversation_id = "conversation-1"
+                error.parent_message_id = "progress-leaf"
+                error.request_message_id = "request-message-1"
+                path = Path(tmp_dir) / "image_tasks.json"
+                service = self.make_service(path, lambda _payload: (_ for _ in ()).throw(error))
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="unknown-task",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    provider_binding_id="cb_account_a",
+                    provider_account_identity="account_opaque_a",
+                    client_conversation_id="workbench-conversation-1",
+                    retain_conversation=True,
+                )
+                wait_for_task(service, OWNER, "unknown-task", "error")
+
+                class FakeBackend:
+                    poll_calls = []
+
+                    def __init__(self, access_token=None, proxy_url=None):
+                        self.access_token = access_token
+
+                    def _get_conversation(self, _conversation_id):
+                        if scenario == "conversation-404":
+                            raise RuntimeError("/backend-api/conversation failed: status=404")
+                        return {
+                            "current_node": "assistant-1",
+                            "mapping": {
+                                "request-message-1": {
+                                    "parent": "prior-turn",
+                                    "message": {"author": {"role": "user"}},
+                                },
+                                "assistant-1": {
+                                    "parent": "request-message-1",
+                                    "message": {
+                                        "author": {"role": "assistant"},
+                                        "status": "finished_successfully",
+                                        "end_turn": True,
+                                        "content": {"content_type": "text", "parts": []},
+                                    },
+                                },
+                            },
+                        }
+
+                    def _poll_image_results(self, conversation_id, timeout, request_message_id=""):
+                        self.poll_calls.append((conversation_id, timeout, request_message_id))
+                        # An empty /backend-api/tasks result and no branch image
+                        # identifiers do not prove success or failure.
+                        return [], []
+
+                    def close(self):
+                        return None
+
+                with (
+                    mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account_opaque_a"),
+                    mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="bound-token"),
+                    mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", FakeBackend),
+                ):
+                    resumed = service.resume_poll(OWNER, "unknown-task", 30, "http://content-provider")
+                    self.assertIn(resumed["status"], {"running", "error"}, resumed)
+                    task = wait_for_task(service, OWNER, "unknown-task", "error")
+
+                self.assertEqual(task["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+                self.assertEqual(task["binding_status"], "unknown")
+                self.assertTrue(task["upstream_unfinished"])
+                self.assertNotIn("recovery_status", task)
+                if scenario == "conversation-404":
+                    self.assertEqual(FakeBackend.poll_calls, [])
+                    self.assertIn("status=404", task["error"])
+                else:
+                    self.assertEqual(
+                        FakeBackend.poll_calls,
+                        [("conversation-1", 30, "request-message-1")],
+                    )
+
+                restarted = self.make_service(path)
+                persisted = restarted.list_tasks(OWNER, ["unknown-task"])["items"][0]
+                self.assertEqual(persisted["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+                self.assertEqual(persisted["binding_status"], "unknown")
+
+    def test_unknown_resume_rejects_changed_bound_account_before_conversation_read(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            error = RuntimeError("ChatGPT 生图超时")
+            error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+            error.provider_binding_id = "cb_account_a"
+            error.provider_account_identity = "account_opaque_a"
+            error.conversation_id = "conversation-1"
+            error.parent_message_id = "progress-leaf"
+            error.request_message_id = "request-message-1"
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json", lambda _payload: (_ for _ in ()).throw(error),
+            )
+            service.submit_generation(
+                OWNER,
+                client_task_id="changed-account-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                provider_binding_id="cb_account_a",
+                provider_account_identity="account_opaque_a",
+                client_conversation_id="workbench-conversation-1",
+                retain_conversation=True,
+            )
+            wait_for_task(service, OWNER, "changed-account-task", "error")
+
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="different-account"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token") as acquire,
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI") as backend,
+            ):
+                service.resume_poll(OWNER, "changed-account-task", 30, "http://content-provider")
+                task = wait_for_task(service, OWNER, "changed-account-task", "error")
+
+            self.assertEqual(task["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+            self.assertEqual(task["binding_status"], "unknown")
+            self.assertIn("account identity changed", task["error"])
+            acquire.assert_not_called()
+            backend.assert_not_called()
+
     def test_authoritative_finished_image_failure_is_terminal(self):
         document = {
             "current_node": "assistant-1",
@@ -311,6 +442,12 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
 
         document["mapping"]["assistant-1"]["message"]["status"] = "finished_successfully"
+        document["mapping"]["assistant-1"]["message"]["content"]["parts"] = []
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document["mapping"]["assistant-1"]["message"]["content"]["parts"] = [
+            "Something went wrong while generating your image. Sorry about that."
+        ]
         document["mapping"]["later-user"] = {
             "parent": "assistant-1", "message": {"author": {"role": "user"}},
         }
@@ -329,35 +466,98 @@ class ImageTaskServiceTests(unittest.TestCase):
         document["current_node"] = "later-failure"
         self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
 
-    def test_resume_without_the_submitted_message_boundary_stays_unknown(self):
+    def test_legacy_resume_without_submitted_message_boundary_is_non_rotating_unknown(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            error = RuntimeError("ChatGPT 生图超时")
-            error.code = "CONVERSATION_OUTCOME_UNKNOWN"
-            error.provider_binding_id = "cb_account_a"
-            error.provider_account_identity = "account_opaque_a"
-            error.conversation_id = "conversation-1"
-            error.parent_message_id = "message-1"
-            service = self.make_service(
-                Path(tmp_dir) / "image_tasks.json", lambda _payload: (_ for _ in ()).throw(error),
+            path = Path(tmp_dir) / "image_tasks.json"
+            request_hash = "same-immutable-request-hash"
+            path.write_text(
+                json.dumps({"tasks": [
+                    {
+                        "id": "missing-boundary-task",
+                        "owner_id": "owner-1",
+                        "status": "error",
+                        "mode": "generate",
+                        "provider_binding_id": "cb_account_a",
+                        "provider_account_identity": "account_opaque_a",
+                        "client_conversation_id": "workbench-conversation-1",
+                        "conversation_id": "conversation-1",
+                        "parent_message_id": "progress-leaf",
+                        "binding_status": "unknown",
+                        "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
+                        "error": "/backend-api/conversation failed: status=404",
+                        "request_hash": request_hash,
+                        "upstream_unfinished": True,
+                        "poll_failures": 7,
+                        "next_poll_at": 4102444800,
+                        "duration_ms": 123,
+                        "updated_at": "2026-09-14 19:00:00",
+                    },
+                    {
+                        # Even an exact request fingerprint and conversation on
+                        # a sibling cannot prove this task's submitted node.
+                        "id": "same-owner-same-request-sibling",
+                        "owner_id": "owner-1",
+                        "status": "error",
+                        "mode": "generate",
+                        "provider_binding_id": "cb_account_a",
+                        "provider_account_identity": "account_opaque_a",
+                        "client_conversation_id": "workbench-conversation-1",
+                        "conversation_id": "conversation-1",
+                        "parent_message_id": "older-branch-leaf",
+                        "request_message_id": "sibling-request-message",
+                        "binding_status": "unknown",
+                        "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
+                        "request_hash": request_hash,
+                        "upstream_unfinished": True,
+                        "updated_at": "2026-09-14 18:59:00",
+                    },
+                    {
+                        "id": "successful-sibling",
+                        "owner_id": "owner-1",
+                        "status": "success",
+                        "mode": "generate",
+                        "data": [{"url": "https://example.test/already-finished.png"}],
+                        "updated_at": "2026-09-14 18:58:00",
+                    },
+                ]}),
+                encoding="utf-8",
             )
-            service.submit_generation(
-                OWNER,
-                client_task_id="missing-boundary-task",
-                prompt="cat",
-                model="gpt-image-2",
-                size=None,
-                provider_binding_id="cb_account_a",
-                provider_account_identity="account_opaque_a",
-                client_conversation_id="workbench-conversation-1",
-                retain_conversation=True,
+            service = self.make_service(path)
+            before = service.list_tasks(OWNER, ["missing-boundary-task"])["items"][0]
+            with (
+                mock.patch("services.image_task_service.threading.Thread") as thread,
+                mock.patch("services.image_task_service.uuid.uuid4") as new_uuid,
+            ):
+                first = service.resume_poll(OWNER, "missing-boundary-task", 30, "http://content-provider")
+                second = service.resume_poll(OWNER, "missing-boundary-task", 30, "http://content-provider")
+
+            self.assertEqual(first, before)
+            self.assertEqual(second, before)
+            self.assertEqual(first["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+            self.assertEqual(first["binding_status"], "unknown")
+            self.assertEqual(first["recovery_status"], "request_message_id_required")
+            self.assertEqual(first["next_poll_at"], 4102444800)
+            self.assertEqual(first["duration_ms"], 123)
+            thread.assert_not_called()
+            new_uuid.assert_not_called()
+
+            stored = next(task for task in service._tasks.values() if task["id"] == "missing-boundary-task")
+            self.assertEqual(stored["request_message_id"], "")
+            self.assertEqual(stored["poll_failures"], 7)
+            self.assertEqual(
+                next(task for task in service._tasks.values() if task["id"] == "same-owner-same-request-sibling")
+                ["request_message_id"],
+                "sibling-request-message",
             )
-            wait_for_task(service, OWNER, "missing-boundary-task", "error")
+            successful = service.list_tasks(OWNER, ["successful-sibling"])["items"][0]
+            self.assertEqual(successful["status"], "success")
+            self.assertEqual(successful["data"], [{"url": "https://example.test/already-finished.png"}])
 
-            service.resume_poll(OWNER, "missing-boundary-task", 30, "http://content-provider")
-            task = wait_for_task(service, OWNER, "missing-boundary-task", "error")
-
-        self.assertEqual(task["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
-        self.assertEqual(task["binding_status"], "unknown")
+            restarted = self.make_service(path)
+            after_restart = restarted.list_tasks(OWNER, ["missing-boundary-task"])["items"][0]
+            self.assertEqual(after_restart, before)
+            self.assertEqual(after_restart["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+            self.assertEqual(after_restart["binding_status"], "unknown")
 
     def test_task_persists_request_and_observed_conversation_before_handler_returns(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

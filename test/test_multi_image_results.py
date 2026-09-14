@@ -5,7 +5,12 @@ import unittest
 from unittest import mock
 
 from services.config import config
-from services.openai_backend_api import ImageContentPolicyError, OpenAIBackendAPI, _is_content_policy_error
+from services.openai_backend_api import (
+    ImageContentPolicyError,
+    ImagePollTimeoutError,
+    OpenAIBackendAPI,
+    _is_content_policy_error,
+)
 from services.protocol import openai_v1_image_generations
 from services.protocol.conversation import (
     ConversationRequest,
@@ -378,6 +383,39 @@ class MultiImageResultTests(unittest.TestCase):
         with mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0}):
             with self.assertRaises(ImageContentPolicyError):
                 backend._poll_image_results("conv-1", timeout_secs=10, request_message_id="request")
+
+    def test_poll_keeps_empty_tasks_and_empty_finished_text_unknown(self) -> None:
+        backend = FakeBackend([{
+            "current_node": "assistant",
+            "mapping": {
+                "request": {
+                    "parent": "root",
+                    "message": {"author": {"role": "user"}},
+                },
+                "assistant": {
+                    "parent": "request",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "status": "finished_successfully",
+                        "end_turn": True,
+                        "content": {"content_type": "text", "parts": []},
+                    },
+                },
+            },
+        }])
+        backend._query_backend_tasks = mock.Mock(return_value=[])
+
+        with mock.patch.dict(config.data, {
+            "image_poll_initial_wait_secs": 0,
+            "image_poll_interval_secs": 0.001,
+        }):
+            with self.assertRaises(ImagePollTimeoutError):
+                backend._poll_image_results(
+                    "conv-1", timeout_secs=0.005, request_message_id="request",
+                )
+
+        backend._query_backend_tasks.assert_called()
+        self.assertGreaterEqual(backend.calls, 1)
 
     def test_responses_stream_emits_all_image_output_items(self) -> None:
         first = base64.b64encode(b"first").decode("ascii")

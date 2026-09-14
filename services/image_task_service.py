@@ -188,6 +188,16 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     ):
         if task.get(field):
             item[field] = task.get(field)
+    if (
+        task.get("status") == TASK_STATUS_ERROR
+        and _clean(task.get("error_code")) == "CONVERSATION_OUTCOME_UNKNOWN"
+        and not _clean(task.get("request_message_id"))
+    ):
+        # Legacy receipts may predate persistence of the submitted user-message
+        # boundary. Keep the upstream outcome UNKNOWN, but tell callers that
+        # automated polling cannot safely continue until that exact boundary is
+        # recovered from independent evidence.
+        item["recovery_status"] = "request_message_id_required"
     if task.get("data") is not None:
         item["data"] = task.get("data")
     if task.get("usage") is not None:
@@ -670,8 +680,6 @@ class ImageTaskService:
                 and any(
                     marker in error
                     for marker in (
-                        "/backend-api/f/conversation failed: status=404",
-                        "/backend-api/conversation failed: status=404",
                         "/backend-api/f/conversation failed: status=403",
                         "/backend-api/conversation failed: status=403",
                     )
@@ -742,6 +750,15 @@ class ImageTaskService:
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
                 raise ValueError("task has no conversation_id")
+            if not _clean(task.get("request_message_id")):
+                # Do not rotate this legacy UNKNOWN through a zero-duration
+                # RUNNING/error cycle. There is no safe message boundary to
+                # query, and selecting an ancestor, latest node, matching
+                # prompt, or another task's request would risk attribution to a
+                # different generation. The task remains recoverable when an
+                # independently proven request_message_id is repaired in its
+                # persisted receipt.
+                return _public_task(task)
             if time.time() < float(task.get("next_poll_at") or 0):
                 return _public_task(task)
             mode = task.get("mode", "generate")
