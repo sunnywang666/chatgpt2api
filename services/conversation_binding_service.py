@@ -6,6 +6,7 @@ from typing import Any
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.conversation import conversation_events
+from utils.helper import UpstreamHTTPError
 
 
 class TextRecoveryReason(str, Enum):
@@ -16,6 +17,9 @@ class TextRecoveryReason(str, Enum):
     REQUEST_BRANCH_AMBIGUOUS = "REQUEST_BRANCH_AMBIGUOUS"
     REQUEST_BRANCH_SUPERSEDED = "REQUEST_BRANCH_SUPERSEDED"
     REQUEST_RESULT_INCOMPLETE = "REQUEST_RESULT_INCOMPLETE"
+    REQUEST_RESULT_NOT_FOUND = "REQUEST_RESULT_NOT_FOUND"
+    REQUEST_RESULT_TERMINAL_EMPTY = "REQUEST_RESULT_TERMINAL_EMPTY"
+    CONVERSATION_NOT_FOUND = "CONVERSATION_NOT_FOUND"
 
 
 class ConversationBindingError(RuntimeError):
@@ -66,7 +70,17 @@ class ConversationBindingService:
         with account_service.conversation_binding_lock(binding, receipt["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:
-                return self._read_text_request_result(backend, receipt)
+                try:
+                    return self._read_text_request_result(backend, receipt)
+                except UpstreamHTTPError as exc:
+                    if exc.status_code != 404:
+                        raise
+                    raise ConversationBindingError(
+                        "original conversation is missing",
+                        code="CONVERSATION_OUTCOME_UNKNOWN",
+                        conversation_id=str(receipt.get("conversation_id") or ""),
+                        recovery_reason=TextRecoveryReason.CONVERSATION_NOT_FOUND.value,
+                    ) from exc
             finally:
                 backend.close()
 
@@ -144,8 +158,14 @@ class ConversationBindingService:
                 recovery_reason=TextRecoveryReason.CONVERSATION_ID_MISMATCH.value,
             )
 
-        mapping = document.get("mapping") or {}
-        request_node = mapping.get(request_message_id) if isinstance(mapping, dict) else None
+        if "mapping" not in document or not isinstance(document.get("mapping"), dict):
+            raise ConversationBindingError(
+                "conversation mapping is missing or invalid",
+                code="CONVERSATION_BINDING_CONTRACT_INVALID",
+                conversation_id=conversation_id,
+            )
+        mapping = document["mapping"]
+        request_node = mapping.get(request_message_id)
         request_message = request_node.get("message") if isinstance(request_node, dict) else None
         request_author = request_message.get("author") if isinstance(request_message, dict) else None
         request_role = request_author.get("role") if isinstance(request_author, dict) else None
@@ -183,6 +203,8 @@ class ConversationBindingService:
         candidates: list[tuple[str, str]] = []
         visited: set[str] = set()
         later_user_seen = False
+        active_result_seen = False
+        terminal_empty_seen = False
         pending = list(children.get(request_message_id, []))
         while pending:
             node_id = pending.pop()
@@ -202,13 +224,16 @@ class ConversationBindingService:
                 continue
             if role and role not in {"assistant", "tool"}:
                 continue
+            status = str(message.get("status") or "").strip().lower()
+            if status in {"in_progress", "running", "pending", "queued"}:
+                active_result_seen = True
             if role == "assistant":
                 content = message.get("content") or {}
                 parts = content.get("parts") if isinstance(content, dict) else None
+                terminal = status == "finished_successfully" and message.get("end_turn") is True
                 text = "".join(parts).strip() if (
                     message.get("id") == node_id
-                    and message.get("status") == "finished_successfully"
-                    and message.get("end_turn") is True
+                    and terminal
                     and message.get("channel") in (None, "final")
                     and isinstance(parts, list)
                     and parts
@@ -217,6 +242,8 @@ class ConversationBindingService:
                 ) else ""
                 if text:
                     candidates.append((node_id, text))
+                elif terminal:
+                    terminal_empty_seen = True
             pending.extend(children.get(node_id, []))
 
         result = {key: receipt[key] for key in (
@@ -230,14 +257,19 @@ class ConversationBindingService:
                 recovery_reason=TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value,
             )
         if not candidates:
+            if active_result_seen:
+                recovery_reason = TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
+            elif terminal_empty_seen:
+                recovery_reason = TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
+            elif later_user_seen:
+                recovery_reason = TextRecoveryReason.REQUEST_BRANCH_SUPERSEDED.value
+            else:
+                recovery_reason = TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value
             return {
                 **result,
                 "binding_status": "unknown",
-                "status": "running",
-                "recovery_reason": (
-                    TextRecoveryReason.REQUEST_BRANCH_SUPERSEDED.value
-                    if later_user_seen else TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
-                ),
+                "status": "running" if active_result_seen else "unknown",
+                "recovery_reason": recovery_reason,
             }
         parent_message_id, text = candidates[0]
         return {

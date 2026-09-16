@@ -12,6 +12,7 @@ from services import account_request_pacing as pacing
 
 from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
 from services.conversation_binding_service import ConversationBindingError, ConversationBindingService, TextRecoveryReason
+from utils.helper import UpstreamHTTPError
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -673,6 +674,40 @@ class TextResultRecoveryTests(unittest.TestCase):
             )
         self.assertEqual(drift.exception.recovery_reason, TextRecoveryReason.REQUEST_PARENT_MISMATCH.value)
 
+    def test_request_recovery_distinguishes_empty_branch_from_invalid_mapping(self):
+        document = self.request_document()
+        for node_id in ("original-answer", "later-user", "later-answer"):
+            document["mapping"].pop(node_id)
+        document["current_node"] = "request-user"
+        backend = mock.Mock()
+        backend._get_conversation.return_value = document
+
+        empty = ConversationBindingService._read_text_request_result(
+            backend, self.request_receipt(),
+        )
+
+        self.assertEqual(empty["status"], "unknown")
+        self.assertEqual(
+            empty["recovery_reason"], TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value,
+        )
+
+        for invalid_document in (
+            {"conversation_id": "conversation-one"},
+            {"conversation_id": "conversation-one", "mapping": []},
+        ):
+            backend._get_conversation.return_value = invalid_document
+            with self.assertRaises(ConversationBindingError) as invalid:
+                ConversationBindingService._read_text_request_result(
+                    backend, self.request_receipt(),
+                )
+            self.assertEqual(
+                invalid.exception.code, "CONVERSATION_BINDING_CONTRACT_INVALID",
+            )
+            self.assertNotEqual(
+                invalid.exception.recovery_reason,
+                TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
+            )
+
     def test_request_recovery_account_and_conversation_mismatch_are_distinct(self):
         service = ConversationBindingService()
         receipt = self.request_receipt()
@@ -709,10 +744,17 @@ class TextResultRecoveryTests(unittest.TestCase):
         self.assertEqual(conversation.exception.code, "CONVERSATION_BINDING_MISMATCH")
         self.assertEqual(conversation.exception.recovery_reason, TextRecoveryReason.CONVERSATION_ID_MISMATCH.value)
 
-    def test_request_recovery_empty_or_in_progress_original_answer_stays_unknown(self):
-        for patch in (
-            {"status": "in_progress"},
-            {"content": {"content_type": "text", "parts": []}},
+    def test_request_recovery_distinguishes_running_from_terminal_empty_answer(self):
+        for patch, expected_reason in (
+            ({"status": "in_progress"}, TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value),
+            (
+                {"content": {"content_type": "text", "parts": []}},
+                TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
+            ),
+            (
+                {"content": {"content_type": "multimodal_text", "parts": [{"type": "image"}]}},
+                TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
+            ),
         ):
             document = self.request_document()
             document["mapping"].pop("later-user")
@@ -722,9 +764,65 @@ class TextResultRecoveryTests(unittest.TestCase):
             backend = mock.Mock()
             backend._get_conversation.return_value = document
             result = ConversationBindingService._read_text_request_result(backend, self.request_receipt())
-            self.assertEqual(result["status"], "running")
-            self.assertEqual(result["recovery_reason"], TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value)
+            self.assertEqual(
+                result["status"],
+                "running" if expected_reason == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value else "unknown",
+            )
+            self.assertEqual(result["recovery_reason"], expected_reason)
             self.assertNotIn("content", result)
+
+    def test_backend_tasks_strict_schema_rejects_missing_or_malformed_tasks(self):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.test"
+        backend._headers = lambda *_args, **_kwargs: {}
+        response = SimpleNamespace(
+            status_code=200, text="{}", headers={}, json=lambda: {},
+        )
+        backend.session = SimpleNamespace(get=mock.Mock(return_value=response))
+
+        self.assertEqual(backend._query_backend_tasks(conversation_id="chat"), [])
+        with self.assertRaisesRegex(RuntimeError, "missing the tasks list"):
+            backend._query_backend_tasks(conversation_id="chat", strict_schema=True)
+
+        response.json = lambda: {"tasks": {"bad": "shape"}}
+        self.assertEqual(backend._query_backend_tasks(conversation_id="chat"), [])
+        with self.assertRaisesRegex(RuntimeError, "invalid tasks list"):
+            backend._query_backend_tasks(conversation_id="chat", strict_schema=True)
+
+        response.json = lambda: {"tasks": ["bad-task"]}
+        with self.assertRaisesRegex(RuntimeError, "invalid task"):
+            backend._query_backend_tasks(conversation_id="chat", strict_schema=True)
+
+    def test_request_recovery_distinguishes_missing_conversation_from_other_read_failures(self):
+        service = ConversationBindingService()
+        receipt = self.request_receipt()
+        backend = mock.Mock()
+        backend._get_conversation.side_effect = UpstreamHTTPError(
+            "/backend-api/conversation/chat", 404, {},
+        )
+        with (
+            mock.patch(
+                "services.conversation_binding_service.account_service.get_bound_account_identity",
+                return_value="account-one",
+            ),
+            mock.patch(
+                "services.conversation_binding_service.account_service.get_bound_text_access_token",
+                return_value="synthetic-token",
+            ),
+            mock.patch(
+                "services.conversation_binding_service.account_service.conversation_binding_lock",
+                return_value=nullcontext(),
+            ),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+        ):
+            with self.assertRaises(ConversationBindingError) as missing:
+                service.read_text_request(receipt)
+
+        self.assertEqual(missing.exception.code, "CONVERSATION_OUTCOME_UNKNOWN")
+        self.assertEqual(
+            missing.exception.recovery_reason,
+            TextRecoveryReason.CONVERSATION_NOT_FOUND.value,
+        )
 
     def test_read_only_completed_answer_and_scope_checks(self):
         backend = mock.Mock()

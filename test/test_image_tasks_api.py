@@ -59,8 +59,8 @@ class FakeImageTaskService:
             "missing_ids": [task_id for task_id in ids if task_id == "missing"],
         }
 
-    def resume_poll(self, identity, task_id, extra_timeout_secs, base_url):
-        self.resume_calls.append((identity, task_id, extra_timeout_secs, base_url))
+    def resume_poll(self, identity, task_id, extra_timeout_secs, base_url, allow_unrecoverable_retry=False):
+        self.resume_calls.append((identity, task_id, extra_timeout_secs, base_url, allow_unrecoverable_retry))
         return {
             "id": task_id,
             "status": "running",
@@ -146,7 +146,17 @@ class ImageTasksApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["status"], "running")
-        self.assertEqual(self.fake_service.resume_calls[0][1:], ("task-1", 45.0, "http://testserver"))
+        self.assertEqual(self.fake_service.resume_calls[0][1:], ("task-1", 45.0, "http://testserver", False))
+
+    def test_resume_poll_forwards_explicit_unrecoverable_retry_authorization(self):
+        response = self.client.post(
+            "/api/image-tasks/task-1/resume-poll",
+            headers=AUTH_HEADERS,
+            json={"extra_timeout_secs": 45, "allow_unrecoverable_retry": True},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.fake_service.resume_calls[0][1:], ("task-1", 45.0, "http://testserver", True))
 
     def test_create_edit_task_accepts_image_url(self):
         """测试图片编辑任务接口支持表单 image_url 引用。"""

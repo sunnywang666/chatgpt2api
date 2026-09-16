@@ -72,6 +72,11 @@ class ConversationBindingTextRequest(BaseModel):
     parent_message_id: str | None = None
 
 
+class TextRequestRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    allow_unrecoverable_retry: bool = False
+
+
 class ConversationArchiveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider_binding_id: str = Field(min_length=1)
@@ -226,6 +231,20 @@ def create_router() -> APIRouter:
     async def read_bound_text_request(request_id: str, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         return await run_in_threadpool(text_task_service.read, str(identity.get("id") or "anonymous"), request_id)
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/recover")
+    async def recover_bound_text_request(
+        request_id: str,
+        body: TextRequestRecoveryRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        return await run_in_threadpool(
+            text_task_service.recover,
+            str(identity.get("id") or "anonymous"),
+            request_id,
+            body.allow_unrecoverable_retry,
+        )
 
     @router.post("/api/conversation-bindings/text")
     async def continue_bound_text(

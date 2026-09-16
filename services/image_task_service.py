@@ -21,6 +21,14 @@ TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+UNRECOVERABLE_MIN_AGE_SECONDS = 15.0 * 60.0
+UNRECOVERABLE_QUALIFIED_READS = 3
+
+
+class UnrecoverableRead(RuntimeError):
+    def __init__(self, message: str, *, requires_new_conversation: bool) -> None:
+        super().__init__(message)
+        self.requires_new_conversation = requires_new_conversation
 
 
 def _holds_upstream_slot(task: dict[str, Any]) -> bool:
@@ -71,6 +79,85 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
             if isinstance(url, str) and url:
                 urls.append(url)
     return urls
+
+
+def _task_age_seconds(task: dict[str, Any], now: float | None = None) -> float:
+    current = time.time() if now is None else now
+    created_ts = task.get("created_ts")
+    if isinstance(created_ts, (int, float)) and created_ts > 0:
+        return max(0.0, current - float(created_ts))
+    created_at = _timestamp(task.get("created_at"))
+    return max(0.0, current - created_at) if created_at > 0 else 0.0
+
+
+def _upstream_status_code(exc: BaseException) -> int | None:
+    value = getattr(exc, "status_code", None)
+    if isinstance(value, int):
+        return value
+    message = str(exc)
+    return 404 if "status=404" in message else None
+
+
+def _branch_read_state(document: object, request_message_id: str) -> str:
+    """Classify an exact request branch without treating active work as absent."""
+    if not isinstance(document, dict) or not isinstance(document.get("mapping"), dict):
+        return "unknown"
+    mapping = document["mapping"]
+    if request_message_id not in mapping:
+        return "unattributable"
+    children: dict[str, list[str]] = {}
+    for node_id, node in mapping.items():
+        if isinstance(node, dict) and node.get("parent"):
+            children.setdefault(str(node["parent"]), []).append(str(node_id))
+    pending = list(children.get(request_message_id, []))
+    visited: set[str] = set()
+    terminal = False
+    while pending:
+        node_id = pending.pop()
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        node = mapping.get(node_id) or {}
+        message = node.get("message") if isinstance(node, dict) else {}
+        author = message.get("author") if isinstance(message, dict) else {}
+        role = _clean(author.get("role")).lower() if isinstance(author, dict) else ""
+        if role == "user":
+            continue
+        status = _clean(message.get("status")).lower() if isinstance(message, dict) else ""
+        if status in {"in_progress", "running", "pending", "queued"}:
+            return "running"
+        if role == "assistant" and status == "finished_successfully" and message.get("end_turn") is True:
+            terminal = True
+        pending.extend(children.get(node_id, []))
+    return "terminal_without_result" if terminal else "no_result"
+
+
+def _document_current_message_active(document: object) -> bool:
+    mapping = document.get("mapping") if isinstance(document, dict) else None
+    if not isinstance(mapping, dict):
+        return True
+    current_node = _clean(document.get("current_node"))
+    node = mapping.get(current_node) if current_node else None
+    message = node.get("message") if isinstance(node, dict) else None
+    status = _clean(message.get("status")).lower() if isinstance(message, dict) else ""
+    return status in {"in_progress", "running", "pending", "queued"}
+
+
+def _backend_tasks_may_be_active(tasks: object) -> bool:
+    if not isinstance(tasks, list):
+        return True
+    for task in tasks:
+        if not isinstance(task, dict):
+            return True
+        status = _clean(
+            task.get("status") or task.get("state") or task.get("task_status")
+        ).lower()
+        if status not in {
+            "completed", "complete", "finished", "done", "succeeded", "success",
+            "failed", "cancelled", "canceled",
+        }:
+            return True
+    return False
 
 
 def _request_hash(mode: str, payload: dict[str, Any]) -> str:
@@ -185,9 +272,18 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "upstream_model",
         "next_poll_at",
         "upstream_unfinished",
+        "upstream_outcome",
+        "recovery_retryable",
     ):
         if task.get(field):
             item[field] = task.get(field)
+    if task.get("recovery_no_result_reads"):
+        item["recovery_no_result_reads"] = task.get("recovery_no_result_reads")
+    if _clean(task.get("error_code")) == "RESULT_UNRECOVERABLE":
+        item["upstream_unfinished"] = False
+        item["recovery_requires_new_conversation"] = bool(
+            task.get("recovery_requires_new_conversation")
+        )
     if (
         task.get("status") == TASK_STATUS_ERROR
         and _clean(task.get("error_code")) == "CONVERSATION_OUTCOME_UNKNOWN"
@@ -660,6 +756,8 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 return
+            if task.get("status") == TASK_STATUS_SUCCESS and updates.get("status") not in (None, TASK_STATUS_SUCCESS):
+                return
             task.update(updates)
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
@@ -717,6 +815,10 @@ class ImageTaskService:
                 "retain_receipt": item.get("retain_receipt") is True,
                 "next_poll_at": item.get("next_poll_at", 0),
                 "poll_failures": item.get("poll_failures", 0),
+                "recovery_no_result_reads": item.get("recovery_no_result_reads", 0),
+                "upstream_outcome": _clean(item.get("upstream_outcome")),
+                "recovery_retryable": item.get("recovery_retryable") is True,
+                "recovery_requires_new_conversation": item.get("recovery_requires_new_conversation") is True,
             }
             data = item.get("data")
             if isinstance(data, list):
@@ -789,6 +891,7 @@ class ImageTaskService:
         task_id: str,
         extra_timeout_secs: float = 30.0,
         base_url: str = "",
+        allow_unrecoverable_retry: bool = False,
     ) -> dict[str, Any]:
         """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
         owner = _owner_id(identity)
@@ -797,8 +900,12 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 raise ValueError("task not found")
+            if task.get("status") in {TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS}:
+                return _public_task(task)
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
+            if _clean(task.get("error_code")) == "RESULT_UNRECOVERABLE":
+                return _public_task(task)
             if _clean(task.get("error_code")) != "CONVERSATION_OUTCOME_UNKNOWN":
                 raise ValueError("task outcome is not unknown")
             conversation_id = _clean(task.get("conversation_id"))
@@ -812,7 +919,8 @@ class ImageTaskService:
                 # different generation. The task remains recoverable when an
                 # independently proven request_message_id is repaired in its
                 # persisted receipt.
-                return _public_task(task)
+                if not allow_unrecoverable_retry:
+                    return _public_task(task)
             if time.time() < float(task.get("next_poll_at") or 0):
                 return _public_task(task)
             mode = task.get("mode", "generate")
@@ -823,7 +931,8 @@ class ImageTaskService:
         # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, base_url, dict(identity), mode, model),
+            args=(key, conversation_id, extra_timeout_secs, base_url, dict(identity), mode, model,
+                  bool(allow_unrecoverable_retry)),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -839,12 +948,14 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        allow_unrecoverable_retry: bool,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
         backend = None
         account_service = None
         access_token = ""
+        conversation_available = False
         try:
             from services.account_service import account_service
             from services.openai_backend_api import OpenAIBackendAPI
@@ -856,7 +967,7 @@ class ImageTaskService:
                 account_identity = _clean(task.get("provider_account_identity")) if task else ""
                 client_conversation_id = _clean(task.get("client_conversation_id")) if task else ""
                 request_message_id = _clean(task.get("request_message_id")) if task else ""
-            if not binding_id or not account_identity or not client_conversation_id or not request_message_id:
+            if not binding_id or not account_identity or not client_conversation_id:
                 raise RuntimeError("conversation binding unavailable: task authority missing")
             authoritative_identity = account_service.get_bound_account_identity(binding_id)
             if authoritative_identity != account_identity:
@@ -865,17 +976,110 @@ class ImageTaskService:
             access_token = account_service.get_bound_text_access_token(binding_id, model="auto")
             with account_service.conversation_binding_lock(binding_id, client_conversation_id):
                 backend = OpenAIBackendAPI(access_token=access_token)
-                authoritative_failure = _authoritative_image_failure(
-                    backend._get_conversation(conversation_id), request_message_id,
-                )
+                try:
+                    document = backend._get_conversation(conversation_id)
+                    conversation_available = True
+                except Exception as exc:
+                    if _upstream_status_code(exc) != 404:
+                        raise
+                    if not allow_unrecoverable_retry:
+                        raise
+                    tasks = backend._query_backend_tasks(
+                        conversation_id=conversation_id, timeout_secs=5.0, strict_schema=True,
+                    )
+                    if _backend_tasks_may_be_active(tasks):
+                        raise RuntimeError("original conversation is missing while an upstream task may still be active") from exc
+                    raise UnrecoverableRead(
+                        "original conversation is missing after a bounded result read",
+                        requires_new_conversation=True,
+                    ) from exc
+                if not request_message_id:
+                    tasks = backend._query_backend_tasks(
+                        conversation_id=conversation_id, timeout_secs=5.0, strict_schema=True,
+                    )
+                    if _document_current_message_active(document) or _backend_tasks_may_be_active(tasks):
+                        raise RuntimeError("legacy image request may still be running upstream")
+                    raise UnrecoverableRead(
+                        "original legacy image result cannot be safely attributed after a bounded read",
+                        requires_new_conversation=False,
+                    )
+                branch_state = _branch_read_state(document, request_message_id)
+                authoritative_failure = _authoritative_image_failure(document, request_message_id)
                 if authoritative_failure:
                     raise AuthoritativeImageTaskFailure(authoritative_failure)
-                file_ids, sediment_ids = backend._poll_image_results(
-                    conversation_id,
-                    extra_timeout_secs,
-                    request_message_id=request_message_id,
-                )
+                no_active_task = False
+                if allow_unrecoverable_retry:
+                    tasks = backend._query_backend_tasks(
+                        conversation_id=conversation_id, timeout_secs=5.0, strict_schema=True,
+                    )
+                    no_active_task = (
+                        not _backend_tasks_may_be_active(tasks)
+                        and not _document_current_message_active(document)
+                    )
+
+                def latest_unrecoverable_requirement() -> bool | None:
+                    try:
+                        latest_document = backend._get_conversation(conversation_id)
+                    except Exception as latest_exc:
+                        if _upstream_status_code(latest_exc) != 404:
+                            raise
+                        latest_tasks = backend._query_backend_tasks(
+                            conversation_id=conversation_id,
+                            timeout_secs=5.0,
+                            strict_schema=True,
+                        )
+                        return True if not _backend_tasks_may_be_active(latest_tasks) else None
+                    latest_tasks = backend._query_backend_tasks(
+                        conversation_id=conversation_id,
+                        timeout_secs=5.0,
+                        strict_schema=True,
+                    )
+                    latest_state = _branch_read_state(latest_document, request_message_id)
+                    if (
+                        _document_current_message_active(latest_document)
+                        or _backend_tasks_may_be_active(latest_tasks)
+                        or latest_state not in {
+                            "terminal_without_result", "unattributable", "no_result",
+                        }
+                    ):
+                        return None
+                    extract_records = getattr(backend, "_extract_image_tool_records", None)
+                    if callable(extract_records):
+                        for record in extract_records(latest_document, request_message_id):
+                            if record.get("file_ids") or record.get("sediment_ids"):
+                                return None
+                    return False
+
+                try:
+                    file_ids, sediment_ids = backend._poll_image_results(
+                        conversation_id,
+                        extra_timeout_secs,
+                        request_message_id=request_message_id,
+                    )
+                except Exception as exc:
+                    if (
+                        no_active_task
+                        and branch_state in {"terminal_without_result", "unattributable", "no_result"}
+                        and exc.__class__.__name__ == "ImagePollTimeoutError"
+                    ):
+                        latest_requirement = latest_unrecoverable_requirement()
+                        if latest_requirement is not None:
+                            raise UnrecoverableRead(
+                                "original image branch has no attributable result after a bounded read",
+                                requires_new_conversation=latest_requirement,
+                            ) from exc
+                    raise
                 if not file_ids and not sediment_ids:
+                    if (
+                        no_active_task
+                        and branch_state in {"terminal_without_result", "unattributable", "no_result"}
+                    ):
+                        latest_requirement = latest_unrecoverable_requirement()
+                        if latest_requirement is not None:
+                            raise UnrecoverableRead(
+                                "original image branch has no attributable result after a bounded read",
+                                requires_new_conversation=latest_requirement,
+                            )
                     raise RuntimeError(
                         f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
                     )
@@ -910,6 +1114,8 @@ class ImageTaskService:
                 upstream_unfinished=False,
                 next_poll_at=0,
                 poll_failures=0,
+                recovery_no_result_reads=0,
+                recovery_requires_new_conversation=False,
                 duration_ms=int((time.time() - started) * 1000),
             )
             self._log_call(
@@ -926,19 +1132,49 @@ class ImageTaskService:
             duration_ms = int((time.time() - started) * 1000)
             error_code = _clean(getattr(exc, "code", ""))
             with self._lock:
-                failures = int(self._tasks.get(key, {}).get("poll_failures") or 0) + 1
+                current = self._tasks.get(key, {})
+                failures = int(current.get("poll_failures") or 0) + 1
+                qualified_reads = int(current.get("recovery_no_result_reads") or 0)
+                requires_new_conversation = bool(current.get("recovery_requires_new_conversation"))
+                qualified_read_recorded = False
+                if conversation_available:
+                    requires_new_conversation = False
+                if allow_unrecoverable_retry and isinstance(exc, UnrecoverableRead):
+                    requires_new_conversation = exc.requires_new_conversation
+                    if _task_age_seconds(current) >= UNRECOVERABLE_MIN_AGE_SECONDS:
+                        qualified_reads += 1
+                        qualified_read_recorded = True
             terminal = error_code == "NO_IMAGE_GENERATED"
+            unrecoverable = qualified_reads >= UNRECOVERABLE_QUALIFIED_READS
             self._update_task(
                 key,
                 status=TASK_STATUS_ERROR,
                 error=error_message,
-                error_code=error_code if terminal else "CONVERSATION_OUTCOME_UNKNOWN",
-                binding_status="bound" if terminal else "unknown",
+                error_code=(
+                    "RESULT_UNRECOVERABLE" if unrecoverable
+                    else error_code if terminal else "CONVERSATION_OUTCOME_UNKNOWN"
+                ),
+                binding_status=("unavailable" if unrecoverable and requires_new_conversation
+                                else "bound" if terminal or unrecoverable else "unknown"),
                 data=[],
                 duration_ms=duration_ms,
-                upstream_unfinished=not terminal,
+                upstream_unfinished=not (terminal or unrecoverable),
                 poll_failures=failures,
-                next_poll_at=time.time() + min(900, 60 * 2 ** min(failures - 1, 4)),
+                recovery_no_result_reads=qualified_reads,
+                recovery_requires_new_conversation=requires_new_conversation,
+                **({"upstream_outcome": "unknown", "recovery_retryable": True}
+                   if unrecoverable else {}),
+                next_poll_at=(
+                    0
+                    if unrecoverable
+                    else time.time() + min(
+                        900,
+                        60 * 2 ** min(
+                            (qualified_reads if qualified_read_recorded else failures) - 1,
+                            4,
+                        ),
+                    )
+                ),
             )
             self._log_call(
                 identity,
