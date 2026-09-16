@@ -48,7 +48,7 @@ The client depends on two details that older server baselines may not provide:
 - immutable input drift for an existing `client_task_id` must surface as HTTP 409;
 - the authenticated receipt-owned `GET /api/image-tasks/{client_task_id}/images/{index}` route must exist.
 
-The public external service accepts only `gpt-image-2`, one output per task (`n=1`), and `b64_json` for synchronous-compatible calls. Codex image routing and Codex recovery are internal capabilities and are not exposed here. The external interface does not accept caller-supplied provider bindings, account identities, or conversation IDs. Provider accounts, raw image storage, files, admin routes, and account/key management remain outside the public `/ai` surface.
+The public external image service accepts only `gpt-image-2`, one output per task (`n=1`), and `b64_json` for synchronous-compatible calls. Codex image routing and Codex recovery are internal capabilities and are not exposed here. The external interface does not accept caller-supplied provider bindings, account identities, or conversation IDs. Provider accounts, raw image storage, files, admin routes, and account/key management remain outside the public `/ai` surface.
 
 Execution currently reuses the service's existing paid-account conversation-binding route. Free accounts are not eligible for this route. A response saying that no eligible image resource was admitted describes the route at that moment; it is not evidence that every account in the private pool has exhausted an upstream quota.
 
@@ -138,3 +138,6 @@ The client prints JSON to stdout on success and a JSON error to stderr on failur
 An HTTP response is recorded in the local state. A timeout, disconnect, invalid response, or interruption after the state was prepared has an unknown submission outcome. The client never converts that uncertainty into a new ID and never silently retries the submit POST. Restart with the same state and run `status`, or run the identical `submit` command, which performs the same status lookup. If the server reports that the original ID is missing, the client stops; deciding to create a different task requires an explicit new state file and ID.
 
 Do not put the bearer token in command arguments, task state, logs, screenshots, or source control. Keep the filled env file private.
+
+
+Codex coding is a separate route (`/ai/codex/v1`) documented in [the Codex CLI package](codex-client.md). It does not replace these image-task endpoints or change their supported image model. Its deployment and real CLI acceptance are tracked separately.

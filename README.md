@@ -381,3 +381,13 @@ curl http://localhost:8000/v1/responses \
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/chart?repos=basketikun/chatgpt2api&type=date&legend=top-left)](https://www.star-history.com/?repos=basketikun%2Fchatgpt2api&type=date&legend=top-left)
+
+
+### Workbench Codex CLI 接入（待部署验收）
+
+原有 `/v1/responses` 仍为 ChatGPT 文本兼容接口。新增 Codex 编程接口使用独立的
+`/codex/v1/models`、`/codex/v1/responses`、`/codex/v1/responses/compact`，沿现有账号池和普通调用密钥，保留原生工具调用、工具返回与流式事件。
+连接中心可以导入自己合法取得的 Codex `auth.json` 中的授权字段，管理自己的账号、刷新/停用，并分别显示图片容量及 Codex 上游用量窗口。导入方式不代表该账号已经通过对应路线验证；未知或读取失败不等于额度为零。
+
+模型名称以实际查询为准。新会话只选择可用资源，已绑定会话不能通过换号重发恢复未知请求；没有内部充值、预算或额度分配。自定义 HTTP Provider 不等于 Codex Desktop 或所有云端功能已验证。
+Mac / Windows 的隔离 CLI 启动脚本与恢复方法见 [Codex 客户端说明](docs/codex-client.md)。当前源码、模拟工具调用测试与公网真实验收分别记录，计划地址在生产部署及独立客户端验收前不能视为已可用。

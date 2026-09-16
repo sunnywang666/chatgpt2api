@@ -40,6 +40,7 @@ class ExternalImageAccessTests(unittest.TestCase):
             ("api.image_tasks.image_task_service", self.tasks),
             ("services.image_task_service.image_task_service", self.tasks),
             ("api.owned_accounts.account_service", self.account),
+            ("services.codex_service.codex_service.refresh_account", lambda *_: {"state": "unknown"}),
             ("api.owned_accounts.auth_service", self.auth),
         ]:
             patcher = patch(target, value)

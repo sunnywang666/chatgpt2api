@@ -352,7 +352,7 @@ class AccountService:
     def _refresh_token_keepalive_due_at(self, account: dict, now: datetime) -> datetime | None:
         if not str(account.get("refresh_token") or "").strip():
             return None
-        if account.get("status") == "禁用":
+        if account.get("managed_disabled") or account.get("status") == "禁用":
             return None
         if self._recent_refresh_token_keepalive_error(account, now):
             return None
@@ -378,12 +378,15 @@ class AccountService:
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
-                    "client_id": self._OAUTH_CLIENT_ID,
+                    "client_id": ("app_EMoamEEZ73f0CkXaXp7hrann" if (account or {}).get("source_type") == "codex" else self._OAUTH_CLIENT_ID),
                 },
                 timeout=60,
+                allow_redirects=False,
             )
             data = response.json() if response.text else {}
             if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
+                if (account or {}).get("source_type") == "codex":
+                    raise RuntimeError(f"codex_oauth_refresh_http_{response.status_code}")
                 detail = ""
                 if isinstance(data, dict):
                     detail = str(data.get("error_description") or data.get("error") or data.get("message") or "")
@@ -848,7 +851,9 @@ class AccountService:
             return [
                 token
                 for account in self._accounts.values()
-                if str(account.get("refresh_token") or "").strip()
+                if not account.get("managed_disabled")
+                and account.get("status") != "禁用"
+                and str(account.get("refresh_token") or "").strip()
                 and (token := str(account.get("access_token") or "").strip())
                 and self._token_needs_refresh(token)
             ]
@@ -1263,7 +1268,7 @@ class AccountService:
             if current and current.get("managed_owner") != owner:
                 raise ValueError("account already exists outside your account scope")
             item = dict(current or {})
-            item.update({key: str(payload[key]).strip() for key in ("refresh_token", "id_token") if payload.get(key)})
+            item.update({key: str(payload[key]).strip() for key in ("refresh_token", "id_token", "account_id") if payload.get(key)})
             item.update(access_token=token, managed_owner=owner,
                         managed_account_id=item.get("managed_account_id") or uuid.uuid4().hex,
                         managed_updated_at=utc_now())
@@ -1284,20 +1289,25 @@ class AccountService:
     def refresh_owned_account(self, owner: str, account_id: str) -> dict:
         from services.owned_accounts import public_owned_account, utc_now
         token = self._owned_token(owner, account_id)
-        try:
-            account = self.fetch_remote_info(token, "workbench_account_refresh")
-            if account is None:
-                raise RuntimeError("account unavailable")
-        except Exception:
-            with self._lock:
-                resolved = self._resolve_access_token_locked(token)
-                current = self._accounts.get(resolved)
-                if current and current.get("managed_owner") == owner:
-                    current["capacity_read_failed_at"] = utc_now()
-                    current["managed_updated_at"] = utc_now()
-                    self._save_accounts()
-                    return public_owned_account(current)
-            raise KeyError("account not found") from None
+        # Codex authorization and capacity are independent of image capacity.
+        from services.codex_service import codex_service
+        token = self.refresh_access_token(token, event="workbench_account_refresh") or token
+        current = self.get_account(token) or {}
+        if current.get("source_type") != "codex":
+            try:
+                self.fetch_remote_info(token, "workbench_account_refresh")
+            except Exception:
+                self.update_account(token, {"capacity_read_failed_at": utc_now()}, quiet=True)
+        codex_service.refresh_account(token)
+        account = self.get_account(token)
+        if not account or account.get("managed_owner") != owner:
+            raise KeyError("account not found")
+        # A successful route probe can re-enable a deliberately retained account;
+        # an image route failure must never invalidate a working Codex route.
+        changes = {"managed_updated_at": utc_now()}
+        if not account.get("managed_disabled") and account.get("codex_observation", {}).get("state") in {"observed", "limited"}:
+            changes["status"] = "正常"
+        account = self.update_account(token, changes, quiet=True)
         return public_owned_account(account)
 
     def set_owned_account_enabled(self, owner: str, account_id: str, enabled: bool) -> dict:
@@ -1461,7 +1471,7 @@ class AccountService:
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts and not account.get("managed_owner"):
+            if updates.get("status") == "限流" and account.get("status") == "限流" and config.auto_remove_rate_limited_accounts and not account.get("managed_owner"):
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
@@ -1580,6 +1590,14 @@ class AccountService:
             raise ValueError("access_token is required")
 
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        if (self.get_account(active_token) or {}).get("source_type") == "codex":
+            # Background refresh must use this authorization's actual route.
+            from services.codex_service import codex_service
+            observation = codex_service.refresh_account(active_token)
+            updates = {}
+            if observation.get("state") in {"observed", "limited"}:
+                updates["status"] = "正常"
+            return self.update_account(active_token, updates, quiet=True)
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             backend = OpenAIBackendAPI(active_token)

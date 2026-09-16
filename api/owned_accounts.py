@@ -1,7 +1,7 @@
 """Internal Workbench management bridge; never exposed by public AI ingress."""
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from api.support import require_admin
 from services.account_service import account_service
@@ -14,6 +14,7 @@ class ImportAccount(BaseModel):
     refresh_token: SecretStr | None = None
     id_token: SecretStr | None = None
     source_type: str = "web"
+    account_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,200}$")
 
 
 class EnabledAccount(BaseModel):
@@ -63,6 +64,12 @@ def create_router() -> APIRouter:
     async def enable_account(account_id: str, body: EnabledAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)
         return {"item": await account_operation(account_service.set_owned_account_enabled, owner, account_id, body.enabled)}
+
+    @router.get("/models")
+    async def models(authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        from services.codex_service import codex_service
+        return await run_in_threadpool(codex_service.management_models)
 
     @router.get("/keys")
     async def keys(authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
