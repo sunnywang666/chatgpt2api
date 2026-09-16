@@ -21,6 +21,10 @@ def normalized_base_url(value: str) -> str:
     parsed = urlsplit(value.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("provider base URL must be an absolute http(s) URL")
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("provider base URL must have a hostname and no embedded credentials")
+    if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("provider base URL requires HTTPS except for localhost, 127.0.0.1 or ::1 mocks")
     if parsed.query or parsed.fragment:
         raise ValueError("provider base URL must not contain a query or fragment")
     path = parsed.path.rstrip("/")

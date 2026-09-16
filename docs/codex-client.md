@@ -29,6 +29,8 @@ The bearer key is absent from that file. `launch_codex.py` reads `CODEX_PROVIDER
 
 The custom provider uses `request_max_retries = 0` and `stream_max_retries = 0` so an acceptance failure is reported to the operator. The launcher does not implement a high-level retry. It does not request or use any admin capability.
 
+Model discovery rejects redirects instead of forwarding the bearer key to a redirect destination. Use the final HTTPS provider Base URL directly. Plain HTTP is accepted only for the local mock hosts `localhost`, `127.0.0.1`, and `::1`; other hosts, embedded credentials, queries and fragments are rejected before discovery or configuration creation.
+
 ## macOS acceptance
 
 Obtain the ordinary provider key from the approved local secret source without echoing it. The following prompt keeps the value out of shell history and terminal output. Select the model after the list preflight:

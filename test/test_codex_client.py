@@ -40,6 +40,65 @@ class CodexClientTests(unittest.TestCase):
             normalized_base_url("example.test/v1")
         with self.assertRaises(ValueError):
             normalized_base_url("https://example.test/v1?key=not-allowed")
+        with self.assertRaises(ValueError):
+            normalized_base_url("https://user:password@example.test/v1")
+
+    def test_http_is_allowed_only_for_the_three_explicit_local_mock_hosts(self) -> None:
+        for host in ("localhost", "127.0.0.1", "[::1]"):
+            with self.subTest(host=host):
+                url = f"http://{host}:18787/v1"
+                self.assertEqual(normalized_base_url(url + "/"), url)
+
+    def test_nonlocal_http_is_rejected_before_network_or_config_creation(self) -> None:
+        for host in ("example.test", "192.168.1.2", "127.0.0.2", "localhost.example.test", "127.0.0.1@example.test"):
+            with self.subTest(host=host), TemporaryDirectory() as directory:
+                root = Path(directory)
+                url = f"http://{host}/v1"
+                with mock.patch("list_models.build_opener") as opener:
+                    with self.assertRaisesRegex(ValueError, "HTTPS|embedded credentials"):
+                        fetch_models(url, "fake-test-key")
+                    opener.assert_not_called()
+                with self.assertRaises(ValueError):
+                    prepare(root / "state", root / "fixture", url, "codex-test")
+                self.assertFalse((root / "state").exists())
+                self.assertFalse((root / "fixture").exists())
+
+    def test_model_preflight_never_follows_cross_origin_redirect_with_bearer(self) -> None:
+        received = []
+        origin_authorizations = []
+
+        class Receiver(_ModelsHandler):
+            def do_GET(self):
+                received.append(self.headers.get("authorization"))
+                super().do_GET()
+
+        receiver = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+
+        class Redirect(_ModelsHandler):
+            def do_GET(self):
+                origin_authorizations.append(self.headers.get("authorization"))
+                self.send_response(int(self.path.split("/")[1]))
+                self.send_header("Location", f"http://127.0.0.1:{receiver.server_port}/models")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        origin = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in (receiver, origin)]
+        for thread in threads:
+            thread.start()
+        try:
+            for status in (301, 302, 303, 307, 308):
+                with self.subTest(status=status):
+                    with self.assertRaisesRegex(RuntimeError, f"GET /models returned HTTP {status}"):
+                        fetch_models(f"http://127.0.0.1:{origin.server_port}/{status}", "fake-test-key")
+            self.assertEqual(origin_authorizations, ["Bearer fake-test-key"] * 5)
+            self.assertEqual(received, [])
+        finally:
+            for server in (origin, receiver):
+                server.shutdown()
+                server.server_close()
+            for thread in threads:
+                thread.join(timeout=2)
 
     def test_prepare_isolated_state_has_no_key_and_fixture_starts_broken(self) -> None:
         with TemporaryDirectory() as directory:

@@ -9,9 +9,15 @@ import os
 import sys
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from prepare_acceptance import DEFAULT_BASE_URL, normalized_base_url
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib otherwise forwards the bearer header to the Location origin.
+        return None
 
 
 def fetch_models(base_url: str, api_key: str, timeout: float = 20.0) -> list[str]:
@@ -22,7 +28,7 @@ def fetch_models(base_url: str, api_key: str, timeout: float = 20.0) -> list[str
         method="GET",
     )
     try:
-        with urlopen(request, timeout=timeout) as response:  # noqa: S310: caller supplied provider endpoint
+        with build_opener(_RejectRedirects()).open(request, timeout=timeout) as response:
             payload: Any = json.load(response)
     except HTTPError as error:
         raise RuntimeError(f"GET /models returned HTTP {error.code}") from error
