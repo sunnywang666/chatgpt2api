@@ -22,6 +22,9 @@ class TextRecoveryReason(str, Enum):
     CONVERSATION_NOT_FOUND = "CONVERSATION_NOT_FOUND"
 
 
+_ACTIVE_TEXT_RESULT_STATUSES = frozenset({"in_progress", "running", "pending", "queued"})
+
+
 class ConversationBindingError(RuntimeError):
     def __init__(
         self,
@@ -166,6 +169,25 @@ class ConversationBindingService:
             )
         mapping = document["mapping"]
         request_node = mapping.get(request_message_id)
+        result = {key: receipt[key] for key in (
+            "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id",
+        ) if key in receipt}
+        if request_message_id and request_node is None:
+            current_node_id = str(document.get("current_node") or "").strip()
+            current_node = mapping.get(current_node_id)
+            current_message = current_node.get("message") if isinstance(current_node, dict) else None
+            current_author = current_message.get("author") if isinstance(current_message, dict) else None
+            current_role = str(current_author.get("role") or "").strip().lower() \
+                if isinstance(current_author, dict) else ""
+            current_status = str(current_message.get("status") or "").strip().lower() \
+                if isinstance(current_message, dict) else ""
+            if current_role in {"assistant", "tool"} and current_status in _ACTIVE_TEXT_RESULT_STATUSES:
+                return {
+                    **result,
+                    "binding_status": "unknown",
+                    "status": "running",
+                    "recovery_reason": TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value,
+                }
         request_message = request_node.get("message") if isinstance(request_node, dict) else None
         request_author = request_message.get("author") if isinstance(request_message, dict) else None
         request_role = request_author.get("role") if isinstance(request_author, dict) else None
@@ -225,7 +247,7 @@ class ConversationBindingService:
             if role and role not in {"assistant", "tool"}:
                 continue
             status = str(message.get("status") or "").strip().lower()
-            if status in {"in_progress", "running", "pending", "queued"}:
+            if status in _ACTIVE_TEXT_RESULT_STATUSES:
                 active_result_seen = True
             if role == "assistant":
                 content = message.get("content") or {}
@@ -246,9 +268,6 @@ class ConversationBindingService:
                     terminal_empty_seen = True
             pending.extend(children.get(node_id, []))
 
-        result = {key: receipt[key] for key in (
-            "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id",
-        ) if key in receipt}
         if len(candidates) > 1:
             raise ConversationBindingError(
                 "multiple completed answers descend from the original request",
