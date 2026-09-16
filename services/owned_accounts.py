@@ -26,15 +26,18 @@ def observed_capacity(account: dict) -> dict:
 def public_owned_account(account: dict) -> dict:
     email = str(account.get("email") or "")
     local, sep, domain = email.partition("@")
+    from services.codex_service import codex_service
     capacity = observed_capacity(account)
+    codex = codex_service.account_projection(account)
     status = str(account.get("status") or "")
     return {
         "id": account["managed_account_id"],
         "label": f"{local[:1]}***@{domain}" if sep else "已接入账号",
         "source_type": account.get("source_type", "web"),
         "enabled": not bool(account.get("managed_disabled")),
-        "connection_status": "disabled" if account.get("managed_disabled") else "unavailable" if status in {"异常", "禁用"} else "connected" if capacity["observed_at"] else "unverified",
+        "connection_status": "disabled" if account.get("managed_disabled") else "unavailable" if status in {"异常", "禁用"} else "connected" if codex["state"] in {"observed", "limited"} or capacity["observed_at"] else "unverified",
         "capacity": capacity,
+        "codex": codex,
         "updated_at": account.get("managed_updated_at"),
     }
 
