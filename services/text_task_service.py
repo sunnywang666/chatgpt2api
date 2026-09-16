@@ -20,7 +20,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from services.config import DATA_DIR
-from services.conversation_binding_service import ConversationBindingError, conversation_binding_service
+from services.conversation_binding_service import (
+    ConversationBindingError,
+    TextRecoveryReason,
+    conversation_binding_service,
+)
 
 
 class ContinuationExecutor:
@@ -85,6 +89,7 @@ class TextTaskService:
         # receipt. Only the recovered answer/cursor may advance.
         "content", "parent_message_id", "binding_status",
     })
+    _SAFE_RECOVERY_REASONS = frozenset(reason.value for reason in TextRecoveryReason)
 
     def __init__(self, path: Path, runner=None, executor=None, *, clock=None, recovery_reader=None):
         self.path = path
@@ -132,9 +137,14 @@ class TextTaskService:
         return code if code in cls._SAFE_RECOVERY_CODES else "RECOVERY_READ_FAILED"
 
     @classmethod
+    def _safe_recovery_reason(cls, value):
+        raw = value.value if isinstance(value, TextRecoveryReason) else str(value or "").strip().upper()
+        return raw if raw in cls._SAFE_RECOVERY_REASONS else None
+
+    @classmethod
     def _safe_recovery_result(cls, recovered):
         if not isinstance(recovered, dict):
-            return None, "RECOVERY_INVALID_RESULT", "read_text_result"
+            return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
         status = recovered.get("status")
         if status == "succeeded":
             content = recovered.get("content")
@@ -142,13 +152,13 @@ class TextTaskService:
             if (recovered.get("binding_status") != "bound"
                     or not isinstance(content, str) or not content.strip()
                     or not isinstance(parent_message_id, str) or not parent_message_id.strip()):
-                return None, "RECOVERY_INVALID_RESULT", "read_text_result"
-            return {key: recovered[key] for key in cls._SUCCESS_RECOVERY_FIELDS if key in recovered}, None, None
+                return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+            return {key: recovered[key] for key in cls._SUCCESS_RECOVERY_FIELDS if key in recovered}, None, None, None
         if status in {"running", "unknown"}:
-            return None, "UPSTREAM_OUTCOME_UNKNOWN", "read_text_result"
-        return None, "RECOVERY_INVALID_RESULT", "read_text_result"
+            return None, "UPSTREAM_OUTCOME_UNKNOWN", "read_text_result", cls._safe_recovery_reason(recovered.get("recovery_reason"))
+        return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
 
-    def _finish_recovery(self, owner, request_id, claim_id, recovered=None, error_code=None, phase=None):
+    def _finish_recovery(self, owner, request_id, claim_id, recovered=None, error_code=None, phase=None, recovery_reason=None):
         now = self._now()
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -168,6 +178,7 @@ class TextTaskService:
                     "recovery_next_at": now + self._recovery_backoff(attempt),
                     "recovery_error_code": error_code,
                     "recovery_phase": phase or "read_text_request",
+                    "recovery_reason": recovery_reason,
                 }
             else:
                 changes = {
@@ -178,6 +189,7 @@ class TextTaskService:
                     "recovery_next_at": None,
                     "recovery_error_code": None,
                     "recovery_phase": None,
+                    "recovery_reason": None,
                 }
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
@@ -231,6 +243,7 @@ class TextTaskService:
                         "recovery_lease_until": now + self.RECOVERY_LEASE_SECONDS,
                         "recovery_error_code": None,
                         "recovery_phase": "read_text_request",
+                        "recovery_reason": None,
                         "updated_at": now,
                     }
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
@@ -240,19 +253,21 @@ class TextTaskService:
         if recovery_claim:
             try:
                 recovered = self.recovery_reader(recovery_claim[1])
-                safe_result, error_code, phase = self._safe_recovery_result(recovered)
-                return self._finish_recovery(owner, request_id, recovery_claim[0], safe_result, error_code, phase)
+                safe_result, error_code, phase, recovery_reason = self._safe_recovery_result(recovered)
+                return self._finish_recovery(owner, request_id, recovery_claim[0], safe_result, error_code, phase, recovery_reason)
             except ConversationBindingError as exc:
                 return self._finish_recovery(owner, request_id, recovery_claim[0],
                                              error_code=self._safe_recovery_code(exc),
-                                             phase="read_text_request")
+                                             phase="read_text_request",
+                                             recovery_reason=self._safe_recovery_reason(getattr(exc, "recovery_reason", "")))
             except Exception:
                 # Never persist exception text: it may contain a token, prompt,
                 # or provider response. The next bounded recovery window is
                 # enough to make the request retryable without hammering GET.
                 return self._finish_recovery(owner, request_id, recovery_claim[0],
                                              error_code="RECOVERY_READ_FAILED",
-                                             phase="read_text_request")
+                                             phase="read_text_request",
+                                             recovery_reason=None)
         return self._public(json.loads(row[0]))
 
     def _update(self, owner, request_id, **changes):
@@ -274,6 +289,7 @@ class TextTaskService:
         request_hash = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         receipt = {"request_id": request_id, "client_conversation_id": body["client_conversation_id"],
                    "request_message_id": str(uuid.uuid4()),
+                   "request_parent_message_id": str(body.get("parent_message_id") or "").strip(),
                    "status": "queued", "boot": self.boot, "created_at": self._now(), "updated_at": self._now()}
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from services import account_request_pacing as pacing
 
 from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
-from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
+from services.conversation_binding_service import ConversationBindingError, ConversationBindingService, TextRecoveryReason
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -573,6 +573,158 @@ class TextResultRecoveryTests(unittest.TestCase):
                 "status": "finished_successfully", "end_turn": True, "channel": "final",
                 "content": {"content_type": "text", "parts": ['{"name_ru":"Набор"}']}}},
         }}
+
+    def request_receipt(self, **changes):
+        receipt = {
+            "provider_binding_id": "binding-one",
+            "provider_account_identity": "account-one",
+            "client_conversation_id": "client-one",
+            "conversation_id": "conversation-one",
+            "parent_message_id": "prior-answer",
+            "request_message_id": "request-user",
+        }
+        receipt.update(changes)
+        return receipt
+
+    def request_document(self):
+        return {
+            "conversation_id": "conversation-one",
+            "current_node": "later-answer",
+            "mapping": {
+                "request-user": {
+                    "parent": "prior-answer",
+                    "message": {"id": "request-user", "author": {"role": "user"}},
+                },
+                "original-answer": {
+                    "parent": "request-user",
+                    "message": {
+                        "id": "original-answer", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True, "channel": "final",
+                        "content": {"content_type": "text", "parts": ["original answer"]},
+                    },
+                },
+                "later-user": {
+                    "parent": "original-answer",
+                    "message": {"id": "later-user", "author": {"role": "user"}},
+                },
+                "later-answer": {
+                    "parent": "later-user",
+                    "message": {
+                        "id": "later-answer", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True, "channel": "final",
+                        "content": {"content_type": "text", "parts": ["later answer"]},
+                    },
+                },
+            },
+        }
+
+    def test_request_recovery_reads_completed_original_after_later_user_turn(self):
+        backend = mock.Mock()
+        backend._get_conversation.return_value = self.request_document()
+        result = ConversationBindingService._read_text_request_result(backend, self.request_receipt())
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["content"], "original answer")
+        self.assertEqual(result["parent_message_id"], "original-answer")
+        self.assertNotEqual(result["parent_message_id"], "later-answer")
+
+    def test_request_recovery_uses_persisted_request_parent_after_timeout_cursor_advance(self):
+        backend = mock.Mock()
+        backend._get_conversation.return_value = self.request_document()
+        receipt = self.request_receipt(request_parent_message_id="prior-answer", parent_message_id="later-answer")
+        result = ConversationBindingService._read_text_request_result(backend, receipt)
+        self.assertEqual(result["content"], "original answer")
+        self.assertEqual(receipt["parent_message_id"], "later-answer")
+
+    def test_request_recovery_keeps_divergent_sibling_finals_unknown(self):
+        document = self.request_document()
+        for node_id in ("later-user", "later-answer"):
+            document["mapping"].pop(node_id)
+        document["current_node"] = "answer-b"
+        for node_id, text in (("answer-a", "branch A"), ("answer-b", "branch B")):
+            document["mapping"][node_id] = {
+                "parent": "request-user",
+                "message": {
+                    "id": node_id, "author": {"role": "assistant"},
+                    "status": "finished_successfully", "end_turn": True, "channel": "final",
+                    "content": {"content_type": "text", "parts": [text]},
+                },
+            }
+        backend = mock.Mock()
+        backend._get_conversation.return_value = document
+        with self.assertRaises(ConversationBindingError) as captured:
+            ConversationBindingService._read_text_request_result(backend, self.request_receipt())
+        self.assertEqual(captured.exception.code, "CONVERSATION_BINDING_MISMATCH")
+        self.assertEqual(captured.exception.recovery_reason, TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value)
+
+    def test_request_recovery_rejects_missing_anchor_and_parent_drift(self):
+        document = self.request_document()
+        document["mapping"].pop("request-user")
+        backend = mock.Mock()
+        backend._get_conversation.return_value = document
+        with self.assertRaises(ConversationBindingError) as missing:
+            ConversationBindingService._read_text_request_result(backend, self.request_receipt())
+        self.assertEqual(missing.exception.recovery_reason, TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value)
+
+        document = self.request_document()
+        backend._get_conversation.return_value = document
+        with self.assertRaises(ConversationBindingError) as drift:
+            ConversationBindingService._read_text_request_result(
+                backend, self.request_receipt(parent_message_id="different-parent")
+            )
+        self.assertEqual(drift.exception.recovery_reason, TextRecoveryReason.REQUEST_PARENT_MISMATCH.value)
+
+    def test_request_recovery_account_and_conversation_mismatch_are_distinct(self):
+        service = ConversationBindingService()
+        receipt = self.request_receipt()
+        with mock.patch(
+            "services.conversation_binding_service.account_service.get_bound_account_identity",
+            return_value="other-account",
+        ):
+            with self.assertRaises(ConversationBindingError) as account:
+                service.read_text_request(receipt)
+        self.assertEqual(account.exception.code, "CONVERSATION_BINDING_MISMATCH")
+        self.assertEqual(account.exception.recovery_reason, TextRecoveryReason.ACCOUNT_IDENTITY_MISMATCH.value)
+
+        backend = mock.Mock()
+        document = self.request_document()
+        document["conversation_id"] = "other-conversation"
+        backend._get_conversation.return_value = document
+        with (
+            mock.patch(
+                "services.conversation_binding_service.account_service.get_bound_account_identity",
+                return_value="account-one",
+            ),
+            mock.patch(
+                "services.conversation_binding_service.account_service.get_bound_text_access_token",
+                return_value="synthetic-token",
+            ),
+            mock.patch(
+                "services.conversation_binding_service.account_service.conversation_binding_lock",
+                return_value=nullcontext(),
+            ),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+        ):
+            with self.assertRaises(ConversationBindingError) as conversation:
+                service.read_text_request(receipt)
+        self.assertEqual(conversation.exception.code, "CONVERSATION_BINDING_MISMATCH")
+        self.assertEqual(conversation.exception.recovery_reason, TextRecoveryReason.CONVERSATION_ID_MISMATCH.value)
+
+    def test_request_recovery_empty_or_in_progress_original_answer_stays_unknown(self):
+        for patch in (
+            {"status": "in_progress"},
+            {"content": {"content_type": "text", "parts": []}},
+        ):
+            document = self.request_document()
+            document["mapping"].pop("later-user")
+            document["mapping"].pop("later-answer")
+            document["current_node"] = "original-answer"
+            document["mapping"]["original-answer"]["message"].update(patch)
+            backend = mock.Mock()
+            backend._get_conversation.return_value = document
+            result = ConversationBindingService._read_text_request_result(backend, self.request_receipt())
+            self.assertEqual(result["status"], "running")
+            self.assertEqual(result["recovery_reason"], TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value)
+            self.assertNotIn("content", result)
 
     def test_read_only_completed_answer_and_scope_checks(self):
         backend = mock.Mock()
