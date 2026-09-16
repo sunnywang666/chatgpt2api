@@ -60,6 +60,24 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(len(self.queue.calls), 0)
         self.assertEqual(restarted.read("other-owner", "attempt-1")["status"], "not_found")
 
+    def test_timeout_cursor_does_not_replace_original_request_parent(self):
+        captured = []
+        def runner(body, on_cursor):
+            on_cursor({"provider_binding_id": "binding", "provider_account_identity": "account", "conversation_id": "chat"})
+            raise ConversationBindingError("timeout", code="CONVERSATION_OUTCOME_UNKNOWN",
+                                           parent_message_id="later-cursor")
+        def reader(receipt):
+            captured.append(receipt)
+            return {"status": "running"}
+        service = TextTaskService(self.path, runner, self.queue, recovery_reader=reader)
+        service.submit("owner", {**self.body, "parent_message_id": "original-parent"})
+        self.queue.run()
+        result = service.read("owner", "attempt-1")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(captured[0]["parent_message_id"], "later-cursor")
+        self.assertEqual(captured[0]["request_parent_message_id"], "original-parent")
+        self.assertEqual(len(self.queue.calls), 0)
+
     def test_concurrent_same_request_is_scheduled_once_and_changed_input_conflicts(self):
         service = TextTaskService(self.path, executor=self.queue)
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -161,16 +179,34 @@ class TextTaskTests(unittest.TestCase):
             {"status": "succeeded", "content": "answer", "parent_message_id": "answer", "binding_status": "unknown"},
         ]
         for invalid in invalid_results:
-            safe_result, error_code, phase = service._safe_recovery_result(invalid)
+            safe_result, error_code, phase, recovery_reason = service._safe_recovery_result(invalid)
             self.assertIsNone(safe_result)
             self.assertEqual(error_code, "RECOVERY_INVALID_RESULT")
             self.assertEqual(phase, "read_text_result")
-        safe_result, error_code, phase = service._safe_recovery_result(
+            self.assertIsNone(recovery_reason)
+        safe_result, error_code, phase, recovery_reason = service._safe_recovery_result(
             {"status": "succeeded", "content": "answer", "parent_message_id": "answer", "binding_status": "bound"}
         )
         self.assertEqual(safe_result, {"content": "answer", "parent_message_id": "answer", "binding_status": "bound"})
         self.assertIsNone(error_code)
         self.assertIsNone(phase)
+        self.assertIsNone(recovery_reason)
+
+    def test_safe_request_recovery_reason_is_persisted_without_exception_text(self):
+        clock = ManualClock()
+
+        def reader(receipt):
+            return {"status": "running", "recovery_reason": "REQUEST_RESULT_INCOMPLETE"}
+
+        service = TextTaskService(self.path, executor=self.queue, clock=clock, recovery_reader=reader)
+        service.submit("owner", self.body)
+        service._update("owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                        provider_binding_id="binding", provider_account_identity="account",
+                        conversation_id="chat")
+        result = service.read("owner", "attempt-1")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["recovery_reason"], "REQUEST_RESULT_INCOMPLETE")
+        self.assertEqual(result["recovery_error_code"], "UPSTREAM_OUTCOME_UNKNOWN")
 
     def test_late_runner_updates_cannot_regress_recovered_success(self):
         clock = ManualClock()

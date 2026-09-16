@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.conversation import conversation_events
+
+
+class TextRecoveryReason(str, Enum):
+    ACCOUNT_IDENTITY_MISMATCH = "ACCOUNT_IDENTITY_MISMATCH"
+    CONVERSATION_ID_MISMATCH = "CONVERSATION_ID_MISMATCH"
+    REQUEST_MESSAGE_NOT_FOUND = "REQUEST_MESSAGE_NOT_FOUND"
+    REQUEST_PARENT_MISMATCH = "REQUEST_PARENT_MISMATCH"
+    REQUEST_BRANCH_AMBIGUOUS = "REQUEST_BRANCH_AMBIGUOUS"
+    REQUEST_BRANCH_SUPERSEDED = "REQUEST_BRANCH_SUPERSEDED"
+    REQUEST_RESULT_INCOMPLETE = "REQUEST_RESULT_INCOMPLETE"
 
 
 class ConversationBindingError(RuntimeError):
@@ -17,6 +28,7 @@ class ConversationBindingError(RuntimeError):
         provider_account_identity: str = "",
         conversation_id: str = "",
         parent_message_id: str = "",
+        recovery_reason: str = "",
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -24,6 +36,7 @@ class ConversationBindingError(RuntimeError):
         self.provider_account_identity = provider_account_identity
         self.conversation_id = conversation_id
         self.parent_message_id = parent_message_id
+        self.recovery_reason = recovery_reason
 
 
 class ConversationBindingService:
@@ -44,15 +57,16 @@ class ConversationBindingService:
         """Recover only the answer descending from this request's own user turn."""
         binding = receipt["provider_binding_id"]
         if account_service.get_bound_account_identity(binding) != receipt["provider_account_identity"]:
-            raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
+            raise ConversationBindingError(
+                "provider account identity changed",
+                code="CONVERSATION_BINDING_MISMATCH",
+                recovery_reason=TextRecoveryReason.ACCOUNT_IDENTITY_MISMATCH.value,
+            )
         token = account_service.get_bound_text_access_token(binding, model="auto")
         with account_service.conversation_binding_lock(binding, receipt["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:
-                # The existing reader checks branch ancestry and refuses a
-                # later user turn; anchoring at OUR user message excludes the
-                # previous assistant answer and any unrelated newer answer.
-                return self._read_text_result(backend, {**receipt, "parent_message_id": receipt["request_message_id"]})
+                return self._read_text_request_result(backend, receipt)
             finally:
                 backend.close()
 
@@ -107,6 +121,132 @@ class ConversationBindingService:
         if not text:
             return {**result, "binding_status": "unknown", "status": "running"}
         return {**result, "binding_status": "bound", "status": "succeeded", "parent_message_id": current, "content": text}
+
+    @staticmethod
+    def _read_text_request_result(backend: OpenAIBackendAPI, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Read the exact request branch without requiring it to be current.
+
+        A later user turn can make the original request no longer reachable
+        from ``current_node`` even though its completed answer is still in the
+        conversation mapping. This reader starts at the persisted request user
+        node, walks only assistant/tool descendants, and stops at later user
+        nodes. It never changes the receipt's binding or cursor.
+        """
+        conversation_id = str(receipt.get("conversation_id") or "").strip()
+        request_message_id = str(receipt.get("request_message_id") or "").strip()
+        document = backend._get_conversation(conversation_id)
+        returned_conversation_id = str(document.get("conversation_id") or conversation_id).strip()
+        if returned_conversation_id != conversation_id:
+            raise ConversationBindingError(
+                "conversation identity changed",
+                code="CONVERSATION_BINDING_MISMATCH",
+                conversation_id=returned_conversation_id,
+                recovery_reason=TextRecoveryReason.CONVERSATION_ID_MISMATCH.value,
+            )
+
+        mapping = document.get("mapping") or {}
+        request_node = mapping.get(request_message_id) if isinstance(mapping, dict) else None
+        request_message = request_node.get("message") if isinstance(request_node, dict) else None
+        request_author = request_message.get("author") if isinstance(request_message, dict) else None
+        request_role = request_author.get("role") if isinstance(request_author, dict) else None
+        if (not request_message_id or not isinstance(request_node, dict)
+                or not isinstance(request_message, dict)
+                or request_message.get("id") != request_message_id
+                or request_role != "user"):
+            raise ConversationBindingError(
+                "original request user turn is missing",
+                code="CONVERSATION_BINDING_MISMATCH",
+                conversation_id=conversation_id,
+                recovery_reason=TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
+            )
+
+        expected_parent = str(receipt.get("request_parent_message_id", receipt.get("parent_message_id")) or "").strip()
+        request_parent = str(request_node.get("parent") or "").strip()
+        if expected_parent and request_parent != expected_parent:
+            raise ConversationBindingError(
+                "original request parent changed",
+                code="CONVERSATION_BINDING_MISMATCH",
+                conversation_id=conversation_id,
+                parent_message_id=request_parent,
+                recovery_reason=TextRecoveryReason.REQUEST_PARENT_MISMATCH.value,
+            )
+
+        children: dict[str, list[str]] = {}
+        for raw_node_id, raw_node in mapping.items():
+            if not isinstance(raw_node, dict):
+                continue
+            node_id = str(raw_node_id)
+            parent = str(raw_node.get("parent") or "").strip()
+            if parent:
+                children.setdefault(parent, []).append(node_id)
+
+        candidates: list[tuple[str, str]] = []
+        visited: set[str] = set()
+        later_user_seen = False
+        pending = list(children.get(request_message_id, []))
+        while pending:
+            node_id = pending.pop()
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            node = mapping.get(node_id)
+            if not isinstance(node, dict):
+                continue
+            message = node.get("message") or {}
+            if not isinstance(message, dict):
+                message = {}
+            author = message.get("author") or {}
+            role = str(author.get("role") or "").strip().lower() if isinstance(author, dict) else ""
+            if role == "user":
+                later_user_seen = True
+                continue
+            if role and role not in {"assistant", "tool"}:
+                continue
+            if role == "assistant":
+                content = message.get("content") or {}
+                parts = content.get("parts") if isinstance(content, dict) else None
+                text = "".join(parts).strip() if (
+                    message.get("id") == node_id
+                    and message.get("status") == "finished_successfully"
+                    and message.get("end_turn") is True
+                    and message.get("channel") in (None, "final")
+                    and isinstance(parts, list)
+                    and parts
+                    and all(isinstance(part, str) for part in parts)
+                    and content.get("content_type") == "text"
+                ) else ""
+                if text:
+                    candidates.append((node_id, text))
+            pending.extend(children.get(node_id, []))
+
+        result = {key: receipt[key] for key in (
+            "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id",
+        ) if key in receipt}
+        if len(candidates) > 1:
+            raise ConversationBindingError(
+                "multiple completed answers descend from the original request",
+                code="CONVERSATION_BINDING_MISMATCH",
+                conversation_id=conversation_id,
+                recovery_reason=TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value,
+            )
+        if not candidates:
+            return {
+                **result,
+                "binding_status": "unknown",
+                "status": "running",
+                "recovery_reason": (
+                    TextRecoveryReason.REQUEST_BRANCH_SUPERSEDED.value
+                    if later_user_seen else TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
+                ),
+            }
+        parent_message_id, text = candidates[0]
+        return {
+            **result,
+            "binding_status": "bound",
+            "status": "succeeded",
+            "parent_message_id": parent_message_id,
+            "content": text,
+        }
 
     def complete_text(self, body: dict[str, Any], *, on_cursor=None) -> dict[str, Any]:
         binding_id = str(body.get("provider_binding_id") or "").strip()
