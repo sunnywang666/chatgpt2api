@@ -907,7 +907,9 @@ class CodexService:
             attempted = True
             response = session.post(
                 CODEX_COMPACT_URL if compact else CODEX_RESPONSES_URL,
-                content=raw,
+                # curl-cffi 0.15.0 in uv.lock accepts raw bytes via data=;
+                # content= is a newer API and fails before transport on 0.15.
+                data=raw,
                 headers=headers,
                 timeout=(10, MAX_STREAM_SECONDS),
                 allow_redirects=False,
