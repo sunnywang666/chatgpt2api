@@ -11,7 +11,7 @@ import api.image_tasks as image_tasks_module
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
-PNG_BYTES = b"\x89PNG\r\n\x1a\n"
+PNG_BYTES = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGPkEpFjYGBgYgADAALmAEAUQs4PAAAAAElFTkSuQmCC")
 DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
 
 
@@ -126,8 +126,8 @@ class ImageTasksApiTests(unittest.TestCase):
             headers=AUTH_HEADERS,
             data={"client_task_id": "edit-1", "prompt": "edit", "model": "gpt-image-2"},
             files=[
-                ("image", ("one.png", b"one", "image/png")),
-                ("image", ("two.png", b"two", "image/png")),
+                ("image", ("one.png", PNG_BYTES, "image/png")),
+                ("image", ("two.png", PNG_BYTES, "image/png")),
             ],
         )
 

@@ -226,7 +226,7 @@ class AccountService:
             normalized["export_type"] = "codex"
             normalized.pop("type", None)
         normalized["type"] = normalized.get("type") or "free"
-        normalized["status"] = normalized.get("status") or "正常"
+        normalized["status"] = "禁用" if normalized.get("managed_disabled") else normalized.get("status") or "正常"
         normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
@@ -926,7 +926,7 @@ class AccountService:
         return [
             token
             for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-            if int(self._image_inflight.get(token, 0)) < max_concurrency
+            if int(self._image_inflight.get(token, 0)) < min(max_concurrency, int(self._accounts[token].get("quota") or 0))
         ]
 
     def _acquire_next_candidate_token(
@@ -968,6 +968,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            excluded_tokens: set[str] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -975,7 +976,7 @@ class AccountService:
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
         max_attempts = 20  # 防止无限循环
-        attempted_tokens: set[str] = set()
+        attempted_tokens: set[str] = set(excluded_tokens or ())
         for _attempt in range(max_attempts):
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
@@ -1074,7 +1075,7 @@ class AccountService:
             ("plus", "team", "pro") if codex_model and not plan_type else None,
         )
 
-    def create_conversation_binding(self, *, image_model: str, text_model: str = "auto") -> tuple[str, str, str]:
+    def create_conversation_binding(self, *, image_model: str, text_model: str = "auto", excluded_account_identities: set[str] | None = None) -> tuple[str, str, str]:
         plan_type, source_type, plan_types = self._image_route(image_model)
         # Product conversations must never fall back to a Free account.
         paid_types = {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
@@ -1091,11 +1092,12 @@ class AccountService:
             if not allowed or (plan_type and self._normalize_account_type(plan_type) not in allowed):
                 raise RuntimeError("conversation binding unavailable: no account supports both text and images")
             plan_types = allowed
-        access_token = self.get_available_access_token(
-            plan_type=plan_type,
-            source_type=source_type,
-            plan_types=plan_types,
-        )
+        selection = dict(plan_type=plan_type, source_type=source_type, plan_types=plan_types)
+        if excluded_account_identities:
+            with self._lock:
+                selection["excluded_tokens"] = {token for token, item in self._accounts.items()
+                                                if item.get("provider_account_identity") in excluded_account_identities}
+        access_token = self.get_available_access_token(**selection)
         with self._lock:
             binding_id = self._conversation_binding_for_token_locked(access_token)
             account_identity = self._provider_account_identity_for_token_locked(access_token)
@@ -1126,7 +1128,7 @@ class AccountService:
                         or not self._account_matches_source_type(account, source_type)
                 ):
                     raise RuntimeError("conversation binding unavailable: bound account cannot generate images")
-                if int(self._image_inflight.get(access_token, 0)) < max_concurrency:
+                if int(self._image_inflight.get(access_token, 0)) < min(max_concurrency, int(account.get("quota") or 0)):
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
@@ -1207,7 +1209,8 @@ class AccountService:
             self._save_accounts()
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
-        if not config.auto_remove_invalid_accounts:
+        managed = bool((self.get_account(access_token) or {}).get("managed_owner"))
+        if managed or not config.auto_remove_invalid_accounts:
             self.update_account(access_token, {"status": "异常", "quota": 0}, quiet=quiet)
             return False
         removed = bool(self.delete_accounts([access_token])["removed"])
@@ -1240,6 +1243,83 @@ class AccountService:
                 account["image_inflight"] = int(self._image_inflight.get(token, 0))
                 result.append(account)
             return result
+
+    def list_owned_accounts(self, owner: str) -> list[dict]:
+        from services.owned_accounts import public_owned_account
+        with self._lock:
+            return [public_owned_account(a) for a in self._accounts.values()
+                    if a.get("managed_owner") == owner and a.get("managed_account_id")]
+
+    def import_owned_account(self, owner: str, payload: dict) -> dict:
+        from services.owned_accounts import public_owned_account, utc_now
+        # Only existing token-based import is offered. Imported metadata cannot
+        # assign ownership, quotas, status, proxy settings or a session binding.
+        token = str(payload.get("access_token") or "").strip()
+        if not token:
+            raise ValueError("access_token is required")
+        with self._lock:
+            token = self._resolve_access_token_locked(token)
+            current = self._accounts.get(token)
+            if current and current.get("managed_owner") != owner:
+                raise ValueError("account already exists outside your account scope")
+            item = dict(current or {})
+            item.update({key: str(payload[key]).strip() for key in ("refresh_token", "id_token") if payload.get(key)})
+            item.update(access_token=token, managed_owner=owner,
+                        managed_account_id=item.get("managed_account_id") or uuid.uuid4().hex,
+                        managed_updated_at=utc_now())
+            if not current:
+                item["source_type"] = "codex" if payload.get("source_type") == "codex" else "web"
+            account = self._normalize_account(item)
+            self._accounts[token] = account
+            self._save_accounts()
+            return public_owned_account(account)
+
+    def _owned_token(self, owner: str, account_id: str) -> str:
+        with self._lock:
+            for token, account in self._accounts.items():
+                if account.get("managed_owner") == owner and account.get("managed_account_id") == account_id:
+                    return token
+        raise KeyError("account not found")
+
+    def refresh_owned_account(self, owner: str, account_id: str) -> dict:
+        from services.owned_accounts import public_owned_account, utc_now
+        token = self._owned_token(owner, account_id)
+        try:
+            account = self.fetch_remote_info(token, "workbench_account_refresh")
+            if account is None:
+                raise RuntimeError("account unavailable")
+        except Exception:
+            with self._lock:
+                resolved = self._resolve_access_token_locked(token)
+                current = self._accounts.get(resolved)
+                if current and current.get("managed_owner") == owner:
+                    current["capacity_read_failed_at"] = utc_now()
+                    current["managed_updated_at"] = utc_now()
+                    self._save_accounts()
+                    return public_owned_account(current)
+            raise KeyError("account not found") from None
+        return public_owned_account(account)
+
+    def set_owned_account_enabled(self, owner: str, account_id: str, enabled: bool) -> dict:
+        from services.owned_accounts import public_owned_account, utc_now
+        token = self._owned_token(owner, account_id)
+        with self._lock:
+            token = self._resolve_access_token_locked(token)
+            current = self._accounts.get(token)
+            if not current or current.get("managed_owner") != owner:
+                raise KeyError("account not found")
+            item = dict(current)
+            item["managed_disabled"] = not enabled
+            item["managed_updated_at"] = utc_now()
+            # Re-enabling requires an explicit successful refresh before it can
+            # supply new work. Existing receipts and account secrets stay put.
+            item["status"] = "禁用"
+            if enabled:
+                item["quota"] = 0
+            self._accounts[token] = item
+            self._save_accounts()
+            self._image_slot_condition.notify_all()
+            return public_owned_account(item)
 
     def list_limited_tokens(self) -> list[str]:
         with self._lock:
@@ -1381,7 +1461,7 @@ class AccountService:
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
+            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts and not account.get("managed_owner"):
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
@@ -1465,6 +1545,7 @@ class AccountService:
             if current is None:
                 return None
             next_item = dict(current)
+            next_item["capacity_used_since_observation"] = True
             next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
@@ -1479,7 +1560,7 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is None:
                 return None
-            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
+            if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts and not account.get("managed_owner"):
                 self._accounts.pop(access_token, None)
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
@@ -1534,6 +1615,11 @@ class AccountService:
                 ):
                     self.remove_invalid_token(active_token, event)
                 raise
+        from services.owned_accounts import utc_now
+        result["capacity_observed_at"] = utc_now()
+        result["capacity_used_since_observation"] = False
+        result["capacity_read_failed_at"] = None
+        result["managed_updated_at"] = utc_now()
         self._record_refresh_success(active_token)
         return self.update_account(active_token, result)
 

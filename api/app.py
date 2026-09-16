@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import os
 from threading import Event
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from api import accounts, ai, image_tasks, system
+from api import accounts, ai, external_images, image_tasks, owned_accounts, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
@@ -35,16 +36,33 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
+    # Keep the image boundary outside the routers so a public marker can never
+    # reach an unallowlisted route. Register it before CORS; Starlette builds
+    # middleware from the reverse registration order, making CORS handle
+    # browser preflights before the boundary evaluates the actual request.
+    app.middleware("http")(external_images.external_image_boundary)
+
+    configured_origins = os.getenv("CHATGPT2API_CORS_ORIGINS")
+    if configured_origins is None:
+        configured_origins = config.data.get("cors_origins", [])
+    if isinstance(configured_origins, str):
+        cors_origins = [item.strip() for item in configured_origins.split(",") if item.strip()]
+    elif isinstance(configured_origins, (list, tuple)):
+        cors_origins = [str(item).strip() for item in configured_origins if str(item).strip()]
+    else:
+        cors_origins = []
+    cors_origins = [origin for origin in cors_origins if origin != "*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=cors_origins,
         allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Workbench-Image-Client", "X-Workbench-Account-Owner"],
     )
     app.include_router(ai.create_router())
     app.include_router(accounts.create_router())
     app.include_router(image_tasks.create_router())
+    app.include_router(owned_accounts.create_router())
     app.include_router(system.create_router(app_version))
 
     @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)

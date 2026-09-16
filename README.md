@@ -31,6 +31,8 @@
 
 ## 快速开始
 
+现有 Workbench 的普通密钥接入、持久任务与可恢复 Python 示例见 [外部生图客户端说明](docs/external-image-client.md)。部署与真实调用状态以该说明的核验记录为准。
+
 ### Docker 运行
 
 ```bash

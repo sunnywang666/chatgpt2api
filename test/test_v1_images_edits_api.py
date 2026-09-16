@@ -11,7 +11,7 @@ import api.ai as ai_module
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
-PNG_BYTES = b"\x89PNG\r\n\x1a\n"
+PNG_BYTES = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGPkEpFjYGBgYgADAALmAEAUQs4PAAAAAElFTkSuQmCC")
 DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
 
 
