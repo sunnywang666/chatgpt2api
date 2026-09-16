@@ -714,10 +714,13 @@ class CodexService:
                 self._mark_observation_state(token, "auth_required", f"codex_http_{status}")
         except Exception:
             pass
-        known_terminal = not post or status < 500
+        # A timeout response does not prove that the non-idempotent POST was
+        # rejected before execution. Keep its session quarantined like a 5xx.
+        unknown_outcome = post and (status == 408 or status >= 500)
+        known_terminal = not unknown_outcome
         self._release_account(token, affinity, known_terminal=known_terminal)
         self._capacity.release()
-        if post and status >= 500:
+        if unknown_outcome:
             return CodexServiceError(502, "codex_upstream_outcome_unknown", "The Codex request outcome is unknown")
         if status == 429:
             return CodexServiceError(429, "codex_limited", "The selected Codex account is temporarily limited")
@@ -794,6 +797,7 @@ class CodexService:
         token: str,
         owner: str,
         finish: Callable[[bool], None],
+        terminal_seen: threading.Event,
     ) -> Iterator[bytes]:
         started = self._clock()
         total = 0
@@ -812,6 +816,8 @@ class CodexService:
                     line, buffer = buffer.split(b"\n", 1)
                     is_terminal, response_id = self._terminal_from_line(line.rstrip(b"\r"))
                     terminal = terminal or is_terminal
+                    if is_terminal:
+                        terminal_seen.set()
                     if response_id:
                         digest = hashlib.sha256(response_id.encode("utf-8")).hexdigest()
                         self._persist_mapping(token, "codex_response_ids", digest, {
@@ -821,6 +827,8 @@ class CodexService:
             if buffer:
                 is_terminal, response_id = self._terminal_from_line(buffer.rstrip(b"\r"))
                 terminal = terminal or is_terminal
+                if is_terminal:
+                    terminal_seen.set()
                 if response_id:
                     digest = hashlib.sha256(response_id.encode("utf-8")).hexdigest()
                     self._persist_mapping(token, "codex_response_ids", digest, {
@@ -832,6 +840,7 @@ class CodexService:
     def _managed_stream(self, response, token: str, affinity: str, owner: str, session) -> ManagedCodexStream:
         cleanup_lock = threading.Lock()
         cleaned = False
+        terminal_seen = threading.Event()
 
         def finish(known_terminal: bool) -> None:
             nonlocal cleaned
@@ -847,11 +856,14 @@ class CodexService:
                 session.close()
             except Exception:
                 pass
-            self._release_account(token, affinity, known_terminal=known_terminal)
+            # close() can run while the generator is suspended after yielding
+            # its terminal chunk. Preserve the evidence already parsed, even
+            # when abort cleanup wins over the generator's finally block.
+            self._release_account(token, affinity, known_terminal=known_terminal or terminal_seen.is_set())
             self._capacity.release()
 
         return ManagedCodexStream(
-            lambda: self._stream_bytes(response, token, owner, finish),
+            lambda: self._stream_bytes(response, token, owner, finish, terminal_seen),
             lambda: finish(False),
         )
 

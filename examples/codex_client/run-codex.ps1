@@ -17,7 +17,7 @@ if ([string]::IsNullOrWhiteSpace($env:CODEX_PROVIDER_API_KEY)) {
 
 $python = Get-Command python -ErrorAction SilentlyContinue
 if ($null -eq $python) { $python = Get-Command py -ErrorAction Stop }
-$pythonArgs = if ($python.Name -like "py*") { @("-3") } else { @() }
+$pythonArgs = if ($python.Name -in @("py", "py.exe")) { @("-3") } else { @() }
 $modelArgs = @()
 if ($Model) { $modelArgs = @("--model", $Model) }
 

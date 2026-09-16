@@ -352,7 +352,7 @@ class AccountService:
     def _refresh_token_keepalive_due_at(self, account: dict, now: datetime) -> datetime | None:
         if not str(account.get("refresh_token") or "").strip():
             return None
-        if account.get("status") == "禁用":
+        if account.get("managed_disabled") or account.get("status") == "禁用":
             return None
         if self._recent_refresh_token_keepalive_error(account, now):
             return None
@@ -851,7 +851,9 @@ class AccountService:
             return [
                 token
                 for account in self._accounts.values()
-                if str(account.get("refresh_token") or "").strip()
+                if not account.get("managed_disabled")
+                and account.get("status") != "禁用"
+                and str(account.get("refresh_token") or "").strip()
                 and (token := str(account.get("access_token") or "").strip())
                 and self._token_needs_refresh(token)
             ]

@@ -355,6 +355,80 @@ class CodexRelayTests(unittest.TestCase):
         binding = next(iter(accounts.accounts["token-a"]["codex_affinities"].values()))
         self.assertEqual(binding["state"], "unknown")
 
+    def test_close_after_terminal_chunk_preserves_receipt_and_allows_continuation(self):
+        for event in ("response.completed", "response.failed"):
+            with self.subTest(event=event):
+                chunk = f'data: {{"type":"{event}","response":{{"id":"r-terminal"}}}}\n\n'.encode()
+                response = FakeResponse(chunks=[chunk], content_type="text/event-stream")
+                first = FakeSession(post_response=response)
+                second = FakeSession(post_response=FakeResponse(payload={"id": "r-next"}))
+                accounts = FakeAccounts([account()])
+                service = CodexService(accounts, SessionFactory([first, second]), max_concurrency=1)
+                result = service.submit(self.identity, {"model": "gpt-5.6-codex", "stream": True}, self.headers)
+                self.assertEqual(next(result.stream), chunk)
+                # Close without advancing the suspended generator to EOF.
+                result.stream.close()
+                result.stream.close()
+                self.assertTrue(response.closed)
+                self.assertTrue(first.closed)
+                self.assertEqual(service._inflight, set())
+                binding = next(iter(accounts.accounts["token-a"]["codex_affinities"].values()))
+                self.assertEqual(binding["state"], "bound")
+                resumed = service.submit(self.identity, {
+                    "model": "gpt-5.6-codex", "previous_response_id": "r-terminal",
+                }, self.headers)
+                self.assertEqual(resumed.status_code, 200)
+                self.assertEqual(len(second.calls), 1)
+
+    def test_http_408_quarantines_exact_session_across_restart_without_replay(self):
+        for compact in (False, True):
+            with self.subTest(compact=compact):
+                first = FakeSession(post_response=FakeResponse(status=408, payload={"detail": "private"}))
+                accounts = FakeAccounts([account(), account("token-b")])
+                service = CodexService(accounts, SessionFactory([first]), max_concurrency=1)
+                payload = {"model": "gpt-5.6-codex", "input": []}
+                with self.assertRaises(CodexServiceError) as raised:
+                    service.submit(self.identity, payload, self.headers, compact=compact)
+                self.assertEqual(raised.exception.status_code, 502)
+                self.assertEqual(raised.exception.code, "codex_upstream_outcome_unknown")
+                self.assertEqual(len(first.calls), 1)
+                self.assertTrue(first.closed)
+                self.assertEqual(service._inflight, set())
+                self.assertTrue(service._capacity.acquire(blocking=False))
+                service._capacity.release()
+                binding = next(iter(accounts.accounts["token-a"]["codex_affinities"].values()))
+                self.assertEqual(binding["state"], "unknown")
+                factory = SessionFactory([])
+                restarted = CodexService(accounts, factory)
+                for current in (service, restarted):
+                    with self.assertRaises(CodexServiceError) as retry:
+                        current.submit(self.identity, payload, self.headers, compact=compact)
+                    self.assertEqual(retry.exception.code, "codex_session_outcome_unknown")
+                self.assertEqual(factory.kwargs, [])
+                self.assertNotIn("codex_affinities", accounts.accounts["token-b"])
+
+    def test_two_owners_share_resources_but_cannot_resume_each_others_response(self):
+        owner_a = {"id": "key-a", "role": "user", "owner_subject": "workbench:o:a"}
+        owner_b = {"id": "key-b", "role": "user", "owner_subject": "workbench:o:b"}
+        accounts = FakeAccounts([account(managed_owner=owner_a["owner_subject"])])
+        sessions = [
+            FakeSession(post_response=FakeResponse(payload={"id": "response-a", "output": ["private-a"]})),
+            FakeSession(post_response=FakeResponse(payload={"id": "response-b", "output": ["private-b"]})),
+        ]
+        factory = SessionFactory(sessions)
+        service = CodexService(accounts, factory)
+        payload = {"model": "gpt-5.6-codex", "input": []}
+        for owner, expected in ((owner_a, "private-a"), (owner_b, "private-b")):
+            result = service.submit(owner, payload, self.headers)
+            self.assertEqual(json.loads(result.body)["output"], [expected])
+        self.assertEqual(len(accounts.accounts["token-a"]["codex_affinities"]), 2)
+        self.assertEqual(len(factory.kwargs), 2)
+        for owner, foreign_response in ((owner_a, "response-b"), (owner_b, "response-a")):
+            with self.assertRaises(CodexServiceError) as raised:
+                service.submit(owner, {**payload, "previous_response_id": foreign_response}, self.headers)
+            self.assertEqual(raised.exception.code, "codex_response_owner_mismatch")
+        self.assertEqual(len(factory.kwargs), 2)
+
     def test_same_new_session_concurrency_dispatches_only_one_upstream_post(self):
         started = threading.Event()
         release = threading.Event()
