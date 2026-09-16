@@ -373,6 +373,227 @@ class ImageTaskServiceTests(unittest.TestCase):
                 self.assertEqual(persisted["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
                 self.assertEqual(persisted["binding_status"], "unknown")
 
+    def test_explicit_bounded_image_recovery_releases_capacity_after_three_empty_terminal_reads(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            error = RuntimeError("ChatGPT image result unknown")
+            error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+            error.provider_binding_id = "cb_account_a"
+            error.provider_account_identity = "account_opaque_a"
+            error.conversation_id = "conversation-1"
+            error.parent_message_id = "assistant-1"
+            error.request_message_id = "request-message-1"
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                lambda _payload: (_ for _ in ()).throw(error),
+            )
+            service.submit_generation(
+                OWNER, client_task_id="unknown-task", prompt="cat", model="gpt-image-2", size=None,
+                provider_binding_id="cb_account_a", provider_account_identity="account_opaque_a",
+                client_conversation_id="workbench-conversation-1", retain_conversation=True,
+            )
+            wait_for_task(service, OWNER, "unknown-task", "error")
+            service._update_task(
+                "owner-1:unknown-task", created_ts=time.time() - 901, poll_failures=99,
+            )
+
+            class FakeBackend:
+                reads = 0
+                latest_read_running_once = True
+
+                def __init__(self, access_token=None, proxy_url=None):
+                    self.access_token = access_token
+
+                def _get_conversation(self, _conversation_id):
+                    type(self).reads += 1
+                    if type(self).latest_read_running_once and type(self).reads == 2:
+                        return {
+                            "current_node": "assistant-running",
+                            "mapping": {
+                                "request-message-1": {
+                                    "message": {"author": {"role": "user"}},
+                                },
+                                "assistant-running": {
+                                    "parent": "request-message-1",
+                                    "message": {
+                                        "author": {"role": "assistant"},
+                                        "status": "in_progress",
+                                    },
+                                },
+                            },
+                        }
+                    return {
+                        "current_node": "request-message-1",
+                        "mapping": {
+                            "request-message-1": {
+                                "parent": "prior-turn",
+                                "message": {"id": "request-message-1", "author": {"role": "user"}},
+                            },
+                        },
+                    }
+
+                def _poll_image_results(self, *_args, **_kwargs):
+                    return [], []
+
+                def _query_backend_tasks(self, **_kwargs):
+                    if _kwargs.get("strict_schema") is not True:
+                        raise AssertionError("recovery must require a strict tasks schema")
+                    return []
+
+                def close(self):
+                    return None
+
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account_opaque_a"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="bound-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", FakeBackend),
+            ):
+                service._update_task("owner-1:unknown-task", next_poll_at=0)
+                service.resume_poll(
+                    OWNER, "unknown-task", 30, "http://content-provider", True,
+                )
+                task = wait_for_task(service, OWNER, "unknown-task", "error")
+                self.assertEqual(task.get("recovery_no_result_reads", 0), 0)
+                FakeBackend.latest_read_running_once = False
+                for expected in (1, 2, 3):
+                    service._update_task("owner-1:unknown-task", next_poll_at=0)
+                    service.resume_poll(
+                        OWNER, "unknown-task", 30, "http://content-provider", True,
+                    )
+                    task = wait_for_task(service, OWNER, "unknown-task", "error")
+                    self.assertEqual(task["recovery_no_result_reads"], expected)
+                    if expected < 3:
+                        expected_delay = 60 * (2 ** (expected - 1))
+                        self.assertAlmostEqual(
+                            task["next_poll_at"] - time.time(), expected_delay, delta=5,
+                        )
+
+            self.assertEqual(task["error_code"], "RESULT_UNRECOVERABLE")
+            self.assertEqual(task["upstream_outcome"], "unknown")
+            self.assertTrue(task["recovery_retryable"])
+            self.assertFalse(task["recovery_requires_new_conversation"])
+            self.assertFalse(task["upstream_unfinished"])
+            self.assertEqual(
+                service.resume_poll(OWNER, "unknown-task", 30, "http://content-provider", True),
+                task,
+            )
+
+    def test_explicit_image_recovery_never_counts_a_running_branch(self):
+        document = {
+            "current_node": "assistant-1",
+            "mapping": {
+                "request-message-1": {
+                    "message": {"author": {"role": "user"}},
+                },
+                "assistant-1": {
+                    "parent": "request-message-1",
+                    "message": {"author": {"role": "assistant"}, "status": "in_progress"},
+                },
+            },
+        }
+        from services.image_task_service import (
+            _backend_tasks_may_be_active,
+            _branch_read_state,
+            _document_current_message_active,
+        )
+        self.assertEqual(_branch_read_state(document, "request-message-1"), "running")
+        self.assertEqual(
+            _branch_read_state({
+                "current_node": "request-message-1",
+                "mapping": {"request-message-1": {"message": {"author": {"role": "user"}}}},
+            }, "request-message-1"),
+            "no_result",
+        )
+        self.assertTrue(_backend_tasks_may_be_active([{"status": "running"}]))
+        self.assertTrue(_backend_tasks_may_be_active([{"unexpected": "shape"}]))
+        self.assertFalse(_backend_tasks_may_be_active([]))
+        self.assertFalse(_backend_tasks_may_be_active([{"task_status": "finished"}]))
+        self.assertTrue(_document_current_message_active({
+            "current_node": "foreign-running",
+            "mapping": {
+                "foreign-running": {"message": {"status": "in_progress"}},
+            },
+        }))
+
+    def test_legacy_missing_anchor_and_missing_chat_require_bounded_reads_without_attributing_images(self):
+        for scenario, requires_new_conversation in (
+            ("legacy-valid-chat", False),
+            ("missing-chat", True),
+            ("missing-then-valid-chat", False),
+        ):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                path.write_text(json.dumps({"tasks": [{
+                    "id": "legacy-task", "owner_id": "owner-1", "status": "error",
+                    "mode": "generate", "model": "gpt-image-2",
+                    "provider_binding_id": "cb_account_a",
+                    "provider_account_identity": "account_opaque_a",
+                    "client_conversation_id": "workbench-conversation-1",
+                    "conversation_id": "conversation-1", "parent_message_id": "old-parent",
+                    "binding_status": "unknown", "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
+                    "upstream_unfinished": True, "created_ts": time.time() - 901,
+                    "created_at": "2026-09-14 00:00:00",
+                    "updated_at": "2026-09-14 00:00:00",
+                }]}), encoding="utf-8")
+                service = self.make_service(path)
+
+                class FakeBackend:
+                    downloads = 0
+                    reads = 0
+
+                    def __init__(self, access_token=None, proxy_url=None):
+                        self.access_token = access_token
+
+                    def _get_conversation(self, _conversation_id):
+                        type(self).reads += 1
+                        if scenario == "missing-chat" or (
+                            scenario == "missing-then-valid-chat" and type(self).reads == 1
+                        ):
+                            raise RuntimeError("/backend-api/conversation failed: status=404")
+                        return {
+                            "current_node": "finished-answer",
+                            "mapping": {
+                                "finished-answer": {
+                                    "message": {
+                                        "author": {"role": "assistant"},
+                                        "status": "finished_successfully", "end_turn": True,
+                                    },
+                                },
+                            },
+                        }
+
+                    def _query_backend_tasks(self, **_kwargs):
+                        if _kwargs.get("strict_schema") is not True:
+                            raise AssertionError("recovery must require a strict tasks schema")
+                        return []
+
+                    def download_image_bytes(self, _urls):
+                        type(self).downloads += 1
+                        return []
+
+                    def close(self):
+                        return None
+
+                with (
+                    mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account_opaque_a"),
+                    mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="bound-token"),
+                    mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", FakeBackend),
+                ):
+                    for expected in (1, 2, 3):
+                        service._update_task("owner-1:legacy-task", next_poll_at=0)
+                        service.resume_poll(
+                            OWNER, "legacy-task", 30, "http://content-provider", True,
+                        )
+                        task = wait_for_task(service, OWNER, "legacy-task", "error")
+                        self.assertEqual(task["recovery_no_result_reads"], expected)
+
+                self.assertEqual(task["error_code"], "RESULT_UNRECOVERABLE")
+                self.assertEqual(
+                    task["recovery_requires_new_conversation"], requires_new_conversation,
+                )
+                self.assertEqual(FakeBackend.downloads, 0)
+
     def test_unknown_resume_rejects_changed_bound_account_before_conversation_read(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             error = RuntimeError("ChatGPT 生图超时")
@@ -397,20 +618,88 @@ class ImageTaskServiceTests(unittest.TestCase):
                 retain_conversation=True,
             )
             wait_for_task(service, OWNER, "changed-account-task", "error")
+            service._update_task("owner-1:changed-account-task", created_ts=time.time() - 901)
 
             with (
                 mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="different-account"),
                 mock.patch("services.account_service.account_service.get_bound_text_access_token") as acquire,
                 mock.patch("services.openai_backend_api.OpenAIBackendAPI") as backend,
             ):
-                service.resume_poll(OWNER, "changed-account-task", 30, "http://content-provider")
+                service.resume_poll(OWNER, "changed-account-task", 30, "http://content-provider", True)
                 task = wait_for_task(service, OWNER, "changed-account-task", "error")
 
             self.assertEqual(task["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
             self.assertEqual(task["binding_status"], "unknown")
             self.assertIn("account identity changed", task["error"])
+            self.assertEqual(task.get("recovery_no_result_reads", 0), 0)
             acquire.assert_not_called()
             backend.assert_not_called()
+
+    def test_image_rate_limit_keeps_historical_poll_backoff(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            error = RuntimeError("ChatGPT image result unknown")
+            error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+            error.provider_binding_id = "cb_account_a"
+            error.provider_account_identity = "account_opaque_a"
+            error.conversation_id = "conversation-1"
+            error.parent_message_id = "assistant-1"
+            error.request_message_id = "request-message-1"
+            service = self.make_service(
+                Path(tmp_dir) / "image_tasks.json",
+                lambda _payload: (_ for _ in ()).throw(error),
+            )
+            service.submit_generation(
+                OWNER, client_task_id="rate-limit-task", prompt="cat", model="gpt-image-2",
+                size=None, provider_binding_id="cb_account_a",
+                provider_account_identity="account_opaque_a",
+                client_conversation_id="workbench-conversation-1", retain_conversation=True,
+            )
+            wait_for_task(service, OWNER, "rate-limit-task", "error")
+            service._update_task(
+                "owner-1:rate-limit-task",
+                created_ts=time.time() - 901,
+                poll_failures=99,
+                next_poll_at=0,
+            )
+
+            class RateLimitError(RuntimeError):
+                status_code = 429
+
+            class RateLimitBackend:
+                def __init__(self, access_token=None, proxy_url=None):
+                    self.access_token = access_token
+
+                def _get_conversation(self, _conversation_id):
+                    raise RateLimitError("upstream status=429")
+
+                def close(self):
+                    return None
+
+            with (
+                mock.patch(
+                    "services.account_service.account_service.get_bound_account_identity",
+                    return_value="account_opaque_a",
+                ),
+                mock.patch(
+                    "services.account_service.account_service.get_bound_text_access_token",
+                    return_value="bound-token",
+                ),
+                mock.patch(
+                    "services.account_service.account_service.conversation_binding_lock",
+                    return_value=nullcontext(),
+                ),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", RateLimitBackend),
+            ):
+                service.resume_poll(
+                    OWNER, "rate-limit-task", 30, "http://content-provider", True,
+                )
+                task = wait_for_task(service, OWNER, "rate-limit-task", "error")
+
+            stored = service._tasks["owner-1:rate-limit-task"]
+            self.assertEqual(stored["poll_failures"], 100)
+            self.assertEqual(task.get("recovery_no_result_reads", 0), 0)
+            self.assertIn("status=429", task["error"])
+            self.assertAlmostEqual(task["next_poll_at"] - time.time(), 900, delta=5)
 
     def test_authoritative_finished_image_failure_is_terminal(self):
         document = {

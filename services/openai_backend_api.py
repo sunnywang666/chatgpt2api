@@ -2490,6 +2490,7 @@ class OpenAIBackendAPI:
         conversation_id: str = "",
         task_id: str = "",
         timeout_secs: float = 30.0,
+        strict_schema: bool = False,
     ) -> list[Dict[str, Any]]:
         """查询 /backend-api/tasks/ 接口获取异步任务状态和错误信息。
 
@@ -2497,6 +2498,7 @@ class OpenAIBackendAPI:
         - `conversation_id`：可选。按 conversation_id 过滤任务。
         - `task_id`：可选。按 task_id 过滤任务。
         - `timeout_secs`：请求超时秒数。
+        - `strict_schema`：恢复判定使用；缺失或畸形 tasks 必须失败关闭。
 
         返回：
         - 任务列表，每个任务包含 image_gen_message 等字段。
@@ -2509,9 +2511,15 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, path)
         data = response.json()
-        tasks = data.get("tasks", [])
+        if strict_schema and (not isinstance(data, dict) or "tasks" not in data):
+            raise RuntimeError("backend tasks response is missing the tasks list")
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
         if not isinstance(tasks, list):
+            if strict_schema:
+                raise RuntimeError("backend tasks response has an invalid tasks list")
             return []
+        if strict_schema and any(not isinstance(task, dict) for task in tasks):
+            raise RuntimeError("backend tasks response contains an invalid task")
 
         # 按 conversation_id 或 task_id 过滤
         if conversation_id:

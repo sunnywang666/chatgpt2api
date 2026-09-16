@@ -32,6 +32,7 @@ class ImageGenerationTaskRequest(BaseModel):
 
 class ResumePollRequest(BaseModel):
     extra_timeout_secs: float = Field(default=30.0, ge=5.0, le=120.0)
+    allow_unrecoverable_retry: bool = False
 
 
 def _parse_task_ids(value: str) -> list[str]:
@@ -147,6 +148,7 @@ def create_router() -> APIRouter:
                 task_id,
                 body.extra_timeout_secs,
                 resolve_image_base_url(request),
+                body.allow_unrecoverable_retry,
             )
             return client_task(result, request)
         except ValueError as exc:

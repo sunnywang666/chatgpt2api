@@ -74,6 +74,8 @@ class TextTaskService:
     RECOVERY_LEASE_SECONDS = 60.0
     RECOVERY_BASE_BACKOFF_SECONDS = 30.0
     RECOVERY_MAX_BACKOFF_SECONDS = 15.0 * 60.0
+    UNRECOVERABLE_MIN_AGE_SECONDS = 15.0 * 60.0
+    UNRECOVERABLE_QUALIFIED_READS = 3
     _INTERNAL_RECEIPT_FIELDS = frozenset({
         "boot", "recovery_claim_id", "recovery_claimed_at", "recovery_lease_until",
     })
@@ -90,6 +92,20 @@ class TextTaskService:
         "content", "parent_message_id", "binding_status",
     })
     _SAFE_RECOVERY_REASONS = frozenset(reason.value for reason in TextRecoveryReason)
+    _UNRECOVERABLE_REASONS = frozenset({
+        TextRecoveryReason.CONVERSATION_NOT_FOUND.value,
+        TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
+        TextRecoveryReason.REQUEST_BRANCH_SUPERSEDED.value,
+        TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
+    })
+    _VALID_CONVERSATION_REASONS = frozenset({
+        TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
+        TextRecoveryReason.REQUEST_PARENT_MISMATCH.value,
+        TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value,
+        TextRecoveryReason.REQUEST_BRANCH_SUPERSEDED.value,
+        TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value,
+        TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
+    })
 
     def __init__(self, path: Path, runner=None, executor=None, *, clock=None, recovery_reader=None):
         self.path = path
@@ -158,7 +174,10 @@ class TextTaskService:
             return None, "UPSTREAM_OUTCOME_UNKNOWN", "read_text_result", cls._safe_recovery_reason(recovered.get("recovery_reason"))
         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
 
-    def _finish_recovery(self, owner, request_id, claim_id, recovered=None, error_code=None, phase=None, recovery_reason=None):
+    def _finish_recovery(
+        self, owner, request_id, claim_id, recovered=None, error_code=None,
+        phase=None, recovery_reason=None, *, count_unrecoverable=False,
+    ):
         now = self._now()
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -174,11 +193,35 @@ class TextTaskService:
                 return self._public(current)
             if error_code:
                 attempt = max(1, int(current.get("recovery_attempt", 1)))
+                qualified_reads = int(current.get("recovery_no_result_reads") or 0)
+                created_at = float(current.get("created_at") or now)
+                qualified_read_recorded = (
+                    count_unrecoverable
+                    and recovery_reason in self._UNRECOVERABLE_REASONS
+                    and now - created_at >= self.UNRECOVERABLE_MIN_AGE_SECONDS
+                )
+                if qualified_read_recorded:
+                    qualified_reads += 1
+                if recovery_reason == TextRecoveryReason.CONVERSATION_NOT_FOUND.value:
+                    requires_new_conversation = True
+                elif recovery_reason in self._VALID_CONVERSATION_REASONS:
+                    requires_new_conversation = False
+                else:
+                    requires_new_conversation = bool(
+                        current.get("recovery_requires_new_conversation")
+                    )
                 changes = {
-                    "recovery_next_at": now + self._recovery_backoff(attempt),
+                    "recovery_next_at": now + self._recovery_backoff(
+                        qualified_reads if qualified_read_recorded else attempt
+                    ),
                     "recovery_error_code": error_code,
                     "recovery_phase": phase or "read_text_request",
                     "recovery_reason": recovery_reason,
+                    "recovery_no_result_reads": qualified_reads,
+                    # This marker describes the latest qualified read. A prior
+                    # 404 must not force a new chat after the same chat becomes
+                    # readable again.
+                    "recovery_requires_new_conversation": requires_new_conversation,
                 }
             else:
                 changes = {
@@ -190,6 +233,7 @@ class TextTaskService:
                     "recovery_error_code": None,
                     "recovery_phase": None,
                     "recovery_reason": None,
+                    "recovery_requires_new_conversation": False,
                 }
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
@@ -198,7 +242,7 @@ class TextTaskService:
                        (json.dumps(updated), owner, request_id, row[0]))
             return self._public(updated)
 
-    def read(self, owner: str, request_id: str):
+    def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False):
         recovery_claim = None
         now = self._now()
         with self._db() as db:
@@ -254,21 +298,80 @@ class TextTaskService:
             try:
                 recovered = self.recovery_reader(recovery_claim[1])
                 safe_result, error_code, phase, recovery_reason = self._safe_recovery_result(recovered)
-                return self._finish_recovery(owner, request_id, recovery_claim[0], safe_result, error_code, phase, recovery_reason)
+                result = self._finish_recovery(
+                    owner, request_id, recovery_claim[0], safe_result, error_code, phase,
+                    recovery_reason, count_unrecoverable=allow_unrecoverable_retry,
+                )
             except ConversationBindingError as exc:
-                return self._finish_recovery(owner, request_id, recovery_claim[0],
-                                             error_code=self._safe_recovery_code(exc),
-                                             phase="read_text_request",
-                                             recovery_reason=self._safe_recovery_reason(getattr(exc, "recovery_reason", "")))
+                result = self._finish_recovery(
+                    owner, request_id, recovery_claim[0],
+                    error_code=self._safe_recovery_code(exc), phase="read_text_request",
+                    recovery_reason=self._safe_recovery_reason(getattr(exc, "recovery_reason", "")),
+                    count_unrecoverable=allow_unrecoverable_retry,
+                )
             except Exception:
                 # Never persist exception text: it may contain a token, prompt,
                 # or provider response. The next bounded recovery window is
                 # enough to make the request retryable without hammering GET.
-                return self._finish_recovery(owner, request_id, recovery_claim[0],
-                                             error_code="RECOVERY_READ_FAILED",
-                                             phase="read_text_request",
-                                             recovery_reason=None)
-        return self._public(json.loads(row[0]))
+                result = self._finish_recovery(
+                    owner, request_id, recovery_claim[0],
+                    error_code="RECOVERY_READ_FAILED", phase="read_text_request",
+                    recovery_reason=None, count_unrecoverable=allow_unrecoverable_retry,
+                )
+            return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result
+        result = self._public(json.loads(row[0]))
+        return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result
+
+    def recover(self, owner: str, request_id: str, allow_unrecoverable_retry: bool = False):
+        return self.read(
+            owner, request_id,
+            allow_unrecoverable_retry=bool(allow_unrecoverable_retry),
+        )
+
+    def _authorize_unrecoverable(self, owner, request_id, observed):
+        if observed.get("error_code") == "RESULT_UNRECOVERABLE":
+            return observed
+        if observed.get("status") != "unknown":
+            return observed
+        now = self._now()
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id),
+            ).fetchone()
+            if not row:
+                return {"request_id": request_id, "status": "not_found"}
+            current = json.loads(row[0])
+            if current.get("status") == "succeeded" or current.get("error_code") == "RESULT_UNRECOVERABLE":
+                return self._public(current)
+            created_at = float(current.get("created_at") or now)
+            if (
+                current.get("status") != "unknown"
+                or now - created_at < self.UNRECOVERABLE_MIN_AGE_SECONDS
+                or int(current.get("recovery_no_result_reads") or 0) < self.UNRECOVERABLE_QUALIFIED_READS
+            ):
+                return self._public(current)
+            updated = {
+                **current,
+                "status": "failed",
+                "error_code": "RESULT_UNRECOVERABLE",
+                "upstream_outcome": "unknown",
+                "recovery_retryable": True,
+                "recovery_requires_new_conversation": bool(
+                    current.get("recovery_requires_new_conversation")
+                ),
+                "recovery_next_at": None,
+                "recovery_claim_id": None,
+                "recovery_claimed_at": None,
+                "recovery_lease_until": None,
+                "updated_at": now,
+                "finished_at": now,
+            }
+            db.execute(
+                "UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
+                (json.dumps(updated), owner, request_id, row[0]),
+            )
+            return self._public(updated)
 
     def _update(self, owner, request_id, **changes):
         with self._db() as db:
