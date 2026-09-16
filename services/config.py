@@ -416,6 +416,23 @@ class ConfigStore:
             return 10.0
 
     @property
+    def account_request_interval_secs(self) -> float:
+        """Conservative local pacing, not an advertised upstream quota."""
+        try:
+            value = float(self.data.get("account_request_interval_secs", 5.0))
+            return value if 1.0 <= value <= 60.0 else 5.0
+        except (TypeError, ValueError):
+            return 5.0
+
+    @property
+    def account_message_interval_secs(self) -> float:
+        try:
+            value = float(self.data.get("account_message_interval_secs", 30.0))
+            return value if 5.0 <= value <= 300.0 else 30.0
+        except (TypeError, ValueError):
+            return 30.0
+
+    @property
     def image_account_concurrency(self) -> int:
         try:
             return max(1, int(self.data.get("image_account_concurrency", 3)))

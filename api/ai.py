@@ -8,7 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
+from services.conversation_binding_service import (
+    ConversationBindingError,
+    conversation_binding_service,
+)
 from services.editable_file_task_service import editable_file_task_service
+from services.text_task_service import text_task_service
 from services.log_service import LoggedCall
 from services.protocol import (
     anthropic_v1_messages,
@@ -49,6 +54,29 @@ class ResponseCreateRequest(BaseModel):
     tools: list[dict[str, object]] | None = None
     tool_choice: object | None = None
     stream: bool | None = None
+
+
+class ConversationBindingTextRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model: str = "auto"
+    image_model: str = "gpt-image-2"
+    messages: list[dict[str, object]]
+    thinking_effort: str = "standard"
+    provider_binding_id: str | None = None
+    provider_account_identity: str | None = None
+    client_conversation_id: str
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    conversation_id: str | None = None
+    parent_message_id: str | None = None
+
+
+class ConversationArchiveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    provider_binding_id: str = Field(min_length=1)
+    provider_account_identity: str = Field(min_length=1)
+    client_conversation_id: str = Field(min_length=1)
+    conversation_id: str = Field(pattern=r"^[a-zA-Z0-9-]+$")
+    parent_message_id: str = Field(min_length=1)
 
 
 class AnthropicMessageRequest(BaseModel):
@@ -151,6 +179,83 @@ def create_router() -> APIRouter:
         )
         await filter_or_log(call, request_preview)
         return await call.run(openai_v1_response.handle, payload)
+
+    @router.post("/api/conversation-bindings/archive")
+    async def archive_bound_conversation(body: ConversationArchiveRequest,
+            authorization: str | None = Header(default=None)):
+        require_identity(authorization)
+        try:
+            return await run_in_threadpool(conversation_binding_service.archive, body.model_dump())
+        except ConversationBindingError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail={"code": "CONVERSATION_ARCHIVE_UNCONFIRMED"}) from exc
+
+    @router.get("/api/conversation-bindings/text")
+    async def read_bound_text(
+            provider_binding_id: str, provider_account_identity: str,
+            client_conversation_id: str, conversation_id: str, parent_message_id: str,
+            authorization: str | None = Header(default=None),
+    ):
+        require_identity(authorization)
+        try:
+            return await run_in_threadpool(conversation_binding_service.read_text, {
+                "provider_binding_id": provider_binding_id,
+                "provider_account_identity": provider_account_identity,
+                "client_conversation_id": client_conversation_id,
+                "conversation_id": conversation_id,
+                "parent_message_id": parent_message_id,
+            })
+        except ConversationBindingError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail={"code": "CONVERSATION_READ_UNAVAILABLE"}) from exc
+
+    @router.get("/api/conversation-bindings/text-requests/{request_id}")
+    async def read_bound_text_request(request_id: str, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        return await run_in_threadpool(text_task_service.read, str(identity.get("id") or "anonymous"), request_id)
+
+    @router.post("/api/conversation-bindings/text")
+    async def continue_bound_text(
+            body: ConversationBindingTextRequest,
+            authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        payload = body.model_dump(mode="python")
+        request_preview = request_text(payload.get("messages"))
+        await filter_or_log(
+            LoggedCall(
+                identity,
+                "/api/conversation-bindings/text",
+                body.model,
+                "绑定会话文本",
+                request_text=request_preview,
+            ),
+            request_preview,
+        )
+        try:
+            if body.client_request_id:
+                return await run_in_threadpool(text_task_service.submit, str(identity.get("id") or "anonymous"), payload)
+            return await run_in_threadpool(conversation_binding_service.complete_text, payload)
+        except ConversationBindingError as exc:
+            detail = {"code": exc.code, "error": str(exc)}
+            for key in (
+                "provider_binding_id",
+                "provider_account_identity",
+                "conversation_id",
+                "parent_message_id",
+            ):
+                value = str(getattr(exc, key, "") or "").strip()
+                if value:
+                    detail[key] = value
+            detail["binding_status"] = (
+                "unknown" if exc.code == "CONVERSATION_OUTCOME_UNKNOWN" else "unavailable"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=detail,
+            ) from exc
 
     @router.post("/v1/messages")
     async def create_message(

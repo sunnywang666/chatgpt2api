@@ -21,6 +21,7 @@ from curl_cffi import requests
 from PIL import Image
 
 from services.account_service import account_service
+from services.account_request_pacing import pace_account_session
 from services.config import config
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
@@ -111,15 +112,23 @@ CODEX_RESPONSES_INSTRUCTIONS = (
 )
 
 # 内容政策违规错误关键词（上游拒绝生成图片的各种表述）
-_CONTENT_POLICY_KEYWORDS = (
-    # 明确的内容政策违规
-    "内容政策", "防护限制", "违反", "moderation", "policy", "blocked",
-    # 拒绝生成类
-    "不能生成", "无法生成", "不能帮助", "无法帮助",
-    # 敏感内容类
-    "裸体", "裸露", "色情", "性内容", "未成年",
-    # 通用拒绝
-    "抱歉，我不能",
+_CONTENT_POLICY_CONTEXT = (
+    "内容政策", "防护限制", "违反内容", "moderation", "content policy",
+    "content_policy", "policy violation", "safety policy", "safety system",
+)
+_CONTENT_POLICY_REFUSAL = (
+    "不能", "无法", "拒绝", "不允许", "抱歉", "cannot", "can't", "unable", "refuse", "decline",
+)
+_CONTENT_POLICY_VIOLATION = (
+    "违反", "违规", "violate", "violation", "breach", "blocked by", "rejected by",
+)
+_CONTENT_POLICY_SENSITIVE_SUBJECTS = (
+    "裸体", "裸露", "色情", "性内容", "未成年", "sexual", "nudity", "minor",
+)
+_CONTENT_POLICY_NEGATION_RE = re.compile(
+    r"\b(?:no|without)\s+(?:any\s+)?content[\s_-]+policy\s+violations?\b"
+    r"|\b(?:do|does|did)\s+not\s+violate\s+(?:our\s+)?content[\s_-]+policy\b",
+    re.IGNORECASE,
 )
 
 
@@ -127,8 +136,19 @@ def _is_content_policy_error(error_msg: str) -> bool:
     """检查错误消息是否为内容政策违规。"""
     if not error_msg:
         return False
-    msg_lower = error_msg.lower()
-    return any(keyword in msg_lower for keyword in _CONTENT_POLICY_KEYWORDS)
+    msg_lower = _CONTENT_POLICY_NEGATION_RE.sub("", error_msg.lower())
+    if (
+        any(keyword in msg_lower for keyword in _CONTENT_POLICY_CONTEXT)
+        and (
+            any(keyword in msg_lower for keyword in _CONTENT_POLICY_REFUSAL)
+            or any(keyword in msg_lower for keyword in _CONTENT_POLICY_VIOLATION)
+        )
+    ):
+        return True
+    return (
+        any(keyword in msg_lower for keyword in _CONTENT_POLICY_REFUSAL)
+        and any(keyword in msg_lower for keyword in _CONTENT_POLICY_SENSITIVE_SUBJECTS)
+    )
 
 
 @dataclass
@@ -214,6 +234,7 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+        pace_account_session(self.session, self.account, self.access_token)
 
     def close(self) -> None:
         if getattr(self, "_closed", False):
@@ -505,6 +526,12 @@ class OpenAIBackendAPI:
                     } for ref in uploaded],
                 },
             })
+        request_message_id = getattr(self, "text_request_message_id", "")
+        if request_message_id:
+            for message in reversed(conversation_messages):
+                if message["author"]["role"] == "user":
+                    message["id"] = request_message_id
+                    break
         return conversation_messages
 
     @staticmethod
@@ -524,20 +551,22 @@ class OpenAIBackendAPI:
             model: str,
             timezone: str,
             thinking_effort: str = "",
+            conversation_id: str = "",
+            parent_message_id: str = "",
     ) -> Dict[str, Any]:
         """把标准 messages 构造成 web 对话请求体。"""
         payload = {
             "action": "next",
             "messages": self._api_messages_to_conversation_messages(messages),
             "model": model,
-            "parent_message_id": new_uuid(),
+            "parent_message_id": parent_message_id or new_uuid(),
             "conversation_mode": {"kind": "primary_assistant"},
             "conversation_origin": None,
             "force_paragen": False,
             "force_paragen_model_slug": "",
             "force_rate_limit": False,
             "force_use_sse": True,
-            "history_and_training_disabled": True,
+            "history_and_training_disabled": not getattr(self, "retain_bound_conversation", False),
             "reset_rate_limits": False,
             "suggestions": [],
             "supported_encodings": [],
@@ -559,6 +588,12 @@ class OpenAIBackendAPI:
         normalized_effort = self._normalize_thinking_effort(thinking_effort or config.default_thinking_effort)
         if normalized_effort:
             payload["thinking_effort"] = normalized_effort
+        if conversation_id:
+            if not parent_message_id:
+                raise RuntimeError("conversation continuation requires parent_message_id")
+            payload["conversation_id"] = conversation_id
+        elif parent_message_id:
+            raise RuntimeError("parent_message_id requires conversation_id")
         return payload
 
     def _image_model_settings(self, model: str) -> tuple[str, str]:
@@ -567,7 +602,7 @@ class OpenAIBackendAPI:
         if not base_model:
             return "auto", ""
         if base_model == "gpt-image-2":
-            upstream_model = config.default_upstream_model_name
+            upstream_model = getattr(self, "image_upstream_model", "") or config.default_upstream_model_name
         elif base_model == CODEX_IMAGE_MODEL:
             upstream_model = base_model
         else:
@@ -575,7 +610,8 @@ class OpenAIBackendAPI:
         model_name, separator, suffix = upstream_model.rpartition("-")
         if separator and suffix.lower() in {"standard", "extended", "max"}:
             return model_name, suffix.lower()
-        return upstream_model, self._normalize_thinking_effort(config.default_thinking_effort)
+        # Instant does not inherit the global Work extended reasoning setting.
+        return upstream_model, "" if upstream_model.endswith("-instant") else self._normalize_thinking_effort(config.default_thinking_effort)
 
     def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
             Dict[str, str]:
@@ -861,14 +897,21 @@ class OpenAIBackendAPI:
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
-    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
+    def _prepare_image_conversation(
+            self,
+            prompt: str,
+            requirements: ChatRequirements,
+            model: str,
+            conversation_id: str = "",
+            parent_message_id: str = "",
+    ) -> str:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
         upstream_model, thinking_effort = self._image_model_settings(model)
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
-            "parent_message_id": new_uuid(),
+            "parent_message_id": parent_message_id or new_uuid(),
             "model": upstream_model,
             "client_prepare_state": "success",
             "timezone_offset_min": -480,
@@ -884,8 +927,16 @@ class OpenAIBackendAPI:
             "supported_encodings": ["v1"],
             "client_contextual_info": {"app_name": "chatgpt.com"},
         }
+        if getattr(self, "retain_bound_conversation", False):
+            payload["history_and_training_disabled"] = False
         if thinking_effort:
             payload["thinking_effort"] = thinking_effort
+        if conversation_id:
+            if not parent_message_id:
+                raise RuntimeError("conversation continuation requires parent_message_id")
+            payload["conversation_id"] = conversation_id
+        elif parent_message_id:
+            raise RuntimeError("parent_message_id requires conversation_id")
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements),
@@ -970,7 +1021,9 @@ class OpenAIBackendAPI:
         }
 
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
-                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+                                references: Optional[list[Dict[str, Any]]] = None,
+                                conversation_id: str = "",
+                                parent_message_id: str = "") -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
         upstream_model, thinking_effort = self._image_model_settings(model)
         references = references or []
@@ -1000,16 +1053,18 @@ class OpenAIBackendAPI:
                 "width": item["width"],
                 "height": item["height"],
             } for item in references]
+        request_message_id = str(getattr(self, "image_request_message_id", "") or "").strip() or new_uuid()
+        self.image_request_message_id = request_message_id
         payload = {
             "action": "next",
             "messages": [{
-                "id": new_uuid(),
+                "id": request_message_id,
                 "author": {"role": "user"},
                 "create_time": time.time(),
                 "content": content,
                 "metadata": metadata,
             }],
-            "parent_message_id": new_uuid(),
+            "parent_message_id": parent_message_id or new_uuid(),
             "model": upstream_model,
             "client_prepare_state": "sent",
             "timezone_offset_min": -480,
@@ -1032,8 +1087,16 @@ class OpenAIBackendAPI:
             "paragen_cot_summary_display_override": "allow",
             "force_parallel_switch": "auto",
         }
+        if getattr(self, "retain_bound_conversation", False):
+            payload["history_and_training_disabled"] = False
         if thinking_effort:
             payload["thinking_effort"] = thinking_effort
+        if conversation_id:
+            if not parent_message_id:
+                raise RuntimeError("conversation continuation requires parent_message_id")
+            payload["conversation_id"] = conversation_id
+        elif parent_message_id:
+            raise RuntimeError("parent_message_id requires conversation_id")
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
@@ -1042,6 +1105,16 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
+        if response.status_code == 404:
+            response.close()
+            path = "/backend-api/conversation"
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+                json=payload,
+                timeout=300,
+                stream=True,
+            )
         ensure_ok(response, path)
         return response
 
@@ -1052,6 +1125,30 @@ class OpenAIBackendAPI:
                                     timeout=60)
         ensure_ok(response, path)
         return response.json()
+
+    def get_conversation_parent_message_id(self, conversation_id: str) -> str:
+        document = self._get_conversation(conversation_id)
+        parent_message_id = str(document.get("current_node") or "").strip()
+        if not parent_message_id:
+            raise RuntimeError("upstream conversation has no authoritative current_node")
+        return parent_message_id
+
+    def archive_conversation(self, conversation_id: str, parent_message_id: str) -> Dict[str, Any]:
+        """Archive the completed product chat, preserving its history and images."""
+        document = self._get_conversation(conversation_id)
+        if parent_message_id not in (document.get("mapping") or {}):
+            raise RuntimeError("original product turn is missing")
+        if document.get("is_archived") is True:
+            return {"archived": True}
+        path = f"/backend-api/conversation/{conversation_id}"
+        response = self.session.patch(self.base_url + path,
+            headers=self._headers(path, {"Accept": "application/json", "Content-Type": "application/json"}),
+            json={"is_archived": True}, timeout=60)
+        ensure_ok(response, path)
+        # A timeout on PATCH is safe to recover by reading this exact chat first.
+        if self._get_conversation(conversation_id).get("is_archived") is not True:
+            raise RuntimeError("archive readback is not confirmed")
+        return {"archived": True}
 
     def delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """删除本地对话记录。"""
@@ -2067,11 +2164,59 @@ class OpenAIBackendAPI:
             return any(cls._has_image_asset_pointer(item) for item in payload)
         return False
 
-    def _extract_image_tool_records(self, data: Dict[str, Any]) -> list[Dict[str, Any]]:
-        """从 conversation 明细里提取图片工具输出记录。"""
+    @staticmethod
+    def _current_message_branch_ids(data: Dict[str, Any], request_message_id: str) -> set[str]:
+        """Return the committed current branch from its leaf back to this request.
+
+        A retained product conversation contains outputs from prior stages. A
+        generated asset or refusal is attributable to the request being polled
+        only when its submitted user message is on the authoritative
+        ``current_node`` parent chain. Missing or divergent links are not
+        guessed from timestamps or the newest image.
+        """
         mapping = data.get("mapping") or {}
+        current_node = str(data.get("current_node") or "").strip()
+        request_message_id = str(request_message_id or "").strip()
+        if not isinstance(mapping, dict) or not current_node or not request_message_id:
+            return set()
+
+        reversed_path: list[str] = []
+        message_id = current_node
+        while message_id and message_id not in reversed_path:
+            node = mapping.get(message_id)
+            if not isinstance(node, dict):
+                return set()
+            reversed_path.append(message_id)
+            if message_id == request_message_id:
+                break
+            message_id = str(node.get("parent") or "").strip()
+        if request_message_id not in reversed_path:
+            return set()
+
+        path = list(reversed(reversed_path))
+        request_index = path.index(request_message_id)
+        for message_id in path[request_index + 1:]:
+            node = mapping.get(message_id) or {}
+            message = node.get("message") if isinstance(node, dict) else {}
+            author = message.get("author") if isinstance(message, dict) else {}
+            if str(author.get("role") or "").strip().lower() == "user":
+                return set(path[request_index:path.index(message_id)])
+        return set(path[request_index:])
+
+    def _extract_image_tool_records(
+            self,
+            data: Dict[str, Any],
+            request_message_id: str,
+    ) -> list[Dict[str, Any]]:
+        """Extract image records only from this submitted request's current branch."""
+        mapping = data.get("mapping") or {}
+        branch_ids = self._current_message_branch_ids(data, request_message_id)
+        if not branch_ids:
+            return []
         records = []
         for message_id, node in mapping.items():
+            if message_id not in branch_ids:
+                continue
             message = (node or {}).get("message") or {}
             author = message.get("author") or {}
             metadata = message.get("metadata") or {}
@@ -2092,15 +2237,16 @@ class OpenAIBackendAPI:
         return sorted(records, key=lambda item: item["create_time"])
 
     @staticmethod
-    def _find_content_policy_error_in_conversation(data: Dict[str, Any]) -> str:
-        """从对话文档中查找内容政策违规错误消息。
-
-        上游拒绝生成图片时，错误消息会出现在 assistant 消息的文本中。
-        本方法遍历所有 assistant/tool 消息，检查是否包含内容政策违规关键词，
-        如果匹配则返回该消息文本（截断至 500 字符），否则返回空字符串。
-        """
+    def _find_content_policy_error_in_conversation(
+            data: Dict[str, Any], request_message_id: str,
+    ) -> str:
+        """Find a policy rejection only on the submitted request's current branch."""
         mapping = data.get("mapping") or {}
-        for node in mapping.values():
+        branch_ids = OpenAIBackendAPI._current_message_branch_ids(data, request_message_id)
+        if not branch_ids:
+            return ""
+        for message_id in branch_ids:
+            node = mapping.get(message_id)
             message = (node or {}).get("message") or {}
             author = message.get("author") or {}
             role = str(author.get("role") or "").strip().lower()
@@ -2131,6 +2277,7 @@ class OpenAIBackendAPI:
             timeout_secs: float = 120.0,
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
+            request_message_id: str = "",
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
@@ -2143,6 +2290,9 @@ class OpenAIBackendAPI:
           (capped at 16s, +jitter) honoring Retry-After when present.
         - All sleeps stay within timeout_secs; on exhaustion raises ImagePollTimeoutError.
         """
+        request_message_id = str(request_message_id or "").strip()
+        if not request_message_id:
+            raise RuntimeError("image result boundary unavailable: submitted message id missing")
         start = time.time()
         attempt = 0
         interval = float(config.image_poll_interval_secs)
@@ -2163,6 +2313,7 @@ class OpenAIBackendAPI:
             "interval_secs": interval,
             "initial_file_ids": file_ids,
             "initial_sediment_ids": sediment_ids,
+            "request_message_id": request_message_id,
         })
 
         def _remaining() -> float:
@@ -2242,7 +2393,7 @@ class OpenAIBackendAPI:
                     continue
                 break
 
-            for record in self._extract_image_tool_records(conversation):
+            for record in self._extract_image_tool_records(conversation, request_message_id):
                 for file_id in record["file_ids"]:
                     if file_id not in file_ids:
                         file_ids.append(file_id)
@@ -2255,7 +2406,7 @@ class OpenAIBackendAPI:
             # 而非 /backend-api/tasks/ 的 task error 结构中。
             # 如果在没有找到图片文件 ID 的同时检测到内容政策违规，立即中断轮询。
             if not file_ids and not sediment_ids:
-                policy_msg = self._find_content_policy_error_in_conversation(conversation)
+                policy_msg = self._find_content_policy_error_in_conversation(conversation, request_message_id)
                 if policy_msg:
                     logger.warning({
                         "event": "image_poll_conversation_text_policy_violation",
@@ -2487,6 +2638,7 @@ class OpenAIBackendAPI:
             sediment_ids: list[str],
             poll: bool = True,
             poll_timeout_secs: float | None = None,
+            request_message_id: str = "",
     ) -> list[str]:
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
@@ -2516,6 +2668,7 @@ class OpenAIBackendAPI:
                     timeout,
                     file_ids,
                     sediment_ids,
+                    request_message_id=request_message_id,
                 )
             except ImagePollTimeoutError as exc:
                 # 如果轮询超时且有 task error（如 moderation 拦截），抛出 ImageContentPolicyError
@@ -2563,17 +2716,32 @@ class OpenAIBackendAPI:
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
             thinking_effort: str = "",
+            conversation_id: str = "",
+            parent_message_id: str = "",
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
-            yield from self._stream_picture_conversation(prompt, model, images or [])
+            yield from self._stream_picture_conversation(
+                prompt,
+                model,
+                images or [],
+                conversation_id=conversation_id,
+                parent_message_id=parent_message_id,
+            )
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
         self._bootstrap()
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
-        payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
+        payload = self._conversation_payload(
+            normalized,
+            model,
+            timezone,
+            thinking_effort=thinking_effort,
+            conversation_id=conversation_id,
+            parent_message_id=parent_message_id,
+        )
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),
@@ -2600,6 +2768,8 @@ class OpenAIBackendAPI:
             prompt: str,
             model: str,
             images: list[str],
+            conversation_id: str = "",
+            parent_message_id: str = "",
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
@@ -2610,9 +2780,23 @@ class OpenAIBackendAPI:
         self._report_progress("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+        conduit_token = self._prepare_image_conversation(
+            prompt,
+            requirements,
+            model,
+            conversation_id=conversation_id,
+            parent_message_id=parent_message_id,
+        )
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        response = self._start_image_generation(
+            prompt,
+            requirements,
+            conduit_token,
+            model,
+            references,
+            conversation_id=conversation_id,
+            parent_message_id=parent_message_id,
+        )
         self._report_progress("generating")
         yield from self._iter_sse_payloads_capped(response, float(config.image_poll_timeout_secs))
 

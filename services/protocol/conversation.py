@@ -36,6 +36,10 @@ class ImageGenerationError(Exception):
         param: str | None = None,
         account_email: str = "",
         conversation_id: str = "",
+        provider_binding_id: str = "",
+        provider_account_identity: str = "",
+        parent_message_id: str = "",
+        request_message_id: str = "",
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -44,6 +48,10 @@ class ImageGenerationError(Exception):
         self.param = param
         self.account_email = account_email
         self.conversation_id = conversation_id
+        self.provider_binding_id = provider_binding_id
+        self.provider_account_identity = provider_account_identity
+        self.parent_message_id = parent_message_id
+        self.request_message_id = request_message_id
 
     def to_openai_error(self) -> dict[str, Any]:
         error_dict = {
@@ -307,6 +315,13 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    provider_binding_id: str = ""
+    provider_account_identity: str = ""
+    client_conversation_id: str = ""
+    conversation_id: str = ""
+    parent_message_id: str = ""
+    retain_conversation: bool = False
+    upstream_model: str = ""
 
 
 @dataclass
@@ -333,6 +348,9 @@ class ImageOutput:
     data: list[dict[str, Any]] = field(default_factory=list)
     account_email: str = ""
     conversation_id: str = ""
+    provider_binding_id: str = ""
+    provider_account_identity: str = ""
+    parent_message_id: str = ""
 
     def to_chunk(self) -> dict[str, Any]:
         chunk: dict[str, Any] = {
@@ -349,6 +367,12 @@ class ImageOutput:
             chunk["_account_email"] = self.account_email
         if self.conversation_id:
             chunk["_conversation_id"] = self.conversation_id
+        if self.provider_binding_id:
+            chunk["_provider_binding_id"] = self.provider_binding_id
+        if self.provider_account_identity:
+            chunk["_provider_account_identity"] = self.provider_account_identity
+        if self.parent_message_id:
+            chunk["_parent_message_id"] = self.parent_message_id
         if self.kind == "message":
             chunk.update({
                 "object": "image.generation.message",
@@ -689,6 +713,8 @@ def conversation_events(
     size: str | None = None,
     quality: str = "auto",
     thinking_effort: str = "",
+    conversation_id: str = "",
+    parent_message_id: str = "",
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
@@ -702,6 +728,8 @@ def conversation_events(
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort=thinking_effort if not image_model else "",
+        conversation_id=conversation_id,
+        parent_message_id=parent_message_id,
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
@@ -815,7 +843,10 @@ def _remove_image_conversation_later(
         conversation_id: str,
         *,
         success: bool,
+        retain_conversation: bool = False,
 ) -> None:
+    if retain_conversation:
+        return
     if not conversation_id:
         return
     if not (config.image_remove_conversation_always or (success and config.image_remove_conversation_after_result)):
@@ -841,6 +872,12 @@ def stream_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
+    request_message_id = str(
+        getattr(request.progress_callback, "request_message_id", "") or "",
+    )
+    if request_message_id:
+        backend.image_request_message_id = request_message_id
+    record_conversation_id = getattr(request.progress_callback, "record_conversation_id", None)
     last: dict[str, Any] = {}
     for event in conversation_events(
             backend,
@@ -849,8 +886,13 @@ def stream_image_outputs(
             images=request.images or [],
             size=request.size,
             quality=request.quality,
+            conversation_id=request.conversation_id,
+            parent_message_id=request.parent_message_id,
     ):
         last = event
+        event_conversation_id = str(event.get("conversation_id") or "")
+        if event_conversation_id and callable(record_conversation_id):
+            record_conversation_id(event_conversation_id)
         if event.get("type") == "conversation.delta":
             yield ImageOutput(
                 kind="progress",
@@ -874,7 +916,14 @@ def stream_image_outputs(
                 conversation_id=str(event.get("conversation_id") or ""),
             )
 
+    submitted_request_message_id = str(
+        getattr(backend, "image_request_message_id", "") or "",
+    ).strip()
+    if submitted_request_message_id:
+        request_message_id = submitted_request_message_id
     conversation_id = str(last.get("conversation_id") or "")
+    if conversation_id and callable(record_conversation_id):
+        record_conversation_id(conversation_id)
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
     message = str(last.get("text") or "").strip()
@@ -909,28 +958,6 @@ def stream_image_outputs(
             "conversation_id": conversation_id,
             "message_preview": message[:200],
         })
-
-    # 当检测到文本回复但 conversation_id 丢失时，尝试从最近对话列表中恢复
-    # SSE 流太短时（模型返回文本而非触发图片工具），conversation_id 可能未被捕获，
-    # 但图片已在上游异步生成。通过列出最近对话来恢复 conversation_id。
-    if is_text_reply and not conversation_id:
-        try:
-            import time as _time
-            recovered_id = backend.find_conversation_by_prompt(
-                request.prompt, _time.time(), timeout_secs=5.0,
-            )
-            if recovered_id:
-                conversation_id = recovered_id
-                logger.info({
-                    "event": "image_conversation_id_recovered",
-                    "conversation_id": conversation_id,
-                    "message_preview": message[:200],
-                })
-        except Exception as exc:
-            logger.warning({
-                "event": "image_conversation_id_recovery_failed",
-                "error": repr(exc)[:300],
-            })
 
     # 在轮询图片之前，先检查 /backend-api/tasks/ 是否有 moderation 拦截
     # 这样可以避免不必要的长时间轮询超时
@@ -972,6 +999,7 @@ def stream_image_outputs(
     try:
         image_urls = backend.resolve_conversation_image_urls(
             conversation_id, file_ids, sediment_ids, poll_timeout_secs=poll_timeout,
+            request_message_id=request_message_id,
         )
     except (ImageContentPolicyError, ImagePollTimeoutError) as exc:
         # 当检测到文本回复时，task error 不应直接判定为内容策略违规，
@@ -1020,25 +1048,6 @@ def stream_image_outputs(
         # 检测模型是否返回了文本描述（含 referenced_image_ids）而非实际生成图片
         # 这说明模型已发起图片生成工具调用，但 SSE 在工具完成前断开。
         # 此时应再尝试轮询图片结果，而不是直接把文本当作最终输出。
-        # 当 is_text_reply 但 conversation_id 丢失时，尝试从最近对话列表恢复
-        if is_text_reply and not conversation_id:
-            try:
-                import time as _time
-                recovered_id = backend.find_conversation_by_prompt(
-                    request.prompt, _time.time(), timeout_secs=5.0,
-                )
-                if recovered_id:
-                    conversation_id = recovered_id
-                    logger.info({
-                        "event": "image_text_reply_conversation_id_recovered",
-                        "conversation_id": conversation_id,
-                        "message_preview": message[:200],
-                    })
-            except Exception as exc:
-                logger.warning({
-                    "event": "image_text_reply_conversation_id_recovery_failed",
-                    "error": repr(exc)[:300],
-                })
         if is_text_reply and conversation_id:
             logger.info({
                 "event": "image_model_text_reply_retry_poll",
@@ -1056,6 +1065,7 @@ def stream_image_outputs(
                         retry_poll_timeout,
                         file_ids,
                         sediment_ids,
+                        request_message_id=request_message_id,
                     )
                     file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                     sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
@@ -1094,6 +1104,7 @@ def stream_image_outputs(
             if file_ids or sediment_ids:
                 image_urls = backend.resolve_conversation_image_urls(
                     conversation_id, file_ids, sediment_ids, poll=False,
+                    request_message_id=request_message_id,
                 )
                 if image_urls:
                     if request.progress_callback:
@@ -1130,24 +1141,6 @@ def stream_image_outputs(
         "sediment_ids": sediment_ids,
         "should_poll_for_image": should_poll_for_image,
     })
-    # 当 should_poll_for_image 为 True 但 conversation_id 丢失时，尝试恢复
-    if should_poll_for_image and not conversation_id:
-        try:
-            import time as _time
-            recovered_id = backend.find_conversation_by_prompt(
-                request.prompt, _time.time(), timeout_secs=5.0,
-            )
-            if recovered_id:
-                conversation_id = recovered_id
-                logger.info({
-                    "event": "image_fallback_conversation_id_recovered",
-                    "conversation_id": conversation_id,
-                })
-        except Exception as exc:
-            logger.warning({
-                "event": "image_fallback_conversation_id_recovery_failed",
-                "error": repr(exc)[:300],
-            })
     if should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
         # 使用 300s 超时并允许多次重试，避免因临时网络问题或图片尚未提交而提前退出。
@@ -1168,6 +1161,7 @@ def stream_image_outputs(
                     retry_poll_timeout,
                     file_ids,
                     sediment_ids,
+                    request_message_id=request_message_id,
                 )
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
@@ -1206,6 +1200,7 @@ def stream_image_outputs(
         if file_ids or sediment_ids:
             image_urls = backend.resolve_conversation_image_urls(
                 conversation_id, file_ids, sediment_ids, poll=False,
+                request_message_id=request_message_id,
             )
             if image_urls:
                 if request.progress_callback:
@@ -1287,6 +1282,189 @@ def stream_codex_image_outputs(
     raise ImageGenerationError("No image result found in response")
 
 
+def _generate_bound_single_image(
+        request: ConversationRequest,
+        index: int,
+        total: int,
+) -> list[ImageOutput]:
+    """Run one durable conversation step without account or conversation failover."""
+    if is_codex_image_model(request.model):
+        raise ImageGenerationError(
+            "conversation binding is not supported for the selected image model",
+            code="CONVERSATION_BINDING_UNSUPPORTED",
+            provider_binding_id=request.provider_binding_id,
+            conversation_id=request.conversation_id,
+            parent_message_id=request.parent_message_id,
+        )
+    if bool(request.conversation_id) != bool(request.parent_message_id):
+        raise ImageGenerationError(
+            "conversation continuation requires conversation_id and parent_message_id",
+            code="CONVERSATION_BINDING_CONTRACT_INVALID",
+            provider_binding_id=request.provider_binding_id,
+            conversation_id=request.conversation_id,
+            parent_message_id=request.parent_message_id,
+        )
+    if not request.client_conversation_id:
+        raise ImageGenerationError(
+            "client_conversation_id is required for retained conversation binding",
+            code="CONVERSATION_BINDING_CONTRACT_INVALID",
+            provider_binding_id=request.provider_binding_id,
+            provider_account_identity=request.provider_account_identity,
+            conversation_id=request.conversation_id,
+            parent_message_id=request.parent_message_id,
+        )
+    token = ""
+    binding_id = request.provider_binding_id
+    account_identity = request.provider_account_identity
+    try:
+        if binding_id:
+            authoritative_identity = account_service.get_bound_account_identity(binding_id)
+            if not account_identity or authoritative_identity != account_identity:
+                raise ImageGenerationError(
+                    "provider account identity changed",
+                    code="CONVERSATION_BINDING_MISMATCH",
+                    provider_binding_id=binding_id,
+                    provider_account_identity=account_identity,
+                    conversation_id=request.conversation_id,
+                    parent_message_id=request.parent_message_id,
+                )
+            token = account_service.acquire_bound_image_access_token(
+                binding_id,
+                image_model=request.model,
+            )
+        else:
+            binding_id, account_identity, token = account_service.create_conversation_binding(
+                image_model=request.model,
+            )
+            request.provider_binding_id = binding_id
+            request.provider_account_identity = account_identity
+    except RuntimeError as exc:
+        raise ImageGenerationError(
+            str(exc) or "conversation binding unavailable",
+            code="CONVERSATION_BINDING_UNAVAILABLE",
+            provider_binding_id=binding_id,
+            provider_account_identity=account_identity,
+            conversation_id=request.conversation_id,
+            parent_message_id=request.parent_message_id,
+        ) from exc
+
+    slot_acquired = bool(token)
+    image_result_marked = False
+    account_email = ""
+    backend: OpenAIBackendAPI | None = None
+    outputs: list[ImageOutput] = []
+    last_conversation_id = request.conversation_id
+    try:
+        account = account_service.get_account(token) or {}
+        account_email = str(account.get("email") or "").strip()
+        with account_service.conversation_binding_lock(binding_id, request.client_conversation_id):
+            backend = OpenAIBackendAPI(access_token=token)
+            # Request-owned model selection; never mutate the shared pool
+            # default used by Content or other callers.
+            backend.retain_bound_conversation = True
+            backend.image_upstream_model = request.upstream_model
+            if request.progress_callback:
+                backend.progress_callback = request.progress_callback
+            try:
+                for output in stream_image_outputs(backend, request, index, total):
+                    last_conversation_id = output.conversation_id or last_conversation_id
+                    output.account_email = output.account_email or account_email
+                    output.provider_binding_id = binding_id
+                    output.provider_account_identity = account_identity
+                    if output.kind == "message" and request.message_as_error:
+                        raise ImageGenerationError(
+                            output.text or "Image generation was rejected by upstream policy.",
+                            status_code=400,
+                            error_type="invalid_request_error",
+                            code="content_policy_violation",
+                            account_email=account_email,
+                            provider_binding_id=binding_id,
+                            conversation_id=last_conversation_id,
+                        )
+                    outputs.append(output)
+                if not last_conversation_id:
+                    raise ImageGenerationError(
+                        "upstream response has no conversation_id",
+                        code="CONVERSATION_OUTCOME_UNKNOWN",
+                        account_email=account_email,
+                        provider_binding_id=binding_id,
+                    )
+                if request.conversation_id and last_conversation_id != request.conversation_id:
+                    raise ImageGenerationError(
+                        "upstream conversation identity changed",
+                        code="CONVERSATION_BINDING_MISMATCH",
+                        account_email=account_email,
+                        provider_binding_id=binding_id,
+                        conversation_id=last_conversation_id,
+                    )
+                if not any(output.kind == "result" for output in outputs):
+                    raise ImageGenerationError(
+                        "upstream completed without generating images",
+                        code="no_image_generated",
+                        account_email=account_email,
+                        provider_binding_id=binding_id,
+                        conversation_id=last_conversation_id,
+                    )
+                next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
+                for output in outputs:
+                    output.provider_binding_id = binding_id
+                    output.provider_account_identity = account_identity
+                    output.conversation_id = last_conversation_id
+                    output.parent_message_id = next_parent_message_id
+                image_result_marked = True
+                account_service.mark_image_result(token, True)
+                return outputs
+            except Exception as exc:
+                if not image_result_marked:
+                    image_result_marked = True
+                    account_service.mark_image_result(token, False)
+                conversation_id = str(getattr(exc, "conversation_id", "") or last_conversation_id)
+                parent_message_id = str(getattr(exc, "parent_message_id", "") or "")
+                request_message_id = str(getattr(backend, "image_request_message_id", "") or "")
+                if conversation_id and backend is not None and not parent_message_id:
+                    try:
+                        parent_message_id = backend.get_conversation_parent_message_id(conversation_id)
+                    except Exception:
+                        pass
+                if isinstance(exc, ImageGenerationError):
+                    exc.provider_binding_id = binding_id
+                    exc.provider_account_identity = account_identity
+                    exc.conversation_id = conversation_id
+                    exc.parent_message_id = parent_message_id
+                    exc.request_message_id = request_message_id
+                    raise
+                if isinstance(exc, ImageContentPolicyError):
+                    raise ImageGenerationError(
+                        str(exc),
+                        status_code=400,
+                        error_type="invalid_request_error",
+                        code="content_policy_violation",
+                        account_email=account_email,
+                        provider_binding_id=binding_id,
+                        provider_account_identity=account_identity,
+                        conversation_id=conversation_id,
+                        parent_message_id=parent_message_id,
+                        request_message_id=request_message_id,
+                    ) from exc
+                raise ImageGenerationError(
+                    image_stream_error_message(str(exc)),
+                    code="CONVERSATION_OUTCOME_UNKNOWN" if conversation_id else "CONVERSATION_BINDING_UNAVAILABLE",
+                    account_email=account_email,
+                    provider_binding_id=binding_id,
+                    provider_account_identity=account_identity,
+                    conversation_id=conversation_id,
+                    parent_message_id=parent_message_id,
+                    request_message_id=request_message_id,
+                ) from exc
+    finally:
+        try:
+            if backend is not None:
+                backend.close()
+        finally:
+            if slot_acquired and not image_result_marked:
+                account_service.release_image_slot(token)
+
+
 def _generate_single_image(
         request: ConversationRequest,
         index: int,
@@ -1297,6 +1475,9 @@ def _generate_single_image(
     该函数在独立线程中运行，每个线程使用不同的账号，
     实现并行生图，避免串行超时阻塞。
     """
+    if request.retain_conversation:
+        return _generate_bound_single_image(request, index, total)
+
     # 模型返回文本而非图片的最大重试次数
     MAX_TEXT_REPLY_RETRIES = 3
     # TLS 连接错误最大重试次数
@@ -1344,6 +1525,8 @@ def _generate_single_image(
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
+            backend.retain_bound_conversation = True
+            backend.image_upstream_model = request.upstream_model
             outputs: list[ImageOutput] = []
             last_conversation_id = ""
             try:
@@ -1623,10 +1806,18 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     message = ""
     progress_parts: list[str] = []
     account_email = ""
+    provider_binding_id = ""
+    provider_account_identity = ""
+    conversation_id = ""
+    parent_message_id = ""
     for output in outputs:
         created = created or output.created
         if output.account_email and not account_email:
             account_email = output.account_email
+        provider_binding_id = output.provider_binding_id or provider_binding_id
+        provider_account_identity = output.provider_account_identity or provider_account_identity
+        conversation_id = output.conversation_id or conversation_id
+        parent_message_id = output.parent_message_id or parent_message_id
         if output.kind == "progress" and output.text:
             progress_parts.append(output.text)
         elif output.kind == "message":
@@ -1641,4 +1832,12 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
             result["message"] = text
     if account_email:
         result["_account_email"] = account_email
+    if provider_binding_id:
+        result["_provider_binding_id"] = provider_binding_id
+    if provider_account_identity:
+        result["_provider_account_identity"] = provider_account_identity
+    if conversation_id:
+        result["_conversation_id"] = conversation_id
+    if parent_message_id:
+        result["_parent_message_id"] = parent_message_id
     return result

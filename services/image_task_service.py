@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +21,16 @@ TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+
+
+def _holds_upstream_slot(task: dict[str, Any]) -> bool:
+    if "upstream_unfinished" in task:
+        return task["upstream_unfinished"] is True
+    # Old receipts did not distinguish local execution from upstream work.
+    return bool(task.get("provider_account_identity")) and (
+        task.get("status") == TASK_STATUS_RUNNING
+        or task.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+    )
 
 
 def _now_iso() -> str:
@@ -61,6 +73,94 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
     return urls
 
 
+def _request_hash(mode: str, payload: dict[str, Any]) -> str:
+    """Hash the immutable task request without persisting prompts or image bytes."""
+    image_hashes = []
+    for item in payload.get("images") or []:
+        if isinstance(item, tuple) and item and isinstance(item[0], bytes):
+            image_hashes.append(hashlib.sha256(item[0]).hexdigest())
+    mask_hashes = []
+    for item in payload.get("mask") or []:
+        if isinstance(item, tuple) and item and isinstance(item[0], bytes):
+            mask_hashes.append(hashlib.sha256(item[0]).hexdigest())
+    contract = {
+        "mode": mode,
+        "prompt_sha256": hashlib.sha256(_clean(payload.get("prompt")).encode("utf-8")).hexdigest(),
+        "model": _clean(payload.get("model"), "gpt-image-2"),
+        "size": _clean(payload.get("size")),
+        "quality": _clean(payload.get("quality"), "auto"),
+        "provider_binding_id": _clean(payload.get("provider_binding_id")),
+        "provider_account_identity": _clean(payload.get("provider_account_identity")),
+        "client_conversation_id": _clean(payload.get("client_conversation_id")),
+        "conversation_id": _clean(payload.get("conversation_id")),
+        "parent_message_id": _clean(payload.get("parent_message_id")),
+        "retain_conversation": bool(payload.get("retain_conversation")),
+        "image_sha256": image_hashes,
+        "mask_sha256": mask_hashes,
+    }
+    # Keep old task fingerprints unchanged when the caller has no override.
+    if _clean(payload.get("upstream_model")):
+        contract["upstream_model"] = _clean(payload.get("upstream_model"))
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+class AuthoritativeImageTaskFailure(RuntimeError):
+    code = "NO_IMAGE_GENERATED"
+
+
+def _authoritative_image_failure(document: object, request_message_id: str) -> str:
+    if not isinstance(document, dict):
+        return ""
+    current_node = _clean(document.get("current_node"))
+    mapping = document.get("mapping")
+    if not current_node or not request_message_id or not isinstance(mapping, dict):
+        return ""
+    reversed_path: list[str] = []
+    message_id = current_node
+    while message_id and message_id not in reversed_path:
+        node = mapping.get(message_id)
+        if not isinstance(node, dict):
+            return ""
+        reversed_path.append(message_id)
+        if message_id == request_message_id:
+            break
+        message_id = _clean(node.get("parent"))
+    if request_message_id not in reversed_path:
+        return ""
+    path = list(reversed(reversed_path))
+    request_index = path.index(request_message_id)
+    for message_id in path[request_index + 1:]:
+        node = mapping.get(message_id) or {}
+        message = node.get("message") if isinstance(node, dict) else {}
+        author = message.get("author") if isinstance(message, dict) else {}
+        if _clean(author.get("role")).lower() == "user":
+            return ""
+    node = mapping.get(current_node) if current_node and isinstance(mapping, dict) else None
+    message = node.get("message") if isinstance(node, dict) else None
+    if not isinstance(message, dict):
+        return ""
+    author = message.get("author")
+    content = message.get("content")
+    if (
+        not isinstance(author, dict)
+        or _clean(author.get("role")).lower() != "assistant"
+        or _clean(message.get("status")) != "finished_successfully"
+        or message.get("end_turn") is not True
+        or not isinstance(content, dict)
+        or _clean(content.get("content_type")) != "text"
+    ):
+        return ""
+    parts = content.get("parts")
+    text = "\n".join(part for part in parts if isinstance(part, str)).strip() if isinstance(parts, list) else ""
+    normalized = " ".join(text.lower().split())
+    explicit_failures = {
+        "something went wrong while generating your image. sorry about that.",
+        "something went wrong while generating your image.",
+    }
+    return text if normalized in explicit_failures else ""
+
+
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
@@ -73,7 +173,31 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "updated_at": task.get("updated_at"),
     }
     if task.get("conversation_id"):
-        item["conversation_id"] = task.get("conversation_id")
+        item["image_session_id"] = task.get("conversation_id")
+    if task.get("parent_message_id"):
+        item["image_session_parent_id"] = task.get("parent_message_id")
+    for field in (
+        "provider_binding_id",
+        "provider_account_identity",
+        "client_conversation_id",
+        "binding_status",
+        "error_code",
+        "upstream_model",
+        "next_poll_at",
+        "upstream_unfinished",
+    ):
+        if task.get(field):
+            item[field] = task.get(field)
+    if (
+        task.get("status") == TASK_STATUS_ERROR
+        and _clean(task.get("error_code")) == "CONVERSATION_OUTCOME_UNKNOWN"
+        and not _clean(task.get("request_message_id"))
+    ):
+        # Legacy receipts may predate persistence of the submitted user-message
+        # boundary. Keep the upstream outcome UNKNOWN, but tell callers that
+        # automated polling cannot safely continue until that exact boundary is
+        # recovered from independent evidence.
+        item["recovery_status"] = "request_message_id_required"
     if task.get("data") is not None:
         item["data"] = task.get("data")
     if task.get("usage") is not None:
@@ -110,6 +234,7 @@ class ImageTaskService:
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self._lock = threading.RLock()
+        self._slot_condition = threading.Condition(self._lock)
         self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
@@ -129,6 +254,13 @@ class ImageTaskService:
         size: str | None,
         quality: str = "auto",
         base_url: str = "",
+        provider_binding_id: str = "",
+        provider_account_identity: str = "",
+        client_conversation_id: str = "",
+        conversation_id: str = "",
+        parent_message_id: str = "",
+        retain_conversation: bool = False,
+        upstream_model: str = "",
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -138,6 +270,13 @@ class ImageTaskService:
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
+            "provider_binding_id": provider_binding_id,
+            "provider_account_identity": provider_account_identity,
+            "client_conversation_id": client_conversation_id,
+            "conversation_id": conversation_id,
+            "parent_message_id": parent_message_id,
+            "retain_conversation": retain_conversation,
+            "upstream_model": upstream_model,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
 
@@ -153,6 +292,13 @@ class ImageTaskService:
         base_url: str = "",
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
+        provider_binding_id: str = "",
+        provider_account_identity: str = "",
+        client_conversation_id: str = "",
+        conversation_id: str = "",
+        parent_message_id: str = "",
+        retain_conversation: bool = False,
+        upstream_model: str = "",
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -164,6 +310,13 @@ class ImageTaskService:
             "quality": quality,
             "response_format": "url",
             "base_url": base_url,
+            "provider_binding_id": provider_binding_id,
+            "provider_account_identity": provider_account_identity,
+            "client_conversation_id": client_conversation_id,
+            "conversation_id": conversation_id,
+            "parent_message_id": parent_message_id,
+            "retain_conversation": retain_conversation,
+            "upstream_model": upstream_model,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
@@ -210,6 +363,8 @@ class ImageTaskService:
             cleaned = self._cleanup_locked()
             task = self._tasks.get(key)
             if task is not None:
+                if task.get("request_hash") and task.get("request_hash") != _request_hash(mode, payload):
+                    raise ValueError("client_task_id already exists with a different immutable request")
                 if cleaned:
                     self._save_locked()
                 return _public_task(task)
@@ -219,11 +374,22 @@ class ImageTaskService:
                 "status": TASK_STATUS_QUEUED,
                 "mode": mode,
                 "model": _clean(payload.get("model"), "gpt-image-2"),
+                "upstream_model": _clean(payload.get("upstream_model")),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
+                "base_url": _clean(payload.get("base_url")),
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
+                "provider_binding_id": _clean(payload.get("provider_binding_id")),
+                "provider_account_identity": _clean(payload.get("provider_account_identity")),
+                "client_conversation_id": _clean(payload.get("client_conversation_id")),
+                "conversation_id": _clean(payload.get("conversation_id")),
+                "parent_message_id": _clean(payload.get("parent_message_id")),
+                "binding_status": "bound" if payload.get("provider_binding_id") else "unbound",
+                "request_hash": _request_hash(mode, payload),
+                "upstream_unfinished": False,
+                "admission_recorded": True,
             }
             self._tasks[key] = task
             self._save_locked()
@@ -247,13 +413,36 @@ class ImageTaskService:
         identity: dict[str, object],
         model: str,
     ) -> None:
+        # Persist account admission before calling the handler. A query timeout
+        # or process restart must not make another upstream generation fit.
+        account = _clean(payload.get("provider_account_identity"))
+        if account:
+            with self._slot_condition:
+                while sum(1 for other_key, task in self._tasks.items()
+                          if other_key != key and task.get("provider_account_identity") == account
+                          and _holds_upstream_slot(task)) >= max(1, int(config.image_account_concurrency)):
+                    self._slot_condition.wait(timeout=1)
+                self._update_task(key, upstream_unfinished=True)
         started = time.time()
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        with self._lock:
+            task = self._tasks.get(key) or {}
+            request_message_id = _clean(task.get("request_message_id"))
+        if not request_message_id:
+            request_message_id = str(uuid.uuid4())
+            self._update_task(key, request_message_id=request_message_id)
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
             if step == "image_stream_resolve_start":
                 self._update_task(key, started_ts=time.time())
             self._update_task(key, progress=step)
+        progress_callback.request_message_id = request_message_id
+
+        def record_conversation_id(conversation_id: str) -> None:
+            conversation_id = _clean(conversation_id)
+            if conversation_id:
+                self._update_task(key, conversation_id=conversation_id)
+        progress_callback.record_conversation_id = record_conversation_id
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
@@ -263,6 +452,10 @@ class ImageTaskService:
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
             account_email = _clean(result.get("_account_email") or result.get("account_email"))
+            provider_binding_id = _clean(result.get("_provider_binding_id"))
+            provider_account_identity = _clean(result.get("_provider_account_identity"))
+            conversation_id = _clean(result.get("_conversation_id"))
+            parent_message_id = _clean(result.get("_parent_message_id"))
             if not isinstance(data, list) or not data:
                 upstream = _clean(result.get("message"))
                 if upstream:
@@ -275,7 +468,32 @@ class ImageTaskService:
                 raise error
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms)
+            expected_binding_id = _clean(payload.get("provider_binding_id"))
+            expected_account_identity = _clean(payload.get("provider_account_identity"))
+            if expected_binding_id and provider_binding_id != expected_binding_id:
+                raise RuntimeError("bound image result changed provider binding identity")
+            if expected_account_identity and provider_account_identity != expected_account_identity:
+                raise RuntimeError("bound image result changed provider account identity")
+            if (
+                bool(provider_binding_id) != bool(provider_account_identity)
+                or bool(provider_binding_id) != bool(conversation_id)
+                or bool(provider_binding_id) != bool(parent_message_id)
+            ):
+                raise RuntimeError("bound image result is missing authoritative conversation state")
+            self._update_task(
+                key,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                usage=usage,
+                error="",
+                duration_ms=duration_ms,
+                provider_binding_id=provider_binding_id,
+                provider_account_identity=provider_account_identity,
+                conversation_id=conversation_id,
+                parent_message_id=parent_message_id,
+                binding_status="bound" if provider_binding_id else "unbound",
+                upstream_unfinished=False,
+            )
             self._log_call(
                 identity,
                 mode,
@@ -290,10 +508,49 @@ class ImageTaskService:
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
+            provider_binding_id = _clean(
+                getattr(exc, "provider_binding_id", "") or payload.get("provider_binding_id")
+            )
+            provider_account_identity = _clean(
+                getattr(exc, "provider_account_identity", "")
+                or payload.get("provider_account_identity")
+            )
+            parent_message_id = _clean(getattr(exc, "parent_message_id", ""))
+            request_message_id = _clean(getattr(exc, "request_message_id", ""))
+            error_code = _clean(getattr(exc, "code", ""))
+            # Only explicit terminal rejections prove there is no generation
+            # left upstream. An unclassified transport exception does not.
+            terminal = error_code.lower() in {
+                "no_image_generated", "content_policy_violation",
+                "conversation_binding_contract_invalid",
+            }
+            if account and not terminal:
+                error_code = "CONVERSATION_OUTCOME_UNKNOWN"
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
-                              **({"conversation_id": conversation_id} if conversation_id else {}))
+                              upstream_unfinished=bool(account) and not terminal,
+                              **({"provider_binding_id": provider_binding_id} if provider_binding_id else {}),
+                              **({"provider_account_identity": provider_account_identity} if provider_account_identity else {}),
+                              **({"conversation_id": conversation_id} if conversation_id else {}),
+                              **({"parent_message_id": parent_message_id} if parent_message_id else {}),
+                              **({"request_message_id": request_message_id} if request_message_id else {}),
+                              **(
+                                  {
+                                      "binding_status": (
+                                          "bound"
+                                          if conversation_id and parent_message_id
+                                          else (
+                                              "unknown"
+                                              if error_code == "CONVERSATION_OUTCOME_UNKNOWN"
+                                              else "unavailable"
+                                          )
+                                      )
+                                  }
+                                  if provider_binding_id
+                                  else {}
+                              ),
+                              **({"error_code": error_code} if error_code else {}))
             self._log_call(
                 identity,
                 mode,
@@ -355,6 +612,7 @@ class ImageTaskService:
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
             self._save_locked()
+            self._slot_condition.notify_all()
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -383,6 +641,7 @@ class ImageTaskService:
                 "status": status,
                 "mode": "edit" if item.get("mode") == "edit" else "generate",
                 "model": _clean(item.get("model"), "gpt-image-2"),
+                "upstream_model": _clean(item.get("upstream_model")),
                 "size": _clean(item.get("size")),
                 "quality": _clean(item.get("quality"), "auto"),
                 "created_at": _clean(item.get("created_at"), _now_iso()),
@@ -390,7 +649,21 @@ class ImageTaskService:
                 "created_ts": item.get("created_ts"),
                 "updated_ts": item.get("updated_ts"),
                 "started_ts": item.get("started_ts"),
+                "progress": item.get("progress"),
                 "duration_ms": item.get("duration_ms"),
+                "provider_binding_id": _clean(item.get("provider_binding_id")),
+                "provider_account_identity": _clean(item.get("provider_account_identity")),
+                "client_conversation_id": _clean(item.get("client_conversation_id")),
+                "conversation_id": _clean(item.get("conversation_id")),
+                "parent_message_id": _clean(item.get("parent_message_id")),
+                "request_message_id": _clean(item.get("request_message_id")),
+                "binding_status": _clean(item.get("binding_status"), "unbound"),
+                "error_code": _clean(item.get("error_code")),
+                "request_hash": _clean(item.get("request_hash")),
+                "upstream_unfinished": _holds_upstream_slot(item),
+                "admission_recorded": item.get("admission_recorded") is True,
+                "next_poll_at": item.get("next_poll_at", 0),
+                "poll_failures": item.get("poll_failures", 0),
             }
             data = item.get("data")
             if isinstance(data, list):
@@ -401,6 +674,19 @@ class ImageTaskService:
             error = _clean(item.get("error"))
             if error:
                 task["error"] = error
+            if (
+                task.get("binding_status") == "unknown"
+                and task.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+                and any(
+                    marker in error
+                    for marker in (
+                        "/backend-api/f/conversation failed: status=403",
+                        "/backend-api/conversation failed: status=403",
+                    )
+                )
+            ):
+                task["binding_status"] = "unavailable"
+                task["error_code"] = "CONVERSATION_BINDING_UNAVAILABLE"
             tasks[_task_key(owner, task_id)] = task
         return tasks
 
@@ -414,8 +700,14 @@ class ImageTaskService:
         changed = False
         for task in self._tasks.values():
             if task.get("status") in UNFINISHED_STATUSES:
+                not_started = (task.get("status") == TASK_STATUS_QUEUED
+                               and task.get("admission_recorded") is True
+                               and task.get("upstream_unfinished") is False)
                 task["status"] = TASK_STATUS_ERROR
                 task["error"] = "服务已重启，未完成的图片任务已中断"
+                task["error_code"] = "IMAGE_TASK_NOT_STARTED" if not_started else "CONVERSATION_OUTCOME_UNKNOWN"
+                if task.get("provider_binding_id"):
+                    task["binding_status"] = "unavailable" if not_started else "unknown"
                 task["updated_at"] = _now_iso()
                 changed = True
         return changed
@@ -429,7 +721,9 @@ class ImageTaskService:
         removed_keys = [
             key
             for key, task in self._tasks.items()
-            if task.get("status") in TERMINAL_STATUSES and _timestamp(task.get("updated_at")) < cutoff
+            if task.get("status") in TERMINAL_STATUSES and not _holds_upstream_slot(task)
+            and task.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
+            and _timestamp(task.get("updated_at")) < cutoff
         ]
         for key in removed_keys:
             self._tasks.pop(key, None)
@@ -440,6 +734,7 @@ class ImageTaskService:
         identity: dict[str, object],
         task_id: str,
         extra_timeout_secs: float = 30.0,
+        base_url: str = "",
     ) -> dict[str, Any]:
         """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
         owner = _owner_id(identity)
@@ -450,12 +745,22 @@ class ImageTaskService:
                 raise ValueError("task not found")
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
-            error_msg = _clean(task.get("error"))
-            if "超时" not in error_msg:
-                raise ValueError("task error is not a timeout error")
+            if _clean(task.get("error_code")) != "CONVERSATION_OUTCOME_UNKNOWN":
+                raise ValueError("task outcome is not unknown")
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
                 raise ValueError("task has no conversation_id")
+            if not _clean(task.get("request_message_id")):
+                # Do not rotate this legacy UNKNOWN through a zero-duration
+                # RUNNING/error cycle. There is no safe message boundary to
+                # query, and selecting an ancestor, latest node, matching
+                # prompt, or another task's request would risk attribution to a
+                # different generation. The task remains recoverable when an
+                # independently proven request_message_id is repaired in its
+                # persisted receipt.
+                return _public_task(task)
+            if time.time() < float(task.get("next_poll_at") or 0):
+                return _public_task(task)
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
             # 将任务状态重置为 running
@@ -464,7 +769,7 @@ class ImageTaskService:
         # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+            args=(key, conversation_id, extra_timeout_secs, base_url, dict(identity), mode, model),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -476,6 +781,7 @@ class ImageTaskService:
         key: str,
         conversation_id: str,
         extra_timeout_secs: float,
+        base_url: str,
         identity: dict[str, object],
         mode: str,
         model: str,
@@ -483,43 +789,75 @@ class ImageTaskService:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
         backend = None
+        account_service = None
+        access_token = ""
         try:
+            from services.account_service import account_service
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
-            file_ids, sediment_ids = backend._poll_image_results(
-                conversation_id,
-                extra_timeout_secs,
-            )
-            if not file_ids and not sediment_ids:
-                raise RuntimeError(
-                    f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
-                )
-
-            image_urls = backend.resolve_conversation_image_urls(
-                conversation_id, file_ids, sediment_ids, poll=False,
-            )
-            if not image_urls:
-                raise RuntimeError("图片 URL 解析失败")
-
-            image_items = [
-                {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
-                for image_data in backend.download_image_bytes(image_urls)
-            ]
-            # 获取 task 的原始 prompt（从 _public_task 的 mode 判断）
             with self._lock:
                 task = self._tasks.get(key)
-                quality = _clean(task.get("quality"), "auto") if task else "auto"
-                size = _clean(task.get("size")) if task else None
+                binding_id = _clean(task.get("provider_binding_id")) if task else ""
+                account_identity = _clean(task.get("provider_account_identity")) if task else ""
+                client_conversation_id = _clean(task.get("client_conversation_id")) if task else ""
+                request_message_id = _clean(task.get("request_message_id")) if task else ""
+            if not binding_id or not account_identity or not client_conversation_id or not request_message_id:
+                raise RuntimeError("conversation binding unavailable: task authority missing")
+            authoritative_identity = account_service.get_bound_account_identity(binding_id)
+            if authoritative_identity != account_identity:
+                raise RuntimeError("conversation binding unavailable: account identity changed")
+            # Reading the original task consumes no new generation admission.
+            access_token = account_service.get_bound_text_access_token(binding_id, model="auto")
+            with account_service.conversation_binding_lock(binding_id, client_conversation_id):
+                backend = OpenAIBackendAPI(access_token=access_token)
+                authoritative_failure = _authoritative_image_failure(
+                    backend._get_conversation(conversation_id), request_message_id,
+                )
+                if authoritative_failure:
+                    raise AuthoritativeImageTaskFailure(authoritative_failure)
+                file_ids, sediment_ids = backend._poll_image_results(
+                    conversation_id,
+                    extra_timeout_secs,
+                    request_message_id=request_message_id,
+                )
+                if not file_ids and not sediment_ids:
+                    raise RuntimeError(
+                        f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
+                    )
+
+                image_urls = backend.resolve_conversation_image_urls(
+                    conversation_id, file_ids, sediment_ids, poll=False,
+                    request_message_id=request_message_id,
+                )
+                if not image_urls:
+                    raise RuntimeError("图片 URL 解析失败")
+
+                image_items = [
+                    {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
+                    for image_data in backend.download_image_bytes(image_urls)
+                ]
+                parent_message_id = backend.get_conversation_parent_message_id(conversation_id)
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
                 "b64_json",
-                "",
+                base_url,
                 int(time.time()),
             )["data"]
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
+            self._update_task(
+                key,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                error="",
+                error_code="",
+                binding_status="bound",
+                parent_message_id=parent_message_id,
+                upstream_unfinished=False,
+                next_poll_at=0,
+                poll_failures=0,
+                duration_ms=int((time.time() - started) * 1000),
+            )
             self._log_call(
                 identity,
                 mode,
@@ -532,7 +870,22 @@ class ImageTaskService:
         except Exception as exc:
             error_message = str(exc) or "resume poll failed"
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
+            error_code = _clean(getattr(exc, "code", ""))
+            with self._lock:
+                failures = int(self._tasks.get(key, {}).get("poll_failures") or 0) + 1
+            terminal = error_code == "NO_IMAGE_GENERATED"
+            self._update_task(
+                key,
+                status=TASK_STATUS_ERROR,
+                error=error_message,
+                error_code=error_code if terminal else "CONVERSATION_OUTCOME_UNKNOWN",
+                binding_status="bound" if terminal else "unknown",
+                data=[],
+                duration_ms=duration_ms,
+                upstream_unfinished=not terminal,
+                poll_failures=failures,
+                next_poll_at=time.time() + min(900, 60 * 2 ** min(failures - 1, 4)),
+            )
             self._log_call(
                 identity,
                 mode,
