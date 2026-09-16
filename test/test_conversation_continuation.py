@@ -674,6 +674,34 @@ class TextResultRecoveryTests(unittest.TestCase):
             )
         self.assertEqual(drift.exception.recovery_reason, TextRecoveryReason.REQUEST_PARENT_MISMATCH.value)
 
+    def test_missing_request_anchor_waits_for_explicit_active_current_node(self):
+        backend = mock.Mock()
+        for role in ("assistant", "tool"):
+            for status in ("in_progress", "running", "pending", "queued"):
+                backend._get_conversation.return_value = {
+                    "conversation_id": "conversation-one",
+                    "current_node": "active-node",
+                    "mapping": {
+                        "active-node": {
+                            "message": {
+                                "id": "active-node",
+                                "author": {"role": role},
+                                "status": status,
+                            },
+                        },
+                    },
+                }
+
+                result = ConversationBindingService._read_text_request_result(
+                    backend, self.request_receipt(),
+                )
+
+                self.assertEqual(result["status"], "running")
+                self.assertEqual(
+                    result["recovery_reason"],
+                    TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value,
+                )
+
     def test_request_recovery_distinguishes_empty_branch_from_invalid_mapping(self):
         document = self.request_document()
         for node_id in ("original-answer", "later-user", "later-answer"):

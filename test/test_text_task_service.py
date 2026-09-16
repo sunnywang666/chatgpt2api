@@ -5,7 +5,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from services.conversation_binding_service import ConversationBindingError
+from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
 from services.text_task_service import TextTaskService, ContinuationExecutor
 
 
@@ -463,6 +463,64 @@ class TextTaskTests(unittest.TestCase):
         )
         self.assertEqual(invalid_result.get("recovery_no_result_reads", 0), 0)
         self.assertNotEqual(invalid_result.get("error_code"), "RESULT_UNRECOVERABLE")
+
+    def test_missing_anchor_waits_while_current_node_is_active_then_recovers(self):
+        clock = ManualClock()
+        document = {
+            "conversation_id": "chat",
+            "current_node": "assistant-running",
+            "mapping": {
+                "assistant-running": {
+                    "message": {
+                        "id": "assistant-running",
+                        "author": {"role": "assistant"},
+                        "status": "in_progress",
+                    },
+                },
+            },
+        }
+        class Backend:
+            def _get_conversation(self, _conversation_id):
+                return document
+
+        backend = Backend()
+
+        def actual_reader(receipt):
+            return ConversationBindingService._read_text_request_result(backend, receipt)
+
+        service = TextTaskService(
+            self.path,
+            executor=self.queue,
+            clock=clock,
+            recovery_reader=actual_reader,
+        )
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="binding", provider_account_identity="account",
+            conversation_id="chat",
+        )
+        clock.advance(TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS + 1)
+
+        for _ in range(3):
+            active = service.recover("owner", "attempt-1", True)
+            self.assertEqual(active["status"], "unknown")
+            self.assertEqual(active["recovery_reason"], "REQUEST_RESULT_INCOMPLETE")
+            self.assertEqual(active.get("recovery_no_result_reads", 0), 0)
+            clock.advance(TextTaskService.RECOVERY_MAX_BACKOFF_SECONDS + 1)
+
+        document["mapping"]["assistant-running"]["message"].update({
+            "status": "finished_successfully",
+            "end_turn": True,
+        })
+        for _ in range(3):
+            recovered = service.recover("owner", "attempt-1", True)
+            clock.advance(TextTaskService.RECOVERY_MAX_BACKOFF_SECONDS + 1)
+
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["error_code"], "RESULT_UNRECOVERABLE")
+        self.assertEqual(recovered["recovery_no_result_reads"], 3)
 
     def test_latest_valid_chat_evidence_clears_an_older_404_marker(self):
         clock = ManualClock()
