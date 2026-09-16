@@ -17,6 +17,7 @@ class TextRecoveryReason(str, Enum):
     REQUEST_BRANCH_AMBIGUOUS = "REQUEST_BRANCH_AMBIGUOUS"
     REQUEST_BRANCH_SUPERSEDED = "REQUEST_BRANCH_SUPERSEDED"
     REQUEST_RESULT_INCOMPLETE = "REQUEST_RESULT_INCOMPLETE"
+    REQUEST_RESULT_NOT_FOUND = "REQUEST_RESULT_NOT_FOUND"
     REQUEST_RESULT_TERMINAL_EMPTY = "REQUEST_RESULT_TERMINAL_EMPTY"
     CONVERSATION_NOT_FOUND = "CONVERSATION_NOT_FOUND"
 
@@ -157,8 +158,14 @@ class ConversationBindingService:
                 recovery_reason=TextRecoveryReason.CONVERSATION_ID_MISMATCH.value,
             )
 
-        mapping = document.get("mapping") or {}
-        request_node = mapping.get(request_message_id) if isinstance(mapping, dict) else None
+        if "mapping" not in document or not isinstance(document.get("mapping"), dict):
+            raise ConversationBindingError(
+                "conversation mapping is missing or invalid",
+                code="CONVERSATION_BINDING_CONTRACT_INVALID",
+                conversation_id=conversation_id,
+            )
+        mapping = document["mapping"]
+        request_node = mapping.get(request_message_id)
         request_message = request_node.get("message") if isinstance(request_node, dict) else None
         request_author = request_message.get("author") if isinstance(request_message, dict) else None
         request_role = request_author.get("role") if isinstance(request_author, dict) else None
@@ -257,11 +264,11 @@ class ConversationBindingService:
             elif later_user_seen:
                 recovery_reason = TextRecoveryReason.REQUEST_BRANCH_SUPERSEDED.value
             else:
-                recovery_reason = TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
+                recovery_reason = TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value
             return {
                 **result,
                 "binding_status": "unknown",
-                "status": "running",
+                "status": "running" if active_result_seen else "unknown",
                 "recovery_reason": recovery_reason,
             }
         parent_message_id, text = candidates[0]

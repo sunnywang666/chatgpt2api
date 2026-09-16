@@ -674,6 +674,40 @@ class TextResultRecoveryTests(unittest.TestCase):
             )
         self.assertEqual(drift.exception.recovery_reason, TextRecoveryReason.REQUEST_PARENT_MISMATCH.value)
 
+    def test_request_recovery_distinguishes_empty_branch_from_invalid_mapping(self):
+        document = self.request_document()
+        for node_id in ("original-answer", "later-user", "later-answer"):
+            document["mapping"].pop(node_id)
+        document["current_node"] = "request-user"
+        backend = mock.Mock()
+        backend._get_conversation.return_value = document
+
+        empty = ConversationBindingService._read_text_request_result(
+            backend, self.request_receipt(),
+        )
+
+        self.assertEqual(empty["status"], "unknown")
+        self.assertEqual(
+            empty["recovery_reason"], TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value,
+        )
+
+        for invalid_document in (
+            {"conversation_id": "conversation-one"},
+            {"conversation_id": "conversation-one", "mapping": []},
+        ):
+            backend._get_conversation.return_value = invalid_document
+            with self.assertRaises(ConversationBindingError) as invalid:
+                ConversationBindingService._read_text_request_result(
+                    backend, self.request_receipt(),
+                )
+            self.assertEqual(
+                invalid.exception.code, "CONVERSATION_BINDING_CONTRACT_INVALID",
+            )
+            self.assertNotEqual(
+                invalid.exception.recovery_reason,
+                TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
+            )
+
     def test_request_recovery_account_and_conversation_mismatch_are_distinct(self):
         service = ConversationBindingService()
         receipt = self.request_receipt()
@@ -730,7 +764,10 @@ class TextResultRecoveryTests(unittest.TestCase):
             backend = mock.Mock()
             backend._get_conversation.return_value = document
             result = ConversationBindingService._read_text_request_result(backend, self.request_receipt())
-            self.assertEqual(result["status"], "running")
+            self.assertEqual(
+                result["status"],
+                "running" if expected_reason == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value else "unknown",
+            )
             self.assertEqual(result["recovery_reason"], expected_reason)
             self.assertNotIn("content", result)
 

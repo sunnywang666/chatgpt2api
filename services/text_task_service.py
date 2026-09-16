@@ -96,6 +96,7 @@ class TextTaskService:
         TextRecoveryReason.CONVERSATION_NOT_FOUND.value,
         TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
         TextRecoveryReason.REQUEST_BRANCH_SUPERSEDED.value,
+        TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value,
         TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
     })
     _VALID_CONVERSATION_REASONS = frozenset({
@@ -104,6 +105,7 @@ class TextTaskService:
         TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value,
         TextRecoveryReason.REQUEST_BRANCH_SUPERSEDED.value,
         TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value,
+        TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value,
         TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
     })
 

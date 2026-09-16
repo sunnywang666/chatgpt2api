@@ -402,6 +402,68 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(result["recovery_no_result_reads"], 3)
         self.assertFalse(result["recovery_requires_new_conversation"])
 
+    def test_missing_result_qualifies_but_invalid_mapping_contract_does_not(self):
+        clock = ManualClock()
+        service = TextTaskService(
+            self.path,
+            executor=self.queue,
+            clock=clock,
+            recovery_reader=lambda _receipt: {
+                "status": "unknown",
+                "recovery_reason": "REQUEST_RESULT_NOT_FOUND",
+            },
+        )
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="binding", provider_account_identity="account",
+            conversation_id="chat",
+        )
+        clock.advance(TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS + 1)
+        for delay in (31, 61, 121):
+            result = service.recover("owner", "attempt-1", True)
+            clock.advance(delay)
+
+        self.assertEqual(result["error_code"], "RESULT_UNRECOVERABLE")
+        self.assertEqual(result["recovery_no_result_reads"], 3)
+
+        invalid_path = self.path.with_name("invalid-mapping.sqlite3")
+
+        def invalid_reader(_receipt):
+            raise ConversationBindingError(
+                "conversation mapping is missing or invalid",
+                code="CONVERSATION_BINDING_CONTRACT_INVALID",
+            )
+
+        invalid_service = TextTaskService(
+            invalid_path,
+            executor=QueuedExecutor(),
+            clock=clock,
+            recovery_reader=invalid_reader,
+        )
+        invalid_body = {**self.body, "client_request_id": "invalid-mapping"}
+        invalid_service.submit("owner", invalid_body)
+        invalid_service._update(
+            "owner", "invalid-mapping", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="binding", provider_account_identity="account",
+            conversation_id="chat",
+        )
+        for delay in (31, 61, 121):
+            invalid_result = invalid_service.recover(
+                "owner", "invalid-mapping", True,
+            )
+            clock.advance(delay)
+
+        self.assertEqual(invalid_result["status"], "unknown")
+        self.assertEqual(
+            invalid_result["recovery_error_code"],
+            "CONVERSATION_BINDING_CONTRACT_INVALID",
+        )
+        self.assertEqual(invalid_result.get("recovery_no_result_reads", 0), 0)
+        self.assertNotEqual(invalid_result.get("error_code"), "RESULT_UNRECOVERABLE")
+
     def test_latest_valid_chat_evidence_clears_an_older_404_marker(self):
         clock = ManualClock()
         reasons = iter([
