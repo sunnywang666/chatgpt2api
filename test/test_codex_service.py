@@ -5,6 +5,7 @@ import hashlib
 import json
 import threading
 import unittest
+from unittest.mock import patch
 
 from services.codex_service import (
     CODEX_COMPACT_URL,
@@ -264,6 +265,28 @@ class CodexRelayTests(unittest.TestCase):
     identity = {"id": "key-one", "role": "user"}
     headers = {"session-id": "session-one", "x-codex-window-id": "window-one", "authorization": "Bearer caller-secret"}
 
+    def test_real_transport_signature_accepts_native_body_without_network(self):
+        # Autospec uses the installed transport signature, unlike FakeSession's
+        # **kwargs. Run under uv.lock's curl-cffi version to catch API drift.
+        payload = {"model": "gpt-5.6-codex", "stream": True,
+                   "input": [{"type": "function_call_output", "call_id": "call-1", "output": "fixture"}],
+                   "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}],
+                   "reasoning": {"effort": "medium"}, "store": False}
+        for compact in (False, True):
+            with self.subTest(compact=compact), \
+                    patch("services.codex_service.proxy_settings.build_session_kwargs", return_value={}), \
+                    patch("curl_cffi.Curl.perform", side_effect=AssertionError("network prohibited")) as perform, \
+                    patch("curl_cffi.requests.Session.request", autospec=True,
+                          return_value=FakeResponse(payload={"id": "r-native"})) as request:
+                service = CodexService(FakeAccounts([account()]))
+                result = service.submit(self.identity, payload, self.headers, compact=compact)
+                self.assertEqual(result.status_code, 200)
+                request.assert_called_once()
+                self.assertEqual(request.call_args.kwargs["url"], CODEX_COMPACT_URL if compact else CODEX_RESPONSES_URL)
+                self.assertEqual(json.loads(request.call_args.kwargs["data"]), payload)
+                self.assertFalse(request.call_args.kwargs["allow_redirects"])
+                perform.assert_not_called()
+
     def test_native_tool_loop_sse_is_relayed_unchanged_and_binds_response(self):
         chunks = [
             b'data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{}"}}\n\n',
@@ -284,7 +307,7 @@ class CodexRelayTests(unittest.TestCase):
         self.assertEqual(b"".join(result.stream), b"".join(chunks))
         call = session.calls[0]
         self.assertEqual(call[1], CODEX_RESPONSES_URL)
-        self.assertEqual(json.loads(call[2]["content"]), payload)
+        self.assertEqual(json.loads(call[2]["data"]), payload)
         self.assertEqual(call[2]["headers"]["session-id"], "session-one")
         self.assertNotEqual(call[2]["headers"]["authorization"], "Bearer caller-secret")
         digest = hashlib.sha256(b"resp_1").hexdigest()
