@@ -52,6 +52,7 @@ class AuthService:
         last_used_at = self._clean(raw.get("last_used_at")) or None
         return {
             "id": item_id,
+            "owner_subject": self._clean(raw.get("owner_subject")),
             "name": name,
             "role": role,
             "key_hash": key_hash,
@@ -147,7 +148,7 @@ class AuthService:
             raise ValueError("这个名称已经在使用中了，换一个更容易区分的名称吧")
         return candidate
 
-    def create_key(self, *, role: AuthRole, name: str = "") -> tuple[dict[str, object], str]:
+    def create_key(self, *, role: AuthRole, name: str = "", owner_subject: str = "") -> tuple[dict[str, object], str]:
         with self._lock:
             self._reload_locked()
             normalized_name = self._build_name_locked(name, role=role)
@@ -160,6 +161,7 @@ class AuthService:
                     continue
             item = {
                 "id": uuid.uuid4().hex[:12],
+                "owner_subject": owner_subject,
                 "name": normalized_name,
                 "role": role,
                 "key_hash": key_hash,
@@ -170,6 +172,22 @@ class AuthService:
             self._items.append(item)
             self._save()
             return self._public_item(item), raw_key
+
+    def list_owned_keys(self, owner: str) -> list[dict[str, object]]:
+        with self._lock:
+            self._reload_locked()
+            return [self._public_item(item) for item in self._items
+                    if item.get("role") == "user" and item.get("owner_subject") == owner]
+
+    def revoke_owned_key(self, owner: str, key_id: str) -> bool:
+        with self._lock:
+            self._reload_locked()
+            for item in self._items:
+                if item.get("id") == key_id and item.get("role") == "user" and item.get("owner_subject") == owner:
+                    item["enabled"] = False
+                    self._save()
+                    return True
+        return False
 
     def update_key(
         self,

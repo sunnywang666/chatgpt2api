@@ -100,6 +100,8 @@ class TextProtocolRoutingTests(unittest.TestCase):
         with (
             mock.patch.object(openai_v1_chat_complete, "text_backend", return_value=object()) as backend,
             mock.patch.object(openai_v1_chat_complete, "collect_text", return_value="ok"),
+            mock.patch.object(openai_v1_chat_complete, "count_message_text_tokens", return_value=2),
+            mock.patch.object(openai_v1_chat_complete, "count_text_tokens", return_value=1),
         ):
             openai_v1_chat_complete.handle(body)
 

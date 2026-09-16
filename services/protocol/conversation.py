@@ -1339,14 +1339,18 @@ def _generate_bound_single_image(
             request.provider_binding_id = binding_id
             request.provider_account_identity = account_identity
     except RuntimeError as exc:
-        raise ImageGenerationError(
+        error = ImageGenerationError(
             str(exc) or "conversation binding unavailable",
             code="CONVERSATION_BINDING_UNAVAILABLE",
             provider_binding_id=binding_id,
             provider_account_identity=account_identity,
             conversation_id=request.conversation_id,
             parent_message_id=request.parent_message_id,
-        ) from exc
+        )
+        # This block ends before any backend/stream is created. Preserve that
+        # positive evidence; the same error code elsewhere can be uncertain.
+        error.upstream_submitted = False
+        raise error from exc
 
     slot_acquired = bool(token)
     image_result_marked = False

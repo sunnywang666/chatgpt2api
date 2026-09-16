@@ -371,6 +371,7 @@ class ImageTaskService:
             task = {
                 "id": task_id,
                 "owner_id": owner,
+                "retain_receipt": bool(identity.get("external_image_client")),
                 "status": TASK_STATUS_QUEUED,
                 "mode": mode,
                 "model": _clean(payload.get("model"), "gpt-image-2"),
@@ -413,10 +414,59 @@ class ImageTaskService:
         identity: dict[str, object],
         model: str,
     ) -> None:
+        if identity.get("external_image_client"):
+            # Allocate once for this newly persisted task, before any generation.
+            # Duplicate submissions never enter this thread. Account selection
+            # only performs readiness reads; a failure here is NOT submitted.
+            from services.account_service import account_service
+            token = ""
+            try:
+                capacities = {str(item.get("provider_account_identity") or ""): min(
+                    max(1, int(config.image_account_concurrency)), max(0, int(item.get("quota") or 0)))
+                    for item in account_service.list_accounts()}
+                with self._lock:
+                    held = {}
+                    for other in self._tasks.values():
+                        identity_id = str(other.get("provider_account_identity") or "")
+                        if identity_id and _holds_upstream_slot(other):
+                            held[identity_id] = held.get(identity_id, 0) + 1
+                    unavailable = {identity_id for identity_id, count in held.items()
+                                   if count >= capacities.get(identity_id, max(1, int(config.image_account_concurrency)))}
+                binding, account_identity, token = account_service.create_conversation_binding(
+                    image_model=model, excluded_account_identities=unavailable)
+                payload = {**payload, "provider_binding_id": binding,
+                           "provider_account_identity": account_identity,
+                           "client_conversation_id": "image-task-" + uuid.uuid4().hex,
+                           "retain_conversation": True}
+                # Recheck after selection: another task can finish selection
+                # while this selector waits for an account slot. Persist our
+                # durable occupancy before releasing the temporary slot.
+                selected = account_service.get_account(token) or {}
+                capacity = min(max(1, int(config.image_account_concurrency)),
+                               max(0, int(selected.get("quota") or 0)))
+                with self._slot_condition:
+                    occupied = sum(1 for other_key, other in self._tasks.items()
+                                   if other_key != key and other.get("provider_account_identity") == account_identity
+                                   and _holds_upstream_slot(other))
+                    if occupied >= capacity:
+                        raise RuntimeError("resource became occupied before submission")
+                    self._update_task(key, provider_binding_id=binding,
+                                      provider_account_identity=account_identity,
+                                      client_conversation_id=payload["client_conversation_id"],
+                                      binding_status="bound", upstream_unfinished=True)
+            except Exception:
+                self._update_task(key, status=TASK_STATUS_ERROR, error_code="IMAGE_RESOURCE_UNAVAILABLE",
+                                  error="No available resource for the selected durable image route",
+                                  upstream_unfinished=False)
+                return
+            finally:
+                if token:
+                    account_service.release_image_slot(token)
+
         # Persist account admission before calling the handler. A query timeout
         # or process restart must not make another upstream generation fit.
         account = _clean(payload.get("provider_account_identity"))
-        if account:
+        if account and not identity.get("external_image_client"):
             with self._slot_condition:
                 while sum(1 for other_key, task in self._tasks.items()
                           if other_key != key and task.get("provider_account_identity") == account
@@ -524,6 +574,8 @@ class ImageTaskService:
                 "no_image_generated", "content_policy_violation",
                 "conversation_binding_contract_invalid",
             }
+            if identity.get("external_image_client") and getattr(exc, "upstream_submitted", None) is False:
+                terminal = True
             if account and not terminal:
                 error_code = "CONVERSATION_OUTCOME_UNKNOWN"
             duration_ms = int((time.time() - started) * 1000)
@@ -662,6 +714,7 @@ class ImageTaskService:
                 "request_hash": _clean(item.get("request_hash")),
                 "upstream_unfinished": _holds_upstream_slot(item),
                 "admission_recorded": item.get("admission_recorded") is True,
+                "retain_receipt": item.get("retain_receipt") is True,
                 "next_poll_at": item.get("next_poll_at", 0),
                 "poll_failures": item.get("poll_failures", 0),
             }
@@ -722,6 +775,7 @@ class ImageTaskService:
             key
             for key, task in self._tasks.items()
             if task.get("status") in TERMINAL_STATUSES and not _holds_upstream_slot(task)
+            and not task.get("retain_receipt")
             and task.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
             and _timestamp(task.get("updated_at")) < cutoff
         ]

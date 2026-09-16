@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
+import ipaddress
 import json
 import mimetypes
 import re
+import socket
+import warnings
 from pathlib import PurePosixPath
 from typing import Any, TypeGuard
-from urllib.parse import unquote, unquote_to_bytes, urlparse
+from urllib.parse import unquote, unquote_to_bytes, urljoin, urlparse
 
-from curl_cffi import requests
+from curl_cffi import CurlOpt, requests
+from curl_cffi.curl import ffi, lib
 from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
+from PIL import Image, UnidentifiedImageError
 from starlette.datastructures import UploadFile
 
 from services.proxy_service import proxy_settings
@@ -20,8 +26,60 @@ ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
+MAX_IMAGE_INPUT_COUNT = 16
+MAX_IMAGE_INPUT_BYTES = MAX_IMAGE_REFERENCE_BYTES * 2
+MAX_IMAGE_REDIRECTS = 5
+IMAGE_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+MAX_BASE64_INPUT_CHARS = 4 * ((MAX_IMAGE_REFERENCE_BYTES + 2) // 3)
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
+
+
+def _input_error(message: str) -> HTTPException:
+    return HTTPException(status_code=400, detail={"error": message})
+
+
+def _normalize_mime_type(mime_type: object) -> str:
+    value = _clean(mime_type).split(";", 1)[0].strip().lower()
+    return "image/jpeg" if value == "image/jpg" else value
+
+
+def _validated_image_input(data: bytes, filename: str, mime_type: str) -> ImageInput:
+    """Validate bytes as a bounded raster and return its canonical MIME type."""
+    if not data:
+        raise _input_error("image file is empty")
+    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
+        raise _input_error("image URL exceeds 50MB limit")
+
+    declared_mime = _normalize_mime_type(mime_type)
+    if declared_mime in {"application/octet-stream", "binary/octet-stream"}:
+        declared_mime = ""
+    if declared_mime and not declared_mime.startswith("image/"):
+        raise _input_error("image MIME type is not a raster image")
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                image.verify()
+            with Image.open(io.BytesIO(data)) as image:
+                width, height = image.size
+                if width < 1 or height < 1 or width * height > 50_000_000:
+                    raise _input_error("image dimensions exceed the safe limit")
+                image.load()
+                image_format = str(image.format or "").upper()
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning, OSError, SyntaxError,
+            UnidentifiedImageError, ValueError) as exc:
+        raise _input_error("image bytes are not a valid raster image") from exc
+
+    actual_mime = _normalize_mime_type(Image.MIME.get(image_format, ""))
+    if not actual_mime or not actual_mime.startswith("image/"):
+        raise _input_error("image format is not a supported raster image")
+    if declared_mime and declared_mime != actual_mime:
+        raise _input_error("image MIME type does not match the image bytes")
+    return data, _safe_filename(filename, actual_mime, "image"), actual_mime
 
 
 def _clean(value: object, default: str = "") -> str:
@@ -105,15 +163,14 @@ def _json_reference_value(value: object) -> object:
 
 
 def _decode_base64_image(value: object, filename: str, mime_type: str) -> ImageInput:
+    encoded = str(value).strip()
+    if len(encoded) > MAX_BASE64_INPUT_CHARS:
+        raise _input_error("image URL exceeds 50MB limit")
     try:
-        data = base64.b64decode(str(value).strip(), validate=True)
+        data = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"}) from exc
-    if not data:
-        raise HTTPException(status_code=400, detail={"error": "image file is empty"})
-    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
-    return data, filename, mime_type
+    return _validated_image_input(data, filename, mime_type)
 
 
 def _source_from_object(value: dict[str, Any]) -> list[ImageSource]:
@@ -126,8 +183,8 @@ def _source_from_object(value: dict[str, Any]) -> list[ImageSource]:
         )
     inline = value.get("b64_json") or value.get("base64")
     if inline:
-        filename = _clean(value.get("filename") or value.get("file_name"), "image.png")
-        mime_type = _clean(value.get("mime_type") or value.get("mimeType"), "image/png")
+        filename = _clean(value.get("filename") or value.get("file_name"), "image")
+        mime_type = _clean(value.get("mime_type") or value.get("mimeType"))
         return [_decode_base64_image(inline, filename, mime_type)]
     if not has_url:
         raise HTTPException(status_code=400, detail={"error": "image reference must include image_url"})
@@ -148,11 +205,15 @@ def _sources_from_value(value: object) -> list[ImageSource]:
             return []
         if text.lower().startswith(("data:", "http://", "https://")):
             return [text]
-        return [_decode_base64_image(text, "image.png", "image/png")]
+        return [_decode_base64_image(text, "image", "")]
     if isinstance(value, list):
+        if len(value) > MAX_IMAGE_INPUT_COUNT:
+            raise _input_error(f"at most {MAX_IMAGE_INPUT_COUNT} images are allowed")
         sources: list[ImageSource] = []
         for item in value:
             sources.extend(_sources_from_value(item))
+            if len(sources) > MAX_IMAGE_INPUT_COUNT:
+                raise _input_error(f"at most {MAX_IMAGE_INPUT_COUNT} images are allowed")
         return sources
     if isinstance(value, dict):
         return _source_from_object(value)
@@ -167,6 +228,8 @@ def _json_image_sources(body: dict[str, Any]) -> list[ImageSource]:
     for key in ("images", "image", "image_url"):
         if key in body:
             sources.extend(_sources_from_value(body.get(key)))
+            if len(sources) > MAX_IMAGE_INPUT_COUNT:
+                raise _input_error(f"at most {MAX_IMAGE_INPUT_COUNT} images are allowed")
     return sources
 
 
@@ -204,8 +267,12 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
     for key, value in form.multi_items():
         if key in IMAGE_REFERENCE_FIELDS:
             sources.extend(_sources_from_value(value))
+            if len(sources) > MAX_IMAGE_INPUT_COUNT:
+                raise _input_error(f"at most {MAX_IMAGE_INPUT_COUNT} images are allowed")
         elif key in MASK_REFERENCE_FIELDS:
             mask_sources.extend(_sources_from_value(value))
+            if len(mask_sources) > MAX_IMAGE_INPUT_COUNT:
+                raise _input_error(f"at most {MAX_IMAGE_INPUT_COUNT} images are allowed")
     return _payload_from_fields(fields), sources, mask_sources
 
 
@@ -232,9 +299,12 @@ def _decode_data_url(url: str) -> ImageInput:
     header, separator, payload = url.partition(",")
     if not separator:
         raise HTTPException(status_code=400, detail={"error": "invalid data image URL"})
-    mime_type = header.split(";", 1)[0].removeprefix("data:") or "image/png"
-    if not mime_type.startswith("image/"):
+    mime_header = header.split(";", 1)[0]
+    mime_type = mime_header[5:] if mime_header.lower().startswith("data:") else mime_header
+    if mime_type and not mime_type.startswith("image/"):
         raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
+    if len(payload) > MAX_BASE64_INPUT_CHARS * 3:
+        raise _input_error("image URL exceeds 50MB limit")
     try:
         data = base64.b64decode(payload, validate=True) if ";base64" in header else unquote_to_bytes(payload)
     except (binascii.Error, ValueError) as exc:
@@ -243,7 +313,8 @@ def _decode_data_url(url: str) -> ImageInput:
         raise HTTPException(status_code=400, detail={"error": "image URL is empty"})
     if len(data) > MAX_IMAGE_REFERENCE_BYTES:
         raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
-    return data, f"image_url.{_extension_from_mime(mime_type)}", mime_type
+    filename = f"image_url.{_extension_from_mime(mime_type)}" if mime_type else "image_url"
+    return _validated_image_input(data, filename, mime_type)
 
 
 def _response_mime_type(response: requests.Response, parsed_path: str) -> str:
@@ -257,7 +328,7 @@ def _response_mime_type(response: requests.Response, parsed_path: str) -> str:
     if guessed_type.startswith("image/"):
         return guessed_type
     if not header_type or header_type in {"application/octet-stream", "binary/octet-stream"}:
-        return "image/png"
+        return ""
     raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
 
 
@@ -267,55 +338,240 @@ def _filename_from_url(parsed_path: str, mime_type: str) -> str:
     return _safe_filename(raw_name, mime_type, "image_url")
 
 
+def _public_destination(url: str) -> tuple[str, int, str]:
+    """Resolve one URL to a public IP that can be pinned for the request."""
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        raise _input_error("image_url must be a public http or https URL") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+        raise _input_error("image_url must be a public http or https URL")
+    try:
+        hostname = parsed.hostname
+    except ValueError as exc:
+        raise _input_error("image_url must be a public http or https URL") from exc
+    if not hostname:
+        raise _input_error("image_url must be a public http or https URL")
+    if hostname.endswith("."):
+        raise _input_error("image_url hostname is invalid")
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise _input_error("image_url hostname is invalid") from exc
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise _input_error("image_url port is invalid") from exc
+    try:
+        literal = ipaddress.ip_address(ascii_hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not literal.is_global:
+            raise _input_error("image_url destination must resolve to a public IP")
+        return ascii_hostname, port, str(literal)
+
+    try:
+        addresses = {
+            str(item[4][0])
+            for item in socket.getaddrinfo(ascii_hostname, port, type=socket.SOCK_STREAM)
+            if item[4] and item[4][0]
+        }
+    except (OSError, socket.gaierror) as exc:
+        raise _input_error("image_url hostname could not be resolved") from exc
+    if not addresses:
+        raise _input_error("image_url hostname could not be resolved")
+    try:
+        parsed_addresses = [ipaddress.ip_address(address) for address in addresses]
+    except ValueError as exc:
+        raise _input_error("image_url hostname resolved to an invalid IP") from exc
+    if any(not address.is_global for address in parsed_addresses):
+        raise _input_error("image_url destination must resolve only to public IPs")
+    # Pin a single public address. Re-resolving and re-pinning on every manual
+    # redirect prevents a later DNS answer from changing the destination to a
+    # private address during this download.
+    return ascii_hostname, port, sorted(addresses)[0]
+
+
+def _read_response_bytes(response: requests.Response) -> bytes:
+    """Read a streamed response while enforcing the per-image byte limit."""
+    content_length = _clean(response.headers.get("content-length"))
+    if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
+        response.close()
+        raise _input_error("image_url exceeds 50MB limit")
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        for chunk in response.iter_content():
+            if not chunk:
+                continue
+            size += len(chunk)
+            if size > MAX_IMAGE_REFERENCE_BYTES:
+                raise _input_error("image_url exceeds 50MB limit")
+            chunks.append(bytes(chunk))
+    finally:
+        response.close()
+    data = b"".join(chunks)
+    if not data:
+        raise _input_error("image_url returned empty content")
+    return data
+
+
+def _curl_slist(values: list[str]):
+    """Build a libcurl string list for options not wrapped by curl_cffi."""
+    values_ptr = ffi.NULL
+    for value in values:
+        values_ptr = lib.curl_slist_append(values_ptr, value.encode("ascii"))
+    if values and values_ptr == ffi.NULL:
+        raise _input_error("image_url destination pinning could not be initialized")
+    return values_ptr
+
+
 def _download_image_url(url: str) -> ImageInput:
     """下载远程图片：把 http/https 图片链接转成标准图片输入元组。"""
     source = _clean(url)
-    if source.startswith("data:"):
+    if source.lower().startswith("data:"):
         return _decode_data_url(source)
-    parsed = urlparse(source)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
+    current = source
+    proxy_kwargs = proxy_settings.build_session_kwargs(upstream=True)
+    proxy_url = _clean(proxy_kwargs.get("proxy"))
+    if proxy_kwargs.get("proxies"):
+        raise _input_error("remote image fetch requires a pin-capable configured egress proxy")
     try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
-            timeout=60,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = _clean(response.headers.get("content-length"))
-    if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    data = response.content
-    if not data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    mime_type = _response_mime_type(response, parsed.path)
-    return data, _filename_from_url(parsed.path, mime_type), mime_type
+        proxy_scheme = urlparse(proxy_url).scheme.lower() if proxy_url else ""
+    except ValueError as exc:
+        raise _input_error("remote image fetch requires a valid egress proxy for destination pinning") from exc
+    if proxy_url and proxy_scheme not in {"http", "https"}:
+        raise _input_error("remote image fetch requires an HTTP or HTTPS egress proxy for destination pinning")
+    for redirect_count in range(MAX_IMAGE_REDIRECTS + 1):
+        try:
+            parsed = urlparse(current)
+        except ValueError as exc:
+            raise _input_error("image_url must be a public http or https URL") from exc
+        ascii_hostname, port, resolved_ip = _public_destination(current)
+        mapped_hostname = f"[{ascii_hostname}]" if ":" in ascii_hostname else ascii_hostname
+        resolve_address = f"[{resolved_ip}]" if ":" in resolved_ip else resolved_ip
+        if proxy_url:
+            connect_to = f"{mapped_hostname}:{port}:{resolve_address}:{port}"
+            try:
+                connect_to_list = _curl_slist([connect_to])
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise _input_error("image_url destination pinning could not be initialized") from exc
+            curl_options = {CurlOpt.CONNECT_TO: connect_to_list}
+        else:
+            connect_to_list = ffi.NULL
+            resolve_host = f"{mapped_hostname}:{port}:{resolve_address}"
+            curl_options = {CurlOpt.RESOLVE: [resolve_host]}
+        session = None
+        try:
+            session = requests.Session(trust_env=False, curl_options=curl_options)
+            response = session.get(
+                current,
+                headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
+                timeout=60,
+                allow_redirects=False,
+                stream=True,
+                **proxy_kwargs,
+            )
+        except HTTPException:
+            if session is not None:
+                session.close()
+            if connect_to_list != ffi.NULL:
+                lib.curl_slist_free_all(connect_to_list)
+            raise
+        except Exception as exc:
+            if session is not None:
+                session.close()
+            if connect_to_list != ffi.NULL:
+                lib.curl_slist_free_all(connect_to_list)
+            raise _input_error("image_url fetch failed") from exc
+        if 300 <= response.status_code < 400:
+            location = _clean(response.headers.get("location"))
+            response.close()
+            if session is not None:
+                session.close()
+            if connect_to_list != ffi.NULL:
+                lib.curl_slist_free_all(connect_to_list)
+            if not location:
+                raise _input_error("image_url redirect did not provide a destination")
+            if redirect_count >= MAX_IMAGE_REDIRECTS:
+                raise _input_error("image_url has too many redirects")
+            current = urljoin(current, location)
+            continue
+        if not 200 <= response.status_code < 300:
+            response.close()
+            if session is not None:
+                session.close()
+            if connect_to_list != ffi.NULL:
+                lib.curl_slist_free_all(connect_to_list)
+            raise _input_error("image_url fetch failed")
+        try:
+            mime_type = _response_mime_type(response, parsed.path)
+        except Exception:
+            response.close()
+            if session is not None:
+                session.close()
+            if connect_to_list != ffi.NULL:
+                lib.curl_slist_free_all(connect_to_list)
+            raise
+        try:
+            data = _read_response_bytes(response)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _input_error("image_url fetch failed") from exc
+        finally:
+            if session is not None:
+                session.close()
+            if connect_to_list != ffi.NULL:
+                lib.curl_slist_free_all(connect_to_list)
+        actual_mime = _validated_image_input(data, _filename_from_url(parsed.path, mime_type), mime_type)[2]
+        return data, _filename_from_url(parsed.path, actual_mime), actual_mime
+    raise _input_error("image_url has too many redirects")
 
 
 async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
     """读取图片来源：上传文件直接读取，URL 下载后统一返回图片元组。"""
+    if len(sources) > MAX_IMAGE_INPUT_COUNT:
+        raise _input_error(f"at most {MAX_IMAGE_INPUT_COUNT} images are allowed")
     images: list[ImageInput] = []
+    total_bytes = 0
     for source in sources:
         if isinstance(source, tuple):
-            images.append(source)
+            image = _validated_image_input(*source)
+            total_bytes += len(image[0])
+            if total_bytes > MAX_IMAGE_INPUT_BYTES:
+                raise _input_error("combined image inputs exceed 100MB limit")
+            images.append(image)
             continue
         if _is_upload(source):
             try:
-                image_data = await source.read()
+                chunks: list[bytes] = []
+                size = 0
+                while True:
+                    chunk = await source.read(IMAGE_DOWNLOAD_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MAX_IMAGE_REFERENCE_BYTES:
+                        raise _input_error("image file exceeds 50MB limit")
+                    chunks.append(bytes(chunk))
+                image_data = b"".join(chunks)
             finally:
                 await source.close()
-            if not image_data:
-                raise HTTPException(status_code=400, detail={"error": "image file is empty"})
-            images.append((image_data, source.filename or "image.png", source.content_type or "image/png"))
+            image = _validated_image_input(image_data, source.filename or "image.png", source.content_type or "")
+            total_bytes += len(image[0])
+            if total_bytes > MAX_IMAGE_INPUT_BYTES:
+                raise _input_error("combined image inputs exceed 100MB limit")
+            images.append(image)
             continue
-        images.append(await run_in_threadpool(_download_image_url, source))
+        image = await run_in_threadpool(_download_image_url, source)
+        total_bytes += len(image[0])
+        if total_bytes > MAX_IMAGE_INPUT_BYTES:
+            raise _input_error("combined image inputs exceed 100MB limit")
+        images.append(image)
     if not images:
         raise HTTPException(status_code=400, detail={"error": "image file or image_url is required"})
     return images

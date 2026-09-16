@@ -41,6 +41,8 @@ def install_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        if request.url.path.startswith("/api/workbench/ai/"):
+            return JSONResponse(status_code=422, content={"detail": {"error": "invalid management request"}})
         if _is_openai_compatible_path(request.url.path):
             return _compatible_error_response(request, exc.errors(), 422)
         return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})

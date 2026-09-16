@@ -5,6 +5,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from api.external_images import client_sync_result, validate_external_input, is_external, synchronous_external_task
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request, request_shape, request_text
@@ -27,6 +28,7 @@ from services.protocol import (
 
 
 class ImageGenerationRequest(BaseModel):
+    client_task_id: str | None = None
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
     n: int = Field(default=1, ge=1, le=4)
@@ -109,12 +111,15 @@ def create_router() -> APIRouter:
     router = APIRouter()
 
     @router.get("/v1/models")
-    async def list_models(authorization: str | None = Header(default=None)):
+    async def list_models(request: Request, authorization: str | None = Header(default=None)):
         require_identity(authorization)
         try:
-            return await run_in_threadpool(openai_v1_models.list_models)
+            result = await run_in_threadpool(openai_v1_models.list_models)
+            if is_external(request):
+                return {**result, "data": [item for item in result.get("data", []) if item.get("id") == "gpt-image-2"]}
+            return result
         except Exception as exc:
-            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+            raise HTTPException(status_code=502, detail={"error": "model discovery unavailable" if is_external(request) else str(exc)}) from exc
 
     @router.post("/v1/images/generations")
     async def generate_images(
@@ -124,10 +129,13 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        validate_external_input(request, payload, synchronous=True)
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
-        return await call.run(openai_v1_image_generations.handle, payload)
+        if is_external(request):
+            return await synchronous_external_task(identity, payload, edit=False)
+        return client_sync_result(await call.run(openai_v1_image_generations.handle, payload), request)
 
     @router.post("/v1/images/edits")
     async def edit_images(
@@ -136,6 +144,7 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
+        validate_external_input(request, payload, synchronous=True)
         prompt = str(payload["prompt"])
         model = str(payload["model"])
         call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
@@ -144,7 +153,9 @@ def create_router() -> APIRouter:
         if mask_sources:
             payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
-        return await call.run(openai_v1_image_edit.handle, payload)
+        if is_external(request):
+            return await synchronous_external_task(identity, payload, edit=True)
+        return client_sync_result(await call.run(openai_v1_image_edit.handle, payload), request)
 
     @router.post("/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
