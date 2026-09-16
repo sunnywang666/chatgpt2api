@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -18,6 +19,17 @@ class QueuedExecutor:
     def run(self):
         function, args = self.calls.pop(0)
         function(*args)
+
+
+class ManualClock:
+    def __init__(self, value=1000.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
 
 
 class TextTaskTests(unittest.TestCase):
@@ -72,6 +84,162 @@ class TextTaskTests(unittest.TestCase):
         restarted.submit("owner", self.body)
         self.assertEqual(len(self.queue.calls), 0)
 
+    def test_unknown_recovery_is_singleflight_across_service_instances(self):
+        clock = ManualClock()
+        calls = []
+        started, release = threading.Event(), threading.Event()
+
+        def reader(receipt):
+            calls.append(receipt["recovery_attempt"])
+            started.set()
+            release.wait(2)
+            return {"status": "running"}
+
+        service = TextTaskService(self.path, executor=self.queue, clock=clock, recovery_reader=reader)
+        service.submit("owner", self.body)
+        service._update("owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                        provider_binding_id="binding", provider_account_identity="account",
+                        conversation_id="chat")
+        restarted = TextTaskService(self.path, executor=self.queue, clock=clock, recovery_reader=reader)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(service.read, "owner", "attempt-1")
+                self.assertTrue(started.wait(1))
+                second = pool.submit(restarted.read, "owner", "attempt-1")
+                second_result = second.result(timeout=1)
+                release.set()
+                first_result = first.result(timeout=2)
+        finally:
+            release.set()
+        self.assertEqual(calls, [1])
+        self.assertEqual(second_result["status"], "unknown")
+        self.assertEqual(first_result["status"], "unknown")
+        self.assertEqual(first_result["recovery_attempt"], 1)
+        self.assertGreater(first_result["recovery_next_at"], clock())
+        self.assertEqual(restarted.read("other-owner", "attempt-1")["status"], "not_found")
+        self.assertEqual(len(self.queue.calls), 1, "recovery must not resubmit the original text")
+
+    def test_recovery_failure_is_safe_and_retries_after_persisted_cooldown(self):
+        clock = ManualClock()
+        calls = []
+
+        def reader(receipt):
+            calls.append(receipt["recovery_attempt"])
+            if len(calls) == 1:
+                raise RuntimeError("upstream token=secret should never be persisted")
+            return {"status": "succeeded", "content": "answer", "conversation_id": "chat",
+                    "parent_message_id": "answer-id", "binding_status": "bound"}
+
+        service = TextTaskService(self.path, executor=self.queue, clock=clock, recovery_reader=reader)
+        service.submit("owner", self.body)
+        service._update("owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                        provider_binding_id="binding", provider_account_identity="account",
+                        conversation_id="chat")
+        failed = service.read("owner", "attempt-1")
+        self.assertEqual(failed["status"], "unknown")
+        self.assertEqual(failed["recovery_error_code"], "RECOVERY_READ_FAILED")
+        self.assertEqual(failed["recovery_phase"], "read_text_request")
+        self.assertEqual(failed["recovery_attempt"], 1)
+        self.assertNotIn(b"upstream token=secret", self.path.read_bytes())
+
+        restarted = TextTaskService(self.path, executor=self.queue, clock=clock, recovery_reader=reader)
+        self.assertEqual(restarted.read("owner", "attempt-1")["status"], "unknown")
+        self.assertEqual(calls, [1], "restart must honor the persisted recovery cooldown")
+        clock.advance(TextTaskService.RECOVERY_BASE_BACKOFF_SECONDS + 1)
+        recovered = restarted.read("owner", "attempt-1")
+        self.assertEqual(recovered["status"], "succeeded")
+        self.assertEqual(recovered["content"], "answer")
+        self.assertIsNone(recovered["recovery_next_at"])
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(len(self.queue.calls), 1, "recovery must never schedule a second runner call")
+
+    def test_recovery_success_requires_nonempty_content_and_parent_cursor(self):
+        service = TextTaskService(self.path, executor=self.queue)
+        invalid_results = [
+            {"status": "succeeded", "content": "", "parent_message_id": "answer", "binding_status": "bound"},
+            {"status": "succeeded", "content": "answer", "parent_message_id": "", "binding_status": "bound"},
+            {"status": "succeeded", "content": "answer", "parent_message_id": "answer", "binding_status": "unknown"},
+        ]
+        for invalid in invalid_results:
+            safe_result, error_code, phase = service._safe_recovery_result(invalid)
+            self.assertIsNone(safe_result)
+            self.assertEqual(error_code, "RECOVERY_INVALID_RESULT")
+            self.assertEqual(phase, "read_text_result")
+        safe_result, error_code, phase = service._safe_recovery_result(
+            {"status": "succeeded", "content": "answer", "parent_message_id": "answer", "binding_status": "bound"}
+        )
+        self.assertEqual(safe_result, {"content": "answer", "parent_message_id": "answer", "binding_status": "bound"})
+        self.assertIsNone(error_code)
+        self.assertIsNone(phase)
+
+    def test_late_runner_updates_cannot_regress_recovered_success(self):
+        clock = ManualClock()
+
+        def reader(receipt):
+            return {"status": "succeeded", "content": "fresh", "parent_message_id": "fresh-answer",
+                    "binding_status": "bound"}
+
+        service = TextTaskService(self.path, executor=self.queue, clock=clock, recovery_reader=reader)
+        service.submit("owner", self.body)
+        service._update("owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                        provider_binding_id="binding", provider_account_identity="account",
+                        conversation_id="chat")
+        recovered = service.read("owner", "attempt-1")
+        self.assertEqual(recovered["status"], "succeeded")
+        self.assertIsNone(recovered["error_code"])
+
+        def stale_update():
+            service._update("owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                            parent_message_id="stale-answer")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(stale_update) for _ in range(2)]
+            for future in futures:
+                future.result(timeout=2)
+        final = service.read("owner", "attempt-1")
+        self.assertEqual(final["status"], "succeeded")
+        self.assertEqual(final["content"], "fresh")
+        self.assertEqual(final["parent_message_id"], "fresh-answer")
+        self.assertIsNone(final["error_code"])
+
+    def test_expired_old_recovery_cannot_overwrite_newer_success(self):
+        clock = ManualClock()
+        calls = []
+        first_started, release_first = threading.Event(), threading.Event()
+
+        def reader(receipt):
+            calls.append(receipt["recovery_attempt"])
+            if len(calls) == 1:
+                first_started.set()
+                release_first.wait(2)
+                return {"status": "running"}
+            return {"status": "succeeded", "content": "fresh", "conversation_id": "chat",
+                    "parent_message_id": "fresh-answer", "binding_status": "bound"}
+
+        service = TextTaskService(self.path, executor=self.queue, clock=clock, recovery_reader=reader)
+        service.submit("owner", self.body)
+        service._update("owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                        provider_binding_id="binding", provider_account_identity="account",
+                        conversation_id="chat")
+        restarted = TextTaskService(self.path, executor=self.queue, clock=clock, recovery_reader=reader)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                old_read = pool.submit(service.read, "owner", "attempt-1")
+                self.assertTrue(first_started.wait(1))
+                clock.advance(TextTaskService.RECOVERY_LEASE_SECONDS + 1)
+                fresh = restarted.read("owner", "attempt-1")
+                self.assertEqual(fresh["status"], "succeeded")
+                self.assertEqual(fresh["content"], "fresh")
+                release_first.set()
+                old_read.result(timeout=2)
+        finally:
+            release_first.set()
+        final = restarted.read("owner", "attempt-1")
+        self.assertEqual(final["status"], "succeeded")
+        self.assertEqual(final["content"], "fresh")
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(len(self.queue.calls), 1, "recovery must not resubmit the original text")
+
     def test_restart_replays_only_unstarted_requests_with_same_input_and_message_identity(self):
         writes = []
         service = TextTaskService(self.path, lambda body, on_cursor: writes.append(body) or {"content": "ok"}, self.queue)
@@ -110,7 +278,14 @@ class TextTaskTests(unittest.TestCase):
         self.queue.run()
         self.assertEqual(service.read("owner", "attempt-1")["request_message_id"], original["request_message_id"])
         self.assertEqual(service.read("owner", "attempt-1")["status"], "succeeded")
-        service._update("owner", "attempt-1", status="failed", error_code="CONVERSATION_BINDING_UNAVAILABLE")
+        # Simulate a legacy receipt written by an older owner. The normal
+        # update path must reject this kind of late callback after success.
+        with service._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", ("owner", "attempt-1")).fetchone()
+            legacy_failed = {**json.loads(row[0]), "status": "failed", "error_code": "CONVERSATION_BINDING_UNAVAILABLE"}
+            db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
+                       (json.dumps(legacy_failed), "owner", "attempt-1"))
         self.assertEqual(service.read("owner", "attempt-1")["status"], "failed", "existing chats cannot be reclassified as never sent")
 
     def test_ready_continuation_precedes_queued_new_products(self):
