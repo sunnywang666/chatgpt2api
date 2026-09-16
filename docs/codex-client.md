@@ -1,12 +1,12 @@
 # Isolated Codex CLI provider acceptance
 
-This is an engineering acceptance package for the planned provider endpoint:
+This is an isolated Codex CLI acceptance package for the provider endpoint:
 
 ```text
 https://app.hugsweetglobal.com/ai/codex/v1
 ```
 
-The endpoint is not deployed at the time this package was written. The commands below are for the approved future account/API acceptance; they do not establish that the service is live today.
+Successful model discovery or deployment health does not prove that a real Responses turn can complete. Use the commands below for the approved account/API acceptance, and preserve the original session when the request outcome is unknown.
 
 ## What the launchers do
 
