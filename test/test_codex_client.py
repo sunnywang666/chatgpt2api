@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -34,6 +35,23 @@ class _ModelsHandler(BaseHTTPRequestHandler):
 
 
 class CodexClientTests(unittest.TestCase):
+    def test_native_codex_model_slugs_are_discovered_without_inventing_ids(self) -> None:
+        payload = {"models": [{"slug": "gpt-5.6-luna"}, {"slug": "gpt-5.6-sol"},
+                              {"slug": "gpt-5.6-luna"}, {"display_name": "Not an ID"},
+                              {"slug": None}, {"slug": 42}, "invalid"]}
+        with mock.patch("list_models.build_opener") as opener:
+            opener.return_value.open.return_value = io.StringIO(json.dumps(payload))
+            self.assertEqual(fetch_models("https://provider.example/v1", "fake-test-key"),
+                             ["gpt-5.6-luna", "gpt-5.6-sol"])
+
+    def test_native_empty_models_do_not_fall_back_to_unrelated_fields(self) -> None:
+        for payload in ({"models": []}, {"models": [{"id": "not-a-native-slug"}]},
+                        {"models": [], "data": [{"id": "not-native"}]}):
+            with self.subTest(payload=payload), mock.patch("list_models.build_opener") as opener:
+                opener.return_value.open.return_value = io.StringIO(json.dumps(payload))
+                with self.assertRaisesRegex(RuntimeError, "no model IDs"):
+                    fetch_models("https://provider.example/v1", "fake-test-key")
+
     def test_base_url_requires_absolute_http_url_without_query(self) -> None:
         self.assertEqual(normalized_base_url("https://example.test/v1/"), "https://example.test/v1")
         with self.assertRaises(ValueError):

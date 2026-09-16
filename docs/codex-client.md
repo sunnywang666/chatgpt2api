@@ -10,7 +10,7 @@ The endpoint is not deployed at the time this package was written. The commands 
 
 ## What the launchers do
 
-`examples/codex_client/run-codex.sh` and `examples/codex_client/run-codex.ps1` first request `GET /models`. Run discovery without a model, then select one exact returned ID before they create an isolated state root and launch Codex.
+`examples/codex_client/run-codex.sh` and `examples/codex_client/run-codex.ps1` first request `GET /models`. Discovery accepts native Codex `models[].slug` and OpenAI-compatible `data[].id` responses without changing the provider protocol. Run discovery without a model, then select one exact returned ID before they create an isolated state root and launch Codex.
 
 The state root contains a generated `config.toml` with this custom Responses provider shape:
 

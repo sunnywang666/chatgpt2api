@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List an OpenAI-compatible provider's model IDs without exposing its key."""
+"""List native Codex or OpenAI-compatible model IDs without exposing its key."""
 
 from __future__ import annotations
 
@@ -34,13 +34,17 @@ def fetch_models(base_url: str, api_key: str, timeout: float = 20.0) -> list[str
         raise RuntimeError(f"GET /models returned HTTP {error.code}") from error
     except URLError as error:
         raise RuntimeError("GET /models could not reach the provider") from error
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        raise RuntimeError("GET /models returned an invalid OpenAI model-list payload")
-    ids = sorted(
-        str(item["id"])
-        for item in payload["data"]
-        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
-    )
+    if isinstance(payload, dict) and isinstance(payload.get("models"), list):
+        items, field = payload["models"], "slug"
+    elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        items, field = payload["data"], "id"
+    else:
+        raise RuntimeError("GET /models returned an invalid model-list payload")
+    ids = sorted({
+        item[field]
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get(field), str) and item[field]
+    })
     if not ids:
         raise RuntimeError("GET /models returned no model IDs")
     return ids
