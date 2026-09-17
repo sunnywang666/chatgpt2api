@@ -512,11 +512,36 @@ class TextTaskService:
             receipt = {**receipt, **changes, "updated_at": self._now()}
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
 
-    def submit(self, owner: str, body: dict):
+    @staticmethod
+    def _submission_identity(owner: str, body: dict) -> tuple[str, str]:
         request_id = str(body.get("client_request_id") or "").strip()
         if not owner or not request_id or len(request_id) > 200:
-            raise ConversationBindingError("request identity is required", code="CONVERSATION_BINDING_CONTRACT_INVALID")
-        request_hash = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            raise ConversationBindingError(
+                "request identity is required",
+                code="CONVERSATION_BINDING_CONTRACT_INVALID",
+            )
+        request_hash = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return request_id, request_hash
+
+    def validate_submission(self, owner: str, body: dict):
+        """Read-only conflict check before any optional external review call."""
+        request_id, request_hash = self._submission_identity(owner, body)
+        with self._db() as db:
+            previous = db.execute(
+                "SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                (owner, request_id),
+            ).fetchone()
+        if previous and previous[0] != request_hash:
+            raise ConversationBindingError(
+                "request identity already has different input",
+                code="CONVERSATION_REQUEST_CONFLICT",
+            )
+        return self._public(json.loads(previous[1])) if previous else None
+
+    def submit(self, owner: str, body: dict):
+        request_id, request_hash = self._submission_identity(owner, body)
         receipt = {"request_id": request_id, "client_conversation_id": body["client_conversation_id"],
                    "request_message_id": str(uuid.uuid4()),
                    "request_parent_message_id": str(body.get("parent_message_id") or "").strip(),

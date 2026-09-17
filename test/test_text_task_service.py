@@ -1109,6 +1109,78 @@ class TextTaskTests(unittest.TestCase):
                 self.assertEqual(recovered.json()["status"], "queued")
         self.assertEqual(len(self.queue.calls), 1)
 
+    def test_http_durable_id_conflict_precedes_enabled_ai_review(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        from services import content_filter
+
+        service = TextTaskService(self.path, executor=self.queue)
+        app = FastAPI()
+        app.include_router(create_router())
+        review_response = mock.Mock(status_code=200, text="ALLOW")
+        review_response.json.return_value = {
+            "choices": [{"message": {"content": "ALLOW"}}],
+        }
+        review_config = {
+            "enabled": True,
+            "base_url": "https://review.test",
+            "api_key": "review-test-key",
+            "model": "review-model",
+        }
+        original_config = content_filter.config.data
+        configured = {**original_config, "ai_review": review_config}
+        with (
+            mock.patch("api.ai.text_task_service", service),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token}),
+            mock.patch.object(content_filter.config, "data", configured),
+            mock.patch("services.content_filter.requests.post", return_value=review_response) as review,
+            TestClient(app) as client,
+        ):
+            first = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(first.json()["status"], "queued")
+            self.assertEqual(review.call_count, 1)
+            self.assertEqual(len(self.queue.calls), 1)
+
+            same = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(same.status_code, 200, same.text)
+            self.assertEqual(review.call_count, 2)
+            self.assertEqual(len(self.queue.calls), 1)
+
+            conflict = client.post(
+                "/api/conversation-bindings/text",
+                json={
+                    **self.body,
+                    "messages": [{"role": "user", "content": "different input"}],
+                },
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(conflict.status_code, 409, conflict.text)
+            self.assertEqual(
+                conflict.json()["detail"]["code"],
+                "CONVERSATION_REQUEST_CONFLICT",
+            )
+            self.assertEqual(review.call_count, 2, "conflict must not call external review")
+            self.assertEqual(len(self.queue.calls), 1, "conflict must not schedule execution")
+
+            new_request = client.post(
+                "/api/conversation-bindings/text",
+                json={**self.body, "client_request_id": "attempt-2"},
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(new_request.status_code, 200, new_request.text)
+            self.assertEqual(review.call_count, 3)
+            self.assertEqual(len(self.queue.calls), 2)
+
     def test_last_user_message_has_the_saved_identity_for_text_and_gallery(self):
         from services.openai_backend_api import OpenAIBackendAPI
         backend = object.__new__(OpenAIBackendAPI)
