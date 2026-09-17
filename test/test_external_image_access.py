@@ -137,6 +137,24 @@ class ExternalImageAccessTests(unittest.TestCase):
             self.assertEqual(task_image_bytes({"status": "success", "data": [{"url": "https://cdn.example.test/assets/day/file.png"}]}, 0), b"png")
             read.assert_called_once_with("day/file.png")
 
+    def test_external_task_projection_hides_adoption_failure_detail(self):
+        from api.external_images import client_task
+        from starlette.requests import Request
+
+        request = Request({
+            "type": "http", "method": "GET", "path": "/api/image-tasks",
+            "headers": [(b"x-workbench-image-client", b"1")],
+            "query_string": b"", "server": ("testserver", 80), "scheme": "http",
+        })
+        projected = client_task({
+            "id": "task", "status": "success",
+            "adopted_from_error_code": "content_policy_violation",
+            "adopted_from_error": "unbounded upstream detail",
+        }, request)
+        self.assertEqual(projected["adopted_from_error_code"], "content_policy_violation")
+        self.assertNotIn("adopted_from_error", projected)
+        self.assertNotIn("unbounded", str(projected))
+
     def test_sync_requires_durable_id_and_reuses_original(self):
         body = {"prompt": "sample", "model": "gpt-image-2"}
         self.assertEqual(self.client.post("/v1/images/generations", headers=self.headers(), json=body).status_code, 400)

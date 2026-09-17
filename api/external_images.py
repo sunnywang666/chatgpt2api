@@ -36,6 +36,9 @@ async def external_image_boundary(request: Request, call_next):
             "/api/image-tasks/generations", "/api/image-tasks/edits",
         }
         or request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/resume-poll", path)
+        or request.method == "POST" and re.fullmatch(
+            r"/api/image-tasks/[^/]+/adopt-latest-conversation-image", path
+        )
         or request.method == "GET" and re.fullmatch(r"/api/image-tasks/[^/]+/images/[0-9]+", path)
     )
     if not allowed:
@@ -78,6 +81,7 @@ def client_task(task: dict, request: Request) -> dict:
     result = {key: value for key, value in task.items() if key not in {
         "provider_binding_id", "provider_account_identity", "client_conversation_id",
         "image_session_id", "image_session_parent_id", "upstream_model",
+        "adopted_from_error",
     }}
     if isinstance(result.get("data"), list):
         prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")

@@ -31,6 +31,10 @@ class UnrecoverableRead(RuntimeError):
         self.requires_new_conversation = requires_new_conversation
 
 
+class ConversationImageAdoptionError(ValueError):
+    """A caller-safe refusal to adopt a manually completed conversation image."""
+
+
 def _holds_upstream_slot(task: dict[str, Any]) -> bool:
     if "upstream_unfinished" in task:
         return task["upstream_unfinished"] is True
@@ -160,6 +164,118 @@ def _backend_tasks_may_be_active(tasks: object) -> bool:
     return False
 
 
+def _latest_completed_manual_image_turn(
+    document: object,
+    original_request_message_id: str,
+    original_task_created_ts: float,
+    extract_records: Callable[[dict[str, Any], str], list[dict[str, Any]]],
+) -> tuple[str, dict[str, Any], str]:
+    """Select the latest completed manual image turn on the authoritative branch.
+
+    The original request must either be on the current-node parent chain or
+    remain in the full mapping with its own parent on the current branch. The
+    task receipt's parent may point at a later failure response and is not used
+    as a pre-send anchor. A newer user turn always wins; if that turn is active
+    or has no completed image, an older image is never substituted.
+    """
+    if not isinstance(document, dict) or not isinstance(document.get("mapping"), dict):
+        raise ConversationImageAdoptionError("conversation branch is unavailable")
+    mapping = document["mapping"]
+    current_node = _clean(document.get("current_node"))
+    if not current_node or not original_request_message_id:
+        raise ConversationImageAdoptionError("conversation branch is unavailable")
+
+    reversed_path: list[str] = []
+    node_id = current_node
+    while node_id:
+        if node_id in reversed_path:
+            raise ConversationImageAdoptionError("conversation branch is invalid")
+        node = mapping.get(node_id)
+        if not isinstance(node, dict):
+            raise ConversationImageAdoptionError("conversation branch is invalid")
+        reversed_path.append(node_id)
+        node_id = _clean(node.get("parent"))
+    path = list(reversed(reversed_path))
+    original_node = mapping.get(original_request_message_id) or {}
+    original_message = original_node.get("message") if isinstance(original_node, dict) else None
+    original_author = original_message.get("author") if isinstance(original_message, dict) else None
+    original_request_verified = (
+        isinstance(original_message, dict)
+        and _clean(original_message.get("id")) == original_request_message_id
+        and isinstance(original_author, dict)
+        and _clean(original_author.get("role")).lower() == "user"
+    )
+    if not original_request_verified:
+        raise ConversationImageAdoptionError("original request is not a verified user message")
+    if original_request_message_id in path:
+        original_index = path.index(original_request_message_id)
+    else:
+        # A user may edit a later prompt in ChatGPT, moving current_node onto a
+        # sibling branch. Read the verified original user node's own parent;
+        # the receipt parent may already have advanced to a terminal response.
+        branch_anchor = _clean(original_node.get("parent"))
+        if (
+            not branch_anchor
+            or branch_anchor not in path
+            or original_task_created_ts <= 0
+        ):
+            raise ConversationImageAdoptionError("original request is not linked to the current conversation branch")
+        original_index = path.index(branch_anchor)
+
+    manual_requests: list[tuple[int, str]] = []
+    for index, candidate_id in enumerate(path[original_index + 1:], start=original_index + 1):
+        node = mapping.get(candidate_id) or {}
+        message = node.get("message") if isinstance(node, dict) else None
+        author = message.get("author") if isinstance(message, dict) else None
+        if isinstance(author, dict) and _clean(author.get("role")).lower() == "user":
+            manual_requests.append((index, candidate_id))
+    if not manual_requests:
+        raise ConversationImageAdoptionError("no later manual request exists on the current conversation branch")
+
+    request_index, request_message_id = manual_requests[-1]
+    if original_request_message_id not in path:
+        request_node = mapping.get(request_message_id) or {}
+        request_message = request_node.get("message") if isinstance(request_node, dict) else None
+        created = request_message.get("create_time") if isinstance(request_message, dict) else None
+        if not isinstance(created, (int, float)) or float(created) <= original_task_created_ts:
+            raise ConversationImageAdoptionError("latest manual request does not postdate the original task")
+    segment = path[request_index + 1:]
+    completed = False
+    for candidate_id in segment:
+        node = mapping.get(candidate_id) or {}
+        message = node.get("message") if isinstance(node, dict) else None
+        if not isinstance(message, dict):
+            continue
+        status = _clean(message.get("status")).lower()
+        if status in {"in_progress", "running", "pending", "queued"}:
+            raise ConversationImageAdoptionError("latest manual request is still active")
+        author = message.get("author")
+        if (
+            isinstance(author, dict)
+            and _clean(author.get("role")).lower() == "assistant"
+            and status == "finished_successfully"
+            and message.get("end_turn") is True
+        ):
+            completed = True
+    if not completed:
+        raise ConversationImageAdoptionError("latest manual request is not complete")
+
+    records = extract_records(document, request_message_id)
+    segment_ids = set(segment)
+    records = [
+        record for record in records
+        if (
+            isinstance(record, dict)
+            and _clean(record.get("message_id")) in segment_ids
+            and (record.get("file_ids") or record.get("sediment_ids"))
+        )
+    ]
+    if not records:
+        raise ConversationImageAdoptionError("latest manual request has no completed image")
+    records.sort(key=lambda record: path.index(_clean(record.get("message_id"))))
+    return request_message_id, records[-1], current_node
+
+
 def _request_hash(mode: str, payload: dict[str, Any]) -> str:
     """Hash the immutable task request without persisting prompts or image bytes."""
     image_hashes = []
@@ -274,6 +390,10 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "upstream_unfinished",
         "upstream_outcome",
         "recovery_retryable",
+        "adopted_source_request_message_id",
+        "adopted_source_image_message_id",
+        "adopted_from_error_code",
+        "adopted_at",
     ):
         if task.get(field):
             item[field] = task.get(field)
@@ -300,6 +420,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["usage"] = task.get("usage")
     if task.get("error"):
         item["error"] = task.get("error")
+    if task.get("adopted_from_error"):
+        item["adopted_from_error"] = task.get("adopted_from_error")
     if task.get("progress"):
         item["progress"] = task.get("progress")
     if task.get("duration_ms") is not None:
@@ -819,6 +941,11 @@ class ImageTaskService:
                 "upstream_outcome": _clean(item.get("upstream_outcome")),
                 "recovery_retryable": item.get("recovery_retryable") is True,
                 "recovery_requires_new_conversation": item.get("recovery_requires_new_conversation") is True,
+                "adopted_source_request_message_id": _clean(item.get("adopted_source_request_message_id")),
+                "adopted_source_image_message_id": _clean(item.get("adopted_source_image_message_id")),
+                "adopted_from_error_code": _clean(item.get("adopted_from_error_code")),
+                "adopted_from_error": _clean(item.get("adopted_from_error")),
+                "adopted_at": _clean(item.get("adopted_at")),
             }
             data = item.get("data")
             if isinstance(data, list):
@@ -938,6 +1065,228 @@ class ImageTaskService:
         )
         thread.start()
         return _public_task(task)
+
+    def adopt_latest_conversation_image(
+        self,
+        identity: dict[str, object],
+        task_id: str,
+        *,
+        provider_binding_id: str,
+        provider_account_identity: str,
+        client_conversation_id: str,
+        conversation_id: str,
+        source_request_message_id: str = "",
+        source_image_message_id: str = "",
+        base_url: str = "",
+    ) -> dict[str, Any]:
+        """Adopt the latest completed manual image turn without generating again."""
+        owner = _owner_id(identity)
+        key = _task_key(owner, _clean(task_id))
+        supplied_identity = tuple(map(_clean, (
+            provider_binding_id,
+            provider_account_identity,
+            client_conversation_id,
+            conversation_id,
+        )))
+        if not all(supplied_identity):
+            raise ConversationImageAdoptionError("complete conversation authority is required")
+        expected_source_request = _clean(source_request_message_id)
+        expected_source_image = _clean(source_image_message_id)
+
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ConversationImageAdoptionError("task not found")
+            stored_identity = tuple(_clean(task.get(field)) for field in (
+                "provider_binding_id",
+                "provider_account_identity",
+                "client_conversation_id",
+                "conversation_id",
+            ))
+            if stored_identity != supplied_identity:
+                raise ConversationImageAdoptionError("conversation authority does not match the original task")
+            if task.get("status") == TASK_STATUS_SUCCESS:
+                if task.get("adopted_source_request_message_id"):
+                    if (
+                        expected_source_request
+                        and expected_source_request
+                        != _clean(task.get("adopted_source_request_message_id"))
+                    ):
+                        raise ConversationImageAdoptionError(
+                            "specified manual request does not match the adopted image"
+                        )
+                    if (
+                        expected_source_image
+                        and expected_source_image
+                        != _clean(task.get("adopted_source_image_message_id"))
+                    ):
+                        raise ConversationImageAdoptionError(
+                            "specified image node does not match the adopted image"
+                        )
+                    return _public_task(task)
+                raise ConversationImageAdoptionError("task already completed without manual image adoption")
+            if task.get("status") != TASK_STATUS_ERROR:
+                raise ConversationImageAdoptionError("task is not in a terminal error state")
+            if _clean(task.get("error_code")).lower() != "content_policy_violation":
+                raise ConversationImageAdoptionError("task is not eligible for manual image adoption")
+            original_request_message_id = _clean(task.get("request_message_id"))
+            if not original_request_message_id:
+                raise ConversationImageAdoptionError("original request identity is unavailable")
+            original_error_code = _clean(task.get("error_code"))
+            original_error = _clean(task.get("error"))
+            original_task_created_ts = task.get("created_ts")
+            if not isinstance(original_task_created_ts, (int, float)):
+                original_task_created_ts = _timestamp(task.get("created_at"))
+
+        backend = None
+        try:
+            from services.account_service import account_service
+            from services.openai_backend_api import OpenAIBackendAPI
+            from services.protocol.conversation import format_image_result
+
+            if account_service.get_bound_account_identity(provider_binding_id) != provider_account_identity:
+                raise ConversationImageAdoptionError("provider account identity changed")
+            access_token = account_service.get_bound_text_access_token(provider_binding_id, model="auto")
+            with account_service.conversation_binding_lock(provider_binding_id, client_conversation_id):
+                backend = OpenAIBackendAPI(access_token=access_token)
+                document = backend._get_conversation(conversation_id)
+                document_id = _clean(document.get("conversation_id") if isinstance(document, dict) else "")
+                if document_id and document_id != conversation_id:
+                    raise ConversationImageAdoptionError("conversation identity changed")
+                source_request_id, image_record, current_node = _latest_completed_manual_image_turn(
+                    document,
+                    original_request_message_id,
+                    float(original_task_created_ts or 0),
+                    backend._extract_image_tool_records,
+                )
+                if expected_source_request and source_request_id != expected_source_request:
+                    raise ConversationImageAdoptionError("specified manual request is not the latest completed image turn")
+                if expected_source_image and _clean(image_record.get("message_id")) != expected_source_image:
+                    raise ConversationImageAdoptionError("specified image node is not the latest completed image")
+                tasks = backend._query_backend_tasks(
+                    conversation_id=conversation_id,
+                    timeout_secs=5.0,
+                    strict_schema=True,
+                )
+                if _backend_tasks_may_be_active(tasks) or _document_current_message_active(document):
+                    raise ConversationImageAdoptionError("latest manual request is still active")
+                image_urls = backend.resolve_conversation_image_urls(
+                    conversation_id,
+                    list(image_record.get("file_ids") or []),
+                    list(image_record.get("sediment_ids") or []),
+                    poll=False,
+                    request_message_id=source_request_id,
+                )
+                if not image_urls:
+                    raise ConversationImageAdoptionError("latest manual image could not be resolved")
+                image_bytes = backend.download_image_bytes(image_urls)
+                if not image_bytes:
+                    raise ConversationImageAdoptionError("latest manual image could not be downloaded")
+                latest_document = backend._get_conversation(conversation_id)
+                latest_document_id = _clean(
+                    latest_document.get("conversation_id")
+                    if isinstance(latest_document, dict) else ""
+                )
+                if latest_document_id and latest_document_id != conversation_id:
+                    raise ConversationImageAdoptionError("conversation identity changed")
+                latest_source_request, latest_image_record, latest_current_node = (
+                    _latest_completed_manual_image_turn(
+                        latest_document,
+                        original_request_message_id,
+                        float(original_task_created_ts or 0),
+                        backend._extract_image_tool_records,
+                    )
+                )
+                latest_tasks = backend._query_backend_tasks(
+                    conversation_id=conversation_id,
+                    timeout_secs=5.0,
+                    strict_schema=True,
+                )
+                if (
+                    _backend_tasks_may_be_active(latest_tasks)
+                    or _document_current_message_active(latest_document)
+                    or latest_source_request != source_request_id
+                    or _clean(latest_image_record.get("message_id")) != _clean(image_record.get("message_id"))
+                    or latest_current_node != current_node
+                ):
+                    raise ConversationImageAdoptionError("conversation changed during image adoption")
+            image_items = [
+                {"b64_json": __import__("base64").b64encode(item).decode("ascii")}
+                for item in image_bytes
+            ]
+            data = format_image_result(
+                image_items,
+                "",
+                "b64_json",
+                base_url,
+                int(time.time()),
+            )["data"]
+            if not data:
+                raise ConversationImageAdoptionError("latest manual image could not be stored")
+
+            with self._lock:
+                current = self._tasks.get(key)
+                if current is None:
+                    raise ConversationImageAdoptionError("task not found")
+                if current.get("status") == TASK_STATUS_SUCCESS and current.get("adopted_source_request_message_id"):
+                    if (
+                        _clean(current.get("adopted_source_request_message_id"))
+                        == source_request_id
+                        and _clean(current.get("adopted_source_image_message_id"))
+                        == _clean(image_record.get("message_id"))
+                    ):
+                        return _public_task(current)
+                    raise ConversationImageAdoptionError(
+                        "task was concurrently adopted from a different conversation image"
+                    )
+                current_identity = tuple(_clean(current.get(field)) for field in (
+                    "provider_binding_id",
+                    "provider_account_identity",
+                    "client_conversation_id",
+                    "conversation_id",
+                ))
+                if (
+                    current.get("status") != TASK_STATUS_ERROR
+                    or _clean(current.get("error_code")).lower() != "content_policy_violation"
+                    or _clean(current.get("request_message_id")) != original_request_message_id
+                    or current_identity != supplied_identity
+                ):
+                    raise ConversationImageAdoptionError("original task changed during image adoption")
+                snapshot = dict(current)
+                try:
+                    current.update({
+                        "status": TASK_STATUS_SUCCESS,
+                        "data": data,
+                        "error": "",
+                        "error_code": "",
+                        "binding_status": "bound",
+                        "parent_message_id": current_node,
+                        "upstream_unfinished": False,
+                        "next_poll_at": 0,
+                        "adopted_source_request_message_id": source_request_id,
+                        "adopted_source_image_message_id": _clean(image_record.get("message_id")),
+                        "adopted_from_error_code": original_error_code,
+                        "adopted_from_error": original_error,
+                        "adopted_at": _now_iso(),
+                        "updated_at": _now_iso(),
+                        "updated_ts": time.time(),
+                    })
+                    self._save_locked()
+                except Exception:
+                    current.clear()
+                    current.update(snapshot)
+                    raise
+                self._slot_condition.notify_all()
+                return _public_task(current)
+        except ConversationImageAdoptionError:
+            raise
+        except Exception as exc:
+            raise ConversationImageAdoptionError(
+                "conversation image adoption could not be verified"
+            ) from exc
+        finally:
+            if backend is not None:
+                backend.close()
 
     def _run_resume_poll(
         self,

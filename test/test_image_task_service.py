@@ -23,6 +23,107 @@ OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
 OTHER_OWNER = {"id": "owner-2", "name": "Other", "role": "user"}
 
 
+def write_policy_task(path: Path, **overrides):
+    task = {
+        "id": "policy-task", "owner_id": "owner-1", "status": "error",
+        "mode": "generate", "model": "gpt-image-2",
+        "provider_binding_id": "binding-1",
+        "provider_account_identity": "account-1",
+        "client_conversation_id": "client-chat-1",
+        "conversation_id": "conversation-1", "parent_message_id": "old-failure-assistant",
+        "request_message_id": "original-request", "binding_status": "bound",
+        "error_code": "content_policy_violation", "error": "original policy failure",
+        "upstream_unfinished": False, "created_ts": 100.0,
+        "created_at": "2026-09-16 00:00:00", "updated_at": "2099-01-01 00:00:00",
+    }
+    task.update(overrides)
+    path.write_text(json.dumps({"tasks": [task]}), encoding="utf-8")
+
+
+def manual_image_document(*, latest_active=False, divergent=False, broken=False):
+    mapping = {
+        "anchor-1": {
+            "message": {"author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True},
+        },
+        "original-request": {
+            "parent": "anchor-1",
+            "message": {"id": "original-request", "author": {"role": "user"}, "create_time": 100.0},
+        },
+        "policy-result": {
+            "parent": "original-request",
+            "message": {"author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True},
+        },
+        "manual-old": {
+            "parent": "policy-result" if not divergent else "anchor-1",
+            "message": {"author": {"role": "user"}, "create_time": 200.0},
+        },
+        "old-image": {
+            "parent": "manual-old",
+            "message": {"author": {"role": "tool"}},
+        },
+        "old-finished": {
+            "parent": "old-image",
+            "message": {"author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True},
+        },
+        "manual-latest": {
+            "parent": "old-finished",
+            "message": {"author": {"role": "user"}, "create_time": 300.0},
+        },
+        "latest-image": {
+            "parent": "manual-latest",
+            "message": {"author": {"role": "tool"}},
+        },
+        "latest-finished": {
+            "parent": "latest-image",
+            "message": {
+                "author": {"role": "assistant"},
+                "status": "in_progress" if latest_active else "finished_successfully",
+                "end_turn": not latest_active,
+            },
+        },
+    }
+    if broken:
+        mapping["latest-image"]["parent"] = "missing-parent"
+    return {"conversation_id": "conversation-1", "current_node": "latest-finished", "mapping": mapping}
+
+
+class AdoptionBackend:
+    document = manual_image_document()
+    reads = 0
+    downloads = 0
+    resolved = []
+
+    def __init__(self, access_token=None, proxy_url=None):
+        self.access_token = access_token
+
+    def _get_conversation(self, _conversation_id):
+        type(self).reads += 1
+        return type(self).document
+
+    def _extract_image_tool_records(self, _document, request_message_id):
+        records = {
+            "manual-old": [{"message_id": "old-image", "create_time": 210.0, "file_ids": ["old-file"], "sediment_ids": []}],
+            "manual-latest": [{"message_id": "latest-image", "create_time": 310.0, "file_ids": [], "sediment_ids": ["latest-file"]}],
+        }
+        return records.get(request_message_id, [])
+
+    def _query_backend_tasks(self, **kwargs):
+        if kwargs.get("strict_schema") is not True:
+            raise AssertionError("adoption must require a strict tasks schema")
+        return []
+
+    def resolve_conversation_image_urls(self, conversation_id, file_ids, sediment_ids, **kwargs):
+        type(self).resolved.append((conversation_id, file_ids, sediment_ids, kwargs))
+        return ["https://example.test/manual.png"]
+
+    def download_image_bytes(self, _urls):
+        type(self).downloads += 1
+        return [b"manual-image-bytes"]
+
+    def close(self):
+        return None
+
+
 def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_id: str, status: str, timeout: float = 2.0):
     deadline = time.time() + timeout
     last = None
@@ -1121,6 +1222,324 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual(result["items"], [])
             self.assertEqual(result["missing_ids"], ["private-task"])
+
+    def test_adopts_latest_completed_manual_image_after_an_edited_branch(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            generation_calls = []
+            service = self.make_service(path, lambda payload: generation_calls.append(payload))
+            AdoptionBackend.document = manual_image_document(divergent=True)
+            AdoptionBackend.reads = AdoptionBackend.downloads = 0
+            AdoptionBackend.resolved = []
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "http://content/images/manual.png"}]}),
+            ):
+                result = service.adopt_latest_conversation_image(
+                    OWNER, "policy-task", provider_binding_id="binding-1",
+                    provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                    conversation_id="conversation-1", source_request_message_id="manual-latest",
+                    source_image_message_id="latest-image", base_url="http://content",
+                )
+
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["adopted_source_request_message_id"], "manual-latest")
+            self.assertEqual(result["adopted_source_image_message_id"], "latest-image")
+            self.assertEqual(result["adopted_from_error_code"], "content_policy_violation")
+            self.assertEqual(result["adopted_from_error"], "original policy failure")
+            self.assertEqual(result["image_session_parent_id"], "latest-finished")
+            self.assertEqual(AdoptionBackend.downloads, 1)
+            self.assertEqual(generation_calls, [])
+            self.assertEqual(AdoptionBackend.resolved[0][3]["request_message_id"], "manual-latest")
+
+    def test_adoption_never_falls_back_when_latest_manual_turn_is_active(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            AdoptionBackend.document = manual_image_document(latest_active=True)
+            AdoptionBackend.downloads = 0
+            AdoptionBackend.resolved = []
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+            ):
+                with self.assertRaisesRegex(ValueError, "latest manual request is still active"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1",
+                    )
+            self.assertEqual(AdoptionBackend.downloads, 0)
+            self.assertEqual(AdoptionBackend.resolved, [])
+            self.assertEqual(service.list_tasks(OWNER, ["policy-task"])["items"][0]["status"], "error")
+
+    def test_adoption_requires_the_original_sent_request_or_verified_sibling_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            document = manual_image_document(divergent=True)
+            document["mapping"].pop("original-request")
+            AdoptionBackend.document = document
+            AdoptionBackend.downloads = 0
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "http://content/images/manual.png"}]}),
+            ):
+                with self.assertRaisesRegex(ValueError, "original request is not a verified user message"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1",
+                    )
+                with self.assertRaisesRegex(ValueError, "original request is not a verified user message"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1", source_request_message_id="manual-latest",
+                        source_image_message_id="latest-image",
+                    )
+            self.assertEqual(AdoptionBackend.downloads, 0)
+
+    def test_adoption_fetches_an_image_that_the_original_task_never_downloaded(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path, data=[])
+            service = self.make_service(path)
+            AdoptionBackend.document = manual_image_document()
+            AdoptionBackend.downloads = 0
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "http://content/images/manual.png"}]}),
+            ):
+                result = service.adopt_latest_conversation_image(
+                    OWNER, "policy-task", provider_binding_id="binding-1",
+                    provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                    conversation_id="conversation-1",
+                )
+            self.assertEqual(result["data"], [{"url": "http://content/images/manual.png"}])
+            self.assertEqual(AdoptionBackend.downloads, 1)
+
+    def test_adoption_rejects_owner_authority_and_bound_account_mismatches_before_download(self):
+        cases = (
+            (OTHER_OWNER, "binding-1", "account-1", "client-chat-1", "conversation-1", "task not found"),
+            (OWNER, "wrong-binding", "account-1", "client-chat-1", "conversation-1", "authority does not match"),
+            (OWNER, "binding-1", "wrong-account", "client-chat-1", "conversation-1", "authority does not match"),
+            (OWNER, "binding-1", "account-1", "wrong-client", "conversation-1", "authority does not match"),
+            (OWNER, "binding-1", "account-1", "client-chat-1", "wrong-conversation", "authority does not match"),
+        )
+        for identity, binding, account, client_chat, conversation, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                write_policy_task(path)
+                service = self.make_service(path)
+                with mock.patch("services.openai_backend_api.OpenAIBackendAPI") as backend:
+                    with self.assertRaisesRegex(ValueError, message):
+                        service.adopt_latest_conversation_image(
+                            identity, "policy-task", provider_binding_id=binding,
+                            provider_account_identity=account, client_conversation_id=client_chat,
+                            conversation_id=conversation,
+                        )
+                backend.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="different-account"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token") as token,
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI") as backend,
+            ):
+                with self.assertRaisesRegex(ValueError, "provider account identity changed"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1",
+                    )
+            token.assert_not_called()
+            backend.assert_not_called()
+
+    def test_adoption_rejects_broken_or_nonlatest_source_nodes(self):
+        mismatched_original_id = manual_image_document()
+        mismatched_original_id["mapping"]["original-request"]["message"]["id"] = "different-request"
+        for document, source_request, source_image, message in (
+            (manual_image_document(broken=True), "", "", "conversation branch is invalid"),
+            (mismatched_original_id, "", "", "original request is not a verified user message"),
+            (manual_image_document(), "manual-old", "old-image", "specified manual request is not the latest"),
+            (manual_image_document(), "manual-latest", "old-image", "specified image node is not the latest"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                write_policy_task(path)
+                service = self.make_service(path)
+                AdoptionBackend.document = document
+                AdoptionBackend.downloads = 0
+                with (
+                    mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                    mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                ):
+                    with self.assertRaisesRegex(ValueError, message):
+                        service.adopt_latest_conversation_image(
+                            OWNER, "policy-task", provider_binding_id="binding-1",
+                            provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                            conversation_id="conversation-1", source_request_message_id=source_request,
+                            source_image_message_id=source_image,
+                        )
+                self.assertEqual(AdoptionBackend.downloads, 0)
+
+    def test_concurrent_adoption_cannot_return_a_different_source_image(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            AdoptionBackend.document = manual_image_document()
+            AdoptionBackend.reads = AdoptionBackend.downloads = 0
+
+            def concurrent_adoption(*_args, **_kwargs):
+                with service._lock:
+                    task = service._tasks["owner-1:policy-task"]
+                    task.update({
+                        "status": "success",
+                        "data": [{"url": "http://content/images/other.png"}],
+                        "adopted_source_request_message_id": "other-manual-request",
+                        "adopted_source_image_message_id": "other-image-node",
+                        "error": "",
+                        "error_code": "",
+                    })
+                    service._save_locked()
+                return {"data": [{"url": "http://content/images/manual.png"}]}
+
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                mock.patch("services.protocol.conversation.format_image_result", side_effect=concurrent_adoption),
+            ):
+                with self.assertRaisesRegex(ValueError, "concurrently adopted from a different"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1",
+                    )
+
+            stored = service.list_tasks(OWNER, ["policy-task"])["items"][0]
+            self.assertEqual(stored["adopted_source_request_message_id"], "other-manual-request")
+            self.assertEqual(stored["adopted_source_image_message_id"], "other-image-node")
+            self.assertEqual(stored["data"], [{"url": "http://content/images/other.png"}])
+            self.assertEqual(AdoptionBackend.reads, 2)
+            self.assertEqual(AdoptionBackend.downloads, 1)
+
+    def test_adoption_save_failure_restores_the_original_receipt_before_retry(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            AdoptionBackend.document = manual_image_document()
+            AdoptionBackend.reads = AdoptionBackend.downloads = 0
+            AdoptionBackend.resolved = []
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "http://content/images/manual.png"}]}),
+            ):
+                with mock.patch.object(service, "_save_locked", side_effect=OSError("disk full")):
+                    with self.assertRaisesRegex(ValueError, "could not be verified"):
+                        service.adopt_latest_conversation_image(
+                            OWNER, "policy-task", provider_binding_id="binding-1",
+                            provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                            conversation_id="conversation-1",
+                        )
+
+                in_memory = service.list_tasks(OWNER, ["policy-task"])["items"][0]
+                self.assertEqual(in_memory["status"], "error")
+                self.assertEqual(in_memory["error_code"], "content_policy_violation")
+                self.assertEqual(in_memory["error"], "original policy failure")
+                self.assertNotIn("adopted_source_request_message_id", in_memory)
+
+                reloaded = self.make_service(path)
+                on_disk = reloaded.list_tasks(OWNER, ["policy-task"])["items"][0]
+                self.assertEqual(on_disk["status"], "error")
+                self.assertEqual(on_disk["error_code"], "content_policy_violation")
+                self.assertEqual(on_disk["error"], "original policy failure")
+                self.assertNotIn("adopted_source_request_message_id", on_disk)
+
+                recovered = service.adopt_latest_conversation_image(
+                    OWNER, "policy-task", provider_binding_id="binding-1",
+                    provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                    conversation_id="conversation-1",
+                )
+
+            self.assertEqual(recovered["status"], "success")
+            self.assertEqual(recovered["adopted_source_request_message_id"], "manual-latest")
+            self.assertEqual(AdoptionBackend.reads, 4)
+            self.assertEqual(AdoptionBackend.downloads, 2)
+            self.assertEqual(len(AdoptionBackend.resolved), 2)
+
+    def test_adoption_is_idempotent_and_a_restart_preserves_its_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            AdoptionBackend.document = manual_image_document()
+            AdoptionBackend.reads = AdoptionBackend.downloads = 0
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "http://content/images/manual.png"}]}),
+            ):
+                first = service.adopt_latest_conversation_image(
+                    OWNER, "policy-task", provider_binding_id="binding-1",
+                    provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                    conversation_id="conversation-1",
+                )
+                second = service.adopt_latest_conversation_image(
+                    OWNER, "policy-task", provider_binding_id="binding-1",
+                    provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                    conversation_id="conversation-1",
+                )
+                with self.assertRaisesRegex(ValueError, "manual request does not match"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1", source_request_message_id="manual-old",
+                        source_image_message_id="latest-image",
+                    )
+                with self.assertRaisesRegex(ValueError, "image node does not match"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1", source_request_message_id="manual-latest",
+                        source_image_message_id="old-image",
+                    )
+            reloaded = self.make_service(path)
+            persisted = reloaded.list_tasks(OWNER, ["policy-task"])["items"][0]
+            self.assertEqual(first, second)
+            self.assertEqual(persisted["adopted_source_request_message_id"], "manual-latest")
+            self.assertEqual(persisted["adopted_source_image_message_id"], "latest-image")
+            self.assertEqual(persisted["adopted_from_error_code"], "content_policy_violation")
+            self.assertEqual(AdoptionBackend.reads, 2)
+            self.assertEqual(AdoptionBackend.downloads, 1)
 
     def test_success_task_persists_to_new_service_instance(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
