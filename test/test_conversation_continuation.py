@@ -11,7 +11,12 @@ from types import SimpleNamespace
 from services import account_request_pacing as pacing
 
 from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
-from services.conversation_binding_service import ConversationBindingError, ConversationBindingService, TextRecoveryReason
+from services.conversation_binding_service import (
+    ConversationBindingError,
+    ConversationBindingService,
+    RECOVERY_CONVERSATION_SCAN_FIELD,
+    TextRecoveryReason,
+)
 from utils.helper import UpstreamHTTPError
 from services.protocol.conversation import (
     ConversationRequest,
@@ -857,11 +862,13 @@ class TextResultRecoveryTests(unittest.TestCase):
             "recent conversations response exceeds the requested limit",
         )
 
-        with self.assertRaisesRegex(RuntimeError, "requested limit"):
+        with self.assertRaises(ConversationBindingError) as failed:
             ConversationBindingService._locate_text_request_conversation(
                 backend, receipt,
             )
 
+        self.assertEqual(failed.exception.code, "RECOVERY_READ_FAILED")
+        self.assertRegex(str(failed.exception.__cause__), "requested limit")
         backend._get_conversation.assert_not_called()
 
     def test_missing_conversation_is_recovered_only_by_one_exact_request_node(self):
@@ -878,7 +885,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         unrelated["conversation_id"] = "unrelated-conversation"
         unrelated["mapping"].pop("request-user")
         backend._get_conversation.side_effect = [
-            unrelated, self.request_document(),
+            unrelated, self.request_document(), self.request_document(),
         ]
 
         with (
@@ -896,20 +903,30 @@ class TextResultRecoveryTests(unittest.TestCase):
             ),
             mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend) as backend_type,
         ):
+            with self.assertRaises(ConversationBindingError) as incomplete:
+                service.read_text_request(receipt)
+            self.assertEqual(
+                incomplete.exception.recovery_reason,
+                TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value,
+            )
+            receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = incomplete.exception.recovery_scan
             recovered = service.read_text_request(receipt)
 
         self.assertEqual(recovered["status"], "succeeded")
         self.assertEqual(recovered["content"], "original answer")
         self.assertEqual(recovered["conversation_id"], "conversation-one")
         self.assertEqual(recovered["parent_message_id"], "original-answer")
-        get_token.assert_called_once_with("binding-one", model="auto")
-        backend_type.assert_called_once_with(access_token="original-paid-account-token")
+        self.assertEqual(get_token.call_count, 2)
+        get_token.assert_called_with("binding-one", model="auto")
+        self.assertEqual(backend_type.call_count, 2)
+        for backend_call in backend_type.call_args_list:
+            self.assertEqual(backend_call.kwargs["access_token"], get_token.return_value)
         backend._list_recent_conversations.assert_called_once_with(
             limit=ConversationBindingService.RECOVERY_RECENT_CONVERSATION_LIMIT,
             timeout_secs=10.0,
             strict_schema=True,
         )
-        self.assertEqual(backend._get_conversation.call_count, 2)
+        self.assertEqual(backend._get_conversation.call_count, 3)
         for call in backend._get_conversation.call_args_list:
             self.assertGreater(call.kwargs["timeout_secs"], 0)
             self.assertLessEqual(
@@ -964,6 +981,11 @@ class TextResultRecoveryTests(unittest.TestCase):
         ]
         backend._get_conversation.return_value = self.request_document()
 
+        with self.assertRaises(ConversationBindingError) as incomplete:
+            ConversationBindingService._locate_text_request_conversation(
+                backend, receipt,
+            )
+        receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = incomplete.exception.recovery_scan
         with self.assertRaises(ConversationBindingError) as mismatch:
             ConversationBindingService._locate_text_request_conversation(
                 backend, receipt,
@@ -987,10 +1009,11 @@ class TextResultRecoveryTests(unittest.TestCase):
         ]
         backend._get_conversation.return_value = document
 
-        located, located_document = (
-            ConversationBindingService._locate_text_request_conversation(
-                backend, receipt,
-            )
+        with self.assertRaises(ConversationBindingError) as incomplete:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+        receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = incomplete.exception.recovery_scan
+        located, located_document = ConversationBindingService._locate_text_request_conversation(
+            backend, receipt,
         )
         result = ConversationBindingService._read_text_request_result(
             backend, located, document=located_document,
@@ -1000,7 +1023,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         self.assertEqual(located["request_parent_message_id"], "")
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["content"], "original answer")
-        backend._get_conversation.assert_called_once()
+        self.assertEqual(backend._get_conversation.call_count, 2)
 
     def test_missing_conversation_scan_has_one_total_time_budget(self):
         receipt = self.request_receipt()
@@ -1015,12 +1038,17 @@ class TextResultRecoveryTests(unittest.TestCase):
                 "services.conversation_binding_service.time.monotonic",
                 side_effect=[100.0, 101.0, 121.0],
             ),
-            self.assertRaisesRegex(TimeoutError, "time budget"),
+            self.assertRaises(ConversationBindingError) as incomplete,
         ):
             ConversationBindingService._locate_text_request_conversation(
                 backend, receipt,
             )
 
+        self.assertEqual(
+            incomplete.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value,
+        )
+        self.assertEqual(incomplete.exception.recovery_scan["next_index"], 0)
         backend._list_recent_conversations.assert_called_once_with(
             limit=ConversationBindingService.RECOVERY_RECENT_CONVERSATION_LIMIT,
             timeout_secs=10.0,
@@ -1036,10 +1064,149 @@ class TextResultRecoveryTests(unittest.TestCase):
             "recent conversation schema invalid",
         )
 
-        with self.assertRaisesRegex(RuntimeError, "schema invalid"):
+        with self.assertRaises(ConversationBindingError) as failed:
             ConversationBindingService._locate_text_request_conversation(
                 backend, receipt,
             )
+        self.assertEqual(failed.exception.code, "RECOVERY_READ_FAILED")
+        self.assertFalse(failed.exception.recovery_reason)
+
+    def test_missing_conversation_scan_retries_failed_item_without_losing_progress(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = [
+            {"id": "conversation-one"},
+            {"id": "conversation-two"},
+            {"id": "conversation-three"},
+        ]
+        unrelated = self.request_document()
+        unrelated["mapping"].pop("request-user")
+        first = {**unrelated, "conversation_id": "conversation-one"}
+        second = {**unrelated, "conversation_id": "conversation-two"}
+        third = {**unrelated, "conversation_id": "conversation-three"}
+        backend._get_conversation.side_effect = [
+            first,
+            UpstreamHTTPError("/backend-api/conversation/conversation-two", 429, {}),
+            second,
+            third,
+        ]
+
+        with self.assertRaises(ConversationBindingError) as failed:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+        self.assertEqual(failed.exception.code, "RECOVERY_READ_FAILED")
+        self.assertEqual(failed.exception.recovery_scan["next_index"], 1)
+        receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = failed.exception.recovery_scan
+
+        with self.assertRaises(ConversationBindingError) as complete:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+        self.assertEqual(
+            complete.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+        )
+        self.assertEqual(
+            [call.args[0] for call in backend._get_conversation.call_args_list],
+            ["conversation-one", "conversation-two", "conversation-two", "conversation-three"],
+        )
+        backend._list_recent_conversations.assert_called_once()
+
+    def test_missing_conversation_scan_keeps_progress_on_detail_schema_failure(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = [
+            {"id": "conversation-one"}, {"id": "conversation-two"},
+        ]
+        unrelated = self.request_document()
+        unrelated["conversation_id"] = "conversation-one"
+        unrelated["mapping"].pop("request-user")
+        backend._get_conversation.side_effect = [
+            unrelated,
+            {"conversation_id": "conversation-two", "mapping": "invalid"},
+        ]
+
+        with self.assertRaises(ConversationBindingError) as failed:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+
+        self.assertEqual(failed.exception.code, "CONVERSATION_BINDING_CONTRACT_INVALID")
+        self.assertEqual(failed.exception.recovery_scan["next_index"], 1)
+
+    def test_missing_conversation_scan_treats_detail_404_as_a_completed_candidate(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = [
+            {"id": "deleted-conversation"}, {"id": "unrelated-conversation"},
+        ]
+        unrelated = self.request_document()
+        unrelated["conversation_id"] = "unrelated-conversation"
+        unrelated["mapping"].pop("request-user")
+        backend._get_conversation.side_effect = [
+            UpstreamHTTPError("/backend-api/conversation/deleted-conversation", 404, {}),
+            unrelated,
+        ]
+
+        with self.assertRaises(ConversationBindingError) as complete:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+
+        self.assertEqual(
+            complete.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+        )
+        self.assertEqual(backend._get_conversation.call_count, 2)
+
+    def test_missing_conversation_scan_identity_change_starts_a_fresh_snapshot(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        stale_identity = ConversationBindingService._recovery_scan_identity(receipt)
+        receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = {
+            "identity": dict(stale_identity),
+            "conversation_ids": ["stale-conversation"],
+            "next_index": 1,
+            "matches": [],
+        }
+        receipt["provider_binding_id"] = "different-binding"
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = []
+
+        with self.assertRaises(ConversationBindingError) as complete:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+
+        self.assertEqual(
+            complete.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+        )
+        backend._list_recent_conversations.assert_called_once()
+        backend._get_conversation.assert_not_called()
+
+    def test_missing_conversation_exact_reread_rejects_a_changed_request_parent(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        first = self.request_document()
+        changed = self.request_document()
+        changed["mapping"]["request-user"]["parent"] = "changed-parent"
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = [
+            {"id": "conversation-one"},
+        ]
+        backend._get_conversation.side_effect = [first, changed]
+
+        with self.assertRaises(ConversationBindingError) as incomplete:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+        receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = incomplete.exception.recovery_scan
+        with self.assertRaises(ConversationBindingError) as mismatch:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+
+        self.assertEqual(
+            mismatch.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_PARENT_MISMATCH.value,
+        )
+        self.assertEqual(mismatch.exception.parent_message_id, "changed-parent")
 
     def test_request_recovery_distinguishes_missing_conversation_from_other_read_failures(self):
         service = ConversationBindingService()

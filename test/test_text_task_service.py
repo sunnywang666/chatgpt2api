@@ -4,8 +4,14 @@ import unittest
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
-from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
+from services.conversation_binding_service import (
+    ConversationBindingError,
+    ConversationBindingService,
+    RECOVERY_CONVERSATION_SCAN_FIELD,
+    TextRecoveryReason,
+)
 from services.text_task_service import TextTaskService, ContinuationExecutor
 
 
@@ -469,6 +475,162 @@ class TextTaskTests(unittest.TestCase):
             self.assertEqual(result["status"], "unknown")
             self.assertEqual(result.get("recovery_no_result_reads", 0), 0)
             clock.advance(delay)
+
+    def test_slow_missing_conversation_scan_persists_progress_across_restart(self):
+        recovery_clock = ManualClock()
+
+        class ScanClock:
+            value = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.value
+
+            @classmethod
+            def advance(cls, seconds):
+                cls.value += seconds
+
+        class SlowBackend:
+            def __init__(self):
+                self.list_calls = 0
+                self.detail_calls = []
+
+            def _list_recent_conversations(self, **_kwargs):
+                self.list_calls += 1
+                ScanClock.advance(1.5)
+                return [{"id": f"conversation-{index}"} for index in range(20)]
+
+            def _get_conversation(self, conversation_id, *, timeout_secs):
+                self.detail_calls.append((conversation_id, timeout_secs))
+                ScanClock.advance(9.5)
+                return {"conversation_id": conversation_id, "mapping": {}}
+
+        backend = SlowBackend()
+
+        def reader(receipt):
+            located, _document = ConversationBindingService._locate_text_request_conversation(
+                backend, receipt,
+            )
+            return located
+
+        service = TextTaskService(
+            self.path,
+            executor=self.queue,
+            clock=recovery_clock,
+            recovery_reader=reader,
+        )
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="binding", provider_account_identity="paid-account",
+        )
+        recovery_clock.advance(TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS + 1)
+
+        with mock.patch(
+            "services.conversation_binding_service.time.monotonic",
+            side_effect=ScanClock.monotonic,
+        ):
+            first = service.recover("owner", "attempt-1", True)
+            self.assertEqual(first["status"], "unknown")
+            self.assertEqual(
+                first["recovery_reason"],
+                TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value,
+            )
+            self.assertEqual(first.get("recovery_no_result_reads", 0), 0)
+            self.assertNotIn(RECOVERY_CONVERSATION_SCAN_FIELD, first)
+            self.assertEqual(first["recovery_next_at"], recovery_clock() + 30)
+
+            with service._db() as db:
+                stored = json.loads(db.execute(
+                    "SELECT receipt FROM requests WHERE owner=? AND id=?",
+                    ("owner", "attempt-1"),
+                ).fetchone()[0])
+            self.assertEqual(stored[RECOVERY_CONVERSATION_SCAN_FIELD]["next_index"], 2)
+
+            restarted = TextTaskService(
+                self.path,
+                executor=QueuedExecutor(),
+                clock=recovery_clock,
+                recovery_reader=reader,
+            )
+            result = first
+            for _ in range(9):
+                recovery_clock.advance(TextTaskService.RECOVERY_BASE_BACKOFF_SECONDS + 1)
+                result = restarted.recover("owner", "attempt-1", True)
+
+        self.assertEqual(backend.list_calls, 1)
+        self.assertEqual(
+            [conversation_id for conversation_id, _timeout in backend.detail_calls],
+            [f"conversation-{index}" for index in range(20)],
+        )
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(
+            result["recovery_reason"],
+            TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+        )
+        self.assertEqual(result["recovery_no_result_reads"], 1)
+        self.assertNotIn(RECOVERY_CONVERSATION_SCAN_FIELD, result)
+        with restarted._db() as db:
+            stored = json.loads(db.execute(
+                "SELECT receipt FROM requests WHERE owner=? AND id=?",
+                ("owner", "attempt-1"),
+            ).fetchone()[0])
+        self.assertNotIn(RECOVERY_CONVERSATION_SCAN_FIELD, stored)
+
+    def test_scan_progress_uses_short_delay_but_network_failure_keeps_attempt_backoff(self):
+        clock = ManualClock()
+        state = {
+            "identity": {
+                "provider_binding_id": "binding",
+                "provider_account_identity": "paid-account",
+                "client_conversation_id": "product-gallery",
+                "request_message_id": "request-message",
+            },
+            "conversation_ids": ["conversation-one"],
+            "next_index": 0,
+            "matches": [],
+        }
+        failures = iter([
+            ConversationBindingError(
+                "budget exhausted",
+                code="CONVERSATION_OUTCOME_UNKNOWN",
+                recovery_reason=TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value,
+                recovery_scan=state,
+            ),
+            ConversationBindingError(
+                "upstream read failed",
+                code="RECOVERY_READ_FAILED",
+                recovery_scan=state,
+            ),
+        ])
+
+        def reader(_receipt):
+            raise next(failures)
+
+        service = TextTaskService(
+            self.path, executor=self.queue, clock=clock, recovery_reader=reader,
+        )
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="binding", provider_account_identity="paid-account",
+            request_message_id="request-message", recovery_attempt=21,
+        )
+        clock.advance(TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS + 1)
+
+        progressed = service.recover("owner", "attempt-1", True)
+        self.assertEqual(progressed["recovery_next_at"], clock() + 30)
+        clock.advance(31)
+        failed = service.recover("owner", "attempt-1", True)
+
+        self.assertEqual(
+            failed["recovery_next_at"],
+            clock() + TextTaskService.RECOVERY_MAX_BACKOFF_SECONDS,
+        )
+        self.assertEqual(failed["recovery_error_code"], "RECOVERY_READ_FAILED")
+        self.assertEqual(failed.get("recovery_no_result_reads", 0), 0)
 
     def test_missing_text_conversation_requires_replacement_chat(self):
         clock = ManualClock()

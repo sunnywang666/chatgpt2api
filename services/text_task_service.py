@@ -22,6 +22,7 @@ from pathlib import Path
 from services.config import DATA_DIR
 from services.conversation_binding_service import (
     ConversationBindingError,
+    RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
     conversation_binding_service,
 )
@@ -78,6 +79,7 @@ class TextTaskService:
     UNRECOVERABLE_QUALIFIED_READS = 3
     _INTERNAL_RECEIPT_FIELDS = frozenset({
         "boot", "recovery_claim_id", "recovery_claimed_at", "recovery_lease_until",
+        RECOVERY_CONVERSATION_SCAN_FIELD,
     })
     _SAFE_RECOVERY_CODES = frozenset({
         "CONVERSATION_BINDING_UNAVAILABLE",
@@ -174,7 +176,11 @@ class TextTaskService:
                     or not isinstance(content, str) or not content.strip()
                     or not isinstance(parent_message_id, str) or not parent_message_id.strip()):
                 return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
-            return {key: recovered[key] for key in cls._SUCCESS_RECOVERY_FIELDS if key in recovered}, None, None, None
+            result = {key: recovered[key] for key in cls._SUCCESS_RECOVERY_FIELDS if key in recovered}
+            scan = cls._safe_recovery_scan(recovered.get(RECOVERY_CONVERSATION_SCAN_FIELD))
+            if scan is not None:
+                result[RECOVERY_CONVERSATION_SCAN_FIELD] = scan
+            return result, None, None, None
         if status in {"running", "unknown"}:
             anchor = {}
             for key in ("conversation_id", "parent_message_id", "request_parent_message_id"):
@@ -185,8 +191,56 @@ class TextTaskService:
                     if key != "request_parent_message_id" and not value.strip():
                         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
                     anchor[key] = value
+            scan = cls._safe_recovery_scan(recovered.get(RECOVERY_CONVERSATION_SCAN_FIELD))
+            if scan is not None:
+                anchor[RECOVERY_CONVERSATION_SCAN_FIELD] = scan
             return anchor or None, "UPSTREAM_OUTCOME_UNKNOWN", "read_text_result", cls._safe_recovery_reason(recovered.get("recovery_reason"))
         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+
+    @staticmethod
+    def _safe_recovery_scan(value):
+        if value == {}:
+            return {}
+        if not isinstance(value, dict):
+            return None
+        identity = value.get("identity")
+        conversation_ids = value.get("conversation_ids")
+        next_index = value.get("next_index")
+        matches = value.get("matches")
+        if (
+            set(value) != {"identity", "conversation_ids", "next_index", "matches"}
+            or not isinstance(identity, dict)
+            or set(identity) != {
+                "provider_binding_id", "provider_account_identity",
+                "client_conversation_id", "request_message_id",
+            }
+            or any(
+                not isinstance(item, str) or not item or len(item) > 300
+                for item in identity.values()
+            )
+            or not isinstance(conversation_ids, list) or len(conversation_ids) > 20
+            or any(not isinstance(item, str) or not item or len(item) > 200 for item in conversation_ids)
+            or len(set(conversation_ids)) != len(conversation_ids)
+            or not isinstance(next_index, int) or isinstance(next_index, bool)
+            or next_index < 0 or next_index > len(conversation_ids)
+            or not isinstance(matches, list) or len(matches) > 2
+        ):
+            return None
+        for match in matches:
+            if (
+                not isinstance(match, dict)
+                or set(match) != {"conversation_id", "request_parent_message_id"}
+                or match.get("conversation_id") not in conversation_ids
+                or not isinstance(match.get("request_parent_message_id"), str)
+                or len(match["request_parent_message_id"]) > 200
+            ):
+                return None
+        return {
+            "identity": dict(identity),
+            "conversation_ids": list(conversation_ids),
+            "next_index": next_index,
+            "matches": [dict(match) for match in matches],
+        }
 
     def _finish_recovery(
         self, owner, request_id, claim_id, recovered=None, error_code=None,
@@ -229,13 +283,20 @@ class TextTaskService:
                     )
                 recovered_anchor = {
                     key: value for key, value in (recovered or {}).items()
-                    if key in {"conversation_id", "parent_message_id", "request_parent_message_id"}
-                    and not current.get(key)
+                    if (
+                        key == RECOVERY_CONVERSATION_SCAN_FIELD
+                        or key in {"conversation_id", "parent_message_id", "request_parent_message_id"}
+                        and not current.get(key)
+                    )
                 }
+                scan_incomplete = (
+                    recovery_reason
+                    == TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value
+                )
                 changes = {
                     **recovered_anchor,
                     "recovery_next_at": now + self._recovery_backoff(
-                        qualified_reads if qualified_read_recorded else attempt
+                        qualified_reads if qualified_read_recorded else (1 if scan_incomplete else attempt)
                     ),
                     "recovery_error_code": error_code,
                     "recovery_phase": phase or "read_text_request",
@@ -261,6 +322,8 @@ class TextTaskService:
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}
+            if updated.get(RECOVERY_CONVERSATION_SCAN_FIELD) == {} or not error_code:
+                updated.pop(RECOVERY_CONVERSATION_SCAN_FIELD, None)
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
                        (json.dumps(updated), owner, request_id, row[0]))
             return self._public(updated)
@@ -329,8 +392,11 @@ class TextTaskService:
                     recovery_reason, count_unrecoverable=allow_unrecoverable_retry,
                 )
             except ConversationBindingError as exc:
+                recovery_scan = self._safe_recovery_scan(getattr(exc, "recovery_scan", None))
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0],
+                    ({RECOVERY_CONVERSATION_SCAN_FIELD: recovery_scan}
+                     if recovery_scan is not None else None),
                     error_code=self._safe_recovery_code(exc), phase="read_text_request",
                     recovery_reason=self._safe_recovery_reason(getattr(exc, "recovery_reason", "")),
                     count_unrecoverable=allow_unrecoverable_retry,
