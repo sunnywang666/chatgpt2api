@@ -413,9 +413,12 @@ class CodexService:
                 except Exception:
                     error_code = f"{kind}_transport_error"
                     break
-                if response.status_code in {401, 403}:
+                if response.status_code == 401:
                     auth_required = True
                     error_code = f"{kind}_auth_required"
+                    break
+                if response.status_code == 403:
+                    error_code = f"{kind}_access_denied"
                     break
                 if response.status_code != 200:
                     error_code = f"{kind}_http_{response.status_code}"
@@ -710,8 +713,13 @@ class CodexService:
         try:
             if status == 429:
                 self._mark_observation_state(token, "limited", "codex_http_429")
-            elif status in {401, 403}:
+            elif status == 401:
                 self._mark_observation_state(token, "auth_required", f"codex_http_{status}")
+            elif status == 403:
+                # A permission/policy rejection does not establish that the
+                # credential expired. Keep the account unavailable without
+                # recommending token rotation or replaying the request.
+                self._mark_observation_state(token, "read_failed", "codex_http_403")
         except Exception:
             pass
         # A timeout response does not prove that the non-idempotent POST was
@@ -724,8 +732,10 @@ class CodexService:
             return CodexServiceError(502, "codex_upstream_outcome_unknown", "The Codex request outcome is unknown")
         if status == 429:
             return CodexServiceError(429, "codex_limited", "The selected Codex account is temporarily limited")
-        if status in {401, 403}:
-            return CodexServiceError(503, "codex_auth_required", "The selected Codex account requires refresh")
+        if status == 401:
+            return CodexServiceError(503, "codex_auth_required", "The upstream rejected the selected Codex account credential")
+        if status == 403:
+            return CodexServiceError(503, "codex_access_denied", "The upstream denied access for the selected Codex account")
         if 400 <= status < 500:
             return CodexServiceError(400, "codex_request_rejected", "The Codex request was rejected")
         return CodexServiceError(502, "codex_upstream_error", "The Codex service is temporarily unavailable")

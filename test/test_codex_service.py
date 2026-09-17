@@ -224,6 +224,20 @@ class CodexObservationTests(unittest.TestCase):
         self.assertEqual(result["state"], "read_failed")
         self.assertEqual(result["error_code"], "usage_invalid_response")
 
+    def test_forbidden_observation_does_not_claim_token_refresh_is_required(self):
+        for failed_kind in ("models", "usage"):
+            with self.subTest(kind=failed_kind):
+                accounts = FakeAccounts([account()])
+                responses = []
+                if failed_kind == "usage":
+                    responses.append(FakeResponse(payload={"models": [{"slug": "gpt-5.6-codex"}]}))
+                responses.append(FakeResponse(status=403, payload={"detail": "private token-a"}))
+                result = CodexService(accounts, SessionFactory([FakeSession(gets=responses)])).refresh_account("token-a")
+                self.assertEqual(result["state"], "read_failed")
+                self.assertEqual(result["error_code"], f"{failed_kind}_access_denied")
+                self.assertEqual(result["models"][0]["id"], "gpt-5.6-codex")
+                self.assertNotIn("token-a", json.dumps(result))
+
     def test_empty_rate_limit_and_nonfinite_usage_are_read_failed(self):
         for usage in (
             {"rate_limit": {}},
@@ -630,6 +644,27 @@ class CodexRelayTests(unittest.TestCase):
         self.assertEqual(len(session.calls), 1)
         binding = next(iter(accounts.accounts["token-a"]["codex_affinities"].values()))
         self.assertEqual(binding["state"], "unknown")
+
+    def test_upstream_403_is_known_rejection_without_refresh_claim_or_replay(self):
+        session = FakeSession(post_response=FakeResponse(status=403, payload={"detail": "private token-a"}))
+        accounts = FakeAccounts([account(), account("token-b")])
+        service = CodexService(accounts, SessionFactory([session]))
+        with self.assertRaises(CodexServiceError) as raised:
+            service.submit(self.identity, {"model": "gpt-5.6-codex", "input": []}, self.headers)
+        self.assertEqual(raised.exception.code, "codex_access_denied")
+        self.assertNotIn("refresh", str(raised.exception).lower())
+        self.assertNotIn("token-a", str(raised.exception))
+        self.assertEqual(len(session.calls), 1)
+        binding = next(iter(accounts.accounts["token-a"]["codex_affinities"].values()))
+        self.assertEqual(binding["state"], "bound")
+        self.assertNotIn("codex_affinities", accounts.accounts["token-b"])
+        observation = accounts.accounts["token-a"]["codex_observation"]
+        self.assertEqual(observation["state"], "read_failed")
+        self.assertEqual(observation["error_code"], "codex_http_403")
+        with self.assertRaises(CodexServiceError) as unavailable:
+            service.submit(self.identity, {"model": "gpt-5.6-codex", "input": []}, self.headers)
+        self.assertEqual(unavailable.exception.code, "codex_bound_account_unavailable")
+        self.assertEqual(len(session.calls), 1)
 
     def test_upstream_429_immediately_limits_account_for_new_sessions(self):
         session = FakeSession(post_response=FakeResponse(status=429, payload={"detail": "private"}))
