@@ -9,6 +9,7 @@ from unittest import mock
 from services.conversation_binding_service import (
     ConversationBindingError,
     ConversationBindingService,
+    RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
     RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
 )
@@ -295,6 +296,43 @@ class TextTaskTests(unittest.TestCase):
         self.assertNotIn("parent_message_id", result)
         self.assertEqual(len(self.queue.calls), 1, "recovery never resubmits upstream")
 
+    def test_coverage_aware_empty_read_does_not_inherit_legacy_qualified_count(self):
+        clock = ManualClock()
+
+        def reader(_receipt):
+            raise ConversationBindingError(
+                "covered account history contains no matching request",
+                code="CONVERSATION_OUTCOME_UNKNOWN",
+                recovery_reason=TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+                recovery_scan={},
+                recovery_coverage_version=1,
+            )
+
+        service = TextTaskService(
+            self.path, executor=self.queue, clock=clock, recovery_reader=reader,
+        )
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="paid-binding",
+            provider_account_identity="paid-account",
+            recovery_no_result_reads=2,
+        )
+        clock.advance(TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS + 1)
+
+        result = service.recover("owner", "attempt-1", True)
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["recovery_no_result_reads"], 1)
+        self.assertNotIn(RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD, result)
+        with service._db() as db:
+            stored = json.loads(db.execute(
+                "SELECT receipt FROM requests WHERE owner=? AND id=?",
+                ("owner", "attempt-1"),
+            ).fetchone()[0])
+        self.assertEqual(stored[RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD], 1)
+
     def test_exact_root_lookup_anchor_is_persisted_for_future_reads(self):
         clock = ManualClock()
 
@@ -495,10 +533,17 @@ class TextTaskTests(unittest.TestCase):
                 self.list_calls = 0
                 self.detail_calls = []
 
-            def _list_recent_conversations(self, **_kwargs):
+            def _list_recent_conversations(self, *, offset, **_kwargs):
                 self.list_calls += 1
                 ScanClock.advance(1.5)
-                return [{"id": f"conversation-{index}"} for index in range(20)]
+                update_time = 1100 if offset == 0 else 900
+                return [
+                    {
+                        "id": f"conversation-{offset + index}",
+                        "update_time": update_time - index,
+                    }
+                    for index in range(20)
+                ]
 
             def _get_conversation(self, conversation_id, *, timeout_secs):
                 self.detail_calls.append((conversation_id, timeout_secs))
@@ -555,14 +600,14 @@ class TextTaskTests(unittest.TestCase):
                 recovery_reader=reader,
             )
             result = first
-            for _ in range(9):
+            for _ in range(19):
                 recovery_clock.advance(TextTaskService.RECOVERY_BASE_BACKOFF_SECONDS + 1)
                 result = restarted.recover("owner", "attempt-1", True)
 
-        self.assertEqual(backend.list_calls, 1)
+        self.assertEqual(backend.list_calls, 2)
         self.assertEqual(
             [conversation_id for conversation_id, _timeout in backend.detail_calls],
-            [f"conversation-{index}" for index in range(20)],
+            [f"conversation-{index}" for index in range(40)],
         )
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(
@@ -588,6 +633,10 @@ class TextTaskTests(unittest.TestCase):
                 "request_message_id": "request-message",
             },
             "conversation_ids": ["conversation-one"],
+            "next_offset": 1,
+            "coverage_complete": True,
+            "time_order_valid": False,
+            "last_update_time": None,
             "next_index": 0,
             "matches": [],
         }

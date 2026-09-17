@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import time
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -27,6 +29,7 @@ class TextRecoveryReason(str, Enum):
 
 _ACTIVE_TEXT_RESULT_STATUSES = frozenset({"in_progress", "running", "pending", "queued"})
 RECOVERY_CONVERSATION_SCAN_FIELD = "_recovery_conversation_scan"
+RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD = "_recovery_conversation_coverage_version"
 
 
 class ConversationBindingError(RuntimeError):
@@ -41,6 +44,7 @@ class ConversationBindingError(RuntimeError):
         parent_message_id: str = "",
         recovery_reason: str = "",
         recovery_scan: dict[str, Any] | None = None,
+        recovery_coverage_version: int | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -50,13 +54,17 @@ class ConversationBindingError(RuntimeError):
         self.parent_message_id = parent_message_id
         self.recovery_reason = recovery_reason
         self.recovery_scan = recovery_scan
+        self.recovery_coverage_version = recovery_coverage_version
 
 
 class ConversationBindingService:
     RECOVERY_RECENT_CONVERSATION_LIMIT = 20
+    RECOVERY_MAX_CONVERSATION_IDS = 100
     RECOVERY_SCAN_TIMEOUT_SECONDS = 20.0
     RECOVERY_LIST_TIMEOUT_SECONDS = 10.0
     RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS = 5.0
+    RECOVERY_DISPATCH_CLOCK_SKEW_SECONDS = 30.0
+    RECOVERY_COVERAGE_VERSION = 1
 
     def archive(self, body: dict[str, Any]) -> dict[str, Any]:
         binding = body["provider_binding_id"]
@@ -135,27 +143,85 @@ class ConversationBindingService:
 
         scan = cls._validated_recovery_scan(receipt, scan_identity)
         if scan is None:
+            scan = {
+                "identity": scan_identity,
+                "conversation_ids": [],
+                "next_offset": 0,
+                "coverage_complete": False,
+                "time_order_valid": True,
+                "last_update_time": None,
+                "next_index": 0,
+                "matches": [],
+            }
+
+        while not scan["coverage_complete"]:
+            # Bound each persisted candidate window, then inspect it before
+            # continuing from the accumulated upstream offset in another
+            # recovery round. This keeps the receipt small without turning the
+            # cap into a permanent stop on older account histories.
+            if (
+                scan["conversation_ids"]
+                and len(scan["conversation_ids"])
+                    + cls.RECOVERY_RECENT_CONVERSATION_LIMIT
+                    > cls.RECOVERY_MAX_CONVERSATION_IDS
+            ):
+                break
+            list_timeout = remaining_timeout()
+            if list_timeout < cls.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS:
+                raise cls._scan_incomplete(scan)
             try:
                 recent = backend._list_recent_conversations(
                     limit=cls.RECOVERY_RECENT_CONVERSATION_LIMIT,
+                    offset=scan["next_offset"],
                     timeout_secs=min(
                         cls.RECOVERY_LIST_TIMEOUT_SECONDS,
-                        remaining_timeout(),
+                        list_timeout,
                     ),
                     strict_schema=True,
                 )
             except Exception as exc:
-                raise cls._scan_read_failed() from exc
-            conversation_ids = list(dict.fromkeys(
+                raise cls._scan_read_failed(scan) from exc
+            raw_page_ids = [
                 str(item.get("id") or item.get("conversation_id") or "").strip()
                 for item in recent
-            ))
-            scan = {
-                "identity": scan_identity,
-                "conversation_ids": conversation_ids,
-                "next_index": 0,
-                "matches": [],
-            }
+            ]
+            page_ids = list(dict.fromkeys(raw_page_ids))
+            page_ids = [item for item in page_ids if item not in scan["conversation_ids"]]
+
+            page_times = [cls._conversation_update_time(item) for item in recent]
+            if scan["time_order_valid"] and all(value is not None for value in page_times):
+                numeric_times = [float(value) for value in page_times]
+                ordered = not (
+                    any(left < right for left, right in zip(numeric_times, numeric_times[1:]))
+                    or (numeric_times and scan["last_update_time"] is not None
+                        and numeric_times[0] > scan["last_update_time"])
+                )
+                if ordered and numeric_times:
+                    scan["last_update_time"] = numeric_times[-1]
+                elif not ordered:
+                    # Offset pagination can drift while newer conversations
+                    # arrive. Once order is not trustworthy, only a short page
+                    # may prove complete coverage.
+                    scan["time_order_valid"] = False
+                    scan["last_update_time"] = None
+            else:
+                scan["time_order_valid"] = False
+                scan["last_update_time"] = None
+
+            scan["conversation_ids"].extend(page_ids)
+            scan["next_offset"] += len(raw_page_ids)
+            dispatch_at = cls._receipt_dispatch_time(receipt)
+            covered_by_time = (
+                scan["time_order_valid"]
+                and scan["last_update_time"] is not None
+                and dispatch_at is not None
+                and scan["last_update_time"]
+                    < dispatch_at - cls.RECOVERY_DISPATCH_CLOCK_SKEW_SECONDS
+            )
+            scan["coverage_complete"] = (
+                len(recent) < cls.RECOVERY_RECENT_CONVERSATION_LIMIT
+                or covered_by_time
+            )
 
         conversation_ids = scan["conversation_ids"]
         matches = scan["matches"]
@@ -173,8 +239,9 @@ class ConversationBindingService:
                 )
             except UpstreamHTTPError as exc:
                 if exc.status_code == 404:
-                    scan["next_index"] += 1
-                    continue
+                    # Without a persisted conversation id, a missing candidate
+                    # cannot prove that the original request was absent.
+                    raise cls._scan_read_failed(scan) from exc
                 raise cls._scan_read_failed(scan) from exc
             except ConversationBindingError:
                 raise
@@ -203,7 +270,22 @@ class ConversationBindingService:
             if len(matches) > 1:
                 break
 
-        if len(matches) != 1:
+        if len(matches) > 1:
+            raise ConversationBindingError(
+                "original request message appears in multiple conversations",
+                code="CONVERSATION_BINDING_MISMATCH",
+                recovery_scan={},
+            )
+        if not scan["coverage_complete"]:
+            # All candidates in this bounded window were inspected. Retain a
+            # found match for uniqueness checking, discard completed unrelated
+            # ids, and continue from next_offset on the next short-delay read.
+            scan["conversation_ids"] = [
+                str(match["conversation_id"]) for match in matches
+            ]
+            scan["next_index"] = len(scan["conversation_ids"])
+            raise cls._scan_incomplete(scan)
+        if not matches:
             raise ConversationBindingError(
                 "original request conversation cannot be attributed uniquely",
                 code="CONVERSATION_OUTCOME_UNKNOWN",
@@ -211,6 +293,7 @@ class ConversationBindingService:
                     TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value
                 ),
                 recovery_scan={},
+                recovery_coverage_version=cls.RECOVERY_COVERAGE_VERSION,
             )
         if scan["next_index"] < len(conversation_ids):
             raise cls._scan_incomplete(scan)
@@ -308,6 +391,37 @@ class ConversationBindingService:
             )
         }
 
+    @staticmethod
+    def _conversation_update_time(item: dict[str, Any]) -> float | None:
+        value = item.get("update_time") or item.get("updated_at")
+        return ConversationBindingService._timestamp(value)
+
+    @staticmethod
+    def _timestamp(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            if not isinstance(value, str):
+                return None
+            normalized = value.strip()
+            if normalized.endswith(("Z", "z")):
+                normalized = normalized[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                return None
+            timestamp = parsed.timestamp()
+        return timestamp if math.isfinite(timestamp) and timestamp > 0 else None
+
+    @staticmethod
+    def _receipt_dispatch_time(receipt: dict[str, Any]) -> float | None:
+        value = receipt.get("started_at") or receipt.get("created_at")
+        return ConversationBindingService._timestamp(value)
+
     @classmethod
     def _validated_recovery_scan(
         cls,
@@ -318,14 +432,32 @@ class ConversationBindingService:
         if not isinstance(value, dict) or value.get("identity") != expected_identity:
             return None
         conversation_ids = value.get("conversation_ids")
+        next_offset = value.get("next_offset")
+        coverage_complete = value.get("coverage_complete")
+        time_order_valid = value.get("time_order_valid")
+        last_update_time = value.get("last_update_time")
         next_index = value.get("next_index")
         matches = value.get("matches")
         if (
-            set(value) != {"identity", "conversation_ids", "next_index", "matches"}
+            set(value) != {
+                "identity", "conversation_ids", "next_offset", "coverage_complete",
+                "time_order_valid", "last_update_time", "next_index", "matches",
+            }
             or not isinstance(conversation_ids, list)
-            or len(conversation_ids) > cls.RECOVERY_RECENT_CONVERSATION_LIMIT
+            or len(conversation_ids) > cls.RECOVERY_MAX_CONVERSATION_IDS
             or any(not isinstance(item, str) or not item or len(item) > 200 for item in conversation_ids)
             or len(set(conversation_ids)) != len(conversation_ids)
+            or not isinstance(next_offset, int) or isinstance(next_offset, bool)
+            or next_offset < len(conversation_ids)
+            or not isinstance(coverage_complete, bool)
+            or not isinstance(time_order_valid, bool)
+            or (last_update_time is not None and (
+                isinstance(last_update_time, bool)
+                or not isinstance(last_update_time, (int, float))
+                or not math.isfinite(last_update_time)
+                or last_update_time <= 0
+            ))
+            or (not time_order_valid and last_update_time is not None)
             or not isinstance(next_index, int) or isinstance(next_index, bool)
             or next_index < 0 or next_index > len(conversation_ids)
             or not isinstance(matches, list) or len(matches) > 2
@@ -351,6 +483,10 @@ class ConversationBindingService:
         return {
             "identity": expected_identity,
             "conversation_ids": list(conversation_ids),
+            "next_offset": next_offset,
+            "coverage_complete": coverage_complete,
+            "time_order_valid": time_order_valid,
+            "last_update_time": last_update_time,
             "next_index": next_index,
             "matches": safe_matches,
         }

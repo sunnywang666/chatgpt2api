@@ -1175,6 +1175,7 @@ class OpenAIBackendAPI:
     def _list_recent_conversations(
         self,
         limit: int = 5,
+        offset: int = 0,
         timeout_secs: float = 10.0,
         strict_schema: bool = False,
     ) -> list[Dict[str, Any]]:
@@ -1183,7 +1184,7 @@ class OpenAIBackendAPI:
         当 SSE 流太短导致 conversation_id 丢失时，可以通过此方法
         查找最近创建的对话来恢复 conversation_id。
         """
-        path = f"/backend-api/conversations?offset=0&limit={limit}&order=updated&conversation_filter=all"
+        path = f"/backend-api/conversations?offset={offset}&limit={limit}&order=updated&conversation_filter=all"
         try:
             response = self.session.get(
                 self.base_url + path,

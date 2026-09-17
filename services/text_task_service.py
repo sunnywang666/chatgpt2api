@@ -11,6 +11,7 @@ import itertools
 import threading
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
@@ -22,6 +23,7 @@ from pathlib import Path
 from services.config import DATA_DIR
 from services.conversation_binding_service import (
     ConversationBindingError,
+    RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
     RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
     conversation_binding_service,
@@ -79,7 +81,7 @@ class TextTaskService:
     UNRECOVERABLE_QUALIFIED_READS = 3
     _INTERNAL_RECEIPT_FIELDS = frozenset({
         "boot", "recovery_claim_id", "recovery_claimed_at", "recovery_lease_until",
-        RECOVERY_CONVERSATION_SCAN_FIELD,
+        RECOVERY_CONVERSATION_SCAN_FIELD, RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
     })
     _SAFE_RECOVERY_CODES = frozenset({
         "CONVERSATION_BINDING_UNAVAILABLE",
@@ -205,10 +207,17 @@ class TextTaskService:
             return None
         identity = value.get("identity")
         conversation_ids = value.get("conversation_ids")
+        next_offset = value.get("next_offset")
+        coverage_complete = value.get("coverage_complete")
+        time_order_valid = value.get("time_order_valid")
+        last_update_time = value.get("last_update_time")
         next_index = value.get("next_index")
         matches = value.get("matches")
         if (
-            set(value) != {"identity", "conversation_ids", "next_index", "matches"}
+            set(value) != {
+                "identity", "conversation_ids", "next_offset", "coverage_complete",
+                "time_order_valid", "last_update_time", "next_index", "matches",
+            }
             or not isinstance(identity, dict)
             or set(identity) != {
                 "provider_binding_id", "provider_account_identity",
@@ -218,9 +227,20 @@ class TextTaskService:
                 not isinstance(item, str) or not item or len(item) > 300
                 for item in identity.values()
             )
-            or not isinstance(conversation_ids, list) or len(conversation_ids) > 20
+            or not isinstance(conversation_ids, list) or len(conversation_ids) > 100
             or any(not isinstance(item, str) or not item or len(item) > 200 for item in conversation_ids)
             or len(set(conversation_ids)) != len(conversation_ids)
+            or not isinstance(next_offset, int) or isinstance(next_offset, bool)
+            or next_offset < len(conversation_ids)
+            or not isinstance(coverage_complete, bool)
+            or not isinstance(time_order_valid, bool)
+            or (last_update_time is not None and (
+                isinstance(last_update_time, bool)
+                or not isinstance(last_update_time, (int, float))
+                or not math.isfinite(last_update_time)
+                or last_update_time <= 0
+            ))
+            or (not time_order_valid and last_update_time is not None)
             or not isinstance(next_index, int) or isinstance(next_index, bool)
             or next_index < 0 or next_index > len(conversation_ids)
             or not isinstance(matches, list) or len(matches) > 2
@@ -238,6 +258,10 @@ class TextTaskService:
         return {
             "identity": dict(identity),
             "conversation_ids": list(conversation_ids),
+            "next_offset": next_offset,
+            "coverage_complete": coverage_complete,
+            "time_order_valid": time_order_valid,
+            "last_update_time": last_update_time,
             "next_index": next_index,
             "matches": [dict(match) for match in matches],
         }
@@ -262,6 +286,12 @@ class TextTaskService:
             if error_code:
                 attempt = max(1, int(current.get("recovery_attempt", 1)))
                 qualified_reads = int(current.get("recovery_no_result_reads") or 0)
+                coverage_version = (recovered or {}).get(
+                    RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD
+                )
+                if coverage_version == 1 and current.get(
+                        RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD) != 1:
+                    qualified_reads = 0
                 created_at = float(current.get("created_at") or now)
                 qualified_read_recorded = (
                     count_unrecoverable
@@ -285,6 +315,7 @@ class TextTaskService:
                     key: value for key, value in (recovered or {}).items()
                     if (
                         key == RECOVERY_CONVERSATION_SCAN_FIELD
+                        or key == RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD
                         or key in {"conversation_id", "parent_message_id", "request_parent_message_id"}
                         and not current.get(key)
                     )
@@ -393,10 +424,14 @@ class TextTaskService:
                 )
             except ConversationBindingError as exc:
                 recovery_scan = self._safe_recovery_scan(getattr(exc, "recovery_scan", None))
+                recovery_evidence = {}
+                if recovery_scan is not None:
+                    recovery_evidence[RECOVERY_CONVERSATION_SCAN_FIELD] = recovery_scan
+                if getattr(exc, "recovery_coverage_version", None) == 1:
+                    recovery_evidence[RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD] = 1
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0],
-                    ({RECOVERY_CONVERSATION_SCAN_FIELD: recovery_scan}
-                     if recovery_scan is not None else None),
+                    recovery_evidence or None,
                     error_code=self._safe_recovery_code(exc), phase="read_text_request",
                     recovery_reason=self._safe_recovery_reason(getattr(exc, "recovery_reason", "")),
                     count_unrecoverable=allow_unrecoverable_retry,
