@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import AbstractContextManager
 from typing import Any
 
 
@@ -26,6 +27,14 @@ class StorageBackend(ABC):
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
         """保存所有鉴权密钥数据"""
         pass
+
+    @abstractmethod
+    def auth_keys_transaction(self) -> AbstractContextManager[list[dict[str, Any]]]:
+        """Lock, load and atomically persist key records across service processes.
+
+        Changes are committed only when the context exits normally.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def health_check(self) -> dict[str, Any]:

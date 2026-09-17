@@ -8,6 +8,14 @@ https://app.hugsweetglobal.com/ai/codex/v1
 
 Successful model discovery or deployment health does not prove that a real Responses turn can complete. Use the commands below for the approved account/API acceptance, and preserve the original session when the request outcome is unknown.
 
+## 程序密钥用途（第二阶段候选）
+
+工作台「ChatGPT / Codex → 密钥与 CLI → 创建程序密钥」选择 **Codex编程**，保存一次性显示的普通密钥，再按下方已有 CLI 接入步骤配置。仅选择 Chat图片生成的密钥不能发起 Codex 编程请求。用途控制的是调用权限，不是额度或模型授权；模型发现成功仍不能证明上游账号可执行。
+
+「编辑用途」保存后立即影响后续提交。并发修改返回 409 `KEY_POLICY_REVISION_CONFLICT`，刷新列表重新核对，不自动覆盖。403 `KEY_CAPABILITY_DENIED` 表示所选用途不允许该请求；`CAPABILITY_NOT_READY` 表示能力尚未开放。Chat识别/规划与 Codex生图本阶段不可新开通。撤销返回 401，已有记录保留；不要通过新建任务绕过未知结果。
+
+2026-09-17：此政策为未发布候选。用户要求逐把确认旧密钥用途后再切换；当前生产行为不由本文候选说明替代。迁移边界见 [部署指南](deployment.md#工作台程序密钥政策第二阶段)。
+
 ## What the launchers do
 
 `examples/codex_client/run-codex.sh` and `examples/codex_client/run-codex.ps1` first request `GET /models`. Discovery accepts native Codex `models[].slug` and OpenAI-compatible `data[].id` responses without changing the provider protocol. Run discovery without a model, then select one exact returned ID before they create an isolated state root and launch Codex.

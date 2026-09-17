@@ -10,6 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
 
 from api.support import require_identity
+from api.key_policy import require_codex_policy
 from services.codex_service import MAX_REQUEST_BYTES, CodexHTTPResponse, CodexServiceError, codex_service
 
 
@@ -109,6 +110,7 @@ def create_router() -> APIRouter:
     async def submit(request: Request, authorization: str | None, *, compact: bool):
         identity = _ordinary_identity(authorization)
         payload = await _payload(request)
+        require_codex_policy(identity, payload)
         try:
             result = await run_in_threadpool(
                 codex_service.submit,

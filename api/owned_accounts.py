@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from api.support import require_admin
 from services.account_service import account_service
 from services.auth_service import auth_service
+from services.program_key_policy import PolicyError
 
 
 class ImportAccount(BaseModel):
@@ -22,7 +23,15 @@ class EnabledAccount(BaseModel):
 
 
 class KeyName(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     name: str = ""
+    capabilities: list[str] = Field(default_factory=lambda: ["chat_image"])
+
+
+class KeyPolicyUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    capabilities: list[str]
+    expected_revision: int = Field(ge=0, strict=True)
 
 
 def owner_scope(authorization: str | None, owner: str | None) -> str:
@@ -85,10 +94,23 @@ def create_router() -> APIRouter:
     async def create_key(body: KeyName, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)
         try:
-            item, key = await run_in_threadpool(auth_service.create_key, role="user", name=body.name, owner_subject=owner)
+            item, key = await run_in_threadpool(auth_service.create_key, role="user", name=body.name, owner_subject=owner, capabilities=body.capabilities)
+        except PolicyError as exc:
+            raise HTTPException(422, detail={"code": exc.code}) from None
         except ValueError:
             raise HTTPException(409, detail={"error": "key name already exists"}) from None
         return {"item": item, "key": key}
+
+    @router.patch("/keys/{key_id}/policy")
+    async def update_key_policy(key_id: str, body: KeyPolicyUpdate, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        try:
+            item = await run_in_threadpool(auth_service.update_owned_policy, owner, key_id, body.capabilities, body.expected_revision)
+        except PolicyError as exc:
+            raise HTTPException(409 if exc.code == "KEY_POLICY_REVISION_CONFLICT" else 422, detail={"code": exc.code}) from None
+        if item is None:
+            raise HTTPException(404, detail={"error": "key not found"})
+        return {"item": item}
 
     @router.delete("/keys/{key_id}")
     async def revoke_key(key_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):

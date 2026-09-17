@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import fcntl
+import os
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -46,21 +50,48 @@ class JSONStorageBackend(StorageBackend):
         """从 JSON 文件加载鉴权密钥数据"""
         if not self.auth_keys_path.exists():
             return []
-        try:
-            data = json.loads(self.auth_keys_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, Exception):
-            return []
+        data = json.loads(self.auth_keys_path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             data = data.get("items")
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            raise ValueError("invalid auth key storage")
+        return data
 
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
         """保存鉴权密钥数据到 JSON 文件"""
-        self.auth_keys_path.parent.mkdir(parents=True, exist_ok=True)
-        self.auth_keys_path.write_text(
-            json.dumps({"items": auth_keys}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        with self.auth_keys_transaction() as items:
+            items[:] = auth_keys
+
+    @contextmanager
+    def auth_keys_transaction(self):
+        # A separate stable inode is essential: the data file is replaced on commit.
+        lock_path = self.auth_keys_path.with_suffix(self.auth_keys_path.suffix + ".lock")
+        with lock_path.open("a+b") as lock:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                items = self.load_auth_keys()
+                before = json.dumps(items, sort_keys=True)
+                yield items
+                if json.dumps(items, sort_keys=True) != before:
+                    fd, temp_path = tempfile.mkstemp(dir=self.auth_keys_path.parent, prefix=".auth-keys-")
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as target:
+                            json.dump({"items": items}, target, ensure_ascii=False, indent=2)
+                            target.write("\n")
+                            target.flush()
+                            os.fsync(target.fileno())
+                        os.replace(temp_path, self.auth_keys_path)
+                        directory_fd = os.open(self.auth_keys_path.parent, os.O_RDONLY)
+                        try:
+                            os.fsync(directory_fd)
+                        finally:
+                            os.close(directory_fd)
+                    finally:
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def health_check(self) -> dict[str, Any]:
         """健康检查"""

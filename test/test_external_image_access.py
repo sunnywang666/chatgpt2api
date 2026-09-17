@@ -56,6 +56,28 @@ class ExternalImageAccessTests(unittest.TestCase):
     def headers(self, secret=None):
         return {"Authorization": "Bearer " + (secret or self.secret_a), "X-Workbench-Image-Client": "1", "X-Forwarded-Prefix": "/ai"}
 
+    def test_narrowed_policy_preserves_own_old_receipt_download_and_read_only_resume(self):
+        body = {"client_task_id": "policy-history", "prompt": "sample", "model": "gpt-image-2"}
+        self.assertEqual(self.client.post("/api/image-tasks/generations", headers=self.headers(), json=body).status_code, 200)
+        for _ in range(100):
+            result = self.client.get("/api/image-tasks?ids=policy-history", headers=self.headers()).json()
+            if result["items"][0]["status"] == "success":
+                break
+            time.sleep(.01)
+        self.assertEqual(result["items"][0]["status"], "success")
+        self.auth.update_owned_policy("workbench:org:a", self.key_a["id"], ["codex_coding"], 1)
+        self.assertEqual(self.client.get("/api/image-tasks?ids=policy-history", headers=self.headers()).json()["items"][0]["id"], "policy-history")
+        with patch("api.image_tasks.task_image_bytes", return_value=b"image") as download:
+            self.assertEqual(self.client.get("/api/image-tasks/policy-history/images/0", headers=self.headers()).content, b"image")
+            self.assertEqual(self.client.get("/api/image-tasks/policy-history/images/0", headers=self.headers(self.secret_b)).status_code, 404)
+            self.assertEqual(download.call_count, 1)
+        self.assertEqual(self.client.post("/api/image-tasks/policy-history/resume-poll", headers=self.headers(), json={"allow_unrecoverable_retry": True}).status_code, 200)
+        self.assertEqual(self.client.post("/api/image-tasks/generations", headers=self.headers(), json={**body, "client_task_id": "new"}).status_code, 403)
+        self.assertEqual(len(self.calls), 1)
+        self.auth.revoke_owned_key("workbench:org:a", self.key_a["id"])
+        self.assertEqual(self.client.get("/api/image-tasks?ids=policy-history", headers=self.headers()).status_code, 401)
+        self.assertEqual(self.tasks.list_tasks({"id": self.key_a["id"]}, ["policy-history"])["items"][0]["status"], "success")
+
     def test_original_receipt_isolation_conflict_download_and_revocation(self):
         body = {"client_task_id": "original", "prompt": "sample", "model": "gpt-image-2"}
         self.assertEqual(self.client.post("/api/image-tasks/generations", headers=self.headers(), json=body).status_code, 200)
