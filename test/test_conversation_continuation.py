@@ -857,7 +857,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         unrelated["conversation_id"] = "unrelated-conversation"
         unrelated["mapping"].pop("request-user")
         backend._get_conversation.side_effect = [
-            unrelated, self.request_document(), self.request_document(),
+            unrelated, self.request_document(),
         ]
 
         with (
@@ -888,6 +888,13 @@ class TextResultRecoveryTests(unittest.TestCase):
             timeout_secs=10.0,
             strict_schema=True,
         )
+        self.assertEqual(backend._get_conversation.call_count, 2)
+        for call in backend._get_conversation.call_args_list:
+            self.assertGreater(call.kwargs["timeout_secs"], 0)
+            self.assertLessEqual(
+                call.kwargs["timeout_secs"],
+                ConversationBindingService.RECOVERY_SCAN_TIMEOUT_SECONDS,
+            )
 
     def test_missing_conversation_zero_or_multiple_exact_matches_are_unattributable(self):
         receipt = self.request_receipt()
@@ -946,6 +953,59 @@ class TextResultRecoveryTests(unittest.TestCase):
             TextRecoveryReason.REQUEST_PARENT_MISMATCH.value,
         )
         self.assertEqual(mismatch.exception.conversation_id, "conversation-one")
+
+    def test_missing_conversation_root_request_keeps_an_explicit_empty_parent(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        document = self.request_document()
+        document["mapping"]["request-user"]["parent"] = None
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = [
+            {"id": "conversation-one"},
+        ]
+        backend._get_conversation.return_value = document
+
+        located, located_document = (
+            ConversationBindingService._locate_text_request_conversation(
+                backend, receipt,
+            )
+        )
+        result = ConversationBindingService._read_text_request_result(
+            backend, located, document=located_document,
+        )
+
+        self.assertIn("request_parent_message_id", located)
+        self.assertEqual(located["request_parent_message_id"], "")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["content"], "original answer")
+        backend._get_conversation.assert_called_once()
+
+    def test_missing_conversation_scan_has_one_total_time_budget(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = [
+            {"id": "conversation-one"},
+        ]
+
+        with (
+            mock.patch(
+                "services.conversation_binding_service.time.monotonic",
+                side_effect=[100.0, 101.0, 121.0],
+            ),
+            self.assertRaisesRegex(TimeoutError, "time budget"),
+        ):
+            ConversationBindingService._locate_text_request_conversation(
+                backend, receipt,
+            )
+
+        backend._list_recent_conversations.assert_called_once_with(
+            limit=ConversationBindingService.RECOVERY_RECENT_CONVERSATION_LIMIT,
+            timeout_secs=10.0,
+            strict_schema=True,
+        )
+        backend._get_conversation.assert_not_called()
 
     def test_missing_conversation_lookup_failures_do_not_become_no_result_evidence(self):
         receipt = self.request_receipt()

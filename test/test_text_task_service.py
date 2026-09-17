@@ -289,7 +289,7 @@ class TextTaskTests(unittest.TestCase):
         self.assertNotIn("parent_message_id", result)
         self.assertEqual(len(self.queue.calls), 1, "recovery never resubmits upstream")
 
-    def test_exact_lookup_anchor_is_persisted_without_overwriting_an_existing_cursor(self):
+    def test_exact_root_lookup_anchor_is_persisted_for_future_reads(self):
         clock = ManualClock()
 
         def reader(_receipt):
@@ -298,7 +298,7 @@ class TextTaskTests(unittest.TestCase):
                 "binding_status": "unknown",
                 "conversation_id": "recovered-chat",
                 "parent_message_id": "original-request-node",
-                "request_parent_message_id": "prior-answer",
+                "request_parent_message_id": "",
                 "recovery_reason": "REQUEST_RESULT_NOT_FOUND",
             }
 
@@ -317,8 +317,37 @@ class TextTaskTests(unittest.TestCase):
 
         self.assertEqual(recovered["conversation_id"], "recovered-chat")
         self.assertEqual(recovered["parent_message_id"], "original-request-node")
-        self.assertEqual(recovered["request_parent_message_id"], "prior-answer")
+        self.assertIn("request_parent_message_id", recovered)
+        self.assertEqual(recovered["request_parent_message_id"], "")
         self.assertEqual(recovered["recovery_no_result_reads"], 0)
+
+    def test_missing_conversation_scan_timeout_never_qualifies_as_no_result(self):
+        clock = ManualClock()
+        service = TextTaskService(
+            self.path,
+            executor=self.queue,
+            clock=clock,
+            recovery_reader=lambda _receipt: (_ for _ in ()).throw(
+                TimeoutError("recent conversation recovery scan exceeded its time budget")
+            ),
+        )
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="paid-binding",
+            provider_account_identity="paid-account",
+        )
+        clock.advance(TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS + 1)
+
+        for _ in range(3):
+            result = service.recover("owner", "attempt-1", True)
+            clock.advance(TextTaskService.RECOVERY_MAX_BACKOFF_SECONDS + 1)
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["recovery_error_code"], "RECOVERY_READ_FAILED")
+        self.assertEqual(result.get("recovery_no_result_reads", 0), 0)
+        self.assertNotEqual(result.get("error_code"), "RESULT_UNRECOVERABLE")
 
     def test_qualified_recovery_backoff_ignores_old_attempts_but_rate_limit_does_not(self):
         clock = ManualClock()

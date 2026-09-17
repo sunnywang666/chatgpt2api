@@ -180,7 +180,9 @@ class TextTaskService:
             for key in ("conversation_id", "parent_message_id", "request_parent_message_id"):
                 value = recovered.get(key)
                 if value is not None:
-                    if not isinstance(value, str) or not value.strip():
+                    if not isinstance(value, str):
+                        return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+                    if key != "request_parent_message_id" and not value.strip():
                         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
                     anchor[key] = value
             return anchor or None, "UPSTREAM_OUTCOME_UNKNOWN", "read_text_result", cls._safe_recovery_reason(recovered.get("recovery_reason"))
