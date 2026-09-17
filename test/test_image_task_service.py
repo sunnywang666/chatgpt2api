@@ -1294,6 +1294,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
                 mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
                 mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "http://content/images/manual.png"}]}),
             ):
                 with self.assertRaisesRegex(ValueError, "original request is not a verified user message"):
                     service.adopt_latest_conversation_image(
@@ -1301,7 +1302,14 @@ class ImageTaskServiceTests(unittest.TestCase):
                         provider_account_identity="account-1", client_conversation_id="client-chat-1",
                         conversation_id="conversation-1",
                     )
-            self.assertEqual(AdoptionBackend.downloads, 0)
+                result = service.adopt_latest_conversation_image(
+                    OWNER, "policy-task", provider_binding_id="binding-1",
+                    provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                    conversation_id="conversation-1", source_request_message_id="manual-latest",
+                    source_image_message_id="latest-image",
+                )
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(AdoptionBackend.downloads, 1)
 
     def test_adoption_fetches_an_image_that_the_original_task_never_downloaded(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

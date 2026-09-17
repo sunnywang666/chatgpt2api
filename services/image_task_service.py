@@ -170,13 +170,16 @@ def _latest_completed_manual_image_turn(
     original_parent_message_id: str,
     original_task_created_ts: float,
     extract_records: Callable[[dict[str, Any], str], list[dict[str, Any]]],
+    *,
+    allow_missing_original_request: bool = False,
 ) -> tuple[str, dict[str, Any], str]:
     """Select the latest completed manual image turn on the authoritative branch.
 
-    The original request must either be on the current-node parent chain or be
-    a verified sibling of that chain at its persisted pre-send parent. A newer
-    user turn always wins; if that turn is active or has no completed image, an
-    older image is never substituted.
+    The original request must either be on the current-node parent chain or use
+    its persisted pre-send parent as a shared branch anchor. A missing edited
+    request node is accepted only when the caller also pins the exact latest
+    manual request and image nodes. A newer user turn always wins; if that turn
+    is active or has no completed image, an older image is never substituted.
     """
     if not isinstance(document, dict) or not isinstance(document.get("mapping"), dict):
         raise ConversationImageAdoptionError("conversation branch is unavailable")
@@ -199,9 +202,17 @@ def _latest_completed_manual_image_turn(
     original_node = mapping.get(original_request_message_id) or {}
     original_message = original_node.get("message") if isinstance(original_node, dict) else None
     original_author = original_message.get("author") if isinstance(original_message, dict) else None
-    if not isinstance(original_author, dict) or _clean(original_author.get("role")).lower() != "user":
+    original_request_verified = (
+        isinstance(original_author, dict)
+        and _clean(original_author.get("role")).lower() == "user"
+    )
+    if not original_request_verified and not (
+        allow_missing_original_request and original_request_message_id not in mapping
+    ):
         raise ConversationImageAdoptionError("original request is not a verified user message")
     if original_request_message_id in path:
+        if not original_request_verified:
+            raise ConversationImageAdoptionError("original request is not a verified user message")
         original_index = path.index(original_request_message_id)
     else:
         # A user may edit a later prompt in ChatGPT, moving current_node onto a
@@ -212,7 +223,10 @@ def _latest_completed_manual_image_turn(
         if (
             not original_parent_message_id
             or original_parent_message_id not in path
-            or _clean(original_node.get("parent")) != original_parent_message_id
+            or (
+                original_request_verified
+                and _clean(original_node.get("parent")) != original_parent_message_id
+            )
             or original_task_created_ts <= 0
         ):
             raise ConversationImageAdoptionError("original request is not linked to the current conversation branch")
@@ -1132,15 +1146,18 @@ class ImageTaskService:
                 document_id = _clean(document.get("conversation_id") if isinstance(document, dict) else "")
                 if document_id and document_id != conversation_id:
                     raise ConversationImageAdoptionError("conversation identity changed")
+                expected_source_request = _clean(source_request_message_id)
+                expected_source_image = _clean(source_image_message_id)
                 source_request_id, image_record, current_node = _latest_completed_manual_image_turn(
                     document,
                     original_request_message_id,
                     original_parent_message_id,
                     float(original_task_created_ts or 0),
                     backend._extract_image_tool_records,
+                    allow_missing_original_request=bool(
+                        expected_source_request and expected_source_image
+                    ),
                 )
-                expected_source_request = _clean(source_request_message_id)
-                expected_source_image = _clean(source_image_message_id)
                 if expected_source_request and source_request_id != expected_source_request:
                     raise ConversationImageAdoptionError("specified manual request is not the latest completed image turn")
                 if expected_source_image and _clean(image_record.get("message_id")) != expected_source_image:
@@ -1178,6 +1195,9 @@ class ImageTaskService:
                         original_parent_message_id,
                         float(original_task_created_ts or 0),
                         backend._extract_image_tool_records,
+                        allow_missing_original_request=bool(
+                            expected_source_request and expected_source_image
+                        ),
                     )
                 )
                 latest_tasks = backend._query_backend_tasks(
