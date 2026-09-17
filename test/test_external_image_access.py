@@ -199,6 +199,19 @@ class ExternalImageAccessTests(unittest.TestCase):
         self.assertEqual(self.client.delete("/api/workbench/ai/keys/" + result["item"]["id"], headers=trusted).status_code, 200)
         self.assertEqual(self.client.get("/api/image-tasks", headers=self.headers(result["key"])).status_code, 401)
 
+    def test_pool_read_requires_admin_and_never_exposes_account_secrets(self):
+        self.account.add_account_items([{"access_token": "private-legacy", "refresh_token": "private-refresh"}])
+        route = "/api/workbench/ai/pool/accounts"
+        self.assertEqual(self.client.get(route).status_code, 401)
+        self.assertEqual(self.client.get(route, headers={"Authorization": "Bearer " + self.secret_a, "X-Workbench-Account-Owner": "workbench:org:a"}).status_code, 403)
+        _, admin = self.auth.create_key(role="admin", name="pool-view")
+        trusted = {"Authorization": "Bearer " + admin, "X-Workbench-Account-Owner": "workbench:org:a"}
+        response = self.client.get(route, headers=trusted)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["items"]), 1)
+        self.assertNotIn("private", response.text)
+        self.assertEqual(self.client.get(route, headers=self.headers(admin)).status_code, 404)
+
     def test_foreign_session_cannot_be_submitted(self):
         response = self.client.post("/api/image-tasks/generations", headers=self.headers(), json={"client_task_id": "x", "prompt": "sample", "conversation_id": "foreign"})
         self.assertEqual(response.status_code, 400)

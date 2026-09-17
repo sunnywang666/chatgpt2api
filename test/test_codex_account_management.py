@@ -16,6 +16,27 @@ class CodexAccountManagementTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.accounts = AccountService(JSONStorageBackend(Path(self.tmp.name) / "accounts.json"))
 
+    def test_service_pool_includes_legacy_accounts_without_adopting_or_saving(self):
+        self.accounts.add_account_items([
+            {"access_token": "private-one", "refresh_token": "private-refresh", "email": "private@example.com", "source_type": "oauth_login", "limits_progress": [{"feature_name": "image_gen", "remaining": 0}]},
+            {"access_token": "private-two", "password": "private-password"},
+        ])
+        before = self.accounts.list_accounts()
+        with patch.object(self.accounts, "_save_accounts") as save, patch.object(self.accounts, "fetch_remote_info") as probe:
+            items = self.accounts.list_pool_accounts()
+        save.assert_not_called()
+        probe.assert_not_called()
+        self.assertEqual(len(items), 2)
+        self.assertEqual(self.accounts.list_owned_accounts("workbench:o:boss"), [])
+        self.assertEqual(before, self.accounts.list_accounts())
+        self.assertNotIn("private", str(items))
+        self.assertEqual(items[0]["capacity"]["remaining"], 0)
+        self.assertIsNone(items[1]["capacity"]["remaining"])
+        self.assertEqual(items[0]["source_type"], "oauth_login")
+        for item in items:
+            with self.assertRaises(KeyError):
+                self.accounts.set_owned_account_enabled("workbench:o:boss", item["id"], False)
+
     def test_import_and_projection_keep_upstream_account_identity_private(self):
         result = self.accounts.import_owned_account("workbench:o:u", {
             "access_token": "private-access", "refresh_token": "private-refresh",

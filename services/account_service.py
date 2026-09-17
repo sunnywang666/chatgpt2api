@@ -1249,6 +1249,12 @@ class AccountService:
                 result.append(account)
             return result
 
+    def list_pool_accounts(self) -> list[dict]:
+        """Read-only, secret-free snapshot. Does not adopt legacy accounts."""
+        from services.owned_accounts import public_pool_account
+        with self._lock:
+            return [public_pool_account(account, index) for index, account in enumerate(self._accounts.values(), 1)]
+
     def list_owned_accounts(self, owner: str) -> list[dict]:
         from services.owned_accounts import public_owned_account
         with self._lock:
