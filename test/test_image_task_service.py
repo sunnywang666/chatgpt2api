@@ -30,7 +30,7 @@ def write_policy_task(path: Path, **overrides):
         "provider_binding_id": "binding-1",
         "provider_account_identity": "account-1",
         "client_conversation_id": "client-chat-1",
-        "conversation_id": "conversation-1", "parent_message_id": "anchor-1",
+        "conversation_id": "conversation-1", "parent_message_id": "old-failure-assistant",
         "request_message_id": "original-request", "binding_status": "bound",
         "error_code": "content_policy_violation", "error": "original policy failure",
         "upstream_unfinished": False, "created_ts": 100.0,
@@ -1302,14 +1302,14 @@ class ImageTaskServiceTests(unittest.TestCase):
                         provider_account_identity="account-1", client_conversation_id="client-chat-1",
                         conversation_id="conversation-1",
                     )
-                result = service.adopt_latest_conversation_image(
-                    OWNER, "policy-task", provider_binding_id="binding-1",
-                    provider_account_identity="account-1", client_conversation_id="client-chat-1",
-                    conversation_id="conversation-1", source_request_message_id="manual-latest",
-                    source_image_message_id="latest-image",
-                )
-            self.assertEqual(result["status"], "success")
-            self.assertEqual(AdoptionBackend.downloads, 1)
+                with self.assertRaisesRegex(ValueError, "original request is not a verified user message"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1", source_request_message_id="manual-latest",
+                        source_image_message_id="latest-image",
+                    )
+            self.assertEqual(AdoptionBackend.downloads, 0)
 
     def test_adoption_fetches_an_image_that_the_original_task_never_downloaded(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1424,6 +1424,20 @@ class ImageTaskServiceTests(unittest.TestCase):
                     provider_account_identity="account-1", client_conversation_id="client-chat-1",
                     conversation_id="conversation-1",
                 )
+                with self.assertRaisesRegex(ValueError, "manual request does not match"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1", source_request_message_id="manual-old",
+                        source_image_message_id="latest-image",
+                    )
+                with self.assertRaisesRegex(ValueError, "image node does not match"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1", source_request_message_id="manual-latest",
+                        source_image_message_id="old-image",
+                    )
             reloaded = self.make_service(path)
             persisted = reloaded.list_tasks(OWNER, ["policy-task"])["items"][0]
             self.assertEqual(first, second)
