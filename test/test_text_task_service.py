@@ -1182,6 +1182,100 @@ class TextTaskTests(unittest.TestCase):
             self.assertEqual(review.call_count, 2)
             self.assertEqual(len(self.queue.calls), 2)
 
+    def test_http_not_started_replay_reschedules_without_another_ai_review(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        from services import content_filter
+
+        app = FastAPI()
+        app.include_router(create_router())
+        review_response = mock.Mock(status_code=200, text="ALLOW")
+        review_response.json.return_value = {
+            "choices": [{"message": {"content": "ALLOW"}}],
+        }
+        configured = {
+            **content_filter.config.data,
+            "ai_review": {
+                "enabled": True,
+                "base_url": "https://review.test",
+                "api_key": "review-test-key",
+                "model": "review-model",
+            },
+        }
+        first_queue = QueuedExecutor()
+        first_service = TextTaskService(self.path, executor=first_queue)
+        with (
+            mock.patch("api.ai.text_task_service", first_service),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token}),
+            mock.patch.object(content_filter.config, "data", configured),
+            mock.patch("services.content_filter.requests.post", return_value=review_response) as review,
+            TestClient(app) as client,
+        ):
+            first = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+        self.assertEqual(first.status_code, 200, first.text)
+        original_message_id = first.json()["request_message_id"]
+        self.assertEqual(review.call_count, 1)
+        self.assertEqual(len(first_queue.calls), 1)
+
+        restarted_queue = QueuedExecutor()
+        restarted = TextTaskService(self.path, executor=restarted_queue)
+        self.assertEqual(restarted.read("owner", "attempt-1")["status"], "not_started")
+        with (
+            mock.patch("api.ai.text_task_service", restarted),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token}),
+            mock.patch.object(content_filter.config, "data", configured),
+            mock.patch("services.content_filter.requests.post", return_value=review_response) as review,
+            TestClient(app) as client,
+        ):
+            replay = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(replay.status_code, 200, replay.text)
+            self.assertEqual(replay.json()["status"], "queued")
+            self.assertEqual(replay.json()["request_message_id"], original_message_id)
+            self.assertEqual(review.call_count, 0)
+            self.assertEqual(len(restarted_queue.calls), 1)
+
+            conflict = client.post(
+                "/api/conversation-bindings/text",
+                json={
+                    **self.body,
+                    "messages": [{"role": "user", "content": "different input"}],
+                },
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(conflict.status_code, 409, conflict.text)
+            self.assertEqual(review.call_count, 0)
+            self.assertEqual(len(restarted_queue.calls), 1)
+
+            queued = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(queued.json()["status"], "queued")
+            self.assertEqual(review.call_count, 0)
+            self.assertEqual(len(restarted_queue.calls), 1)
+
+            restarted._update(
+                "owner", "attempt-1", status="succeeded", content="done",
+            )
+            succeeded = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(succeeded.json()["status"], "succeeded")
+            self.assertEqual(review.call_count, 0)
+            self.assertEqual(len(restarted_queue.calls), 1)
+
     def test_last_user_message_has_the_saved_identity_for_text_and_gallery(self):
         from services.openai_backend_api import OpenAIBackendAPI
         backend = object.__new__(OpenAIBackendAPI)

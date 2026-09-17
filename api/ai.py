@@ -263,6 +263,10 @@ def create_router() -> APIRouter:
                     text_task_service.validate_submission, owner, payload,
                 )
                 if existing is not None:
+                    if existing.get("status") == "not_started":
+                        return await run_in_threadpool(
+                            text_task_service.submit, owner, payload,
+                        )
                     return existing
             request_preview = request_text(payload.get("messages"))
             await filter_or_log(
