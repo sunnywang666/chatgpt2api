@@ -20,6 +20,7 @@ class FakeImageTaskService:
         self.generation_calls = []
         self.edit_calls = []
         self.resume_calls = []
+        self.adoption_calls = []
 
     def submit_generation(self, identity, **kwargs):
         self.generation_calls.append((identity, kwargs))
@@ -67,6 +68,18 @@ class FakeImageTaskService:
             "mode": "generate",
             "created_at": "2026-01-01 00:00:00",
             "updated_at": "2026-01-01 00:00:00",
+        }
+
+    def adopt_latest_conversation_image(self, identity, task_id, **kwargs):
+        self.adoption_calls.append((identity, task_id, kwargs))
+        return {
+            "id": task_id,
+            "status": "success",
+            "mode": "generate",
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00",
+            "adopted_source_request_message_id": kwargs.get("source_request_message_id"),
+            "adopted_source_image_message_id": kwargs.get("source_image_message_id"),
         }
 
 
@@ -157,6 +170,43 @@ class ImageTasksApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.fake_service.resume_calls[0][1:], ("task-1", 45.0, "http://testserver", True))
+
+    def test_adopt_latest_conversation_image_forwards_exact_authority_and_source_nodes(self):
+        response = self.client.post(
+            "/api/image-tasks/policy-task/adopt-latest-conversation-image",
+            headers=AUTH_HEADERS,
+            json={
+                "provider_binding_id": "binding-1",
+                "provider_account_identity": "account-1",
+                "client_conversation_id": "client-chat-1",
+                "conversation_id": "conversation-1",
+                "source_request_message_id": "manual-latest",
+                "source_image_message_id": "latest-image",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        identity, task_id, kwargs = self.fake_service.adoption_calls[0]
+        self.assertEqual(identity["id"], "test-key")
+        self.assertEqual(task_id, "policy-task")
+        self.assertEqual(kwargs, {
+            "provider_binding_id": "binding-1",
+            "provider_account_identity": "account-1",
+            "client_conversation_id": "client-chat-1",
+            "conversation_id": "conversation-1",
+            "source_request_message_id": "manual-latest",
+            "source_image_message_id": "latest-image",
+            "base_url": "http://testserver",
+        })
+
+    def test_adopt_latest_conversation_image_requires_complete_authority(self):
+        response = self.client.post(
+            "/api/image-tasks/policy-task/adopt-latest-conversation-image",
+            headers=AUTH_HEADERS,
+            json={"provider_binding_id": "binding-1"},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.fake_service.adoption_calls, [])
 
     def test_create_edit_task_accepts_image_url(self):
         """测试图片编辑任务接口支持表单 image_url 引用。"""
