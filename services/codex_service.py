@@ -302,11 +302,17 @@ class CodexService:
         self._probe_index = 0
         self._clock = clock
 
-    @staticmethod
-    def account_projection(account: dict) -> dict:
+    @classmethod
+    def account_projection(cls, account: dict) -> dict:
         raw = account.get("codex_observation") if isinstance(account, dict) else None
         if not isinstance(raw, dict):
             raw = {}
+        rejection = account.get("codex_auth_rejection") if isinstance(account, dict) else None
+        if (isinstance(rejection, dict) and account.get("access_token")
+                and rejection.get("credential_digest") == cls._credential_digest(account)):
+            # A concurrent catalog refresh must not hide a newer rejection.
+            raw = {**raw, "state": "auth_required", "error_code": "codex_http_401",
+                   "failed_at": rejection.get("failed_at")}
         state = str(raw.get("state") or "unknown")
         if state not in {"observed", "unknown", "read_failed", "auth_required", "limited"}:
             state = "unknown"
@@ -392,12 +398,39 @@ class CodexService:
         headers["accept"] = "text/event-stream, application/json"
         return headers
 
+    @classmethod
+    def _credential_digest(cls, account: dict) -> str:
+        # Bind a rejection to the actual authorization, without storing another
+        # token copy or preventing recovery after token/account rotation.
+        headers = cls._account_headers(account)
+        value = [headers["authorization"], headers.get("chatgpt-account-id", "")]
+        return hashlib.sha256(json.dumps(value).encode()).hexdigest()
+
     def refresh_account(self, access_token: str) -> dict:
+        before = self.accounts.get_account(access_token)
         current_token = self.accounts.refresh_access_token(access_token, event="codex_observation") or access_token
         account = self.accounts.get_account(current_token)
         if account is None:
             raise KeyError("account not found")
         previous = self.account_projection(account)
+        rejection = account.get("codex_auth_rejection")
+        if not isinstance(rejection, dict):
+            rejection = {}
+        # Legacy 401s did not record the rejected credential. Do not invent a
+        # fingerprint from today's token. Only a witnessed rotation or a token
+        # issued after that failure establishes that this is new authorization.
+        legacy_rejection = not rejection and previous["error_code"] == "codex_http_401"
+        if legacy_rejection:
+            changed = before and self._credential_digest(before) != self._credential_digest(account)
+            failed_at = _parse_iso(previous["failed_at"])
+            try:
+                part = current_token.split(".")[1]
+                issued_at = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("iat")
+                changed = changed or (failed_at is not None and isinstance(issued_at, (int, float))
+                                      and not isinstance(issued_at, bool) and issued_at > failed_at.timestamp())
+            except (IndexError, ValueError, TypeError, AttributeError):
+                pass
+            legacy_rejection = not changed
         observed_at = _utc_now()
         models: list[dict] | None = None
         limits: list[dict] | None = None
@@ -456,8 +489,16 @@ class CodexService:
                 "limits": limits or [],
                 "error_code": None,
             }
-        self.accounts.update_account(current_token, {"codex_observation": observation}, quiet=True)
-        return self.account_projection({"codex_observation": observation})
+        if rejection.get("credential_digest") == self._credential_digest(account):
+            # Catalog/usage reads do not prove permission to execute Responses.
+            observation.update(state="auth_required", error_code="codex_http_401",
+                               failed_at=rejection.get("failed_at"))
+        elif legacy_rejection:
+            observation.update(state="auth_required", error_code="codex_http_401",
+                               failed_at=previous["failed_at"])
+        self.accounts.update_account(current_token, {"codex_observation": observation}, quiet=True,
+                                     expected_credentials=self._credential_fields(account))
+        return self.account_projection(self.accounts.get_account(current_token) or {"codex_observation": observation})
 
     def _observation_fresh(self, projection: dict) -> bool:
         observed_at = _parse_iso(projection.get("observed_at"))
@@ -694,13 +735,24 @@ class CodexService:
         if not self._capacity.acquire(blocking=False):
             raise CodexServiceError(429, "codex_busy", "Codex request capacity is busy")
 
-    def _mark_observation_state(self, token: str, state: str, error_code: str) -> None:
+    @staticmethod
+    def _credential_fields(account: dict) -> tuple[str, str]:
+        return str(account.get("access_token") or ""), str(account.get("account_id") or "")
+
+    def _mark_observation_state(self, token: str, state: str, error_code: str, request_account: dict, request_digest: str) -> None:
         account = self.accounts.get_account(token)
         if not account:
             return
         projection = self.account_projection(account)
         projection.update(state=state, failed_at=_utc_now(), error_code=error_code)
-        self.accounts.update_account(token, {"codex_observation": projection}, quiet=True)
+        updates = {"codex_observation": projection}
+        if error_code == "codex_http_401":
+            updates["codex_auth_rejection"] = {
+                "credential_digest": request_digest,
+                "failed_at": projection["failed_at"],
+            }
+        self.accounts.update_account(token, updates, quiet=True,
+                                     expected_credentials=self._credential_fields(request_account))
 
     def _safe_upstream_error(
         self,
@@ -709,17 +761,19 @@ class CodexService:
         affinity: str,
         *,
         post: bool,
+        request_account: dict,
+        request_digest: str,
     ) -> CodexServiceError:
         try:
             if status == 429:
-                self._mark_observation_state(token, "limited", "codex_http_429")
+                self._mark_observation_state(token, "limited", "codex_http_429", request_account, request_digest)
             elif status == 401:
-                self._mark_observation_state(token, "auth_required", f"codex_http_{status}")
+                self._mark_observation_state(token, "auth_required", f"codex_http_{status}", request_account, request_digest)
             elif status == 403:
                 # A permission/policy rejection does not establish that the
                 # credential expired. Keep the account unavailable without
                 # recommending token rotation or replaying the request.
-                self._mark_observation_state(token, "read_failed", "codex_http_403")
+                self._mark_observation_state(token, "read_failed", "codex_http_403", request_account, request_digest)
         except Exception:
             pass
         # A timeout response does not prove that the non-idempotent POST was
@@ -749,6 +803,7 @@ class CodexService:
             account, token, affinity = self._select_account(
                 identity, forwarded_headers, bind_session=False
             )
+            request_digest = self._credential_digest(account)
             session = self._session(account)
             response = session.get(
                 CODEX_MODELS_URL,
@@ -757,7 +812,8 @@ class CodexService:
                 allow_redirects=False,
             )
             if response.status_code != 200:
-                raise self._safe_upstream_error(response.status_code, token, affinity, post=False)
+                raise self._safe_upstream_error(response.status_code, token, affinity, post=False,
+                                                request_account=account, request_digest=request_digest)
             body = bytes(response.content)
             if len(body) > 4 * 1024 * 1024:
                 raise CodexServiceError(502, "codex_response_too_large", "The Codex model catalog is too large")
@@ -909,6 +965,7 @@ class CodexService:
         try:
             account, token, affinity = self._select_account(identity, forwarded_headers, payload)
             headers = self._account_headers(account, forwarded_headers)
+            request_digest = self._credential_digest(account)
             headers["content-type"] = "application/json"
             session = self._session(account)
             # From this point a transport error is an unknown POST outcome.  It
@@ -930,7 +987,8 @@ class CodexService:
                     response.close()
                 except Exception:
                     pass
-                raise self._safe_upstream_error(response.status_code, token, affinity, post=True)
+                raise self._safe_upstream_error(response.status_code, token, affinity, post=True,
+                                                request_account=account, request_digest=request_digest)
             headers_out = _response_headers(response.headers)
             content_type = headers_out.get("content-type", "").lower()
             if "text/event-stream" in content_type:
