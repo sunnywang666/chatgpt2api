@@ -1446,6 +1446,54 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(AdoptionBackend.reads, 2)
             self.assertEqual(AdoptionBackend.downloads, 1)
 
+    def test_adoption_save_failure_restores_the_original_receipt_before_retry(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            AdoptionBackend.document = manual_image_document()
+            AdoptionBackend.reads = AdoptionBackend.downloads = 0
+            AdoptionBackend.resolved = []
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "http://content/images/manual.png"}]}),
+            ):
+                with mock.patch.object(service, "_save_locked", side_effect=OSError("disk full")):
+                    with self.assertRaisesRegex(ValueError, "could not be verified"):
+                        service.adopt_latest_conversation_image(
+                            OWNER, "policy-task", provider_binding_id="binding-1",
+                            provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                            conversation_id="conversation-1",
+                        )
+
+                in_memory = service.list_tasks(OWNER, ["policy-task"])["items"][0]
+                self.assertEqual(in_memory["status"], "error")
+                self.assertEqual(in_memory["error_code"], "content_policy_violation")
+                self.assertEqual(in_memory["error"], "original policy failure")
+                self.assertNotIn("adopted_source_request_message_id", in_memory)
+
+                reloaded = self.make_service(path)
+                on_disk = reloaded.list_tasks(OWNER, ["policy-task"])["items"][0]
+                self.assertEqual(on_disk["status"], "error")
+                self.assertEqual(on_disk["error_code"], "content_policy_violation")
+                self.assertEqual(on_disk["error"], "original policy failure")
+                self.assertNotIn("adopted_source_request_message_id", on_disk)
+
+                recovered = service.adopt_latest_conversation_image(
+                    OWNER, "policy-task", provider_binding_id="binding-1",
+                    provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                    conversation_id="conversation-1",
+                )
+
+            self.assertEqual(recovered["status"], "success")
+            self.assertEqual(recovered["adopted_source_request_message_id"], "manual-latest")
+            self.assertEqual(AdoptionBackend.reads, 4)
+            self.assertEqual(AdoptionBackend.downloads, 2)
+            self.assertEqual(len(AdoptionBackend.resolved), 2)
+
     def test_adoption_is_idempotent_and_a_restart_preserves_its_provenance(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"

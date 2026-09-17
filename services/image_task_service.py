@@ -1252,24 +1252,30 @@ class ImageTaskService:
                     or current_identity != supplied_identity
                 ):
                     raise ConversationImageAdoptionError("original task changed during image adoption")
-                current.update({
-                    "status": TASK_STATUS_SUCCESS,
-                    "data": data,
-                    "error": "",
-                    "error_code": "",
-                    "binding_status": "bound",
-                    "parent_message_id": current_node,
-                    "upstream_unfinished": False,
-                    "next_poll_at": 0,
-                    "adopted_source_request_message_id": source_request_id,
-                    "adopted_source_image_message_id": _clean(image_record.get("message_id")),
-                    "adopted_from_error_code": original_error_code,
-                    "adopted_from_error": original_error,
-                    "adopted_at": _now_iso(),
-                    "updated_at": _now_iso(),
-                    "updated_ts": time.time(),
-                })
-                self._save_locked()
+                snapshot = dict(current)
+                try:
+                    current.update({
+                        "status": TASK_STATUS_SUCCESS,
+                        "data": data,
+                        "error": "",
+                        "error_code": "",
+                        "binding_status": "bound",
+                        "parent_message_id": current_node,
+                        "upstream_unfinished": False,
+                        "next_poll_at": 0,
+                        "adopted_source_request_message_id": source_request_id,
+                        "adopted_source_image_message_id": _clean(image_record.get("message_id")),
+                        "adopted_from_error_code": original_error_code,
+                        "adopted_from_error": original_error,
+                        "adopted_at": _now_iso(),
+                        "updated_at": _now_iso(),
+                        "updated_ts": time.time(),
+                    })
+                    self._save_locked()
+                except Exception:
+                    current.clear()
+                    current.update(snapshot)
+                    raise
                 self._slot_condition.notify_all()
                 return _public_task(current)
         except ConversationImageAdoptionError:
