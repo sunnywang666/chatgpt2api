@@ -1212,6 +1212,8 @@ class OpenAIBackendAPI:
                     raise RuntimeError("recent conversations response has an invalid conversation list")
                 return []
             if strict_schema:
+                if len(items) > limit:
+                    raise RuntimeError("recent conversations response exceeds the requested limit")
                 for item in items:
                     if not isinstance(item, dict):
                         raise RuntimeError("recent conversations response contains an invalid conversation")

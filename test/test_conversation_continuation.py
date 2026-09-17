@@ -843,6 +843,27 @@ class TextResultRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "without an id"):
             backend._list_recent_conversations(strict_schema=True)
 
+        response.json = lambda: {
+            "items": [{"id": f"conversation-{index}"} for index in range(21)],
+        }
+        with self.assertRaisesRegex(RuntimeError, "exceeds the requested limit"):
+            backend._list_recent_conversations(limit=20, strict_schema=True)
+
+    def test_oversized_recent_conversation_response_reads_no_details(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        backend = mock.Mock()
+        backend._list_recent_conversations.side_effect = RuntimeError(
+            "recent conversations response exceeds the requested limit",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requested limit"):
+            ConversationBindingService._locate_text_request_conversation(
+                backend, receipt,
+            )
+
+        backend._get_conversation.assert_not_called()
+
     def test_missing_conversation_is_recovered_only_by_one_exact_request_node(self):
         service = ConversationBindingService()
         receipt = self.request_receipt()

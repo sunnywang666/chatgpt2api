@@ -349,6 +349,34 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(result.get("recovery_no_result_reads", 0), 0)
         self.assertNotEqual(result.get("error_code"), "RESULT_UNRECOVERABLE")
 
+    def test_oversized_recent_response_never_qualifies_as_no_result(self):
+        clock = ManualClock()
+        service = TextTaskService(
+            self.path,
+            executor=self.queue,
+            clock=clock,
+            recovery_reader=lambda _receipt: (_ for _ in ()).throw(
+                RuntimeError("recent conversations response exceeds the requested limit")
+            ),
+        )
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="paid-binding",
+            provider_account_identity="paid-account",
+        )
+        clock.advance(TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS + 1)
+
+        for _ in range(3):
+            result = service.recover("owner", "attempt-1", True)
+            clock.advance(TextTaskService.RECOVERY_MAX_BACKOFF_SECONDS + 1)
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["recovery_error_code"], "RECOVERY_READ_FAILED")
+        self.assertEqual(result.get("recovery_no_result_reads", 0), 0)
+        self.assertNotEqual(result.get("error_code"), "RESULT_UNRECOVERABLE")
+
     def test_qualified_recovery_backoff_ignores_old_attempts_but_rate_limit_does_not(self):
         clock = ManualClock()
 
