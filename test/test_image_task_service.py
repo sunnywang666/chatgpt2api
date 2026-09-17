@@ -47,7 +47,7 @@ def manual_image_document(*, latest_active=False, divergent=False, broken=False)
         },
         "original-request": {
             "parent": "anchor-1",
-            "message": {"author": {"role": "user"}, "create_time": 100.0},
+            "message": {"id": "original-request", "author": {"role": "user"}, "create_time": 100.0},
         },
         "policy-result": {
             "parent": "original-request",
@@ -1374,8 +1374,11 @@ class ImageTaskServiceTests(unittest.TestCase):
             backend.assert_not_called()
 
     def test_adoption_rejects_broken_or_nonlatest_source_nodes(self):
+        mismatched_original_id = manual_image_document()
+        mismatched_original_id["mapping"]["original-request"]["message"]["id"] = "different-request"
         for document, source_request, source_image, message in (
             (manual_image_document(broken=True), "", "", "conversation branch is invalid"),
+            (mismatched_original_id, "", "", "original request is not a verified user message"),
             (manual_image_document(), "manual-old", "old-image", "specified manual request is not the latest"),
             (manual_image_document(), "manual-latest", "old-image", "specified image node is not the latest"),
         ):
@@ -1399,6 +1402,49 @@ class ImageTaskServiceTests(unittest.TestCase):
                             source_image_message_id=source_image,
                         )
                 self.assertEqual(AdoptionBackend.downloads, 0)
+
+    def test_concurrent_adoption_cannot_return_a_different_source_image(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            AdoptionBackend.document = manual_image_document()
+            AdoptionBackend.reads = AdoptionBackend.downloads = 0
+
+            def concurrent_adoption(*_args, **_kwargs):
+                with service._lock:
+                    task = service._tasks["owner-1:policy-task"]
+                    task.update({
+                        "status": "success",
+                        "data": [{"url": "http://content/images/other.png"}],
+                        "adopted_source_request_message_id": "other-manual-request",
+                        "adopted_source_image_message_id": "other-image-node",
+                        "error": "",
+                        "error_code": "",
+                    })
+                    service._save_locked()
+                return {"data": [{"url": "http://content/images/manual.png"}]}
+
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                mock.patch("services.protocol.conversation.format_image_result", side_effect=concurrent_adoption),
+            ):
+                with self.assertRaisesRegex(ValueError, "concurrently adopted from a different"):
+                    service.adopt_latest_conversation_image(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        conversation_id="conversation-1",
+                    )
+
+            stored = service.list_tasks(OWNER, ["policy-task"])["items"][0]
+            self.assertEqual(stored["adopted_source_request_message_id"], "other-manual-request")
+            self.assertEqual(stored["adopted_source_image_message_id"], "other-image-node")
+            self.assertEqual(stored["data"], [{"url": "http://content/images/other.png"}])
+            self.assertEqual(AdoptionBackend.reads, 2)
+            self.assertEqual(AdoptionBackend.downloads, 1)
 
     def test_adoption_is_idempotent_and_a_restart_preserves_its_provenance(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

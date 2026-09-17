@@ -200,7 +200,9 @@ def _latest_completed_manual_image_turn(
     original_message = original_node.get("message") if isinstance(original_node, dict) else None
     original_author = original_message.get("author") if isinstance(original_message, dict) else None
     original_request_verified = (
-        isinstance(original_author, dict)
+        isinstance(original_message, dict)
+        and _clean(original_message.get("id")) == original_request_message_id
+        and isinstance(original_author, dict)
         and _clean(original_author.get("role")).lower() == "user"
     )
     if not original_request_verified:
@@ -1227,7 +1229,16 @@ class ImageTaskService:
                 if current is None:
                     raise ConversationImageAdoptionError("task not found")
                 if current.get("status") == TASK_STATUS_SUCCESS and current.get("adopted_source_request_message_id"):
-                    return _public_task(current)
+                    if (
+                        _clean(current.get("adopted_source_request_message_id"))
+                        == source_request_id
+                        and _clean(current.get("adopted_source_image_message_id"))
+                        == _clean(image_record.get("message_id"))
+                    ):
+                        return _public_task(current)
+                    raise ConversationImageAdoptionError(
+                        "task was concurrently adopted from a different conversation image"
+                    )
                 current_identity = tuple(_clean(current.get(field)) for field in (
                     "provider_binding_id",
                     "provider_account_identity",
