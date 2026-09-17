@@ -270,6 +270,19 @@ def test_persisted_text_receipt_owner_survives_narrowing_but_not_revocation(runt
 
 
 @pytest.mark.parametrize("routes", [["chat"], ["codex"], ["chat", "codex"]])
+def test_chat_model_discovery_checks_endpoint_before_account_read(runtime, monkeypatch, routes):
+    auth, client, *_ = runtime
+    _, headers = key(auth, routes)
+    read = Mock(return_value={"data": [{"id": "gpt-image-2"}]})
+    monkeypatch.setattr(ai.openai_v1_models, "list_models", read)
+    result = client.get("/v1/models", headers=headers)
+    assert result.status_code == (200 if "chat" in routes else 403)
+    assert read.call_count == int("chat" in routes)
+    if "chat" not in routes:
+        assert result.json()["detail"]["code"] == "KEY_ROUTE_DENIED"
+
+
+@pytest.mark.parametrize("routes", [["chat"], ["codex"], ["chat", "codex"]])
 def test_codex_model_discovery_checks_endpoint_before_account_read(runtime, monkeypatch, routes):
     auth, client, *_ = runtime
     _, headers = key(auth, routes)

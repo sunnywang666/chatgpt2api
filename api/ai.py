@@ -119,7 +119,8 @@ def create_router() -> APIRouter:
 
     @router.get("/v1/models")
     async def list_models(request: Request, authorization: str | None = Header(default=None)):
-        require_identity(authorization)
+        identity = require_identity(authorization)
+        require_chat_text_policy(identity)
         try:
             result = await run_in_threadpool(openai_v1_models.list_models)
             if is_external(request):
