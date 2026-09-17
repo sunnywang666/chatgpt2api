@@ -1118,11 +1118,15 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response
 
-    def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
+    def _get_conversation(
+        self,
+        conversation_id: str,
+        timeout_secs: float = 60.0,
+    ) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    timeout=timeout_secs)
         ensure_ok(response, path)
         return response.json()
 
@@ -1168,7 +1172,12 @@ class OpenAIBackendAPI:
         ensure_ok(response, path)
         return response.json()
 
-    def _list_recent_conversations(self, limit: int = 5, timeout_secs: float = 10.0) -> list[Dict[str, Any]]:
+    def _list_recent_conversations(
+        self,
+        limit: int = 5,
+        timeout_secs: float = 10.0,
+        strict_schema: bool = False,
+    ) -> list[Dict[str, Any]]:
         """列出最近的对话列表，按更新时间倒序。
 
         当 SSE 流太短导致 conversation_id 丢失时，可以通过此方法
@@ -1183,9 +1192,39 @@ class OpenAIBackendAPI:
             )
             ensure_ok(response, path)
             data = response.json()
-            return data.get("items") or data.get("conversations") or []
+            if not strict_schema:
+                if not isinstance(data, dict):
+                    return []
+                items = data.get("items") or data.get("conversations") or []
+                return items if isinstance(items, list) else []
+            if strict_schema and not isinstance(data, dict):
+                raise RuntimeError("recent conversations response is not an object")
+            if isinstance(data, dict) and "items" in data:
+                items = data["items"]
+            elif isinstance(data, dict) and "conversations" in data:
+                items = data["conversations"]
+            else:
+                if strict_schema:
+                    raise RuntimeError("recent conversations response is missing the conversation list")
+                return []
+            if not isinstance(items, list):
+                if strict_schema:
+                    raise RuntimeError("recent conversations response has an invalid conversation list")
+                return []
+            if strict_schema:
+                if len(items) > limit:
+                    raise RuntimeError("recent conversations response exceeds the requested limit")
+                for item in items:
+                    if not isinstance(item, dict):
+                        raise RuntimeError("recent conversations response contains an invalid conversation")
+                    conversation_id = item.get("id") or item.get("conversation_id")
+                    if not isinstance(conversation_id, str) or not conversation_id.strip():
+                        raise RuntimeError("recent conversations response contains a conversation without an id")
+            return items
         except Exception as exc:
             logger.debug({"event": "list_conversations_failed", "error": str(exc)})
+            if strict_schema:
+                raise
             return []
 
     def find_conversation_by_prompt(self, prompt: str, started_at: float, timeout_secs: float = 10.0) -> str:

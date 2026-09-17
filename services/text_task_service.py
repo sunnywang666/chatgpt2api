@@ -88,8 +88,10 @@ class TextTaskService:
     })
     _SUCCESS_RECOVERY_FIELDS = frozenset({
         # Binding and conversation identity stay rooted in the original
-        # receipt. Only the recovered answer/cursor may advance.
-        "content", "parent_message_id", "binding_status",
+        # receipt unless the original receipt never captured a conversation.
+        # Only an exact-account request lookup may fill that missing anchor.
+        "content", "conversation_id", "parent_message_id",
+        "request_parent_message_id", "binding_status",
     })
     _SAFE_RECOVERY_REASONS = frozenset(reason.value for reason in TextRecoveryReason)
     _UNRECOVERABLE_REASONS = frozenset({
@@ -98,6 +100,7 @@ class TextTaskService:
         TextRecoveryReason.REQUEST_BRANCH_SUPERSEDED.value,
         TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value,
         TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
+        TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
     })
     _VALID_CONVERSATION_REASONS = frozenset({
         TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
@@ -173,7 +176,16 @@ class TextTaskService:
                 return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
             return {key: recovered[key] for key in cls._SUCCESS_RECOVERY_FIELDS if key in recovered}, None, None, None
         if status in {"running", "unknown"}:
-            return None, "UPSTREAM_OUTCOME_UNKNOWN", "read_text_result", cls._safe_recovery_reason(recovered.get("recovery_reason"))
+            anchor = {}
+            for key in ("conversation_id", "parent_message_id", "request_parent_message_id"):
+                value = recovered.get(key)
+                if value is not None:
+                    if not isinstance(value, str):
+                        return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+                    if key != "request_parent_message_id" and not value.strip():
+                        return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+                    anchor[key] = value
+            return anchor or None, "UPSTREAM_OUTCOME_UNKNOWN", "read_text_result", cls._safe_recovery_reason(recovered.get("recovery_reason"))
         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
 
     def _finish_recovery(
@@ -204,7 +216,10 @@ class TextTaskService:
                 )
                 if qualified_read_recorded:
                     qualified_reads += 1
-                if recovery_reason == TextRecoveryReason.CONVERSATION_NOT_FOUND.value:
+                if recovery_reason in {
+                    TextRecoveryReason.CONVERSATION_NOT_FOUND.value,
+                    TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+                }:
                     requires_new_conversation = True
                 elif recovery_reason in self._VALID_CONVERSATION_REASONS:
                     requires_new_conversation = False
@@ -212,7 +227,13 @@ class TextTaskService:
                     requires_new_conversation = bool(
                         current.get("recovery_requires_new_conversation")
                     )
+                recovered_anchor = {
+                    key: value for key, value in (recovered or {}).items()
+                    if key in {"conversation_id", "parent_message_id", "request_parent_message_id"}
+                    and not current.get(key)
+                }
                 changes = {
+                    **recovered_anchor,
                     "recovery_next_at": now + self._recovery_backoff(
                         qualified_reads if qualified_read_recorded else attempt
                     ),
@@ -276,8 +297,11 @@ class TextTaskService:
                     previous = {**previous, "status": "unknown", "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "updated_at": now}
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
-                if (previous["status"] == "unknown" and previous.get("conversation_id")
-                        and previous.get("request_message_id") and self._recovery_due(previous, now)):
+                if (previous["status"] == "unknown"
+                        and previous.get("request_message_id")
+                        and previous.get("provider_binding_id")
+                        and previous.get("provider_account_identity")
+                        and self._recovery_due(previous, now)):
                     attempt = int(previous.get("recovery_attempt", 0)) + 1
                     claim_id = uuid.uuid4().hex
                     recovery_claim = claim_id, {
