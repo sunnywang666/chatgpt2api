@@ -1378,7 +1378,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         self.assertEqual(generation.call_count, 1)
         backend._get_conversation.assert_called_once_with("conversation-one")
 
-    def test_get_route_authenticates_then_reads_the_same_bound_account(self):
+    def test_admin_cursor_route_reads_the_same_bound_account(self):
         from fastapi import FastAPI, HTTPException
         from fastapi.testclient import TestClient
         from api.ai import create_router
@@ -1387,7 +1387,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         backend = mock.Mock()
         backend._get_conversation.return_value = self.document()
         with (
-            mock.patch("api.ai.require_identity", return_value={}) as identity,
+            mock.patch("api.ai.require_identity", return_value={"id": "admin", "role": "admin"}) as identity,
             mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
             mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
             mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),

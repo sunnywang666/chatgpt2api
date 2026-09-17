@@ -226,7 +226,12 @@ def create_router() -> APIRouter:
             client_conversation_id: str, conversation_id: str, parent_message_id: str,
             authorization: str | None = Header(default=None),
     ):
-        require_identity(authorization)
+        identity = require_identity(authorization)
+        # Legacy direct cursors have no persisted caller ownership. Only the
+        # existing trusted Content/admin path may use them; ordinary callers
+        # read their owner-scoped durable text-request receipt below.
+        if identity.get("role") != "admin":
+            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND"})
         try:
             return await run_in_threadpool(conversation_binding_service.read_text, {
                 "provider_binding_id": provider_binding_id,

@@ -21,7 +21,7 @@ JSON 使用同路径文件锁与原子替换；SQL 使用事务（SQLite 写锁�
 [{"id":"<confirmed-existing-key-id>","capabilities":["chat_image"],"legacy_text_compatibility":[{"endpoint":"/v1/chat/completions","models":["<observed-model>"]}]}]
 ```
 
-`python scripts/reconcile_program_keys.py --assignments <reviewed-file>` 默认只读核对；必须一次覆盖全部启用且无政策的普通密钥，集合变化即失败。`--apply` 才写入。用户在界面修改用途会移除该密钥的历史文本例外；页面提前提示。缩小用途仍允许读取原有且同 owner 的任务/文件/回执，不重新生成，撤销则禁止全部调用。
+`python scripts/reconcile_program_keys.py --assignments <reviewed-file>` 默认只读核对；必须一次覆盖全部启用且无政策的普通密钥，集合变化即失败。`--apply` 才写入。用户在界面修改用途会移除该密钥的历史文本例外；页面提前提示。缩小用途仍允许读取原有且同 owner 的任务/文件/回执，不重新生成，撤销则禁止全部调用。旧 `GET /api/conversation-bindings/text` 的直接 cursor 没有持久调用方归属，仅保留现有 admin/Content 路径；普通密钥使用按 key ID 归属的 `/api/conversation-bindings/text-requests/{request_id}` 及原回执恢复，不能凭他人的 cursor 取得文本。
 
 正式切换遵循 Workbench 当前 `docs/runbooks/DEPLOYMENT_AND_ROLLBACK_P0_1.md`、唯一发布负责人及精确镜像 digest：先保存密钥存储与现役版本回退点，停止旧 Provider 写入者，使用已核对的完整映射迁移原记录，启动新 Provider 后发布兼容 BFF/页面，再独立读回。不得修改账号/任务正本或重建未变服务；生产预检还需验证镜像 Python 3.13 运行态。回退必须先停止新写入者，核对切换期间新增/修改/撤销的密钥，禁止盲目覆盖旧快照导致已撤销密钥复活。任何未知结果先读回，不重复迁移。
 

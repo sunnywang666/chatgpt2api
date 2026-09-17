@@ -196,3 +196,58 @@ def test_conversation_archive_is_an_upstream_write_not_read_recovery(runtime, mo
     _, admin = auth.create_key(role="admin")
     assert client.post("/api/conversation-bindings/archive", headers={"Authorization": "Bearer " + admin}, json=body).status_code == 200
     archive.assert_called_once_with(body)
+
+
+@pytest.mark.parametrize("caps", [["chat_image"], ["codex_coding"]])
+def test_ordinary_key_cannot_read_unowned_legacy_text_cursor(runtime, monkeypatch, caps):
+    auth, client, *_ = runtime
+    item, headers = key(auth, caps)
+    read = Mock(return_value={"content": "another caller's private text"})
+    monkeypatch.setattr(ai.conversation_binding_service, "read_text", read)
+    cursor = {name: "foreign-cursor" for name in ("provider_binding_id", "provider_account_identity",
+              "client_conversation_id", "conversation_id", "parent_message_id")}
+    response = client.get("/api/conversation-bindings/text", headers=headers, params=cursor)
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "TASK_NOT_FOUND"
+    read.assert_not_called()
+    auth.revoke_owned_key("workbench:company:user", item["id"])
+    assert client.get("/api/conversation-bindings/text", headers=headers, params=cursor).status_code == 401
+    read.assert_not_called()
+
+
+def test_persisted_text_receipt_owner_survives_narrowing_but_not_revocation(runtime, monkeypatch, tmp_path):
+    from services.text_task_service import TextTaskService
+    auth, client, *_ = runtime
+    item, headers = key(auth, ["chat_image", "codex_coding"])
+    _, foreign = key(auth, ["codex_coding"])
+    # Seed an already accepted historical receipt through the actual service;
+    # no new Chat-text capability is opened and no upstream is called.
+    class ImmediateExecutor:
+        def submit(self, function, *args):
+            function(*args)
+    completed = Mock(return_value={"content": "private historical result", "conversation_id": "chat", "parent_message_id": "answer"})
+    path = tmp_path / "text-receipts.sqlite3"
+    service = TextTaskService(path, completed, ImmediateExecutor())
+    body = {"client_request_id": "saved-text", "client_conversation_id": "original",
+            "messages": [{"role": "user", "content": "historical"}]}
+    service.submit(item["id"], body)
+    completed.assert_called_once()
+    auth.update_owned_policy("workbench:company:user", item["id"], ["codex_coding"], 1)
+    upstream_read = Mock(side_effect=AssertionError("must not read another caller's Provider conversation"))
+    monkeypatch.setattr(ai.conversation_binding_service, "read_text", upstream_read)
+    monkeypatch.setattr(ai, "text_task_service", TextTaskService(path, completed, ImmediateExecutor()))
+    route = "/api/conversation-bindings/text-requests/saved-text"
+    response = client.get(route, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["content"] == "private historical result"
+    other = client.get(route, headers=foreign)
+    assert other.json()["status"] == "not_found"
+    assert "private historical result" not in other.text
+    recovery = client.post(route + "/recover", headers=foreign, json={"allow_unrecoverable_retry": True})
+    assert recovery.json()["status"] == "not_found"
+    upstream_read.assert_not_called()
+    completed.assert_called_once()
+    auth.revoke_owned_key("workbench:company:user", item["id"])
+    assert client.get(route, headers=headers).status_code == 401
+    assert client.post(route + "/recover", headers=headers, json={"allow_unrecoverable_retry": True}).status_code == 401
+    upstream_read.assert_not_called()
