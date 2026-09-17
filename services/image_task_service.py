@@ -14,6 +14,7 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from utils.helper import is_codex_image_model
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -397,6 +398,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     ):
         if task.get(field):
             item[field] = task.get(field)
+    if isinstance(task.get("upstream_submission_started"), bool):
+        item["upstream_submission_started"] = task["upstream_submission_started"]
     if task.get("recovery_no_result_reads"):
         item["recovery_no_result_reads"] = task.get("recovery_no_result_reads")
     if _clean(task.get("error_code")) == "RESULT_UNRECOVERABLE":
@@ -692,6 +695,19 @@ class ImageTaskService:
                     self._slot_condition.wait(timeout=1)
                 self._update_task(key, upstream_unfinished=True)
         started = time.time()
+        # Shared external routes can swap handlers and therefore do not infer
+        # coverage from their normalized payload. Their receipt changes only
+        # when the active bound-Chat attempt propagates an explicit marker.
+        submission_boundary_covered = (
+            not bool(identity.get("external_image_client"))
+            and bool(_clean(payload.get("provider_binding_id")))
+            and bool(_clean(payload.get("provider_account_identity")))
+            and bool(_clean(payload.get("client_conversation_id")))
+            and bool(payload.get("retain_conversation"))
+            and not is_codex_image_model(model)
+        )
+        if submission_boundary_covered:
+            self._update_task(key, upstream_submission_started=False)
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
         with self._lock:
             task = self._tasks.get(key) or {}
@@ -711,6 +727,10 @@ class ImageTaskService:
             if conversation_id:
                 self._update_task(key, conversation_id=conversation_id)
         progress_callback.record_conversation_id = record_conversation_id
+
+        def record_submission_started() -> None:
+            self._update_task(key, upstream_submission_started=True)
+        progress_callback.record_submission_started = record_submission_started
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
@@ -786,20 +806,41 @@ class ImageTaskService:
             parent_message_id = _clean(getattr(exc, "parent_message_id", ""))
             request_message_id = _clean(getattr(exc, "request_message_id", ""))
             error_code = _clean(getattr(exc, "code", ""))
+            upstream_submitted = getattr(exc, "upstream_submitted", None)
+            known_not_submitted = upstream_submitted is False
+            retryable_not_submitted = (
+                known_not_submitted and error_code == "IMAGE_GENERATION_NOT_SUBMITTED"
+            )
             # Only explicit terminal rejections prove there is no generation
             # left upstream. An unclassified transport exception does not.
             terminal = error_code.lower() in {
                 "no_image_generated", "content_policy_violation",
                 "conversation_binding_contract_invalid",
             }
-            if identity.get("external_image_client") and getattr(exc, "upstream_submitted", None) is False:
+            if known_not_submitted:
                 terminal = True
+            if retryable_not_submitted:
+                error_code = "RESULT_UNRECOVERABLE"
             if account and not terminal:
                 error_code = "CONVERSATION_OUTCOME_UNKNOWN"
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
                               upstream_unfinished=bool(account) and not terminal,
+                              **(
+                                  {
+                                      "upstream_submission_started": False,
+                                      "upstream_outcome": "not_submitted",
+                                      **(
+                                          {
+                                              "recovery_retryable": True,
+                                              "recovery_requires_new_conversation": False,
+                                          }
+                                          if retryable_not_submitted else {}
+                                      ),
+                                  }
+                                  if known_not_submitted else {}
+                              ),
                               **({"provider_binding_id": provider_binding_id} if provider_binding_id else {}),
                               **({"provider_account_identity": provider_account_identity} if provider_account_identity else {}),
                               **({"conversation_id": conversation_id} if conversation_id else {}),
@@ -933,6 +974,11 @@ class ImageTaskService:
                 "error_code": _clean(item.get("error_code")),
                 "request_hash": _clean(item.get("request_hash")),
                 "upstream_unfinished": _holds_upstream_slot(item),
+                "upstream_submission_started": (
+                    item.get("upstream_submission_started")
+                    if isinstance(item.get("upstream_submission_started"), bool)
+                    else None
+                ),
                 "admission_recorded": item.get("admission_recorded") is True,
                 "retain_receipt": item.get("retain_receipt") is True,
                 "next_poll_at": item.get("next_poll_at", 0),
@@ -982,14 +1028,28 @@ class ImageTaskService:
         changed = False
         for task in self._tasks.values():
             if task.get("status") in UNFINISHED_STATUSES:
+                known_not_submitted = task.get("upstream_submission_started") is False
                 not_started = (task.get("status") == TASK_STATUS_QUEUED
                                and task.get("admission_recorded") is True
                                and task.get("upstream_unfinished") is False)
                 task["status"] = TASK_STATUS_ERROR
                 task["error"] = "服务已重启，未完成的图片任务已中断"
-                task["error_code"] = "IMAGE_TASK_NOT_STARTED" if not_started else "CONVERSATION_OUTCOME_UNKNOWN"
+                task["error_code"] = (
+                    "RESULT_UNRECOVERABLE" if known_not_submitted
+                    else "IMAGE_TASK_NOT_STARTED" if not_started
+                    else "CONVERSATION_OUTCOME_UNKNOWN"
+                )
+                if known_not_submitted:
+                    task["upstream_unfinished"] = False
+                    task["upstream_outcome"] = "not_submitted"
+                    task["recovery_retryable"] = True
+                    task["recovery_requires_new_conversation"] = False
                 if task.get("provider_binding_id"):
-                    task["binding_status"] = "unavailable" if not_started else "unknown"
+                    task["binding_status"] = (
+                        "bound"
+                        if known_not_submitted and task.get("conversation_id") and task.get("parent_message_id")
+                        else "unavailable" if not_started or known_not_submitted else "unknown"
+                    )
                 task["updated_at"] = _now_iso()
                 changed = True
         return changed

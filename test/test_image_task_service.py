@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from services.image_task_service import ImageTaskService, _authoritative_image_failure
-from services.openai_backend_api import ImageContentPolicyError
+from services.openai_backend_api import ChatRequirements, ImageContentPolicyError, OpenAIBackendAPI
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -137,6 +137,247 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
+    def test_generation_post_records_submission_boundary_before_network_call(self):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.example.test"
+        backend.image_request_message_id = "request-message-1"
+        backend.image_submission_started = False
+        backend.retain_bound_conversation = True
+        backend._image_model_settings = lambda _model: ("gpt-image", "")
+        backend._image_headers = lambda *_args: {}
+        observed = []
+
+        def progress_callback(_step):
+            return None
+
+        def record_submission_started():
+            observed.append("persisted")
+
+        progress_callback.record_submission_started = record_submission_started
+        backend.progress_callback = progress_callback
+
+        class Session:
+            def post(self, *_args, **_kwargs):
+                self.assert_boundary()
+                raise RuntimeError("generation POST timed out")
+
+            def assert_boundary(self):
+                if observed != ["persisted"] or backend.image_submission_started is not True:
+                    raise AssertionError("submission boundary was not recorded before POST")
+
+        backend.session = Session()
+
+        with self.assertRaisesRegex(RuntimeError, "generation POST timed out"):
+            backend._start_image_generation(
+                "cat", ChatRequirements(token="requirements"), "conduit", "gpt-image-2",
+                conversation_id="conversation-1", parent_message_id="parent-1",
+            )
+
+        self.assertTrue(backend.image_submission_started)
+        self.assertEqual(observed, ["persisted"])
+
+    def test_generation_post_is_not_called_when_submission_boundary_cannot_be_persisted(self):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.example.test"
+        backend.image_request_message_id = "request-message-1"
+        backend.image_submission_started = False
+        backend.retain_bound_conversation = True
+        backend._image_model_settings = lambda _model: ("gpt-image", "")
+        backend._image_headers = lambda *_args: {}
+
+        def progress_callback(_step):
+            return None
+
+        def record_submission_started():
+            raise OSError("receipt save failed")
+
+        progress_callback.record_submission_started = record_submission_started
+        backend.progress_callback = progress_callback
+        session = mock.Mock()
+        backend.session = session
+
+        with self.assertRaisesRegex(OSError, "receipt save failed"):
+            backend._start_image_generation(
+                "cat", ChatRequirements(token="requirements"), "conduit", "gpt-image-2",
+                conversation_id="conversation-1", parent_message_id="parent-1",
+            )
+
+        session.post.assert_not_called()
+        self.assertFalse(backend.image_submission_started)
+
+    def test_bound_bootstrap_failure_is_known_not_submitted_with_existing_chat(self):
+        class Backend:
+            image_submission_started = False
+            image_request_message_id = "request-message-1"
+
+            def __init__(self, access_token=None):
+                self.access_token = access_token
+
+            def stream_conversation(self, **_kwargs):
+                raise RuntimeError("bootstrap connection timed out")
+
+            def get_conversation_parent_message_id(self, _conversation_id):
+                return "parent-before-request"
+
+            def close(self):
+                return None
+
+        request = ConversationRequest(
+            model="gpt-image-2", prompt="cat", provider_binding_id="cb_account_a",
+            provider_account_identity="account_opaque_a",
+            client_conversation_id="workbench-conversation-1",
+            conversation_id="conversation-1", parent_message_id="parent-before-request",
+            retain_conversation=True,
+        )
+        with (
+            mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", return_value="account_opaque_a"),
+            mock.patch("services.protocol.conversation.account_service.acquire_bound_image_access_token", return_value="bound-token"),
+            mock.patch("services.protocol.conversation.account_service.get_account", return_value={"email": "account@example.test"}),
+            mock.patch("services.protocol.conversation.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", Backend),
+        ):
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_bound_single_image(request, 1, 1)
+
+        self.assertEqual(raised.exception.code, "IMAGE_GENERATION_NOT_SUBMITTED")
+        self.assertIs(raised.exception.upstream_submitted, False)
+        self.assertEqual(raised.exception.conversation_id, "conversation-1")
+        self.assertIn("timed out", str(raised.exception))
+
+    def test_bound_post_submission_timeout_remains_unknown(self):
+        class Backend:
+            image_submission_started = True
+            image_request_message_id = "request-message-1"
+
+            def __init__(self, access_token=None):
+                self.access_token = access_token
+
+            def stream_conversation(self, **_kwargs):
+                raise RuntimeError("generation POST response timed out")
+
+            def get_conversation_parent_message_id(self, _conversation_id):
+                return "parent-before-request"
+
+            def close(self):
+                return None
+
+        request = ConversationRequest(
+            model="gpt-image-2", prompt="cat", provider_binding_id="cb_account_a",
+            provider_account_identity="account_opaque_a",
+            client_conversation_id="workbench-conversation-1",
+            conversation_id="conversation-1", parent_message_id="parent-before-request",
+            retain_conversation=True,
+        )
+        with (
+            mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", return_value="account_opaque_a"),
+            mock.patch("services.protocol.conversation.account_service.acquire_bound_image_access_token", return_value="bound-token"),
+            mock.patch("services.protocol.conversation.account_service.get_account", return_value={"email": "account@example.test"}),
+            mock.patch("services.protocol.conversation.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", Backend),
+        ):
+            with self.assertRaises(ImageGenerationError) as raised:
+                _generate_bound_single_image(request, 1, 1)
+
+        self.assertEqual(raised.exception.code, "CONVERSATION_OUTCOME_UNKNOWN")
+        self.assertIs(raised.exception.upstream_submitted, True)
+
+    def test_known_not_submitted_receipt_is_retryable_without_a_new_chat_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+
+            def handler(payload):
+                payload["progress_callback"]("bootstrapping")
+                raise ImageGenerationError(
+                    "bootstrap connection timed out",
+                    code="IMAGE_GENERATION_NOT_SUBMITTED",
+                    provider_binding_id="cb_account_a",
+                    provider_account_identity="account_opaque_a",
+                    conversation_id="conversation-1",
+                    parent_message_id="parent-before-request",
+                    upstream_submitted=False,
+                )
+
+            service = self.make_service(path, handler)
+            service.submit_generation(
+                OWNER, client_task_id="not-submitted-task", prompt="cat",
+                model="gpt-image-2", size=None, provider_binding_id="cb_account_a",
+                provider_account_identity="account_opaque_a",
+                client_conversation_id="workbench-conversation-1",
+                conversation_id="conversation-1", parent_message_id="parent-before-request",
+                retain_conversation=True,
+            )
+            task = wait_for_task(service, OWNER, "not-submitted-task", "error")
+
+            self.assertEqual(task["error_code"], "RESULT_UNRECOVERABLE")
+            self.assertEqual(task["error"], "bootstrap connection timed out")
+            self.assertEqual(task["progress"], "bootstrapping")
+            self.assertFalse(task["upstream_submission_started"])
+            self.assertFalse(task["upstream_unfinished"])
+            self.assertEqual(task["upstream_outcome"], "not_submitted")
+            self.assertTrue(task["recovery_retryable"])
+            self.assertFalse(task["recovery_requires_new_conversation"])
+
+            restarted = self.make_service(path)
+            reloaded = restarted.list_tasks(OWNER, ["not-submitted-task"])["items"][0]
+            self.assertEqual(reloaded, task)
+            with mock.patch("services.image_task_service.threading.Thread") as thread:
+                resumed = restarted.resume_poll(
+                    OWNER, "not-submitted-task", 30, "http://content-provider", True,
+                )
+            self.assertEqual(resumed, task)
+            thread.assert_not_called()
+
+    def test_restart_does_not_infer_non_submission_for_an_alternate_image_route(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            path.write_text(json.dumps({"tasks": [{
+                "id": "codex-route-task", "owner_id": "owner-1", "status": "running",
+                "mode": "generate", "model": "codex-gpt-image-2",
+                "created_at": "2026-09-17 00:00:00", "updated_at": "2026-09-17 00:00:00",
+                "provider_binding_id": "binding-1", "provider_account_identity": "account-1",
+                "client_conversation_id": "client-1", "upstream_unfinished": True,
+                "progress": "generating",
+            }]}), encoding="utf-8")
+
+            service = self.make_service(path)
+            task = service.list_tasks(OWNER, ["codex-route-task"])["items"][0]
+
+        self.assertEqual(task["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+        self.assertTrue(task["upstream_unfinished"])
+        self.assertNotIn("upstream_submission_started", task)
+        self.assertNotIn("recovery_retryable", task)
+
+    def test_restart_recovers_a_persisted_pre_submission_boundary_without_polling(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            path.write_text(json.dumps({"tasks": [{
+                "id": "pre-submit-restart", "owner_id": "owner-1", "status": "running",
+                "mode": "generate", "model": "gpt-image-2",
+                "created_at": "2026-09-17 00:00:00", "updated_at": "2026-09-17 00:00:00",
+                "provider_binding_id": "binding-1", "provider_account_identity": "account-1",
+                "client_conversation_id": "client-1", "conversation_id": "conversation-1",
+                "parent_message_id": "parent-1", "upstream_unfinished": True,
+                "upstream_submission_started": False, "progress": "bootstrapping",
+            }]}), encoding="utf-8")
+
+            service = self.make_service(path)
+            task = service.list_tasks(OWNER, ["pre-submit-restart"])["items"][0]
+            with mock.patch("services.image_task_service.threading.Thread") as thread:
+                resumed = service.resume_poll(
+                    OWNER, "pre-submit-restart", 30, "http://content-provider", True,
+                )
+
+        self.assertEqual(task["error_code"], "RESULT_UNRECOVERABLE")
+        self.assertEqual(task["progress"], "bootstrapping")
+        self.assertFalse(task["upstream_submission_started"])
+        self.assertFalse(task["upstream_unfinished"])
+        self.assertTrue(task["recovery_retryable"])
+        self.assertFalse(task["recovery_requires_new_conversation"])
+        self.assertEqual(resumed, task)
+        thread.assert_not_called()
+
     def test_four_unknown_generations_keep_slots_and_fifth_waits_until_terminal(self):
         with tempfile.TemporaryDirectory() as tmp_dir, mock.patch(
             "services.image_task_service.config", image_account_concurrency=4
@@ -925,6 +1166,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(second, before)
             self.assertEqual(first["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
             self.assertEqual(first["binding_status"], "unknown")
+            self.assertNotIn("upstream_submission_started", first)
             self.assertEqual(first["recovery_status"], "request_message_id_required")
             self.assertEqual(first["next_poll_at"], 4102444800)
             self.assertEqual(first["duration_ms"], 123)
