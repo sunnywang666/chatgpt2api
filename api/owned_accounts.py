@@ -49,6 +49,11 @@ def create_router() -> APIRouter:
         owner = owner_scope(authorization, x_workbench_account_owner)
         return {"items": await run_in_threadpool(account_service.list_owned_accounts, owner)}
 
+    @router.get("/pool/accounts")
+    async def pool_accounts(authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        return {"items": await run_in_threadpool(account_service.list_pool_accounts)}
+
     @router.post("/accounts")
     async def import_account(body: ImportAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)

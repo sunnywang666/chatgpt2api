@@ -44,3 +44,23 @@ def public_owned_account(account: dict) -> dict:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def public_pool_account(account: dict, index: int) -> dict:
+    # Snapshot IDs are display-only and cannot be passed to owner mutation routes.
+    from services.codex_service import codex_service
+    capacity = observed_capacity(account)
+    codex = codex_service.account_projection(account)
+    status = str(account.get("status") or "")
+    disabled = bool(account.get("managed_disabled")) or status == "禁用"
+    source = account.get("source_type")
+    return {
+        "id": f"pool-row-{index}",
+        "label": f"服务账号 {index}",
+        "source_type": source if source in {"web", "codex", "oauth_login", "password"} else "unknown",
+        "enabled": not disabled,
+        "connection_status": "disabled" if disabled else "unavailable" if status == "异常" else "connected" if codex["state"] in {"observed", "limited"} or capacity["observed_at"] else "unverified",
+        "capacity": capacity,
+        "codex": codex,
+        "updated_at": account.get("managed_updated_at") or capacity["observed_at"] or codex.get("observed_at"),
+    }
