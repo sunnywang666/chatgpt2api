@@ -259,7 +259,11 @@ def create_router() -> APIRouter:
                 # Reject a durable id/body conflict before the optional AI
                 # review can make an external request. submit repeats the same
                 # check transactionally after review to close the race.
-                await run_in_threadpool(text_task_service.validate_submission, owner, payload)
+                existing = await run_in_threadpool(
+                    text_task_service.validate_submission, owner, payload,
+                )
+                if existing is not None:
+                    return existing
             request_preview = request_text(payload.get("messages"))
             await filter_or_log(
                 LoggedCall(

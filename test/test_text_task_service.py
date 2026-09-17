@@ -1153,7 +1153,8 @@ class TextTaskTests(unittest.TestCase):
                 headers={"Authorization": "owner"},
             )
             self.assertEqual(same.status_code, 200, same.text)
-            self.assertEqual(review.call_count, 2)
+            self.assertEqual(same.json()["status"], "queued")
+            self.assertEqual(review.call_count, 1, "same durable request reuses its review")
             self.assertEqual(len(self.queue.calls), 1)
 
             conflict = client.post(
@@ -1169,7 +1170,7 @@ class TextTaskTests(unittest.TestCase):
                 conflict.json()["detail"]["code"],
                 "CONVERSATION_REQUEST_CONFLICT",
             )
-            self.assertEqual(review.call_count, 2, "conflict must not call external review")
+            self.assertEqual(review.call_count, 1, "conflict must not call external review")
             self.assertEqual(len(self.queue.calls), 1, "conflict must not schedule execution")
 
             new_request = client.post(
@@ -1178,7 +1179,7 @@ class TextTaskTests(unittest.TestCase):
                 headers={"Authorization": "owner"},
             )
             self.assertEqual(new_request.status_code, 200, new_request.text)
-            self.assertEqual(review.call_count, 3)
+            self.assertEqual(review.call_count, 2)
             self.assertEqual(len(self.queue.calls), 2)
 
     def test_last_user_message_has_the_saved_identity_for_text_and_gallery(self):
