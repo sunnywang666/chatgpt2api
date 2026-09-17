@@ -302,11 +302,17 @@ class CodexService:
         self._probe_index = 0
         self._clock = clock
 
-    @staticmethod
-    def account_projection(account: dict) -> dict:
+    @classmethod
+    def account_projection(cls, account: dict) -> dict:
         raw = account.get("codex_observation") if isinstance(account, dict) else None
         if not isinstance(raw, dict):
             raw = {}
+        rejection = account.get("codex_auth_rejection") if isinstance(account, dict) else None
+        if (isinstance(rejection, dict) and account.get("access_token")
+                and rejection.get("credential_digest") == cls._credential_digest(account)):
+            # A concurrent catalog refresh must not hide a newer rejection.
+            raw = {**raw, "state": "auth_required", "error_code": "codex_http_401",
+                   "failed_at": rejection.get("failed_at")}
         state = str(raw.get("state") or "unknown")
         if state not in {"observed", "unknown", "read_failed", "auth_required", "limited"}:
             state = "unknown"
@@ -392,12 +398,28 @@ class CodexService:
         headers["accept"] = "text/event-stream, application/json"
         return headers
 
+    @classmethod
+    def _credential_digest(cls, account: dict) -> str:
+        # Bind a rejection to the actual authorization, without storing another
+        # token copy or preventing recovery after token/account rotation.
+        headers = cls._account_headers(account)
+        value = [headers["authorization"], headers.get("chatgpt-account-id", "")]
+        return hashlib.sha256(json.dumps(value).encode()).hexdigest()
+
     def refresh_account(self, access_token: str) -> dict:
         current_token = self.accounts.refresh_access_token(access_token, event="codex_observation") or access_token
         account = self.accounts.get_account(current_token)
         if account is None:
             raise KeyError("account not found")
         previous = self.account_projection(account)
+        rejection = account.get("codex_auth_rejection")
+        if not isinstance(rejection, dict):
+            rejection = {}
+        # Preserve known 401s written before credential-bound rejection records.
+        if not rejection and previous["error_code"] == "codex_http_401":
+            rejection = {"credential_digest": self._credential_digest(account),
+                         "failed_at": previous["failed_at"]}
+            self.accounts.update_account(current_token, {"codex_auth_rejection": rejection}, quiet=True)
         observed_at = _utc_now()
         models: list[dict] | None = None
         limits: list[dict] | None = None
@@ -456,8 +478,12 @@ class CodexService:
                 "limits": limits or [],
                 "error_code": None,
             }
+        if rejection.get("credential_digest") == self._credential_digest(account):
+            # Catalog/usage reads do not prove permission to execute Responses.
+            observation.update(state="auth_required", error_code="codex_http_401",
+                               failed_at=rejection.get("failed_at"))
         self.accounts.update_account(current_token, {"codex_observation": observation}, quiet=True)
-        return self.account_projection({"codex_observation": observation})
+        return self.account_projection(self.accounts.get_account(current_token) or {"codex_observation": observation})
 
     def _observation_fresh(self, projection: dict) -> bool:
         observed_at = _parse_iso(projection.get("observed_at"))
@@ -700,7 +726,13 @@ class CodexService:
             return
         projection = self.account_projection(account)
         projection.update(state=state, failed_at=_utc_now(), error_code=error_code)
-        self.accounts.update_account(token, {"codex_observation": projection}, quiet=True)
+        updates = {"codex_observation": projection}
+        if error_code == "codex_http_401":
+            updates["codex_auth_rejection"] = {
+                "credential_digest": self._credential_digest(account),
+                "failed_at": projection["failed_at"],
+            }
+        self.accounts.update_account(token, updates, quiet=True)
 
     def _safe_upstream_error(
         self,

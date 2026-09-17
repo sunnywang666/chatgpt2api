@@ -634,6 +634,87 @@ class CodexRelayTests(unittest.TestCase):
         self.assertEqual(binding["state"], "bound")
         self.assertEqual(accounts.accounts["token-a"]["codex_observation"]["state"], "auth_required")
 
+    def test_catalog_refresh_does_not_clear_response_auth_rejection(self):
+        rejected = FakeSession(post_response=FakeResponse(status=401, payload={}))
+        catalog = FakeSession(gets=[
+            FakeResponse(payload={"models": [{"slug": "gpt-5.6-codex"}]}),
+            FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 10}}}),
+        ])
+        accounts = FakeAccounts([account()])
+        service = CodexService(accounts, SessionFactory([rejected, catalog]))
+        with self.assertRaises(CodexServiceError):
+            service.submit(self.identity, {"model": "gpt-5.6-codex", "input": []}, self.headers)
+        # Reconstruct the service to cover a restart before the UI refresh.
+        service = CodexService(accounts, SessionFactory([catalog]))
+        result = service.refresh_account("token-a")
+        self.assertEqual(result["state"], "auth_required")
+        self.assertEqual(result["error_code"], "codex_http_401")
+        self.assertEqual(service.management_models()["items"][0]["available_accounts"], 0)
+        with self.assertRaises(CodexServiceError):
+            service.submit(self.identity, {"model": "gpt-5.6-codex", "input": []}, self.headers)
+        self.assertEqual(len(rejected.calls), 1)
+        self.assertTrue(all(method == "GET" for method, _, _ in catalog.calls))
+
+    def test_new_authorization_can_be_observed_after_rejection(self):
+        for changed_field in ("access_token", "account_id"):
+            with self.subTest(changed_field=changed_field):
+                accounts = FakeAccounts([account()])
+                service = CodexService(accounts, SessionFactory([]))
+                service._mark_observation_state("token-a", "auth_required", "codex_http_401")
+                old = accounts.accounts.pop("token-a")
+                old[changed_field] = "new-authorization"
+                token = old["access_token"]
+                accounts.accounts[token] = old
+                session = FakeSession(gets=[
+                    FakeResponse(payload={"models": [{"slug": "gpt-5.6-codex"}]}),
+                    FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 10}}}),
+                ])
+                service = CodexService(accounts, SessionFactory([session]))
+                result = service.refresh_account(token)
+                self.assertEqual(result["state"], "observed")
+                self.assertIsNone(result["error_code"])
+                self.assertIsNotNone(service._eligible_account(accounts.get_account(token), allow_probe=False))
+                public = json.dumps(result)
+                self.assertNotIn("credential_digest", public)
+                self.assertNotIn("new-authorization", public)
+
+    def test_rejection_during_catalog_refresh_remains_unavailable(self):
+        accounts = FakeAccounts([account()])
+        session = FakeSession(gets=[
+            FakeResponse(payload={"models": [{"slug": "gpt-5.6-codex"}]}),
+            FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 10}}}),
+        ])
+        service = CodexService(accounts, SessionFactory([session]))
+        original_get = session.get
+
+        def reject_while_reading(*args, **kwargs):
+            service._mark_observation_state("token-a", "auth_required", "codex_http_401")
+            return original_get(*args, **kwargs)
+
+        session.get = reject_while_reading
+        result = service.refresh_account("token-a")
+        self.assertEqual(result["state"], "auth_required")
+        self.assertIsNone(service._eligible_account(accounts.get_account("token-a"), allow_probe=False))
+        self.assertNotIn("credential_digest", json.dumps(result))
+
+    def test_legacy_401_survives_refresh_failure_then_success(self):
+        prior = observation(state="auth_required", minutes_ago=10)
+        prior.update(error_code="codex_http_401", failed_at="2026-09-16T20:27:36+00:00")
+        accounts = FakeAccounts([account(codex_observation=prior)])
+        sessions = [
+            FakeSession(gets=[FakeResponse(status=502, payload={})]),
+            FakeSession(gets=[
+                FakeResponse(payload={"models": [{"slug": "gpt-5.6-codex"}]}),
+                FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 10}}}),
+            ]),
+        ]
+        service = CodexService(accounts, SessionFactory(sessions))
+        for _ in range(2):
+            result = service.refresh_account("token-a")
+            self.assertEqual(result["state"], "auth_required")
+            self.assertEqual(result["failed_at"], prior["failed_at"])
+            self.assertEqual(result["error_code"], "codex_http_401")
+
     def test_upstream_5xx_is_unknown_and_not_replayed_or_rebound(self):
         session = FakeSession(post_response=FakeResponse(status=503, payload={"detail": "private"}))
         accounts = FakeAccounts([account()])

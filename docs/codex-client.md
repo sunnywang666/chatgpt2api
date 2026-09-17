@@ -115,6 +115,8 @@ The local mock is engineering evidence. A successful real CLI fixture run proves
 
 ## Current operational limits
 
+A Codex upstream 401 keeps that credential in `auth_required`, including after a service restart or a successful model/usage refresh. Those read endpoints do not prove that Responses execution is authorized. A changed access token or ChatGPT account identifier can be checked again; the service does not convert a Platform login into Codex authorization or replay the rejected request. Existing Content account credentials and task bindings are retained.
+
 The candidate serves HTTP Responses and SSE only; WebSocket transport and Codex Desktop are not yet accepted. Account observations expire after five minutes and are refreshed with bounded read-only probes. A missing/failed observation is not zero remaining quota. Upstream use remains subject to the account's real limits and availability; this service adds no budget, top-up, or internal token allocation.
 
 A pending or unknown session is retained and rejected with `codex_session_outcome_unknown` on continuation. A POST HTTP 408, like a transport timeout or 5xx, has an unknown outcome and is never automatically replayed. A terminal SSE response already parsed before client disconnect remains terminal. Do not create another session to replay the uncertain request. There is not yet an operator UI for resolving that receipt. This candidate keeps up to 256 session bindings and 256 response-owner references per account in the existing account record; it never evicts a prior owner to accept new work. `codex_binding_capacity` requires operator handling and is a storage protection, not an allowance of requests or tokens. Long-term retention/archival handling remains a release consideration.
