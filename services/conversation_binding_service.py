@@ -19,6 +19,7 @@ class TextRecoveryReason(str, Enum):
     REQUEST_RESULT_INCOMPLETE = "REQUEST_RESULT_INCOMPLETE"
     REQUEST_RESULT_NOT_FOUND = "REQUEST_RESULT_NOT_FOUND"
     REQUEST_RESULT_TERMINAL_EMPTY = "REQUEST_RESULT_TERMINAL_EMPTY"
+    REQUEST_CONVERSATION_UNATTRIBUTABLE = "REQUEST_CONVERSATION_UNATTRIBUTABLE"
     CONVERSATION_NOT_FOUND = "CONVERSATION_NOT_FOUND"
 
 
@@ -47,6 +48,8 @@ class ConversationBindingError(RuntimeError):
 
 
 class ConversationBindingService:
+    RECOVERY_RECENT_CONVERSATION_LIMIT = 20
+
     def archive(self, body: dict[str, Any]) -> dict[str, Any]:
         binding = body["provider_binding_id"]
         if account_service.get_bound_account_identity(binding) != body["provider_account_identity"]:
@@ -73,6 +76,11 @@ class ConversationBindingService:
         with account_service.conversation_binding_lock(binding, receipt["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:
+                if not str(receipt.get("conversation_id") or "").strip():
+                    located_receipt = self._locate_text_request_conversation(
+                        backend, receipt,
+                    )
+                    return self._read_text_request_result(backend, located_receipt)
                 try:
                     return self._read_text_request_result(backend, receipt)
                 except UpstreamHTTPError as exc:
@@ -86,6 +94,118 @@ class ConversationBindingService:
                     ) from exc
             finally:
                 backend.close()
+
+    @classmethod
+    def _locate_text_request_conversation(
+        cls,
+        backend: OpenAIBackendAPI,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Find one exact request user node within a bounded recent-account scan."""
+        request_message_id = str(receipt.get("request_message_id") or "").strip()
+        if not request_message_id:
+            raise ConversationBindingError(
+                "original request message identity is required",
+                code="CONVERSATION_BINDING_CONTRACT_INVALID",
+            )
+        recent = backend._list_recent_conversations(
+            limit=cls.RECOVERY_RECENT_CONVERSATION_LIMIT,
+            timeout_secs=10.0,
+            strict_schema=True,
+        )
+        matches: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in recent:
+            conversation_id = str(
+                item.get("id") or item.get("conversation_id") or ""
+            ).strip()
+            if conversation_id in seen:
+                continue
+            seen.add(conversation_id)
+            document = backend._get_conversation(conversation_id)
+            if not isinstance(document, dict):
+                raise ConversationBindingError(
+                    "conversation document is invalid",
+                    code="CONVERSATION_BINDING_CONTRACT_INVALID",
+                )
+            returned_conversation_id = str(
+                document.get("conversation_id") or conversation_id
+            ).strip()
+            if returned_conversation_id != conversation_id:
+                raise ConversationBindingError(
+                    "conversation identity changed during request recovery",
+                    code="CONVERSATION_BINDING_CONTRACT_INVALID",
+                )
+            mapping = document.get("mapping")
+            if not isinstance(mapping, dict):
+                raise ConversationBindingError(
+                    "conversation mapping is missing or invalid",
+                    code="CONVERSATION_BINDING_CONTRACT_INVALID",
+                )
+            request_node = mapping.get(request_message_id)
+            if request_node is None:
+                continue
+            request_message = (
+                request_node.get("message")
+                if isinstance(request_node, dict) else None
+            )
+            request_author = (
+                request_message.get("author")
+                if isinstance(request_message, dict) else None
+            )
+            if (
+                not isinstance(request_node, dict)
+                or not isinstance(request_message, dict)
+                or request_message.get("id") != request_message_id
+                or not isinstance(request_author, dict)
+                or request_author.get("role") != "user"
+            ):
+                raise ConversationBindingError(
+                    "request message anchor is invalid",
+                    code="CONVERSATION_BINDING_CONTRACT_INVALID",
+                )
+            matches.append((conversation_id, str(request_node.get("parent") or "").strip()))
+            if len(matches) > 1:
+                break
+
+        if len(matches) != 1:
+            raise ConversationBindingError(
+                "original request conversation cannot be attributed uniquely",
+                code="CONVERSATION_OUTCOME_UNKNOWN",
+                recovery_reason=(
+                    TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value
+                ),
+            )
+        conversation_id, request_parent_message_id = matches[0]
+        expected_parent_message_id = str(
+            receipt.get(
+                "request_parent_message_id",
+                receipt.get("parent_message_id"),
+            ) or ""
+        ).strip()
+        if (
+            expected_parent_message_id
+            and request_parent_message_id != expected_parent_message_id
+        ):
+            raise ConversationBindingError(
+                "original request parent changed",
+                code="CONVERSATION_BINDING_MISMATCH",
+                conversation_id=conversation_id,
+                parent_message_id=request_parent_message_id,
+                recovery_reason=TextRecoveryReason.REQUEST_PARENT_MISMATCH.value,
+            )
+        return {
+            **receipt,
+            "conversation_id": conversation_id,
+            # Both anchors are exact nodes from the recovered mapping. The
+            # request parent validates branch identity; the request node is a
+            # usable continuation cursor until a completed answer replaces it.
+            "parent_message_id": request_message_id,
+            **(
+                {"request_parent_message_id": request_parent_message_id}
+                if request_parent_message_id else {}
+            ),
+        }
 
     def read_text(self, body: dict[str, Any]) -> dict[str, Any]:
         """Read an already-issued cursor on its bound account; never send a message."""
@@ -171,7 +291,11 @@ class ConversationBindingService:
         request_node = mapping.get(request_message_id)
         result = {key: receipt[key] for key in (
             "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id",
-        ) if key in receipt}
+            "parent_message_id", "request_parent_message_id",
+        ) if key in receipt and (
+            key not in {"parent_message_id", "request_parent_message_id"}
+            or str(receipt[key] or "").strip()
+        )}
         if request_message_id and request_node is None:
             current_node_id = str(document.get("current_node") or "").strip()
             current_node = mapping.get(current_node_id)

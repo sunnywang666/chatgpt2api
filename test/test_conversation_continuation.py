@@ -821,6 +821,145 @@ class TextResultRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid task"):
             backend._query_backend_tasks(conversation_id="chat", strict_schema=True)
 
+    def test_recent_conversations_strict_schema_rejects_unknown_or_malformed_lists(self):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.test"
+        backend._headers = lambda *_args, **_kwargs: {}
+        response = SimpleNamespace(
+            status_code=200, text="{}", headers={}, json=lambda: {},
+        )
+        backend.session = SimpleNamespace(get=mock.Mock(return_value=response))
+
+        self.assertEqual(backend._list_recent_conversations(), [])
+        with self.assertRaisesRegex(RuntimeError, "missing the conversation list"):
+            backend._list_recent_conversations(strict_schema=True)
+
+        response.json = lambda: {"items": {"bad": "shape"}}
+        self.assertEqual(backend._list_recent_conversations(), [])
+        with self.assertRaisesRegex(RuntimeError, "invalid conversation list"):
+            backend._list_recent_conversations(strict_schema=True)
+
+        response.json = lambda: {"items": [{"title": "missing id"}]}
+        with self.assertRaisesRegex(RuntimeError, "without an id"):
+            backend._list_recent_conversations(strict_schema=True)
+
+    def test_missing_conversation_is_recovered_only_by_one_exact_request_node(self):
+        service = ConversationBindingService()
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = [
+            {"id": "unrelated-conversation"},
+            {"id": "conversation-one"},
+        ]
+        unrelated = self.request_document()
+        unrelated["conversation_id"] = "unrelated-conversation"
+        unrelated["mapping"].pop("request-user")
+        backend._get_conversation.side_effect = [
+            unrelated, self.request_document(), self.request_document(),
+        ]
+
+        with (
+            mock.patch(
+                "services.conversation_binding_service.account_service.get_bound_account_identity",
+                return_value="account-one",
+            ),
+            mock.patch(
+                "services.conversation_binding_service.account_service.get_bound_text_access_token",
+                return_value="original-paid-account-token",
+            ) as get_token,
+            mock.patch(
+                "services.conversation_binding_service.account_service.conversation_binding_lock",
+                return_value=nullcontext(),
+            ),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend) as backend_type,
+        ):
+            recovered = service.read_text_request(receipt)
+
+        self.assertEqual(recovered["status"], "succeeded")
+        self.assertEqual(recovered["content"], "original answer")
+        self.assertEqual(recovered["conversation_id"], "conversation-one")
+        self.assertEqual(recovered["parent_message_id"], "original-answer")
+        get_token.assert_called_once_with("binding-one", model="auto")
+        backend_type.assert_called_once_with(access_token="original-paid-account-token")
+        backend._list_recent_conversations.assert_called_once_with(
+            limit=ConversationBindingService.RECOVERY_RECENT_CONVERSATION_LIMIT,
+            timeout_secs=10.0,
+            strict_schema=True,
+        )
+
+    def test_missing_conversation_zero_or_multiple_exact_matches_are_unattributable(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+
+        empty_backend = mock.Mock()
+        empty_backend._list_recent_conversations.return_value = []
+        with self.assertRaises(ConversationBindingError) as empty:
+            ConversationBindingService._locate_text_request_conversation(
+                empty_backend, receipt,
+            )
+        self.assertEqual(
+            empty.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+        )
+        self.assertFalse(empty.exception.conversation_id)
+
+        duplicate_backend = mock.Mock()
+        duplicate_backend._list_recent_conversations.return_value = [
+            {"id": "conversation-one"}, {"id": "conversation-two"},
+        ]
+        first = self.request_document()
+        second = self.request_document()
+        second["conversation_id"] = "conversation-two"
+        duplicate_backend._get_conversation.side_effect = [first, second]
+        with self.assertRaises(ConversationBindingError) as duplicate:
+            ConversationBindingService._locate_text_request_conversation(
+                duplicate_backend, receipt,
+            )
+        self.assertEqual(
+            duplicate.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+        )
+        self.assertFalse(duplicate.exception.conversation_id)
+
+    def test_missing_conversation_lookup_preserves_the_original_request_parent(self):
+        receipt = self.request_receipt(
+            conversation_id="",
+            parent_message_id="",
+            request_parent_message_id="different-parent",
+        )
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = [
+            {"id": "conversation-one"},
+        ]
+        backend._get_conversation.return_value = self.request_document()
+
+        with self.assertRaises(ConversationBindingError) as mismatch:
+            ConversationBindingService._locate_text_request_conversation(
+                backend, receipt,
+            )
+
+        self.assertEqual(
+            mismatch.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_PARENT_MISMATCH.value,
+        )
+        self.assertEqual(mismatch.exception.conversation_id, "conversation-one")
+
+    def test_missing_conversation_lookup_failures_do_not_become_no_result_evidence(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        backend = mock.Mock()
+        backend._list_recent_conversations.side_effect = RuntimeError(
+            "recent conversation schema invalid",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "schema invalid"):
+            ConversationBindingService._locate_text_request_conversation(
+                backend, receipt,
+            )
+
     def test_request_recovery_distinguishes_missing_conversation_from_other_read_failures(self):
         service = ConversationBindingService()
         receipt = self.request_receipt()

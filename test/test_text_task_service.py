@@ -248,6 +248,78 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(service.recover("owner", "attempt-1", True), final)
         self.assertEqual(len(self.queue.calls), 1, "replacement is authorized, never sent here")
 
+    def test_missing_conversation_receipt_uses_bounded_recovery_and_keeps_paid_binding(self):
+        clock = ManualClock()
+        calls = []
+
+        def reader(receipt):
+            calls.append(receipt)
+            self.assertNotIn("conversation_id", receipt)
+            raise ConversationBindingError(
+                "original request conversation cannot be attributed uniquely",
+                code="CONVERSATION_OUTCOME_UNKNOWN",
+                recovery_reason="REQUEST_CONVERSATION_UNATTRIBUTABLE",
+            )
+
+        service = TextTaskService(
+            self.path, executor=self.queue, clock=clock, recovery_reader=reader,
+        )
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="paid-binding",
+            provider_account_identity="paid-account",
+        )
+        clock.advance(TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS + 1)
+
+        for delay in (31, 61, 121):
+            result = service.recover("owner", "attempt-1", True)
+            clock.advance(delay)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "RESULT_UNRECOVERABLE")
+        self.assertEqual(result["upstream_outcome"], "unknown")
+        self.assertTrue(result["recovery_retryable"])
+        self.assertTrue(result["recovery_requires_new_conversation"])
+        self.assertEqual(result["provider_binding_id"], "paid-binding")
+        self.assertEqual(result["provider_account_identity"], "paid-account")
+        self.assertNotIn("conversation_id", result)
+        self.assertNotIn("parent_message_id", result)
+        self.assertEqual(len(self.queue.calls), 1, "recovery never resubmits upstream")
+
+    def test_exact_lookup_anchor_is_persisted_without_overwriting_an_existing_cursor(self):
+        clock = ManualClock()
+
+        def reader(_receipt):
+            return {
+                "status": "unknown",
+                "binding_status": "unknown",
+                "conversation_id": "recovered-chat",
+                "parent_message_id": "original-request-node",
+                "request_parent_message_id": "prior-answer",
+                "recovery_reason": "REQUEST_RESULT_NOT_FOUND",
+            }
+
+        service = TextTaskService(
+            self.path, executor=self.queue, clock=clock, recovery_reader=reader,
+        )
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="paid-binding",
+            provider_account_identity="paid-account",
+        )
+
+        recovered = service.read("owner", "attempt-1")
+
+        self.assertEqual(recovered["conversation_id"], "recovered-chat")
+        self.assertEqual(recovered["parent_message_id"], "original-request-node")
+        self.assertEqual(recovered["request_parent_message_id"], "prior-answer")
+        self.assertEqual(recovered["recovery_no_result_reads"], 0)
+
     def test_qualified_recovery_backoff_ignores_old_attempts_but_rate_limit_does_not(self):
         clock = ManualClock()
 
