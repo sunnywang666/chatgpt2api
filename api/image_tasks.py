@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
+from api.key_policy import require_image_policy
 from services.content_filter import check_request
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
@@ -77,6 +78,7 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         validate_external_input(request, body.model_dump())
+        require_image_policy(identity, body.model)
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/generations", body.model, "文生图任务", request_text=body.prompt), body.prompt)
         try:
             result = await run_in_threadpool(
@@ -109,6 +111,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         validate_external_input(request, payload)
+        require_image_policy(identity, payload.get("model"))
         client_task_id = str(payload.get("client_task_id") or "").strip()
         if not client_task_id:
             raise HTTPException(status_code=400, detail={"error": "client_task_id is required"})

@@ -5,11 +5,16 @@ import hmac
 import secrets
 import uuid
 from datetime import datetime, timezone
+from contextlib import contextmanager
+from copy import deepcopy
 from threading import Lock
 from typing import Literal
 
 from services.config import config
 from services.storage.base import StorageBackend
+
+from services.program_key_policy import ProgramKeyPolicy, PolicyError, make_policy
+
 
 AuthRole = Literal["admin", "user"]
 
@@ -20,6 +25,7 @@ def _now_iso() -> str:
 
 def _hash_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
 
 
 class AuthService:
@@ -59,25 +65,36 @@ class AuthService:
             "enabled": bool(raw.get("enabled", True)),
             "created_at": created_at,
             "last_used_at": last_used_at,
+            "policy": deepcopy(raw.get("policy")),
         }
 
     def _load(self) -> list[dict[str, object]]:
-        try:
-            items = self.storage.load_auth_keys()
-        except Exception:
-            return []
+        items = self.storage.load_auth_keys()
         if not isinstance(items, list):
             return []
         return [normalized for item in items if (normalized := self._normalize_item(item)) is not None]
 
-    def _save(self) -> None:
-        self.storage.save_auth_keys(self._items)
+    @contextmanager
+    def _transaction(self, *, persist: bool = True):
+        with self._lock, self.storage.auth_keys_transaction() as records:
+            self._items = [normalized for raw in records
+                           if (normalized := self._normalize_item(raw)) is not None]
+            # Never silently destroy malformed records during an unrelated update.
+            if len(self._items) != len(records):
+                raise ValueError("invalid auth key storage")
+            yield
+            if persist:
+                records[:] = self._items
 
     def _reload_locked(self) -> None:
         self._items = self._load()
 
     @staticmethod
     def _public_item(item: dict[str, object]) -> dict[str, object]:
+        try:
+            policy = ProgramKeyPolicy.from_record(item.get("policy")).to_record()
+        except PolicyError:
+            policy = None
         return {
             "id": item.get("id"),
             "name": item.get("name"),
@@ -85,6 +102,8 @@ class AuthService:
             "enabled": bool(item.get("enabled", True)),
             "created_at": item.get("created_at"),
             "last_used_at": item.get("last_used_at"),
+            "policy": policy,
+            "policy_state": "active" if policy is not None else "reconciliation_required",
         }
 
     def list_keys(self, role: AuthRole | None = None) -> list[dict[str, object]]:
@@ -148,9 +167,9 @@ class AuthService:
             raise ValueError("这个名称已经在使用中了，换一个更容易区分的名称吧")
         return candidate
 
-    def create_key(self, *, role: AuthRole, name: str = "", owner_subject: str = "") -> tuple[dict[str, object], str]:
-        with self._lock:
-            self._reload_locked()
+    def create_key(self, *, role: AuthRole, name: str = "", owner_subject: str = "", routes: list[str] | None = None) -> tuple[dict[str, object], str]:
+        policy = make_policy(routes if routes is not None else ["chat"], revision=1) if role == "user" else None
+        with self._transaction():
             normalized_name = self._build_name_locked(name, role=role)
             while True:
                 raw_key = f"sk-{secrets.token_urlsafe(24)}"
@@ -168,9 +187,9 @@ class AuthService:
                 "enabled": True,
                 "created_at": _now_iso(),
                 "last_used_at": None,
+                "policy": policy.to_record() if policy else None,
             }
             self._items.append(item)
-            self._save()
             return self._public_item(item), raw_key
 
     def list_owned_keys(self, owner: str) -> list[dict[str, object]]:
@@ -180,12 +199,10 @@ class AuthService:
                     if item.get("role") == "user" and item.get("owner_subject") == owner]
 
     def revoke_owned_key(self, owner: str, key_id: str) -> bool:
-        with self._lock:
-            self._reload_locked()
+        with self._transaction():
             for item in self._items:
                 if item.get("id") == key_id and item.get("role") == "user" and item.get("owner_subject") == owner:
                     item["enabled"] = False
-                    self._save()
                     return True
         return False
 
@@ -199,8 +216,7 @@ class AuthService:
         normalized_id = self._clean(key_id)
         if not normalized_id:
             return None
-        with self._lock:
-            self._reload_locked()
+        with self._transaction():
             for index, item in enumerate(self._items):
                 if item.get("id") != normalized_id:
                     continue
@@ -219,7 +235,6 @@ class AuthService:
                 if "key" in updates and updates.get("key") is not None:
                     next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
                 self._items[index] = next_item
-                self._save()
                 return self._public_item(next_item)
         return None
 
@@ -227,8 +242,7 @@ class AuthService:
         normalized_id = self._clean(key_id)
         if not normalized_id:
             return False
-        with self._lock:
-            self._reload_locked()
+        with self._transaction():
             before = len(self._items)
             self._items = [
                 item
@@ -237,34 +251,74 @@ class AuthService:
             ]
             if len(self._items) == before:
                 return False
-            self._save()
             return True
+
+    def update_owned_policy(self, owner: str, key_id: str, routes: list[str],
+                            expected_revision: int) -> dict[str, object] | None:
+        with self._transaction():
+            for item in self._items:
+                if item.get("id") != key_id or item.get("owner_subject") != owner or item.get("role") != "user":
+                    continue
+                existing = item.get("policy")
+                revision = ProgramKeyPolicy.from_record(existing).revision if existing is not None else 0
+                if type(expected_revision) is not int or expected_revision != revision:
+                    raise PolicyError("KEY_POLICY_REVISION_CONFLICT")
+                item["policy"] = make_policy(routes, revision=revision + 1).to_record()
+                return self._public_item(item)
+        return None
+
+    def reconcile_legacy_policies(self, assignments: list[dict], *, apply: bool = False) -> list[dict]:
+        """Operator-only cutover step, never exposed to ordinary API callers.
+
+        Explicit key IDs/routes come from consumer/receipt reconciliation.
+        Hashes, owners, enabled state and tasks are unchanged. All enabled legacy
+        keys must be accounted for so guard cutover cannot silently strand one.
+        """
+        if not isinstance(assignments, list):
+            raise PolicyError("LEGACY_ASSIGNMENTS_INVALID")
+        by_id = {}
+        for assignment in assignments:
+            if not isinstance(assignment, dict) or set(assignment) - {"id", "routes"}:
+                raise PolicyError("LEGACY_ASSIGNMENTS_INVALID")
+            key_id = assignment.get("id")
+            if not isinstance(key_id, str) or not key_id or key_id in by_id:
+                raise PolicyError("LEGACY_ASSIGNMENTS_INVALID")
+            by_id[key_id] = assignment
+        with self._transaction(persist=apply):
+            legacy = {str(item["id"]): item for item in self._items
+                      if item["role"] == "user" and item["enabled"] and item.get("policy") is None}
+            if set(legacy) != set(by_id):
+                raise PolicyError("LEGACY_KEY_SET_CHANGED")
+            result = []
+            for key_id, assignment in by_id.items():
+                policy = make_policy(assignment.get("routes"), revision=1)
+                candidate = {**legacy[key_id], "policy": policy.to_record()}
+                result.append(self._public_item(candidate))
+                if apply:
+                    legacy[key_id].update(policy=candidate["policy"])
+            return result
 
     def authenticate(self, raw_key: str) -> dict[str, object] | None:
         candidate = self._clean(raw_key)
         if not candidate:
             return None
         candidate_hash = _hash_key(candidate)
-        with self._lock:
-            for index, item in enumerate(self._items):
+        # Authentication and last_used updates share the same cross-process
+        # transaction as revocation/policy changes. No stale snapshot is saved.
+        with self._transaction():
+            for item in self._items:
                 if not bool(item.get("enabled", True)):
                     continue
                 stored_hash = self._clean(item.get("key_hash"))
                 if not stored_hash or not hmac.compare_digest(stored_hash, candidate_hash):
                     continue
-                next_item = dict(item)
                 now = datetime.now(timezone.utc)
-                next_item["last_used_at"] = now.isoformat()
-                self._items[index] = next_item
-                item_id = self._clean(next_item.get("id"))
+                item_id = self._clean(item.get("id"))
                 last_flush_at = self._last_used_flush_at.get(item_id)
                 if last_flush_at is None or (now - last_flush_at).total_seconds() >= 60:
-                    try:
-                        self._save()
-                        self._last_used_flush_at[item_id] = now
-                    except Exception:
-                        pass
-                return self._public_item(next_item)
+                    item["last_used_at"] = now.isoformat()
+                    self._last_used_flush_at[item_id] = now
+                return self._public_item(item)
         return None
 
 

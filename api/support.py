@@ -29,7 +29,10 @@ def _legacy_admin_identity(token: str) -> dict[str, object] | None:
 
 def require_identity(authorization: str | None) -> dict[str, object]:
     token = extract_bearer_token(authorization)
-    identity = _legacy_admin_identity(token) or auth_service.authenticate(token)
+    try:
+        identity = _legacy_admin_identity(token) or auth_service.authenticate(token)
+    except Exception:
+        raise HTTPException(status_code=503, detail={"code": "KEY_STORAGE_UNAVAILABLE"}) from None
     if identity is None:
         raise HTTPException(status_code=401, detail={"error": "密钥无效或已失效，请重新登录"})
     return identity

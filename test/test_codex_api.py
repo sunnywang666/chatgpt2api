@@ -41,7 +41,8 @@ class CodexApiTests(unittest.TestCase):
         self.identity_patch = mock.patch.object(
             codex_api,
             "require_identity",
-            return_value={"id": "key-id", "name": "CLI", "role": "user"},
+            return_value={"id": "key-id", "name": "CLI", "role": "user", "enabled": True,
+                          "policy": {"version": 2, "revision": 1, "routes": ["codex"]}},
         )
         self.identity = self.identity_patch.start()
         self.addCleanup(self.identity_patch.stop)
@@ -144,4 +145,3 @@ class CodexApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

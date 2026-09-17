@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from typing import Any
 
 from sqlalchemy import Column, String, Text, create_engine, Integer, text
@@ -69,7 +70,57 @@ class DatabaseStorageBackend(StorageBackend):
 
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
         """保存鉴权密钥数据到数据库"""
-        self._save_rows(AuthKeyModel, auth_keys, "id", "key_id")
+        with self.auth_keys_transaction() as items:
+            items[:] = auth_keys
+
+    @contextmanager
+    def auth_keys_transaction(self):
+        # Keep the same connection through commit and named-lock release. A row
+        # lock alone cannot serialize concurrent creates in an empty table.
+        with self.engine.connect() as connection:
+            session = self.Session(bind=connection)
+            dialect = self.engine.dialect.name
+            mysql_locked = False
+            try:
+                if dialect == "sqlite":
+                    connection.execute(text("BEGIN IMMEDIATE"))
+                elif dialect == "postgresql":
+                    connection.execute(text("SELECT pg_advisory_xact_lock(724180291)"))
+                elif dialect in {"mysql", "mariadb"}:
+                    mysql_locked = connection.execute(text("SELECT GET_LOCK('chatgpt2api_auth_keys', 30)")).scalar() == 1
+                    if not mysql_locked:
+                        raise RuntimeError("auth key storage lock unavailable")
+                else:
+                    raise RuntimeError("auth key transactions unsupported for storage dialect")
+                rows = {row.key_id: row for row in session.query(AuthKeyModel).with_for_update().all()}
+                items = [json.loads(row.data) for row in rows.values()]
+                yield items
+                incoming = set()
+                for item in items:
+                    key_id = str(item.get("id") or "").strip()
+                    if key_id in incoming:
+                        raise ValueError("Duplicate id in storage snapshot")
+                    if not key_id:
+                        raise ValueError("invalid auth key id")
+                    incoming.add(key_id)
+                    serialized = json.dumps(item, ensure_ascii=False)
+                    if key_id in rows:
+                        if rows[key_id].data != serialized:
+                            rows[key_id].data = serialized
+                    else:
+                        session.add(AuthKeyModel(key_id=key_id, data=serialized))
+                for key_id, row in rows.items():
+                    if key_id not in incoming:
+                        session.delete(row)
+                session.flush()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                session.close()
+                if mysql_locked:
+                    connection.execute(text("SELECT RELEASE_LOCK('chatgpt2api_auth_keys')"))
 
     def _load_rows(self, model: type[AccountModel] | type[AuthKeyModel]) -> list[dict[str, Any]]:
         session = self.Session()

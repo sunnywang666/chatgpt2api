@@ -151,7 +151,7 @@ def main() -> int:
             storage = JSONStorageBackend(temporary_root / "accounts.json", temporary_root / "auth_keys.json")
             accounts = AccountService(storage)
             auth = AuthService(storage)
-            user_item, ordinary_key = auth.create_key(role="user", name="qa ordinary user")
+            user_item, ordinary_key = auth.create_key(role="user", name="qa ordinary user", routes=["codex"])
             _admin_item, admin_key = auth.create_key(role="admin", name="qa admin")
             upstream_token = "qa-fake-upstream-account-token"
             accounts.import_owned_account(

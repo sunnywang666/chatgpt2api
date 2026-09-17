@@ -1093,7 +1093,7 @@ class TextTaskTests(unittest.TestCase):
         from api.ai import create_router
         service = TextTaskService(self.path, executor=self.queue)
         app = FastAPI(); app.include_router(create_router())
-        with mock.patch("api.ai.text_task_service", service), mock.patch("api.ai.filter_or_log", mock.AsyncMock()), mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token}):
+        with mock.patch("api.ai.text_task_service", service), mock.patch("api.ai.filter_or_log", mock.AsyncMock()), mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}):
             with TestClient(app) as client:
                 response = client.post("/api/conversation-bindings/text", json=self.body, headers={"Authorization": "owner"})
                 self.assertEqual(response.status_code, 200, response.text)
@@ -1132,7 +1132,7 @@ class TextTaskTests(unittest.TestCase):
         configured = {**original_config, "ai_review": review_config}
         with (
             mock.patch("api.ai.text_task_service", service),
-            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token}),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
             mock.patch.object(content_filter.config, "data", configured),
             mock.patch("services.content_filter.requests.post", return_value=review_response) as review,
             TestClient(app) as client,
@@ -1207,7 +1207,7 @@ class TextTaskTests(unittest.TestCase):
         first_service = TextTaskService(self.path, executor=first_queue)
         with (
             mock.patch("api.ai.text_task_service", first_service),
-            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token}),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
             mock.patch.object(content_filter.config, "data", configured),
             mock.patch("services.content_filter.requests.post", return_value=review_response) as review,
             TestClient(app) as client,
@@ -1227,7 +1227,7 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(restarted.read("owner", "attempt-1")["status"], "not_started")
         with (
             mock.patch("api.ai.text_task_service", restarted),
-            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token}),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
             mock.patch.object(content_filter.config, "data", configured),
             mock.patch("services.content_filter.requests.post", return_value=review_response) as review,
             TestClient(app) as client,

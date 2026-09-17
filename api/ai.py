@@ -8,6 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from api.external_images import client_sync_result, validate_external_input, is_external, synchronous_external_task
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
+from api.key_policy import require_image_policy, require_chat_text_policy
+from utils.helper import is_image_chat_request, has_response_image_generation_tool
 from services.content_filter import check_request, request_shape, request_text
 from services.conversation_binding_service import (
     ConversationBindingError,
@@ -117,7 +119,8 @@ def create_router() -> APIRouter:
 
     @router.get("/v1/models")
     async def list_models(request: Request, authorization: str | None = Header(default=None)):
-        require_identity(authorization)
+        identity = require_identity(authorization)
+        require_chat_text_policy(identity)
         try:
             result = await run_in_threadpool(openai_v1_models.list_models)
             if is_external(request):
@@ -135,6 +138,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         validate_external_input(request, payload, synchronous=True)
+        require_image_policy(identity, payload.get("model"))
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
@@ -150,6 +154,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         validate_external_input(request, payload, synchronous=True)
+        require_image_policy(identity, payload.get("model"))
         prompt = str(payload["prompt"])
         model = str(payload["model"])
         call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
@@ -166,6 +171,10 @@ def create_router() -> APIRouter:
     async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        if is_image_chat_request(payload):
+            require_image_policy(identity, payload.get("model"))
+        else:
+            require_chat_text_policy(identity, endpoint="/v1/chat/completions", model=payload.get("model"))
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("prompt"), payload.get("messages"))
         call = LoggedCall(
@@ -183,6 +192,10 @@ def create_router() -> APIRouter:
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
+        if has_response_image_generation_tool(payload):
+            require_image_policy(identity, payload.get("model"))
+        else:
+            require_chat_text_policy(identity, endpoint="/v1/responses", model=payload.get("model"))
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("input"), payload.get("instructions"))
         call = LoggedCall(
@@ -199,7 +212,9 @@ def create_router() -> APIRouter:
     @router.post("/api/conversation-bindings/archive")
     async def archive_bound_conversation(body: ConversationArchiveRequest,
             authorization: str | None = Header(default=None)):
-        require_identity(authorization)
+        identity = require_identity(authorization)
+        if identity.get("role") != "admin":
+            raise HTTPException(404, detail={"code": "TASK_NOT_FOUND"})
         try:
             return await run_in_threadpool(conversation_binding_service.archive, body.model_dump())
         except ConversationBindingError as exc:
@@ -213,7 +228,12 @@ def create_router() -> APIRouter:
             client_conversation_id: str, conversation_id: str, parent_message_id: str,
             authorization: str | None = Header(default=None),
     ):
-        require_identity(authorization)
+        identity = require_identity(authorization)
+        # Legacy direct cursors have no persisted caller ownership. Only the
+        # existing trusted Content/admin path may use them; ordinary callers
+        # read their owner-scoped durable text-request receipt below.
+        if identity.get("role") != "admin":
+            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND"})
         try:
             return await run_in_threadpool(conversation_binding_service.read_text, {
                 "provider_binding_id": provider_binding_id,
@@ -252,6 +272,10 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
+        if identity.get("role") != "admin":
+            raise HTTPException(501, detail={"code": "SERVICE_OPERATION_UNAVAILABLE",
+                "error": "ordinary-client bound conversation submission is not supported; use the supported Chat API"})
+        require_chat_text_policy(identity)
         owner = str(identity.get("id") or "anonymous")
         payload = body.model_dump(mode="python")
         try:
@@ -309,6 +333,7 @@ def create_router() -> APIRouter:
             anthropic_version: str | None = Header(default=None, alias="anthropic-version"),
     ):
         identity = require_identity(authorization or (f"Bearer {x_api_key}" if x_api_key else None))
+        require_chat_text_policy(identity)
         payload = body.model_dump(mode="python")
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("system"), payload.get("messages"), payload.get("tools"))
@@ -319,6 +344,7 @@ def create_router() -> APIRouter:
     @router.post("/v1/search")
     async def search(body: SearchRequest, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
+        require_chat_text_policy(identity)
         call = LoggedCall(identity, "/v1/search", openai_search.MODEL, "搜索", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
         return await call.run(openai_search.handle, body.model_dump(mode="python"))
@@ -340,6 +366,7 @@ def create_router() -> APIRouter:
     @router.post("/v1/ppt/generations")
     async def create_ppt_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
+        require_chat_text_policy(identity)
         await filter_or_log(LoggedCall(identity, "/v1/ppt/generations", "gpt-5-5-thinking", "PPT生成任务", request_text=body.prompt), body.prompt)
         return await run_in_threadpool(
             editable_file_task_service.submit_ppt,
@@ -353,6 +380,7 @@ def create_router() -> APIRouter:
     @router.post("/v1/psd/generations")
     async def create_psd_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
+        require_chat_text_policy(identity)
         await filter_or_log(LoggedCall(identity, "/v1/psd/generations", "gpt-5-5-thinking", "PSD生成任务", request_text=body.prompt), body.prompt)
         return await run_in_threadpool(
             editable_file_task_service.submit_psd,
