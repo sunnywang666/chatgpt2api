@@ -854,6 +854,10 @@ class TextResultRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exceeds the requested limit"):
             backend._list_recent_conversations(limit=20, strict_schema=True)
 
+        response.json = lambda: {"items": []}
+        backend._list_recent_conversations(limit=20, offset=40, strict_schema=True)
+        self.assertIn("offset=40&limit=20", backend.session.get.call_args.args[0])
+
     def test_oversized_recent_conversation_response_reads_no_details(self):
         receipt = self.request_receipt()
         receipt.pop("conversation_id")
@@ -923,6 +927,7 @@ class TextResultRecoveryTests(unittest.TestCase):
             self.assertEqual(backend_call.kwargs["access_token"], get_token.return_value)
         backend._list_recent_conversations.assert_called_once_with(
             limit=ConversationBindingService.RECOVERY_RECENT_CONVERSATION_LIMIT,
+            offset=0,
             timeout_secs=10.0,
             strict_schema=True,
         )
@@ -934,7 +939,7 @@ class TextResultRecoveryTests(unittest.TestCase):
                 ConversationBindingService.RECOVERY_SCAN_TIMEOUT_SECONDS,
             )
 
-    def test_missing_conversation_zero_or_multiple_exact_matches_are_unattributable(self):
+    def test_missing_conversation_zero_match_is_unattributable_but_multiple_is_a_mismatch(self):
         receipt = self.request_receipt()
         receipt.pop("conversation_id")
         receipt.pop("parent_message_id")
@@ -963,10 +968,8 @@ class TextResultRecoveryTests(unittest.TestCase):
             ConversationBindingService._locate_text_request_conversation(
                 duplicate_backend, receipt,
             )
-        self.assertEqual(
-            duplicate.exception.recovery_reason,
-            TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
-        )
+        self.assertEqual(duplicate.exception.code, "CONVERSATION_BINDING_MISMATCH")
+        self.assertFalse(duplicate.exception.recovery_reason)
         self.assertFalse(duplicate.exception.conversation_id)
 
     def test_missing_conversation_lookup_preserves_the_original_request_parent(self):
@@ -1051,10 +1054,100 @@ class TextResultRecoveryTests(unittest.TestCase):
         self.assertEqual(incomplete.exception.recovery_scan["next_index"], 0)
         backend._list_recent_conversations.assert_called_once_with(
             limit=ConversationBindingService.RECOVERY_RECENT_CONVERSATION_LIMIT,
+            offset=0,
             timeout_secs=10.0,
             strict_schema=True,
         )
         backend._get_conversation.assert_not_called()
+
+    def test_missing_conversation_scan_accepts_real_iso_update_time_and_stops_at_dispatch(self):
+        receipt = self.request_receipt(
+            created_at=ConversationBindingService._timestamp("2026-09-17T15:15:38.243Z"),
+        )
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = [
+            {
+                "id": f"conversation-{index}",
+                "update_time": "2026-09-17T13:30:26.273935Z",
+            }
+            for index in range(20)
+        ]
+        backend._get_conversation.side_effect = [
+            {"conversation_id": f"conversation-{index}", "mapping": {}}
+            for index in range(20)
+        ]
+
+        with self.assertRaises(ConversationBindingError) as complete:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+
+        self.assertEqual(
+            complete.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+        )
+        backend._list_recent_conversations.assert_called_once_with(
+            limit=20, offset=0, timeout_secs=10.0, strict_schema=True,
+        )
+        self.assertEqual(backend._get_conversation.call_count, 20)
+        self.assertEqual(
+            ConversationBindingService._conversation_update_time(
+                {"update_time": "2026-09-17T13:30:26.273935Z"}
+            ),
+            1789651826.273935,
+        )
+        self.assertEqual(
+            ConversationBindingService._conversation_update_time({"update_time": "123.5"}),
+            123.5,
+        )
+        self.assertIsNone(
+            ConversationBindingService._conversation_update_time(
+                {"update_time": "2026-09-17T13:30:26"}
+            )
+        )
+
+    def test_missing_timestamps_continue_beyond_each_hundred_candidate_window(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        backend = mock.Mock()
+
+        def list_page(*, offset, **_kwargs):
+            if offset >= 120:
+                return []
+            return [
+                {"id": f"conversation-{offset + index}"}
+                for index in range(20)
+            ]
+
+        backend._list_recent_conversations.side_effect = list_page
+        backend._get_conversation.side_effect = lambda conversation_id, **_kwargs: {
+            "conversation_id": conversation_id,
+            "mapping": {},
+        }
+
+        with self.assertRaises(ConversationBindingError) as first:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+        self.assertEqual(
+            first.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value,
+        )
+        self.assertEqual(first.exception.recovery_scan["next_offset"], 100)
+        self.assertEqual(first.exception.recovery_scan["conversation_ids"], [])
+        receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = first.exception.recovery_scan
+
+        with self.assertRaises(ConversationBindingError) as complete:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+
+        self.assertEqual(
+            complete.exception.recovery_reason,
+            TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+        )
+        self.assertEqual(
+            [call.kwargs["offset"] for call in backend._list_recent_conversations.call_args_list],
+            [0, 20, 40, 60, 80, 100, 120],
+        )
+        self.assertEqual(backend._get_conversation.call_count, 120)
 
     def test_missing_conversation_lookup_failures_do_not_become_no_result_evidence(self):
         receipt = self.request_receipt()
@@ -1133,7 +1226,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         self.assertEqual(failed.exception.code, "CONVERSATION_BINDING_CONTRACT_INVALID")
         self.assertEqual(failed.exception.recovery_scan["next_index"], 1)
 
-    def test_missing_conversation_scan_treats_detail_404_as_a_completed_candidate(self):
+    def test_missing_conversation_scan_does_not_treat_detail_404_as_absence(self):
         receipt = self.request_receipt()
         receipt.pop("conversation_id")
         receipt.pop("parent_message_id")
@@ -1152,11 +1245,10 @@ class TextResultRecoveryTests(unittest.TestCase):
         with self.assertRaises(ConversationBindingError) as complete:
             ConversationBindingService._locate_text_request_conversation(backend, receipt)
 
-        self.assertEqual(
-            complete.exception.recovery_reason,
-            TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
-        )
-        self.assertEqual(backend._get_conversation.call_count, 2)
+        self.assertEqual(complete.exception.code, "RECOVERY_READ_FAILED")
+        self.assertFalse(complete.exception.recovery_reason)
+        self.assertEqual(complete.exception.recovery_scan["next_index"], 0)
+        self.assertEqual(backend._get_conversation.call_count, 1)
 
     def test_missing_conversation_scan_identity_change_starts_a_fresh_snapshot(self):
         receipt = self.request_receipt()

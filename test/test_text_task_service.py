@@ -9,6 +9,7 @@ from unittest import mock
 from services.conversation_binding_service import (
     ConversationBindingError,
     ConversationBindingService,
+    RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
     RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
 )
@@ -295,6 +296,43 @@ class TextTaskTests(unittest.TestCase):
         self.assertNotIn("parent_message_id", result)
         self.assertEqual(len(self.queue.calls), 1, "recovery never resubmits upstream")
 
+    def test_coverage_aware_empty_read_does_not_inherit_legacy_qualified_count(self):
+        clock = ManualClock()
+
+        def reader(_receipt):
+            raise ConversationBindingError(
+                "covered account history contains no matching request",
+                code="CONVERSATION_OUTCOME_UNKNOWN",
+                recovery_reason=TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
+                recovery_scan={},
+                recovery_coverage_version=1,
+            )
+
+        service = TextTaskService(
+            self.path, executor=self.queue, clock=clock, recovery_reader=reader,
+        )
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="paid-binding",
+            provider_account_identity="paid-account",
+            recovery_no_result_reads=2,
+        )
+        clock.advance(TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS + 1)
+
+        result = service.recover("owner", "attempt-1", True)
+
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["recovery_no_result_reads"], 1)
+        self.assertNotIn(RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD, result)
+        with service._db() as db:
+            stored = json.loads(db.execute(
+                "SELECT receipt FROM requests WHERE owner=? AND id=?",
+                ("owner", "attempt-1"),
+            ).fetchone()[0])
+        self.assertEqual(stored[RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD], 1)
+
     def test_exact_root_lookup_anchor_is_persisted_for_future_reads(self):
         clock = ManualClock()
 
@@ -495,10 +533,17 @@ class TextTaskTests(unittest.TestCase):
                 self.list_calls = 0
                 self.detail_calls = []
 
-            def _list_recent_conversations(self, **_kwargs):
+            def _list_recent_conversations(self, *, offset, **_kwargs):
                 self.list_calls += 1
                 ScanClock.advance(1.5)
-                return [{"id": f"conversation-{index}"} for index in range(20)]
+                update_time = 1100 if offset == 0 else 900
+                return [
+                    {
+                        "id": f"conversation-{offset + index}",
+                        "update_time": update_time - index,
+                    }
+                    for index in range(20)
+                ]
 
             def _get_conversation(self, conversation_id, *, timeout_secs):
                 self.detail_calls.append((conversation_id, timeout_secs))
@@ -555,14 +600,14 @@ class TextTaskTests(unittest.TestCase):
                 recovery_reader=reader,
             )
             result = first
-            for _ in range(9):
+            for _ in range(19):
                 recovery_clock.advance(TextTaskService.RECOVERY_BASE_BACKOFF_SECONDS + 1)
                 result = restarted.recover("owner", "attempt-1", True)
 
-        self.assertEqual(backend.list_calls, 1)
+        self.assertEqual(backend.list_calls, 2)
         self.assertEqual(
             [conversation_id for conversation_id, _timeout in backend.detail_calls],
-            [f"conversation-{index}" for index in range(20)],
+            [f"conversation-{index}" for index in range(40)],
         )
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(
@@ -588,6 +633,10 @@ class TextTaskTests(unittest.TestCase):
                 "request_message_id": "request-message",
             },
             "conversation_ids": ["conversation-one"],
+            "next_offset": 1,
+            "coverage_complete": True,
+            "time_order_valid": False,
+            "last_update_time": None,
             "next_index": 0,
             "matches": [],
         }
@@ -1059,6 +1108,173 @@ class TextTaskTests(unittest.TestCase):
                 self.assertEqual(recovered.status_code, 200, recovered.text)
                 self.assertEqual(recovered.json()["status"], "queued")
         self.assertEqual(len(self.queue.calls), 1)
+
+    def test_http_durable_id_conflict_precedes_enabled_ai_review(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        from services import content_filter
+
+        service = TextTaskService(self.path, executor=self.queue)
+        app = FastAPI()
+        app.include_router(create_router())
+        review_response = mock.Mock(status_code=200, text="ALLOW")
+        review_response.json.return_value = {
+            "choices": [{"message": {"content": "ALLOW"}}],
+        }
+        review_config = {
+            "enabled": True,
+            "base_url": "https://review.test",
+            "api_key": "review-test-key",
+            "model": "review-model",
+        }
+        original_config = content_filter.config.data
+        configured = {**original_config, "ai_review": review_config}
+        with (
+            mock.patch("api.ai.text_task_service", service),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token}),
+            mock.patch.object(content_filter.config, "data", configured),
+            mock.patch("services.content_filter.requests.post", return_value=review_response) as review,
+            TestClient(app) as client,
+        ):
+            first = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(first.json()["status"], "queued")
+            self.assertEqual(review.call_count, 1)
+            self.assertEqual(len(self.queue.calls), 1)
+
+            same = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(same.status_code, 200, same.text)
+            self.assertEqual(same.json()["status"], "queued")
+            self.assertEqual(review.call_count, 1, "same durable request reuses its review")
+            self.assertEqual(len(self.queue.calls), 1)
+
+            conflict = client.post(
+                "/api/conversation-bindings/text",
+                json={
+                    **self.body,
+                    "messages": [{"role": "user", "content": "different input"}],
+                },
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(conflict.status_code, 409, conflict.text)
+            self.assertEqual(
+                conflict.json()["detail"]["code"],
+                "CONVERSATION_REQUEST_CONFLICT",
+            )
+            self.assertEqual(review.call_count, 1, "conflict must not call external review")
+            self.assertEqual(len(self.queue.calls), 1, "conflict must not schedule execution")
+
+            new_request = client.post(
+                "/api/conversation-bindings/text",
+                json={**self.body, "client_request_id": "attempt-2"},
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(new_request.status_code, 200, new_request.text)
+            self.assertEqual(review.call_count, 2)
+            self.assertEqual(len(self.queue.calls), 2)
+
+    def test_http_not_started_replay_reschedules_without_another_ai_review(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        from services import content_filter
+
+        app = FastAPI()
+        app.include_router(create_router())
+        review_response = mock.Mock(status_code=200, text="ALLOW")
+        review_response.json.return_value = {
+            "choices": [{"message": {"content": "ALLOW"}}],
+        }
+        configured = {
+            **content_filter.config.data,
+            "ai_review": {
+                "enabled": True,
+                "base_url": "https://review.test",
+                "api_key": "review-test-key",
+                "model": "review-model",
+            },
+        }
+        first_queue = QueuedExecutor()
+        first_service = TextTaskService(self.path, executor=first_queue)
+        with (
+            mock.patch("api.ai.text_task_service", first_service),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token}),
+            mock.patch.object(content_filter.config, "data", configured),
+            mock.patch("services.content_filter.requests.post", return_value=review_response) as review,
+            TestClient(app) as client,
+        ):
+            first = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+        self.assertEqual(first.status_code, 200, first.text)
+        original_message_id = first.json()["request_message_id"]
+        self.assertEqual(review.call_count, 1)
+        self.assertEqual(len(first_queue.calls), 1)
+
+        restarted_queue = QueuedExecutor()
+        restarted = TextTaskService(self.path, executor=restarted_queue)
+        self.assertEqual(restarted.read("owner", "attempt-1")["status"], "not_started")
+        with (
+            mock.patch("api.ai.text_task_service", restarted),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token}),
+            mock.patch.object(content_filter.config, "data", configured),
+            mock.patch("services.content_filter.requests.post", return_value=review_response) as review,
+            TestClient(app) as client,
+        ):
+            replay = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(replay.status_code, 200, replay.text)
+            self.assertEqual(replay.json()["status"], "queued")
+            self.assertEqual(replay.json()["request_message_id"], original_message_id)
+            self.assertEqual(review.call_count, 0)
+            self.assertEqual(len(restarted_queue.calls), 1)
+
+            conflict = client.post(
+                "/api/conversation-bindings/text",
+                json={
+                    **self.body,
+                    "messages": [{"role": "user", "content": "different input"}],
+                },
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(conflict.status_code, 409, conflict.text)
+            self.assertEqual(review.call_count, 0)
+            self.assertEqual(len(restarted_queue.calls), 1)
+
+            queued = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(queued.json()["status"], "queued")
+            self.assertEqual(review.call_count, 0)
+            self.assertEqual(len(restarted_queue.calls), 1)
+
+            restarted._update(
+                "owner", "attempt-1", status="succeeded", content="done",
+            )
+            succeeded = client.post(
+                "/api/conversation-bindings/text",
+                json=self.body,
+                headers={"Authorization": "owner"},
+            )
+            self.assertEqual(succeeded.json()["status"], "succeeded")
+            self.assertEqual(review.call_count, 0)
+            self.assertEqual(len(restarted_queue.calls), 1)
 
     def test_last_user_message_has_the_saved_identity_for_text_and_gallery(self):
         from services.openai_backend_api import OpenAIBackendAPI

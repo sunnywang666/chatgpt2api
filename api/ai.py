@@ -252,21 +252,35 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
+        owner = str(identity.get("id") or "anonymous")
         payload = body.model_dump(mode="python")
-        request_preview = request_text(payload.get("messages"))
-        await filter_or_log(
-            LoggedCall(
-                identity,
-                "/api/conversation-bindings/text",
-                body.model,
-                "绑定会话文本",
-                request_text=request_preview,
-            ),
-            request_preview,
-        )
         try:
             if body.client_request_id:
-                return await run_in_threadpool(text_task_service.submit, str(identity.get("id") or "anonymous"), payload)
+                # Reject a durable id/body conflict before the optional AI
+                # review can make an external request. submit repeats the same
+                # check transactionally after review to close the race.
+                existing = await run_in_threadpool(
+                    text_task_service.validate_submission, owner, payload,
+                )
+                if existing is not None:
+                    if existing.get("status") == "not_started":
+                        return await run_in_threadpool(
+                            text_task_service.submit, owner, payload,
+                        )
+                    return existing
+            request_preview = request_text(payload.get("messages"))
+            await filter_or_log(
+                LoggedCall(
+                    identity,
+                    "/api/conversation-bindings/text",
+                    body.model,
+                    "绑定会话文本",
+                    request_text=request_preview,
+                ),
+                request_preview,
+            )
+            if body.client_request_id:
+                return await run_in_threadpool(text_task_service.submit, owner, payload)
             return await run_in_threadpool(conversation_binding_service.complete_text, payload)
         except ConversationBindingError as exc:
             detail = {"code": exc.code, "error": str(exc)}
