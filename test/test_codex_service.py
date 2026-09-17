@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import base64
 import hashlib
 import json
 import threading
@@ -41,10 +42,15 @@ class FakeAccounts:
         item = self.accounts.get(token)
         return dict(item) if item else None
 
-    def update_account(self, token, updates, quiet=False):
+    def update_account(self, token, updates, quiet=False, *, expected_credentials=None):
         self.updates.append((token, updates, quiet))
         if token not in self.accounts:
             return None
+        current = self.accounts[token]
+        if expected_credentials is not None and expected_credentials != (
+            current.get("access_token", ""), current.get("account_id", "")
+        ):
+            return dict(current)
         self.accounts[token].update(updates)
         return dict(self.accounts[token])
 
@@ -660,7 +666,7 @@ class CodexRelayTests(unittest.TestCase):
             with self.subTest(changed_field=changed_field):
                 accounts = FakeAccounts([account()])
                 service = CodexService(accounts, SessionFactory([]))
-                service._mark_observation_state("token-a", "auth_required", "codex_http_401")
+                service._mark_observation_state("token-a", "auth_required", "codex_http_401", accounts.get_account("token-a"), service._credential_digest(accounts.get_account("token-a")))
                 old = accounts.accounts.pop("token-a")
                 old[changed_field] = "new-authorization"
                 token = old["access_token"]
@@ -688,7 +694,7 @@ class CodexRelayTests(unittest.TestCase):
         original_get = session.get
 
         def reject_while_reading(*args, **kwargs):
-            service._mark_observation_state("token-a", "auth_required", "codex_http_401")
+            service._mark_observation_state("token-a", "auth_required", "codex_http_401", accounts.get_account("token-a"), service._credential_digest(accounts.get_account("token-a")))
             return original_get(*args, **kwargs)
 
         session.get = reject_while_reading
@@ -714,6 +720,24 @@ class CodexRelayTests(unittest.TestCase):
             self.assertEqual(result["state"], "auth_required")
             self.assertEqual(result["failed_at"], prior["failed_at"])
             self.assertEqual(result["error_code"], "codex_http_401")
+            self.assertNotIn("codex_auth_rejection", accounts.get_account("token-a"))
+
+    def test_legacy_401_does_not_bind_to_token_issued_after_failure(self):
+        prior = observation(state="auth_required", minutes_ago=10)
+        prior.update(error_code="codex_http_401", failed_at="2026-09-16T20:27:36+00:00")
+        failure_time = int(datetime.fromisoformat(prior["failed_at"]).timestamp())
+        for issued_at, expected in ((failure_time + 60, "observed"), (failure_time - 60, "auth_required")):
+            with self.subTest(issued_at=issued_at):
+                claims = base64.urlsafe_b64encode(json.dumps({"iat": issued_at}).encode()).decode().rstrip("=")
+                token = f"header.{claims}.signature"
+                accounts = FakeAccounts([account(token, codex_observation=prior)])
+                session = FakeSession(gets=[
+                    FakeResponse(payload={"models": [{"slug": "gpt-5.6-codex"}]}),
+                    FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 10}}}),
+                ])
+                service = CodexService(accounts, SessionFactory([session]))
+                self.assertEqual(service.refresh_account(token)["state"], expected)
+                self.assertNotIn("codex_auth_rejection", accounts.get_account(token))
 
     def test_upstream_5xx_is_unknown_and_not_replayed_or_rebound(self):
         session = FakeSession(post_response=FakeResponse(status=503, payload={"detail": "private"}))

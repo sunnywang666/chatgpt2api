@@ -8,6 +8,8 @@ from services.account_service import AccountService
 from services.config import config
 from services.storage.json_storage import JSONStorageBackend
 from services.owned_accounts import public_owned_account
+from services.codex_service import CodexService, CodexServiceError
+from test.test_codex_service import FakeResponse, FakeSession, SessionFactory, account
 
 
 class CodexAccountManagementTests(unittest.TestCase):
@@ -15,6 +17,57 @@ class CodexAccountManagementTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.accounts = AccountService(JSONStorageBackend(Path(self.tmp.name) / "accounts.json"))
+
+    def test_inflight_401_cannot_reject_replacement_credentials(self):
+        for changed_field in ("access_token", "account_id"):
+            for timing in ("during_post", "before_atomic_update"):
+                with self.subTest(changed_field=changed_field, timing=timing):
+                    path = Path(self.tmp.name) / f"{changed_field}-{timing}.json"
+                    accounts = AccountService(JSONStorageBackend(path))
+                    accounts.add_account_items([account()])
+                    session = FakeSession(post_response=FakeResponse(status=401, payload={}))
+                    service = CodexService(accounts, SessionFactory([session]))
+                    original_post = session.post
+                    original_update = accounts.update_account
+                    rotated = False
+
+                    def rotate():
+                        nonlocal rotated
+                        if rotated:
+                            return
+                        rotated = True
+                        if changed_field == "access_token":
+                            accounts._apply_refreshed_tokens("token-a", {"access_token": "token-new"}, "test")
+                        else:
+                            original_update("token-a", {"account_id": "account-new"}, quiet=True)
+
+                    def post(*args, **kwargs):
+                        self.assertEqual(kwargs["headers"]["authorization"], "Bearer token-a")
+                        self.assertEqual(kwargs["headers"]["chatgpt-account-id"], "account-token-a")
+                        if timing == "during_post":
+                            rotate()
+                        return original_post(*args, **kwargs)
+
+                    def update(token, changes, quiet=False, **kwargs):
+                        if timing == "before_atomic_update" and "codex_auth_rejection" in changes:
+                            rotate()
+                        return original_update(token, changes, quiet, **kwargs)
+
+                    session.post = post
+                    with patch.object(accounts, "refresh_access_token", side_effect=lambda token, **_: token), \
+                            patch.object(accounts, "update_account", side_effect=update):
+                        with self.assertRaises(CodexServiceError) as rejected:
+                            service.submit({"id": "caller"}, {"model": "gpt-5.6-codex", "input": []}, {"session-id": "original"})
+                    self.assertEqual(rejected.exception.code, "codex_auth_required")
+                    self.assertTrue(rotated)
+                    self.assertEqual(len(session.calls), 1)
+                    token = "token-new" if changed_field == "access_token" else "token-a"
+                    # Re-open persisted storage: neither aliases nor restart
+                    # may attach the old response's 401 to the new credential.
+                    current = AccountService(JSONStorageBackend(path)).get_account(token)
+                    self.assertNotIn("codex_auth_rejection", current)
+                    self.assertEqual(CodexService.account_projection(current)["state"], "observed")
+                    self.assertEqual(next(iter(current["codex_affinities"].values()))["state"], "bound")
 
     def test_service_pool_includes_legacy_accounts_without_adopting_or_saving(self):
         self.accounts.add_account_items([

@@ -1466,7 +1466,7 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
-    def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
+    def update_account(self, access_token: str, updates: dict, quiet: bool = False, *, expected_credentials: tuple[str, str] | None = None) -> dict | None:
         if not access_token:
             return None
         with self._lock:
@@ -1474,6 +1474,13 @@ class AccountService:
             current = self._accounts.get(access_token)
             if current is None:
                 return None
+            # An in-flight Codex observation belongs to the authorization sent,
+            # not a replacement reached through a token alias. Compare and
+            # update under the same lock as token/account rotation.
+            if expected_credentials is not None and expected_credentials != (
+                str(current.get("access_token") or ""), str(current.get("account_id") or "")
+            ):
+                return dict(current)
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
                 return None
