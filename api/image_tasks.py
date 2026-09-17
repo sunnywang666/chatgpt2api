@@ -35,6 +35,15 @@ class ResumePollRequest(BaseModel):
     allow_unrecoverable_retry: bool = False
 
 
+class AdoptLatestConversationImageRequest(BaseModel):
+    provider_binding_id: str = Field(..., min_length=1, max_length=300)
+    provider_account_identity: str = Field(..., min_length=1, max_length=300)
+    client_conversation_id: str = Field(..., min_length=1, max_length=300)
+    conversation_id: str = Field(..., min_length=1, max_length=300)
+    source_request_message_id: str = Field(default="", max_length=300)
+    source_image_message_id: str = Field(default="", max_length=300)
+
+
 def _parse_task_ids(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -154,6 +163,31 @@ def create_router() -> APIRouter:
         except ValueError as exc:
             status = 409 if "different immutable request" in str(exc) else 400
             raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-tasks/{task_id}/adopt-latest-conversation-image")
+    async def adopt_latest_conversation_image(
+        task_id: str,
+        body: AdoptLatestConversationImageRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            result = await run_in_threadpool(
+                image_task_service.adopt_latest_conversation_image,
+                identity,
+                task_id,
+                provider_binding_id=body.provider_binding_id,
+                provider_account_identity=body.provider_account_identity,
+                client_conversation_id=body.client_conversation_id,
+                conversation_id=body.conversation_id,
+                source_request_message_id=body.source_request_message_id,
+                source_image_message_id=body.source_image_message_id,
+                base_url=resolve_image_base_url(request),
+            )
+            return client_task(result, request)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
     @router.get("/api/image-tasks/{task_id}/images/{index}")
     async def download_task_image(task_id: str, index: int, authorization: str | None = Header(default=None)):
