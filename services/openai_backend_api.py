@@ -201,6 +201,10 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
+        # This flag is per image attempt. It changes only at the exact
+        # generation POST boundary; upload/bootstrap/requirements/prepare do
+        # not prove that an image request was submitted.
+        self.image_submission_started: bool | None = None
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
@@ -1098,6 +1102,14 @@ class OpenAIBackendAPI:
         elif parent_message_id:
             raise RuntimeError("parent_message_id requires conversation_id")
         path = "/backend-api/f/conversation"
+        record_submission_started = getattr(
+            getattr(self, "progress_callback", None), "record_submission_started", None,
+        )
+        if callable(record_submission_started):
+            # Persist the boundary before entering the network call. If the
+            # receipt cannot be updated, fail closed without making the POST.
+            record_submission_started()
+        self.image_submission_started = True
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
@@ -2821,6 +2833,7 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
+        self.image_submission_started = False
         self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         self._report_progress("bootstrapping")

@@ -40,6 +40,7 @@ class ImageGenerationError(Exception):
         provider_account_identity: str = "",
         parent_message_id: str = "",
         request_message_id: str = "",
+        upstream_submitted: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -52,6 +53,7 @@ class ImageGenerationError(Exception):
         self.provider_account_identity = provider_account_identity
         self.parent_message_id = parent_message_id
         self.request_message_id = request_message_id
+        self.upstream_submitted = upstream_submitted
 
     def to_openai_error(self) -> dict[str, Any]:
         error_dict = {
@@ -1425,6 +1427,7 @@ def _generate_bound_single_image(
                 conversation_id = str(getattr(exc, "conversation_id", "") or last_conversation_id)
                 parent_message_id = str(getattr(exc, "parent_message_id", "") or "")
                 request_message_id = str(getattr(backend, "image_request_message_id", "") or "")
+                upstream_submitted = getattr(backend, "image_submission_started", None)
                 if conversation_id and backend is not None and not parent_message_id:
                     try:
                         parent_message_id = backend.get_conversation_parent_message_id(conversation_id)
@@ -1436,6 +1439,8 @@ def _generate_bound_single_image(
                     exc.conversation_id = conversation_id
                     exc.parent_message_id = parent_message_id
                     exc.request_message_id = request_message_id
+                    if exc.upstream_submitted is None and isinstance(upstream_submitted, bool):
+                        exc.upstream_submitted = upstream_submitted
                     raise
                 if isinstance(exc, ImageContentPolicyError):
                     raise ImageGenerationError(
@@ -1449,17 +1454,30 @@ def _generate_bound_single_image(
                         conversation_id=conversation_id,
                         parent_message_id=parent_message_id,
                         request_message_id=request_message_id,
+                        upstream_submitted=(
+                            upstream_submitted if isinstance(upstream_submitted, bool) else None
+                        ),
                     ) from exc
-                raise ImageGenerationError(
+                error = ImageGenerationError(
                     image_stream_error_message(str(exc)),
-                    code="CONVERSATION_OUTCOME_UNKNOWN" if conversation_id else "CONVERSATION_BINDING_UNAVAILABLE",
+                    code=(
+                        "IMAGE_GENERATION_NOT_SUBMITTED"
+                        if upstream_submitted is False
+                        else "CONVERSATION_OUTCOME_UNKNOWN"
+                        if conversation_id
+                        else "CONVERSATION_BINDING_UNAVAILABLE"
+                    ),
                     account_email=account_email,
                     provider_binding_id=binding_id,
                     provider_account_identity=account_identity,
                     conversation_id=conversation_id,
                     parent_message_id=parent_message_id,
                     request_message_id=request_message_id,
-                ) from exc
+                    upstream_submitted=(
+                        upstream_submitted if isinstance(upstream_submitted, bool) else None
+                    ),
+                )
+                raise error from exc
     finally:
         try:
             if backend is not None:
