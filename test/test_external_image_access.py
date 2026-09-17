@@ -65,7 +65,7 @@ class ExternalImageAccessTests(unittest.TestCase):
                 break
             time.sleep(.01)
         self.assertEqual(result["items"][0]["status"], "success")
-        self.auth.update_owned_policy("workbench:org:a", self.key_a["id"], ["codex_coding"], 1)
+        self.auth.update_owned_policy("workbench:org:a", self.key_a["id"], ["codex"], 1)
         self.assertEqual(self.client.get("/api/image-tasks?ids=policy-history", headers=self.headers()).json()["items"][0]["id"], "policy-history")
         with patch("api.image_tasks.task_image_bytes", return_value=b"image") as download:
             self.assertEqual(self.client.get("/api/image-tasks/policy-history/images/0", headers=self.headers()).content, b"image")

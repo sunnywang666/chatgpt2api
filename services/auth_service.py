@@ -13,9 +13,8 @@ from typing import Literal
 from services.config import config
 from services.storage.base import StorageBackend
 
-from services.program_key_policy import ProgramKeyPolicy, PolicyError, make_policy, Capability
+from services.program_key_policy import ProgramKeyPolicy, PolicyError, make_policy
 
-READY_CAPABILITIES = frozenset({Capability.CHAT_IMAGE, Capability.CODEX_CODING})
 
 AuthRole = Literal["admin", "user"]
 
@@ -27,25 +26,6 @@ def _now_iso() -> str:
 def _hash_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-
-def _legacy_text_compatibility(value: object) -> list[dict]:
-    """Only an explicit reconciled legacy endpoint/model allowlist, never prose."""
-    if value is None:
-        return []
-    if not isinstance(value, list) or len(value) > 2:
-        raise PolicyError("LEGACY_COMPATIBILITY_INVALID")
-    output = []
-    endpoints = set()
-    for entry in value:
-        if (not isinstance(entry, dict) or set(entry) != {"endpoint", "models"}
-                or entry["endpoint"] not in {"/v1/chat/completions", "/v1/responses"}
-                or entry["endpoint"] in endpoints
-                or not isinstance(entry["models"], list) or not 1 <= len(entry["models"]) <= 100
-                or any(not isinstance(m, str) or not m or len(m) > 100 or any(c.isspace() for c in m) for m in entry["models"])):
-            raise PolicyError("LEGACY_COMPATIBILITY_INVALID")
-        endpoints.add(entry["endpoint"])
-        output.append({"endpoint": entry["endpoint"], "models": sorted(set(entry["models"]))})
-    return output
 
 
 class AuthService:
@@ -86,7 +66,6 @@ class AuthService:
             "created_at": created_at,
             "last_used_at": last_used_at,
             "policy": deepcopy(raw.get("policy")),
-            "legacy_text_compatibility": _legacy_text_compatibility(raw.get("legacy_text_compatibility")),
         }
 
     def _load(self) -> list[dict[str, object]]:
@@ -125,7 +104,6 @@ class AuthService:
             "last_used_at": item.get("last_used_at"),
             "policy": policy,
             "policy_state": "active" if policy is not None else "reconciliation_required",
-            "legacy_text_compatibility": _legacy_text_compatibility(item.get("legacy_text_compatibility")),
         }
 
     def list_keys(self, role: AuthRole | None = None) -> list[dict[str, object]]:
@@ -189,9 +167,8 @@ class AuthService:
             raise ValueError("这个名称已经在使用中了，换一个更容易区分的名称吧")
         return candidate
 
-    def create_key(self, *, role: AuthRole, name: str = "", owner_subject: str = "", capabilities: list[str] | None = None) -> tuple[dict[str, object], str]:
-        policy = make_policy(capabilities if capabilities is not None else ["chat_image"],
-                             revision=1, ready=READY_CAPABILITIES) if role == "user" else None
+    def create_key(self, *, role: AuthRole, name: str = "", owner_subject: str = "", routes: list[str] | None = None) -> tuple[dict[str, object], str]:
+        policy = make_policy(routes if routes is not None else ["chat"], revision=1) if role == "user" else None
         with self._transaction():
             normalized_name = self._build_name_locked(name, role=role)
             while True:
@@ -276,7 +253,7 @@ class AuthService:
                 return False
             return True
 
-    def update_owned_policy(self, owner: str, key_id: str, capabilities: list[str],
+    def update_owned_policy(self, owner: str, key_id: str, routes: list[str],
                             expected_revision: int) -> dict[str, object] | None:
         with self._transaction():
             for item in self._items:
@@ -286,16 +263,14 @@ class AuthService:
                 revision = ProgramKeyPolicy.from_record(existing).revision if existing is not None else 0
                 if type(expected_revision) is not int or expected_revision != revision:
                     raise PolicyError("KEY_POLICY_REVISION_CONFLICT")
-                item["policy"] = make_policy(capabilities, revision=revision + 1,
-                                             ready=READY_CAPABILITIES).to_record()
-                item["legacy_text_compatibility"] = []
+                item["policy"] = make_policy(routes, revision=revision + 1).to_record()
                 return self._public_item(item)
         return None
 
     def reconcile_legacy_policies(self, assignments: list[dict], *, apply: bool = False) -> list[dict]:
         """Operator-only cutover step, never exposed to ordinary API callers.
 
-        Explicit key IDs/capabilities come from consumer/receipt reconciliation.
+        Explicit key IDs/routes come from consumer/receipt reconciliation.
         Hashes, owners, enabled state and tasks are unchanged. All enabled legacy
         keys must be accounted for so guard cutover cannot silently strand one.
         """
@@ -303,7 +278,7 @@ class AuthService:
             raise PolicyError("LEGACY_ASSIGNMENTS_INVALID")
         by_id = {}
         for assignment in assignments:
-            if not isinstance(assignment, dict) or set(assignment) - {"id", "capabilities", "legacy_text_compatibility"}:
+            if not isinstance(assignment, dict) or set(assignment) - {"id", "routes"}:
                 raise PolicyError("LEGACY_ASSIGNMENTS_INVALID")
             key_id = assignment.get("id")
             if not isinstance(key_id, str) or not key_id or key_id in by_id:
@@ -316,13 +291,11 @@ class AuthService:
                 raise PolicyError("LEGACY_KEY_SET_CHANGED")
             result = []
             for key_id, assignment in by_id.items():
-                policy = make_policy(assignment.get("capabilities"), revision=1, ready=READY_CAPABILITIES)
-                compatibility = _legacy_text_compatibility(assignment.get("legacy_text_compatibility"))
-                candidate = {**legacy[key_id], "policy": policy.to_record(),
-                             "legacy_text_compatibility": compatibility}
+                policy = make_policy(assignment.get("routes"), revision=1)
+                candidate = {**legacy[key_id], "policy": policy.to_record()}
                 result.append(self._public_item(candidate))
                 if apply:
-                    legacy[key_id].update(policy=candidate["policy"], legacy_text_compatibility=compatibility)
+                    legacy[key_id].update(policy=candidate["policy"])
             return result
 
     def authenticate(self, raw_key: str) -> dict[str, object] | None:

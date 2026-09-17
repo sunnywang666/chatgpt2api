@@ -1,7 +1,6 @@
 """Trusted request classification before any ordinary-key upstream admission."""
 from fastapi import HTTPException
 
-from services.auth_service import READY_CAPABILITIES
 from services.program_key_policy import (
     Capability, PolicyError, ProgramKeyPolicy, RequestUse, Route,
     authorize_submission, codex_use, image_use,
@@ -31,14 +30,21 @@ def _authorize(identity: dict, resolve) -> None:
     try:
         policy = ProgramKeyPolicy.from_record(identity.get("policy"))
         authorize_submission(policy, key_enabled=identity.get("enabled", True),
-                             use=resolve(), ready=READY_CAPABILITIES)
+                             use=resolve())
     except PolicyError as exc:
-        raise HTTPException(403, detail={"code": exc.code}) from None
+        status = 403 if exc.code.startswith("KEY_") else 400
+        if exc.code == "NATIVE_TOOL_NOT_CLASSIFIED":
+            status = 501
+        raise HTTPException(status, detail={"code": exc.code}) from None
 
 
 def require_image_policy(identity: dict, model: object) -> None:
     _authorize(identity, lambda: image_use(str(model or "gpt-image-2").strip().lower(),
                                          model_routes=IMAGE_ROUTES))
+
+
+def require_codex_endpoint(identity: dict) -> None:
+    _authorize(identity, lambda: RequestUse(Route.CODEX, frozenset({Capability.CODEX_CODING})))
 
 
 def require_codex_policy(identity: dict, payload: dict) -> None:
@@ -51,10 +57,4 @@ def require_codex_policy(identity: dict, payload: dict) -> None:
 
 
 def require_chat_text_policy(identity: dict, *, endpoint: str = "", model: object = "") -> None:
-    # Retain only observed pre-policy compatibility for explicitly reconciled
-    # keys. Updating the key policy removes this non-transferable exception.
-    if identity.get("enabled", True) and identity.get("policy") is not None:
-        for entry in identity.get("legacy_text_compatibility", []):
-            if entry["endpoint"] == endpoint and str(model or "auto").strip() in entry["models"]:
-                return
     _authorize(identity, lambda: RequestUse(Route.CHAT, frozenset({Capability.CHAT_TEXT})))

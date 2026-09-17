@@ -25,12 +25,12 @@ class EnabledAccount(BaseModel):
 class KeyName(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = ""
-    capabilities: list[str] = Field(default_factory=lambda: ["chat_image"])
+    routes: list[str] = Field(default_factory=lambda: ["chat"])
 
 
 class KeyPolicyUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    capabilities: list[str]
+    routes: list[str]
     expected_revision: int = Field(ge=0, strict=True)
 
 
@@ -94,7 +94,7 @@ def create_router() -> APIRouter:
     async def create_key(body: KeyName, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)
         try:
-            item, key = await run_in_threadpool(auth_service.create_key, role="user", name=body.name, owner_subject=owner, capabilities=body.capabilities)
+            item, key = await run_in_threadpool(auth_service.create_key, role="user", name=body.name, owner_subject=owner, routes=body.routes)
         except PolicyError as exc:
             raise HTTPException(422, detail={"code": exc.code}) from None
         except ValueError:
@@ -105,7 +105,7 @@ def create_router() -> APIRouter:
     async def update_key_policy(key_id: str, body: KeyPolicyUpdate, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)
         try:
-            item = await run_in_threadpool(auth_service.update_owned_policy, owner, key_id, body.capabilities, body.expected_revision)
+            item = await run_in_threadpool(auth_service.update_owned_policy, owner, key_id, body.routes, body.expected_revision)
         except PolicyError as exc:
             raise HTTPException(409 if exc.code == "KEY_POLICY_REVISION_CONFLICT" else 422, detail={"code": exc.code}) from None
         if item is None:

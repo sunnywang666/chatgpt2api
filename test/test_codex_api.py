@@ -42,7 +42,7 @@ class CodexApiTests(unittest.TestCase):
             codex_api,
             "require_identity",
             return_value={"id": "key-id", "name": "CLI", "role": "user", "enabled": True,
-                          "policy": {"version": 1, "revision": 1, "capabilities": ["codex_coding"]}},
+                          "policy": {"version": 2, "revision": 1, "routes": ["codex"]}},
         )
         self.identity = self.identity_patch.start()
         self.addCleanup(self.identity_patch.stop)

@@ -53,53 +53,51 @@ def _positive_integer(value: object) -> bool:
 class ProgramKeyPolicy:
     """Stored on the EXISTING key, not in a second policy/credential database."""
     revision: int
-    capabilities: frozenset[Capability]
+    routes: frozenset[Route]
 
     def __post_init__(self) -> None:
         if not _positive_integer(self.revision):
             raise PolicyError("KEY_POLICY_INVALID_REVISION")
-        if (not isinstance(self.capabilities, frozenset) or not self.capabilities
-                or any(not isinstance(item, Capability) for item in self.capabilities)):
-            raise PolicyError("KEY_POLICY_INVALID_CAPABILITIES")
+        if (not isinstance(self.routes, frozenset) or not self.routes
+                or any(not isinstance(item, Route) for item in self.routes)):
+            raise PolicyError("KEY_POLICY_INVALID_ROUTES")
 
     @classmethod
     def from_record(cls, value: object) -> "ProgramKeyPolicy":
         if value is None:
-            # A missing legacy policy is NOT interpreted as unlimited permission.
-            # Deployment must reconcile existing consumers before enabling guards.
             raise PolicyError("KEY_POLICY_RECONCILIATION_REQUIRED")
-        if not isinstance(value, dict) or set(value) != {"version", "revision", "capabilities"}:
+        if not isinstance(value, dict):
             raise PolicyError("KEY_POLICY_INVALID_RECORD")
-        if type(value["version"]) is not int or value["version"] != 1:
+        # Version 1 was an unreleased four-purpose candidate. Never silently
+        # broaden it into endpoint permission; require an explicit reviewed edit.
+        if type(value.get("version")) is not int or value["version"] != 2:
             raise PolicyError("KEY_POLICY_UNSUPPORTED_VERSION")
-        items = value["capabilities"]
+        if set(value) != {"version", "revision", "routes"}:
+            raise PolicyError("KEY_POLICY_INVALID_RECORD")
+        items = value["routes"]
         if (not isinstance(items, list) or not items
                 or any(type(item) is not str for item in items)):
-            raise PolicyError("KEY_POLICY_INVALID_CAPABILITIES")
+            raise PolicyError("KEY_POLICY_INVALID_ROUTES")
         if len(items) != len(set(items)):
-            raise PolicyError("KEY_POLICY_DUPLICATE_CAPABILITY")
+            raise PolicyError("KEY_POLICY_DUPLICATE_ROUTE")
         try:
-            capabilities = frozenset(Capability(item) for item in items)
+            routes = frozenset(Route(item) for item in items)
         except ValueError:
-            raise PolicyError("KEY_POLICY_UNKNOWN_CAPABILITY") from None
-        return cls(value["revision"], capabilities)
+            raise PolicyError("KEY_POLICY_UNKNOWN_ROUTE") from None
+        return cls(value["revision"], routes)
 
     def to_record(self) -> dict[str, object]:
-        return {"version": 1, "revision": self.revision,
-                "capabilities": sorted(item.value for item in self.capabilities)}
+        return {"version": 2, "revision": self.revision,
+                "routes": sorted(item.value for item in self.routes)}
 
 
-def make_policy(capabilities: Sequence[str], *, revision: int,
-                ready: frozenset[Capability]) -> ProgramKeyPolicy:
-    """A management operation: don't let an unshipped feature look enabled."""
-    if not isinstance(capabilities, Sequence) or isinstance(capabilities, (str, bytes)):
-        raise PolicyError("KEY_POLICY_INVALID_CAPABILITIES")
-    policy = ProgramKeyPolicy.from_record({
-        "version": 1, "revision": revision, "capabilities": list(capabilities),
+def make_policy(routes: Sequence[str], *, revision: int) -> ProgramKeyPolicy:
+    """Keys permit endpoints; operation readiness is not a key sub-permission."""
+    if not isinstance(routes, Sequence) or isinstance(routes, (str, bytes)):
+        raise PolicyError("KEY_POLICY_INVALID_ROUTES")
+    return ProgramKeyPolicy.from_record({
+        "version": 2, "revision": revision, "routes": list(routes),
     })
-    if not policy.capabilities <= ready:
-        raise PolicyError("CAPABILITY_NOT_READY")
-    return policy
 
 
 @dataclass(frozen=True)
@@ -134,7 +132,7 @@ class TaskBinding:
 
 
 def authorize_submission(policy: ProgramKeyPolicy, *, key_enabled: bool,
-                         use: RequestUse, ready: frozenset[Capability],
+                         use: RequestUse,
                          key_id: str = "", original: TaskBinding | None = None) -> RequestUse:
     """Authorize a new write. This is NOT permission to retry an unknown write."""
     if key_enabled is not True:
@@ -146,10 +144,8 @@ def authorize_submission(policy: ProgramKeyPolicy, *, key_enabled: bool,
             raise PolicyError("TASK_NOT_FOUND")
         if original.use != use:
             raise PolicyError("TASK_ROUTE_CHANGE_FORBIDDEN")
-    if not use.capabilities <= policy.capabilities:
-        raise PolicyError("KEY_CAPABILITY_DENIED")
-    if not use.capabilities <= ready:
-        raise PolicyError("CAPABILITY_NOT_READY")
+    if use.route not in policy.routes:
+        raise PolicyError("KEY_ROUTE_DENIED")
     return use
 
 

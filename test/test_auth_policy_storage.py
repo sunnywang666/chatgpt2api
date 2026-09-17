@@ -30,7 +30,7 @@ def stale_reader(kind, root, secret, ready, resume, results):
 @pytest.mark.parametrize("operation", ["revoke", "narrow"])
 def test_process_cache_cannot_restore_revocation_or_policy(tmp_path, kind, operation):
     a = AuthService(backend(kind, tmp_path))
-    item, secret = a.create_key(role="user", owner_subject="owner", capabilities=["chat_image", "codex_coding"])
+    item, secret = a.create_key(role="user", owner_subject="owner", routes=["chat", "codex"])
     context = multiprocessing.get_context("spawn")
     ready, resume, results = context.Event(), context.Event(), context.Queue()
     child = context.Process(target=stale_reader, args=(kind, str(tmp_path), secret, ready, resume, results))
@@ -40,7 +40,7 @@ def test_process_cache_cannot_restore_revocation_or_policy(tmp_path, kind, opera
         if operation == "revoke":
             assert a.revoke_owned_key("owner", item["id"])
         else:
-            a.update_owned_policy("owner", item["id"], ["codex_coding"], 1)
+            a.update_owned_policy("owner", item["id"], ["codex"], 1)
         resume.set()
         identity = results.get(timeout=15)
         child.join(15)
@@ -51,7 +51,7 @@ def test_process_cache_cannot_restore_revocation_or_policy(tmp_path, kind, opera
             assert restarted.authenticate(secret) is None
         else:
             assert identity["policy"]["revision"] == 2
-            assert restarted.authenticate(secret)["policy"]["capabilities"] == ["codex_coding"]
+            assert restarted.authenticate(secret)["policy"]["routes"] == ["codex"]
         assert len(restarted.list_keys()) == 2
     finally:
         if child.is_alive():
@@ -65,11 +65,11 @@ def test_update_conflict_owner_scope_and_secrets_survive_restart(tmp_path, kind)
     item, secret = first.create_key(role="user", owner_subject="owner")
     original = first.storage.load_auth_keys()[0]
     second = AuthService(backend(kind, tmp_path))
-    assert second.update_owned_policy("other", item["id"], ["codex_coding"], 1) is None
-    updated = second.update_owned_policy("owner", item["id"], ["codex_coding"], 1)
+    assert second.update_owned_policy("other", item["id"], ["codex"], 1) is None
+    updated = second.update_owned_policy("owner", item["id"], ["codex"], 1)
     assert updated["policy"]["revision"] == 2
     with pytest.raises(PolicyError, match="REVISION_CONFLICT"):
-        first.update_owned_policy("owner", item["id"], ["chat_image"], 1)
+        first.update_owned_policy("owner", item["id"], ["chat"], 1)
     assert first.authenticate(secret)["policy"] == updated["policy"]
     final = first.storage.load_auth_keys()[0]
     for field in ("id", "owner_subject", "key_hash", "created_at"):
@@ -82,14 +82,14 @@ def test_no_partial_write_on_policy_error_and_legacy_not_implicitly_open(tmp_pat
     service = AuthService(backend(kind, tmp_path))
     item, secret = service.create_key(role="user", owner_subject="owner")
     before = service.storage.load_auth_keys()
-    with pytest.raises(PolicyError, match="NOT_READY"):
+    with pytest.raises(PolicyError, match="UNKNOWN_ROUTE"):
         service.update_owned_policy("owner", item["id"], ["codex_image"], 1)
     assert service.storage.load_auth_keys() == before
     with service.storage.auth_keys_transaction() as keys:
         keys[0].pop("policy")
     legacy = service.authenticate(secret)
     assert legacy["policy"] is None and legacy["policy_state"] == "reconciliation_required"
-    assigned = service.update_owned_policy("owner", item["id"], ["chat_image"], 0)
+    assigned = service.update_owned_policy("owner", item["id"], ["chat"], 0)
     assert assigned["policy"]["revision"] == 1
 
 
@@ -113,9 +113,8 @@ def test_explicit_legacy_reconciliation_is_atomic_and_dry_run_is_read_only(tmp_p
         for item in records:
             item.pop("policy")
     original = service.storage.load_auth_keys()
-    assignments = [{"id": first["id"], "capabilities": ["chat_image", "codex_coding"],
-                    "legacy_text_compatibility": [{"endpoint": "/v1/chat/completions", "models": ["old-model"]}]},
-                   {"id": second["id"], "capabilities": ["chat_image"]}]
+    assignments = [{"id": first["id"], "routes": ["chat", "codex"]},
+                   {"id": second["id"], "routes": ["chat"]}]
     service.reconcile_legacy_policies(assignments)
     assert service.storage.load_auth_keys() == original
     with pytest.raises(PolicyError, match="KEY_SET_CHANGED"):
@@ -125,9 +124,9 @@ def test_explicit_legacy_reconciliation_is_atomic_and_dry_run_is_read_only(tmp_p
     assert len(result) == 2
     for prior, after in zip(original, service.storage.load_auth_keys()):
         assert all(prior[field] == after[field] for field in ("id", "owner_subject", "key_hash", "enabled"))
-    assert service.authenticate(secret)["legacy_text_compatibility"]
-    service.update_owned_policy("owner", first["id"], ["chat_image"], 1)
-    assert service.authenticate(secret)["legacy_text_compatibility"] == []
+    assert service.authenticate(secret)["policy"]["routes"] == ["chat", "codex"]
+    service.update_owned_policy("owner", first["id"], ["chat"], 1)
+    assert service.authenticate(secret)["policy"]["routes"] == ["chat"]
     with pytest.raises(PolicyError, match="KEY_SET_CHANGED"):
         service.reconcile_legacy_policies(assignments, apply=True)
 

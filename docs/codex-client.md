@@ -8,13 +8,13 @@ https://app.hugsweetglobal.com/ai/codex/v1
 
 Successful model discovery or deployment health does not prove that a real Responses turn can complete. Use the commands below for the approved account/API acceptance, and preserve the original session when the request outcome is unknown.
 
-## 程序密钥用途（第二阶段候选）
+## 程序密钥允许端（第二阶段候选）
 
-工作台「ChatGPT / Codex → 密钥与 CLI → 创建程序密钥」选择 **Codex编程**，保存一次性显示的普通密钥，再按下方已有 CLI 接入步骤配置。仅选择 Chat图片生成的密钥不能发起 Codex 编程请求。用途控制的是调用权限，不是额度或模型授权；模型发现成功仍不能证明上游账号可执行。
+工作台「ChatGPT / Codex → 密钥与 CLI → 创建程序密钥」勾选 **允许 Codex**，保存一次性显示的普通密钥，再按下方已有 CLI 步骤配置。也可以同时勾选「允许 Chat」。只允许 Chat 的密钥不能调用 Codex；具体编程、生图或其它该端已支持操作由应用请求决定，不再另设用途权限。模型发现成功不代表上游账号可执行。
 
-「编辑用途」保存后立即影响后续提交。并发修改返回 409 `KEY_POLICY_REVISION_CONFLICT`，刷新列表重新核对，不自动覆盖。403 `KEY_CAPABILITY_DENIED` 表示所选用途不允许该请求；`CAPABILITY_NOT_READY` 表示能力尚未开放。Chat识别/规划与 Codex生图本阶段不可新开通。撤销返回 401，已有记录保留；不要通过新建任务绕过未知结果。
+「编辑允许端」保存后影响后续提交。并发修改返回409 `KEY_POLICY_REVISION_CONFLICT`，刷新重新核对，不自动覆盖。403 `KEY_ROUTE_DENIED` 表示密钥未允许实际请求的端；接口/工具未实现返回技术错误，如501 `SERVICE_OPERATION_UNAVAILABLE` 或 `NATIVE_TOOL_NOT_CLASSIFIED`，不是缺少生图或规划权限。撤销后返回401，原记录保留；未知请求不新建重试。
 
-2026-09-17：此政策为未发布候选。用户要求逐把确认旧密钥用途后再切换；当前生产行为不由本文候选说明替代。迁移边界见 [部署指南](deployment.md#工作台程序密钥政策第二阶段)。
+2026-09-17：端级政策尚未发布。四把旧密钥保持原状，后续仅核对Chat/Codex兼容和切换影响；不再逐生图/规划/编程确认。部署边界见 [部署指南](deployment.md#工作台程序密钥政策第二阶段)。
 
 ## What the launchers do
 

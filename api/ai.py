@@ -212,7 +212,8 @@ def create_router() -> APIRouter:
     async def archive_bound_conversation(body: ConversationArchiveRequest,
             authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
-        require_chat_text_policy(identity)
+        if identity.get("role") != "admin":
+            raise HTTPException(404, detail={"code": "TASK_NOT_FOUND"})
         try:
             return await run_in_threadpool(conversation_binding_service.archive, body.model_dump())
         except ConversationBindingError as exc:
@@ -270,6 +271,9 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
+        if identity.get("role") != "admin":
+            raise HTTPException(501, detail={"code": "SERVICE_OPERATION_UNAVAILABLE",
+                "error": "ordinary-client bound conversation submission is not supported; use the supported Chat API"})
         require_chat_text_policy(identity)
         owner = str(identity.get("id") or "anonymous")
         payload = body.model_dump(mode="python")

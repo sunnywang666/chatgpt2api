@@ -1,7 +1,7 @@
 """Explicit one-time policy assignment on existing key records; dry run by default.
 
 Use during the owned Provider cutover with the old writer stopped. Input contains
-key IDs and capability names only, never raw keys or upstream account secrets.
+key IDs and route names only, never raw keys or upstream account secrets.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def main() -> int:
         print(json.dumps({"error": exc.code if isinstance(exc, PolicyError) else "KEY_RECONCILIATION_FAILED"}))
         return 1
     print(json.dumps({"applied": args.apply, "items": [
-        {field: item[field] for field in ("id", "enabled", "policy", "legacy_text_compatibility")}
+        {field: item[field] for field in ("id", "enabled", "policy")}
         for item in items
     ]}))
     return 0
