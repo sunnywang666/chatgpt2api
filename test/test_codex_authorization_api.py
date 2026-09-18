@@ -41,6 +41,19 @@ class CodexAuthorizationApiTests(unittest.TestCase):
         self.trusted = {"Authorization": "Bearer " + self.admin,
                         "X-Workbench-Account-Owner": "workbench:org:boss"}
 
+    def test_observation_requires_admin_bridge_and_forwards_scope(self):
+        ref = "car_" + "A" * 43
+        for pool in (False, True):
+            path = "/api/workbench/ai/" + ("pool/" if pool else "") + "codex-observation"
+            self.accounts.refresh_codex_observation.return_value = {"state": "observed", "limits": []}
+            denied = self.client.post(path, headers={**self.trusted, "Authorization": "Bearer " + self.user}, json={"account_ref": ref})
+            self.assertEqual(denied.status_code, 403)
+            self.accounts.refresh_codex_observation.assert_not_called()
+            result = self.client.post(path, headers=self.trusted, json={"account_ref": ref})
+            self.assertEqual(result.status_code, 200)
+            self.accounts.refresh_codex_observation.assert_called_once_with("workbench:org:boss", ref, pool)
+            self.accounts.reset_mock()
+
     def test_only_admin_bridge_can_attach_and_response_contains_no_material(self):
         self.accounts.attach_codex_authorization.return_value = {"attached": True, **self.body}
         response = self.client.post(self.route, headers=self.trusted, json=self.body)

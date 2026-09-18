@@ -79,6 +79,21 @@ class CodexDualAuthorizationTests(unittest.TestCase):
         self.accounts.add_account_items([item])
         return token
 
+    def test_quota_read_targets_original_account_and_checks_owner_before_upstream(self):
+        primary = self.add_primary()
+        ref = self.accounts.codex_authorization_ref(self.accounts.get_account(primary))
+        with patch("services.codex_service.codex_service") as service:
+            service.refresh_account.return_value = {"state": "observed", "limits": []}
+            with self.assertRaises(CodexAuthorizationAttachError):
+                self.accounts.refresh_codex_observation("workbench:other", ref)
+            service.refresh_account.assert_not_called()
+            self.accounts.refresh_codex_observation("workbench:o:boss", ref)
+            service.refresh_account.assert_called_once_with(primary)
+            service.reset_mock()
+            self.accounts.refresh_codex_observation("workbench:pool-admin", ref, True)
+            service.refresh_account.assert_called_once_with(primary)
+        self.assertEqual(len(self.accounts.list_accounts()), 1)
+
     def test_saved_authorization_is_independent_of_capacity_and_survives_restart(self):
         primary = self.add_primary()
         self.assertEqual(CodexService.account_projection(self.accounts.get_account(primary))["authorization_status"], "missing")
