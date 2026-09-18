@@ -1696,7 +1696,15 @@ class AccountService:
                 raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
             if not matches or (not pool and matches[0][1].get("managed_owner") != owner):
                 raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
-            token = matches[0][0]
+            token, account = matches[0]
+            # This new management action is exclusively for explicit Codex
+            # authorization. Do not enter legacy Chat-token fallback/refresh.
+            material = account.get("codex_credentials")
+            if not isinstance(material, dict) and account.get("source_type") == "codex":
+                material = account
+            credentials = self._validated_codex_credentials(material)
+            if self._account_identity(account) != self._codex_identity(credentials):
+                raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
         from services.codex_service import codex_service
         result = codex_service.refresh_account(token)
         self.codex_login_target(owner, account_ref, pool=pool)

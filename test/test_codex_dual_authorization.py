@@ -81,6 +81,7 @@ class CodexDualAuthorizationTests(unittest.TestCase):
 
     def test_quota_read_targets_original_account_and_checks_owner_before_upstream(self):
         primary = self.add_primary()
+        self.accounts.attach_codex_authorization(credentials("quota-read"))
         ref = self.accounts.codex_authorization_ref(self.accounts.get_account(primary))
         with patch("services.codex_service.codex_service") as service:
             service.refresh_account.return_value = {"state": "observed", "limits": []}
@@ -93,6 +94,34 @@ class CodexDualAuthorizationTests(unittest.TestCase):
             self.accounts.refresh_codex_observation("workbench:pool-admin", ref, True)
             service.refresh_account.assert_called_once_with(primary)
         self.assertEqual(len(self.accounts.list_accounts()), 1)
+
+    def test_chat_only_observation_rejects_before_codex_or_chat_refresh_for_both_scopes(self):
+        primary = self.add_primary()
+        before = self.accounts.get_account(primary)
+        ref = self.accounts.codex_authorization_ref(before)
+        with patch("services.codex_service.codex_service") as service, \
+                patch.object(self.accounts, "refresh_access_token") as chat_refresh:
+            for pool in (False, True):
+                with self.subTest(pool=pool), self.assertRaisesRegex(
+                    CodexAuthorizationAttachError, "invalid_material"
+                ):
+                    self.accounts.refresh_codex_observation("workbench:o:boss", ref, pool)
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "not_found"):
+                self.accounts.refresh_codex_observation("workbench:other", ref)
+            service.refresh_account.assert_not_called()
+            chat_refresh.assert_not_called()
+        self.assertEqual(self.accounts.get_account(primary), before)
+
+    def test_invalid_saved_codex_material_cannot_enter_legacy_refresh(self):
+        primary = self.add_primary(codex_credentials={"access_token": "incomplete"})
+        ref = self.accounts.codex_authorization_ref(self.accounts.get_account(primary))
+        with patch("services.codex_service.codex_service") as service:
+            for pool in (False, True):
+                with self.subTest(pool=pool), self.assertRaisesRegex(
+                    CodexAuthorizationAttachError, "invalid_material"
+                ):
+                    self.accounts.refresh_codex_observation("workbench:o:boss", ref, pool)
+            service.refresh_account.assert_not_called()
 
     def test_saved_authorization_is_independent_of_capacity_and_survives_restart(self):
         primary = self.add_primary()
