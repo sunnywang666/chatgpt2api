@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import datetime as dt
 import fcntl
@@ -245,8 +246,8 @@ def _state_path(args: argparse.Namespace) -> Path:
 
 
 def _validate_task_id(value: object) -> str:
-    if not isinstance(value, str) or TASK_ID_PATTERN.fullmatch(value) is None:
-        raise ClientError("client task ID must be 1..200 characters from A-Z, a-z, 0-9, underscore, period, colon, or hyphen")
+    if not isinstance(value, str) or TASK_ID_PATTERN.fullmatch(value) is None or value in {".", ".."}:
+        raise ClientError("client task ID must be 1..200 characters from A-Z, a-z, 0-9, underscore, period, colon, or hyphen, and cannot be . or ..")
     return value
 
 
@@ -538,6 +539,84 @@ def _command_download(api: ApiClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def _chat_state_path(args: argparse.Namespace) -> Path:
+    return Path(args.state or ".chat-client-request.json").expanduser()
+
+
+def _load_chat_state(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ClientError("cannot read Chat state file") from exc
+    if not isinstance(value, dict) or value.get("schema") != "chatgpt2api.chat-request.v1":
+        raise ClientError("not a Chat request state file")
+    _validate_task_id(value.get("request_id"))
+    return value
+
+
+def _chat_request_id(args: argparse.Namespace, state: dict[str, Any] | None) -> str:
+    explicit = getattr(args, "request_id", None)
+    if state:
+        if explicit and explicit != state["request_id"]:
+            raise ClientError("request ID does not match the Chat state file")
+        return state["request_id"]
+    return _validate_task_id(explicit)
+
+
+def _chat_receipt(api: ApiClient, request_id: str, *, recover: bool = False) -> dict[str, Any]:
+    path = f"/api/chat-requests/{parse.quote(request_id, safe='')}"
+    result = api.json("POST" if recover else "GET", path + ("/recover" if recover else ""),
+                      payload={} if recover else None)
+    if result.get("request_id") != request_id:
+        raise ClientError("Chat response changed the original request ID")
+    return result
+
+
+def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
+    parts: list[dict[str, Any]] = [{"type": "text", "text": args.prompt}]
+    for path in args.image:
+        item = _read_input_image(path)
+        if item["content_type"] not in {"image/png", "image/jpeg", "image/webp"}:
+            raise ClientError("Chat images must be PNG, JPEG or WebP")
+        parts.append({"type": "image_url", "image_url": {"url":
+            f"data:{item['content_type']};base64," + base64.b64encode(item["data"]).decode("ascii")}})
+    body = {"model": args.model, "messages": [{"role": "user", "content": parts}]}
+    fingerprint = _fingerprint(body)
+    state_path = _chat_state_path(args)
+    with _state_lock(state_path):
+        state = _load_chat_state(state_path)
+        if state:
+            request_id = _chat_request_id(args, state)
+            if fingerprint != state.get("input_fingerprint"):
+                raise ClientError("Chat request already belongs to different immutable input")
+            _emit(_chat_receipt(api, request_id))
+            return 0
+        request_id = _validate_task_id(args.request_id or f"chat-{uuid.uuid4()}")
+        state = {"schema": "chatgpt2api.chat-request.v1", "request_id": request_id,
+                 "input_fingerprint": fingerprint, "phase": "prepared", "created_at": _utc_now()}
+        _atomic_write_state(state_path, state)
+        try:
+            result = api.json("POST", "/api/chat-requests", payload={"client_request_id": request_id, **body})
+            if result.get("request_id") != request_id:
+                raise ClientError("Chat response changed the original request ID")
+        except (ClientError, KeyboardInterrupt):
+            state.update(phase="unknown", updated_at=_utc_now())
+            _atomic_write_state(state_path, state)
+            raise
+        state.update(phase="accepted", last_status=result.get("status"), updated_at=_utc_now())
+        _atomic_write_state(state_path, state)
+    _emit(result)
+    return 0
+
+
+def _command_chat_status(api: ApiClient, args: argparse.Namespace) -> int:
+    request_id = _chat_request_id(args, _load_chat_state(_chat_state_path(args)))
+    _emit(_chat_receipt(api, request_id, recover=args.command == "chat-recover"))
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", help="optional KEY=VALUE file; existing environment values win")
@@ -570,6 +649,16 @@ def _parser() -> argparse.ArgumentParser:
     download.add_argument("--task-id")
     download.add_argument("--index", type=int, default=0)
     download.add_argument("--output", required=True)
+    chat = subparsers.add_parser("chat-submit", help="submit one durable Chat text/image request, or read its original result")
+    chat.add_argument("--state")
+    chat.add_argument("--request-id")
+    chat.add_argument("--model", required=True)
+    chat.add_argument("--prompt", required=True)
+    chat.add_argument("--image", action="append", default=[])
+    for command in ("chat-status", "chat-recover"):
+        operation = subparsers.add_parser(command, help="read the original Chat receipt; recover only reads the upstream result")
+        operation.add_argument("--state")
+        operation.add_argument("--request-id")
     return parser
 
 
@@ -586,6 +675,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         commands = {
             "models": _command_models,
+            "chat-submit": _command_chat_submit,
+            "chat-status": _command_chat_status,
+            "chat-recover": _command_chat_status,
             "submit": _command_submit,
             "status": _command_status,
             "resume": _command_resume,

@@ -1108,6 +1108,58 @@ class AccountService:
             account_identity = self._provider_account_identity_for_token_locked(access_token)
         return binding_id, account_identity, access_token
 
+    def create_text_conversation_binding(self, *, text_model: str) -> tuple[str, str]:
+        """Bind an ordinary text conversation to the existing paid account pool.
+
+        Text-only callers must not consume or depend on image quota. Model
+        support still comes from the same observed catalog used by all other
+        text paths, and the resulting binding uses the existing persisted
+        account/conversation authority.
+        """
+        requested_model = str(text_model or "").strip()
+        if not requested_model or requested_model == "auto":
+            raise RuntimeError("conversation binding unavailable: explicit text model required")
+        from services.model_service import model_catalog_service
+
+        supported_types = {
+            self._normalize_account_type(value)
+            for value in model_catalog_service.route_for_model(requested_model).account_types
+        }
+        paid_types = {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
+        allowed_types = supported_types & paid_types
+        if not allowed_types:
+            raise RuntimeError("conversation binding unavailable: no paid account supports text model")
+
+        with self._lock:
+            candidates = [
+                str(account.get("access_token") or "")
+                for account in self._accounts.values()
+                if account.get("status") not in {"禁用", "异常"}
+                and not account.get("managed_disabled")
+                and self._normalize_account_type(account.get("type")) in allowed_types
+                and str(account.get("access_token") or "")
+            ]
+            if not candidates:
+                raise RuntimeError("conversation binding unavailable: no paid account supports text model")
+            access_token = candidates[self._index % len(candidates)]
+            self._index += 1
+
+        refreshed = self.refresh_access_token(access_token, event="create_text_conversation_binding")
+        if not refreshed:
+            raise RuntimeError("conversation binding unavailable: account token refresh failed")
+        with self._lock:
+            resolved = self._resolve_access_token_locked(refreshed)
+            account = self._accounts.get(resolved) or {}
+            if (
+                account.get("status") in {"禁用", "异常"}
+                or account.get("managed_disabled")
+                or self._normalize_account_type(account.get("type")) not in allowed_types
+            ):
+                raise RuntimeError("conversation binding unavailable: selected account changed")
+            binding_id = self._conversation_binding_for_token_locked(resolved)
+            account_identity = self._provider_account_identity_for_token_locked(resolved)
+        return binding_id, account_identity
+
     def get_bound_account_identity(self, binding_id: str) -> str:
         with self._lock:
             access_token = self._bound_token_locked(binding_id)

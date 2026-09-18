@@ -816,10 +816,15 @@ class ConversationBindingService:
             )
         else:
             try:
-                binding_id, account_identity, image_token = account_service.create_conversation_binding(
-                    image_model=image_model, text_model=model
-                )
-                account_service.release_image_slot(image_token)
+                if body.get("_text_only_binding") is True:
+                    binding_id, account_identity = account_service.create_text_conversation_binding(
+                        text_model=model,
+                    )
+                else:
+                    binding_id, account_identity, image_token = account_service.create_conversation_binding(
+                        image_model=image_model, text_model=model
+                    )
+                    account_service.release_image_slot(image_token)
             except RuntimeError as exc:
                 raise ConversationBindingError(str(exc)) from exc
 

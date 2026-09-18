@@ -8,13 +8,13 @@ https://app.hugsweetglobal.com/ai/codex/v1
 
 Successful model discovery or deployment health does not prove that a real Responses turn can complete. Use the commands below for the approved account/API acceptance, and preserve the original session when the request outcome is unknown.
 
-## 程序密钥允许端（第二阶段候选）
+## 程序密钥允许端（第二阶段已上线）
 
 工作台「ChatGPT / Codex → 密钥与 CLI → 创建程序密钥」勾选 **允许 Codex**，保存一次性显示的普通密钥，再按下方已有 CLI 步骤配置。也可以同时勾选「允许 Chat」。只允许 Chat 的密钥不能调用 Codex；具体编程、生图或其它该端已支持操作由应用请求决定，不再另设用途权限。模型发现成功不代表上游账号可执行。
 
 「编辑允许端」保存后影响后续提交。并发修改返回409 `KEY_POLICY_REVISION_CONFLICT`，刷新重新核对，不自动覆盖。403 `KEY_ROUTE_DENIED` 表示密钥未允许实际请求的端；接口/工具未实现返回技术错误，如501 `SERVICE_OPERATION_UNAVAILABLE` 或 `NATIVE_TOOL_NOT_CLASSIFIED`，不是缺少生图或规划权限。撤销后返回401，原记录保留；未知请求不新建重试。
 
-2026-09-17：端级政策尚未发布。四把旧密钥保持原状，后续仅核对Chat/Codex兼容和切换影响；不再逐生图/规划/编程确认。部署边界见 [部署指南](deployment.md#工作台程序密钥政策第二阶段)。
+2026-09-17：端级政策已部署并获用户确认，两把保留旧key均允许Chat/Codex、三把旧key已撤销；新key按当前政策执行。模型查询成功不代表真实Responses授权已解决。新接入优先从工作台复制给AI配置，公开合同 /ai/integration.md 与复制文本同源，普通密钥另行私密提供。部署边界见 [部署指南](deployment.md#工作台程序密钥政策第二阶段)。
 
 ## What the launchers do
 

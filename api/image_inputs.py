@@ -31,6 +31,7 @@ MAX_IMAGE_INPUT_BYTES = MAX_IMAGE_REFERENCE_BYTES * 2
 MAX_IMAGE_REDIRECTS = 5
 IMAGE_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 MAX_BASE64_INPUT_CHARS = 4 * ((MAX_IMAGE_REFERENCE_BYTES + 2) // 3)
+MAX_CHAT_TEXT_BYTES = 1024 * 1024
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
 
@@ -315,6 +316,127 @@ def _decode_data_url(url: str) -> ImageInput:
         raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
     filename = f"image_url.{_extension_from_mime(mime_type)}" if mime_type else "image_url"
     return _validated_image_input(data, filename, mime_type)
+
+
+def normalize_inline_chat_messages(messages: object) -> list[dict[str, Any]]:
+    """Validate public Chat messages and materialize only inline image bytes.
+
+    The ordinary Chat boundary intentionally does not fetch remote URLs. Every
+    image passes through the same bounded raster validation used by image edit
+    requests before the durable text request can be accepted.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(400, detail={"code": "CHAT_MESSAGES_INVALID", "error": "messages must be a non-empty array"})
+    if len(messages) > 100:
+        raise HTTPException(400, detail={"code": "CHAT_MESSAGES_INVALID", "error": "at most 100 messages are allowed"})
+
+    normalized: list[dict[str, Any]] = []
+    image_count = 0
+    image_bytes = 0
+    text_bytes = 0
+    has_user = False
+
+    def invalid(message: str, code: str = "CHAT_MESSAGES_INVALID") -> HTTPException:
+        return HTTPException(400, detail={"code": code, "error": message})
+
+    def image_part(part: dict[str, Any]) -> dict[str, Any]:
+        nonlocal image_count, image_bytes
+        kind = str(part.get("type") or "").strip()
+        if kind in {"image_url", "input_image"}:
+            allowed = {"type", "image_url"}
+            if set(part) - allowed:
+                raise invalid("image parts do not accept options", "CHAT_OPTION_UNSUPPORTED")
+            source = part.get("image_url")
+            if isinstance(source, dict):
+                if set(source) != {"url"}:
+                    raise invalid("image_url accepts only an inline url", "CHAT_OPTION_UNSUPPORTED")
+                source = source.get("url")
+            if not isinstance(source, str) or not source.strip():
+                raise invalid("image_url must be an inline data URL")
+            source = source.strip()
+            if source.lower().startswith(("http://", "https://")):
+                raise invalid("remote image URLs are not supported", "REMOTE_IMAGE_URL_NOT_SUPPORTED")
+            if not source.lower().startswith("data:image/"):
+                raise invalid("image_url must be an image data URL")
+            header, separator, encoded = source.partition(",")
+            if not separator:
+                raise invalid("invalid data image URL")
+            if ";base64" in header.lower() and len(encoded) > MAX_BASE64_INPUT_CHARS:
+                raise invalid("image data exceeds 50MB limit")
+            if ";base64" not in header.lower() and len(encoded) > MAX_IMAGE_REFERENCE_BYTES * 3:
+                raise invalid("image data exceeds 50MB limit")
+            data, _, mime = _decode_data_url(source)
+        else:
+            allowed = {"type", "data", "mime", "mime_type"}
+            if set(part) - allowed:
+                raise invalid("image parts do not accept options", "CHAT_OPTION_UNSUPPORTED")
+            source = part.get("data")
+            declared_mime = str(part.get("mime") or part.get("mime_type") or "image/png")
+            if isinstance(source, str):
+                if source.lower().startswith(("http://", "https://")):
+                    raise invalid("remote image URLs are not supported", "REMOTE_IMAGE_URL_NOT_SUPPORTED")
+                if not source.lower().startswith("data:image/"):
+                    raise invalid("string image data must be an image data URL")
+                header, separator, encoded = source.partition(",")
+                if not separator:
+                    raise invalid("invalid data image URL")
+                if ";base64" in header.lower() and len(encoded) > MAX_BASE64_INPUT_CHARS:
+                    raise invalid("image data exceeds 50MB limit")
+                if ";base64" not in header.lower() and len(encoded) > MAX_IMAGE_REFERENCE_BYTES * 3:
+                    raise invalid("image data exceeds 50MB limit")
+                data, _, mime = _decode_data_url(source)
+            elif isinstance(source, (bytes, bytearray)):
+                data, _, mime = _validated_image_input(bytes(source), "chat-image", declared_mime)
+            else:
+                raise invalid("image data must be bytes or an image data URL")
+        if mime not in {"image/png", "image/jpeg", "image/webp"}:
+            raise invalid("image format must be PNG, JPEG, or WebP", "CHAT_IMAGE_FORMAT_UNSUPPORTED")
+        image_count += 1
+        image_bytes += len(data)
+        if image_count > MAX_IMAGE_INPUT_COUNT:
+            raise invalid(f"at most {MAX_IMAGE_INPUT_COUNT} images are allowed")
+        if image_bytes > MAX_IMAGE_INPUT_BYTES:
+            raise invalid("combined image inputs exceed 100MB limit")
+        return {"type": "image", "data": data, "mime": mime}
+
+    for message in messages:
+        if not isinstance(message, dict) or set(message) != {"role", "content"}:
+            raise invalid("each message must contain only role and content")
+        role = str(message.get("role") or "").strip().lower()
+        if role not in {"system", "user", "assistant"}:
+            raise invalid("message role must be system, user, or assistant")
+        has_user = has_user or role == "user"
+        content = message.get("content")
+        if isinstance(content, str):
+            text_bytes += len(content.encode("utf-8"))
+            if text_bytes > MAX_CHAT_TEXT_BYTES:
+                raise invalid("combined message text exceeds 1MiB limit")
+            normalized.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list) or not content:
+            raise invalid("message content must be text or a non-empty parts array")
+        parts: list[dict[str, Any]] = []
+        for part in content:
+            if not isinstance(part, dict):
+                raise invalid("message parts must be objects")
+            kind = str(part.get("type") or "").strip()
+            if kind in {"text", "input_text"}:
+                if set(part) != {"type", "text"} or not isinstance(part.get("text"), str):
+                    raise invalid("text parts accept only type and text")
+                text_bytes += len(part["text"].encode("utf-8"))
+                if text_bytes > MAX_CHAT_TEXT_BYTES:
+                    raise invalid("combined message text exceeds 1MiB limit")
+                parts.append({"type": "text", "text": part["text"]})
+            elif kind in {"image_url", "input_image", "image"}:
+                if role != "user":
+                    raise invalid("only user messages may contain images")
+                parts.append(image_part(part))
+            else:
+                raise invalid("message part type is not supported", "CHAT_OPTION_UNSUPPORTED")
+        normalized.append({"role": role, "content": parts})
+    if not has_user:
+        raise invalid("messages must include a user message")
+    return normalized
 
 
 def _response_mime_type(response: requests.Response, parsed_path: str) -> str:
