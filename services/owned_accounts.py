@@ -33,7 +33,8 @@ def public_owned_account(account: dict) -> dict:
     capacity = observed_capacity(account)
     codex = codex_service.account_projection(account)
     status = str(account.get("status") or "")
-    return {
+    from services.account_service import AccountService
+    result = {
         "id": account["managed_account_id"],
         "label": f"{local[:1]}***@{domain}" if sep else "已接入账号",
         "source_type": account.get("source_type", "web"),
@@ -43,6 +44,10 @@ def public_owned_account(account: dict) -> dict:
         "codex": codex,
         "updated_at": account.get("managed_updated_at"),
     }
+    authorization_ref = AccountService.codex_authorization_ref(account)
+    if authorization_ref:
+        result["authorization_ref"] = authorization_ref
+    return result
 
 
 def utc_now() -> str:
@@ -57,7 +62,8 @@ def public_pool_account(account: dict, index: int) -> dict:
     status = str(account.get("status") or "")
     disabled = bool(account.get("managed_disabled")) or status == "禁用"
     source = account.get("source_type")
-    return {
+    from services.account_service import AccountService
+    result = {
         "id": f"pool-row-{index}",
         "label": f"服务账号 {index}",
         "source_type": source if source in {"web", "codex", "oauth_login", "password"} else "unknown",
@@ -67,3 +73,7 @@ def public_pool_account(account: dict, index: int) -> dict:
         "codex": codex,
         "updated_at": account.get("managed_updated_at") or capacity["observed_at"] or codex.get("observed_at"),
     }
+    authorization_ref = AccountService.codex_authorization_ref(account)
+    if authorization_ref:
+        result["authorization_ref"] = authorization_ref
+    return result
