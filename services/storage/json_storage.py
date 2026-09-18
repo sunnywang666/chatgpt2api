@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from services.storage.base import StorageBackend
+from services.storage.base import AccountCommitUncertain, StorageBackend
 
 
 class JSONStorageBackend(StorageBackend):
@@ -22,29 +22,79 @@ class JSONStorageBackend(StorageBackend):
 
     @staticmethod
     def _load_json_list(file_path: Path) -> list[dict[str, Any]]:
-        if not file_path.exists():
-            return []
         try:
-            data = json.loads(file_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
-        except (json.JSONDecodeError, Exception):
+            raw = file_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return []
+        except (OSError, UnicodeError):
+            raise RuntimeError("account storage is unreadable") from None
+        try:
+            data = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise RuntimeError("account storage is corrupt") from None
+        if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+            raise RuntimeError("account storage has invalid structure")
+        return data
 
     @staticmethod
-    def _save_json_list(file_path: Path, items: list[dict[str, Any]]) -> None:
+    def _sync_directory(directory: Path) -> None:
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def _save_json_list(cls, file_path: Path, items: list[dict[str, Any]]) -> None:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(
-            json.dumps(items, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        # Refuse to overwrite an unreadable/corrupt live pool with cached data.
+        cls._load_json_list(file_path)
+        fd, temporary = tempfile.mkstemp(dir=file_path.parent, prefix=".accounts-")
+        replacing = False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as target:
+                os.fchmod(target.fileno(), 0o600)
+                json.dump(items, target, ensure_ascii=False, indent=2)
+                target.write("\n")
+                target.flush()
+                os.fsync(target.fileno())
+            # A replace error is conservatively uncertain: a filesystem/driver
+            # may have replaced the directory entry before returning an error.
+            replacing = True
+            os.replace(temporary, file_path)
+            cls._sync_directory(file_path.parent)
+        except Exception:
+            if replacing:
+                raise AccountCommitUncertain("account commit outcome requires readback") from None
+            raise
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def load_accounts(self) -> list[dict[str, Any]]:
-        """从 JSON 文件加载账号数据"""
         return self._load_json_list(self.file_path)
 
     def save_accounts(self, accounts: list[dict[str, Any]]) -> None:
-        """保存账号数据到 JSON 文件"""
         self._save_json_list(self.file_path, accounts)
+
+    def confirm_accounts_commit(self) -> list[dict[str, Any]]:
+        # Settle file and directory durability before interpreting a post-replace
+        # error. Failure remains unknown; never rewrite or exchange again here.
+        try:
+            source_file = self.file_path.open("rb")
+        except FileNotFoundError:
+            self._sync_directory(self.file_path.parent)
+            return []
+        with source_file as source:
+            os.fsync(source.fileno())
+            self._sync_directory(self.file_path.parent)
+            try:
+                data = json.load(source)
+            except (ValueError, UnicodeError):
+                raise RuntimeError("account storage is corrupt") from None
+        if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+            raise RuntimeError("account storage has invalid structure")
+        return data
 
     def load_auth_keys(self) -> list[dict[str, Any]]:
         """从 JSON 文件加载鉴权密钥数据"""
@@ -98,7 +148,7 @@ class JSONStorageBackend(StorageBackend):
         try:
             # 检查文件是否可读写
             if self.file_path.exists():
-                self.file_path.read_text(encoding="utf-8")
+                self.load_accounts()
             return {
                 "status": "healthy",
                 "backend": "json",

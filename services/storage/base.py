@@ -5,6 +5,10 @@ from contextlib import AbstractContextManager
 from typing import Any
 
 
+class AccountCommitUncertain(RuntimeError):
+    """Account replacement may have happened; reconcile before any further save."""
+
+
 class StorageBackend(ABC):
     """抽象存储后端基类"""
 
@@ -17,6 +21,10 @@ class StorageBackend(ABC):
     def save_accounts(self, accounts: list[dict[str, Any]]) -> None:
         """保存所有账号数据"""
         pass
+
+    def confirm_accounts_commit(self) -> list[dict[str, Any]]:
+        """Read the committed account snapshot for an interrupted operation."""
+        return self.load_accounts()
 
     @abstractmethod
     def load_auth_keys(self) -> list[dict[str, Any]]:

@@ -78,23 +78,8 @@ class CodexLoginService:
         self._sessions = self._load_sessions()
         changed = False
         for session in self._sessions.values():
-            if session.get("state") == "completing" and session.get("completion_authorization_ref"):
-                readback = self.accounts.codex_login_completion_readback(
-                    str(session.get("owner") or ""),
-                    str(session.get("scope") or ""),
-                    str(session.get("mode") or ""),
-                    str(session.get("account_ref") or ""),
-                    str(session.get("completion_authorization_ref") or ""),
-                    str(session.get("completion_credential_digest") or ""),
-                )
-                if readback.get("applied"):
-                    session["state"] = "succeeded"
-                    session["account_ref"] = readback.get("account_ref") or session.get("account_ref")
-                    session["error_code"] = None
-                else:
-                    session["state"] = "interrupted"
-                    session["error_code"] = "codex_login_interrupted"
-                self._erase_terminal(session)
+            if session.get("state") in {"completing", "interrupted"} and session.get("completion_authorization_ref"):
+                self._reconcile_completion_locked(session)
                 changed = True
             elif session.get("state") in {"pending", "completing"}:
                 session["state"] = "interrupted"
@@ -339,9 +324,37 @@ class CodexLoginService:
             ).start()
         return result
 
+    def _reconcile_completion_locked(self, session: dict) -> None:
+        try:
+            readback = self.accounts.codex_login_completion_readback(
+                str(session.get("owner") or ""), str(session.get("scope") or ""),
+                str(session.get("mode") or ""), str(session.get("account_ref") or ""),
+                str(session.get("completion_authorization_ref") or ""),
+                str(session.get("completion_credential_digest") or ""),
+            )
+        except Exception:
+            session["state"] = "interrupted"
+            session["error_code"] = "codex_login_save_failed"
+            self._erase_sensitive(session)
+            # Keep the original operation's identity/digest for later GET or
+            # restart readback. No token material or repeat exchange is needed.
+            return
+        if readback.get("applied"):
+            session["state"] = "succeeded"
+            session["account_ref"] = readback.get("account_ref") or session.get("account_ref")
+            session["error_code"] = None
+        else:
+            session["state"] = "failed"
+            session["error_code"] = "codex_login_save_not_applied"
+        self._erase_terminal(session)
+
     def get(self, owner: str, scope: str, session_id: str) -> dict:
         with self._lock:
-            return self._public(self._lookup_locked(owner, scope, session_id))
+            session = self._lookup_locked(owner, scope, session_id)
+            if session.get("state") == "interrupted" and session.get("completion_authorization_ref"):
+                self._reconcile_completion_locked(session)
+                self._save_locked()
+            return self._public(session)
 
     def cancel(self, owner: str, scope: str, session_id: str) -> dict:
         with self._lock:
@@ -582,7 +595,18 @@ class CodexLoginService:
             code = "codex_login_stale_target" if exc.code == "codex_authorization_stale_target" else exc.code
             self._fail(session_id, code)
         except Exception:
-            self._fail(session_id, "codex_login_save_failed")
+            with self._lock:
+                session = self._sessions.get(session_id)
+                if session and session.get("completion_authorization_ref"):
+                    self._reconcile_completion_locked(session)
+                    try:
+                        self._save_locked()
+                    except Exception:
+                        # Previously persisted completing record stays the
+                        # recovery authority when the session store also fails.
+                        pass
+                else:
+                    self._fail(session_id, "codex_login_save_failed")
 
 
 codex_login_service = CodexLoginService()

@@ -20,6 +20,8 @@ Successful model discovery or deployment health does not prove that a real Respo
 
 ### Account login and authorization
 
+Account JSON commits use a same-directory temporary file, file fsync, atomic replacement and directory fsync with 0600 permissions. A corrupt or unreadable pool fails closed instead of becoming an empty pool. If replacement may have happened, the original login reads back the durable account snapshot and exact credential digest; it does not repeat the token exchange. A confirmed non-write and an unresolved commit remain distinct results.
+
 The account login/import flow is being added to the existing Workbench account
 center. Its code, deployment and actual upstream acceptance are separate states;
 do not treat this section as proof that the new UI has been deployed.

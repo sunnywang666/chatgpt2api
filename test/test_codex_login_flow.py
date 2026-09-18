@@ -333,6 +333,56 @@ class CodexLoginFlowTests(unittest.TestCase):
         self.assertEqual(len(self.accounts.list_owned_accounts("workbench:org:one")), 1)
         self.assertNotIn("completion_authorization_ref", self.sessions_path.read_text())
 
+    def test_replace_then_directory_failure_recovers_exact_original_login_and_preserves_pool(self):
+        from services.storage.base import AccountCommitUncertain
+        original = self.add_primary()
+        primary = credentials("primary")["access_token"]
+        self.accounts._accounts[primary]["codex_affinities"] = {"original": {"state": "bound"}}
+        self.accounts._accounts[primary]["codex_response_ids"] = {"receipt": {"owner": "caller"}}
+        self.accounts._save_accounts()
+        before = self.accounts.storage.load_accounts()[0]
+        self.accounts.storage.save_auth_keys([{"id": "ordinary-key", "key_hash": "fixture-hash"}])
+        key_bytes = self.accounts.storage.auth_keys_path.read_bytes()
+        incoming = credentials("directory-fault")
+        http = FakeHttp([device_start(), device_complete(), token_exchange(incoming)])
+        service = self.service(http)
+        pending = service.start("workbench:org:one", "owned", "attach", str(uuid.uuid4()), original["authorization_ref"])
+        with patch.object(JSONStorageBackend, "_sync_directory", side_effect=OSError("durability pending")):
+            service._run(pending["id"])
+            uncertain = service.get("workbench:org:one", "owned", pending["id"])
+            self.assertEqual(uncertain["state"], "interrupted")
+            self.assertEqual(uncertain["error_code"], "codex_login_save_failed")
+            with self.assertRaises(AccountCommitUncertain):
+                self.accounts._save_accounts()
+            self.assertIn("completion_credential_digest", self.sessions_path.read_text())
+        restarted_accounts = AccountService(JSONStorageBackend(self.accounts.storage.file_path))
+        restarted = CodexLoginService(self.sessions_path, restarted_accounts, FakeHttp([]).factory, auto_start_workers=False)
+        self.assertEqual(restarted.get("workbench:org:one", "owned", pending["id"])["state"], "succeeded")
+        # The same process can also settle its cache through original GET only.
+        self.assertEqual(service.get("workbench:org:one", "owned", pending["id"])["state"], "succeeded")
+        self.assertEqual(len(http.calls), 3)
+        after = self.accounts.storage.load_accounts()[0]
+        for field in ("access_token", "refresh_token", "id_token", "managed_owner", "managed_account_id", "codex_affinities", "codex_response_ids"):
+            self.assertEqual(after[field], before[field])
+        self.assertEqual(after["codex_credentials"], incoming)
+        self.assertEqual(self.accounts.storage.auth_keys_path.read_bytes(), key_bytes)
+        self.assertNotIn("completion_credential_digest", self.sessions_path.read_text())
+
+    def test_pre_replace_failure_reads_original_pool_and_never_exchanges_again(self):
+        self.add_primary()
+        before = self.accounts.storage.file_path.read_bytes()
+        incoming = credentials("new-account", subject="other", account_id=OTHER_ACCOUNT_ID)
+        http = FakeHttp([device_start(), device_complete(), token_exchange(incoming)])
+        service = self.service(http)
+        pending = service.start("workbench:org:one", "owned", "import", str(uuid.uuid4()))
+        with patch.object(JSONStorageBackend, "save_accounts", side_effect=OSError("before replace")):
+            service._run(pending["id"])
+        result = service.get("workbench:org:one", "owned", pending["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error_code"], "codex_login_save_not_applied")
+        self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
+        self.assertEqual(len(http.calls), 3)
+
     def test_recovery_does_not_mistake_old_same_identity_credentials_for_new_save(self):
         old = credentials("old")
         incoming = credentials("new")

@@ -18,7 +18,7 @@ from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
 )
-from services.storage.base import StorageBackend
+from services.storage.base import AccountCommitUncertain, StorageBackend
 from utils.helper import anonymize_token, is_codex_image_model, split_image_model
 
 
@@ -146,7 +146,22 @@ class AccountService:
         }
 
     def _save_accounts(self) -> None:
-        self.storage.save_accounts(list(self._accounts.values()))
+        if getattr(self, "_account_commit_uncertain", False):
+            raise AccountCommitUncertain("account commit outcome requires readback")
+        intended = list(self._accounts.values())
+        try:
+            self.storage.save_accounts(intended)
+        except AccountCommitUncertain:
+            self._account_commit_uncertain = True
+            try:
+                observed = self.storage.confirm_accounts_commit()
+            except Exception:
+                raise AccountCommitUncertain("account commit outcome requires readback") from None
+            if observed != intended:
+                raise AccountCommitUncertain("account commit outcome requires readback") from None
+            # Equality alone is insufficient: confirm_accounts_commit also
+            # settles filesystem durability before returning this snapshot.
+            self._account_commit_uncertain = False
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
@@ -1695,6 +1710,17 @@ class AccountService:
         exchanges a code or mutates an account.
         """
         with self._lock:
+            # The in-memory cache may have rolled back while replace committed.
+            # Only the storage's authoritative snapshot can settle this result.
+            persisted = self.storage.confirm_accounts_commit()
+            restored = {}
+            for item in persisted:
+                normalized = self._normalize_account(item)
+                if normalized is None:
+                    raise RuntimeError("account storage has invalid account")
+                restored[normalized["access_token"]] = normalized
+            self._accounts = restored
+            self._account_commit_uncertain = False
             lookup_ref = authorization_ref if mode == "import" else account_ref
             matches = self._account_ref_matches_locked(lookup_ref)
             if len(matches) != 1:
