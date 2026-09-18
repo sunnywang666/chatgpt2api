@@ -133,6 +133,17 @@ def account(token="token-a", **updates):
 
 
 class CodexObservationTests(unittest.TestCase):
+    def test_model_projection_applies_limit_after_discarding_invalid_entries(self):
+        accounts = FakeAccounts([account()])
+        session = FakeSession(gets=[
+            FakeResponse(payload={"models": [{} for _ in range(256)] + [{"slug": "gpt-new"}]}),
+            FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 10}}}),
+        ])
+
+        result = CodexService(accounts, SessionFactory([session])).refresh_account("token-a")
+
+        self.assertEqual([model["id"] for model in result["models"]], ["gpt-new"])
+
     def test_refresh_projects_safe_models_and_general_usage(self):
         accounts = FakeAccounts([account()])
         session = FakeSession(gets=[
@@ -341,6 +352,52 @@ class CodexRelayTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200)
         self.assertNotIn("codex_affinities", accounts.accounts["token-a"])
 
+    def test_models_read_updates_eligibility_for_the_returned_catalog(self):
+        accounts = FakeAccounts([account()])
+        catalog = FakeSession(gets=[FakeResponse(payload={"models": [{"slug": "gpt-new"}]})])
+        response = FakeSession(post_response=FakeResponse(payload={"id": "r-new"}))
+        service = CodexService(accounts, SessionFactory([catalog, response]))
+
+        models = service.list_native_models(self.identity, self.headers)
+        result = service.submit(self.identity, {"model": "gpt-new", "input": []}, self.headers)
+
+        self.assertEqual(json.loads(models.body)["models"][0]["slug"], "gpt-new")
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual([item["id"] for item in service.account_projection(accounts.get_account("token-a"))["models"]], ["gpt-new"])
+        self.assertEqual(len(catalog.calls), 1)
+        self.assertEqual(len(response.calls), 1)
+
+    def test_fresh_catalog_miss_cannot_trigger_probes_with_changing_model_names(self):
+        factory = SessionFactory([])
+        service = CodexService(FakeAccounts([account()]), factory)
+
+        for model in ("gpt-unknown-one", "gpt-unknown-two"):
+            with self.assertRaises(CodexServiceError) as raised:
+                service.submit(self.identity, {"model": model, "input": []}, self.headers)
+            self.assertEqual(raised.exception.code, "codex_busy")
+
+        self.assertEqual(factory.kwargs, [])
+
+    def test_models_read_does_not_clear_a_concurrent_response_auth_rejection(self):
+        accounts = FakeAccounts([account()])
+        session = FakeSession(gets=[FakeResponse(payload={"models": [{"slug": "gpt-new"}]})])
+        service = CodexService(accounts, SessionFactory([session]))
+        original_get = session.get
+
+        def reject_while_reading(*args, **kwargs):
+            current = accounts.get_account("token-a")
+            service._mark_observation_state(
+                "token-a", "auth_required", "codex_http_401", current, service._credential_digest(current)
+            )
+            return original_get(*args, **kwargs)
+
+        session.get = reject_while_reading
+        result = service.list_native_models(self.identity, self.headers)
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(service.account_projection(accounts.get_account("token-a"))["state"], "auth_required")
+        self.assertIn("codex_auth_rejection", accounts.get_account("token-a"))
+
     def test_compact_uses_fixed_endpoint_and_preserves_native_payload(self):
         payload = {"model": "gpt-5.6-codex", "input": [{"type": "compaction", "encrypted_content": "cipher"}]}
         session = FakeSession(post_response=FakeResponse(payload={"id": "cmp_1", "output": payload["input"]}))
@@ -356,6 +413,19 @@ class CodexRelayTests(unittest.TestCase):
         result = service.submit(self.identity, {"model": "gpt-5.6-codex", "input": []}, self.headers)
         self.assertEqual(result.status_code, 200)
         self.assertNotIn("chatgpt-account-id", session.calls[0][2]["headers"])
+
+    def test_caller_cannot_override_stored_chatgpt_account_id(self):
+        session = FakeSession(post_response=FakeResponse(payload={"id": "r"}))
+        service = CodexService(FakeAccounts([account(account_id="stored-account")]), SessionFactory([session]))
+
+        result = service.submit(
+            self.identity,
+            {"model": "gpt-5.6-codex", "input": []},
+            {**self.headers, "chatgpt-account-id": "caller-forged"},
+        )
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(session.calls[0][2]["headers"]["chatgpt-account-id"], "stored-account")
 
     def test_post_transport_error_is_not_retried_and_quarantines_unknown_outcome(self):
         session = FakeSession(post_error=TimeoutError("raw token-a upstream detail"))

@@ -184,7 +184,15 @@ def _project_models(payload: object) -> list[dict]:
         raw = payload
     if not isinstance(raw, list):
         raise ValueError("models payload is invalid")
-    return [model for item in raw[:256] if (model := _safe_model(item)) is not None]
+    models: list[dict] = []
+    for item in raw:
+        model = _safe_model(item)
+        if model is None:
+            continue
+        models.append(model)
+        if len(models) == 256:
+            break
+    return models
 
 
 def _safe_number(value: object) -> float | None:
@@ -506,6 +514,20 @@ class CodexService:
             return False
         return (datetime.now(timezone.utc) - observed_at).total_seconds() <= OBSERVATION_MAX_AGE_SECONDS
 
+    def _record_model_catalog(self, token: str, request_account: dict, models: list[dict]) -> None:
+        account = self.accounts.get_account(token)
+        if account is None:
+            return
+        observation = account.get("codex_observation")
+        observation = dict(observation) if isinstance(observation, dict) else {}
+        observation["models"] = models
+        self.accounts.update_account(
+            token,
+            {"codex_observation": observation},
+            quiet=True,
+            expected_credentials=self._credential_fields(request_account),
+        )
+
     @staticmethod
     def _affinity_key(identity: dict, forwarded: Mapping[str, object], payload: dict | None = None) -> str:
         lowered = {str(key).lower(): str(value) for key, value in forwarded.items()}
@@ -817,6 +839,12 @@ class CodexService:
             body = bytes(response.content)
             if len(body) > 4 * 1024 * 1024:
                 raise CodexServiceError(502, "codex_response_too_large", "The Codex model catalog is too large")
+            try:
+                models = _project_models(json.loads(body))
+            except Exception:
+                models = None
+            if models is not None:
+                self._record_model_catalog(token, account, models)
             self._release_account(token, affinity, known_terminal=True)
             self._capacity.release()
             return CodexHTTPResponse(200, _response_headers(response.headers), body=body)

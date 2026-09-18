@@ -1,22 +1,33 @@
 from __future__ import annotations
 
 import base64
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
+from services.auth_service import AuthService
+from services.storage.json_storage import JSONStorageBackend
 
 
-AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
 PNG_BYTES = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGPkEpFjYGBgYgADAALmAEAUQs4PAAAAAElFTkSuQmCC")
 DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
 
 
 class ImagesEditsApiTests(unittest.TestCase):
     def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        auth = AuthService(JSONStorageBackend(Path(temporary.name) / "accounts.json"))
+        _, secret = auth.create_key(role="admin", name="internal-edit-test")
+        self.auth_headers = {"Authorization": "Bearer " + secret}
+        auth_patcher = mock.patch("api.support.auth_service", auth)
+        auth_patcher.start()
+        self.addCleanup(auth_patcher.stop)
         self.handle_calls = []
 
         def fake_handle(payload):
@@ -34,7 +45,7 @@ class ImagesEditsApiTests(unittest.TestCase):
         """测试图片编辑接口支持官方 JSON image_url 引用。"""
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=self.auth_headers,
             json={
                 "model": "gpt-image-2",
                 "prompt": "edit",
@@ -55,7 +66,7 @@ class ImagesEditsApiTests(unittest.TestCase):
         """测试图片编辑接口对暂不支持的 file_id 返回明确错误。"""
         response = self.client.post(
             "/v1/images/edits",
-            headers=AUTH_HEADERS,
+            headers=self.auth_headers,
             json={
                 "model": "gpt-image-2",
                 "prompt": "edit",

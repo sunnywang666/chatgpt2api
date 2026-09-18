@@ -227,7 +227,8 @@ class AccountService:
             normalized.pop("type", None)
         normalized["type"] = normalized.get("type") or "free"
         normalized["status"] = "禁用" if normalized.get("managed_disabled") else normalized.get("status") or "正常"
-        normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
+        quota = normalized.get("quota")
+        normalized["quota"] = max(0, int(quota)) if quota is not None else None
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
         normalized["proxy"] = str(normalized.get("proxy") or "").strip()
@@ -1549,21 +1550,6 @@ class AccountService:
             return dict(account)
         return None
 
-    def _record_refresh_success(self, access_token: str) -> None:
-        with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
-            if current is None:
-                return
-            next_item = dict(current)
-            next_item["invalid_count"] = 0
-            next_item["last_invalid_at"] = None
-            next_item["last_refresh_error"] = None
-            next_item["last_refresh_error_at"] = None
-            account = self._normalize_account(next_item)
-            if account is not None:
-                self._accounts[access_token] = account
-
     def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
         if not isinstance(account, dict):
             return False
@@ -1665,6 +1651,11 @@ class AccountService:
             return self.update_account(active_token, updates, quiet=True)
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
+            request_account = self.get_account(active_token) or {}
+            expected_credentials = (
+                active_token,
+                str(request_account.get("account_id") or ""),
+            )
             backend = OpenAIBackendAPI(active_token)
             try:
                 result = backend.get_user_info()
@@ -1674,6 +1665,11 @@ class AccountService:
             refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
             if refreshed_token and refreshed_token != active_token:
                 try:
+                    request_account = self.get_account(refreshed_token) or {}
+                    expected_credentials = (
+                        refreshed_token,
+                        str(request_account.get("account_id") or ""),
+                    )
                     backend = OpenAIBackendAPI(refreshed_token)
                     try:
                         result = backend.get_user_info()
@@ -1698,13 +1694,28 @@ class AccountService:
                 ):
                     self.remove_invalid_token(active_token, event)
                 raise
+        incoming_account_id = OpenAIBackendAPI._validated_account_id(result.get("account_id"))
+        existing_account_id = str(request_account.get("account_id") or "").strip()
+        if incoming_account_id and (not existing_account_id or incoming_account_id == existing_account_id):
+            result["account_id"] = incoming_account_id
+        else:
+            result.pop("account_id", None)
         from services.owned_accounts import utc_now
         result["capacity_observed_at"] = utc_now()
         result["capacity_used_since_observation"] = False
         result["capacity_read_failed_at"] = None
         result["managed_updated_at"] = utc_now()
-        self._record_refresh_success(active_token)
-        return self.update_account(active_token, result)
+        result.update(
+            invalid_count=0,
+            last_invalid_at=None,
+            last_refresh_error=None,
+            last_refresh_error_at=None,
+        )
+        return self.update_account(
+            active_token,
+            result,
+            expected_credentials=expected_credentials,
+        )
 
     # ---- 刷新进度追踪 ----
 

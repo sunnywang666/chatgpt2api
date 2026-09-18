@@ -12,12 +12,85 @@ os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
 from services.account_service import AccountService
 from services.auth_service import AuthService
 from services.config import config
-from services.openai_backend_api import InvalidAccessTokenError
+from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
+from services.owned_accounts import observed_capacity
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
+    def test_image_quota_projection_distinguishes_unknown_zero_and_positive(self) -> None:
+        unknown_limits = (
+            [],
+            [{"feature_name": "other", "remaining": 4}],
+            [{"feature_name": "image_gen"}],
+            [{"feature_name": "image_gen", "remaining": None}],
+            [{"feature_name": "image_gen", "remaining": "unknown"}],
+            [{"feature_name": "image_gen", "remaining": "3"}],
+            [{"feature_name": "image_gen", "remaining": True}],
+            [{"feature_name": "image_gen", "remaining": -1}],
+            [{"feature_name": "image_gen", "remaining": 1.5}],
+            [{"feature_name": "image_gen", "remaining": float("inf")}],
+        )
+        for limits in unknown_limits:
+            with self.subTest(limits=limits):
+                self.assertIsNone(OpenAIBackendAPI._extract_quota_and_restore_at(limits)[0])
+                self.assertIsNone(observed_capacity({"limits_progress": limits})["remaining"])
+        self.assertEqual(OpenAIBackendAPI._extract_quota_and_restore_at([
+            {"feature_name": "image_gen", "remaining": 0}
+        ])[0], 0)
+        self.assertEqual(OpenAIBackendAPI._extract_quota_and_restore_at([
+            {"feature_name": "image_gen", "remaining": 3}
+        ])[0], 3)
+        self.assertEqual(OpenAIBackendAPI._extract_quota_and_restore_at([
+            {"feature_name": "image_gen", "remaining": 3.0}
+        ])[0], 3)
+        self.assertEqual(observed_capacity({
+            "limits_progress": [{"feature_name": "image_gen", "remaining": 3}]
+        })["remaining"], 3)
+
+    def test_unknown_image_quota_stays_unknown_and_is_not_admitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            account = service._normalize_account({"access_token": "unknown", "status": "正常"})
+
+            self.assertIsNone(account["quota"])
+            self.assertFalse(service._is_image_account_available(account))
+            self.assertEqual(service._normalize_account({"access_token": "zero", "quota": 0})["quota"], 0)
+            self.assertEqual(service._normalize_account({"access_token": "positive", "quota": 2})["quota"], 2)
+
+    def test_user_info_marks_only_observed_zero_as_limited(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.access_token = "fixture-token"
+        backend._get_me = lambda: {"email": "fixture@example.com", "id": "user-1"}
+        backend._get_default_account = lambda: {"plan_type": "Plus"}
+
+        for limits, quota, status in (([], None, "正常"), (
+            [{"feature_name": "image_gen", "remaining": 0}], 0, "限流"
+        ), (
+            [{"feature_name": "image_gen", "remaining": 2}], 2, "正常"
+        )):
+            with self.subTest(limits=limits):
+                backend._get_conversation_init = lambda limits=limits: {"limits_progress": limits}
+                result = backend.get_user_info()
+                self.assertEqual(result["quota"], quota)
+                self.assertEqual(result["status"], status)
+
+    def test_user_info_only_projects_a_valid_upstream_workspace_id(self) -> None:
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        backend.access_token = "fixture-token"
+        backend._get_me = lambda: {"email": "fixture@example.com", "id": "user-1"}
+        backend._get_conversation_init = lambda: {"limits_progress": []}
+        valid = "12345678-1234-5678-9234-567812345678"
+
+        for value, expected in ((valid, valid), ("", None), (None, None), ("not-a-uuid", None)):
+            with self.subTest(value=value):
+                backend._get_default_account = lambda value=value: {
+                    "plan_type": "Pro", "account_id": value
+                }
+                result = backend.get_user_info()
+                self.assertEqual(result.get("account_id"), expected)
+
     def test_product_binding_requires_one_account_capable_of_text_and_images(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
