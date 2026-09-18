@@ -26,10 +26,14 @@ The account login/import flow is being added to the existing Workbench account
 center. Its code, deployment and actual upstream acceptance are separate states;
 do not treat this section as proof that the new UI has been deployed.
 
-- **New account:** choose `接入账号` → `登录授权 Codex`. The service starts an
+- **Submit authorization:** choose `接入账号` → `登录授权 Codex`. The service starts an
   official device-code login and the page shows a short-lived code and the official
   sign-in link. Complete sign-in at `https://auth.openai.com/codex/device` and enter
   that code. Workbench then reports the result without asking you to copy tokens.
+  Verified upstream subject/workspace identity determines whether to add a new
+  record or supplement an existing one. A different Workbench user or Chrome
+  Profile does not require duplicating the upstream account or switching to its
+  original owner; existing ownership, Chat credentials and request bindings remain.
 - **Existing account:** choose `补充 Codex 授权` on the intended account. The service
   checks the returned upstream subject and workspace against that selected record.
   Another account is rejected; this never replaces the record's Chat credential,
@@ -60,8 +64,14 @@ The existing boss/administrator same-origin attachment route is
 cannot manage accounts. The UI supplies a stable opaque `account_ref` when
 attaching to a selected service-pool record; `pool-row-N` is display-only.
 The legacy no-reference attachment remains compatible with its strict unique
-subject/workspace match. Login/import requests keep the same role and ownership
-boundaries and never return upstream access, refresh or ID tokens to the browser.
+subject/workspace match. General login/import can match a record owned by another
+Workbench identity after verifying the newly submitted upstream authorization.
+The submitter receives only a minimal import receipt and a safe reference for
+reading the submitted Codex authorization observation, not management/export
+access to that record. Saving starts a capacity read; unknown, limited, failed
+and authentication-required observations remain distinct. An uncertain save
+reads back the original submission and must not trigger another import or login.
+Upstream access, refresh and ID tokens are never returned to the browser.
 
 `examples/codex_client/run-codex.sh` and `examples/codex_client/run-codex.ps1` first request `GET /models`. Discovery accepts native Codex `models[].slug` and OpenAI-compatible `data[].id` responses without changing the provider protocol. Run discovery without a model, then select one exact returned ID before they create an isolated state root and launch Codex.
 
