@@ -4,7 +4,7 @@
 
 ## 工作台程序密钥政策第二阶段
 
-**2026-09-17：候选，禁止当前生产切换。** 线上四把旧密钥允许端及兼容影响未确认，用户明确选择确认后再切换。不能默认双端授权，也不能直接部署缺政策即拒绝的认证版本。此节只说明后续已获切换授权时的操作边界。
+**2026-09-17：第二阶段已上线并获用户确认。** Provider PR18与Workbench PR948已发布；按用户明确决定，两把保留旧密钥允许Chat/Codex，另外三把旧密钥已撤销。原政策迁移已完成，后续发布不得重复迁移、恢复旧auth快照或启动policy-unaware版本；新增key按其实际政策执行。下文保留维护与恢复边界。
 
 政策写入既有 auth_keys 记录，不新建账号池或密钥正本。政策为 `version:2`，`routes` 可选 `chat`、`codex` 或两端；不再有生图/识别/规划/编程子权限。版本1仅为未发布候选，不自动扩大转换；接口/工具技术就绪与密钥授权分开。内部 Workbench 管理接口保留管理员认证和服务端 owner 注入，普通程序密钥不能调用：
 
@@ -21,7 +21,7 @@ JSON 使用同路径文件锁与原子替换；SQL 使用事务（SQLite 写锁�
 [{"id":"<confirmed-existing-key-id>","routes":["chat"]}]
 ```
 
-`python scripts/reconcile_program_keys.py --assignments <reviewed-file>` 默认只读核对；必须一次覆盖全部启用且无政策的普通密钥，集合变化即失败。`--apply` 才写入。不再使用历史文本用途例外；允许Chat即可使用该端已支持操作。缩小允许端仍允许读取原有且同 owner 的任务/文件/回执，不重新生成，撤销则禁止全部调用。旧直接cursor的归档也仅限admin/Content；普通客户端直接绑定会话提交尚不支持，返回技术501，不能凭别人的binding写入。旧 `GET /api/conversation-bindings/text` 的直接 cursor 没有持久调用方归属，仅保留现有 admin/Content 路径；普通密钥使用按 key ID 归属的 `/api/conversation-bindings/text-requests/{request_id}` 及原回执恢复，不能凭他人的 cursor 取得文本。
+`python scripts/reconcile_program_keys.py --assignments <reviewed-file>` 默认只读核对；必须一次覆盖全部启用且无政策的普通密钥，集合变化即失败。`--apply` 才写入。不再使用历史文本用途例外；允许Chat即可使用该端已支持操作。缩小允许端仍允许读取原有且同 owner 的任务/文件/回执，不重新生成，撤销则禁止全部调用。旧直接cursor的归档也仅限admin/Content；普通客户端直接绑定会话提交尚不支持，返回技术501，不能凭别人的binding写入。旧 `GET /api/conversation-bindings/text` 的直接 cursor 没有持久调用方归属，仅保留现有 admin/Content 路径；原内部回执继续保留。第三阶段新增公共 `/api/chat-requests` 提交与 `/{request_id}` 查询、`/{request_id}/recover` 原结果读取，使用同一TextTaskService按key ID归属；客户端不提供账号或cursor，不能凭他人的cursor取得文本。只精确开放这些公网路由及无秘密 `/ai/integration.md`，不得公开管理路由或整个 `/ai/`。
 
 正式切换遵循 Workbench 当前 `docs/runbooks/DEPLOYMENT_AND_ROLLBACK_P0_1.md`、唯一发布负责人及精确镜像 digest：先保存密钥存储与现役版本回退点，停止旧 Provider 写入者，使用已核对的完整映射迁移原记录，启动新 Provider 后发布兼容 BFF/页面，再独立读回。不得修改账号/任务正本或重建未变服务；生产预检还需验证镜像 Python 3.13 运行态。回退必须先停止新写入者，核对切换期间新增/修改/撤销的密钥，禁止盲目覆盖旧快照导致已撤销密钥复活。任何未知结果先读回，不重复迁移。
 

@@ -18,6 +18,7 @@ from services.conversation_binding_service import (
 from services.editable_file_task_service import editable_file_task_service
 from services.text_task_service import text_task_service
 from services.log_service import LoggedCall
+from services.public_chat_service import PublicChatContractError, project_public_models
 from services.protocol import (
     anthropic_v1_messages,
     openai_v1_chat_complete,
@@ -124,8 +125,10 @@ def create_router() -> APIRouter:
         try:
             result = await run_in_threadpool(openai_v1_models.list_models)
             if is_external(request):
-                return {**result, "data": [item for item in result.get("data", []) if item.get("id") == "gpt-image-2"]}
+                return await run_in_threadpool(project_public_models, result)
             return result
+        except PublicChatContractError as exc:
+            raise HTTPException(status_code=502, detail={"code": exc.code}) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail={"error": "model discovery unavailable" if is_external(request) else str(exc)}) from exc
 

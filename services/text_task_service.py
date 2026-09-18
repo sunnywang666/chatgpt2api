@@ -14,6 +14,7 @@ import json
 import math
 import os
 import sqlite3
+import sys
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -30,28 +31,82 @@ from services.conversation_binding_service import (
 )
 
 
+class TextTaskCapacityError(RuntimeError):
+    pass
+
+
+def _retained_size(value, seen=None):
+    """Estimate the Python heap retained by one scheduled request body."""
+    seen = seen if seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return 0
+    seen.add(identity)
+    size = sys.getsizeof(value)
+    if isinstance(value, dict):
+        return size + sum(
+            _retained_size(key, seen) + _retained_size(item, seen)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return size + sum(_retained_size(item, seen) for item in value)
+    return size
+
+
 class ContinuationExecutor:
     """Finish ready products before starting more first-turn gallery requests."""
-    def __init__(self, max_workers=4):
+    DEFAULT_MAX_OUTSTANDING = 32
+    DEFAULT_MAX_RETAINED_BYTES = 256 * 1024 * 1024
+
+    def __init__(
+        self,
+        max_workers=4,
+        *,
+        max_outstanding=DEFAULT_MAX_OUTSTANDING,
+        max_retained_bytes=DEFAULT_MAX_RETAINED_BYTES,
+    ):
         self.pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="bound-text")
         self.limit = max_workers
+        self.max_outstanding = max(1, int(max_outstanding))
+        self.max_retained_bytes = max(1, int(max_retained_bytes))
         self.lock = threading.Lock()
         self.queue = []
         self.sequence = itertools.count()
         self.active = 0
+        self.outstanding = 0
+        self.retained_bytes = 0
         self.closed = False
 
     def submit(self, function, *args):
         future = Future()
         body = args[-1] if args and isinstance(args[-1], dict) else {}
         priority = 0 if body.get("conversation_id") else 1
+        retained_bytes = sum(_retained_size(item) for item in args)
         with self.lock:
             if self.closed:
                 raise RuntimeError("executor shut down")
-            heapq.heappush(self.queue, (priority, next(self.sequence), future, function, args))
+            if (
+                self.outstanding >= self.max_outstanding
+                or self.retained_bytes + retained_bytes > self.max_retained_bytes
+            ):
+                raise TextTaskCapacityError("text task capacity exceeded")
+            self.outstanding += 1
+            self.retained_bytes += retained_bytes
+            entry = (
+                priority, next(self.sequence), future, function, args, retained_bytes,
+            )
+            heapq.heappush(self.queue, entry)
             if self.active < self.limit:
                 self.active += 1
-                self.pool.submit(self._drain)
+                try:
+                    self.pool.submit(self._drain)
+                except BaseException:
+                    self.active -= 1
+                    self.queue.remove(entry)
+                    heapq.heapify(self.queue)
+                    self.outstanding -= 1
+                    self.retained_bytes -= retained_bytes
+                    raise
         return future
 
     def _drain(self):
@@ -60,12 +115,16 @@ class ContinuationExecutor:
                 if not self.queue:
                     self.active -= 1
                     return
-                _, _, future, function, args = heapq.heappop(self.queue)
-            if future.set_running_or_notify_cancel():
-                try:
+                _, _, future, function, args, retained_bytes = heapq.heappop(self.queue)
+            try:
+                if future.set_running_or_notify_cancel():
                     future.set_result(function(*args))
-                except BaseException as exc:
-                    future.set_exception(exc)
+            except BaseException as exc:
+                future.set_exception(exc)
+            finally:
+                with self.lock:
+                    self.outstanding -= 1
+                    self.retained_bytes -= retained_bytes
 
     def shutdown(self, wait=True):
         with self.lock:
@@ -558,8 +617,24 @@ class TextTaskService:
                 "request identity is required",
                 code="CONVERSATION_BINDING_CONTRACT_INVALID",
             )
+        def immutable(value):
+            # Public multimodal requests are validated into bytes before they
+            # reach the durable service. Hash the bytes without storing another
+            # copy of the image in the receipt or relying on JSON serialization.
+            if isinstance(value, (bytes, bytearray)):
+                data = bytes(value)
+                return {
+                    "$bytes_sha256": hashlib.sha256(data).hexdigest(),
+                    "$bytes_length": len(data),
+                }
+            if isinstance(value, dict):
+                return {str(key): immutable(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [immutable(item) for item in value]
+            return value
+
         request_hash = hashlib.sha256(
-            json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(immutable(body), sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         return request_id, request_hash
 
@@ -581,6 +656,8 @@ class TextTaskService:
     def submit(self, owner: str, body: dict):
         request_id, request_hash = self._submission_identity(owner, body)
         receipt = {"request_id": request_id, "client_conversation_id": body["client_conversation_id"],
+                   "route": str(body.get("_public_route") or ""),
+                   "model": str(body.get("model") or "auto"),
                    "request_message_id": str(uuid.uuid4()),
                    "request_parent_message_id": str(body.get("parent_message_id") or "").strip(),
                    "status": "queued", "boot": self.boot, "created_at": self._now(), "updated_at": self._now()}
@@ -590,8 +667,29 @@ class TextTaskService:
             if previous and previous[0] != request_hash:
                 raise ConversationBindingError("request identity already has different input", code="CONVERSATION_REQUEST_CONFLICT")
             schedule = not previous
-            if previous and json.loads(previous[1])["status"] == "not_started":
-                receipt = {**json.loads(previous[1]), "status": "queued", "boot": self.boot, "updated_at": self._now()}
+            previous_receipt = json.loads(previous[1]) if previous else None
+            public_chat_submission = str(body.get("_public_route") or "") == "chat"
+            safe_capacity_retry = bool(
+                previous_receipt
+                and public_chat_submission
+                and previous_receipt.get("route") == "chat"
+                and previous_receipt.get("status") == "failed"
+                and previous_receipt.get("error_code") == "TEXT_TASK_CAPACITY_EXCEEDED"
+                and previous_receipt.get("upstream_outcome") == "not_sent"
+            )
+            if previous and (
+                (previous_receipt["status"] == "not_started" and not public_chat_submission)
+                or safe_capacity_retry
+            ):
+                receipt = {
+                    **previous_receipt,
+                    "status": "queued",
+                    "boot": self.boot,
+                    "updated_at": self._now(),
+                }
+                if safe_capacity_retry:
+                    for field in ("error_code", "upstream_outcome", "finished_at"):
+                        receipt.pop(field, None)
                 db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
                 schedule = True
             elif not previous:
@@ -599,6 +697,17 @@ class TextTaskService:
         if schedule:
             try:
                 self.executor.submit(self._run, owner, request_id, {**body, "_request_message_id": receipt["request_message_id"]})
+            except TextTaskCapacityError:
+                # The receipt already exists, so overload is a durable known
+                # rejection that can be queried safely without another submit.
+                self._update(
+                    owner,
+                    request_id,
+                    status="failed",
+                    error_code="TEXT_TASK_CAPACITY_EXCEEDED",
+                    upstream_outcome="not_sent",
+                    finished_at=self._now(),
+                )
             except Exception:
                 # No upstream call was scheduled, so this is a known rejection.
                 self._update(owner, request_id, status="failed", error_code="CONVERSATION_SCHEDULING_FAILED")
