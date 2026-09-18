@@ -24,6 +24,7 @@ TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 UNRECOVERABLE_MIN_AGE_SECONDS = 15.0 * 60.0
 UNRECOVERABLE_QUALIFIED_READS = 3
+IMAGE_ACTIVE_BUDGET_SECONDS = 300.0
 
 
 class UnrecoverableRead(RuntimeError):
@@ -101,6 +102,53 @@ def _upstream_status_code(exc: BaseException) -> int | None:
         return value
     message = str(exc)
     return 404 if "status=404" in message else None
+
+
+def _retry_after_seconds(exc: BaseException) -> int | None:
+    value = getattr(exc, "retry_after", None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return int(value)
+    return None
+
+
+def _recovery_failure_code(exc: BaseException, phase: str) -> str:
+    status = _upstream_status_code(exc)
+    if status == 429:
+        return "RECOVERY_RATE_LIMITED"
+    if status in {401, 403}:
+        return "RECOVERY_AUTH_REQUIRED"
+    if phase == "download_image_result":
+        return "RECOVERY_DOWNLOAD_FAILED"
+    exc_type = type(exc)
+    type_name = f"{exc_type.__module__}.{exc_type.__name__}".lower()
+    if (
+        getattr(exc, "recovery_transport_failure", False) is True
+        or
+        (isinstance(exc, (ConnectionError, OSError)) and not isinstance(exc, TimeoutError))
+        or any(marker in type_name for marker in ("curl_cffi", "connection", "network"))
+    ):
+        return "RECOVERY_TRANSPORT_FAILED"
+    return "RECOVERY_READ_FAILED"
+
+
+def _safe_recovery_error(code: str, phase: str) -> str:
+    if phase == "download_image_result":
+        reason = {
+            "RECOVERY_RATE_LIMITED": "the provider is rate limited",
+            "RECOVERY_AUTH_REQUIRED": "the bound account connection must be restored",
+            "RECOVERY_TRANSPORT_FAILED": "the provider could not be reached",
+            "RECOVERY_READ_FAILED": "the provider response could not be read",
+        }.get(code, "the result download did not complete")
+        return (
+            f"Generated image is preserved; {reason}. "
+            "Result download will resume without generating again."
+        )
+    return {
+        "RECOVERY_RATE_LIMITED": "Image result lookup is rate limited; retry after the provider cooldown.",
+        "RECOVERY_AUTH_REQUIRED": "Image result lookup requires the bound account connection to be restored.",
+        "RECOVERY_TRANSPORT_FAILED": "Image result lookup could not reach the provider; retry when connectivity returns.",
+        "RECOVERY_READ_FAILED": "Image result lookup returned an unreadable response; retry the same request lookup.",
+    }.get(code, "Image result lookup did not complete; retry the same request lookup.")
 
 
 def _branch_read_state(document: object, request_message_id: str) -> str:
@@ -388,9 +436,12 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "error_code",
         "upstream_model",
         "next_poll_at",
-        "upstream_unfinished",
+        "active_attempt_started_at",
+        "active_attempt_deadline_at",
         "upstream_outcome",
         "recovery_retryable",
+        "recovery_error_code",
+        "recovery_phase",
         "adopted_source_request_message_id",
         "adopted_source_image_message_id",
         "adopted_from_error_code",
@@ -398,8 +449,13 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     ):
         if task.get(field):
             item[field] = task.get(field)
+    retry_after = task.get("recovery_retry_after_seconds")
+    if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and retry_after >= 0:
+        item["recovery_retry_after_seconds"] = retry_after
     if isinstance(task.get("upstream_submission_started"), bool):
         item["upstream_submission_started"] = task["upstream_submission_started"]
+    if isinstance(task.get("upstream_unfinished"), bool):
+        item["upstream_unfinished"] = task["upstream_unfinished"]
     if task.get("recovery_no_result_reads"):
         item["recovery_no_result_reads"] = task.get("recovery_no_result_reads")
     if _clean(task.get("error_code")) == "RESULT_UNRECOVERABLE":
@@ -427,6 +483,9 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["adopted_from_error"] = task.get("adopted_from_error")
     if task.get("progress"):
         item["progress"] = task.get("progress")
+    deadline = task.get("active_attempt_deadline_at")
+    if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and deadline > 0:
+        item["active_budget_remaining_secs"] = round(max(0.0, float(deadline) - time.time()), 1)
     if task.get("duration_ms") is not None:
         item["duration_ms"] = task.get("duration_ms")
     if task.get("status") in (TASK_STATUS_RUNNING, TASK_STATUS_QUEUED):
@@ -695,6 +754,10 @@ class ImageTaskService:
                     self._slot_condition.wait(timeout=1)
                 self._update_task(key, upstream_unfinished=True)
         started = time.time()
+        with self._lock:
+            current = self._tasks.get(key) or {}
+            active_started_at = current.get("active_attempt_started_at")
+            active_deadline_at = current.get("active_attempt_deadline_at")
         # Shared external routes can swap handlers and therefore do not infer
         # coverage from their normalized payload. Their receipt changes only
         # when the active bound-Chat attempt propagates an explicit marker.
@@ -717,10 +780,46 @@ class ImageTaskService:
             self._update_task(key, request_message_id=request_message_id)
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
-            if step == "image_stream_resolve_start":
-                self._update_task(key, started_ts=time.time())
             self._update_task(key, progress=step)
         progress_callback.request_message_id = request_message_id
+        progress_callback.active_deadline_at = (
+            float(active_deadline_at)
+            if isinstance(active_deadline_at, (int, float))
+            and not isinstance(active_deadline_at, bool)
+            and active_deadline_at > 0
+            else None
+        )
+
+        def start_active_attempt() -> float:
+            nonlocal active_started_at, active_deadline_at
+            with self._lock:
+                current = self._tasks.get(key) or {}
+                saved_start = current.get("active_attempt_started_at")
+                saved_deadline = current.get("active_attempt_deadline_at")
+            if (
+                not isinstance(saved_start, (int, float))
+                or isinstance(saved_start, bool)
+                or saved_start <= 0
+            ):
+                saved_start = time.time()
+            if (
+                not isinstance(saved_deadline, (int, float))
+                or isinstance(saved_deadline, bool)
+                or saved_deadline <= 0
+            ):
+                saved_deadline = float(saved_start) + IMAGE_ACTIVE_BUDGET_SECONDS
+            active_started_at = float(saved_start)
+            active_deadline_at = float(saved_deadline)
+            progress_callback.active_deadline_at = active_deadline_at
+            self._update_task(
+                key,
+                active_attempt_started_at=active_started_at,
+                active_attempt_deadline_at=active_deadline_at,
+                started_ts=active_started_at,
+            )
+            return active_deadline_at
+
+        progress_callback.start_active_attempt = start_active_attempt
 
         def record_conversation_id(conversation_id: str) -> None:
             conversation_id = _clean(conversation_id)
@@ -731,6 +830,17 @@ class ImageTaskService:
         def record_submission_started() -> None:
             self._update_task(key, upstream_submission_started=True)
         progress_callback.record_submission_started = record_submission_started
+
+        def record_result_ids(file_ids: list[str], sediment_ids: list[str]) -> None:
+            self._update_task(
+                key,
+                result_file_ids=list(dict.fromkeys(str(item) for item in file_ids if item)),
+                result_sediment_ids=list(dict.fromkeys(str(item) for item in sediment_ids if item)),
+                progress="receiving_image",
+                upstream_outcome="generated",
+                upstream_unfinished=False,
+            )
+        progress_callback.record_result_ids = record_result_ids
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
@@ -781,6 +891,11 @@ class ImageTaskService:
                 parent_message_id=parent_message_id,
                 binding_status="bound" if provider_binding_id else "unbound",
                 upstream_unfinished=False,
+                upstream_outcome="generated",
+                recovery_error_code="",
+                recovery_phase="",
+                recovery_retry_after_seconds=None,
+                next_poll_at=0,
             )
             self._log_call(
                 identity,
@@ -794,17 +909,31 @@ class ImageTaskService:
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
+            with self._lock:
+                current = dict(self._tasks.get(key) or {})
             account_email = _clean(getattr(exc, "account_email", ""))
-            conversation_id = _clean(getattr(exc, "conversation_id", ""))
+            conversation_id = _clean(
+                getattr(exc, "conversation_id", "") or current.get("conversation_id")
+            )
             provider_binding_id = _clean(
-                getattr(exc, "provider_binding_id", "") or payload.get("provider_binding_id")
+                getattr(exc, "provider_binding_id", "")
+                or current.get("provider_binding_id")
+                or payload.get("provider_binding_id")
             )
             provider_account_identity = _clean(
                 getattr(exc, "provider_account_identity", "")
+                or current.get("provider_account_identity")
                 or payload.get("provider_account_identity")
             )
-            parent_message_id = _clean(getattr(exc, "parent_message_id", ""))
-            request_message_id = _clean(getattr(exc, "request_message_id", ""))
+            parent_message_id = _clean(
+                getattr(exc, "parent_message_id", "") or current.get("parent_message_id")
+            )
+            request_message_id = _clean(
+                getattr(exc, "request_message_id", "") or current.get("request_message_id")
+            )
+            result_captured = bool(
+                current.get("result_file_ids") or current.get("result_sediment_ids")
+            )
             error_code = _clean(getattr(exc, "code", ""))
             upstream_submitted = getattr(exc, "upstream_submitted", None)
             known_not_submitted = upstream_submitted is False
@@ -823,10 +952,34 @@ class ImageTaskService:
                 error_code = "RESULT_UNRECOVERABLE"
             if account and not terminal:
                 error_code = "CONVERSATION_OUTCOME_UNKNOWN"
+            recovery_phase = (
+                "download_image_result" if result_captured else "read_image_request"
+            )
+            recovery_error_code = _recovery_failure_code(exc, recovery_phase)
+            retry_after = _retry_after_seconds(exc)
+            if error_code == "CONVERSATION_OUTCOME_UNKNOWN":
+                error_message = _safe_recovery_error(recovery_error_code, recovery_phase)
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                               duration_ms=duration_ms,
-                              upstream_unfinished=bool(account) and not terminal,
+                              upstream_unfinished=bool(account) and not terminal and not result_captured,
+                              **(
+                                  {
+                                      "recovery_error_code": recovery_error_code,
+                                      "recovery_phase": recovery_phase,
+                                      "recovery_retry_after_seconds": retry_after,
+                                      "next_poll_at": time.time() + (
+                                          retry_after if retry_after is not None else 0
+                                      ),
+                                      **({"upstream_outcome": "generated"} if result_captured else {}),
+                                  }
+                                  if error_code == "CONVERSATION_OUTCOME_UNKNOWN"
+                                  else {
+                                      "recovery_error_code": "",
+                                      "recovery_phase": "",
+                                      "recovery_retry_after_seconds": None,
+                                  }
+                              ),
                               **(
                                   {
                                       "upstream_submission_started": False,
@@ -962,6 +1115,8 @@ class ImageTaskService:
                 "created_ts": item.get("created_ts"),
                 "updated_ts": item.get("updated_ts"),
                 "started_ts": item.get("started_ts"),
+                "active_attempt_started_at": item.get("active_attempt_started_at"),
+                "active_attempt_deadline_at": item.get("active_attempt_deadline_at"),
                 "progress": item.get("progress"),
                 "duration_ms": item.get("duration_ms"),
                 "provider_binding_id": _clean(item.get("provider_binding_id")),
@@ -987,6 +1142,18 @@ class ImageTaskService:
                 "upstream_outcome": _clean(item.get("upstream_outcome")),
                 "recovery_retryable": item.get("recovery_retryable") is True,
                 "recovery_requires_new_conversation": item.get("recovery_requires_new_conversation") is True,
+                "recovery_error_code": _clean(item.get("recovery_error_code")),
+                "recovery_phase": _clean(item.get("recovery_phase")),
+                "recovery_retry_after_seconds": item.get("recovery_retry_after_seconds"),
+                "deadline_recovery_started": item.get("deadline_recovery_started") is True,
+                "result_file_ids": [
+                    _clean(value) for value in item.get("result_file_ids", [])
+                    if _clean(value)
+                ] if isinstance(item.get("result_file_ids"), list) else [],
+                "result_sediment_ids": [
+                    _clean(value) for value in item.get("result_sediment_ids", [])
+                    if _clean(value)
+                ] if isinstance(item.get("result_sediment_ids"), list) else [],
                 "adopted_source_request_message_id": _clean(item.get("adopted_source_request_message_id")),
                 "adopted_source_image_message_id": _clean(item.get("adopted_source_image_message_id")),
                 "adopted_from_error_code": _clean(item.get("adopted_from_error_code")),
@@ -1028,6 +1195,9 @@ class ImageTaskService:
         changed = False
         for task in self._tasks.values():
             if task.get("status") in UNFINISHED_STATUSES:
+                result_captured = bool(
+                    task.get("result_file_ids") or task.get("result_sediment_ids")
+                )
                 known_not_submitted = task.get("upstream_submission_started") is False
                 not_started = (task.get("status") == TASK_STATUS_QUEUED
                                and task.get("admission_recorded") is True
@@ -1044,6 +1214,26 @@ class ImageTaskService:
                     task["upstream_outcome"] = "not_submitted"
                     task["recovery_retryable"] = True
                     task["recovery_requires_new_conversation"] = False
+                elif result_captured:
+                    task["upstream_unfinished"] = False
+                    task["upstream_outcome"] = "generated"
+                    task["recovery_error_code"] = "RECOVERY_DOWNLOAD_FAILED"
+                    task["recovery_phase"] = "download_image_result"
+                    task["next_poll_at"] = 0
+                elif task["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN":
+                    task["recovery_error_code"] = "RECOVERY_READ_FAILED"
+                    task["recovery_phase"] = "read_image_request"
+                    deadline = task.get("active_attempt_deadline_at")
+                    if (
+                        isinstance(deadline, (int, float))
+                        and not isinstance(deadline, bool)
+                        and deadline > 0
+                        and time.time() >= float(deadline)
+                    ):
+                        # A process exit during the first post-deadline read
+                        # must not strand the receipt behind its old schedule.
+                        task["deadline_recovery_started"] = False
+                        task["next_poll_at"] = 0
                 if task.get("provider_binding_id"):
                     task["binding_status"] = (
                         "bound"
@@ -1108,18 +1298,31 @@ class ImageTaskService:
                 # persisted receipt.
                 if not allow_unrecoverable_retry:
                     return _public_task(task)
-            if time.time() < float(task.get("next_poll_at") or 0):
+            deadline = task.get("active_attempt_deadline_at")
+            deadline_expired = (
+                isinstance(deadline, (int, float))
+                and not isinstance(deadline, bool)
+                and deadline > 0
+                and time.time() >= float(deadline)
+            )
+            deadline_recovery_start = deadline_expired and not task.get("deadline_recovery_started")
+            if time.time() < float(task.get("next_poll_at") or 0) and not deadline_recovery_start:
                 return _public_task(task)
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
             # 将任务状态重置为 running
-            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+            self._update_task(
+                key,
+                status=TASK_STATUS_RUNNING,
+                error="",
+                **({"deadline_recovery_started": True} if deadline_recovery_start else {}),
+            )
 
         # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
             args=(key, conversation_id, extra_timeout_secs, base_url, dict(identity), mode, model,
-                  bool(allow_unrecoverable_retry)),
+                  bool(allow_unrecoverable_retry), bool(deadline_expired)),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -1358,6 +1561,7 @@ class ImageTaskService:
         mode: str,
         model: str,
         allow_unrecoverable_retry: bool,
+        deadline_expired: bool,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
@@ -1367,7 +1571,7 @@ class ImageTaskService:
         conversation_available = False
         try:
             from services.account_service import account_service
-            from services.openai_backend_api import OpenAIBackendAPI
+            from services.openai_backend_api import ImageContentPolicyError, OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
             with self._lock:
@@ -1376,22 +1580,83 @@ class ImageTaskService:
                 account_identity = _clean(task.get("provider_account_identity")) if task else ""
                 client_conversation_id = _clean(task.get("client_conversation_id")) if task else ""
                 request_message_id = _clean(task.get("request_message_id")) if task else ""
+                persisted_file_ids = list(task.get("result_file_ids") or []) if task else []
+                persisted_sediment_ids = list(task.get("result_sediment_ids") or []) if task else []
             if not binding_id or not account_identity or not client_conversation_id:
-                raise RuntimeError("conversation binding unavailable: task authority missing")
+                error = RuntimeError("conversation binding unavailable: task authority missing")
+                error.status_code = 403
+                raise error
             authoritative_identity = account_service.get_bound_account_identity(binding_id)
             if authoritative_identity != account_identity:
-                raise RuntimeError("conversation binding unavailable: account identity changed")
+                error = RuntimeError("conversation binding unavailable: account identity changed")
+                error.status_code = 403
+                raise error
             # Reading the original task consumes no new generation admission.
             access_token = account_service.get_bound_text_access_token(binding_id, model="auto")
             with account_service.conversation_binding_lock(binding_id, client_conversation_id):
                 backend = OpenAIBackendAPI(access_token=access_token)
+                if persisted_file_ids or persisted_sediment_ids:
+                    self._update_task(key, progress="receiving_image", recovery_phase="download_image_result")
+                    image_urls = backend.resolve_conversation_image_urls(
+                        conversation_id,
+                        persisted_file_ids,
+                        persisted_sediment_ids,
+                        poll=False,
+                        request_message_id=request_message_id,
+                    )
+                    if not image_urls:
+                        raise RuntimeError("generated image URL could not be resolved")
+                    downloaded = backend.download_image_bytes(image_urls)
+                    if not downloaded:
+                        raise RuntimeError("generated image could not be downloaded")
+                    image_items = [
+                        {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
+                        for image_data in downloaded
+                    ]
+                    parent_message_id = backend.get_conversation_parent_message_id(conversation_id)
+                    data = format_image_result(
+                        image_items,
+                        "",
+                        "b64_json",
+                        base_url,
+                        int(time.time()),
+                    )["data"]
+                    self._update_task(
+                        key,
+                        status=TASK_STATUS_SUCCESS,
+                        data=data,
+                        error="",
+                        error_code="",
+                        binding_status="bound",
+                        parent_message_id=parent_message_id,
+                        upstream_unfinished=False,
+                        upstream_outcome="generated",
+                        next_poll_at=0,
+                        poll_failures=0,
+                        recovery_no_result_reads=0,
+                        recovery_requires_new_conversation=False,
+                        recovery_error_code="",
+                        recovery_phase="",
+                        recovery_retry_after_seconds=None,
+                        duration_ms=int((time.time() - started) * 1000),
+                    )
+                    self._log_call(
+                        identity,
+                        mode,
+                        model,
+                        started,
+                        "调用完成（恢复下载）",
+                        status="success",
+                        urls=_collect_image_urls(data),
+                    )
+                    return
                 try:
                     document = backend._get_conversation(conversation_id)
                     conversation_available = True
                 except Exception as exc:
                     if _upstream_status_code(exc) != 404:
                         raise
-                    if not allow_unrecoverable_retry:
+                    if not (allow_unrecoverable_retry or deadline_expired):
                         raise
                     tasks = backend._query_backend_tasks(
                         conversation_id=conversation_id, timeout_secs=5.0, strict_schema=True,
@@ -1417,7 +1682,7 @@ class ImageTaskService:
                 if authoritative_failure:
                     raise AuthoritativeImageTaskFailure(authoritative_failure)
                 no_active_task = False
-                if allow_unrecoverable_retry:
+                if allow_unrecoverable_retry or deadline_expired:
                     tasks = backend._query_backend_tasks(
                         conversation_id=conversation_id, timeout_secs=5.0, strict_schema=True,
                     )
@@ -1493,6 +1758,16 @@ class ImageTaskService:
                         f"继续等待 {extra_timeout_secs} 秒后仍未找到图片结果。"
                     )
 
+                self._update_task(
+                    key,
+                    result_file_ids=list(dict.fromkeys(file_ids)),
+                    result_sediment_ids=list(dict.fromkeys(sediment_ids)),
+                    progress="receiving_image",
+                    upstream_outcome="generated",
+                    upstream_unfinished=False,
+                    recovery_phase="download_image_result",
+                )
+
                 image_urls = backend.resolve_conversation_image_urls(
                     conversation_id, file_ids, sediment_ids, poll=False,
                     request_message_id=request_message_id,
@@ -1525,6 +1800,10 @@ class ImageTaskService:
                 poll_failures=0,
                 recovery_no_result_reads=0,
                 recovery_requires_new_conversation=False,
+                recovery_error_code="",
+                recovery_phase="",
+                recovery_retry_after_seconds=None,
+                upstream_outcome="generated",
                 duration_ms=int((time.time() - started) * 1000),
             )
             self._log_call(
@@ -1545,43 +1824,76 @@ class ImageTaskService:
                 failures = int(current.get("poll_failures") or 0) + 1
                 qualified_reads = int(current.get("recovery_no_result_reads") or 0)
                 requires_new_conversation = bool(current.get("recovery_requires_new_conversation"))
+                result_captured = bool(
+                    current.get("result_file_ids") or current.get("result_sediment_ids")
+                )
                 qualified_read_recorded = False
                 if conversation_available:
                     requires_new_conversation = False
-                if allow_unrecoverable_retry and isinstance(exc, UnrecoverableRead):
+                if (allow_unrecoverable_retry or deadline_expired) and isinstance(exc, UnrecoverableRead):
                     requires_new_conversation = exc.requires_new_conversation
-                    if _task_age_seconds(current) >= UNRECOVERABLE_MIN_AGE_SECONDS:
+                    if deadline_expired or _task_age_seconds(current) >= UNRECOVERABLE_MIN_AGE_SECONDS:
                         qualified_reads += 1
                         qualified_read_recorded = True
-            terminal = error_code == "NO_IMAGE_GENERATED"
+            if isinstance(exc, ImageContentPolicyError):
+                error_code = "content_policy_violation"
+            terminal = error_code in {"NO_IMAGE_GENERATED", "content_policy_violation"}
             unrecoverable = qualified_reads >= UNRECOVERABLE_QUALIFIED_READS
+            recovery_phase = (
+                "download_image_result" if result_captured else "read_image_request"
+            )
+            recovery_error_code = _recovery_failure_code(exc, recovery_phase)
+            retry_after = _retry_after_seconds(exc)
+            final_error_code = (
+                "RESULT_UNRECOVERABLE" if unrecoverable
+                else error_code if terminal else "CONVERSATION_OUTCOME_UNKNOWN"
+            )
+            if final_error_code == "CONVERSATION_OUTCOME_UNKNOWN":
+                error_message = _safe_recovery_error(recovery_error_code, recovery_phase)
             self._update_task(
                 key,
                 status=TASK_STATUS_ERROR,
                 error=error_message,
-                error_code=(
-                    "RESULT_UNRECOVERABLE" if unrecoverable
-                    else error_code if terminal else "CONVERSATION_OUTCOME_UNKNOWN"
-                ),
+                error_code=final_error_code,
                 binding_status=("unavailable" if unrecoverable and requires_new_conversation
                                 else "bound" if terminal or unrecoverable else "unknown"),
                 data=[],
                 duration_ms=duration_ms,
-                upstream_unfinished=not (terminal or unrecoverable),
+                upstream_unfinished=not (terminal or unrecoverable or result_captured),
                 poll_failures=failures,
                 recovery_no_result_reads=qualified_reads,
                 recovery_requires_new_conversation=requires_new_conversation,
+                recovery_error_code=(
+                    recovery_error_code
+                    if final_error_code == "CONVERSATION_OUTCOME_UNKNOWN" else ""
+                ),
+                recovery_phase=(
+                    recovery_phase
+                    if final_error_code == "CONVERSATION_OUTCOME_UNKNOWN" else ""
+                ),
+                recovery_retry_after_seconds=(
+                    retry_after
+                    if final_error_code == "CONVERSATION_OUTCOME_UNKNOWN" else None
+                ),
                 **({"upstream_outcome": "unknown", "recovery_retryable": True}
                    if unrecoverable else {}),
                 next_poll_at=(
                     0
                     if unrecoverable
-                    else time.time() + min(
-                        900,
-                        60 * 2 ** min(
-                            (qualified_reads if qualified_read_recorded else failures) - 1,
-                            4,
-                        ),
+                    else time.time() + (
+                        retry_after
+                        if retry_after is not None
+                        else 5
+                        if deadline_expired and qualified_read_recorded
+                        else 30
+                        if deadline_expired
+                        else min(
+                            900,
+                            60 * 2 ** min(
+                                (qualified_reads if qualified_read_recorded else failures) - 1,
+                                4,
+                            ),
+                        )
                     )
                 ),
             )

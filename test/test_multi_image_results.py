@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import unittest
 from unittest import mock
 
@@ -14,8 +15,11 @@ from services.openai_backend_api import (
 from services.protocol import openai_v1_image_generations
 from services.protocol.conversation import (
     ConversationRequest,
+    ImageGenerationError,
     ImageOutput,
+    _message_output_error,
     extract_conversation_ids,
+    iter_conversation_payloads,
     stream_image_outputs,
 )
 from services.protocol.openai_v1_response import stream_image_response
@@ -191,6 +195,129 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertFalse(_is_content_policy_error("No content policy violation."))
         self.assertTrue(_is_content_policy_error("This request violates our content policy."))
         self.assertTrue(_is_content_policy_error("I can't generate that because it violates our content policy."))
+
+    def test_text_only_image_message_is_not_reclassified_as_policy(self) -> None:
+        ordinary = _message_output_error(ImageOutput(
+            kind="message", model="gpt-image-2", index=1, total=1,
+            text="I can only provide a written description for this request.", conversation_id="conv-1",
+        ))
+        policy = _message_output_error(ImageOutput(
+            kind="message", model="gpt-image-2", index=1, total=1,
+            text="This request violates our content policy.", conversation_id="conv-1",
+        ))
+
+        self.assertIsInstance(ordinary, ImageGenerationError)
+        self.assertEqual(ordinary.code, "NO_IMAGE_GENERATED")
+        self.assertEqual(policy.code, "content_policy_violation")
+
+        still_processing = _message_output_error(ImageOutput(
+            kind="message", model="gpt-image-2", index=1, total=1,
+            text="The image may still be processing. Please try again in a moment.",
+            conversation_id="conv-1",
+        ))
+        self.assertEqual(still_processing.code, "CONVERSATION_OUTCOME_UNKNOWN")
+        incomplete = _message_output_error(ImageOutput(
+            kind="message", model="gpt-image-2", index=1, total=1,
+            text="Image generation started upstream but the response was incomplete. Please try again.",
+            conversation_id="",
+        ))
+        self.assertEqual(incomplete.code, "CONVERSATION_OUTCOME_UNKNOWN")
+
+    def test_unbudgeted_stream_keeps_legacy_bounded_fallback_retries(self) -> None:
+        class Backend:
+            poll_calls = 0
+
+            def stream_conversation(self, **_kwargs):
+                yield json.dumps({
+                    "conversation_id": "conv-1",
+                    "type": "server_ste_metadata",
+                    "metadata": {"turn_use_case": "image gen"},
+                })
+                yield "[DONE]"
+
+            def resolve_conversation_image_urls(self, *_args, **_kwargs):
+                return []
+
+            def _query_backend_tasks(self, **_kwargs):
+                return []
+
+            def _poll_image_results(self, *_args, **_kwargs):
+                type(self).poll_calls += 1
+                if type(self).poll_calls < 3:
+                    raise ConnectionError("temporary network failure")
+                return [], []
+
+        Backend.poll_calls = 0
+        with mock.patch("services.protocol.conversation.time.sleep", return_value=None):
+            outputs = list(stream_image_outputs(
+                Backend(), ConversationRequest(prompt="cat", model="gpt-image-2"),
+            ))
+
+        self.assertEqual(Backend.poll_calls, 3)
+        self.assertEqual(
+            _message_output_error(outputs[-1]).code,
+            "CONVERSATION_OUTCOME_UNKNOWN",
+        )
+
+    def test_structured_moderation_block_is_policy_even_with_generic_text(self) -> None:
+        class Backend:
+            def stream_conversation(self, **_kwargs):
+                yield json.dumps({"type": "moderation", "moderation_response": {"blocked": True}})
+                yield json.dumps({
+                    "conversation_id": "conv-1",
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"parts": ["I cannot help with that request."]},
+                    },
+                })
+                yield "[DONE]"
+
+            def _query_backend_tasks(self, **_kwargs):
+                return []
+
+        with self.assertRaises(ImageContentPolicyError):
+            list(stream_image_outputs(
+                Backend(),
+                ConversationRequest(prompt="blocked request", model="gpt-image-2"),
+            ))
+
+    def test_stream_collects_only_image_tool_output_not_input_or_tool_arguments(self) -> None:
+        payloads = iter([
+            json.dumps({
+                "message": {
+                    "author": {"role": "user"},
+                    "content": {"parts": [
+                        {"content_type": "image_asset_pointer", "asset_pointer": "file-service://input-file"},
+                    ]},
+                },
+            }),
+            json.dumps({
+                "type": "server_ste_metadata",
+                "metadata": {"tool_invoked": True, "turn_use_case": "image gen"},
+            }),
+            json.dumps({
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": [
+                        '{"referenced_image_ids":["file-service://input-file"]}',
+                    ]},
+                },
+            }),
+            json.dumps({
+                "message": {
+                    "author": {"role": "tool"},
+                    "metadata": {"async_task_type": "image_gen"},
+                    "content": {"content_type": "multimodal_text", "parts": [
+                        {"content_type": "image_asset_pointer", "asset_pointer": "file-service://generated-file"},
+                    ]},
+                },
+            }),
+            "[DONE]",
+        ])
+
+        events = list(iter_conversation_payloads(payloads))
+
+        self.assertEqual(events[-1]["file_ids"], ["generated-file"])
 
     def test_poll_uses_only_the_current_request_branch(self) -> None:
         backend = FakeBackend([{

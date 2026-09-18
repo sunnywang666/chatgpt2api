@@ -89,6 +89,10 @@ class TextTaskService:
         "CONVERSATION_BINDING_CONTRACT_INVALID",
         "CONVERSATION_BINDING_MISMATCH",
         "CONVERSATION_OUTCOME_UNKNOWN",
+        "RECOVERY_TRANSPORT_FAILED",
+        "RECOVERY_RATE_LIMITED",
+        "RECOVERY_AUTH_REQUIRED",
+        "RECOVERY_READ_FAILED",
     })
     _SUCCESS_RECOVERY_FIELDS = frozenset({
         # Binding and conversation identity stay rooted in the original
@@ -160,6 +164,30 @@ class TextTaskService:
     def _safe_recovery_code(cls, exc):
         code = str(getattr(exc, "code", "")).strip().upper()
         return code if code in cls._SAFE_RECOVERY_CODES else "RECOVERY_READ_FAILED"
+
+    @classmethod
+    def _recovery_failure(cls, exc):
+        status = getattr(exc, "status_code", None)
+        retry_after = getattr(exc, "retry_after", None)
+        safe_retry_after = (
+            int(retry_after)
+            if isinstance(retry_after, (int, float))
+            and not isinstance(retry_after, bool)
+            and retry_after >= 0
+            else None
+        )
+        if status == 429:
+            return "RECOVERY_RATE_LIMITED", safe_retry_after
+        if status in {401, 403}:
+            return "RECOVERY_AUTH_REQUIRED", None
+        exc_type = type(exc)
+        type_name = f"{exc_type.__module__}.{exc_type.__name__}".lower()
+        if (
+            (isinstance(exc, (ConnectionError, OSError)) and not isinstance(exc, TimeoutError))
+            or any(marker in type_name for marker in ("curl_cffi", "connection", "network"))
+        ):
+            return "RECOVERY_TRANSPORT_FAILED", None
+        return cls._safe_recovery_code(exc), None
 
     @classmethod
     def _safe_recovery_reason(cls, value):
@@ -268,7 +296,7 @@ class TextTaskService:
 
     def _finish_recovery(
         self, owner, request_id, claim_id, recovered=None, error_code=None,
-        phase=None, recovery_reason=None, *, count_unrecoverable=False,
+        phase=None, recovery_reason=None, retry_after_seconds=None, *, count_unrecoverable=False,
     ):
         now = self._now()
         with self._db() as db:
@@ -326,11 +354,16 @@ class TextTaskService:
                 )
                 changes = {
                     **recovered_anchor,
-                    "recovery_next_at": now + self._recovery_backoff(
-                        qualified_reads if qualified_read_recorded else (1 if scan_incomplete else attempt)
+                    "recovery_next_at": now + (
+                        retry_after_seconds
+                        if retry_after_seconds is not None
+                        else self._recovery_backoff(
+                            qualified_reads if qualified_read_recorded else (1 if scan_incomplete else attempt)
+                        )
                     ),
                     "recovery_error_code": error_code,
                     "recovery_phase": phase or "read_text_request",
+                    "recovery_retry_after_seconds": retry_after_seconds,
                     "recovery_reason": recovery_reason,
                     "recovery_no_result_reads": qualified_reads,
                     # This marker describes the latest qualified read. A prior
@@ -347,6 +380,7 @@ class TextTaskService:
                     "recovery_next_at": None,
                     "recovery_error_code": None,
                     "recovery_phase": None,
+                    "recovery_retry_after_seconds": None,
                     "recovery_reason": None,
                     "recovery_requires_new_conversation": False,
                 }
@@ -429,20 +463,24 @@ class TextTaskService:
                     recovery_evidence[RECOVERY_CONVERSATION_SCAN_FIELD] = recovery_scan
                 if getattr(exc, "recovery_coverage_version", None) == 1:
                     recovery_evidence[RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD] = 1
+                recovery_error_code, retry_after_seconds = self._recovery_failure(exc)
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0],
                     recovery_evidence or None,
-                    error_code=self._safe_recovery_code(exc), phase="read_text_request",
+                    error_code=recovery_error_code, phase="read_text_request",
                     recovery_reason=self._safe_recovery_reason(getattr(exc, "recovery_reason", "")),
+                    retry_after_seconds=retry_after_seconds,
                     count_unrecoverable=allow_unrecoverable_retry,
                 )
-            except Exception:
+            except Exception as exc:
                 # Never persist exception text: it may contain a token, prompt,
                 # or provider response. The next bounded recovery window is
                 # enough to make the request retryable without hammering GET.
+                recovery_error_code, retry_after_seconds = self._recovery_failure(exc)
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0],
-                    error_code="RECOVERY_READ_FAILED", phase="read_text_request",
+                    error_code=recovery_error_code, phase="read_text_request",
+                    retry_after_seconds=retry_after_seconds,
                     recovery_reason=None, count_unrecoverable=allow_unrecoverable_retry,
                 )
             return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result
