@@ -957,6 +957,101 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertFalse(task["upstream_unfinished"])
             self.assertEqual(EmptyBackend.polls, 3)
 
+    def test_expired_deadline_never_bypasses_provider_retry_after(self):
+        for phase in ("read_image_request", "download_image_result"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp_dir:
+                error = RuntimeError("image outcome unknown")
+                error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+                error.provider_binding_id = "binding-1"
+                error.provider_account_identity = "account-1"
+                error.conversation_id = "conversation-1"
+                error.parent_message_id = "assistant-1"
+                error.request_message_id = "request-1"
+                error.upstream_submitted = True
+                service = self.make_service(
+                    Path(tmp_dir) / "image_tasks.json",
+                    lambda _payload: (_ for _ in ()).throw(error),
+                )
+                service.submit_generation(
+                    OWNER, client_task_id="cooldown-task", prompt="cat", model="gpt-image-2", size=None,
+                    provider_binding_id="binding-1", provider_account_identity="account-1",
+                    client_conversation_id="client-1", retain_conversation=True,
+                )
+                wait_for_task(service, OWNER, "cooldown-task", "error")
+                cooldown_until = time.time() + 3600
+                updates = {
+                    "active_attempt_deadline_at": time.time() - 1,
+                    "next_poll_at": cooldown_until,
+                    "recovery_error_code": "RECOVERY_RATE_LIMITED",
+                    "recovery_retry_after_seconds": 3600,
+                    "recovery_phase": phase,
+                }
+                if phase == "download_image_result":
+                    updates.update(
+                        result_file_ids=["file-generated"],
+                        upstream_outcome="generated",
+                        upstream_unfinished=False,
+                    )
+                service._update_task("owner-1:cooldown-task", **updates)
+
+                before = service.list_tasks(OWNER, ["cooldown-task"])["items"][0]
+                with mock.patch("services.image_task_service.threading.Thread") as thread:
+                    result = service.resume_poll(
+                        OWNER, "cooldown-task", 5, "http://content-provider",
+                    )
+
+                thread.assert_not_called()
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(result["recovery_error_code"], "RECOVERY_RATE_LIMITED")
+                self.assertEqual(result["recovery_phase"], phase)
+                self.assertEqual(result["recovery_retry_after_seconds"], 3600)
+                self.assertEqual(result["next_poll_at"], before["next_poll_at"])
+                self.assertGreater(result["next_poll_at"], time.time() + 3500)
+
+    def test_deadline_recovery_started_marker_survives_restart(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            error = RuntimeError("image outcome unknown")
+            error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+            error.provider_binding_id = "binding-1"
+            error.provider_account_identity = "account-1"
+            error.conversation_id = "conversation-1"
+            error.parent_message_id = "assistant-1"
+            error.request_message_id = "request-1"
+            error.upstream_submitted = True
+            service = self.make_service(
+                path, lambda _payload: (_ for _ in ()).throw(error),
+            )
+            service.submit_generation(
+                OWNER, client_task_id="deadline-marker-task", prompt="cat", model="gpt-image-2", size=None,
+                provider_binding_id="binding-1", provider_account_identity="account-1",
+                client_conversation_id="client-1", retain_conversation=True,
+            )
+            wait_for_task(service, OWNER, "deadline-marker-task", "error")
+            next_poll_at = time.time() + 900
+            service._update_task(
+                "owner-1:deadline-marker-task",
+                active_attempt_deadline_at=time.time() - 1,
+                deadline_recovery_started=True,
+                recovery_error_code="RECOVERY_READ_FAILED",
+                recovery_phase="read_image_request",
+                recovery_retry_after_seconds=None,
+                next_poll_at=next_poll_at,
+            )
+
+            restarted = self.make_service(path)
+            self.assertTrue(
+                restarted._tasks["owner-1:deadline-marker-task"]["deadline_recovery_started"]
+            )
+            with mock.patch("services.image_task_service.threading.Thread") as thread:
+                result = restarted.resume_poll(
+                    OWNER, "deadline-marker-task", 5, "http://content-provider",
+                )
+
+            thread.assert_not_called()
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["next_poll_at"], next_poll_at)
+
     def test_expired_deadline_preserves_running_request_and_transport_failures(self):
         for scenario, expected_code in (
             ("running", "RECOVERY_READ_FAILED"),

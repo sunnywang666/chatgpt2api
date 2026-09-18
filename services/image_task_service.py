@@ -1305,8 +1305,23 @@ class ImageTaskService:
                 and deadline > 0
                 and time.time() >= float(deadline)
             )
-            deadline_recovery_start = deadline_expired and not task.get("deadline_recovery_started")
-            if time.time() < float(task.get("next_poll_at") or 0) and not deadline_recovery_start:
+            now = time.time()
+            retry_after = task.get("recovery_retry_after_seconds")
+            provider_cooldown_active = (
+                _clean(task.get("recovery_error_code")) == "RECOVERY_RATE_LIMITED"
+                and isinstance(retry_after, (int, float))
+                and not isinstance(retry_after, bool)
+                and retry_after >= 0
+                and now < float(task.get("next_poll_at") or 0)
+            )
+            # The first post-deadline read may bypass a locally synthesized
+            # backoff, but never a provider-supplied 429 Retry-After window.
+            deadline_recovery_start = (
+                deadline_expired
+                and not task.get("deadline_recovery_started")
+                and not provider_cooldown_active
+            )
+            if now < float(task.get("next_poll_at") or 0) and not deadline_recovery_start:
                 return _public_task(task)
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
