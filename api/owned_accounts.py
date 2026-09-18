@@ -2,10 +2,12 @@
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from typing import Literal
 
 from api.support import require_admin
-from services.account_service import account_service
+from services.account_service import CodexAuthorizationAttachError, account_service
 from services.auth_service import auth_service
+from services.codex_login_service import CodexLoginError, codex_login_service
 from services.program_key_policy import PolicyError
 
 
@@ -28,6 +30,14 @@ class CodexAuthorization(BaseModel):
     refresh_token: SecretStr = Field(min_length=1, max_length=20_000)
     id_token: SecretStr = Field(min_length=1, max_length=20_000)
     account_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,200}$")
+    account_ref: str | None = Field(default=None, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+
+
+class CodexLoginStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    client_request_id: str = Field(min_length=36, max_length=36)
+    mode: Literal["import", "attach"]
+    account_ref: str | None = Field(default=None, pattern=r"^car_[A-Za-z0-9_-]{43}$")
 
 
 class KeyName(BaseModel):
@@ -54,8 +64,20 @@ async def account_operation(handler, *args):
         return await run_in_threadpool(handler, *args)
     except KeyError:
         raise HTTPException(404, detail={"error": "account not found"}) from None
+    except CodexAuthorizationAttachError as exc:
+        raise HTTPException(409, detail={"code": exc.code}) from None
     except ValueError:
         raise HTTPException(409, detail={"error": "account import conflicts with existing account scope or has invalid input"}) from None
+
+
+async def login_operation(handler, *args):
+    try:
+        return await run_in_threadpool(handler, *args)
+    except CodexLoginError as exc:
+        raise HTTPException(exc.status_code, detail={"code": exc.code}) from None
+    except CodexAuthorizationAttachError as exc:
+        status = 404 if exc.code == "codex_authorization_account_not_found" else 409
+        raise HTTPException(status, detail={"code": exc.code}) from None
 
 
 def create_router() -> APIRouter:
@@ -77,14 +99,67 @@ def create_router() -> APIRouter:
         payload = {key: value.get_secret_value() if isinstance(value, SecretStr) else value for key, value in body if value is not None}
         return {"item": await account_operation(account_service.import_owned_account, owner, payload)}
 
+    @router.post("/accounts/{account_id}/codex-authorization")
+    async def attach_owned_codex_authorization(account_id: str, body: CodexAuthorization, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        payload = {key: value.get_secret_value() if isinstance(value, SecretStr) else value for key, value in body if value is not None}
+        payload.pop("account_ref", None)
+        await account_operation(account_service.attach_owned_codex_authorization, owner, account_id, payload)
+        return {"attached": True}
+
     @router.post("/pool/codex-authorization")
     async def attach_codex_authorization(body: CodexAuthorization, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         # This internal bridge is reached only through the BFF's existing boss
         # gate. A normal program key never authorizes account management.
         owner_scope(authorization, x_workbench_account_owner)
-        payload = {key: value.get_secret_value() if isinstance(value, SecretStr) else value for key, value in body}
-        await account_operation(account_service.attach_codex_authorization, payload)
+        payload = {key: value.get_secret_value() if isinstance(value, SecretStr) else value for key, value in body if value is not None}
+        account_ref = payload.pop("account_ref", None)
+        await account_operation(account_service.attach_codex_authorization, payload, account_ref)
         return {"attached": True}
+
+    @router.post("/codex-login")
+    async def start_codex_login(body: CodexLoginStart, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await login_operation(
+            codex_login_service.start,
+            owner,
+            "owned",
+            body.mode,
+            body.client_request_id,
+            body.account_ref,
+        )
+
+    @router.get("/codex-login/{session_id}")
+    async def get_codex_login(session_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await login_operation(codex_login_service.get, owner, "owned", session_id)
+
+    @router.delete("/codex-login/{session_id}")
+    async def cancel_codex_login(session_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await login_operation(codex_login_service.cancel, owner, "owned", session_id)
+
+    @router.post("/pool/codex-login")
+    async def start_pool_codex_login(body: CodexLoginStart, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await login_operation(
+            codex_login_service.start,
+            owner,
+            "pool",
+            body.mode,
+            body.client_request_id,
+            body.account_ref,
+        )
+
+    @router.get("/pool/codex-login/{session_id}")
+    async def get_pool_codex_login(session_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await login_operation(codex_login_service.get, owner, "pool", session_id)
+
+    @router.delete("/pool/codex-login/{session_id}")
+    async def cancel_pool_codex_login(session_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await login_operation(codex_login_service.cancel, owner, "pool", session_id)
 
     @router.post("/accounts/{account_id}/refresh")
     async def refresh_account(account_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):

@@ -241,6 +241,18 @@ class CodexDualAuthorizationTests(unittest.TestCase):
             accounts.attach_codex_authorization(credentials("conflicting-original-id"))
         self.assertNotIn("codex_credentials", accounts.list_accounts()[0])
 
+    def test_valid_exact_primary_with_corrupted_exact_sibling_is_rejected(self):
+        primary = self.add_primary()
+        corrupted = jwt(SUBJECT, account_id=ACCOUNT_ID, marker="corrupted-sibling")
+        self.accounts.add_account_items([{
+            "access_token": corrupted,
+            "id_token": jwt("other-subject", account_id=ACCOUNT_ID),
+            "account_id": ACCOUNT_ID,
+        }])
+        with self.assertRaisesRegex(CodexAuthorizationAttachError, "account_conflict"):
+            self.accounts.attach_codex_authorization(credentials("blocked-by-corruption"))
+        self.assertNotIn("codex_credentials", self.accounts.get_account(primary))
+
     def test_codex_requests_use_nested_authorization_and_primary_key_for_affinity(self):
         primary = self.add_primary(codex_credentials=credentials("request"))
         session = FakeSession(post_response=FakeResponse(payload={"id": "response"}))

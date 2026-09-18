@@ -18,30 +18,48 @@ Successful model discovery or deployment health does not prove that a real Respo
 
 ## What the launchers do
 
-### Existing pool account: attach Codex authorization
+### Account login and authorization
 
-An official Codex login is distinct from the ordinary service key used below. If the
-existing Chat credential is rejected by Codex, complete the official login for that
-same account in an isolated CLI home. Keep its `auth.json` private; do not place it
-in a repository, message, screenshot, or acceptance bundle.
+The account login/import flow is being added to the existing Workbench account
+center. Its code, deployment and actual upstream acceptance are separate states;
+do not treat this section as proof that the new UI has been deployed.
 
-For an existing pool record, the authenticated Workbench management bridge accepts
-`POST /api/ai-service/pool/codex-authorization` with the file's `tokens.access_token`,
-`tokens.refresh_token`, `tokens.id_token`, and `tokens.account_id` as the corresponding
-top-level JSON fields. This is an existing boss/administrator session operation with
-a same-origin requirement, **not** a public API authenticated with a program key.
-Workbench forwards it through its private Provider management connection.
+- **New account:** choose `接入账号` → `登录授权 Codex`. The service starts an
+  official device-code login and the page shows a short-lived code and the official
+  sign-in link. Complete sign-in at `https://auth.openai.com/codex/device` and enter
+  that code. Workbench then reports the result without asking you to copy tokens.
+- **Existing account:** choose `补充 Codex 授权` on the intended account. The service
+  checks the returned upstream subject and workspace against that selected record.
+  Another account is rejected; this never replaces the record's Chat credential,
+  owner, ordinary keys, or original request/session bindings.
+- **Already signed in locally:** choose `导入已有授权` and select the official
+  `auth.json`. Only the allowlisted credential fields are submitted through the
+  authenticated HTTPS management bridge. Do not paste the file into chat or logs.
+  This fallback is also available when device login is unavailable for the account.
+- **Chat authorization:** retain the existing controlled Chat token import path.
+  Codex sign-in is not displayed as proof of Chat authorization or image capacity.
 
-The operation requires one existing record with the same exact upstream subject and
-workspace ID. It never creates or adopts a record. Missing, mismatched or ambiguous
-identity returns a conflict. A successful response is only `{"attached": true}`:
-Chat credentials, account ownership, ordinary keys and original task/session bindings
-remain unchanged. Codex credentials are persisted separately in that same record and
-refreshed with the Codex client. Attachment does not prove Responses success; resume
-the original isolated CLI session through the service and inspect its actual result.
+Device login is currently an upstream beta and may require enabling it in the
+account's security settings or workspace permissions. The official sign-in page
+is the only place to enter an OpenAI password or approve OpenAI authorization.
+[Official authentication documentation](https://learn.chatgpt.com/docs/auth#login-on-headless-devices).
 
-This endpoint is a candidate until the exact Provider and Content API versions have
-been deployed. Browser login and local engineering tests are not live acceptance.
+Closing the dialog hides it; cancelling explicitly stops the local login operation.
+Browser refresh resumes the saved opaque operation identifier, not a second login.
+Expired or interrupted operations are shown explicitly. A failed or uncertain
+exchange is not automatically repeated. `授权已保存，实际调用待验证` means only that
+credentials were saved; real Codex tool execution still requires the isolated
+client acceptance below.
+
+The production management URL prefix is `/api/v1/content/ai-service` (the Content
+service's configured API prefix), not the public `/ai/codex/v1` program endpoint.
+The existing boss/administrator same-origin attachment route is
+`POST /api/v1/content/ai-service/pool/codex-authorization`. Ordinary program keys
+cannot manage accounts. The UI supplies a stable opaque `account_ref` when
+attaching to a selected service-pool record; `pool-row-N` is display-only.
+The legacy no-reference attachment remains compatible with its strict unique
+subject/workspace match. Login/import requests keep the same role and ownership
+boundaries and never return upstream access, refresh or ID tokens to the browser.
 
 `examples/codex_client/run-codex.sh` and `examples/codex_client/run-codex.ps1` first request `GET /models`. Discovery accepts native Codex `models[].slug` and OpenAI-compatible `data[].id` responses without changing the provider protocol. Run discovery without a model, then select one exact returned ID before they create an isolated state root and launch Codex.
 

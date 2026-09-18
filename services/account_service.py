@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import secrets
 import time
@@ -327,6 +328,45 @@ class AccountService:
             raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
         credentials["account_id"] = account_id
         return credentials
+
+    @classmethod
+    def _codex_identity(cls, credentials: dict[str, str]) -> tuple[str, str]:
+        return cls._jwt_subject(credentials.get("access_token")), str(credentials.get("account_id") or "")
+
+    @classmethod
+    def _account_identity(cls, account: dict) -> tuple[str, str] | None:
+        subject = cls._jwt_subject(account.get("access_token"))
+        id_subject = cls._jwt_subject(account.get("id_token"))
+        account_id = cls._validated_workspace_id(account.get("account_id"))
+        if not subject or not account_id or (id_subject and id_subject != subject):
+            return None
+        try:
+            claimed_ids = cls._jwt_workspace_ids(account.get("access_token"), account.get("id_token"))
+        except CodexAuthorizationAttachError:
+            return None
+        if claimed_ids and claimed_ids != {account_id}:
+            return None
+        return subject, account_id
+
+    @staticmethod
+    def _authorization_ref(subject: str, account_id: str) -> str:
+        material = f"codex-authorization:v1\0{subject}\0{account_id}".encode("utf-8")
+        return "car_" + base64.urlsafe_b64encode(hashlib.sha256(material).digest()).decode("ascii").rstrip("=")
+
+    @classmethod
+    def codex_authorization_ref(cls, account: dict) -> str | None:
+        identity = cls._account_identity(account)
+        return cls._authorization_ref(*identity) if identity else None
+
+    @classmethod
+    def _authorization_revision(cls, account: dict) -> str:
+        fields = [
+            str(account.get(key) or "")
+            for key in ("access_token", "refresh_token", "id_token", "account_id")
+        ]
+        fields.extend(cls._codex_credential_fields(account))
+        material = json.dumps(fields, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(material).hexdigest()
 
     @staticmethod
     def codex_authorization_fields(account: dict) -> tuple[str, str]:
@@ -1546,84 +1586,275 @@ class AccountService:
             return [public_owned_account(a) for a in self._accounts.values()
                     if a.get("managed_owner") == owner and a.get("managed_account_id")]
 
-    def attach_codex_authorization(self, payload: dict) -> dict:
+    def _identity_matches_locked(self, identity: tuple[str, str]) -> list[tuple[str, dict]]:
+        return [
+            (token, account)
+            for token, account in self._accounts.items()
+            if self._account_identity(account) == identity
+        ]
+
+    def _has_invalid_exact_identity_locked(self, identity: tuple[str, str]) -> bool:
+        subject, account_id = identity
+        return any(
+            self._jwt_subject(account.get("access_token")) == subject
+            and self._validated_workspace_id(account.get("account_id")) == account_id
+            and self._account_identity(account) != identity
+            for account in self._accounts.values()
+        )
+
+    def _account_ref_matches_locked(self, account_ref: str) -> list[tuple[str, dict]]:
+        expected = str(account_ref or "").strip()
+        if not expected:
+            return []
+        return [
+            (token, account)
+            for token, account in self._accounts.items()
+            if self.codex_authorization_ref(account) == expected
+        ]
+
+    def _attach_codex_locked(
+        self,
+        token: str,
+        current: dict,
+        credentials: dict[str, str],
+        *,
+        expected_revision: str | None = None,
+    ) -> bool:
+        incoming = tuple(
+            credentials[key]
+            for key in ("access_token", "refresh_token", "id_token", "account_id")
+        )
+        if self._codex_credential_fields(current) == incoming:
+            return False
+        if expected_revision is not None and self._authorization_revision(current) != expected_revision:
+            raise CodexAuthorizationAttachError("codex_authorization_stale_target")
+
+        observation = current.get("codex_observation")
+        observation = dict(observation) if isinstance(observation, dict) else {}
+        observation.update({
+            "state": "unknown",
+            "observed_at": None,
+            "failed_at": None,
+            "error_code": None,
+        })
+        next_item = self._normalize_account({
+            **current,
+            "access_token": token,
+            "codex_credentials": credentials,
+            "codex_observation": observation,
+            "last_codex_token_refresh_at": None,
+            "last_codex_token_refresh_error": None,
+            "last_codex_token_refresh_error_at": None,
+        })
+        if next_item is None:
+            raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+        self._accounts[token] = next_item
+        try:
+            self._save_accounts()
+        except Exception:
+            self._accounts[token] = current
+            raise
+        return True
+
+    def codex_login_target(self, owner: str, account_ref: str, *, pool: bool = False) -> dict[str, str]:
+        """Resolve a browser-login target without exposing or persisting credentials."""
+        with self._lock:
+            matches = self._account_ref_matches_locked(account_ref)
+            if len(matches) > 1:
+                raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
+            if not matches:
+                raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
+            _token, account = matches[0]
+            if not pool and account.get("managed_owner") != owner:
+                raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
+            return {
+                "account_ref": str(account_ref),
+                "revision": self._authorization_revision(account),
+            }
+
+    @staticmethod
+    def codex_credential_digest(credentials: dict) -> str:
+        # Internal crash-recovery comparison only, never returned to clients.
+        material = json.dumps([credentials.get(key, "") for key in
+                               ("access_token", "refresh_token", "id_token", "account_id")],
+                              separators=(",", ":")).encode()
+        return hashlib.sha256(material).hexdigest()
+
+    def codex_login_completion_readback(
+        self,
+        owner: str,
+        scope: str,
+        mode: str,
+        account_ref: str,
+        authorization_ref: str,
+        credential_digest: str,
+    ) -> dict[str, object]:
+        """Read whether an exchanged authorization was already durably saved.
+
+        This is used only after an interrupted local completion record. It never
+        exchanges a code or mutates an account.
+        """
+        with self._lock:
+            lookup_ref = authorization_ref if mode == "import" else account_ref
+            matches = self._account_ref_matches_locked(lookup_ref)
+            if len(matches) != 1:
+                return {"applied": False}
+            _token, account = matches[0]
+            if scope == "owned" and account.get("managed_owner") != owner:
+                return {"applied": False}
+            raw = account.get("codex_credentials")
+            try:
+                credentials = self._validated_codex_credentials(raw)
+            except CodexAuthorizationAttachError:
+                return {"applied": False}
+            stored_ref = self._authorization_ref(*self._codex_identity(credentials))
+            if stored_ref != authorization_ref or self.codex_credential_digest(credentials) != credential_digest:
+                return {"applied": False}
+            return {
+                "applied": True,
+                "account_ref": self.codex_authorization_ref(account),
+            }
+
+    def attach_codex_authorization(
+        self,
+        payload: dict,
+        account_ref: str | None = None,
+        expected_revision: str | None = None,
+    ) -> dict:
         """Attach a separately issued Codex authorization to one existing account.
 
         JWT payloads are used only as trusted management consistency material.
         This method does not authenticate callers and never creates an account.
         """
         credentials = self._validated_codex_credentials(payload)
-        subject = self._jwt_subject(credentials["access_token"])
-        account_id = credentials["account_id"]
+        identity = self._codex_identity(credentials)
         with self._lock:
-            exact: list[tuple[str, dict]] = []
-            related = False
-            invalid_related = False
-            for token, account in self._accounts.items():
-                primary_sub = self._jwt_subject(account.get("access_token"))
-                primary_id_sub = self._jwt_subject(account.get("id_token"))
-                primary_account_id = self._validated_workspace_id(account.get("account_id"))
-                if primary_sub == subject or primary_account_id == account_id:
-                    related = True
-                if primary_sub != subject or primary_account_id != account_id:
-                    continue
-                if primary_id_sub and primary_id_sub != primary_sub:
-                    invalid_related = True
-                    continue
-                try:
-                    claimed_ids = self._jwt_workspace_ids(
-                        account.get("access_token"), account.get("id_token")
-                    )
-                except CodexAuthorizationAttachError:
-                    invalid_related = True
-                    continue
-                if claimed_ids and claimed_ids != {account_id}:
-                    invalid_related = True
-                    continue
-                exact.append((token, account))
+            subject, account_id = identity
+            invalid_related = self._has_invalid_exact_identity_locked(identity)
+            if account_ref:
+                exact = self._account_ref_matches_locked(account_ref)
+                if len(exact) > 1:
+                    raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
+                if not exact:
+                    raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
+                if self._account_identity(exact[0][1]) != identity:
+                    raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+            else:
+                exact = self._identity_matches_locked(identity)
 
             if len(exact) > 1:
                 raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
             if exact and invalid_related:
                 raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
             if not exact:
+                related = any(
+                    self._jwt_subject(account.get("access_token")) == subject
+                    or self._validated_workspace_id(account.get("account_id")) == account_id
+                    for account in self._accounts.values()
+                )
                 if related or invalid_related:
                     raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
                 raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
 
             token, current = exact[0]
-            if self._codex_credential_fields(current) == tuple(
-                credentials[key] for key in ("access_token", "refresh_token", "id_token", "account_id")
-            ):
-                return {"attached": True}
+            changed = self._attach_codex_locked(
+                token,
+                current,
+                credentials,
+                expected_revision=expected_revision,
+            )
+        if changed:
+            log_service.add(LOG_TYPE_ACCOUNT, "附加 Codex 独立授权", {"status": "成功"})
+        return {"attached": True}
 
-            observation = current.get("codex_observation")
-            observation = dict(observation) if isinstance(observation, dict) else {}
-            observation.update({
-                "state": "unknown",
-                "observed_at": None,
-                "failed_at": None,
-                "error_code": None,
-            })
-            next_item = self._normalize_account({
-                **current,
-                "access_token": token,
-                "codex_credentials": credentials,
-                "codex_observation": observation,
-                "last_codex_token_refresh_at": None,
-                "last_codex_token_refresh_error": None,
-                "last_codex_token_refresh_error_at": None,
-            })
-            if next_item is None:
+    def attach_owned_codex_authorization(
+        self,
+        owner: str,
+        managed_account_id: str,
+        payload: dict,
+        *,
+        expected_revision: str | None = None,
+    ) -> dict:
+        credentials = self._validated_codex_credentials(payload)
+        identity = self._codex_identity(credentials)
+        with self._lock:
+            exact = [
+                (token, account)
+                for token, account in self._accounts.items()
+                if account.get("managed_owner") == owner
+                and account.get("managed_account_id") == managed_account_id
+            ]
+            if not exact:
+                raise KeyError("account not found")
+            if len(exact) > 1:
+                raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
+            token, current = exact[0]
+            identity_matches = self._identity_matches_locked(identity)
+            if len(identity_matches) > 1:
+                raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
+            if self._has_invalid_exact_identity_locked(identity):
                 raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
-            self._accounts[token] = next_item
+            if self._account_identity(current) != identity:
+                raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+            changed = self._attach_codex_locked(
+                token,
+                current,
+                credentials,
+                expected_revision=expected_revision,
+            )
+        if changed:
+            log_service.add(LOG_TYPE_ACCOUNT, "附加 Codex 独立授权", {"status": "成功"})
+        return {"attached": True}
+
+    def import_owned_codex_authorization(self, owner: str, payload: dict) -> dict:
+        from services.owned_accounts import public_owned_account, utc_now
+
+        credentials = self._validated_codex_credentials(payload)
+        identity = self._codex_identity(credentials)
+        with self._lock:
+            matches = self._identity_matches_locked(identity)
+            if len(matches) > 1:
+                raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
+            if self._has_invalid_exact_identity_locked(identity):
+                raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+            if matches:
+                token, current = matches[0]
+                if current.get("managed_owner") != owner:
+                    raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+                self._attach_codex_locked(token, current, credentials)
+                return public_owned_account(self._accounts[token])
+
+            token = credentials["access_token"]
+            if token in self._accounts:
+                raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+            account = self._normalize_account({
+                **credentials,
+                "access_token": token,
+                "source_type": "codex",
+                "status": "正常",
+                "quota": None,
+                "managed_owner": owner,
+                "managed_account_id": uuid.uuid4().hex,
+                "managed_updated_at": utc_now(),
+                "codex_credentials": credentials,
+                "codex_observation": {
+                    "state": "unknown",
+                    "observed_at": None,
+                    "failed_at": None,
+                    "error_code": None,
+                },
+            })
+            if account is None:
+                raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
+            self._accounts[token] = account
             try:
                 self._save_accounts()
             except Exception:
-                self._accounts[token] = current
+                self._accounts.pop(token, None)
                 raise
-        log_service.add(LOG_TYPE_ACCOUNT, "附加 Codex 独立授权", {"status": "成功"})
-        return {"attached": True}
+            self._cumulative_total += 1
+            self._save_cumulative_total()
+            return public_owned_account(account)
 
     def import_owned_account(self, owner: str, payload: dict) -> dict:
         from services.owned_accounts import public_owned_account, utc_now
@@ -1632,6 +1863,28 @@ class AccountService:
         token = str(payload.get("access_token") or "").strip()
         if not token:
             raise ValueError("access_token is required")
+        if self._normalize_source_type(payload.get("source_type")) == "codex" and all(
+            str(payload.get(key) or "").strip()
+            for key in ("access_token", "refresh_token", "id_token", "account_id")
+        ):
+            return self.import_owned_codex_authorization(owner, payload)
+        if all(
+            str(payload.get(key) or "").strip()
+            for key in ("access_token", "refresh_token", "id_token", "account_id")
+        ):
+            credentials = self._validated_codex_credentials(payload)
+            identity = self._codex_identity(credentials)
+            with self._lock:
+                matches = self._identity_matches_locked(identity)
+                if len(matches) > 1:
+                    raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
+                if self._has_invalid_exact_identity_locked(identity):
+                    raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+                if matches:
+                    _existing_token, existing = matches[0]
+                    if existing.get("managed_owner") != owner:
+                        raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+                    return public_owned_account(existing)
         with self._lock:
             token = self._resolve_access_token_locked(token)
             current = self._accounts.get(token)
