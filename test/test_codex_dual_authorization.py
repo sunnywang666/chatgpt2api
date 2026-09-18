@@ -79,6 +79,20 @@ class CodexDualAuthorizationTests(unittest.TestCase):
         self.accounts.add_account_items([item])
         return token
 
+    def test_saved_authorization_is_independent_of_capacity_and_survives_restart(self):
+        primary = self.add_primary()
+        self.assertEqual(CodexService.account_projection(self.accounts.get_account(primary))["authorization_status"], "missing")
+        self.accounts.attach_codex_authorization(credentials("feedback"))
+        restored = AccountService(JSONStorageBackend(self.path)).get_account(primary)
+        for state in ("unknown", "read_failed", "limited", "observed", "auth_required"):
+            restored["codex_observation"]["state"] = state
+            public = CodexService.account_projection(restored)
+            self.assertEqual(public["authorization_status"], "saved")
+            self.assertEqual(public["state"], state)
+            self.assertNotIn("access_token", json.dumps(public))
+        restored["codex_credentials"] = {}
+        self.assertEqual(CodexService.account_projection(restored)["authorization_status"], "missing")
+
     def test_attach_persists_on_same_record_and_safe_projections_hide_nested_secrets(self):
         primary = self.add_primary()
         before = self.accounts.get_account(primary)
