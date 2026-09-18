@@ -743,9 +743,17 @@ class AccountService:
                         or primary_account_id != candidate["account_id"]
                     )
                     if not invalid_current:
+                        submissions = current.get("codex_import_submissions")
+                        submissions = dict(submissions) if isinstance(submissions, dict) else {}
+                        old_digest = self.codex_credential_digest(credentials)
+                        new_digest = self.codex_credential_digest(candidate)
+                        for submitter, submission in submissions.items():
+                            if isinstance(submission, dict) and submission.get("digest") == old_digest:
+                                submissions[submitter] = {**submission, "digest": new_digest}
                         next_item = self._normalize_account({
                             **current,
                             "codex_credentials": candidate,
+                            "codex_import_submissions": submissions,
                             "last_codex_token_refresh_at": now,
                             "last_codex_token_refresh_error": None,
                             "last_codex_token_refresh_error_at": None,
@@ -1634,33 +1642,53 @@ class AccountService:
         credentials: dict[str, str],
         *,
         expected_revision: str | None = None,
+        submitted_by: str | None = None,
+        observation: dict | None = None,
     ) -> bool:
         incoming = tuple(
             credentials[key]
             for key in ("access_token", "refresh_token", "id_token", "account_id")
         )
-        if self._codex_credential_fields(current) == incoming:
-            return False
+        same_credentials = self._codex_credential_fields(current) == incoming
         if expected_revision is not None and self._authorization_revision(current) != expected_revision:
             raise CodexAuthorizationAttachError("codex_authorization_stale_target")
 
-        observation = current.get("codex_observation")
-        observation = dict(observation) if isinstance(observation, dict) else {}
-        observation.update({
-            "state": "unknown",
-            "observed_at": None,
-            "failed_at": None,
-            "error_code": None,
-        })
-        next_item = self._normalize_account({
+        submissions = current.get("codex_import_submissions")
+        submissions = dict(submissions) if isinstance(submissions, dict) else {}
+        if submitted_by:
+            submissions[submitted_by] = {
+                "digest": self.codex_credential_digest(credentials),
+                "import_status": "unchanged" if same_credentials else "updated",
+            }
+        if same_credentials and not submitted_by and observation is None:
+            return False
+
+        if observation is not None:
+            observation = dict(observation)
+        else:
+            existing_observation = current.get("codex_observation")
+            observation = dict(existing_observation) if isinstance(existing_observation, dict) else {}
+            if not same_credentials:
+                observation.update({
+                    "state": "unknown",
+                    "observed_at": None,
+                    "failed_at": None,
+                    "error_code": None,
+                })
+        updates = {
             **current,
             "access_token": token,
             "codex_credentials": credentials,
             "codex_observation": observation,
-            "last_codex_token_refresh_at": None,
-            "last_codex_token_refresh_error": None,
-            "last_codex_token_refresh_error_at": None,
-        })
+            "codex_import_submissions": submissions,
+        }
+        if not same_credentials:
+            updates.update(
+                last_codex_token_refresh_at=None,
+                last_codex_token_refresh_error=None,
+                last_codex_token_refresh_error_at=None,
+            )
+        next_item = self._normalize_account(updates)
         if next_item is None:
             raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
         self._accounts[token] = next_item
@@ -1749,7 +1777,7 @@ class AccountService:
             if len(matches) != 1:
                 return {"applied": False}
             _token, account = matches[0]
-            if scope == "owned" and account.get("managed_owner") != owner:
+            if scope == "owned" and mode != "import" and account.get("managed_owner") != owner:
                 return {"applied": False}
             raw = account.get("codex_credentials")
             try:
@@ -1759,10 +1787,59 @@ class AccountService:
             stored_ref = self._authorization_ref(*self._codex_identity(credentials))
             if stored_ref != authorization_ref or self.codex_credential_digest(credentials) != credential_digest:
                 return {"applied": False}
+            submissions = account.get("codex_import_submissions")
+            submission = submissions.get(owner) if isinstance(submissions, dict) else None
+            if mode == "import" and (
+                not isinstance(submission, dict) or submission.get("digest") != credential_digest
+            ):
+                return {"applied": False}
             return {
                 "applied": True,
                 "account_ref": self.codex_authorization_ref(account),
+                "import_status": submission.get("import_status") if mode == "import" else None,
+                "codex": self._submitted_codex_projection(account) if mode == "import" else None,
             }
+
+    @staticmethod
+    def _submitted_codex_projection(account: dict) -> dict:
+        from services.codex_service import CodexService
+        return CodexService.account_projection(account)
+
+    def refresh_submitted_codex_observation(self, owner: str, account_ref: str) -> dict:
+        """Read only the authorization this Workbench identity last submitted."""
+        with self._lock:
+            matches = self._account_ref_matches_locked(account_ref)
+            if len(matches) != 1:
+                raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
+            token, account = matches[0]
+            credentials = self._validated_codex_credentials(account.get("codex_credentials"))
+            digest = self.codex_credential_digest(credentials)
+            submissions = account.get("codex_import_submissions")
+            submission = submissions.get(owner) if isinstance(submissions, dict) else None
+            if not isinstance(submission, dict) or submission.get("digest") != digest:
+                raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
+        from services.codex_service import codex_service
+        observation = codex_service.observe_import_authorization(credentials)
+        with self._lock:
+            matches = self._account_ref_matches_locked(account_ref)
+            if len(matches) != 1:
+                raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
+            account = matches[0][1]
+            credentials = self._validated_codex_credentials(account.get("codex_credentials"))
+            submissions = account.get("codex_import_submissions")
+            submission = submissions.get(owner) if isinstance(submissions, dict) else None
+            if not isinstance(submission, dict) or submission.get("digest") != digest or self.codex_credential_digest(credentials) != digest:
+                raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
+            token = matches[0][0]
+            updated = dict(account)
+            updated["codex_observation"] = observation
+            self._accounts[token] = updated
+            try:
+                self._save_accounts()
+            except Exception:
+                self._accounts[token] = account
+                raise
+            return self._submitted_codex_projection(updated)
 
     def attach_codex_authorization(
         self,
@@ -1855,11 +1932,26 @@ class AccountService:
             log_service.add(LOG_TYPE_ACCOUNT, "附加 Codex 独立授权", {"status": "成功"})
         return {"attached": True}
 
-    def import_owned_codex_authorization(self, owner: str, payload: dict) -> dict:
-        from services.owned_accounts import public_owned_account, utc_now
+    def import_owned_codex_authorization(self, owner: str, payload: dict, *, verified_exchange: bool = False) -> dict:
+        from services.owned_accounts import utc_now
+        from services.codex_service import codex_service
 
         credentials = self._validated_codex_credentials(payload)
         identity = self._codex_identity(credentials)
+        with self._lock:
+            initial_matches = self._identity_matches_locked(identity)
+            if len(initial_matches) > 1:
+                raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
+            initial_revision = (
+                (initial_matches[0][0], self._authorization_revision(initial_matches[0][1]))
+                if initial_matches else None
+            )
+        # A decoded JWT is forgeable. The official device exchange already
+        # proves issuance; manually supplied material must pass a protected
+        # upstream read before it can replace anyone's stored authorization.
+        observation = codex_service.observe_import_authorization(credentials)
+        if not verified_exchange and observation["state"] not in {"observed", "limited"} and not observation.get("verified"):
+            raise CodexAuthorizationAttachError("codex_authorization_upstream_unverified")
         with self._lock:
             matches = self._identity_matches_locked(identity)
             if len(matches) > 1:
@@ -1868,12 +1960,25 @@ class AccountService:
                 raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
             if matches:
                 token, current = matches[0]
-                if current.get("managed_owner") != owner:
-                    raise CodexAuthorizationAttachError("codex_authorization_owned_elsewhere")
-                self._attach_codex_locked(token, current, credentials)
-                return public_owned_account(self._accounts[token])
+                same_credentials = self._codex_credential_fields(current) == tuple(
+                    credentials[key] for key in ("access_token", "refresh_token", "id_token", "account_id")
+                )
+                if not same_credentials and (
+                    initial_revision is None
+                    or initial_revision != (token, self._authorization_revision(current))
+                ):
+                    raise CodexAuthorizationAttachError("codex_authorization_stale_target")
+                self._attach_codex_locked(token, current, credentials, submitted_by=owner, observation=observation)
+                account = self._accounts[token]
+                return {
+                    "authorization_ref": self.codex_authorization_ref(account),
+                    "import_status": "unchanged" if same_credentials else "updated",
+                    "codex": self._submitted_codex_projection(account),
+                }
 
             token = credentials["access_token"]
+            if initial_revision is not None:
+                raise CodexAuthorizationAttachError("codex_authorization_stale_target")
             if token in self._accounts:
                 raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
             account = self._normalize_account({
@@ -1886,12 +1991,11 @@ class AccountService:
                 "managed_account_id": uuid.uuid4().hex,
                 "managed_updated_at": utc_now(),
                 "codex_credentials": credentials,
-                "codex_observation": {
-                    "state": "unknown",
-                    "observed_at": None,
-                    "failed_at": None,
-                    "error_code": None,
-                },
+                "codex_observation": observation,
+                "codex_import_submissions": {owner: {
+                    "digest": self.codex_credential_digest(credentials),
+                    "import_status": "created",
+                }},
             })
             if account is None:
                 raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
@@ -1903,7 +2007,11 @@ class AccountService:
                 raise
             self._cumulative_total += 1
             self._save_cumulative_total()
-            return public_owned_account(account)
+            return {
+                "authorization_ref": self.codex_authorization_ref(account),
+                "import_status": "created",
+                "codex": self._submitted_codex_projection(account),
+            }
 
     def import_owned_account(self, owner: str, payload: dict) -> dict:
         from services.owned_accounts import public_owned_account, utc_now
@@ -1912,33 +2020,39 @@ class AccountService:
         token = str(payload.get("access_token") or "").strip()
         if not token:
             raise ValueError("access_token is required")
-        if self._normalize_source_type(payload.get("source_type")) == "codex" and all(
-            str(payload.get(key) or "").strip()
-            for key in ("access_token", "refresh_token", "id_token", "account_id")
-        ):
-            return self.import_owned_codex_authorization(owner, payload)
         if all(
             str(payload.get(key) or "").strip()
             for key in ("access_token", "refresh_token", "id_token", "account_id")
         ):
-            credentials = self._validated_codex_credentials(payload)
-            identity = self._codex_identity(credentials)
-            with self._lock:
-                matches = self._identity_matches_locked(identity)
-                if len(matches) > 1:
-                    raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
-                if self._has_invalid_exact_identity_locked(identity):
-                    raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
-                if matches:
-                    _existing_token, existing = matches[0]
-                    if existing.get("managed_owner") != owner:
-                        raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
-                    return public_owned_account(existing)
+            if self._normalize_source_type(payload.get("source_type")) == "codex":
+                return self.import_owned_codex_authorization(owner, payload)
+            try:
+                return self.import_owned_codex_authorization(owner, payload)
+            except CodexAuthorizationAttachError as exc:
+                if exc.code != "codex_authorization_upstream_unverified":
+                    raise
+                # A complete legacy Chat export may have no Codex entitlement.
+                # Preserve its original token path after a failed Codex read.
         with self._lock:
+            submitted_token = token
             token = self._resolve_access_token_locked(token)
             current = self._accounts.get(token)
             if current and current.get("managed_owner") != owner:
-                raise ValueError("account already exists outside your account scope")
+                if token != submitted_token:
+                    raise ValueError("account already exists outside your account scope")
+                from services.owned_accounts import observed_capacity
+                return {
+                    "import_status": "unchanged",
+                    "route": "chat",
+                    "capacity": observed_capacity(current),
+                }
+            if current is None:
+                subject = self._jwt_subject(token)
+                workspace_ids = self._jwt_workspace_ids(token, payload.get("id_token"))
+                if subject and len(workspace_ids) == 1:
+                    identity = (subject, next(iter(workspace_ids)))
+                    if self._identity_matches_locked(identity) or self._has_invalid_exact_identity_locked(identity):
+                        raise ValueError("account already exists outside your account scope")
             item = dict(current or {})
             item.update({key: str(payload[key]).strip() for key in ("refresh_token", "id_token", "account_id") if payload.get(key)})
             item.update(access_token=token, managed_owner=owner,

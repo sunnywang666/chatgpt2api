@@ -54,6 +54,8 @@ class CodexLoginService:
         "expires_at",
         "poll_after_seconds",
         "account_ref",
+        "import_status",
+        "codex",
         "error_code",
     )
     SENSITIVE_FIELDS = ("device_auth_id", "user_code", "verification_url")
@@ -342,6 +344,9 @@ class CodexLoginService:
         if readback.get("applied"):
             session["state"] = "succeeded"
             session["account_ref"] = readback.get("account_ref") or session.get("account_ref")
+            if session.get("mode") == "import":
+                session["import_status"] = readback.get("import_status")
+                session["codex"] = readback.get("codex")
             session["error_code"] = None
         else:
             session["state"] = "failed"
@@ -557,8 +562,12 @@ class CodexLoginService:
                 session["completion_credential_digest"] = AccountService.codex_credential_digest(credentials)
                 self._save_locked()
                 if session["mode"] == "import":
-                    item = self.accounts.import_owned_codex_authorization(session["owner"], credentials)
+                    item = self.accounts.import_owned_codex_authorization(
+                        session["owner"], credentials, verified_exchange=True
+                    )
                     account_ref = str(item.get("authorization_ref") or "") or None
+                    session["import_status"] = item["import_status"]
+                    session["codex"] = item["codex"]
                 elif session["scope"] == "pool":
                     self.accounts.attach_codex_authorization(
                         credentials,

@@ -446,6 +446,71 @@ class CodexService:
         value = [headers["authorization"], headers.get("chatgpt-account-id", "")]
         return hashlib.sha256(json.dumps(value).encode()).hexdigest()
 
+    def observe_import_authorization(self, credentials: dict[str, str]) -> dict:
+        """Prove a supplied bearer token with a protected upstream usage read.
+
+        JWT claims alone are only consistency hints. This read neither selects
+        nor mutates a stored account, so a failed proof cannot affect a peer's
+        authorization or observation.
+        """
+        account = {"codex_credentials": credentials, "source_type": "codex"}
+        observed_at = _utc_now()
+        session = None
+        try:
+            session = self._session(account)
+            response = session.get(
+                CODEX_USAGE_URL,
+                headers=self._account_headers(account, {"user-agent": "codex-cli/0.149.1"}),
+                timeout=(5, 20),
+                allow_redirects=False,
+            )
+            if response.status_code != 200 or len(response.content) > 4 * 1024 * 1024:
+                raise ValueError("upstream usage read did not verify authorization")
+            limits, limited = _project_limits(response.json())
+            return {
+                "state": "limited" if limited else "observed",
+                "verified": True,
+                "observed_at": observed_at,
+                "failed_at": None,
+                "models": [],
+                "limits": limits,
+                "error_code": None,
+            }
+        except Exception:
+            # Usage can be temporarily unavailable while the protected Codex
+            # catalog still proves the bearer token and selected workspace.
+            try:
+                if session is None:
+                    raise ValueError("upstream session unavailable")
+                response = session.get(
+                    CODEX_MODELS_URL,
+                    headers=self._account_headers(account, {"user-agent": "codex-cli/0.149.1"}),
+                    timeout=(5, 20),
+                    allow_redirects=False,
+                )
+                if response.status_code != 200 or len(response.content) > 4 * 1024 * 1024:
+                    raise ValueError("upstream catalog did not verify authorization")
+                models = _project_models(response.json())
+                verified = True
+            except Exception:
+                models = []
+                verified = False
+            return {
+                "state": "read_failed",
+                "verified": verified,
+                "observed_at": None,
+                "failed_at": observed_at,
+                "models": models,
+                "limits": [],
+                "error_code": "usage_unverified",
+            }
+        finally:
+            try:
+                if session is not None:
+                    session.close()
+            except Exception:
+                pass
+
     def refresh_account(self, access_token: str) -> dict:
         before = self.accounts.get_account(access_token)
         current_token = self._refresh_authorization(access_token, event="codex_observation")

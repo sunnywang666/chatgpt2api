@@ -70,7 +70,8 @@ async def account_operation(handler, *args):
     except KeyError:
         raise HTTPException(404, detail={"error": "account not found"}) from None
     except CodexAuthorizationAttachError as exc:
-        raise HTTPException(409, detail={"code": exc.code}) from None
+        status = 404 if exc.code == "codex_authorization_account_not_found" else 409
+        raise HTTPException(status, detail={"code": exc.code}) from None
     except ValueError:
         raise HTTPException(409, detail={"error": "account import conflicts with existing account scope or has invalid input"}) from None
 
@@ -126,6 +127,11 @@ def create_router() -> APIRouter:
     async def refresh_owned_codex_observation(body: CodexObservationTarget, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)
         return await account_operation(account_service.refresh_codex_observation, owner, body.account_ref, False)
+
+    @router.post("/submitted-codex-observation")
+    async def refresh_submitted_codex_observation(body: CodexObservationTarget, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await account_operation(account_service.refresh_submitted_codex_observation, owner, body.account_ref)
 
     @router.post("/pool/codex-observation")
     async def refresh_pool_codex_observation(body: CodexObservationTarget, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):

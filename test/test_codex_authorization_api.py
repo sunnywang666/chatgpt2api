@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from api import owned_accounts
 from api.errors import install_exception_handlers
 from api.external_images import external_image_boundary
+from services.account_service import CodexAuthorizationAttachError
 from services.auth_service import AuthService
 from services.storage.json_storage import JSONStorageBackend
 
@@ -53,6 +54,22 @@ class CodexAuthorizationApiTests(unittest.TestCase):
             self.assertEqual(result.status_code, 200)
             self.accounts.refresh_codex_observation.assert_called_once_with("workbench:org:boss", ref, pool)
             self.accounts.reset_mock()
+
+    def test_submitted_observation_forwards_only_owner_and_reference(self):
+        ref = "car_" + "B" * 43
+        route = "/api/workbench/ai/submitted-codex-observation"
+        self.accounts.refresh_submitted_codex_observation.return_value = {"state": "observed", "limits": []}
+        denied = self.client.post(route, headers={**self.trusted, "Authorization": "Bearer " + self.user}, json={"account_ref": ref})
+        self.assertEqual(denied.status_code, 403)
+        self.accounts.refresh_submitted_codex_observation.assert_not_called()
+        response = self.client.post(route, headers=self.trusted, json={"account_ref": ref})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"state": "observed", "limits": []})
+        self.accounts.refresh_submitted_codex_observation.assert_called_once_with("workbench:org:boss", ref)
+        self.accounts.refresh_submitted_codex_observation.side_effect = CodexAuthorizationAttachError("codex_authorization_account_not_found")
+        stale = self.client.post(route, headers=self.trusted, json={"account_ref": ref})
+        self.assertEqual(stale.status_code, 404)
+        self.assertEqual(stale.json()["detail"]["code"], "codex_authorization_account_not_found")
 
     def test_only_admin_bridge_can_attach_and_response_contains_no_material(self):
         self.accounts.attach_codex_authorization.return_value = {"attached": True, **self.body}
