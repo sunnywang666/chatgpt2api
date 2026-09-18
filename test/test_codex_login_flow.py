@@ -971,6 +971,93 @@ class CodexLoginFlowTests(unittest.TestCase):
             with self.assertRaisesRegex(CodexAuthorizationAttachError, "stale_target"):
                 self.accounts.import_owned_account("workbench:org:one", {**first, "source_type": "web"})
 
+    def test_chat_submitted_id_is_never_saved_without_official_id(self):
+        info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 3, "limits_progress": []}
+        for submitter in ("workbench:org:one", "workbench:org:two"):
+            for submitted_refresh in (False, True):
+                with self.subTest(submitter=submitter, submitted_refresh=submitted_refresh):
+                    path = Path(self.tmp.name) / f"chat-id-{submitter[-3:]}-{submitted_refresh}.json"
+                    accounts = AccountService(JSONStorageBackend(path))
+                    old = credentials("trusted-chat")
+                    accounts.add_account_items([{
+                        **old, "source_type": "web", "managed_owner": "workbench:org:one",
+                        "managed_account_id": "original-row", "user_id": SUBJECT,
+                        "capacity_observed_at": "2026-09-17T00:00:00+00:00",
+                    }])
+                    submitted = credentials("forged-same-claims")
+                    payload = {"access_token": submitted["access_token"],
+                               "id_token": submitted["id_token"], "source_type": "web"}
+                    if submitted_refresh:
+                        payload["refresh_token"] = submitted["refresh_token"]
+                    issued = {"access_token": credentials("official-chat")["access_token"],
+                              "refresh_token": "official-refresh", "id_token": ""}
+                    with patch.object(accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)), \
+                            patch.object(accounts, "_request_access_token_refresh", return_value=issued) as exchange:
+                        receipt = accounts.import_owned_account(submitter, payload)
+                    self.assertEqual(exchange.call_count, int(submitted_refresh))
+                    self.assertEqual(receipt["import_status"], "updated")
+                    saved = accounts.storage.load_accounts()[0]
+                    self.assertEqual(saved["id_token"], old["id_token"])
+                    self.assertNotEqual(saved["id_token"], submitted["id_token"])
+                    self.assertEqual(saved["managed_owner"], "workbench:org:one")
+                    self.assertEqual(saved["managed_account_id"], "original-row")
+
+        for submitted_refresh in (False, True):
+            with self.subTest(new_record=True, submitted_refresh=submitted_refresh):
+                path = Path(self.tmp.name) / f"chat-new-id-{submitted_refresh}.json"
+                accounts = AccountService(JSONStorageBackend(path))
+                submitted = credentials("new-untrusted-id")
+                payload = {"access_token": submitted["access_token"],
+                           "id_token": submitted["id_token"], "source_type": "web"}
+                if submitted_refresh:
+                    payload["refresh_token"] = submitted["refresh_token"]
+                issued = {"access_token": credentials("new-issued-no-id")["access_token"],
+                          "refresh_token": "issued-refresh", "id_token": ""}
+                with patch.object(accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)), \
+                        patch.object(accounts, "_request_access_token_refresh", return_value=issued) as exchange:
+                    accounts.import_owned_account("workbench:org:one", payload)
+                self.assertEqual(exchange.call_count, int(submitted_refresh))
+                self.assertFalse(accounts.storage.load_accounts()[0].get("id_token"))
+
+    def test_codex_missing_official_id_uses_only_stored_id_or_rejects(self):
+        old = credentials("trusted-codex")
+        incoming = credentials("forged-codex-id")
+        issued = {"access_token": credentials("issued-codex")["access_token"],
+                  "refresh_token": "issued-refresh", "id_token": ""}
+        for submitter in ("workbench:org:one", "workbench:org:two"):
+            with self.subTest(submitter=submitter):
+                path = Path(self.tmp.name) / f"codex-no-id-{submitter[-3:]}.json"
+                accounts = AccountService(JSONStorageBackend(path))
+                accounts.add_account_items([{
+                    **old, "source_type": "codex", "managed_owner": "workbench:org:one",
+                    "managed_account_id": "original-row", "codex_credentials": old,
+                }])
+                with patch.object(accounts, "_request_access_token_refresh", return_value=issued) as exchange:
+                    receipt = accounts.import_owned_codex_authorization(submitter, incoming)
+                exchange.assert_called_once()
+                self.assertEqual(receipt["import_status"], "updated")
+                saved = accounts.storage.load_accounts()[0]
+                self.assertEqual(saved["codex_credentials"]["id_token"], old["id_token"])
+                self.assertNotEqual(saved["codex_credentials"]["id_token"], incoming["id_token"])
+                self.assertEqual(saved["managed_owner"], "workbench:org:one")
+
+        with patch.object(self.accounts, "_request_access_token_refresh", return_value=issued) as exchange:
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "refresh_unverified"):
+                self.accounts.import_owned_codex_authorization("workbench:org:one", incoming)
+        exchange.assert_called_once()
+        self.assertEqual(self.accounts.list_accounts(), [])
+
+        no_stored_id = {key: value for key, value in old.items() if key != "id_token"}
+        self.accounts.add_account_items([{
+            **no_stored_id, "source_type": "codex", "managed_owner": "workbench:org:one",
+            "managed_account_id": "legacy-no-id",
+        }])
+        same_refresh = {**incoming, "refresh_token": old["refresh_token"]}
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("active refresh must not be consumed")):
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "invalid_material"):
+                self.accounts.import_owned_codex_authorization("workbench:org:two", same_refresh)
+        self.assertFalse(self.accounts.storage.load_accounts()[0].get("id_token"))
+
     def test_new_chat_unknown_commit_reads_back_without_repeat_refresh(self):
         incoming = credentials("chat-uncertain-new")
         info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 5, "limits_progress": []}

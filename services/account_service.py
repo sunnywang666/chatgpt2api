@@ -390,15 +390,15 @@ class AccountService:
         """Authenticate new Chat material before it can create or rekey a row."""
         submitted_token = str(payload.get("access_token") or "").strip()
         replacement = {"access_token": submitted_token}
-        for key in ("refresh_token", "id_token"):
-            if payload.get(key):
-                replacement[key] = str(payload[key]).strip()
+        if payload.get("refresh_token"):
+            replacement["refresh_token"] = str(payload["refresh_token"]).strip()
+        submitted_id = str(payload.get("id_token") or "").strip()
         claimed_subjects = {
             value for value in (
-                self._jwt_subject(submitted_token), self._jwt_subject(replacement.get("id_token"))
+                self._jwt_subject(submitted_token), self._jwt_subject(submitted_id)
             ) if value
         }
-        claimed_workspaces = self._jwt_workspace_ids(submitted_token, replacement.get("id_token"))
+        claimed_workspaces = self._jwt_workspace_ids(submitted_token, submitted_id)
         supplied_workspace = str(payload.get("account_id") or "").strip()
         if supplied_workspace:
             parsed_workspace = self._validated_workspace_id(supplied_workspace)
@@ -414,10 +414,7 @@ class AccountService:
         submitted_refresh = replacement.get("refresh_token", "")
         if submitted_refresh and attached_refresh == submitted_refresh and stored_refresh != submitted_refresh:
             raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
-        if submitted_refresh and stored_refresh == submitted_refresh:
-            # A protected bearer read cannot verify a newly supplied ID token.
-            replacement.pop("id_token", None)
-        elif submitted_refresh:
+        if submitted_refresh and stored_refresh != submitted_refresh:
             try:
                 refreshed = self._request_access_token_refresh(
                     submitted_refresh, {"source_type": source_type}, timeout=20,
@@ -428,8 +425,9 @@ class AccountService:
             replacement["refresh_token"] = str(refreshed.get("refresh_token") or "").strip()
             if refreshed.get("id_token"):
                 replacement["id_token"] = str(refreshed["id_token"]).strip()
-            elif previous is None:
-                replacement.pop("id_token", None)
+        # Submitted ID claims constrain identity matching but never authorize
+        # persistence. Only an official exchange can supply a new ID token;
+        # _apply_refreshed_tokens retains an existing trusted ID if absent.
 
         access_subject = self._jwt_subject(replacement["access_token"])
         id_subject = self._jwt_subject(replacement.get("id_token") or (previous or {}).get("id_token"))
@@ -2093,8 +2091,9 @@ class AccountService:
             if same_codex_refresh and not verified_exchange:
                 # The protected bearer read cannot authenticate a newly
                 # supplied ID token. Keep the trusted stored Codex value.
-                if prior_id:
-                    credentials = self._validated_codex_credentials({**credentials, "id_token": prior_id})
+                if not prior_id:
+                    raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
+                credentials = self._validated_codex_credentials({**credentials, "id_token": prior_id})
         # A decoded JWT is forgeable. The official device exchange already
         # proves issuance. Every newly submitted manual refresh token must
         # pass one official OAuth exchange, regardless of submitter or whether
@@ -2108,11 +2107,14 @@ class AccountService:
                 )
             except Exception:
                 raise CodexAuthorizationAttachError("codex_authorization_refresh_unverified") from None
+            trusted_id = str(refreshed.get("id_token") or prior_id).strip()
+            if not trusted_id:
+                raise CodexAuthorizationAttachError("codex_authorization_refresh_unverified")
             credentials = self._validated_codex_credentials({
                 **credentials,
                 "access_token": refreshed.get("access_token") or "",
                 "refresh_token": refreshed.get("refresh_token") or credentials["refresh_token"],
-                "id_token": refreshed.get("id_token") or credentials["id_token"],
+                "id_token": trusted_id,
             })
             if self._codex_identity(credentials) != identity:
                 raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
