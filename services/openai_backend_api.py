@@ -1,11 +1,13 @@
 import base64
 import json
+import math
 import mimetypes
 import os
 import random
 import re
 import threading
 import time
+import uuid
 
 import urllib.error
 import urllib.request
@@ -315,11 +317,29 @@ class OpenAIBackendAPI:
         return headers
 
     @staticmethod
-    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None]:
+    def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int | None, str | None]:
         for item in limits_progress:
             if isinstance(item, dict) and item.get("feature_name") == "image_gen":
-                return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None
-        return 0, None
+                restore_at = str(item.get("reset_after") or "") or None
+                remaining = item.get("remaining")
+                valid = (type(remaining) is int and remaining >= 0) or (
+                    isinstance(remaining, float) and math.isfinite(remaining)
+                    and remaining >= 0 and remaining.is_integer()
+                )
+                if not valid:
+                    return None, restore_at
+                return int(remaining), restore_at
+        return None, None
+
+    @staticmethod
+    def _validated_account_id(value: object) -> str | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            return str(uuid.UUID(raw))
+        except (ValueError, AttributeError):
+            return None
 
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
@@ -403,6 +423,9 @@ class OpenAIBackendAPI:
             "restore_at": restore_at,
             "status": "限流" if quota == 0 else "正常",
         }
+        account_id = self._validated_account_id(default_account.get("account_id"))
+        if account_id:
+            result["account_id"] = account_id
         logger.debug({
             "event": "backend_user_info_result",
             "email": result.get("email"),

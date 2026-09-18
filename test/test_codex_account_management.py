@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 from services.account_service import AccountService
 from services.config import config
+from services.openai_backend_api import OpenAIBackendAPI
 from services.storage.json_storage import JSONStorageBackend
 from services.owned_accounts import public_owned_account
 from services.codex_service import CodexService, CodexServiceError
@@ -68,6 +69,107 @@ class CodexAccountManagementTests(unittest.TestCase):
                     self.assertNotIn("codex_auth_rejection", current)
                     self.assertEqual(CodexService.account_projection(current)["state"], "observed")
                     self.assertEqual(next(iter(current["codex_affinities"].values()))["state"], "bound")
+
+    def test_remote_workspace_identity_fills_only_an_empty_matching_account(self):
+        first = "12345678-1234-5678-9234-567812345678"
+        other = "87654321-4321-6789-9234-567812345678"
+        for stored, observed, expected in (
+            ("", first, first),
+            (first, None, first),
+            (first, "not-a-uuid", first),
+            (first, other, first),
+        ):
+            with self.subTest(stored=stored, observed=observed):
+                path = Path(self.tmp.name) / f"identity-{stored or 'empty'}-{observed or 'missing'}.json"
+                accounts = AccountService(JSONStorageBackend(path))
+                accounts.add_account_items([{
+                    "access_token": "token-a", "account_id": stored, "source_type": "web"
+                }])
+                info = {"quota": None, "limits_progress": [], "status": "正常"}
+                if observed is not None:
+                    info["account_id"] = observed
+                with patch.object(OpenAIBackendAPI, "__init__", return_value=None), \
+                        patch.object(OpenAIBackendAPI, "get_user_info", return_value=info):
+                    accounts.fetch_remote_info("token-a")
+                self.assertEqual(accounts.get_account("token-a").get("account_id") or "", expected)
+
+    def test_remote_identity_readback_is_discarded_after_concurrent_token_rotation(self):
+        accounts = AccountService(JSONStorageBackend(Path(self.tmp.name) / "identity-race.json"))
+        accounts.add_account_items([{
+            "access_token": "token-a", "refresh_token": "refresh-a", "source_type": "web"
+        }])
+
+        def rotate_then_return():
+            accounts._apply_refreshed_tokens("token-a", {"access_token": "token-new"}, "test")
+            return {
+                "account_id": "12345678-1234-5678-9234-567812345678",
+                "quota": None,
+                "limits_progress": [],
+                "status": "正常",
+            }
+
+        with patch.object(OpenAIBackendAPI, "__init__", return_value=None), \
+                patch.object(OpenAIBackendAPI, "get_user_info", side_effect=rotate_then_return):
+            result = accounts.fetch_remote_info("token-a")
+
+        self.assertEqual(result["access_token"], "token-new")
+        self.assertFalse(result.get("account_id"))
+
+    def test_rotation_before_read_snapshot_does_not_adopt_new_token_for_old_request(self):
+        accounts = AccountService(JSONStorageBackend(Path(self.tmp.name) / "identity-before-read.json"))
+        accounts.add_account_items([{"access_token": "token-a", "source_type": "web"}])
+
+        def refresh_then_rotate(*args, **kwargs):
+            accounts._apply_refreshed_tokens("token-a", {"access_token": "token-new"}, "test")
+            return "token-a"
+
+        info = {"account_id": "12345678-1234-5678-9234-567812345678", "quota": 8}
+        with patch.object(accounts, "refresh_access_token", side_effect=refresh_then_rotate), \
+                patch.object(OpenAIBackendAPI, "__init__", return_value=None) as initialize, \
+                patch.object(OpenAIBackendAPI, "get_user_info", return_value=info):
+            result = accounts.fetch_remote_info("token-a")
+
+        initialize.assert_called_once_with("token-a")
+        self.assertEqual(result["access_token"], "token-new")
+        self.assertFalse(result.get("account_id"))
+        self.assertIsNone(result.get("quota"))
+
+    def test_verified_workspace_identity_changes_header_and_reopens_rejected_authorization_once(self):
+        account_id = "12345678-1234-5678-9234-567812345678"
+        accounts = AccountService(JSONStorageBackend(Path(self.tmp.name) / "identity-recovery.json"))
+        accounts.add_account_items([account(account_id="", source_type="web")])
+        rejected = FakeSession(post_response=FakeResponse(status=401, payload={}))
+        catalog = FakeSession(gets=[
+            FakeResponse(payload={"models": [{"slug": "gpt-5.6-codex"}]}),
+            FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 10}}}),
+        ])
+        accepted = FakeSession(post_response=FakeResponse(payload={"id": "r-accepted"}))
+        service = CodexService(accounts, SessionFactory([rejected, catalog, accepted]))
+        identity = {"id": "caller", "role": "user"}
+        headers = {"session-id": "original"}
+
+        with self.assertRaises(CodexServiceError):
+            service.submit(identity, {"model": "gpt-5.6-codex", "input": []}, headers)
+        original_rejection = accounts.get_account("token-a")["codex_auth_rejection"]
+        self.assertEqual(service.account_projection(accounts.get_account("token-a"))["state"], "auth_required")
+
+        info = {
+            "account_id": account_id, "quota": None, "limits_progress": [], "status": "正常"
+        }
+        with patch.object(OpenAIBackendAPI, "__init__", return_value=None), \
+                patch.object(OpenAIBackendAPI, "get_user_info", return_value=info):
+            accounts.fetch_remote_info("token-a")
+
+        current = accounts.get_account("token-a")
+        self.assertEqual(current["account_id"], account_id)
+        self.assertEqual(current["codex_auth_rejection"], original_rejection)
+        self.assertNotEqual(service._credential_digest(current), original_rejection["credential_digest"])
+        self.assertEqual(service.refresh_account("token-a")["state"], "observed")
+        result = service.submit(identity, {"model": "gpt-5.6-codex", "input": []}, headers)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(rejected.calls), 1)
+        self.assertEqual(len(accepted.calls), 1)
+        self.assertEqual(accepted.calls[0][2]["headers"]["chatgpt-account-id"], account_id)
 
     def test_service_pool_includes_legacy_accounts_without_adopting_or_saving(self):
         self.accounts.add_account_items([
