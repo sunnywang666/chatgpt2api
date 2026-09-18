@@ -315,9 +315,27 @@ class CodexService:
         raw = account.get("codex_observation") if isinstance(account, dict) else None
         if not isinstance(raw, dict):
             raw = {}
+        if isinstance(account, dict) and "codex_credentials" in account:
+            try:
+                cls._account_headers(account)
+            except CodexServiceError:
+                raw = {
+                    **raw,
+                    "state": "unknown",
+                    "observed_at": None,
+                    "failed_at": None,
+                    "error_code": None,
+                }
         rejection = account.get("codex_auth_rejection") if isinstance(account, dict) else None
-        if (isinstance(rejection, dict) and account.get("access_token")
-                and rejection.get("credential_digest") == cls._credential_digest(account)):
+        try:
+            rejected_current = (
+                isinstance(rejection, dict)
+                and bool(account.get("access_token"))
+                and rejection.get("credential_digest") == cls._credential_digest(account)
+            )
+        except CodexServiceError:
+            rejected_current = False
+        if rejected_current:
             # A concurrent catalog refresh must not hide a newer rejection.
             raw = {**raw, "state": "auth_required", "error_code": "codex_http_401",
                    "failed_at": rejection.get("failed_at")}
@@ -395,12 +413,17 @@ class CodexService:
 
     @staticmethod
     def _account_headers(account: dict, forwarded: Mapping[str, object] | None = None) -> dict[str, str]:
-        token = str(account.get("access_token") or "").strip()
+        credentials = account.get("codex_credentials")
+        if isinstance(credentials, dict):
+            token = str(credentials.get("access_token") or "").strip()
+            account_id = str(credentials.get("account_id") or "").strip()
+        else:
+            token = str(account.get("access_token") or "").strip()
+            account_id = str(account.get("account_id") or "").strip() or _jwt_account_id(token)
         if not token:
             raise CodexServiceError(503, "codex_account_unavailable", "No Codex account is available")
         headers = _safe_headers(forwarded or {})
         headers["authorization"] = f"Bearer {token}"
-        account_id = str(account.get("account_id") or "").strip() or _jwt_account_id(token)
         if account_id:
             headers["chatgpt-account-id"] = account_id
         headers["accept"] = "text/event-stream, application/json"
@@ -416,7 +439,7 @@ class CodexService:
 
     def refresh_account(self, access_token: str) -> dict:
         before = self.accounts.get_account(access_token)
-        current_token = self.accounts.refresh_access_token(access_token, event="codex_observation") or access_token
+        current_token = self._refresh_authorization(access_token, event="codex_observation")
         account = self.accounts.get_account(current_token)
         if account is None:
             raise KeyError("account not found")
@@ -432,7 +455,8 @@ class CodexService:
             changed = before and self._credential_digest(before) != self._credential_digest(account)
             failed_at = _parse_iso(previous["failed_at"])
             try:
-                part = current_token.split(".")[1]
+                authorization_token = self._credential_fields(account)[0]
+                part = authorization_token.split(".")[1]
                 issued_at = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("iat")
                 changed = changed or (failed_at is not None and isinstance(issued_at, (int, float))
                                       and not isinstance(issued_at, bool) and issued_at > failed_at.timestamp())
@@ -505,7 +529,7 @@ class CodexService:
             observation.update(state="auth_required", error_code="codex_http_401",
                                failed_at=previous["failed_at"])
         self.accounts.update_account(current_token, {"codex_observation": observation}, quiet=True,
-                                     expected_credentials=self._credential_fields(account))
+                                     expected_codex_credentials=self._credential_fields(account))
         return self.account_projection(self.accounts.get_account(current_token) or {"codex_observation": observation})
 
     def _observation_fresh(self, projection: dict) -> bool:
@@ -525,7 +549,7 @@ class CodexService:
             token,
             {"codex_observation": observation},
             quiet=True,
-            expected_credentials=self._credential_fields(request_account),
+            expected_codex_credentials=self._credential_fields(request_account),
         )
 
     @staticmethod
@@ -600,6 +624,10 @@ class CodexService:
             return None
         token = str(account.get("access_token") or "")
         if not token or account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
+            return None
+        try:
+            self._account_headers(account)
+        except CodexServiceError:
             return None
         projection = self.account_projection(account)
         if projection["state"] == "unknown" or not self._observation_fresh(projection):
@@ -721,7 +749,7 @@ class CodexService:
             if account is None:
                 raise CodexServiceError(429, "codex_busy", "All eligible Codex accounts are busy")
             token = str(account["access_token"])
-        current_token = self.accounts.refresh_access_token(token, event="codex_request") or token
+        current_token = self._refresh_authorization(token, event="codex_request")
         account = self.accounts.get_account(current_token)
         if account is None or account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
             raise CodexServiceError(503, "codex_account_unavailable", "No Codex account is available")
@@ -759,7 +787,16 @@ class CodexService:
 
     @staticmethod
     def _credential_fields(account: dict) -> tuple[str, str]:
+        credentials = account.get("codex_credentials")
+        if isinstance(credentials, dict):
+            return str(credentials.get("access_token") or ""), str(credentials.get("account_id") or "")
         return str(account.get("access_token") or ""), str(account.get("account_id") or "")
+
+    def _refresh_authorization(self, token: str, *, event: str) -> str:
+        refresh = getattr(self.accounts, "refresh_codex_access_token", None)
+        if callable(refresh):
+            return refresh(token, event=event) or token
+        return self.accounts.refresh_access_token(token, event=event) or token
 
     def _mark_observation_state(self, token: str, state: str, error_code: str, request_account: dict, request_digest: str) -> None:
         account = self.accounts.get_account(token)
@@ -774,7 +811,7 @@ class CodexService:
                 "failed_at": projection["failed_at"],
             }
         self.accounts.update_account(token, updates, quiet=True,
-                                     expected_credentials=self._credential_fields(request_account))
+                                     expected_codex_credentials=self._credential_fields(request_account))
 
     def _safe_upstream_error(
         self,

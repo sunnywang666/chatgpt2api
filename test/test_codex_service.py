@@ -42,7 +42,15 @@ class FakeAccounts:
         item = self.accounts.get(token)
         return dict(item) if item else None
 
-    def update_account(self, token, updates, quiet=False, *, expected_credentials=None):
+    def update_account(
+        self,
+        token,
+        updates,
+        quiet=False,
+        *,
+        expected_credentials=None,
+        expected_codex_credentials=None,
+    ):
         self.updates.append((token, updates, quiet))
         if token not in self.accounts:
             return None
@@ -50,6 +58,14 @@ class FakeAccounts:
         if expected_credentials is not None and expected_credentials != (
             current.get("access_token", ""), current.get("account_id", "")
         ):
+            return dict(current)
+        credentials = current.get("codex_credentials")
+        actual_codex = (
+            (credentials.get("access_token", ""), credentials.get("account_id", ""))
+            if isinstance(credentials, dict)
+            else (current.get("access_token", ""), current.get("account_id", ""))
+        )
+        if expected_codex_credentials is not None and expected_codex_credentials != actual_codex:
             return dict(current)
         self.accounts[token].update(updates)
         return dict(self.accounts[token])
