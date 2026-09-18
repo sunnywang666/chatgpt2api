@@ -329,6 +329,227 @@ class CodexLoginFlowTests(unittest.TestCase):
         self.assertEqual(receipt["codex"]["error_code"], "usage_unverified")
         self.assertEqual(self.accounts.storage.load_accounts()[0]["managed_owner"], "workbench:org:one")
 
+    def test_same_codex_refresh_token_never_exchanges_and_requires_bearer_proof(self):
+        old = credentials("stored")
+        self.accounts.add_account_items([{
+            **old, "source_type": "codex", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row", "codex_credentials": old,
+        }])
+        before = self.accounts.storage.file_path.read_bytes()
+        incoming = {**credentials("fresh-access"), "refresh_token": old["refresh_token"]}
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume stored refresh")):
+            receipt = self.accounts.import_owned_codex_authorization("workbench:org:two", incoming)
+        self.assertEqual(receipt["import_status"], "updated")
+        saved = self.accounts.storage.load_accounts()[0]
+        self.assertEqual(saved["codex_credentials"]["access_token"], incoming["access_token"])
+        self.assertEqual(saved["codex_credentials"]["refresh_token"], old["refresh_token"])
+        self.assertEqual(saved["codex_credentials"]["id_token"], old["id_token"])
+        self.assertEqual(saved["managed_owner"], "workbench:org:one")
+
+        failed = {"state": "read_failed", "verified": False, "observed_at": None,
+                  "failed_at": "now", "models": [], "limits": [], "error_code": "usage_unverified"}
+        newer = {**credentials("failed-access"), "refresh_token": old["refresh_token"]}
+        with patch("services.codex_service.codex_service.observe_import_authorization", return_value=failed), \
+                patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume stored refresh")):
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "upstream_unverified"):
+                self.accounts.import_owned_codex_authorization("workbench:org:three", newer)
+        self.assertEqual(self.accounts.storage.load_accounts()[0], saved)
+        self.assertNotEqual(self.accounts.storage.file_path.read_bytes(), before)
+
+    def test_same_codex_refresh_stale_and_save_failure_do_not_consume_it(self):
+        old = credentials("stored")
+        self.accounts.add_account_items([{
+            **old, "source_type": "codex", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row", "codex_credentials": old,
+        }])
+        incoming = {**credentials("fresh"), "refresh_token": old["refresh_token"]}
+        before = self.accounts.storage.file_path.read_bytes()
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume stored refresh")), \
+                patch.object(self.accounts, "_save_accounts", side_effect=OSError("pre-replace failure")):
+            with self.assertRaisesRegex(OSError, "pre-replace failure"):
+                self.accounts.import_owned_codex_authorization("workbench:org:two", incoming)
+        self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
+
+        started = threading.Event()
+        release = threading.Event()
+        normal = {"state": "observed", "verified": True, "observed_at": "now", "failed_at": None,
+                  "models": [], "limits": [], "error_code": None}
+
+        def blocked_probe(_credentials):
+            started.set()
+            self.assertTrue(release.wait(5))
+            return normal
+
+        with patch("services.codex_service.codex_service.observe_import_authorization", side_effect=blocked_probe), \
+                patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume stored refresh")):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                waiting = executor.submit(self.accounts.import_owned_codex_authorization, "workbench:org:two", incoming)
+                self.assertTrue(started.wait(5))
+                self.accounts.attach_codex_authorization(credentials("concurrent"))
+                release.set()
+                with self.assertRaisesRegex(CodexAuthorizationAttachError, "stale_target"):
+                    waiting.result()
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["codex_credentials"], credentials("concurrent"))
+
+    def test_manual_codex_uncertain_save_reads_original_issued_bundle(self):
+        old = credentials("stored")
+        self.accounts.add_account_items([{
+            **old, "source_type": "codex", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row", "codex_credentials": old,
+        }])
+        submitted = credentials("submitted")
+        issued = credentials("issued")
+        sync_calls = 0
+        real_sync = JSONStorageBackend._sync_directory
+
+        def uncertain_twice(directory):
+            nonlocal sync_calls
+            sync_calls += 1
+            if sync_calls <= 2:
+                raise OSError("durability pending")
+            return real_sync(directory)
+
+        with patch.object(self.accounts, "_request_access_token_refresh", return_value=issued) as exchange, \
+                patch.object(JSONStorageBackend, "_sync_directory", side_effect=uncertain_twice):
+            receipt = self.accounts.import_owned_codex_authorization("workbench:org:two", submitted)
+        exchange.assert_called_once()
+        self.assertEqual(receipt["import_status"], "updated")
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["codex_credentials"], issued)
+
+    def test_same_codex_refresh_uncertain_save_recovers_without_exchange(self):
+        old = credentials("stored")
+        self.accounts.add_account_items([{
+            **old, "source_type": "codex", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row", "codex_credentials": old,
+        }])
+        incoming = {**credentials("fresh"), "refresh_token": old["refresh_token"]}
+        sync_calls = 0
+        real_sync = JSONStorageBackend._sync_directory
+
+        def uncertain_twice(directory):
+            nonlocal sync_calls
+            sync_calls += 1
+            if sync_calls <= 2:
+                raise OSError("durability pending")
+            return real_sync(directory)
+
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume stored refresh")), \
+                patch.object(JSONStorageBackend, "_sync_directory", side_effect=uncertain_twice):
+            receipt = self.accounts.import_owned_codex_authorization("workbench:org:two", incoming)
+        self.assertEqual(receipt["import_status"], "updated")
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["codex_credentials"]["refresh_token"], old["refresh_token"])
+
+    def test_manual_codex_unconfirmed_save_reports_unknown_without_reexchange(self):
+        old = credentials("stored")
+        self.accounts.add_account_items([{
+            **old, "source_type": "codex", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row", "codex_credentials": old,
+        }])
+        submitted = credentials("submitted")
+        issued = credentials("issued")
+        with patch.object(self.accounts, "_request_access_token_refresh", return_value=issued) as exchange, \
+                patch.object(JSONStorageBackend, "_sync_directory", side_effect=OSError("durability pending")):
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "codex_authorization_import_unknown"):
+                self.accounts.import_owned_codex_authorization("workbench:org:two", submitted)
+        exchange.assert_called_once()
+        restarted = AccountService(JSONStorageBackend(self.accounts.storage.file_path))
+        self.assertEqual(restarted.list_accounts()[0]["codex_credentials"], issued)
+        self.assertEqual(restarted.list_accounts()[0]["managed_owner"], "workbench:org:one")
+
+    def test_same_chat_refresh_never_exchanges_and_preserves_stored_id(self):
+        old = credentials("stored-chat")
+        self.accounts.add_account_items([{
+            **old, "source_type": "web", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row", "user_id": SUBJECT,
+            "capacity_observed_at": "2026-09-17T00:00:00+00:00",
+        }])
+        incoming = {**credentials("fresh-chat"), "refresh_token": old["refresh_token"]}
+        info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 7,
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 7}]}
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume stored refresh")), \
+                patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)):
+            receipt = self.accounts.import_owned_account("workbench:org:two", {**incoming, "source_type": "web"})
+        self.assertEqual(receipt["import_status"], "updated")
+        saved = self.accounts.storage.load_accounts()[0]
+        self.assertEqual(saved["access_token"], incoming["access_token"])
+        self.assertEqual(saved["refresh_token"], old["refresh_token"])
+        self.assertEqual(saved["id_token"], old["id_token"])
+        self.assertEqual(saved["managed_owner"], "workbench:org:one")
+
+    def test_same_chat_refresh_read_timeout_stale_and_save_failure_leave_pool_usable(self):
+        old = credentials("stored-chat")
+        self.accounts.add_account_items([{
+            **old, "source_type": "web", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row", "user_id": SUBJECT,
+            "capacity_observed_at": "2026-09-17T00:00:00+00:00",
+        }])
+        incoming = {**credentials("fresh-chat"), "refresh_token": old["refresh_token"]}
+        before = self.accounts.storage.file_path.read_bytes()
+        info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 7,
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 7}]}
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume stored refresh")), \
+                patch("services.openai_backend_api.OpenAIBackendAPI") as backend_type:
+            backend_type.return_value.get_user_info.side_effect = TimeoutError("read timeout")
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "upstream_unverified"):
+                self.accounts.import_owned_account("workbench:org:two", {**incoming, "source_type": "web"})
+        self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
+
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume stored refresh")), \
+                patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)), \
+                patch.object(self.accounts, "_save_accounts", side_effect=OSError("pre-replace failure")):
+            with self.assertRaisesRegex(OSError, "pre-replace failure"):
+                self.accounts.import_owned_account("workbench:org:two", {**incoming, "source_type": "web"})
+        self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
+        self.assertEqual(self.accounts.resolve_access_token(old["access_token"]), old["access_token"])
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_read(_token):
+            started.set()
+            self.assertTrue(release.wait(5))
+            return (SUBJECT, ACCOUNT_ID), info
+
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume stored refresh")), \
+                patch.object(self.accounts, "_verified_chat_info", side_effect=blocked_read):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                waiting = executor.submit(self.accounts.import_owned_account, "workbench:org:two", {**incoming, "source_type": "web"})
+                self.assertTrue(started.wait(5))
+                self.accounts._apply_refreshed_tokens(old["access_token"], {"access_token": jwt(marker="concurrent-chat")}, "test")
+                release.set()
+                with self.assertRaisesRegex(CodexAuthorizationAttachError, "stale_target"):
+                    waiting.result()
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["managed_owner"], "workbench:org:one")
+
+    def test_same_chat_refresh_uncertain_save_returns_original_receipt_after_readback(self):
+        old = credentials("stored-chat")
+        self.accounts.add_account_items([{
+            **old, "source_type": "web", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row", "user_id": SUBJECT,
+            "capacity_observed_at": "2026-09-17T00:00:00+00:00",
+        }])
+        incoming = {**credentials("fresh-chat"), "refresh_token": old["refresh_token"]}
+        info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 7,
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 7}]}
+        sync_calls = 0
+        real_sync = JSONStorageBackend._sync_directory
+
+        def uncertain_twice(directory):
+            nonlocal sync_calls
+            sync_calls += 1
+            if sync_calls <= 2:
+                raise OSError("durability pending")
+            return real_sync(directory)
+
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume stored refresh")), \
+                patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)), \
+                patch.object(JSONStorageBackend, "_sync_directory", side_effect=uncertain_twice):
+            receipt = self.accounts.import_owned_account("workbench:org:two", {**incoming, "source_type": "web"})
+        self.assertEqual(receipt["import_status"], "updated")
+        self.assertEqual(receipt["capacity"]["remaining"], 7)
+        self.assertEqual(self.accounts.resolve_access_token(old["access_token"]), incoming["access_token"])
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["managed_owner"], "workbench:org:one")
+
     def test_foreign_chat_refresh_must_be_exchanged_before_rekey(self):
         old = credentials("owner-chat")
         self.accounts.add_account_items([{
@@ -578,7 +799,6 @@ class CodexLoginFlowTests(unittest.TestCase):
         self.assertEqual(self.accounts.list_accounts()[0]["access_token"], jwt(marker="other-refresh"))
 
     def test_chat_rotation_unknown_commit_is_read_back_before_retry(self):
-        from services.storage.base import AccountCommitUncertain
         old = credentials("old-chat")
         self.accounts.add_account_items([{
             **old, "source_type": "web", "managed_owner": "workbench:org:one",
@@ -589,7 +809,7 @@ class CodexLoginFlowTests(unittest.TestCase):
         info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 2, "limits_progress": []}
         with patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)):
             with patch.object(JSONStorageBackend, "_sync_directory", side_effect=OSError("durability pending")):
-                with self.assertRaises(AccountCommitUncertain):
+                with self.assertRaisesRegex(CodexAuthorizationAttachError, "chat_authorization_import_unknown"):
                     self.accounts.import_owned_account("workbench:org:two", {**incoming, "source_type": "web"})
         # The original operation may have committed. Retry first settles the
         # exact persisted pool and never repeats credential rotation.

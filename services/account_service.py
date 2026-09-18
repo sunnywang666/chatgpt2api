@@ -2001,11 +2001,27 @@ class AccountService:
                     credentials[key] for key in ("access_token", "refresh_token", "id_token", "account_id")
                 )
             )
+            current_refreshes = set()
+            if initial_matches:
+                current = initial_matches[0][1]
+                current_refreshes = {
+                    str(current.get("refresh_token") or "").strip(),
+                    str((current.get("codex_credentials") or {}).get("refresh_token") or "").strip()
+                    if isinstance(current.get("codex_credentials"), dict) else "",
+                }
+            reused_refresh = foreign_replacement and credentials["refresh_token"] in current_refreshes
+            if reused_refresh and isinstance(initial_matches[0][1].get("codex_credentials"), dict):
+                # The protected bearer read cannot authenticate a newly
+                # supplied ID token. Keep the attached one when it exists.
+                prior_id = str(initial_matches[0][1]["codex_credentials"].get("id_token") or "").strip()
+                if prior_id:
+                    credentials = self._validated_codex_credentials({**credentials, "id_token": prior_id})
         # A decoded JWT is forgeable. The official device exchange already
         # proves issuance. For manual foreign replacement, refreshing the
         # submitted credential proves both its bearer and refresh token in
         # one official OAuth exchange before any stored credential changes.
-        if foreign_replacement and not verified_exchange:
+        exchanged_refresh = foreign_replacement and not verified_exchange and not reused_refresh
+        if exchanged_refresh:
             try:
                 refreshed = self._request_access_token_refresh(
                     credentials["refresh_token"], {"source_type": "codex"}, timeout=20,
@@ -2021,12 +2037,12 @@ class AccountService:
             if self._codex_identity(credentials) != identity:
                 raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
         observation = codex_service.observe_import_authorization(credentials)
-        if (verified_exchange or foreign_replacement) and observation["state"] == "auth_required":
+        if (verified_exchange or exchanged_refresh) and observation["state"] == "auth_required":
             # OAuth just issued this bearer. Two immediate 401 reads may be
             # propagation lag; only a later persisted read can classify it
             # as a credential that actually needs reauthorization.
             observation = {**observation, "state": "read_failed", "error_code": "usage_unverified"}
-        if not verified_exchange and not foreign_replacement and observation["state"] not in {"observed", "limited"} and not observation.get("verified"):
+        if not verified_exchange and not exchanged_refresh and observation["state"] not in {"observed", "limited"} and not observation.get("verified"):
             raise CodexAuthorizationAttachError("codex_authorization_upstream_unverified")
         with self._lock:
             matches = self._identity_matches_locked(identity)
@@ -2044,7 +2060,12 @@ class AccountService:
                     or initial_revision != (token, self._authorization_revision(current))
                 ):
                     raise CodexAuthorizationAttachError("codex_authorization_stale_target")
-                self._attach_codex_locked(token, current, credentials, submitted_by=owner, observation=observation)
+                try:
+                    self._attach_codex_locked(token, current, credentials, submitted_by=owner, observation=observation)
+                except AccountCommitUncertain:
+                    if verified_exchange:
+                        raise
+                    return self._readback_manual_codex_import(owner, identity, credentials)
                 account = self._accounts[token]
                 return {
                     "authorization_ref": self.codex_authorization_ref(account),
@@ -2078,6 +2099,14 @@ class AccountService:
             self._accounts[token] = account
             try:
                 self._save_accounts()
+            except AccountCommitUncertain:
+                self._accounts.pop(token, None)
+                if verified_exchange:
+                    raise
+                receipt = self._readback_manual_codex_import(owner, identity, credentials)
+                self._cumulative_total += 1
+                self._save_cumulative_total()
+                return receipt
             except Exception:
                 self._accounts.pop(token, None)
                 raise
@@ -2088,6 +2117,82 @@ class AccountService:
                 "import_status": "created",
                 "codex": self._submitted_codex_projection(account),
             }
+
+    def _readback_manual_codex_import(
+        self, owner: str, identity: tuple[str, str], credentials: dict[str, str],
+    ) -> dict:
+        # Called under the import lock. A second lock acquisition through
+        # codex_login_completion_readback would deadlock this AccountService.
+        authorization_ref = self._authorization_ref(*identity)
+        digest = self.codex_credential_digest(credentials)
+        try:
+            persisted = self.storage.confirm_accounts_commit()
+            restored = {}
+            for item in persisted:
+                account = self._normalize_account(item)
+                if account is None or account["access_token"] in restored:
+                    raise RuntimeError("account storage has invalid account")
+                restored[account["access_token"]] = account
+            self._accounts = restored
+            self._account_commit_uncertain = False
+        except Exception:
+            raise CodexAuthorizationAttachError("codex_authorization_import_unknown") from None
+        matches = self._account_ref_matches_locked(authorization_ref)
+        if len(matches) != 1:
+            raise CodexAuthorizationAttachError("codex_authorization_import_unknown")
+        account = matches[0][1]
+        try:
+            stored_credentials = self._validated_codex_credentials(account.get("codex_credentials"))
+        except CodexAuthorizationAttachError:
+            raise CodexAuthorizationAttachError("codex_authorization_import_unknown") from None
+        submissions = account.get("codex_import_submissions")
+        submission = submissions.get(owner) if isinstance(submissions, dict) else None
+        if (self.codex_credential_digest(stored_credentials) != digest
+                or not isinstance(submission, dict) or submission.get("digest") != digest
+                or submission.get("import_status") not in {"created", "updated", "unchanged"}):
+            raise CodexAuthorizationAttachError("codex_authorization_import_unknown")
+        return {
+            "authorization_ref": authorization_ref,
+            "import_status": submission["import_status"],
+            "codex": self._submitted_codex_projection(account),
+        }
+
+    def _readback_manual_chat_import(
+        self, old_token: str, previous: dict, replacement: dict, identity: tuple[str, str],
+    ) -> dict:
+        from services.owned_accounts import observed_capacity
+
+        next_token = replacement["access_token"]
+        expected_revision = self._authorization_revision({**previous, **replacement})
+        try:
+            with self._image_slot_condition:
+                persisted = self.storage.confirm_accounts_commit()
+                restored = {}
+                for item in persisted:
+                    account = self._normalize_account(item)
+                    if account is None or account["access_token"] in restored:
+                        raise RuntimeError("account storage has invalid account")
+                    restored[account["access_token"]] = account
+                account = restored.get(next_token)
+                applied = bool(
+                    account and self._account_identity(account) == identity
+                    and self._authorization_revision(account) == expected_revision
+                    and account.get("managed_owner") == previous.get("managed_owner")
+                    and account.get("managed_account_id") == previous.get("managed_account_id")
+                )
+                self._accounts = restored
+                self._account_commit_uncertain = False
+                if applied and next_token != old_token:
+                    self._token_aliases[old_token] = next_token
+                    old_inflight = int(self._image_inflight.pop(old_token, 0))
+                    if old_inflight:
+                        self._image_inflight[next_token] = int(self._image_inflight.get(next_token, 0)) + old_inflight
+                    self._image_slot_condition.notify_all()
+        except Exception:
+            raise CodexAuthorizationAttachError("chat_authorization_import_unknown") from None
+        if not applied:
+            raise CodexAuthorizationAttachError("chat_authorization_import_unknown")
+        return {"import_status": "updated", "route": "chat", "capacity": observed_capacity(account)}
 
     def import_owned_account(self, owner: str, payload: dict) -> dict:
         from services.owned_accounts import public_owned_account, utc_now
@@ -2149,7 +2254,13 @@ class AccountService:
             for key in ("refresh_token", "id_token"):
                 if payload.get(key):
                     replacement[key] = str(payload[key]).strip()
-            if replacement.get("refresh_token"):
+            reused_refresh = bool(replacement.get("refresh_token")) and replacement["refresh_token"] == str(previous.get("refresh_token") or "").strip()
+            if reused_refresh:
+                # A new bearer may be checked without consuming the existing
+                # refresh token. Its unrelated submitted ID token is not
+                # authenticated by that read, so retain the stored one.
+                replacement.pop("id_token", None)
+            elif replacement.get("refresh_token"):
                 try:
                     refreshed = self._request_access_token_refresh(
                         replacement["refresh_token"], {"source_type": source_type or "web"}, timeout=20,
@@ -2180,10 +2291,13 @@ class AccountService:
                 old_identity, _old_info = self._verified_chat_info(old_token)
                 if old_identity != identity:
                     raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
-            self._apply_refreshed_tokens(
-                old_token, replacement, "workbench_chat_authorization_import",
-                expected_revision=revision, chat_info=info,
-            )
+            try:
+                self._apply_refreshed_tokens(
+                    old_token, replacement, "workbench_chat_authorization_import",
+                    expected_revision=revision, chat_info=info,
+                )
+            except AccountCommitUncertain:
+                return self._readback_manual_chat_import(old_token, previous, replacement, identity)
             with self._lock:
                 account = self._accounts.get(replacement["access_token"])
                 if account is None:
