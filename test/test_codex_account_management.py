@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from services.account_service import AccountService
+from services.account_service import AccountService, CodexAuthorizationAttachError
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
 from services.storage.json_storage import JSONStorageBackend
@@ -193,11 +193,15 @@ class CodexAccountManagementTests(unittest.TestCase):
                 self.accounts.set_owned_account_enabled("workbench:o:boss", item["id"], False)
 
     def test_import_and_projection_keep_upstream_account_identity_private(self):
+        with self.assertRaisesRegex(CodexAuthorizationAttachError, "invalid_material"):
+            self.accounts.import_owned_account("workbench:o:u", {
+                "access_token": "private-access", "refresh_token": "private-refresh",
+                "account_id": "private-account-id", "source_type": "codex",
+            })
+        self.assertEqual(self.accounts.list_accounts(), [])
         result = self.accounts.import_owned_account("workbench:o:u", {
-            "access_token": "private-access", "refresh_token": "private-refresh",
-            "account_id": "private-account-id", "source_type": "codex",
+            "access_token": "private-access", "source_type": "codex",
         })
-        self.assertEqual(self.accounts.get_account("private-access")["account_id"], "private-account-id")
         self.assertEqual(result["codex"]["state"], "unknown")
         self.assertIsNone(result["capacity"]["remaining"])
         self.assertNotIn("private-", str(result))

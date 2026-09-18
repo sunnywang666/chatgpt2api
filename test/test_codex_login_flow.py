@@ -147,7 +147,10 @@ class CodexLoginFlowTests(unittest.TestCase):
 
     def add_primary(self, owner: str = "workbench:org:one", label: str = "primary") -> dict:
         value = credentials(label)
-        self.accounts.import_owned_account(owner, {**value, "source_type": "web"})
+        info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 3,
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 3}]}
+        with patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)):
+            self.accounts.import_owned_account(owner, {**value, "source_type": "web"})
         return self.accounts.list_owned_accounts(owner)[0]
 
     def test_successful_import_is_durable_redacted_and_same_request_is_reused(self):
@@ -807,7 +810,9 @@ class CodexLoginFlowTests(unittest.TestCase):
             backend_type.return_value.close.assert_called_once_with()
 
     def test_explicit_chat_source_does_not_become_codex_when_all_fields_present(self):
-        with patch("services.codex_service.codex_service.observe_import_authorization", side_effect=AssertionError("Chat must not probe Codex")):
+        info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 3, "limits_progress": []}
+        with patch("services.codex_service.codex_service.observe_import_authorization", side_effect=AssertionError("Chat must not probe Codex")), \
+                patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)):
             row = self.accounts.import_owned_account(
                 "workbench:org:one", {**credentials("oauth-chat"), "source_type": "oauth_login"}
             )
@@ -879,7 +884,7 @@ class CodexLoginFlowTests(unittest.TestCase):
                 )
         self.assertEqual(self.accounts.list_accounts(), [])
 
-    def test_complete_chat_file_identity_is_not_cloned_but_unknown_identity_keeps_legacy_fallback(self):
+    def test_complete_chat_file_identity_is_not_cloned_and_opaque_identity_is_proved(self):
         original = self.add_primary()
         info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 3, "limits_progress": []}
         with patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)):
@@ -888,7 +893,7 @@ class CodexLoginFlowTests(unittest.TestCase):
             )
         self.assertEqual(same["import_status"], "updated")
         self.assertEqual(same["route"], "chat")
-        self.assertEqual(self.accounts.list_owned_accounts("workbench:org:one")[0]["authorization_ref"], original["authorization_ref"])
+        self.assertEqual(self.accounts.list_owned_accounts("workbench:org:one")[0]["id"], original["id"])
         self.assertEqual(len(self.accounts.list_accounts()), 1)
 
         opaque = {
@@ -896,9 +901,88 @@ class CodexLoginFlowTests(unittest.TestCase):
             "refresh_token": "opaque-refresh-token",
             "source_type": "web",
         }
-        fallback = self.accounts.import_owned_account("workbench:org:one", opaque)
-        self.assertNotEqual(fallback["id"], original["id"])
-        self.assertEqual(len(self.accounts.list_accounts()), 2)
+        issued = {"access_token": "opaque-issued-access", "refresh_token": "opaque-issued-refresh"}
+        with patch.object(self.accounts, "_request_access_token_refresh", return_value=issued) as exchange, \
+                patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)) as proof:
+            receipt = self.accounts.import_owned_account("workbench:org:one", opaque)
+        exchange.assert_called_once()
+        self.assertEqual(proof.call_count, 2)
+        self.assertEqual(receipt["import_status"], "updated")
+        self.assertEqual(self.accounts.list_owned_accounts("workbench:org:one")[0]["id"], original["id"])
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["access_token"], issued["access_token"])
+        self.assertEqual(len(self.accounts.list_accounts()), 1)
+
+    def test_manual_codex_new_refresh_is_exchanged_before_first_save(self):
+        incoming = credentials("manual-new")
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=RuntimeError("invalid")) as exchange:
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "refresh_unverified"):
+                self.accounts.import_owned_account("workbench:org:one", {**incoming, "source_type": "codex"})
+        exchange.assert_called_once()
+        self.assertEqual(self.accounts.list_accounts(), [])
+        issued = credentials("manual-issued")
+        with patch.object(self.accounts, "_request_access_token_refresh", return_value=issued) as exchange:
+            receipt = self.accounts.import_owned_account("workbench:org:one", {**incoming, "source_type": "codex"})
+        exchange.assert_called_once()
+        self.assertEqual(receipt["import_status"], "created")
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["codex_credentials"], issued)
+
+    def test_manual_codex_same_owner_new_refresh_requires_exchange_and_matching_identity(self):
+        self.accounts.import_owned_account("workbench:org:one", {**credentials("codex-old"), "source_type": "codex"})
+        before = self.accounts.storage.file_path.read_bytes()
+        incoming = credentials("codex-new")
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=RuntimeError("invalid")):
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "refresh_unverified"):
+                self.accounts.import_owned_account("workbench:org:one", {**incoming, "source_type": "codex"})
+        self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
+        with patch.object(self.accounts, "_request_access_token_refresh", return_value=credentials("wrong", subject="other-subject")):
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "account_conflict"):
+                self.accounts.import_owned_account("workbench:org:one", {**incoming, "source_type": "codex"})
+        self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
+        receipt = self.accounts.import_owned_account("workbench:org:one", {**incoming, "source_type": "codex"})
+        self.assertEqual(receipt["import_status"], "updated")
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["codex_credentials"], incoming)
+
+    def test_chat_new_and_same_owner_refresh_require_exchange_and_protected_identity(self):
+        first = credentials("chat-first")
+        info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 7,
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 7}]}
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=RuntimeError("invalid")):
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "refresh_unverified"):
+                self.accounts.import_owned_account("workbench:org:one", {**first, "source_type": "web"})
+        self.assertEqual(self.accounts.list_accounts(), [])
+        with patch.object(self.accounts, "_verified_chat_info", return_value=(("other-subject", ACCOUNT_ID), info)):
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "account_conflict"):
+                self.accounts.import_owned_account("workbench:org:one", {**first, "source_type": "web"})
+        self.assertEqual(self.accounts.list_accounts(), [])
+        with patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)):
+            created = self.accounts.import_owned_account("workbench:org:one", {**first, "source_type": "web", "quota": 999})
+        self.assertEqual(created["capacity"]["remaining"], 7)
+        before = self.accounts.storage.file_path.read_bytes()
+        second = credentials("chat-second")
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=RuntimeError("invalid")):
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "refresh_unverified"):
+                self.accounts.import_owned_account("workbench:org:one", {**second, "source_type": "web"})
+        self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
+        with patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)):
+            updated = self.accounts.import_owned_account("workbench:org:one", {**second, "source_type": "web"})
+        self.assertEqual(updated["import_status"], "updated")
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["refresh_token"], second["refresh_token"])
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("stale alias must not exchange")):
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "stale_target"):
+                self.accounts.import_owned_account("workbench:org:one", {**first, "source_type": "web"})
+
+    def test_new_chat_unknown_commit_reads_back_without_repeat_refresh(self):
+        incoming = credentials("chat-uncertain-new")
+        info = {"user_id": SUBJECT, "account_id": ACCOUNT_ID, "quota": 5, "limits_progress": []}
+        with patch.object(self.accounts, "_verified_chat_info", return_value=((SUBJECT, ACCOUNT_ID), info)), \
+                patch.object(JSONStorageBackend, "_sync_directory", side_effect=[
+                    OSError("initial durability pending"), OSError("first readback pending"), None,
+                ]), \
+                patch.object(self.accounts, "_request_access_token_refresh", return_value=incoming) as exchange:
+            receipt = self.accounts.import_owned_account("workbench:org:one", {**incoming, "source_type": "web"})
+        exchange.assert_called_once()
+        self.assertEqual(receipt["id"], self.accounts.list_owned_accounts("workbench:org:one")[0]["id"])
+        self.assertEqual(len(self.accounts.storage.load_accounts()), 1)
 
     def test_cancel_expiry_restart_and_owner_scope_erase_device_material(self):
         http = FakeHttp([device_start(), device_start(), device_start()])

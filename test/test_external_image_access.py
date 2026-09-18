@@ -259,7 +259,12 @@ class ExternalImageAccessTests(unittest.TestCase):
 
     def test_owned_account_projection_rotation_disable_and_no_takeover(self):
         owner = "workbench:org:a"
-        account = self.account.import_owned_account(owner, {"access_token": "private-upstream", "refresh_token": "private-refresh", "quota": 999})
+        verified = {"user_id": "fixture-user", "account_id": "12345678-1234-5678-9234-567812345678",
+                    "quota": None, "limits_progress": []}
+        with patch.object(self.account, "_request_access_token_refresh", return_value={
+                "access_token": "private-upstream", "refresh_token": "private-refresh", "id_token": "",
+        }), patch.object(self.account, "_verified_chat_info", return_value=((verified["user_id"], verified["account_id"]), verified)):
+            account = self.account.import_owned_account(owner, {"access_token": "private-upstream", "refresh_token": "private-refresh", "quota": 999})
         self.assertIsNone(account["capacity"]["remaining"])
         self.assertEqual(account["capacity"]["state"], "unknown")
         self.assertNotIn("private", str(account))
