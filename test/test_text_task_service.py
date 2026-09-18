@@ -98,6 +98,7 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(receipt["provider_account_identity"], "account-a")
         self.assertEqual(receipt["original_failure_phase"], "stream_open")
         self.assertEqual(receipt["original_http_status"], 429)
+        self.assertEqual(receipt["original_upstream_request_stage"], "unknown")
         self.assertEqual(receipt["original_exception_category"], "http")
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
@@ -201,6 +202,120 @@ class TextTaskTests(unittest.TestCase):
             "/backend-api/conversation", 422, {"error": {"param": "SECRET_TOKEN"}},
         ))
         self.assertEqual(unlisted, {"original_upstream_error_form": "error"})
+
+    def test_actual_http_steps_and_response_shapes_survive_original_owner_get(self):
+        from contextlib import nullcontext
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from requests import Response
+        from api.ai import create_router
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        # Exercise the real stream/bootstrap/requirements code with only HTTP
+        # mocked, so the persisted stage comes from the actual ensure_ok site.
+        cases = [
+            ("bootstrap", {"error": "SECRET_ERROR_TEXT"}, "error_text", None),
+            ("chat_requirements_prepare", {"message": "SECRET_MESSAGE"}, "message_text", None),
+            ("chat_requirements_finalize", {"error": {"param": "messages[0].SECRET_PATH",
+                                                      "message": "SECRET_MESSAGE"}}, "error", "messages"),
+            ("conversation", {"detail": [{"loc": ["body", "thinking_effort"],
+                                            "msg": "SECRET_MESSAGE"}]}, "validation", "thinking_effort"),
+            ("conversation", {"SECRET_KEY": "SECRET_VALUE"}, "object", None),
+            ("conversation", [{"error": "SECRET_LIST"}], "list", None),
+            ("conversation", "messages SECRET_TEXT", "text", None),
+            ("conversation", "", "empty", None),
+            ("conversation", None, "empty", None),
+            ("conversation", {}, "object", None),
+            ("conversation", [], "list", None),
+            ("conversation", {"detail": {"error": "SECRET_NESTED"}}, "detail_error_text", None),
+            ("conversation", {"error": "SECRET_ERROR", "param": "model"}, "error_text", "model"),
+        ]
+        stages = ["bootstrap", "chat_requirements_prepare", "chat_requirements_finalize", "conversation"]
+        service = TextTaskService(self.path, ConversationBindingService().complete_text, self.queue,
+                                  recovery_reader=lambda _receipt: {"status": "running"})
+        app = FastAPI()
+        app.include_router(create_router())
+
+        def response(status, body):
+            result = Response()
+            result.status_code = status
+            result._content = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+            return result
+
+        for index, (stage, error_body, form, field) in enumerate(cases):
+            with self.subTest(stage=stage, form=form, index=index):
+                backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+                backend.base_url = "https://SECRET_HOST.invalid"
+                backend.access_token = "SECRET_TOKEN"
+                backend.user_agent = "test"
+                backend.image_submission_started = None
+                backend.session = mock.Mock()
+                backend._headers = mock.Mock(return_value={})
+                backend._bootstrap_headers = mock.Mock(return_value={})
+                replies = [response(200, ""), response(200, {"prepare_token": "SECRET_PREPARE"}),
+                           response(200, {"token": "SECRET_FINALIZE"})]
+                failed_at = stages.index(stage)
+                replies[failed_at:failed_at + 1] = [response(422, error_body)]
+                backend.session.get.return_value = replies[0]
+                backend.session.post.side_effect = replies[1:]
+                request_id = f"diagnostic-{index}"
+                body = {**self.body, "client_request_id": request_id,
+                        "provider_binding_id": "binding-a", "provider_account_identity": "account-a",
+                        "model": "gpt-5-6-thinking", "thinking_effort": "high"}
+                with (
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-a"),
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="SECRET_TOKEN"),
+                    mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+                    mock.patch("services.openai_backend_api.build_legacy_requirements_token", return_value="SECRET_POW"),
+                ):
+                    self.assertEqual(service.submit("owner", body)["status"], "queued")
+                    self.queue.run()
+                self.assertEqual(backend.session.get.call_count, 1)
+                self.assertEqual(backend.session.post.call_count, failed_at)
+                if stage == "conversation":
+                    self.assertEqual(backend.session.post.call_args.kwargs["json"]["thinking_effort"], "high")
+
+                restarted = TextTaskService(self.path, executor=self.queue,
+                                            recovery_reader=lambda _receipt: {"status": "running"})
+                with (
+                    mock.patch("api.ai.text_task_service", restarted),
+                    mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
+                    TestClient(app) as client,
+                ):
+                    readback = client.get(f"/api/conversation-bindings/text-requests/{request_id}",
+                                          headers={"Authorization": "owner"})
+                    other_owner = client.get(f"/api/conversation-bindings/text-requests/{request_id}",
+                                             headers={"Authorization": "other-owner"})
+                self.assertEqual(readback.status_code, 200)
+                receipt = readback.json()
+                self.assertEqual(receipt["request_id"], request_id)
+                self.assertEqual(receipt["status"], "unknown")
+                self.assertEqual(receipt["provider_binding_id"], "binding-a")
+                self.assertEqual(receipt["provider_account_identity"], "account-a")
+                self.assertEqual(receipt["original_failure_phase"], "stream_open")
+                self.assertEqual(receipt["original_http_status"], 422)
+                self.assertEqual(receipt["original_upstream_request_stage"], stage)
+                self.assertEqual(receipt["original_upstream_error_form"], form)
+                self.assertEqual(receipt.get("original_upstream_rejected_field"), field)
+                self.assertEqual(other_owner.json()["status"], "not_found")
+                self.assertNotIn("original_upstream_request_stage", other_owner.json())
+                self.assertEqual(len(self.queue.calls), 0)
+                self.assertNotIn("SECRET_", readback.text)
+        self.assertNotIn(b"SECRET_", self.path.read_bytes())
+        self.assertNotIn(b"private prompt", self.path.read_bytes())
+
+    def test_http_stage_and_error_shape_reject_arbitrary_metadata(self):
+        error = ConversationBindingError(
+            "SECRET_MESSAGE", original_failure_phase="stream_open", original_http_status=422,
+            original_upstream_request_stage="https://SECRET_URL",
+            original_upstream_error_form="SECRET_SHAPE", original_upstream_rejected_field="SECRET_FIELD",
+        )
+        self.assertEqual(error.original_upstream_request_stage, "")
+        self.assertEqual(error.original_upstream_error_form, "")
+        self.assertEqual(error.original_upstream_rejected_field, "")
+        no_http = ConversationBindingError("failure", original_upstream_request_stage="conversation")
+        self.assertEqual(no_http.original_upstream_request_stage, "")
 
     def test_original_sse_timeout_keeps_cursor_and_no_exception_text(self):
         from contextlib import nullcontext

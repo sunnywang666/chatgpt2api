@@ -34,7 +34,19 @@ _TEXT_FAILURE_PHASES = frozenset({"stream_open", "stream_event", "result_check",
 _TEXT_FAILURE_CATEGORIES = frozenset({
     "http", "timeout", "transport", "parse", "empty_result", "provider_error", "other",
 })
-_TEXT_422_ERROR_FORMS = frozenset({"error", "detail_error", "detail", "detail_text", "validation", "opaque"})
+_TEXT_HTTP_REQUEST_STAGES = {
+    "bootstrap": "bootstrap",
+    "chat_requirements_prepare": "chat_requirements_prepare",
+    "chat_requirements_finalize": "chat_requirements_finalize",
+    "/backend-api/conversation": "conversation",
+    "/backend-anon/conversation": "conversation",
+}
+_TEXT_HTTP_REQUEST_STAGE_VALUES = frozenset({*_TEXT_HTTP_REQUEST_STAGES.values(), "unknown"})
+_TEXT_422_ERROR_FORMS = frozenset({
+    "error", "error_text", "detail_error", "detail_error_text", "detail",
+    "detail_text", "validation", "message_text", "object", "list", "text",
+    "empty", "opaque",
+})
 _TEXT_422_FIELDS = frozenset({
     "action", "messages", "model", "parent_message_id", "conversation_id",
     "conversation_mode", "thinking_effort", "history_and_training_disabled",
@@ -56,6 +68,7 @@ def _text_422_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
     candidates: list[object] = []
     form = "opaque"
     if isinstance(body, dict):
+        form = "object"
         candidates.append(body.get("param"))
         error = body.get("error")
         detail = body.get("detail")
@@ -64,7 +77,10 @@ def _text_422_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
             candidates.append(error.get("param"))
         elif isinstance(detail, dict):
             nested = detail.get("error")
-            form = "detail_error" if isinstance(nested, dict) else "detail"
+            form = (
+                "detail_error" if isinstance(nested, dict)
+                else "detail_error_text" if isinstance(nested, str) else "detail"
+            )
             candidates.append(detail.get("param"))
             if isinstance(nested, dict):
                 candidates.append(nested.get("param"))
@@ -78,6 +94,16 @@ def _text_422_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
                     candidates.append(location[1])
         elif isinstance(detail, str):
             form = "detail_text"
+        elif isinstance(error, str):
+            form = "error_text"
+        elif isinstance(body.get("message"), str):
+            form = "message_text"
+    elif isinstance(body, list):
+        form = "list"
+    elif isinstance(body, str):
+        form = "text" if body else "empty"
+    elif body is None:
+        form = "empty"
     fields = {_text_422_field(value) for value in candidates} - {""}
     return {
         "original_upstream_error_form": form,
@@ -114,6 +140,7 @@ class ConversationBindingError(RuntimeError):
         original_failure_phase: str = "",
         original_http_status: int | None = None,
         original_exception_category: str = "",
+        original_upstream_request_stage: str = "",
         original_upstream_error_form: str = "",
         original_upstream_rejected_field: str = "",
     ) -> None:
@@ -135,6 +162,11 @@ class ConversationBindingError(RuntimeError):
         )
         self.original_exception_category = (
             original_exception_category if original_exception_category in _TEXT_FAILURE_CATEGORIES else ""
+        )
+        self.original_upstream_request_stage = (
+            original_upstream_request_stage
+            if self.original_http_status is not None
+            and original_upstream_request_stage in _TEXT_HTTP_REQUEST_STAGE_VALUES else ""
         )
         is_stream_open_422 = self.original_failure_phase == "stream_open" and self.original_http_status == 422
         self.original_upstream_error_form = (
@@ -1038,6 +1070,10 @@ class ConversationBindingService:
                     original_failure_phase=failure_phase,
                     original_http_status=original_status,
                     original_exception_category=original_category,
+                    original_upstream_request_stage=(
+                        _TEXT_HTTP_REQUEST_STAGES.get(exc.context, "unknown")
+                        if isinstance(exc, UpstreamHTTPError) else ""
+                    ),
                     **(_text_422_diagnostic(exc)
                        if isinstance(exc, UpstreamHTTPError) and exc.status_code == 422
                        and failure_phase == "stream_open" else {}),

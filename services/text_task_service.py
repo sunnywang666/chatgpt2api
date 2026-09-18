@@ -732,6 +732,7 @@ class TextTaskService:
             diagnostic = {
                 key: value for key in (
                     "original_failure_phase", "original_http_status", "original_exception_category",
+                    "original_upstream_request_stage",
                     "original_upstream_error_form", "original_upstream_rejected_field",
                 )
                 if (value := getattr(exc, key, None)) is not None and value != ""
