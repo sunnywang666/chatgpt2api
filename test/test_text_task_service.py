@@ -477,11 +477,52 @@ class TextTaskTests(unittest.TestCase):
 
         self.assertEqual(limited["recovery_attempt"], 100)
         self.assertEqual(limited.get("recovery_no_result_reads", 0), 0)
-        self.assertEqual(limited["recovery_error_code"], "RECOVERY_READ_FAILED")
+        self.assertEqual(limited["recovery_error_code"], "RECOVERY_RATE_LIMITED")
         self.assertEqual(
             limited["recovery_next_at"] - clock(),
             TextTaskService.RECOVERY_MAX_BACKOFF_SECONDS,
         )
+
+    def test_recovery_distinguishes_transport_rate_limit_and_auth_without_leaking_details(self):
+        clock = ManualClock()
+
+        class RateLimitError(RuntimeError):
+            status_code = 429
+            retry_after = 47
+
+        class AuthError(RuntimeError):
+            status_code = 401
+
+        scenarios = (
+            ("transport", ConnectionError("proxy token=secret"), "RECOVERY_TRANSPORT_FAILED", None),
+            ("rate", RateLimitError("body token=secret"), "RECOVERY_RATE_LIMITED", 47),
+            ("auth", AuthError("credential token=secret"), "RECOVERY_AUTH_REQUIRED", None),
+        )
+        for name, failure, expected_code, expected_retry_after in scenarios:
+            with self.subTest(name=name):
+                path = self.path.with_name(f"{name}.sqlite3")
+                body = {**self.body, "client_request_id": f"{name}-attempt"}
+                service = TextTaskService(
+                    path,
+                    executor=QueuedExecutor(),
+                    clock=clock,
+                    recovery_reader=lambda _receipt, failure=failure: (_ for _ in ()).throw(failure),
+                )
+                service.submit("owner", body)
+                service._update(
+                    "owner", f"{name}-attempt", status="unknown",
+                    error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                    provider_binding_id="binding", provider_account_identity="account",
+                    conversation_id="chat",
+                )
+
+                result = service.recover("owner", f"{name}-attempt")
+
+                self.assertEqual(result["recovery_error_code"], expected_code)
+                self.assertEqual(result.get("recovery_retry_after_seconds"), expected_retry_after)
+                if expected_retry_after is not None:
+                    self.assertEqual(result["recovery_next_at"] - clock(), expected_retry_after)
+                self.assertNotIn(b"token=secret", path.read_bytes())
 
     def test_unrecoverable_opt_in_does_not_count_running_or_read_failures(self):
         clock = ManualClock()
