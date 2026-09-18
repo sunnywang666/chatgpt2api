@@ -21,6 +21,14 @@ from services.storage.base import StorageBackend
 from utils.helper import anonymize_token, is_codex_image_model, split_image_model
 
 
+class CodexAuthorizationAttachError(ValueError):
+    """Safe, caller-facing classification for rejected Codex attachments."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
@@ -33,6 +41,7 @@ class AccountService:
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
+    _CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
     _OAUTH_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -250,8 +259,97 @@ class AccountService:
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
+        raw_codex_credentials = normalized.get("codex_credentials")
+        if isinstance(raw_codex_credentials, dict):
+            normalized["codex_credentials"] = {
+                key: str(raw_codex_credentials.get(key) or "").strip()
+                for key in ("access_token", "refresh_token", "id_token", "account_id")
+            }
+        elif "codex_credentials" in normalized:
+            # Presence is meaningful: an invalid persisted attachment must not
+            # silently fall back to the primary Chat authorization.
+            normalized["codex_credentials"] = {}
+        normalized["last_codex_token_refresh_at"] = normalized.get("last_codex_token_refresh_at") or None
+        normalized["last_codex_token_refresh_error"] = normalized.get("last_codex_token_refresh_error") or None
+        normalized["last_codex_token_refresh_error_at"] = normalized.get("last_codex_token_refresh_error_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
+
+    @staticmethod
+    def _validated_workspace_id(value: object) -> str | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            return str(uuid.UUID(raw))
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    @classmethod
+    def _jwt_subject(cls, token: object) -> str:
+        return str(cls._decode_jwt_payload(str(token or "")).get("sub") or "").strip()
+
+    @classmethod
+    def _jwt_workspace_ids(cls, *tokens: object) -> set[str]:
+        result: set[str] = set()
+        for token in tokens:
+            payload = cls._decode_jwt_payload(str(token or ""))
+            claim = payload.get("https://api.openai.com/auth")
+            if not isinstance(claim, dict):
+                continue
+            raw = str(claim.get("chatgpt_account_id") or "").strip()
+            if raw:
+                parsed = cls._validated_workspace_id(raw)
+                if parsed is None:
+                    raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
+                result.add(parsed)
+        return result
+
+    @classmethod
+    def _validated_codex_credentials(cls, payload: object) -> dict[str, str]:
+        if not isinstance(payload, dict):
+            raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
+        credentials = {
+            key: str(payload.get(key) or "").strip()
+            for key in ("access_token", "refresh_token", "id_token", "account_id")
+        }
+        if not all(credentials.values()):
+            raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
+        access_sub = cls._jwt_subject(credentials["access_token"])
+        id_sub = cls._jwt_subject(credentials["id_token"])
+        if not access_sub or not id_sub or access_sub != id_sub:
+            raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
+        account_id = cls._validated_workspace_id(credentials["account_id"])
+        if account_id is None:
+            raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
+        claimed_ids = cls._jwt_workspace_ids(credentials["access_token"], credentials["id_token"])
+        if claimed_ids and claimed_ids != {account_id}:
+            raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
+        credentials["account_id"] = account_id
+        return credentials
+
+    @staticmethod
+    def codex_authorization_fields(account: dict) -> tuple[str, str]:
+        raw = account.get("codex_credentials")
+        if isinstance(raw, dict):
+            return str(raw.get("access_token") or ""), str(raw.get("account_id") or "")
+        return str(account.get("access_token") or ""), str(account.get("account_id") or "")
+
+    @staticmethod
+    def _codex_credential_fields(account: dict) -> tuple[str, str, str, str]:
+        raw = account.get("codex_credentials")
+        if not isinstance(raw, dict):
+            return "", "", "", ""
+        return tuple(str(raw.get(key) or "") for key in (
+            "access_token", "refresh_token", "id_token", "account_id"
+        ))
+
+    @staticmethod
+    def _copy_account(account: dict) -> dict:
+        result = dict(account)
+        if isinstance(result.get("codex_credentials"), dict):
+            result["codex_credentials"] = dict(result["codex_credentials"])
+        return result
 
     @staticmethod
     def _jwt_exp(access_token: str) -> int:
@@ -309,7 +407,7 @@ class AccountService:
         with self._lock:
             resolved = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(resolved)
-            return resolved, dict(account) if account else None
+            return resolved, self._copy_account(account) if account else None
 
     def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -333,6 +431,12 @@ class AccountService:
 
     def _recent_token_refresh_error(self, account: dict) -> bool:
         last_error_at = self._parse_time(account.get("last_token_refresh_error_at"))
+        if last_error_at is None:
+            return False
+        return (datetime.now(timezone.utc) - last_error_at).total_seconds() < self._TOKEN_REFRESH_ERROR_BACKOFF_SECONDS
+
+    def _recent_codex_token_refresh_error(self, account: dict) -> bool:
+        last_error_at = self._parse_time(account.get("last_codex_token_refresh_error_at"))
         if last_error_at is None:
             return False
         return (datetime.now(timezone.utc) - last_error_at).total_seconds() < self._TOKEN_REFRESH_ERROR_BACKOFF_SECONDS
@@ -379,7 +483,7 @@ class AccountService:
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": refresh_token,
-                    "client_id": ("app_EMoamEEZ73f0CkXaXp7hrann" if (account or {}).get("source_type") == "codex" else self._OAUTH_CLIENT_ID),
+                    "client_id": (self._CODEX_OAUTH_CLIENT_ID if (account or {}).get("source_type") == "codex" else self._OAUTH_CLIENT_ID),
                 },
                 timeout=60,
                 allow_redirects=False,
@@ -483,6 +587,134 @@ class AccountService:
                         t.start()
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
+
+    def _record_codex_token_refresh_error(
+        self,
+        access_token: str,
+        event: str,
+        error: object,
+        *,
+        expected_credentials: tuple[str, str, str, str] | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        raw = str(error or "")
+        safe_error = raw if raw.startswith("codex_oauth_refresh_http_") else "codex_oauth_refresh_failed"
+        with self._lock:
+            resolved = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(resolved)
+            if current is None or not isinstance(current.get("codex_credentials"), dict):
+                return
+            if (expected_credentials is not None
+                    and self._codex_credential_fields(current) != expected_credentials):
+                return
+            next_item = self._normalize_account({
+                **current,
+                "last_codex_token_refresh_error": safe_error,
+                "last_codex_token_refresh_error_at": now,
+            })
+            if next_item is not None:
+                self._accounts[resolved] = next_item
+                self._save_accounts()
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "Codex refresh_token 刷新 access_token 失败",
+            {"source": event, "error": safe_error},
+        )
+
+    def refresh_codex_access_token(
+        self,
+        access_token: str,
+        *,
+        force: bool = False,
+        event: str = "refresh_codex_access_token",
+    ) -> str:
+        """Refresh the attached Codex authorization without rotating the pool key."""
+        if not access_token:
+            return ""
+        fallback = False
+        with self._token_refresh_lock:
+            resolved_token, account = self._get_account_for_token(access_token)
+            if not account:
+                return access_token
+            if "codex_credentials" not in account:
+                fallback = True
+            else:
+                credentials = account.get("codex_credentials")
+                credentials = dict(credentials) if isinstance(credentials, dict) else {}
+                active_token = str(credentials.get("access_token") or "").strip()
+                if not active_token or not self._token_needs_refresh(active_token, force=force):
+                    return resolved_token
+                refresh_token = str(credentials.get("refresh_token") or "").strip()
+                if not refresh_token or (not force and self._recent_codex_token_refresh_error(account)):
+                    return resolved_token
+                expected = self._codex_credential_fields(account)
+                try:
+                    token_data = self._request_access_token_refresh(
+                        refresh_token,
+                        {**account, "source_type": "codex"},
+                    )
+                except Exception as exc:
+                    self._record_codex_token_refresh_error(
+                        resolved_token, event, exc, expected_credentials=expected
+                    )
+                    return resolved_token
+
+                candidate = {
+                    "access_token": str(token_data.get("access_token") or active_token).strip(),
+                    "refresh_token": str(token_data.get("refresh_token") or refresh_token).strip(),
+                    "id_token": str(token_data.get("id_token") or credentials.get("id_token") or "").strip(),
+                    "account_id": str(credentials.get("account_id") or "").strip(),
+                }
+                try:
+                    candidate = self._validated_codex_credentials(candidate)
+                except CodexAuthorizationAttachError as exc:
+                    self._record_codex_token_refresh_error(
+                        resolved_token, event, exc, expected_credentials=expected
+                    )
+                    return resolved_token
+
+                now = datetime.now(timezone.utc).isoformat()
+                invalid_current = False
+                with self._lock:
+                    resolved_token = self._resolve_access_token_locked(resolved_token)
+                    current = self._accounts.get(resolved_token)
+                    if current is None or self._codex_credential_fields(current) != expected:
+                        return resolved_token
+                    primary_sub = self._jwt_subject(current.get("access_token"))
+                    primary_account_id = self._validated_workspace_id(current.get("account_id"))
+                    invalid_current = (
+                        not primary_sub
+                        or self._jwt_subject(candidate["access_token"]) != primary_sub
+                        or primary_account_id != candidate["account_id"]
+                    )
+                    if not invalid_current:
+                        next_item = self._normalize_account({
+                            **current,
+                            "codex_credentials": candidate,
+                            "last_codex_token_refresh_at": now,
+                            "last_codex_token_refresh_error": None,
+                            "last_codex_token_refresh_error_at": None,
+                        })
+                        if next_item is not None:
+                            self._accounts[resolved_token] = next_item
+                            self._save_accounts()
+                if invalid_current:
+                    self._record_codex_token_refresh_error(
+                        resolved_token,
+                        event,
+                        "codex_authorization_invalid_material",
+                        expected_credentials=expected,
+                    )
+                    return resolved_token
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "Codex refresh_token 已刷新 access_token",
+                    {"source": event},
+                )
+                return resolved_token
+        if fallback:
+            return self.refresh_access_token(access_token, force=force, event=event)
+        return access_token
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
@@ -1285,7 +1517,7 @@ class AccountService:
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(access_token)
-            return dict(account) if account else None
+            return self._copy_account(account) if account else None
 
     def list_accounts(self) -> list[dict]:
         """返回所有账号的副本，并为每个账号附加当前图片在途数 image_inflight。
@@ -1296,7 +1528,7 @@ class AccountService:
         with self._lock:
             result = []
             for item in self._accounts.values():
-                account = dict(item)
+                account = self._copy_account(item)
                 token = account.get("access_token") or ""
                 account["image_inflight"] = int(self._image_inflight.get(token, 0))
                 result.append(account)
@@ -1313,6 +1545,85 @@ class AccountService:
         with self._lock:
             return [public_owned_account(a) for a in self._accounts.values()
                     if a.get("managed_owner") == owner and a.get("managed_account_id")]
+
+    def attach_codex_authorization(self, payload: dict) -> dict:
+        """Attach a separately issued Codex authorization to one existing account.
+
+        JWT payloads are used only as trusted management consistency material.
+        This method does not authenticate callers and never creates an account.
+        """
+        credentials = self._validated_codex_credentials(payload)
+        subject = self._jwt_subject(credentials["access_token"])
+        account_id = credentials["account_id"]
+        with self._lock:
+            exact: list[tuple[str, dict]] = []
+            related = False
+            invalid_related = False
+            for token, account in self._accounts.items():
+                primary_sub = self._jwt_subject(account.get("access_token"))
+                primary_id_sub = self._jwt_subject(account.get("id_token"))
+                primary_account_id = self._validated_workspace_id(account.get("account_id"))
+                if primary_sub == subject or primary_account_id == account_id:
+                    related = True
+                if primary_sub != subject or primary_account_id != account_id:
+                    continue
+                if primary_id_sub and primary_id_sub != primary_sub:
+                    invalid_related = True
+                    continue
+                try:
+                    claimed_ids = self._jwt_workspace_ids(
+                        account.get("access_token"), account.get("id_token")
+                    )
+                except CodexAuthorizationAttachError:
+                    invalid_related = True
+                    continue
+                if claimed_ids and claimed_ids != {account_id}:
+                    invalid_related = True
+                    continue
+                exact.append((token, account))
+
+            if len(exact) > 1:
+                raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
+            if exact and invalid_related:
+                raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+            if not exact:
+                if related or invalid_related:
+                    raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+                raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
+
+            token, current = exact[0]
+            if self._codex_credential_fields(current) == tuple(
+                credentials[key] for key in ("access_token", "refresh_token", "id_token", "account_id")
+            ):
+                return {"attached": True}
+
+            observation = current.get("codex_observation")
+            observation = dict(observation) if isinstance(observation, dict) else {}
+            observation.update({
+                "state": "unknown",
+                "observed_at": None,
+                "failed_at": None,
+                "error_code": None,
+            })
+            next_item = self._normalize_account({
+                **current,
+                "access_token": token,
+                "codex_credentials": credentials,
+                "codex_observation": observation,
+                "last_codex_token_refresh_at": None,
+                "last_codex_token_refresh_error": None,
+                "last_codex_token_refresh_error_at": None,
+            })
+            if next_item is None:
+                raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+            self._accounts[token] = next_item
+            try:
+                self._save_accounts()
+            except Exception:
+                self._accounts[token] = current
+                raise
+        log_service.add(LOG_TYPE_ACCOUNT, "附加 Codex 独立授权", {"status": "成功"})
+        return {"attached": True}
 
     def import_owned_account(self, owner: str, payload: dict) -> dict:
         from services.owned_accounts import public_owned_account, utc_now
@@ -1519,7 +1830,15 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
-    def update_account(self, access_token: str, updates: dict, quiet: bool = False, *, expected_credentials: tuple[str, str] | None = None) -> dict | None:
+    def update_account(
+        self,
+        access_token: str,
+        updates: dict,
+        quiet: bool = False,
+        *,
+        expected_credentials: tuple[str, str] | None = None,
+        expected_codex_credentials: tuple[str, str] | None = None,
+    ) -> dict | None:
         if not access_token:
             return None
         with self._lock:
@@ -1533,6 +1852,9 @@ class AccountService:
             if expected_credentials is not None and expected_credentials != (
                 str(current.get("access_token") or ""), str(current.get("account_id") or "")
             ):
+                return dict(current)
+            if (expected_codex_credentials is not None
+                    and expected_codex_credentials != self.codex_authorization_fields(current)):
                 return dict(current)
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:

@@ -22,6 +22,14 @@ class EnabledAccount(BaseModel):
     enabled: bool
 
 
+class CodexAuthorization(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    access_token: SecretStr = Field(min_length=1, max_length=20_000)
+    refresh_token: SecretStr = Field(min_length=1, max_length=20_000)
+    id_token: SecretStr = Field(min_length=1, max_length=20_000)
+    account_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,200}$")
+
+
 class KeyName(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = ""
@@ -68,6 +76,15 @@ def create_router() -> APIRouter:
         owner = owner_scope(authorization, x_workbench_account_owner)
         payload = {key: value.get_secret_value() if isinstance(value, SecretStr) else value for key, value in body if value is not None}
         return {"item": await account_operation(account_service.import_owned_account, owner, payload)}
+
+    @router.post("/pool/codex-authorization")
+    async def attach_codex_authorization(body: CodexAuthorization, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        # This internal bridge is reached only through the BFF's existing boss
+        # gate. A normal program key never authorizes account management.
+        owner_scope(authorization, x_workbench_account_owner)
+        payload = {key: value.get_secret_value() if isinstance(value, SecretStr) else value for key, value in body}
+        await account_operation(account_service.attach_codex_authorization, payload)
+        return {"attached": True}
 
     @router.post("/accounts/{account_id}/refresh")
     async def refresh_account(account_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):

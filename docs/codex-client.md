@@ -18,6 +18,31 @@ Successful model discovery or deployment health does not prove that a real Respo
 
 ## What the launchers do
 
+### Existing pool account: attach Codex authorization
+
+An official Codex login is distinct from the ordinary service key used below. If the
+existing Chat credential is rejected by Codex, complete the official login for that
+same account in an isolated CLI home. Keep its `auth.json` private; do not place it
+in a repository, message, screenshot, or acceptance bundle.
+
+For an existing pool record, the authenticated Workbench management bridge accepts
+`POST /api/ai-service/pool/codex-authorization` with the file's `tokens.access_token`,
+`tokens.refresh_token`, `tokens.id_token`, and `tokens.account_id` as the corresponding
+top-level JSON fields. This is an existing boss/administrator session operation with
+a same-origin requirement, **not** a public API authenticated with a program key.
+Workbench forwards it through its private Provider management connection.
+
+The operation requires one existing record with the same exact upstream subject and
+workspace ID. It never creates or adopts a record. Missing, mismatched or ambiguous
+identity returns a conflict. A successful response is only `{"attached": true}`:
+Chat credentials, account ownership, ordinary keys and original task/session bindings
+remain unchanged. Codex credentials are persisted separately in that same record and
+refreshed with the Codex client. Attachment does not prove Responses success; resume
+the original isolated CLI session through the service and inspect its actual result.
+
+This endpoint is a candidate until the exact Provider and Content API versions have
+been deployed. Browser login and local engineering tests are not live acceptance.
+
 `examples/codex_client/run-codex.sh` and `examples/codex_client/run-codex.ps1` first request `GET /models`. Discovery accepts native Codex `models[].slug` and OpenAI-compatible `data[].id` responses without changing the provider protocol. Run discovery without a model, then select one exact returned ID before they create an isolated state root and launch Codex.
 
 The state root contains a generated `config.toml` with this custom Responses provider shape:
