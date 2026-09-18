@@ -372,6 +372,42 @@ class CodexLoginFlowTests(unittest.TestCase):
         self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
         self.assertEqual(self.accounts.storage.load_accounts()[0]["codex_credentials"], attached)
 
+    def test_legacy_primary_only_codex_reuses_its_own_refresh_for_both_owners(self):
+        old = credentials("legacy-codex")
+        incoming = {**credentials("new-codex"), "refresh_token": old["refresh_token"]}
+        for submitter in ("workbench:org:one", "workbench:org:two"):
+            with self.subTest(submitter=submitter):
+                path = Path(self.tmp.name) / f"legacy-{submitter.rsplit(':', 1)[-1]}.json"
+                accounts = AccountService(JSONStorageBackend(path))
+                accounts.add_account_items([{
+                    **old, "source_type": "codex", "managed_owner": "workbench:org:one",
+                    "managed_account_id": "original-row",
+                }])
+                self.assertNotIn("codex_credentials", accounts.storage.load_accounts()[0])
+                with patch.object(accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume legacy Codex refresh")):
+                    receipt = accounts.import_owned_account(submitter, {**incoming, "source_type": "codex"})
+                self.assertEqual(receipt["import_status"], "updated")
+                saved = accounts.storage.load_accounts()[0]
+                self.assertEqual(saved["access_token"], old["access_token"])
+                self.assertEqual(saved["refresh_token"], old["refresh_token"])
+                self.assertEqual(saved["managed_owner"], "workbench:org:one")
+                self.assertEqual(saved["codex_credentials"], {**incoming, "id_token": old["id_token"]})
+                self.assertEqual(len(accounts.storage.load_accounts()), 1)
+
+    def test_legacy_primary_only_codex_device_exchange_keeps_new_id(self):
+        old = credentials("legacy-codex")
+        self.accounts.add_account_items([{
+            **old, "source_type": "codex", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row",
+        }])
+        incoming = {**credentials("device-new"), "refresh_token": old["refresh_token"]}
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("device exchange is proof")):
+            receipt = self.accounts.import_owned_codex_authorization(
+                "workbench:org:two", incoming, verified_exchange=True,
+            )
+        self.assertEqual(receipt["import_status"], "updated")
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["codex_credentials"], incoming)
+
     def test_same_codex_refresh_stale_and_save_failure_do_not_consume_it(self):
         old = credentials("stored")
         self.accounts.add_account_items([{

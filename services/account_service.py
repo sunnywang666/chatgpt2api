@@ -2002,19 +2002,28 @@ class AccountService:
                 )
             )
             attached_refresh = ""
+            prior_id = ""
             if initial_matches:
                 current = initial_matches[0][1]
                 attached = current.get("codex_credentials")
                 if isinstance(attached, dict):
                     attached_refresh = str(attached.get("refresh_token") or "").strip()
+                    prior_id = str(attached.get("id_token") or "").strip()
                 primary_refresh = str(current.get("refresh_token") or "").strip()
-                if credentials["refresh_token"] == primary_refresh and credentials["refresh_token"] != attached_refresh:
+                legacy_primary_codex = current.get("source_type") == "codex" and not isinstance(attached, dict)
+                if legacy_primary_codex:
+                    prior_id = str(current.get("id_token") or "").strip()
+                if (credentials["refresh_token"] == primary_refresh
+                        and credentials["refresh_token"] != attached_refresh
+                        and not legacy_primary_codex):
                     raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
-            reused_refresh = bool(foreign_replacement and attached_refresh and credentials["refresh_token"] == attached_refresh)
-            if reused_refresh and not verified_exchange:
+            same_codex_refresh = bool(initial_matches and credentials["refresh_token"] == attached_refresh and attached_refresh)
+            if initial_matches and legacy_primary_codex and credentials["refresh_token"] == primary_refresh:
+                same_codex_refresh = True
+            reused_refresh = bool(foreign_replacement and same_codex_refresh)
+            if same_codex_refresh and not verified_exchange:
                 # The protected bearer read cannot authenticate a newly
-                # supplied ID token. Keep the attached one when it exists.
-                prior_id = str(initial_matches[0][1]["codex_credentials"].get("id_token") or "").strip()
+                # supplied ID token. Keep the trusted stored Codex value.
                 if prior_id:
                     credentials = self._validated_codex_credentials({**credentials, "id_token": prior_id})
         # A decoded JWT is forgeable. The official device exchange already
