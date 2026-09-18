@@ -6,7 +6,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.external_images import client_sync_result, validate_external_input, is_external, synchronous_external_task
-from api.image_inputs import parse_image_edit_request, read_image_sources
+from api.image_inputs import normalize_inline_chat_messages, parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from api.key_policy import require_image_policy, require_chat_text_policy
 from utils.helper import is_image_chat_request, has_response_image_generation_tool
@@ -281,6 +281,15 @@ def create_router() -> APIRouter:
         require_chat_text_policy(identity)
         owner = str(identity.get("id") or "anonymous")
         payload = body.model_dump(mode="python")
+        if any(
+            isinstance(part, dict) and part.get("type") in {"image_url", "input_image"}
+            for message in payload["messages"]
+            for part in (message.get("content") if isinstance(message.get("content"), list) else [])
+        ):
+            # Bound DSH calls use the same inline image shape as public Chat.
+            # Decode and validate before saving the original request identity;
+            # otherwise the upstream converter silently drops image_url parts.
+            payload["messages"] = await run_in_threadpool(normalize_inline_chat_messages, payload["messages"])
         try:
             if body.client_request_id:
                 # Reject a durable id/body conflict before the optional AI

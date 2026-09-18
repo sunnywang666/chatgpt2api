@@ -1150,6 +1150,68 @@ class TextTaskTests(unittest.TestCase):
                 self.assertEqual(recovered.json()["status"], "queued")
         self.assertEqual(len(self.queue.calls), 1)
 
+    def test_bound_dsh_image_reaches_upstream_and_keeps_original_request_identity(self):
+        import base64
+        import io
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from PIL import Image
+        from api.ai import create_router
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        image = io.BytesIO()
+        Image.new("RGB", (2, 2), "blue").save(image, format="PNG")
+        data = image.getvalue()
+        image_url = "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+        body = {**self.body, "client_request_id": "dsh-image", "messages": [
+            {"role": "system", "content": "Inspect the attached image."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Check the image."},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]},
+        ]}
+        service = TextTaskService(self.path, executor=self.queue)
+        app = FastAPI()
+        app.include_router(create_router())
+        with (
+            mock.patch("api.ai.text_task_service", service),
+            mock.patch("api.ai.filter_or_log", mock.AsyncMock()),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
+            TestClient(app) as client,
+        ):
+            first = client.post("/api/conversation-bindings/text", json=body, headers={"Authorization": "owner"})
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(first.json()["status"], "queued")
+            self.assertEqual(client.post("/api/conversation-bindings/text", json=body,
+                                         headers={"Authorization": "owner"}).json()["status"], "queued")
+            self.assertEqual(len(self.queue.calls), 1)
+
+            scheduled = self.queue.calls[0][1][2]
+            self.assertEqual(scheduled["messages"][1]["content"][0], {"type": "text", "text": "Check the image."})
+            self.assertEqual(scheduled["messages"][1]["content"][1],
+                             {"type": "image", "data": data, "mime": "image/png"})
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.access_token = "test-account-token"
+            backend.text_request_message_id = scheduled["_request_message_id"]
+            backend._upload_image = mock.Mock(return_value={
+                "file_id": "input-image", "width": 2, "height": 2,
+                "file_size": len(data), "mime_type": "image/png", "file_name": "image_1.png",
+            })
+            converted = backend._api_messages_to_conversation_messages(scheduled["messages"])
+            self.assertEqual(converted[-1]["id"], scheduled["_request_message_id"])
+            self.assertEqual(converted[-1]["content"]["parts"][0]["asset_pointer"],
+                             "file-service://input-image")
+            backend._upload_image.assert_called_once()
+
+            remote = {**body, "client_request_id": "dsh-remote"}
+            remote["messages"] = [body["messages"][0], {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+            ]}]
+            denied = client.post("/api/conversation-bindings/text", json=remote,
+                                 headers={"Authorization": "owner"})
+            self.assertEqual(denied.status_code, 400, denied.text)
+            self.assertEqual(len(self.queue.calls), 1)
+
     def test_http_durable_id_conflict_precedes_enabled_ai_review(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
