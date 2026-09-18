@@ -34,6 +34,55 @@ _TEXT_FAILURE_PHASES = frozenset({"stream_open", "stream_event", "result_check",
 _TEXT_FAILURE_CATEGORIES = frozenset({
     "http", "timeout", "transport", "parse", "empty_result", "provider_error", "other",
 })
+_TEXT_422_ERROR_FORMS = frozenset({"error", "detail_error", "detail", "detail_text", "validation", "opaque"})
+_TEXT_422_FIELDS = frozenset({
+    "action", "messages", "model", "parent_message_id", "conversation_id",
+    "conversation_mode", "thinking_effort", "history_and_training_disabled",
+    "force_use_sse", "supported_encodings", "system_hints", "timezone",
+    "websocket_request_id",
+})
+
+
+def _text_422_field(value: object) -> str:
+    if not isinstance(value, str) or len(value) > 96:
+        return ""
+    top_level = value.split(".", 1)[0].split("[", 1)[0]
+    return top_level if top_level in _TEXT_422_FIELDS else ""
+
+
+def _text_422_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
+    """Keep only the shape and allowlisted top-level field, never upstream text."""
+    body = exc.body
+    candidates: list[object] = []
+    form = "opaque"
+    if isinstance(body, dict):
+        candidates.append(body.get("param"))
+        error = body.get("error")
+        detail = body.get("detail")
+        if isinstance(error, dict):
+            form = "error"
+            candidates.append(error.get("param"))
+        elif isinstance(detail, dict):
+            nested = detail.get("error")
+            form = "detail_error" if isinstance(nested, dict) else "detail"
+            candidates.append(detail.get("param"))
+            if isinstance(nested, dict):
+                candidates.append(nested.get("param"))
+        elif isinstance(detail, list):
+            form = "validation"
+            for item in detail[:20]:
+                if not isinstance(item, dict):
+                    continue
+                location = item.get("loc")
+                if isinstance(location, list) and len(location) >= 2 and location[0] == "body":
+                    candidates.append(location[1])
+        elif isinstance(detail, str):
+            form = "detail_text"
+    fields = {_text_422_field(value) for value in candidates} - {""}
+    return {
+        "original_upstream_error_form": form,
+        **({"original_upstream_rejected_field": next(iter(fields))} if len(fields) == 1 else {}),
+    }
 
 
 def _text_failure_category(exc: Exception) -> str:
@@ -65,6 +114,8 @@ class ConversationBindingError(RuntimeError):
         original_failure_phase: str = "",
         original_http_status: int | None = None,
         original_exception_category: str = "",
+        original_upstream_error_form: str = "",
+        original_upstream_rejected_field: str = "",
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -84,6 +135,15 @@ class ConversationBindingError(RuntimeError):
         )
         self.original_exception_category = (
             original_exception_category if original_exception_category in _TEXT_FAILURE_CATEGORIES else ""
+        )
+        is_stream_open_422 = self.original_failure_phase == "stream_open" and self.original_http_status == 422
+        self.original_upstream_error_form = (
+            original_upstream_error_form
+            if is_stream_open_422 and original_upstream_error_form in _TEXT_422_ERROR_FORMS else ""
+        )
+        self.original_upstream_rejected_field = (
+            original_upstream_rejected_field
+            if is_stream_open_422 and original_upstream_rejected_field in _TEXT_422_FIELDS else ""
         )
 
 
@@ -978,6 +1038,9 @@ class ConversationBindingService:
                     original_failure_phase=failure_phase,
                     original_http_status=original_status,
                     original_exception_category=original_category,
+                    **(_text_422_diagnostic(exc)
+                       if isinstance(exc, UpstreamHTTPError) and exc.status_code == 422
+                       and failure_phase == "stream_open" else {}),
                 ) from exc
             finally:
                 backend.close()

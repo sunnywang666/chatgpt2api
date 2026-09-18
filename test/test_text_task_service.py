@@ -120,10 +120,87 @@ class TextTaskTests(unittest.TestCase):
         invalid = ConversationBindingError(
             "SECRET_MESSAGE", original_failure_phase="SECRET_PHASE",
             original_http_status=9000, original_exception_category="SECRET_CATEGORY",
+            original_upstream_error_form="SECRET_FORM", original_upstream_rejected_field="SECRET_FIELD",
         )
         self.assertEqual(invalid.original_failure_phase, "")
         self.assertIsNone(invalid.original_http_status)
         self.assertEqual(invalid.original_exception_category, "")
+        self.assertEqual(invalid.original_upstream_error_form, "")
+        self.assertEqual(invalid.original_upstream_rejected_field, "")
+
+    def test_original_422_keeps_only_allowlisted_field_from_structured_upstream_error(self):
+        from contextlib import nullcontext
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        from services.conversation_binding_service import (
+            ConversationBindingService, _text_422_diagnostic,
+        )
+        from requests import Response
+        from utils.helper import UpstreamHTTPError, ensure_ok
+
+        service = TextTaskService(
+            self.path, ConversationBindingService().complete_text, self.queue,
+            recovery_reader=lambda _receipt: {"status": "running"},
+        )
+        body = {**self.body, "provider_binding_id": "binding-a", "provider_account_identity": "account-a"}
+        upstream_response = Response()
+        upstream_response.status_code = 422
+        upstream_response._content = json.dumps({
+            "error": {"type": "invalid_request_error", "param": "messages[0].content.SECRET_PATH",
+                      "code": "SECRET_CODE", "message": "SECRET_PROMPT"},
+        }).encode()
+        with self.assertRaises(UpstreamHTTPError) as captured:
+            ensure_ok(upstream_response, "/backend-api/conversation?SECRET_URL")
+        upstream_error = captured.exception
+        backend = mock.Mock()
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="SECRET_TOKEN"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+            mock.patch("services.conversation_binding_service.conversation_events", side_effect=upstream_error),
+        ):
+            self.assertEqual(service.submit("owner", body)["status"], "queued")
+            self.queue.run()
+
+        receipt = service.read("owner", body["client_request_id"])
+        self.assertEqual(receipt["status"], "unknown")
+        self.assertEqual(receipt["original_failure_phase"], "stream_open")
+        self.assertEqual(receipt["original_http_status"], 422)
+        self.assertEqual(receipt["original_upstream_error_form"], "error")
+        self.assertEqual(receipt["original_upstream_rejected_field"], "messages")
+        app = FastAPI()
+        app.include_router(create_router())
+        with (
+            mock.patch("api.ai.text_task_service", service),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
+            TestClient(app) as client,
+        ):
+            response = client.get("/api/conversation-bindings/text-requests/attempt-1",
+                                  headers={"Authorization": "owner"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["original_upstream_rejected_field"], "messages")
+        for secret in ("SECRET_URL", "SECRET_PATH", "SECRET_CODE", "SECRET_PROMPT", "SECRET_TOKEN"):
+            self.assertNotIn(secret.encode(), self.path.read_bytes())
+            self.assertNotIn(secret, response.text)
+
+        validation = _text_422_diagnostic(UpstreamHTTPError(
+            "/backend-api/conversation", 422,
+            {"detail": [{"loc": ["body", "thinking_effort"], "msg": "SECRET_PROMPT"}]},
+        ))
+        self.assertEqual(validation, {
+            "original_upstream_error_form": "validation",
+            "original_upstream_rejected_field": "thinking_effort",
+        })
+        free_text = _text_422_diagnostic(UpstreamHTTPError(
+            "/backend-api/conversation", 422, {"detail": "thinking_effort SECRET_PROMPT"},
+        ))
+        self.assertEqual(free_text, {"original_upstream_error_form": "detail_text"})
+        unlisted = _text_422_diagnostic(UpstreamHTTPError(
+            "/backend-api/conversation", 422, {"error": {"param": "SECRET_TOKEN"}},
+        ))
+        self.assertEqual(unlisted, {"original_upstream_error_form": "error"})
 
     def test_original_sse_timeout_keeps_cursor_and_no_exception_text(self):
         from contextlib import nullcontext

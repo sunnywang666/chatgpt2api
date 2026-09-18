@@ -730,7 +730,10 @@ class TextTaskService:
         except ConversationBindingError as exc:
             cursor = {k: getattr(exc, k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id") if getattr(exc, k, "")}
             diagnostic = {
-                key: value for key in ("original_failure_phase", "original_http_status", "original_exception_category")
+                key: value for key in (
+                    "original_failure_phase", "original_http_status", "original_exception_category",
+                    "original_upstream_error_form", "original_upstream_rejected_field",
+                )
                 if (value := getattr(exc, key, None)) is not None and value != ""
             }
             self._update(owner, request_id, **cursor, **diagnostic,
