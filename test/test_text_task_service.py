@@ -67,6 +67,98 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(len(self.queue.calls), 0)
         self.assertEqual(restarted.read("other-owner", "attempt-1")["status"], "not_found")
 
+    def test_original_http_failure_diagnostic_is_bounded_and_survives_id_read(self):
+        from contextlib import nullcontext
+        from services.conversation_binding_service import ConversationBindingService
+        from utils.helper import UpstreamHTTPError
+
+        service = TextTaskService(
+            self.path, ConversationBindingService().complete_text, self.queue,
+            recovery_reader=lambda _receipt: {"status": "running"},
+        )
+        body = {**self.body, "provider_binding_id": "binding-a", "provider_account_identity": "account-a"}
+        upstream_error = UpstreamHTTPError(
+            "/backend-api/conversation?SECRET_QUERY", 429, {"secret": "SECRET_BODY"},
+        )
+        backend = mock.Mock()
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="SECRET_TOKEN"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+            mock.patch("services.conversation_binding_service.conversation_events", side_effect=upstream_error),
+        ):
+            self.assertEqual(service.submit("owner", body)["status"], "queued")
+            self.queue.run()
+
+        receipt = service.read("owner", body["client_request_id"])
+        self.assertEqual(receipt["status"], "unknown")
+        self.assertEqual(receipt["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+        self.assertEqual(receipt["provider_binding_id"], "binding-a")
+        self.assertEqual(receipt["provider_account_identity"], "account-a")
+        self.assertEqual(receipt["original_failure_phase"], "stream_open")
+        self.assertEqual(receipt["original_http_status"], 429)
+        self.assertEqual(receipt["original_exception_category"], "http")
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        app = FastAPI()
+        app.include_router(create_router())
+        with (
+            mock.patch("api.ai.text_task_service", service),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
+            TestClient(app) as client,
+        ):
+            response = client.get("/api/conversation-bindings/text-requests/attempt-1",
+                                  headers={"Authorization": "owner"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["original_http_status"], 429)
+        for secret in (b"SECRET_QUERY", b"SECRET_BODY", b"SECRET_TOKEN"):
+            self.assertNotIn(secret, self.path.read_bytes())
+            self.assertNotIn(secret.decode(), json.dumps(receipt))
+            self.assertNotIn(secret.decode(), response.text)
+        invalid = ConversationBindingError(
+            "SECRET_MESSAGE", original_failure_phase="SECRET_PHASE",
+            original_http_status=9000, original_exception_category="SECRET_CATEGORY",
+        )
+        self.assertEqual(invalid.original_failure_phase, "")
+        self.assertIsNone(invalid.original_http_status)
+        self.assertEqual(invalid.original_exception_category, "")
+
+    def test_original_sse_timeout_keeps_cursor_and_no_exception_text(self):
+        from contextlib import nullcontext
+        from services.conversation_binding_service import ConversationBindingService
+
+        def interrupted_events(*_args, **_kwargs):
+            yield {"type": "conversation.delta", "conversation_id": "conversation-a", "delta": "partial"}
+            raise TimeoutError("SECRET_TIMEOUT_DETAILS")
+
+        service = TextTaskService(
+            self.path, ConversationBindingService().complete_text, self.queue,
+            recovery_reader=lambda _receipt: {"status": "running"},
+        )
+        body = {**self.body, "provider_binding_id": "binding-a", "provider_account_identity": "account-a"}
+        backend = mock.Mock()
+        backend.get_conversation_parent_message_id.return_value = ""
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="SECRET_TOKEN"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+            mock.patch("services.conversation_binding_service.conversation_events", side_effect=interrupted_events),
+        ):
+            self.assertEqual(service.submit("owner", body)["status"], "queued")
+            self.queue.run()
+
+        receipt = service.read("owner", body["client_request_id"])
+        self.assertEqual(receipt["status"], "unknown")
+        self.assertEqual(receipt["conversation_id"], "conversation-a")
+        self.assertEqual(receipt["original_failure_phase"], "stream_event")
+        self.assertEqual(receipt["original_exception_category"], "timeout")
+        self.assertNotIn("original_http_status", receipt)
+        self.assertNotIn(b"SECRET_TIMEOUT_DETAILS", self.path.read_bytes())
+        self.assertNotIn("SECRET_TIMEOUT_DETAILS", json.dumps(receipt))
+
     def test_timeout_cursor_does_not_replace_original_request_parent(self):
         captured = []
         def runner(body, on_cursor):

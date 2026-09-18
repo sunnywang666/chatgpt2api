@@ -729,11 +729,16 @@ class TextTaskService:
             self._update(owner, request_id, **{**result, "status": "succeeded", "finished_at": self._now()})
         except ConversationBindingError as exc:
             cursor = {k: getattr(exc, k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id") if getattr(exc, k, "")}
-            self._update(owner, request_id, **cursor,
+            diagnostic = {
+                key: value for key in ("original_failure_phase", "original_http_status", "original_exception_category")
+                if (value := getattr(exc, key, None)) is not None and value != ""
+            }
+            self._update(owner, request_id, **cursor, **diagnostic,
                          status="unknown" if exc.code == "CONVERSATION_OUTCOME_UNKNOWN" else "failed",
                          error_code=exc.code, finished_at=self._now())
         except Exception:
-            self._update(owner, request_id, status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN", finished_at=self._now())
+            self._update(owner, request_id, status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                         original_failure_phase="runner", original_exception_category="other", finished_at=self._now())
 
 
 text_task_service = TextTaskService(DATA_DIR / "text_tasks.sqlite3")
