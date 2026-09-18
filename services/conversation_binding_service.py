@@ -30,6 +30,23 @@ class TextRecoveryReason(str, Enum):
 _ACTIVE_TEXT_RESULT_STATUSES = frozenset({"in_progress", "running", "pending", "queued"})
 RECOVERY_CONVERSATION_SCAN_FIELD = "_recovery_conversation_scan"
 RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD = "_recovery_conversation_coverage_version"
+_TEXT_FAILURE_PHASES = frozenset({"stream_open", "stream_event", "result_check", "cursor_read", "runner"})
+_TEXT_FAILURE_CATEGORIES = frozenset({
+    "http", "timeout", "transport", "parse", "empty_result", "provider_error", "other",
+})
+
+
+def _text_failure_category(exc: Exception) -> str:
+    if isinstance(exc, UpstreamHTTPError):
+        return "http"
+    name = type(exc).__name__
+    if isinstance(exc, TimeoutError) or name in {"Timeout", "ReadTimeout", "ConnectTimeout"}:
+        return "timeout"
+    if isinstance(exc, ConnectionError) or name in {"ProxyError", "DNSError", "ConnectionError", "SSLError"}:
+        return "transport"
+    if isinstance(exc, (ValueError, TypeError, KeyError)):
+        return "parse"
+    return "other"
 
 
 class ConversationBindingError(RuntimeError):
@@ -45,6 +62,9 @@ class ConversationBindingError(RuntimeError):
         recovery_reason: str = "",
         recovery_scan: dict[str, Any] | None = None,
         recovery_coverage_version: int | None = None,
+        original_failure_phase: str = "",
+        original_http_status: int | None = None,
+        original_exception_category: str = "",
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -55,6 +75,16 @@ class ConversationBindingError(RuntimeError):
         self.recovery_reason = recovery_reason
         self.recovery_scan = recovery_scan
         self.recovery_coverage_version = recovery_coverage_version
+        self.original_failure_phase = (
+            original_failure_phase if original_failure_phase in _TEXT_FAILURE_PHASES else ""
+        )
+        self.original_http_status = (
+            original_http_status
+            if type(original_http_status) is int and 100 <= original_http_status <= 599 else None
+        )
+        self.original_exception_category = (
+            original_exception_category if original_exception_category in _TEXT_FAILURE_CATEGORIES else ""
+        )
 
 
 class ConversationBindingService:
@@ -845,6 +875,7 @@ class ConversationBindingService:
             backend = OpenAIBackendAPI(access_token=access_token)
             backend.retain_bound_conversation = True
             backend.text_request_message_id = str(body.get("_request_message_id") or "")
+            failure_phase = "stream_open"
             try:
                 parts: list[str] = []
                 returned_conversation_id = ""
@@ -856,6 +887,7 @@ class ConversationBindingService:
                     conversation_id=conversation_id,
                     parent_message_id=parent_message_id,
                 ):
+                    failure_phase = "stream_event"
                     old_conversation_id = returned_conversation_id
                     returned_conversation_id = str(
                         event.get("conversation_id") or returned_conversation_id
@@ -866,12 +898,15 @@ class ConversationBindingService:
                         delta = str(event.get("delta") or "")
                         if delta:
                             parts.append(delta)
+                failure_phase = "result_check"
                 if not returned_conversation_id:
                     raise ConversationBindingError(
                         "upstream response has no conversation_id",
                         code="CONVERSATION_OUTCOME_UNKNOWN",
                         provider_binding_id=binding_id,
                         provider_account_identity=account_identity,
+                        original_failure_phase=failure_phase,
+                        original_exception_category="empty_result",
                     )
                 if conversation_id and returned_conversation_id != conversation_id:
                     raise ConversationBindingError(
@@ -889,7 +924,10 @@ class ConversationBindingService:
                         provider_binding_id=binding_id,
                         provider_account_identity=account_identity,
                         conversation_id=returned_conversation_id,
+                        original_failure_phase=failure_phase,
+                        original_exception_category="empty_result",
                     )
+                failure_phase = "cursor_read"
                 next_parent_message_id = backend.get_conversation_parent_message_id(
                     returned_conversation_id
                 )
@@ -902,9 +940,14 @@ class ConversationBindingService:
                     "parent_message_id": next_parent_message_id,
                     "binding_status": "bound",
                 }
-            except ConversationBindingError:
+            except ConversationBindingError as exc:
+                if exc.code == "CONVERSATION_OUTCOME_UNKNOWN" and not exc.original_failure_phase:
+                    exc.original_failure_phase = failure_phase
+                    exc.original_exception_category = "provider_error"
                 raise
             except Exception as exc:
+                original_category = _text_failure_category(exc)
+                original_status = exc.status_code if isinstance(exc, UpstreamHTTPError) else None
                 recovered_parent = ""
                 if returned_conversation_id:
                     try:
@@ -932,6 +975,9 @@ class ConversationBindingService:
                     provider_account_identity=account_identity,
                     conversation_id=returned_conversation_id,
                     parent_message_id=recovered_parent,
+                    original_failure_phase=failure_phase,
+                    original_http_status=original_status,
+                    original_exception_category=original_category,
                 ) from exc
             finally:
                 backend.close()

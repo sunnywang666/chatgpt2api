@@ -559,6 +559,8 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
 
         self.assertEqual(captured.exception.code, "CONVERSATION_OUTCOME_UNKNOWN")
         self.assertEqual(captured.exception.provider_binding_id, "cb-account-a")
+        self.assertEqual(captured.exception.original_failure_phase, "result_check")
+        self.assertEqual(captured.exception.original_exception_category, "empty_result")
         self.assertEqual(
             captured.exception.provider_account_identity, "account-opaque-a"
         )
