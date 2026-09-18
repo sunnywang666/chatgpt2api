@@ -2,11 +2,11 @@
 
 ## 中文接入要点
 
-第二阶段候选中，图片程序勾选「允许 Chat」，需要 Codex 时可另勾选「允许 Codex」，同端操作没有额外用途权限。修改允许端只影响后续提交，原任务查询、下载、回执读取仍按所有者校验；撤销后调用失效。未允许实际端返回403 `KEY_ROUTE_DENIED`；持久图片接口尚未支持Codex恢复是技术限制，不是缺少生图权限。旧密钥未改，尚未生产发布，详见 [部署指南](deployment.md#工作台程序密钥政策第二阶段)。
+第二阶段双端权限已于2026-09-17部署并由用户确认。图片/文字程序勾选「允许 Chat」，需要 Codex 时可另勾选「允许 Codex」；同端操作没有用途子权限。修改允许端不删除原回执；撤销后认证失效。发布时两把保留旧key均双端，三把旧key保持撤销，新创建密钥以其当前政策为准。
 
-目前是待发布候选，下面的正式域名路径尚未完成外网和真实生图验收。部署核验完成后再交调用方使用。
+首选入口是工作台「ChatGPT / Codex → 密钥与 CLI → 复制给AI配置」。复制说明不包含真实密钥，交给负责目标应用的AI；密钥通过本地私密环境配置另行提供。公开同源合同位于 https://app.hugsweetglobal.com/ai/integration.md ，不需要网站后台登录。下文为已有Python客户端的备用操作说明。第三阶段公共Chat增量的真实部署/接入证据单列，不以第二阶段发布推断第三阶段已经验收。
 
-- `SERVER_ROOT` 是服务根（计划为 `https://app.hugsweetglobal.com/ai`）；兼容 API Base URL 另加 `/v1`。持久任务不能拼成 `/v1/api/...`。
+- `SERVER_ROOT` 是服务根（`https://app.hugsweetglobal.com/ai`）；兼容 API Base URL 另加 `/v1`。持久任务不能拼成 `/v1/api/...`。
 - 在工作台“AI 服务连接”中创建普通调用密钥，仅通过私有渠道交付，填入本地权限为 `600` 的环境文件。它没有账号池管理员能力；撤销后原密钥立即失效。
 - 用下面的 `submit` 保存原任务号，再用 `status` 查询、`download` 保存图片。编辑时加 `--image 本地图片`，可传多张参考图。
 - 进程退出、网络超时或结果未知后，继续使用原状态文件和任务号。客户端不会自动换号或重新生成。
@@ -16,11 +16,11 @@
 
 `examples/image_client.py` is a dependency-free Python client for an external caller that needs a durable image-task receipt. It uses only the Python standard library. Its local state contains no bearer token, prompt text, or image bytes.
 
-This is an engineering client for the persistent task API. The planned public root is `https://app.hugsweetglobal.com/ai`, but it has not been deployed or live-validated. Local fixture tests do not establish a reachable endpoint, a usable provider account, or a successful external image generation.
+This is an engineering client for the persistent task API. The existing public service root is `https://app.hugsweetglobal.com/ai`. Local fixture tests do not establish a reachable endpoint, a usable provider account, or a successful external image generation.
 
 ## Server requirements
 
-Set `SERVER_ROOT` to the service root used by the external caller. The root may include an ingress prefix, but it must not end in `/v1`. The example environment contains the planned `/ai` address and labels it as unvalidated. Do not reuse an OpenAI SDK `OPENAI_BASE_URL` value ending in `/v1`: doing so would incorrectly produce `/v1/api/...` paths.
+Set `SERVER_ROOT` to the service root used by the external caller. The root may include an ingress prefix, but it must not end in `/v1`. The example environment contains the existing `/ai` service root and no credential. Do not reuse an OpenAI SDK `OPENAI_BASE_URL` value ending in `/v1`: doing so would incorrectly produce `/v1/api/...` paths.
 
 The example environment file contains no credential:
 
@@ -60,7 +60,7 @@ The synchronous-compatible routes use the same persistent receipt machinery as `
 
 The client reads the env file only when `--env-file` is supplied. Global options precede the command.
 
-Read the service model catalog before submitting. The external contract currently permits only `gpt-image-2`; discovery still confirms whether the deployed service actually advertises it:
+Read the service model catalog before submitting. For image output select `gpt-image-2`; text-capable entries have `capabilities` including `text` and `image_input`:
 
 ```sh
 python3 examples/image_client.py --env-file .image-client.env models
@@ -143,3 +143,22 @@ Do not put the bearer token in command arguments, task state, logs, screenshots,
 
 
 Codex coding is a separate route (`/ai/codex/v1`) documented in [the Codex CLI package](codex-client.md). It does not replace these image-task endpoints or change their supported image model. Its deployment and real CLI acceptance are tracked separately.
+
+## 公共Chat文字与图片理解（第三阶段增量）
+
+同一个现有客户端增加 `chat-submit`、`chat-status`、`chat-recover`，不需要另装SDK。模型从 `models` 的实时目录选择具有text能力的ID；不能用图片模型或未经公布的auto别名。请求与错误完整合同以页面复制文本和公开 `/ai/integration.md` 为准。
+
+```sh
+python3 examples/image_client.py --env-file .image-client.env chat-submit \
+  --state ./my-chat-request.json --model DISCOVERED_TEXT_MODEL \
+  --prompt '仅描述这张商品图能确认的事实，看不清的留空。' --image ./input.png
+python3 examples/image_client.py --env-file .image-client.env chat-status --state ./my-chat-request.json
+# 只向上游读取原请求结果，不重发生成：
+python3 examples/image_client.py --env-file .image-client.env chat-recover --state ./my-chat-request.json
+```
+
+纯文字省略 `--image`。本地图片转为data URL字节，不把路径传给服务器。提交前原子保存request_id及输入指纹，状态文件不存密钥、提示词或图片字节；相同输入再次执行只查询，漂移在本地拒绝。收到202、断线或超时后退出再运行status，绝不新开ID自动重试。404表示未在当前身份找到原回执，需要调查，不证明可以重发。
+
+技术保护按服务进程限制为2个请求体读取、32个执行或等待的文字任务、256MiB保留输入内存，不是密钥预算。429 `CHAT_BODY_READER_CAPACITY_EXCEEDED` 表示读取繁忙。队列满会保存原ID回执：`failed` / `TEXT_TASK_CAPACITY_EXCEEDED` / `recovery.upstream_outcome=not_sent`；只有这项明确未发送证据允许应用退避后原ID原输入再次POST。示例客户端保持查询优先，不自动执行这个重试，也不能删除状态文件换ID绕过保护。
+
+Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `success`，不要混用。只有实际取得的上游usage才可报告，当前未返回usage时应显示未知。现有公共Chat不提供工具执行或结构化输出保证；应用自行校验模型文本，不把JSON解析失败包装为成功。

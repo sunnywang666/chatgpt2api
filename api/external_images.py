@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 import base64
 import asyncio
+import threading
 import time
 from urllib.parse import quote, unquote, urlsplit
 
@@ -18,23 +19,100 @@ from fastapi.concurrency import run_in_threadpool
 from api.support import require_identity
 from services.image_storage_service import image_storage_service
 
+MAX_PUBLIC_CHAT_BODY_BYTES = 140 * 1024 * 1024
+MAX_CONCURRENT_PUBLIC_CHAT_BODY_READERS = 2
+_public_chat_body_reader_lock = threading.Lock()
+_public_chat_body_readers = 0
+
 
 def is_external(request: Request) -> bool:
     return request.headers.get("x-workbench-image-client") == "1"
 
 
+async def _buffer_bounded_body(request: Request, limit: int, error_code: str):
+    content_length = str(request.headers.get("content-length") or "").strip()
+    if content_length.isdigit() and int(content_length) > limit:
+        return JSONResponse({"detail": {"code": error_code}}, status_code=413)
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > limit:
+            return JSONResponse({"detail": {"code": error_code}}, status_code=413)
+    request._body = bytes(body)
+    return None
+
+
+def _try_acquire_public_chat_body_reader() -> bool:
+    global _public_chat_body_readers
+    with _public_chat_body_reader_lock:
+        if _public_chat_body_readers >= MAX_CONCURRENT_PUBLIC_CHAT_BODY_READERS:
+            return False
+        _public_chat_body_readers += 1
+        return True
+
+
+def _release_public_chat_body_reader() -> None:
+    global _public_chat_body_readers
+    with _public_chat_body_reader_lock:
+        _public_chat_body_readers -= 1
+
+
+def _ordinary_chat_identity(request: Request):
+    try:
+        identity = require_identity(request.headers.get("authorization"))
+        if identity.get("role") != "user":
+            raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
+        return identity, None
+    except HTTPException as exc:
+        return None, JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
+
 async def external_image_boundary(request: Request, call_next):
+    path = request.url.path
+    chat_body_limit = None
+    chat_body_error = None
+    if request.method == "POST" and path == "/api/chat-requests":
+        chat_body_limit = MAX_PUBLIC_CHAT_BODY_BYTES
+        chat_body_error = "CHAT_REQUEST_TOO_LARGE"
+    elif request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/recover", path):
+        chat_body_limit = 1024
+        chat_body_error = "CHAT_RECOVERY_BODY_TOO_LARGE"
+    if chat_body_limit is not None:
+        # Authenticate before inspecting Content-Length or consuming one byte.
+        # This also protects direct Provider calls where the proxy marker is
+        # absent. Hold the slot through downstream JSON parsing so a caller
+        # cannot multiply the bounded body allocation with concurrent reads.
+        _, rejected = _ordinary_chat_identity(request)
+        if rejected is not None:
+            return rejected
+        if not _try_acquire_public_chat_body_reader():
+            return JSONResponse(
+                {"detail": {"code": "CHAT_BODY_READER_CAPACITY_EXCEEDED"}},
+                status_code=429,
+            )
+        try:
+            rejected = await _buffer_bounded_body(
+                request, chat_body_limit, chat_body_error,
+            )
+            if rejected is not None:
+                return rejected
+            response = await call_next(request)
+            response.headers["Cache-Control"] = "private, no-store"
+            return response
+        finally:
+            _release_public_chat_body_reader()
     if not is_external(request):
         return await call_next(request)
     if request.method == "OPTIONS":
         return await call_next(request)
-    path = request.url.path
     allowed = (
         request.method == "GET" and path in {"/v1/models", "/api/image-tasks"}
         or request.method == "POST" and path in {
             "/v1/images/generations", "/v1/images/edits",
-            "/api/image-tasks/generations", "/api/image-tasks/edits",
+            "/api/image-tasks/generations", "/api/image-tasks/edits", "/api/chat-requests",
         }
+        or request.method == "GET" and re.fullmatch(r"/api/chat-requests/[^/]+", path)
+        or request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/recover", path)
         or request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/resume-poll", path)
         or request.method == "POST" and re.fullmatch(
             r"/api/image-tasks/[^/]+/adopt-latest-conversation-image", path
