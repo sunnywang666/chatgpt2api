@@ -2001,16 +2001,17 @@ class AccountService:
                     credentials[key] for key in ("access_token", "refresh_token", "id_token", "account_id")
                 )
             )
-            current_refreshes = set()
+            attached_refresh = ""
             if initial_matches:
                 current = initial_matches[0][1]
-                current_refreshes = {
-                    str(current.get("refresh_token") or "").strip(),
-                    str((current.get("codex_credentials") or {}).get("refresh_token") or "").strip()
-                    if isinstance(current.get("codex_credentials"), dict) else "",
-                }
-            reused_refresh = foreign_replacement and credentials["refresh_token"] in current_refreshes
-            if reused_refresh and isinstance(initial_matches[0][1].get("codex_credentials"), dict):
+                attached = current.get("codex_credentials")
+                if isinstance(attached, dict):
+                    attached_refresh = str(attached.get("refresh_token") or "").strip()
+                primary_refresh = str(current.get("refresh_token") or "").strip()
+                if credentials["refresh_token"] == primary_refresh and credentials["refresh_token"] != attached_refresh:
+                    raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+            reused_refresh = bool(foreign_replacement and attached_refresh and credentials["refresh_token"] == attached_refresh)
+            if reused_refresh and not verified_exchange:
                 # The protected bearer read cannot authenticate a newly
                 # supplied ID token. Keep the attached one when it exists.
                 prior_id = str(initial_matches[0][1]["codex_credentials"].get("id_token") or "").strip()

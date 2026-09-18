@@ -356,6 +356,22 @@ class CodexLoginFlowTests(unittest.TestCase):
         self.assertEqual(self.accounts.storage.load_accounts()[0], saved)
         self.assertNotEqual(self.accounts.storage.file_path.read_bytes(), before)
 
+    def test_chat_primary_refresh_cannot_be_imported_as_separate_codex_refresh(self):
+        primary = credentials("chat-primary")
+        attached = credentials("separate-codex")
+        self.accounts.add_account_items([{
+            **primary, "source_type": "web", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row", "codex_credentials": attached,
+        }])
+        before = self.accounts.storage.file_path.read_bytes()
+        incoming = {**credentials("new-codex"), "refresh_token": primary["refresh_token"]}
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("must not consume Chat refresh")), \
+                patch("services.codex_service.codex_service.observe_import_authorization", side_effect=AssertionError("must reject before Codex probe")):
+            with self.assertRaisesRegex(CodexAuthorizationAttachError, "account_conflict"):
+                self.accounts.import_owned_codex_authorization("workbench:org:two", incoming)
+        self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
+        self.assertEqual(self.accounts.storage.load_accounts()[0]["codex_credentials"], attached)
+
     def test_same_codex_refresh_stale_and_save_failure_do_not_consume_it(self):
         old = credentials("stored")
         self.accounts.add_account_items([{
@@ -1015,6 +1031,37 @@ class CodexLoginFlowTests(unittest.TestCase):
         self.assertEqual(recovered["state"], "succeeded")
         self.assertEqual(recovered["import_status"], "updated")
         self.assertEqual(recovered["codex"]["state"], "observed")
+        self.assertEqual(len(http.calls), 3)
+        self.assertEqual(restarted_accounts.list_accounts()[0]["managed_owner"], "workbench:org:one")
+
+    def test_device_exchange_same_refresh_keeps_new_id_and_recovers_original_digest(self):
+        primary = credentials("chat-primary")
+        attached = credentials("old-codex")
+        self.accounts.add_account_items([{
+            **primary, "source_type": "web", "managed_owner": "workbench:org:one",
+            "managed_account_id": "original-row", "codex_credentials": attached,
+        }])
+        incoming = {**credentials("device-new"), "refresh_token": attached["refresh_token"]}
+        self.assertNotEqual(incoming["id_token"], attached["id_token"])
+        http = FakeHttp([device_start(), device_complete(), token_exchange(incoming)])
+        service = self.service(http)
+        pending = service.start("workbench:org:two", "owned", "import", str(uuid.uuid4()))
+        with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("device exchange is proof")), \
+                patch.object(JSONStorageBackend, "_sync_directory", side_effect=OSError("durability pending")):
+            service._run(pending["id"])
+            uncertain = service.get("workbench:org:two", "owned", pending["id"])
+            self.assertEqual(uncertain["state"], "interrupted")
+            self.assertEqual(uncertain["error_code"], "codex_login_save_failed")
+        saved = self.accounts.storage.load_accounts()[0]
+        self.assertEqual(saved["codex_credentials"], incoming)
+        restarted_accounts = AccountService(JSONStorageBackend(self.accounts.storage.file_path))
+        restarted = CodexLoginService(
+            self.sessions_path, restarted_accounts, FakeHttp([]).factory,
+            auto_start_workers=False,
+        )
+        recovered = restarted.get("workbench:org:two", "owned", pending["id"])
+        self.assertEqual(recovered["state"], "succeeded")
+        self.assertEqual(recovered["import_status"], "updated")
         self.assertEqual(len(http.calls), 3)
         self.assertEqual(restarted_accounts.list_accounts()[0]["managed_owner"], "workbench:org:one")
 
