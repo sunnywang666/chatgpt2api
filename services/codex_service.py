@@ -456,6 +456,8 @@ class CodexService:
         account = {"codex_credentials": credentials, "source_type": "codex"}
         observed_at = _utc_now()
         session = None
+        usage_status = None
+        models_status = None
         try:
             session = self._session(account)
             response = session.get(
@@ -464,6 +466,7 @@ class CodexService:
                 timeout=(5, 20),
                 allow_redirects=False,
             )
+            usage_status = response.status_code
             if response.status_code != 200 or len(response.content) > 4 * 1024 * 1024:
                 raise ValueError("upstream usage read did not verify authorization")
             limits, limited = _project_limits(response.json())
@@ -488,6 +491,7 @@ class CodexService:
                     timeout=(5, 20),
                     allow_redirects=False,
                 )
+                models_status = response.status_code
                 if response.status_code != 200 or len(response.content) > 4 * 1024 * 1024:
                     raise ValueError("upstream catalog did not verify authorization")
                 models = _project_models(response.json())
@@ -495,14 +499,15 @@ class CodexService:
             except Exception:
                 models = []
                 verified = False
+            auth_required = usage_status == 401 and models_status == 401
             return {
-                "state": "read_failed",
+                "state": "auth_required" if auth_required else "read_failed",
                 "verified": verified,
                 "observed_at": None,
                 "failed_at": observed_at,
                 "models": models,
                 "limits": [],
-                "error_code": "usage_unverified",
+                "error_code": "codex_http_401" if auth_required else "usage_unverified",
             }
         finally:
             try:

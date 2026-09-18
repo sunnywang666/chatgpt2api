@@ -363,6 +363,26 @@ class AccountService:
             return None
         return subject, account_id
 
+    @classmethod
+    def _verified_chat_info(cls, access_token: str) -> tuple[tuple[str, str], dict]:
+        """Read the real Chat principal without trusting submitted JWT claims."""
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        backend = None
+        try:
+            backend = OpenAIBackendAPI(access_token)
+            info = backend.get_user_info()
+        except Exception:
+            raise CodexAuthorizationAttachError("chat_authorization_upstream_unverified") from None
+        finally:
+            if backend is not None:
+                backend.close()
+        subject = str(info.get("user_id") or "").strip() if isinstance(info, dict) else ""
+        workspace = cls._validated_workspace_id(info.get("account_id")) if isinstance(info, dict) else None
+        if not subject or workspace is None:
+            raise CodexAuthorizationAttachError("chat_authorization_upstream_unverified")
+        return (subject, workspace), info
+
     @staticmethod
     def _authorization_ref(subject: str, account_id: str) -> str:
         material = f"codex-authorization:v1\0{subject}\0{account_id}".encode("utf-8")
@@ -522,7 +542,9 @@ class AccountService:
         due_at = anchor + timedelta(seconds=self._REFRESH_TOKEN_KEEPALIVE_SECONDS)
         return due_at if due_at <= now else None
 
-    def _request_access_token_refresh(self, refresh_token: str, account: dict | None = None) -> dict[str, str]:
+    def _request_access_token_refresh(
+        self, refresh_token: str, account: dict | None = None, *, timeout: int = 60,
+    ) -> dict[str, str]:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
@@ -540,7 +562,7 @@ class AccountService:
                     "refresh_token": refresh_token,
                     "client_id": (self._CODEX_OAUTH_CLIENT_ID if (account or {}).get("source_type") == "codex" else self._OAUTH_CLIENT_ID),
                 },
-                timeout=60,
+                timeout=timeout,
                 allow_redirects=False,
             )
             data = response.json() if response.text else {}
@@ -560,16 +582,25 @@ class AccountService:
         finally:
             session.close()
 
-    def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
+    def _apply_refreshed_tokens(
+        self, old_access_token: str, token_data: dict, event: str, *,
+        expected_revision: str | None = None, chat_info: dict | None = None,
+    ) -> str:
         now = datetime.now(timezone.utc).isoformat()
         with self._image_slot_condition:
             old_token = self._resolve_access_token_locked(old_access_token)
             current = self._accounts.get(old_token)
             if current is None:
                 return old_token
+            if expected_revision is not None and (
+                old_token != old_access_token or self._authorization_revision(current) != expected_revision
+            ):
+                raise CodexAuthorizationAttachError("chat_authorization_stale_target")
             new_token = str(token_data.get("access_token") or old_token).strip()
             if not new_token:
                 return old_token
+            if new_token != old_token and new_token in self._accounts:
+                raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
 
             next_item = dict(current)
             next_item["access_token"] = new_token
@@ -584,12 +615,23 @@ class AccountService:
             next_item["last_invalid_at"] = None
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
+            if chat_info is not None:
+                limits = chat_info.get("limits_progress")
+                quota = chat_info.get("quota")
+                next_item["limits_progress"] = limits if isinstance(limits, list) else []
+                next_item["quota"] = quota if type(quota) is int and quota >= 0 else None
+                next_item["capacity_observed_at"] = now
+                next_item["capacity_used_since_observation"] = False
+                next_item["capacity_read_failed_at"] = None
 
             account = self._normalize_account(next_item)
             if account is None:
                 return old_token
 
             rotated = new_token != old_token
+            before_accounts = dict(self._accounts)
+            before_aliases = dict(self._token_aliases)
+            before_inflight = dict(self._image_inflight)
             if rotated:
                 self._accounts.pop(old_token, None)
                 self._token_aliases[old_token] = new_token
@@ -597,7 +639,13 @@ class AccountService:
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
             self._accounts[new_token] = account
-            self._save_accounts()
+            try:
+                self._save_accounts()
+            except Exception:
+                self._accounts = before_accounts
+                self._token_aliases = before_aliases
+                self._image_inflight = before_inflight
+                raise
             self._image_slot_condition.notify_all()
 
         log_service.add(
@@ -1946,11 +1994,39 @@ class AccountService:
                 (initial_matches[0][0], self._authorization_revision(initial_matches[0][1]))
                 if initial_matches else None
             )
+            foreign_replacement = bool(
+                initial_matches
+                and initial_matches[0][1].get("managed_owner") != owner
+                and self._codex_credential_fields(initial_matches[0][1]) != tuple(
+                    credentials[key] for key in ("access_token", "refresh_token", "id_token", "account_id")
+                )
+            )
         # A decoded JWT is forgeable. The official device exchange already
-        # proves issuance; manually supplied material must pass a protected
-        # upstream read before it can replace anyone's stored authorization.
+        # proves issuance. For manual foreign replacement, refreshing the
+        # submitted credential proves both its bearer and refresh token in
+        # one official OAuth exchange before any stored credential changes.
+        if foreign_replacement and not verified_exchange:
+            try:
+                refreshed = self._request_access_token_refresh(
+                    credentials["refresh_token"], {"source_type": "codex"}, timeout=20,
+                )
+            except Exception:
+                raise CodexAuthorizationAttachError("codex_authorization_refresh_unverified") from None
+            credentials = self._validated_codex_credentials({
+                **credentials,
+                "access_token": refreshed.get("access_token") or "",
+                "refresh_token": refreshed.get("refresh_token") or credentials["refresh_token"],
+                "id_token": refreshed.get("id_token") or credentials["id_token"],
+            })
+            if self._codex_identity(credentials) != identity:
+                raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
         observation = codex_service.observe_import_authorization(credentials)
-        if not verified_exchange and observation["state"] not in {"observed", "limited"} and not observation.get("verified"):
+        if (verified_exchange or foreign_replacement) and observation["state"] == "auth_required":
+            # OAuth just issued this bearer. Two immediate 401 reads may be
+            # propagation lag; only a later persisted read can classify it
+            # as a credential that actually needs reauthorization.
+            observation = {**observation, "state": "read_failed", "error_code": "usage_unverified"}
+        if not verified_exchange and not foreign_replacement and observation["state"] not in {"observed", "limited"} and not observation.get("verified"):
             raise CodexAuthorizationAttachError("codex_authorization_upstream_unverified")
         with self._lock:
             matches = self._identity_matches_locked(identity)
@@ -2020,19 +2096,100 @@ class AccountService:
         token = str(payload.get("access_token") or "").strip()
         if not token:
             raise ValueError("access_token is required")
-        if all(
+        with self._lock:
+            if getattr(self, "_account_commit_uncertain", False):
+                persisted = self.storage.confirm_accounts_commit()
+                restored = {}
+                for item in persisted:
+                    account = self._normalize_account(item)
+                    if account is None:
+                        raise RuntimeError("account storage has invalid account")
+                    restored[account["access_token"]] = account
+                self._accounts = restored
+                self._account_commit_uncertain = False
+        source_type = self._normalize_source_type(payload.get("source_type"))
+        if source_type == "codex" and all(
             str(payload.get(key) or "").strip()
             for key in ("access_token", "refresh_token", "id_token", "account_id")
         ):
-            if self._normalize_source_type(payload.get("source_type")) == "codex":
-                return self.import_owned_codex_authorization(owner, payload)
-            try:
-                return self.import_owned_codex_authorization(owner, payload)
-            except CodexAuthorizationAttachError as exc:
-                if exc.code != "codex_authorization_upstream_unverified":
-                    raise
-                # A complete legacy Chat export may have no Codex entitlement.
-                # Preserve its original token path after a failed Codex read.
+            return self.import_owned_codex_authorization(owner, payload)
+
+        # JWT claims only locate a possible old Chat record. Both submitted
+        # and stored principals must have trusted upstream identity evidence
+        # before a changed bearer token can rekey that record.
+        subject = self._jwt_subject(token) or self._jwt_subject(payload.get("id_token"))
+        workspace_ids = self._jwt_workspace_ids(token, payload.get("id_token"))
+        payload_workspace = self._validated_workspace_id(payload.get("account_id"))
+        if payload_workspace:
+            workspace_ids.add(payload_workspace)
+        if subject and len(workspace_ids) > 1:
+            raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+        identity = (subject, next(iter(workspace_ids))) if subject and len(workspace_ids) == 1 else None
+        related = None
+        with self._lock:
+            if token not in self._accounts and identity is not None:
+                matches = self._identity_matches_locked(identity)
+                if len(matches) > 1:
+                    raise CodexAuthorizationAttachError("chat_authorization_account_ambiguous")
+                if self._has_invalid_exact_identity_locked(identity):
+                    raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+                if matches:
+                    old_token, old_account = matches[0]
+                    if old_account.get("source_type") not in {"web", "oauth_login", "password"}:
+                        raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+                    related = (old_token, self._authorization_revision(old_account), dict(old_account))
+        if related is not None:
+            if source_type == "codex":
+                raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
+            old_token, revision, previous = related
+            incoming_id_subject = self._jwt_subject(payload.get("id_token"))
+            if incoming_id_subject and incoming_id_subject != identity[0]:
+                raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+            replacement = {"access_token": token}
+            for key in ("refresh_token", "id_token"):
+                if payload.get(key):
+                    replacement[key] = str(payload[key]).strip()
+            if replacement.get("refresh_token"):
+                try:
+                    refreshed = self._request_access_token_refresh(
+                        replacement["refresh_token"], {"source_type": source_type or "web"}, timeout=20,
+                    )
+                except Exception:
+                    raise CodexAuthorizationAttachError("chat_authorization_refresh_unverified") from None
+                replacement["access_token"] = str(refreshed.get("access_token") or "").strip()
+                replacement["refresh_token"] = str(refreshed.get("refresh_token") or "").strip()
+                if refreshed.get("id_token"):
+                    replacement["id_token"] = str(refreshed["id_token"]).strip()
+                if self._jwt_subject(replacement["access_token"]) != identity[0]:
+                    raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+                refreshed_id_subject = self._jwt_subject(replacement.get("id_token"))
+                if refreshed_id_subject and refreshed_id_subject != identity[0]:
+                    raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+                refreshed_workspaces = self._jwt_workspace_ids(replacement["access_token"], replacement.get("id_token"))
+                if refreshed_workspaces and refreshed_workspaces != {identity[1]}:
+                    raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+            verified_identity, info = self._verified_chat_info(replacement["access_token"])
+            if verified_identity != identity:
+                raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+            previously_observed = bool(previous.get("capacity_observed_at"))
+            stored_identity = (
+                str(previous.get("user_id") or "").strip(),
+                self._validated_workspace_id(previous.get("account_id")),
+            )
+            if not previously_observed or stored_identity != identity:
+                old_identity, _old_info = self._verified_chat_info(old_token)
+                if old_identity != identity:
+                    raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+            self._apply_refreshed_tokens(
+                old_token, replacement, "workbench_chat_authorization_import",
+                expected_revision=revision, chat_info=info,
+            )
+            with self._lock:
+                account = self._accounts.get(replacement["access_token"])
+                if account is None:
+                    raise CodexAuthorizationAttachError("chat_authorization_stale_target")
+                from services.owned_accounts import observed_capacity
+                return {"import_status": "updated", "route": "chat", "capacity": observed_capacity(account)}
         with self._lock:
             submitted_token = token
             token = self._resolve_access_token_locked(token)
@@ -2059,7 +2216,7 @@ class AccountService:
                         managed_account_id=item.get("managed_account_id") or uuid.uuid4().hex,
                         managed_updated_at=utc_now())
             if not current:
-                item["source_type"] = "codex" if payload.get("source_type") == "codex" else "web"
+                item["source_type"] = source_type if source_type in {"web", "oauth_login", "password", "codex"} else "web"
             account = self._normalize_account(item)
             self._accounts[token] = account
             self._save_accounts()
