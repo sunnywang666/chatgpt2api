@@ -190,14 +190,14 @@ class CodexLoginFlowTests(unittest.TestCase):
         self.assertEqual(stored["access_token"], first["access_token"])
         self.assertEqual(stored["codex_credentials"], rotated)
 
-        with self.assertRaisesRegex(CodexAuthorizationAttachError, "account_conflict"):
+        with self.assertRaisesRegex(CodexAuthorizationAttachError, "owned_elsewhere"):
             self.accounts.import_owned_account(
                 "workbench:org:two", {**credentials("other-owner"), "source_type": "codex"}
             )
 
         shared_accounts = AccountService(JSONStorageBackend(Path(self.tmp.name) / "shared.json"))
         shared_accounts.add_account_items([{**credentials("shared"), "source_type": "codex"}])
-        with self.assertRaisesRegex(CodexAuthorizationAttachError, "account_conflict"):
+        with self.assertRaisesRegex(CodexAuthorizationAttachError, "owned_elsewhere"):
             shared_accounts.import_owned_account(
                 "workbench:org:one", {**credentials("claim-shared"), "source_type": "codex"}
             )

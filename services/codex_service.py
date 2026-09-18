@@ -361,7 +361,16 @@ class CodexService:
                 "label": str(item.get("label") or item.get("id") or "")[:160],
                 "windows": windows,
             })
+        # Credential presence is independent of quota observations and execution
+        # success. A Chat-only primary token is not a saved Codex authorization.
+        credentials = account.get("codex_credentials")
+        explicit = credentials if isinstance(credentials, dict) else account if account.get("source_type") == "codex" else {}
+        authorization_status = "saved" if (
+            isinstance(explicit.get("access_token"), str) and explicit["access_token"].strip()
+            and isinstance(explicit.get("account_id"), str) and explicit["account_id"].strip()
+        ) else "missing"
         return {
+            "authorization_status": authorization_status,
             "state": state,
             "observed_at": raw.get("observed_at") if isinstance(raw.get("observed_at"), str) else None,
             "failed_at": raw.get("failed_at") if isinstance(raw.get("failed_at"), str) else None,

@@ -1687,6 +1687,29 @@ class AccountService:
                 "revision": self._authorization_revision(account),
             }
 
+    def refresh_codex_observation(self, owner: str, account_ref: str, pool: bool = False) -> dict:
+        # Resolve only the already selected record. This never imports an account
+        # or calls the image/Chat metadata path.
+        with self._lock:
+            matches = self._account_ref_matches_locked(account_ref)
+            if len(matches) > 1:
+                raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
+            if not matches or (not pool and matches[0][1].get("managed_owner") != owner):
+                raise CodexAuthorizationAttachError("codex_authorization_account_not_found")
+            token, account = matches[0]
+            # This new management action is exclusively for explicit Codex
+            # authorization. Do not enter legacy Chat-token fallback/refresh.
+            material = account.get("codex_credentials")
+            if not isinstance(material, dict) and account.get("source_type") == "codex":
+                material = account
+            credentials = self._validated_codex_credentials(material)
+            if self._account_identity(account) != self._codex_identity(credentials):
+                raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
+        from services.codex_service import codex_service
+        result = codex_service.refresh_account(token)
+        self.codex_login_target(owner, account_ref, pool=pool)
+        return result
+
     @staticmethod
     def codex_credential_digest(credentials: dict) -> str:
         # Internal crash-recovery comparison only, never returned to clients.
@@ -1846,7 +1869,7 @@ class AccountService:
             if matches:
                 token, current = matches[0]
                 if current.get("managed_owner") != owner:
-                    raise CodexAuthorizationAttachError("codex_authorization_account_conflict")
+                    raise CodexAuthorizationAttachError("codex_authorization_owned_elsewhere")
                 self._attach_codex_locked(token, current, credentials)
                 return public_owned_account(self._accounts[token])
 

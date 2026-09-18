@@ -33,6 +33,11 @@ class CodexAuthorization(BaseModel):
     account_ref: str | None = Field(default=None, pattern=r"^car_[A-Za-z0-9_-]{43}$")
 
 
+class CodexObservationTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    account_ref: str = Field(pattern=r"^car_[A-Za-z0-9_-]{43}$")
+
+
 class CodexLoginStart(BaseModel):
     model_config = ConfigDict(extra="forbid")
     client_request_id: str = Field(min_length=36, max_length=36)
@@ -116,6 +121,16 @@ def create_router() -> APIRouter:
         account_ref = payload.pop("account_ref", None)
         await account_operation(account_service.attach_codex_authorization, payload, account_ref)
         return {"attached": True}
+
+    @router.post("/codex-observation")
+    async def refresh_owned_codex_observation(body: CodexObservationTarget, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await account_operation(account_service.refresh_codex_observation, owner, body.account_ref, False)
+
+    @router.post("/pool/codex-observation")
+    async def refresh_pool_codex_observation(body: CodexObservationTarget, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await account_operation(account_service.refresh_codex_observation, owner, body.account_ref, True)
 
     @router.post("/codex-login")
     async def start_codex_login(body: CodexLoginStart, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
