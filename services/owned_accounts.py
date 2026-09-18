@@ -9,7 +9,10 @@ def observed_capacity(account: dict) -> dict:
     limits = account.get("limits_progress")
     image_limit = next((value for value in limits if isinstance(value, dict) and value.get("feature_name") == "image_gen"), None) if isinstance(limits, list) else None
     remaining = image_limit.get("remaining") if image_limit else None
-    valid = isinstance(remaining, (int, float)) and not isinstance(remaining, bool) and math.isfinite(remaining) and remaining >= 0 and remaining == int(remaining)
+    valid = (type(remaining) is int and remaining >= 0) or (
+        isinstance(remaining, float) and math.isfinite(remaining)
+        and remaining >= 0 and remaining.is_integer()
+    )
     return {
         "route": "chatgpt_image_gen",
         "source": "limits_progress.image_gen.remaining",

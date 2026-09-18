@@ -59,6 +59,13 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(service._normalize_account({"access_token": "zero", "quota": 0})["quota"], 0)
             self.assertEqual(service._normalize_account({"access_token": "positive", "quota": 2})["quota"], 2)
 
+    def test_large_integer_quota_does_not_convert_through_float(self) -> None:
+        from services.owned_accounts import observed_capacity
+        remaining = 10 ** 400
+        limits = [{"feature_name": "image_gen", "remaining": remaining}]
+        self.assertEqual(OpenAIBackendAPI._extract_quota_and_restore_at(limits)[0], remaining)
+        self.assertEqual(observed_capacity({"limits_progress": limits})["remaining"], remaining)
+
     def test_user_info_marks_only_observed_zero_as_limited(self) -> None:
         backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
         backend.access_token = "fixture-token"

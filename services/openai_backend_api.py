@@ -322,12 +322,9 @@ class OpenAIBackendAPI:
             if isinstance(item, dict) and item.get("feature_name") == "image_gen":
                 restore_at = str(item.get("reset_after") or "") or None
                 remaining = item.get("remaining")
-                valid = (
-                    isinstance(remaining, (int, float))
-                    and not isinstance(remaining, bool)
-                    and math.isfinite(remaining)
-                    and remaining >= 0
-                    and remaining == int(remaining)
+                valid = (type(remaining) is int and remaining >= 0) or (
+                    isinstance(remaining, float) and math.isfinite(remaining)
+                    and remaining >= 0 and remaining.is_integer()
                 )
                 if not valid:
                     return None, restore_at
