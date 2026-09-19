@@ -300,6 +300,7 @@ class CodexService:
         *,
         max_concurrency: int = 4,
         clock: Callable[[], float] = time.monotonic,
+        chat_catalog: object | None = None,
     ) -> None:
         self.accounts = accounts
         self.session_factory = session_factory
@@ -309,6 +310,7 @@ class CodexService:
         self._affinity_locks = tuple(threading.Lock() for _ in range(64))
         self._probe_index = 0
         self._clock = clock
+        self._chat_catalog = chat_catalog
 
     @classmethod
     def account_projection(cls, account: dict) -> dict:
@@ -386,21 +388,56 @@ class CodexService:
             projection = self.account_projection(account)
             active = not account.get("managed_disabled") and account.get("status") not in {"禁用", "异常"}
             fresh = self._observation_fresh(projection)
+            exhausted_model_limits = {
+                limit["id"]
+                for limit in projection["limits"]
+                if any(window["used_percent"] >= 100 for window in limit["windows"])
+            }
             for model in projection["models"]:
                 current = by_id.setdefault(model["id"], {
                     "id": model["id"],
                     "label": model["label"],
                     "route": "codex",
+                    "capabilities": ["responses"],
                     "state": "unknown",
                     "available_accounts": None,
+                    "supported_accounts": 0,
+                    "pending_accounts": 0,
+                    "unavailable_accounts": 0,
+                    "accounts": [],
                     "reasoning_efforts": [],
-                    "_known_unavailable": False,
                 })
-                if active and fresh and projection["state"] == "observed":
+                from services.owned_accounts import public_pool_account
+                safe = public_pool_account(account)
+                current["supported_accounts"] += 1
+                if (active and fresh and projection["state"] == "observed"
+                        and model["id"] in exhausted_model_limits):
+                    current["unavailable_accounts"] += 1
+                    account_state, reason = "unavailable", "model_limited"
+                elif active and fresh and projection["state"] == "observed":
                     current["available_accounts"] = int(current["available_accounts"] or 0) + 1
                     current["state"] = "available"
-                elif active and fresh and projection["state"] in {"limited", "auth_required"}:
-                    current["_known_unavailable"] = True
+                    account_state, reason = "available", "observed"
+                elif not active:
+                    current["unavailable_accounts"] += 1
+                    account_state, reason = "unavailable", "disabled" if account.get("managed_disabled") or account.get("status") == "禁用" else "account_unavailable"
+                elif fresh and projection["state"] in {"limited", "auth_required"}:
+                    current["unavailable_accounts"] += 1
+                    account_state, reason = "unavailable", "limited" if projection["state"] == "limited" else "auth_required"
+                else:
+                    current["pending_accounts"] += 1
+                    account_state = "unknown"
+                    reason = (
+                        projection["state"]
+                        if projection["state"] in {"unknown", "read_failed"}
+                        else "stale"
+                    )
+                current["accounts"].append({
+                    "account_ref": safe["account_ref"],
+                    "label": safe["label"],
+                    "state": account_state,
+                    "reason": reason,
+                })
                 for effort in model["reasoning_efforts"]:
                     if effort not in current["reasoning_efforts"]:
                         current["reasoning_efforts"].append(effort)
@@ -408,12 +445,13 @@ class CodexService:
             if observed and (newest is None or observed > newest):
                 newest = observed
         for item in by_id.values():
-            if item["state"] != "available" and item.pop("_known_unavailable", False):
+            if item["state"] != "available" and item["pending_accounts"] == 0 and item["unavailable_accounts"]:
                 item["state"] = "unavailable"
                 item["available_accounts"] = 0
-            else:
-                item.pop("_known_unavailable", None)
-        return {"items": sorted(by_id.values(), key=lambda item: item["id"]), "observed_at": newest}
+        items = list(by_id.values())
+        if self._chat_catalog is not None:
+            items.extend(self._chat_catalog.management_models())
+        return {"items": sorted(items, key=lambda item: (item["route"], item["id"])), "observed_at": newest}
 
     def _session(self, account: dict):
         kwargs = proxy_settings.build_session_kwargs(account=account, upstream=True, impersonate="chrome", verify=True)
@@ -1187,4 +1225,6 @@ class CodexService:
             raise CodexServiceError(502, code, "The Codex request outcome is unknown" if attempted else "The Codex request could not be sent") from exc
 
 
-codex_service = CodexService()
+from services.model_service import model_catalog_service
+
+codex_service = CodexService(chat_catalog=model_catalog_service)

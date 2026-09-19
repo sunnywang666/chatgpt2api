@@ -18,10 +18,23 @@ class ImportAccount(BaseModel):
     id_token: SecretStr | None = None
     source_type: str = "web"
     account_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,200}$")
+    account_ref: str | None = Field(default=None, pattern=r"^car_[A-Za-z0-9_-]{43}$")
 
 
 class EnabledAccount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     enabled: bool
+
+
+class AccountLabel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: str = Field(max_length=80)
+
+
+class AccountRefresh(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    routes: list[Literal["chat", "codex"]] | None = Field(default=None, min_length=1, max_length=2)
+    stale_only: bool = False
 
 
 class CodexAuthorization(BaseModel):
@@ -122,6 +135,21 @@ def create_router() -> APIRouter:
         account_ref = payload.pop("account_ref", None)
         await account_operation(account_service.attach_codex_authorization, payload, account_ref)
         return {"attached": True}
+
+    @router.post("/pool/accounts/{account_ref}/enabled")
+    async def enable_pool_account(account_ref: str, body: EnabledAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        return {"item": await account_operation(account_service.set_pool_account_enabled, account_ref, body.enabled)}
+
+    @router.post("/pool/accounts/{account_ref}/label")
+    async def label_pool_account(account_ref: str, body: AccountLabel, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        return {"item": await account_operation(account_service.set_pool_account_label, account_ref, body.label)}
+
+    @router.post("/pool/accounts/{account_ref}/refresh")
+    async def refresh_pool_account(account_ref: str, body: AccountRefresh, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        return {"item": await account_operation(account_service.refresh_pool_account, account_ref, body.routes or ["chat", "codex"], body.stale_only)}
 
     @router.post("/codex-observation")
     async def refresh_owned_codex_observation(body: CodexObservationTarget, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):

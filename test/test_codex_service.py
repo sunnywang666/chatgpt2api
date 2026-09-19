@@ -293,10 +293,15 @@ class CodexObservationTests(unittest.TestCase):
             account("b", codex_observation=observation(state="limited")),
         ])
         result = CodexService(accounts, SessionFactory([])).management_models()
-        self.assertEqual(result["items"], [{
-            "id": "gpt-5.6-codex", "label": "GPT-5.6 Codex", "route": "codex",
-            "state": "available", "available_accounts": 1, "reasoning_efforts": ["medium"],
-        }])
+        item = result["items"][0]
+        self.assertEqual(item["id"], "gpt-5.6-codex")
+        self.assertEqual(item["route"], "codex")
+        self.assertEqual(item["state"], "available")
+        self.assertEqual(item["supported_accounts"], 2)
+        self.assertEqual(item["available_accounts"], 1)
+        self.assertEqual(item["unavailable_accounts"], 1)
+        self.assertEqual(item["pending_accounts"], 0)
+        self.assertEqual(item["reasoning_efforts"], ["medium"])
 
     def test_management_models_does_not_count_disabled_or_stale_accounts_as_available(self):
         accounts = FakeAccounts([
@@ -306,6 +311,29 @@ class CodexObservationTests(unittest.TestCase):
         result = CodexService(accounts, SessionFactory([])).management_models()
         self.assertEqual(result["items"][0]["state"], "unknown")
         self.assertIsNone(result["items"][0]["available_accounts"])
+
+    def test_management_models_scopes_exhausted_named_limit_to_matching_model(self):
+        models = [
+            {"id": "gpt-general", "label": "General", "reasoning_efforts": ["medium"]},
+            {"id": "gpt-reserve", "label": "Reserve", "reasoning_efforts": ["high"]},
+        ]
+        limits = [
+            {"id": "codex", "label": "Codex", "windows": [{"used_percent": 25, "window_seconds": 18000}]},
+            {"id": "gpt-reserve", "label": "Reserve", "windows": [{"used_percent": 100, "window_seconds": 18000}]},
+        ]
+        accounts = FakeAccounts([account(codex_observation=observation(models=models, limits=limits))])
+
+        items = {
+            item["id"]: item
+            for item in CodexService(accounts, SessionFactory([])).management_models()["items"]
+        }
+        self.assertEqual(items["gpt-general"]["state"], "available")
+        self.assertEqual(items["gpt-general"]["available_accounts"], 1)
+        self.assertEqual(items["gpt-general"]["accounts"][0]["reason"], "observed")
+        self.assertEqual(items["gpt-reserve"]["state"], "unavailable")
+        self.assertEqual(items["gpt-reserve"]["available_accounts"], 0)
+        self.assertEqual(items["gpt-reserve"]["unavailable_accounts"], 1)
+        self.assertEqual(items["gpt-reserve"]["accounts"][0]["reason"], "model_limited")
 
 
 class CodexRelayTests(unittest.TestCase):

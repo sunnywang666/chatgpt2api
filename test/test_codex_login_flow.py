@@ -601,6 +601,7 @@ class CodexLoginFlowTests(unittest.TestCase):
                 patch.object(JSONStorageBackend, "_sync_directory", side_effect=uncertain_twice):
             receipt = self.accounts.import_owned_account("workbench:org:two", {**incoming, "source_type": "web"})
         self.assertEqual(receipt["import_status"], "updated")
+        self.assertEqual(receipt["authorization_ref"], self.accounts.list_pool_accounts()[0]["account_ref"])
         self.assertEqual(receipt["capacity"]["remaining"], 7)
         self.assertEqual(self.accounts.resolve_access_token(old["access_token"]), incoming["access_token"])
         self.assertEqual(self.accounts.storage.load_accounts()[0]["managed_owner"], "workbench:org:one")
@@ -736,7 +737,7 @@ class CodexLoginFlowTests(unittest.TestCase):
         }])
         before = self.accounts.storage.file_path.read_bytes()
         receipt = self.accounts.import_owned_account("workbench:org:two", {"access_token": original["access_token"]})
-        self.assertEqual(set(receipt), {"import_status", "route", "capacity"})
+        self.assertEqual(set(receipt), {"authorization_ref", "import_status", "route", "capacity"})
         self.assertEqual(receipt["route"], "chat")
         self.assertEqual(receipt["capacity"]["remaining"], 4)
         self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
@@ -777,7 +778,7 @@ class CodexLoginFlowTests(unittest.TestCase):
         self.assertEqual(receipt["import_status"], "updated")
         self.assertEqual(receipt["route"], "chat")
         self.assertEqual(receipt["capacity"]["remaining"], 9)
-        self.assertEqual(set(receipt), {"import_status", "route", "capacity"})
+        self.assertEqual(set(receipt), {"authorization_ref", "import_status", "route", "capacity"})
         self.assertEqual(self.accounts.list_owned_accounts("workbench:org:two"), [])
         with self.assertRaises(KeyError):
             self.accounts.set_owned_account_enabled("workbench:org:two", "original-row", False)
@@ -872,6 +873,7 @@ class CodexLoginFlowTests(unittest.TestCase):
         # exact persisted pool and never repeats credential rotation.
         receipt = self.accounts.import_owned_account("workbench:org:two", {"access_token": incoming["access_token"]})
         self.assertEqual(receipt["import_status"], "unchanged")
+        self.assertEqual(receipt["authorization_ref"], self.accounts.list_pool_accounts()[0]["account_ref"])
         self.assertEqual(self.accounts.storage.load_accounts()[0]["managed_owner"], "workbench:org:one")
         self.assertEqual(len(self.accounts.storage.load_accounts()), 1)
 

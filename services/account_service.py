@@ -6,7 +6,7 @@ import json
 import secrets
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Condition, Lock, Thread
@@ -66,6 +66,8 @@ class AccountService:
         self._image_inflight: dict[str, int] = {}
         self._conversation_binding_locks: dict[str, Lock] = {}
         self._token_aliases: dict[str, str] = {}
+        self._pool_refresh_lock = Lock()
+        self._pool_refreshes: dict[str, tuple[tuple[tuple[str, ...], bool], Future]] = {}
         self._cumulative_total = self._load_cumulative_total()
 
     def conversation_binding_lock(self, binding_id: str, client_conversation_id: str = "") -> Lock:
@@ -288,6 +290,7 @@ class AccountService:
         normalized["last_codex_token_refresh_at"] = normalized.get("last_codex_token_refresh_at") or None
         normalized["last_codex_token_refresh_error"] = normalized.get("last_codex_token_refresh_error") or None
         normalized["last_codex_token_refresh_error_at"] = normalized.get("last_codex_token_refresh_error_at") or None
+        normalized["managed_pool_account_ref"] = self.pool_account_ref(normalized)
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
 
@@ -455,6 +458,24 @@ class AccountService:
     def codex_authorization_ref(cls, account: dict) -> str | None:
         identity = cls._account_identity(account)
         return cls._authorization_ref(*identity) if identity else None
+
+    @classmethod
+    def pool_account_ref(cls, account: dict) -> str:
+        persisted = str(account.get("managed_pool_account_ref") or "").strip()
+        if persisted.startswith("car_") and len(persisted) == 47:
+            return persisted
+        identity = cls._account_identity(account)
+        if identity is None:
+            subject = str(account.get("user_id") or "").strip()
+            workspace = cls._validated_workspace_id(account.get("account_id"))
+            identity = (subject, workspace) if subject and workspace else None
+        if identity is not None:
+            return cls._authorization_ref(*identity)
+        # Legacy rows can lack trustworthy identity material. Persist this
+        # opaque ref on their next ordinary save; token rotation copies it.
+        token = str(account.get("access_token") or "")
+        material = f"pool-account-ref:v1\0{token}".encode("utf-8")
+        return "car_" + base64.urlsafe_b64encode(hashlib.sha256(material).digest()).decode("ascii").rstrip("=")
 
     @classmethod
     def _authorization_revision(cls, account: dict) -> str:
@@ -686,6 +707,15 @@ class AccountService:
                 next_item["capacity_observed_at"] = now
                 next_item["capacity_used_since_observation"] = False
                 next_item["capacity_read_failed_at"] = None
+                verified_user = str(chat_info.get("user_id") or "").strip()
+                verified_workspace = self._validated_workspace_id(chat_info.get("account_id"))
+                if verified_user:
+                    next_item["user_id"] = verified_user
+                if verified_workspace:
+                    next_item["account_id"] = verified_workspace
+                source_type = self._normalize_source_type(token_data.get("source_type"))
+                if source_type in {"web", "oauth_login", "password"}:
+                    next_item["source_type"] = source_type
 
             account = self._normalize_account(next_item)
             if account is None:
@@ -1712,7 +1742,7 @@ class AccountService:
         """Read-only, secret-free snapshot. Does not adopt legacy accounts."""
         from services.owned_accounts import public_pool_account
         with self._lock:
-            return [public_pool_account(account, index) for index, account in enumerate(self._accounts.values(), 1)]
+            return [public_pool_account(account) for account in self._accounts.values()]
 
     def list_owned_accounts(self, owner: str) -> list[dict]:
         from services.owned_accounts import public_owned_account
@@ -1755,8 +1785,190 @@ class AccountService:
         return [
             (token, account)
             for token, account in self._accounts.items()
-            if self.codex_authorization_ref(account) == expected
+            if self.pool_account_ref(account) == expected or self.codex_authorization_ref(account) == expected
         ]
+
+    def _pool_account_locked(self, account_ref: str) -> tuple[str, dict]:
+        matches = self._account_ref_matches_locked(account_ref)
+        if len(matches) > 1:
+            raise CodexAuthorizationAttachError("codex_authorization_account_ambiguous")
+        if not matches:
+            raise KeyError("account not found")
+        return matches[0]
+
+    def set_pool_account_enabled(self, account_ref: str, enabled: bool) -> dict:
+        from services.owned_accounts import public_pool_account, utc_now
+        with self._image_slot_condition:
+            token, current = self._pool_account_locked(account_ref)
+            requested_disabled = not enabled
+            if bool(current.get("managed_disabled")) == requested_disabled:
+                return public_pool_account(current)
+            item = dict(current)
+            item["managed_disabled"] = requested_disabled
+            item["managed_updated_at"] = utc_now()
+            # Re-enabled rows require a successful route refresh before either
+            # execution selector can use them again. Preserve the last real
+            # quota observation; disabling is a selector state, not a quota
+            # observation.
+            item["status"] = "禁用"
+            account = self._normalize_account(item)
+            before = self._accounts[token]
+            self._accounts[token] = account
+            try:
+                self._save_accounts()
+            except Exception:
+                self._accounts[token] = before
+                raise
+            self._image_slot_condition.notify_all()
+            return public_pool_account(account)
+
+    def set_pool_account_label(self, account_ref: str, label: str) -> dict:
+        from services.owned_accounts import public_pool_account, utc_now
+        normalized_label = str(label or "").strip()
+        if len(normalized_label) > 80:
+            raise ValueError("label is too long")
+        with self._lock:
+            token, current = self._pool_account_locked(account_ref)
+            item = self._normalize_account({
+                **current,
+                "managed_label": normalized_label or None,
+                "managed_updated_at": utc_now(),
+            })
+            before = self._accounts[token]
+            self._accounts[token] = item
+            try:
+                self._save_accounts()
+            except Exception:
+                self._accounts[token] = before
+                raise
+            return public_pool_account(item)
+
+    @staticmethod
+    def _chat_authorization_saved(account: dict) -> bool:
+        return (
+            str(account.get("source_type") or "").strip().lower()
+            in {"web", "oauth_login", "password"}
+            and bool(str(account.get("access_token") or "").strip())
+        )
+
+    def _refresh_pool_chat(self, account_ref: str) -> None:
+        from services.owned_accounts import utc_now
+        with self._lock:
+            token, account = self._pool_account_locked(account_ref)
+            if not self._chat_authorization_saved(account):
+                return
+        token = self.refresh_access_token(token, event="workbench_pool_chat_refresh") or token
+        with self._lock:
+            token, account = self._pool_account_locked(account_ref)
+            if not self._chat_authorization_saved(account):
+                return
+            expected = (token, str(account.get("account_id") or ""))
+            expected_identity = self._account_identity(account)
+            if expected_identity is None:
+                subject = str(account.get("user_id") or "").strip()
+                workspace = self._validated_workspace_id(account.get("account_id"))
+                expected_identity = (subject, workspace) if subject and workspace else None
+        try:
+            observed_identity, info = self._verified_chat_info(token)
+            if expected_identity is not None and observed_identity != expected_identity:
+                raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+        except Exception:
+            self.update_account(
+                token,
+                {"capacity_read_failed_at": utc_now(), "managed_updated_at": utc_now()},
+                quiet=True,
+                expected_credentials=expected,
+            )
+            return
+        updates = {
+            "user_id": observed_identity[0],
+            "account_id": observed_identity[1],
+            "limits_progress": info.get("limits_progress") if isinstance(info.get("limits_progress"), list) else [],
+            "quota": info.get("quota") if type(info.get("quota")) is int and info["quota"] >= 0 else None,
+            "capacity_observed_at": utc_now(),
+            "capacity_used_since_observation": False,
+            "capacity_read_failed_at": None,
+            "managed_updated_at": utc_now(),
+        }
+        if isinstance(info.get("email"), str):
+            updates["email"] = info["email"]
+        self.update_account(token, updates, quiet=True, expected_credentials=expected)
+
+    def _refresh_pool_account_once(
+        self, account_ref: str, routes: tuple[str, ...], stale_only: bool,
+    ) -> dict:
+        from services.codex_service import codex_service
+        from services.owned_accounts import observation_is_fresh, public_pool_account, chat_projection
+
+        with self._lock:
+            token, account = self._pool_account_locked(account_ref)
+            snapshot = self._copy_account(account)
+        if "chat" in routes and self._chat_authorization_saved(snapshot):
+            chat = chat_projection(snapshot)
+            if not stale_only or not observation_is_fresh(chat.get("observed_at")):
+                self._refresh_pool_chat(account_ref)
+        with self._lock:
+            token, account = self._pool_account_locked(account_ref)
+            snapshot = self._copy_account(account)
+        if "codex" in routes and codex_service.account_projection(snapshot)["authorization_status"] == "saved":
+            projection = codex_service.account_projection(snapshot)
+            if not stale_only or not codex_service._observation_fresh(projection):
+                codex_service.refresh_account(token)
+        with self._lock:
+            token, account = self._pool_account_locked(account_ref)
+            chat = chat_projection(account)
+            codex = codex_service.account_projection(account)
+            route_observed = (
+                chat["state"] == "observed" and observation_is_fresh(chat.get("observed_at"))
+            ) or (
+                codex["state"] in {"observed", "limited"}
+                and codex_service._observation_fresh(codex)
+            )
+            if (not account.get("managed_disabled") and account.get("status") == "禁用"
+                    and route_observed):
+                updated = self._normalize_account({**account, "status": "正常"})
+                before = self._accounts[token]
+                self._accounts[token] = updated
+                try:
+                    self._save_accounts()
+                except Exception:
+                    self._accounts[token] = before
+                    raise
+                account = updated
+            return public_pool_account(account)
+
+    def refresh_pool_account(
+        self, account_ref: str, routes: list[str] | tuple[str, ...], stale_only: bool,
+    ) -> dict:
+        normalized_routes = tuple(dict.fromkeys(str(route) for route in routes))
+        signature = (normalized_routes, bool(stale_only))
+        while True:
+            with self._pool_refresh_lock:
+                existing = self._pool_refreshes.get(account_ref)
+                if existing is None:
+                    future: Future = Future()
+                    self._pool_refreshes[account_ref] = (signature, future)
+                    owner = True
+                else:
+                    existing_signature, future = existing
+                    owner = False
+            if owner:
+                break
+            result = future.result()
+            if existing_signature == signature:
+                return result
+        try:
+            result = self._refresh_pool_account_once(account_ref, normalized_routes, bool(stale_only))
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        else:
+            future.set_result(result)
+            return result
+        finally:
+            with self._pool_refresh_lock:
+                if self._pool_refreshes.get(account_ref) == (signature, future):
+                    self._pool_refreshes.pop(account_ref, None)
 
     def _attach_codex_locked(
         self,
@@ -2274,10 +2486,23 @@ class AccountService:
             raise CodexAuthorizationAttachError("chat_authorization_import_unknown") from None
         if not applied:
             raise CodexAuthorizationAttachError("chat_authorization_import_unknown")
-        return {"import_status": "updated", "route": "chat", "capacity": observed_capacity(account)}
+        return self._chat_import_receipt(account, "updated")
 
-    def _import_verified_chat_account(self, owner: str, payload: dict, source_type: str) -> dict:
-        from services.owned_accounts import observed_capacity, public_owned_account, utc_now
+    @classmethod
+    def _chat_import_receipt(cls, account: dict, import_status: str) -> dict:
+        from services.owned_accounts import observed_capacity
+
+        return {
+            "authorization_ref": cls.pool_account_ref(account),
+            "import_status": import_status,
+            "route": "chat",
+            "capacity": observed_capacity(account),
+        }
+
+    def _import_verified_chat_account(
+        self, owner: str, payload: dict, source_type: str, account_ref: str | None = None,
+    ) -> dict:
+        from services.owned_accounts import public_owned_account, utc_now
 
         token = str(payload.get("access_token") or "").strip()
         subject = self._jwt_subject(token) or self._jwt_subject(payload.get("id_token"))
@@ -2293,21 +2518,41 @@ class AccountService:
         identity = (subject, next(iter(workspace_ids))) if subject and len(workspace_ids) == 1 else None
         related = None
         with self._lock:
-            if self._resolve_access_token_locked(token) != token:
+            if account_ref:
+                target_token, target = self._pool_account_locked(account_ref)
+                target_identity = self._account_identity(target)
+                if target_identity is None:
+                    target_subject = str(target.get("user_id") or "").strip()
+                    target_workspace = self._validated_workspace_id(target.get("account_id"))
+                    target_identity = (
+                        (target_subject, target_workspace)
+                        if target_subject and target_workspace else None
+                    )
+                if target_identity is None:
+                    raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+                if identity is not None and identity != target_identity:
+                    raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+                identity = target_identity
+                related = (
+                    target_token,
+                    self._authorization_revision(target),
+                    dict(target),
+                )
+            elif self._resolve_access_token_locked(token) != token:
                 raise CodexAuthorizationAttachError("chat_authorization_stale_target")
-            current = self._accounts.get(token)
+            current = self._accounts.get(token) if not account_ref else None
             if current:
-                if current.get("source_type") not in {"web", "oauth_login", "password"}:
+                if current.get("source_type") not in {"web", "oauth_login", "password", "codex"}:
                     raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
                 changed_material = any(
                     str(payload.get(key) or "").strip()
                     and str(payload[key]).strip() != str(current.get(key) or "").strip()
                     for key in ("refresh_token", "id_token", "account_id")
                 )
-                if not changed_material:
+                if not changed_material and current.get("source_type") != "codex":
                     if current.get("managed_owner") == owner:
                         return public_owned_account(current)
-                    return {"import_status": "unchanged", "route": "chat", "capacity": observed_capacity(current)}
+                    return self._chat_import_receipt(current, "unchanged")
                 current_identity = self._account_identity(current)
                 if identity and current_identity and identity != current_identity:
                     raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
@@ -2321,7 +2566,7 @@ class AccountService:
                     raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
                 if matches:
                     old_token, old_account = matches[0]
-                    if old_account.get("source_type") not in {"web", "oauth_login", "password"}:
+                    if old_account.get("source_type") not in {"web", "oauth_login", "password", "codex"}:
                         raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
                     related = (old_token, self._authorization_revision(old_account), dict(old_account))
 
@@ -2337,7 +2582,7 @@ class AccountService:
                     raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
                 if matches:
                     old_token, old_account = matches[0]
-                    if old_account.get("source_type") not in {"web", "oauth_login", "password"}:
+                    if old_account.get("source_type") not in {"web", "oauth_login", "password", "codex"}:
                         raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
                     related = (old_token, self._authorization_revision(old_account), dict(old_account))
 
@@ -2348,12 +2593,14 @@ class AccountService:
             replacement, verified_identity, info = self._verified_chat_import_material(
                 payload, source_type, previous, identity,
             )
+            replacement["source_type"] = source_type
             stored_identity = (
                 str(previous.get("user_id") or "").strip(),
                 self._validated_workspace_id(previous.get("account_id")),
             )
-            if (not previous.get("capacity_observed_at") or stored_identity != verified_identity
-                    or self._account_identity(previous) is None):
+            if (self._chat_authorization_saved(previous)
+                    and (not previous.get("capacity_observed_at") or stored_identity != verified_identity
+                         or self._account_identity(previous) is None)):
                 old_identity, _old_info = self._verified_chat_info(old_token)
                 if old_identity != verified_identity:
                     raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
@@ -2368,11 +2615,12 @@ class AccountService:
                 account = self._accounts.get(replacement["access_token"])
                 if account is None:
                     raise CodexAuthorizationAttachError("chat_authorization_stale_target")
-                return {"import_status": "updated", "route": "chat", "capacity": observed_capacity(account)}
+                return self._chat_import_receipt(account, "updated")
 
         replacement, verified_identity, info = self._verified_chat_import_material(
             payload, source_type, None, identity,
         )
+        replacement["source_type"] = source_type
         new_token = replacement["access_token"]
         now = utc_now()
         account = self._normalize_account({
@@ -2446,6 +2694,7 @@ class AccountService:
                 self._accounts = restored
                 self._account_commit_uncertain = False
         source_type = self._normalize_source_type(payload.get("source_type"))
+        account_ref = str(payload.get("account_ref") or "").strip() or None
         if source_type == "codex" and all(
             str(payload.get(key) or "").strip()
             for key in ("access_token", "refresh_token", "id_token", "account_id")
@@ -2453,7 +2702,7 @@ class AccountService:
             return self.import_owned_codex_authorization(owner, payload)
 
         if source_type != "codex":
-            return self._import_verified_chat_account(owner, payload, source_type)
+            return self._import_verified_chat_account(owner, payload, source_type, account_ref)
         if any(str(payload.get(key) or "").strip() for key in ("refresh_token", "id_token", "account_id")):
             raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
         with self._lock:
@@ -2467,6 +2716,7 @@ class AccountService:
                     raise ValueError("account already exists outside your account scope")
                 from services.owned_accounts import observed_capacity
                 return {
+                    "authorization_ref": self.pool_account_ref(current),
                     "import_status": "unchanged",
                     "route": "chat",
                     "capacity": observed_capacity(current),
