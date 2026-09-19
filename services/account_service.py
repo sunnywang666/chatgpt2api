@@ -388,7 +388,7 @@ class AccountService:
 
     def _verified_chat_import_material(
         self, payload: dict, source_type: str, previous: dict | None,
-        identity_hint: tuple[str, str] | None,
+        identity_hint: tuple[str, str] | None, *, verified_oauth: bool = False,
     ) -> tuple[dict[str, str], tuple[str, str], dict]:
         """Authenticate new Chat material before it can create or rekey a row."""
         submitted_token = str(payload.get("access_token") or "").strip()
@@ -417,7 +417,9 @@ class AccountService:
         submitted_refresh = replacement.get("refresh_token", "")
         if submitted_refresh and attached_refresh == submitted_refresh and stored_refresh != submitted_refresh:
             raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
-        if submitted_refresh and stored_refresh != submitted_refresh:
+        if verified_oauth and submitted_id:
+            replacement["id_token"] = submitted_id
+        if submitted_refresh and stored_refresh != submitted_refresh and not verified_oauth:
             try:
                 refreshed = self._request_access_token_refresh(
                     submitted_refresh, {"source_type": source_type}, timeout=20,
@@ -2501,6 +2503,7 @@ class AccountService:
 
     def _import_verified_chat_account(
         self, owner: str, payload: dict, source_type: str, account_ref: str | None = None,
+        *, verified_oauth: bool = False,
     ) -> dict:
         from services.owned_accounts import public_owned_account, utc_now
 
@@ -2591,7 +2594,7 @@ class AccountService:
             if identity is None:
                 identity, _old_info = self._verified_chat_info(old_token)
             replacement, verified_identity, info = self._verified_chat_import_material(
-                payload, source_type, previous, identity,
+                payload, source_type, previous, identity, verified_oauth=verified_oauth,
             )
             replacement["source_type"] = source_type
             stored_identity = (
@@ -2618,7 +2621,7 @@ class AccountService:
                 return self._chat_import_receipt(account, "updated")
 
         replacement, verified_identity, info = self._verified_chat_import_material(
-            payload, source_type, None, identity,
+            payload, source_type, None, identity, verified_oauth=verified_oauth,
         )
         replacement["source_type"] = source_type
         new_token = replacement["access_token"]
@@ -2675,7 +2678,31 @@ class AccountService:
                 raise
             return public_owned_account(account)
 
-    def import_owned_account(self, owner: str, payload: dict) -> dict:
+    def chat_login_committed_receipt(self, credentials: dict, account_ref: str | None = None) -> dict | None:
+        # Read back only exact material already issued by the scoped OAuth
+        # exchange. Do not refresh it or change account ownership on recovery.
+        with self._lock:
+            if getattr(self, "_account_commit_uncertain", False):
+                persisted = self.storage.confirm_accounts_commit()
+                restored = {}
+                for item in persisted:
+                    normalized = self._normalize_account(item)
+                    if normalized is None or normalized["access_token"] in restored:
+                        raise RuntimeError("account storage has invalid account")
+                    restored[normalized["access_token"]] = normalized
+                self._accounts = restored
+                self._account_commit_uncertain = False
+            account = self._accounts.get(str(credentials.get("access_token") or ""))
+            if not account or not self._chat_authorization_saved(account):
+                return None
+            if any(str(account.get(key) or "") != str(credentials.get(key) or "")
+                   for key in ("refresh_token", "id_token") if credentials.get(key)):
+                return None
+            if account_ref and self.pool_account_ref(account) != account_ref:
+                raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+            return self._chat_import_receipt(account, "unchanged")
+
+    def import_owned_account(self, owner: str, payload: dict, *, verified_oauth: bool = False) -> dict:
         from services.owned_accounts import public_owned_account, utc_now
         # Only existing token-based import is offered. Imported metadata cannot
         # assign ownership, quotas, status, proxy settings or a session binding.
@@ -2702,7 +2729,7 @@ class AccountService:
             return self.import_owned_codex_authorization(owner, payload)
 
         if source_type != "codex":
-            return self._import_verified_chat_account(owner, payload, source_type, account_ref)
+            return self._import_verified_chat_account(owner, payload, source_type, account_ref, verified_oauth=verified_oauth)
         if any(str(payload.get(key) or "").strip() for key in ("refresh_token", "id_token", "account_id")):
             raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
         with self._lock:

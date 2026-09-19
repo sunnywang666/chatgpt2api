@@ -20,6 +20,7 @@ from typing import Callable, Iterable, Iterator, Mapping
 from curl_cffi import requests
 
 from services.account_service import account_service
+from services.config import config
 from services.proxy_service import proxy_settings
 
 
@@ -292,25 +293,80 @@ def _project_limits(payload: object) -> tuple[list[dict], bool]:
     return result, limited
 
 
+class _RuntimeCapacity:
+    """A live limit never cancels or reassigns already admitted requests."""
+    def __init__(self, limit):
+        self._limit = limit
+        self._active = 0
+        self._lock = threading.Lock()
+
+    def acquire(self, blocking=False):
+        if blocking:
+            raise ValueError("Codex admission is non-blocking")
+        with self._lock:
+            if self._active >= self._limit():
+                return False
+            self._active += 1
+            return True
+
+    def release(self):
+        with self._lock:
+            if self._active <= 0:
+                raise ValueError("capacity released without admission")
+            self._active -= 1
+
+    def snapshot(self):
+        with self._lock:
+            return {"limit": self._limit(), "active": self._active}
+
+
 class CodexService:
     def __init__(
         self,
         accounts=account_service,
         session_factory: Callable[..., object] = requests.Session,
         *,
-        max_concurrency: int = 4,
+        max_concurrency: int | None = None,
         clock: Callable[[], float] = time.monotonic,
         chat_catalog: object | None = None,
     ) -> None:
         self.accounts = accounts
         self.session_factory = session_factory
-        self._capacity = threading.BoundedSemaphore(max(1, max_concurrency))
+        self._capacity = _RuntimeCapacity(
+            (lambda: config.codex_max_concurrency) if max_concurrency is None
+            else (lambda: max(1, max_concurrency))
+        )
         self._lock = threading.RLock()
         self._inflight: set[str] = set()
         self._affinity_locks = tuple(threading.Lock() for _ in range(64))
         self._probe_index = 0
         self._clock = clock
         self._chat_catalog = chat_catalog
+
+    def resource_snapshot(self) -> dict:
+        # Never refresh credentials or probe the upstream merely for a dashboard.
+        rows = [item for item in self.accounts.list_accounts() if not item.get("managed_disabled")
+                and self.account_projection(item)["authorization_status"] == "saved"]
+        observed = 0
+        for item in rows:
+            projection = self.account_projection(item)
+            known_ids = {model["id"].strip().casefold() for model in projection["models"]}
+            exhausted = {limit["id"].strip().casefold() for limit in projection["limits"]
+                         if any(window["used_percent"] >= 100 for window in limit["windows"])}
+            if (self._observation_fresh(projection) and not exhausted - known_ids - {"codex"}
+                    and projection["state"] in {"observed", "limited", "auth_required"}):
+                observed += 1
+        complete = observed == len(rows)
+        eligible = [item for item in rows
+                    if self._eligible_account(item, allow_probe=False) is not None]
+        with self._lock:
+            available = sum(str(item.get("access_token") or "") not in self._inflight for item in eligible)
+            capacity = self._capacity.snapshot()
+        return {"state": "observed" if complete else "partial" if observed else "unknown",
+                "total_accounts": len(rows), "observed_accounts": observed,
+                "eligible_accounts": len(eligible), "inflight": capacity["active"],
+                "slots_total": min(capacity["limit"], len(eligible)) if complete else None,
+                "slots_free": min(max(0, capacity["limit"] - capacity["active"]), available) if complete else None}
 
     @classmethod
     def account_projection(cls, account: dict) -> dict:
@@ -764,6 +820,15 @@ class CodexService:
             account = self.accounts.get_account(token) or account
         model_ids = {item["id"] for item in projection["models"]}
         if projection["state"] != "observed" or (requested_model and requested_model not in model_ids):
+            return None
+        exhausted = {limit["id"].strip().casefold() for limit in projection["limits"]
+                     if any(window["used_percent"] >= 100 for window in limit["windows"])}
+        known_ids = {model.casefold() for model in model_ids}
+        if "codex" in exhausted or exhausted - known_ids - {"codex"}:
+            return None
+        if requested_model and requested_model.casefold() in exhausted:
+            return None
+        if not requested_model and not known_ids - exhausted:
             return None
         return account
 

@@ -7,6 +7,8 @@ import os
 import sys
 from pathlib import Path
 import time
+import threading
+import fcntl
 
 from services.storage.base import StorageBackend
 
@@ -350,6 +352,8 @@ def _load_settings() -> LoadedSettings:
 class ConfigStore:
     def __init__(self, path: Path):
         self.path = path
+        self._update_lock = threading.RLock()
+        self._resource_path = (DATA_DIR if path == CONFIG_FILE else path.parent) / "resource_settings.json"
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
         self._storage_backend: StorageBackend | None = None
@@ -435,9 +439,71 @@ class ConfigStore:
     @property
     def image_account_concurrency(self) -> int:
         try:
-            return max(1, int(self.data.get("image_account_concurrency", 3)))
+            return max(1, int(self._resource_data().get("image_account_concurrency", self.data.get("image_account_concurrency", 3))))
         except (TypeError, ValueError):
             return 3
+
+    @property
+    def codex_max_concurrency(self) -> int:
+        value = self._resource_data().get("codex_max_concurrency", self.data.get("codex_max_concurrency", 4))
+        return value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 32 else 4
+
+    def _resource_data(self) -> dict:
+        from services.storage.json_storage import JSONStorageBackend
+        values = JSONStorageBackend._load_json_list(self._resource_path)
+        if not values:
+            return {}
+        if (len(values) != 1 or set(values[0]) != {"revision", "image_account_concurrency", "codex_max_concurrency"}
+                or any(type(value) is not int for value in values[0].values())
+                or values[0]["revision"] < 1 or not 1 <= values[0]["image_account_concurrency"] <= 16
+                or not 1 <= values[0]["codex_max_concurrency"] <= 32):
+            raise RuntimeError("resource settings are invalid")
+        return values[0]
+
+    def resource_settings(self) -> dict:
+        with self._update_lock:
+            snapshot = self._resource_data()
+            try:
+                image_limit = max(1, int(snapshot.get("image_account_concurrency", self.data.get("image_account_concurrency", 3))))
+            except (TypeError, ValueError):
+                image_limit = 3
+            codex_limit = snapshot.get("codex_max_concurrency", self.data.get("codex_max_concurrency", 4))
+            if type(codex_limit) is not int or not 1 <= codex_limit <= 32:
+                codex_limit = 4
+            return {"revision": snapshot.get("revision", 0),
+                    "image_account_concurrency": image_limit,
+                    "codex_max_concurrency": codex_limit}
+
+    def update_resource_settings(self, expected_revision: int, image_account_concurrency: int, codex_max_concurrency: int) -> dict:
+        from services.storage.json_storage import JSONStorageBackend
+        from services.storage.base import AccountCommitUncertain
+        if (type(image_account_concurrency) is not int or not 1 <= image_account_concurrency <= 16
+                or type(codex_max_concurrency) is not int or not 1 <= codex_max_concurrency <= 32):
+            raise ValueError("resource_settings_invalid")
+        self._resource_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._update_lock, self._resource_path.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                current = self.resource_settings()
+                if current["revision"] != expected_revision:
+                    raise ValueError("resource_settings_conflict")
+                result = {"revision": expected_revision + 1,
+                          "image_account_concurrency": image_account_concurrency,
+                          "codex_max_concurrency": codex_max_concurrency}
+                if all(result[key] == current[key] for key in result if key != "revision"):
+                    return current
+                # Reuse the pool's atomic JSON persistence; only technical
+                # settings live here. The bind-mounted credential/config file
+                # is never rewritten by this operation.
+                storage = JSONStorageBackend(self._resource_path)
+                try:
+                    storage.save_accounts([result])
+                except AccountCommitUncertain:
+                    if storage.confirm_accounts_commit() != [result]:
+                        raise
+                return result
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     @property
     def image_parallel_generation(self) -> bool:
@@ -627,6 +693,10 @@ class ConfigStore:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
+        with self._update_lock:
+            return self._update_locked(data)
+
+    def _update_locked(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
         if "backup" in next_data:
@@ -650,8 +720,25 @@ class ConfigStore:
                     incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
             next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
         next_data.pop("backup_state", None)
+        resource_keys = {"image_account_concurrency", "codex_max_concurrency"}
+        if resource_keys.intersection(data):
+            current = self.resource_settings()
+            if any(data[key] != current[key] for key in resource_keys.intersection(data)):
+                raise ValueError("Use the account center resource-settings endpoint to change concurrency")
+            # Legacy full settings forms may echo unchanged resource fields.
+            # Never combine their credential/config save with another file commit.
+            for key in resource_keys:
+                if key in self.data:
+                    next_data[key] = self.data[key]
+                else:
+                    next_data.pop(key, None)
+        previous = self.data
         self.data = next_data
-        self._save()
+        try:
+            self._save()
+        except Exception:
+            self.data = previous
+            raise
         return self.get()
 
     def get_backup_settings(self) -> dict[str, object]:
