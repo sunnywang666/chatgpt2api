@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from api import accounts, ai, chat_requests, codex, external_images, image_tasks, owned_accounts, system
+from api import accounts, ai, chat_requests, codex, company_requests, external_images, image_tasks, owned_accounts, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
@@ -41,6 +41,7 @@ def create_app() -> FastAPI:
     # middleware from the reverse registration order, making CORS handle
     # browser preflights before the boundary evaluates the actual request.
     app.middleware("http")(external_images.external_image_boundary)
+    app.middleware("http")(company_requests.company_request_boundary)
 
     configured_origins = os.getenv("CHATGPT2API_CORS_ORIGINS")
     if configured_origins is None:

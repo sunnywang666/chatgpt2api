@@ -4,7 +4,7 @@ import hashlib
 import re
 from typing import Literal
 
-from fastapi import APIRouter, Header, HTTPException, Response
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -54,8 +54,8 @@ class OriginalRecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def _ordinary_identity(authorization: str | None) -> dict[str, object]:
-    identity = require_identity(authorization)
+def _ordinary_identity(authorization: str | None, request: Request) -> dict[str, object]:
+    identity = require_identity(authorization, request=request)
     if identity.get("role") != "user":
         raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
     return identity
@@ -116,9 +116,10 @@ def create_router() -> APIRouter:
     async def create_chat_request(
         body: PublicChatRequest,
         response: Response,
+        request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = _ordinary_identity(authorization)
+        identity = _ordinary_identity(authorization, request)
         owner = _owner(identity)
         messages = await run_in_threadpool(normalize_inline_chat_messages, body.messages)
         payload = _payload(owner, body, messages)
@@ -201,9 +202,10 @@ def create_router() -> APIRouter:
     async def read_chat_request(
         request_id: str,
         response: Response,
+        request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = _ordinary_identity(authorization)
+        identity = _ordinary_identity(authorization, request)
         request_id = _validated_request_id(request_id)
         receipt = await run_in_threadpool(text_task_service.read, _owner(identity), request_id)
         response.headers["Cache-Control"] = "private, no-store"
@@ -213,11 +215,12 @@ def create_router() -> APIRouter:
     async def recover_chat_request(
         request_id: str,
         response: Response,
+        request: Request,
         body: OriginalRecoveryRequest | None = None,
         authorization: str | None = Header(default=None),
     ):
         del body
-        identity = _ordinary_identity(authorization)
+        identity = _ordinary_identity(authorization, request)
         request_id = _validated_request_id(request_id)
         receipt = await run_in_threadpool(
             text_task_service.recover,

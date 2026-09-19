@@ -66,8 +66,13 @@ def create_router() -> APIRouter:
         ids: str = Query(default=""),
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
-        result = await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids))
+        identity = require_identity(authorization, request=request)
+        task_ids = _parse_task_ids(ids)
+        if getattr(request.state, "company_identity", None) and not task_ids:
+            raise HTTPException(400, detail={"code": "ORIGINAL_TASK_IDS_REQUIRED"})
+        result = await run_in_threadpool(image_task_service.list_tasks, identity, task_ids)
+        if getattr(request.state, "company_identity", None) and result.get("missing_ids"):
+            raise HTTPException(404, detail={"code": "IMAGE_TASK_NOT_FOUND"})
         return {**result, "items": [client_task(item, request) for item in result["items"]]}
 
     @router.post("/api/image-tasks/generations")
@@ -76,7 +81,7 @@ def create_router() -> APIRouter:
         request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = require_identity(authorization, request=request)
         validate_external_input(request, body.model_dump())
         require_image_policy(identity, body.model)
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/generations", body.model, "文生图任务", request_text=body.prompt), body.prompt)
@@ -108,7 +113,7 @@ def create_router() -> APIRouter:
         request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = require_identity(authorization, request=request)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         validate_external_input(request, payload)
         require_image_policy(identity, payload.get("model"))
@@ -152,7 +157,9 @@ def create_router() -> APIRouter:
         request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = require_identity(authorization, request=request)
+        if getattr(request.state, "company_identity", None) and body.allow_unrecoverable_retry:
+            raise HTTPException(400, detail={"code": "ORIGINAL_TASK_RECOVERY_ONLY"})
         try:
             result = await run_in_threadpool(
                 image_task_service.resume_poll,
@@ -164,6 +171,8 @@ def create_router() -> APIRouter:
             )
             return client_task(result, request)
         except ValueError as exc:
+            if getattr(request.state, "company_identity", None) and str(exc) == "task not found":
+                raise HTTPException(404, detail={"code": "IMAGE_TASK_NOT_FOUND"}) from None
             status = 409 if "different immutable request" in str(exc) else 400
             raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
 
@@ -174,7 +183,7 @@ def create_router() -> APIRouter:
         request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = require_identity(authorization, request=request)
         try:
             result = await run_in_threadpool(
                 image_task_service.adopt_latest_conversation_image,
@@ -193,8 +202,8 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
     @router.get("/api/image-tasks/{task_id}/images/{index}")
-    async def download_task_image(task_id: str, index: int, authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+    async def download_task_image(task_id: str, index: int, request: Request, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization, request=request)
         result = await run_in_threadpool(image_task_service.list_tasks, identity, [task_id])
         if not result["items"]:
             raise HTTPException(status_code=404, detail={"error": "image not found"})

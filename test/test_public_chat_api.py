@@ -405,7 +405,7 @@ def _asgi_request(path, *, authorization="Bearer valid", body=b"{}"):
 def test_public_chat_boundary_authenticates_before_consuming_body(monkeypatch):
     request, consumed = _asgi_request("/api/chat-requests", body=b"not-json")
 
-    def reject(_authorization):
+    def reject(_authorization, **_kwargs):
         raise HTTPException(401, detail={"code": "INVALID_API_KEY"})
 
     async def downstream(_request):
@@ -420,7 +420,7 @@ def test_public_chat_boundary_authenticates_before_consuming_body(monkeypatch):
 
 
 def test_public_chat_body_reader_capacity_is_nonblocking_and_released(monkeypatch):
-    monkeypatch.setattr(external_images, "require_identity", lambda _authorization: {"role": "user"})
+    monkeypatch.setattr(external_images, "require_identity", lambda _authorization, **_kwargs: {"role": "user"})
     with external_images._public_chat_body_reader_lock:
         external_images._public_chat_body_readers = (
             external_images.MAX_CONCURRENT_PUBLIC_CHAT_BODY_READERS
