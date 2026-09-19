@@ -274,7 +274,7 @@ class TextTaskTests(unittest.TestCase):
                 self.assertEqual(backend.session.get.call_count, 1)
                 self.assertEqual(backend.session.post.call_count, failed_at)
                 if stage == "conversation":
-                    self.assertEqual(backend.session.post.call_args.kwargs["json"]["thinking_effort"], "high")
+                    self.assertEqual(backend.session.post.call_args.kwargs["json"]["thinking_effort"], "extended")
 
                 restarted = TextTaskService(self.path, executor=self.queue,
                                             recovery_reader=lambda _receipt: {"status": "running"})
@@ -1638,6 +1638,69 @@ class TextTaskTests(unittest.TestCase):
         self.assertTrue(backend._conversation_payload(*args)["history_and_training_disabled"])
         backend.retain_bound_conversation = True
         self.assertFalse(backend._conversation_payload(*args)["history_and_training_disabled"])
+
+    def test_target_text_high_maps_only_at_conversation_transport_boundary(self):
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        backend = object.__new__(OpenAIBackendAPI)
+        messages = [{"role": "user", "content": "copy"}]
+        target = backend._conversation_payload(
+            messages, "gpt-5-6-thinking", "UTC", thinking_effort=" HIGH ",
+        )
+        self.assertEqual(target["thinking_effort"], "extended")
+        self.assertEqual(
+            backend._conversation_payload(
+                messages, "gpt-5-6-thinking-pro", "UTC", thinking_effort="high",
+            )["thinking_effort"],
+            "high",
+        )
+
+    def test_image_settings_keep_high_unchanged(self):
+        from services.config import config
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.image_upstream_model = "gpt-5-6-thinking"
+        with mock.patch.object(type(config), "default_thinking_effort", new_callable=mock.PropertyMock, return_value="high"):
+            self.assertEqual(backend._image_model_settings("gpt-image-2"), ("gpt-5-6-thinking", "high"))
+
+    def test_target_transport_mapping_preserves_durable_high_input_and_unknown_receipt(self):
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        body = {
+            **self.body,
+            "model": "gpt-5-6-thinking",
+            "thinking_effort": "high",
+        }
+        service = TextTaskService(
+            self.path,
+            executor=self.queue,
+            recovery_reader=lambda _receipt: {"status": "running"},
+        )
+        request_id, request_hash = service._submission_identity("owner", body)
+        payload = object.__new__(OpenAIBackendAPI)._conversation_payload(
+            body["messages"], body["model"], "UTC", thinking_effort=body["thinking_effort"],
+        )
+        self.assertEqual(payload["thinking_effort"], "extended")
+        self.assertEqual(body["thinking_effort"], "high")
+        self.assertEqual(service.submit("owner", body)["status"], "queued")
+        self.assertEqual(service._submission_identity("owner", body), (request_id, request_hash))
+        service._update(
+            "owner", request_id,
+            status="unknown",
+            error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="binding",
+            provider_account_identity="account",
+            conversation_id="conversation",
+        )
+        restarted = TextTaskService(
+            self.path,
+            executor=self.queue,
+            recovery_reader=lambda _receipt: {"status": "running"},
+        )
+        self.assertEqual(restarted.read("owner", request_id)["status"], "unknown")
+        self.assertEqual(restarted.submit("owner", body)["status"], "unknown")
+        self.assertEqual(len(self.queue.calls), 1, "an UNKNOWN receipt must not resubmit")
 
 
 if __name__ == "__main__":
