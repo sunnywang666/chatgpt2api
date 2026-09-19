@@ -389,10 +389,15 @@ class CodexService:
             active = not account.get("managed_disabled") and account.get("status") not in {"禁用", "异常"}
             fresh = self._observation_fresh(projection)
             exhausted_model_limits = {
-                limit["id"]
+                limit["id"].strip().casefold()
                 for limit in projection["limits"]
                 if any(window["used_percent"] >= 100 for window in limit["windows"])
             }
+            # WHAM can use a display-cased model ID as limit_name, which the
+            # usage projection preserves as its fallback ID. Only case/space
+            # normalization is justified; do not guess aliases from labels.
+            known_model_ids = {model["id"].strip().casefold() for model in projection["models"]}
+            unmapped_exhausted_limit = bool(exhausted_model_limits - known_model_ids - {"codex"})
             for model in projection["models"]:
                 current = by_id.setdefault(model["id"], {
                     "id": model["id"],
@@ -411,9 +416,14 @@ class CodexService:
                 safe = public_pool_account(account)
                 current["supported_accounts"] += 1
                 if (active and fresh and projection["state"] == "observed"
-                        and model["id"] in exhausted_model_limits):
+                        and model["id"].strip().casefold() in exhausted_model_limits):
                     current["unavailable_accounts"] += 1
                     account_state, reason = "unavailable", "model_limited"
+                elif active and fresh and projection["state"] == "observed" and unmapped_exhausted_limit:
+                    # An exhausted bucket of unproven scope cannot establish
+                    # that this model is either available or exhausted.
+                    current["pending_accounts"] += 1
+                    account_state, reason = "unknown", "unknown"
                 elif active and fresh and projection["state"] == "observed":
                     current["available_accounts"] = int(current["available_accounts"] or 0) + 1
                     current["state"] = "available"
