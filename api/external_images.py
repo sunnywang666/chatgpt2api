@@ -59,7 +59,7 @@ def _release_public_chat_body_reader() -> None:
 
 def _ordinary_chat_identity(request: Request):
     try:
-        identity = require_identity(request.headers.get("authorization"))
+        identity = require_identity(request.headers.get("authorization"), request=request)
         if identity.get("role") != "user":
             raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
         return identity, None
@@ -122,7 +122,7 @@ async def external_image_boundary(request: Request, call_next):
     if not allowed:
         return JSONResponse({"detail": {"error": "route not available on image service"}}, status_code=404)
     try:
-        identity = require_identity(request.headers.get("authorization"))
+        identity = require_identity(request.headers.get("authorization"), request=request)
         if identity.get("role") != "user":
             raise HTTPException(403, detail={"error": "use an ordinary service key"})
     except HTTPException as exc:

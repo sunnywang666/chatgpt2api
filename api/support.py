@@ -27,7 +27,13 @@ def _legacy_admin_identity(token: str) -> dict[str, object] | None:
     return None
 
 
-def require_identity(authorization: str | None) -> dict[str, object]:
+def require_identity(authorization: str | None, *, request: Request | None = None) -> dict[str, object]:
+    # Only the authenticated, allowlisted company ingress sets this state. It
+    # is never populated from public client headers or ordinary-key requests.
+    if request is not None:
+        company_identity = getattr(request.state, "company_identity", None)
+        if company_identity is not None:
+            return company_identity
     token = extract_bearer_token(authorization)
     try:
         identity = _legacy_admin_identity(token) or auth_service.authenticate(token)
