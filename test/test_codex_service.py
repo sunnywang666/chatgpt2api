@@ -335,6 +335,52 @@ class CodexObservationTests(unittest.TestCase):
         self.assertEqual(items["gpt-reserve"]["unavailable_accounts"], 1)
         self.assertEqual(items["gpt-reserve"]["accounts"][0]["reason"], "model_limited")
 
+    def test_management_models_maps_wham_limit_name_case_without_limiting_other_models(self):
+        accounts = FakeAccounts([account()])
+        session = FakeSession(gets=[
+            FakeResponse(payload={"models": [
+                {"slug": "gpt-5.6-sol"}, {"slug": "gpt-5.3-codex-spark"},
+            ]}),
+            FakeResponse(payload={
+                "rate_limit": {"allowed": True, "primary_window": {"used_percent": 15}},
+                "additional_rate_limits": [{
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "rate_limit": {"allowed": False, "primary_window": {"used_percent": 100}},
+                }],
+            }),
+        ])
+        service = CodexService(accounts, SessionFactory([session]))
+        self.assertEqual(service.refresh_account("token-a")["state"], "observed")
+
+        items = {item["id"]: item for item in service.management_models()["items"]}
+        self.assertEqual(items["gpt-5.6-sol"]["available_accounts"], 1)
+        self.assertEqual(items["gpt-5.3-codex-spark"]["state"], "unavailable")
+        self.assertEqual(items["gpt-5.3-codex-spark"]["available_accounts"], 0)
+        self.assertEqual(items["gpt-5.3-codex-spark"]["accounts"][0]["reason"], "model_limited")
+
+    def test_management_models_does_not_guess_scope_of_unmapped_wham_limit(self):
+        accounts = FakeAccounts([account()])
+        session = FakeSession(gets=[
+            FakeResponse(payload={"models": [
+                {"slug": "gpt-5.6-sol"}, {"slug": "gpt-5.3-codex-spark"},
+            ]}),
+            FakeResponse(payload={
+                "rate_limit": {"allowed": True, "primary_window": {"used_percent": 15}},
+                "additional_rate_limits": [{
+                    "limit_name": "Spark plan",
+                    "rate_limit": {"allowed": False, "primary_window": {"used_percent": 100}},
+                }],
+            }),
+        ])
+        service = CodexService(accounts, SessionFactory([session]))
+        service.refresh_account("token-a")
+
+        for item in service.management_models()["items"]:
+            self.assertEqual(item["state"], "unknown")
+            self.assertIsNone(item["available_accounts"])
+            self.assertEqual(item["pending_accounts"], 1)
+            self.assertEqual(item["unavailable_accounts"], 0)
+
 
 class CodexRelayTests(unittest.TestCase):
     identity = {"id": "key-one", "role": "user"}
