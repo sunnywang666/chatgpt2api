@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 import threading
 import tempfile
+import time
 from pathlib import Path
 from contextlib import nullcontext
 from unittest import mock
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 
 from services import account_request_pacing as pacing
 
-from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
+from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, StreamHardTimeoutError
 from services.conversation_binding_service import (
     ConversationBindingError,
     ConversationBindingService,
@@ -29,6 +30,7 @@ from services.protocol.conversation import (
 class AccountRequestPacingTests(unittest.TestCase):
     def setUp(self):
         pacing._clocks.clear()
+        self.real_monotonic = time.monotonic
         self.now = 1000.0
         self.calls = []
         self.addCleanup(mock.patch.stopall)
@@ -167,6 +169,45 @@ class AccountRequestPacingTests(unittest.TestCase):
         self.assertTrue(clock.turn_lock.acquire(blocking=False))
         clock.turn_lock.release()
 
+    def test_deadline_held_turn_lock_prevents_send_and_releases_nothing(self):
+        clock = pacing.AccountRequestClock()
+
+        class HeldLock:
+            def __init__(self):
+                self.timeouts = []
+
+            def acquire(self, *, timeout=None, **_kwargs):
+                self.timeouts.append(timeout)
+                return False
+
+        held_lock = HeldLock()
+        clock.turn_lock = held_lock
+        send = mock.Mock()
+        with self.assertRaises(pacing.AccountRequestDeadlineExceeded):
+            clock.request(
+                send, "POST", "https://chatgpt.com/backend-api/conversation",
+                timeout=2,
+            )
+        send.assert_not_called()
+        self.assertEqual(held_lock.timeouts, [2])
+
+    def test_deadline_expires_during_cooldown_without_submission_or_lock_leak(self):
+        clock = pacing.AccountRequestClock()
+        clock.cooldown_until = self.now + 30
+        send = mock.Mock()
+        before_send = mock.Mock()
+        with self.assertRaises(pacing.AccountRequestDeadlineExceeded):
+            clock.request(
+                send, "POST", "https://chatgpt.com/backend-api/conversation",
+                timeout=5,
+                _account_request_before_send=before_send,
+            )
+        send.assert_not_called()
+        before_send.assert_not_called()
+        self.assertEqual(clock.cooldown_until, self.now + 30)
+        self.assertTrue(clock.turn_lock.acquire(blocking=False))
+        clock.turn_lock.release()
+
     def test_actual_backend_session_get_and_post_use_shared_account_pacing(self):
         def send(_session, method, url, **kwargs):
             self.calls.append((method, self.now))
@@ -183,6 +224,37 @@ class AccountRequestPacingTests(unittest.TestCase):
                 first.close()
                 second.close()
         self.assertEqual(self.calls, [("POST",1000), ("GET",1005), ("POST",1030)])
+
+    def test_text_stream_watchdog_closes_a_stalled_response(self):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.test"
+        backend._bootstrap = mock.Mock()
+        backend._get_chat_requirements = mock.Mock(return_value=ChatRequirements(token="requirements"))
+        backend._chat_target = mock.Mock(return_value=("/backend-api/conversation", "UTC"))
+        backend._conversation_headers = mock.Mock(return_value={})
+        closed = threading.Event()
+
+        class Response:
+            status_code = 200
+            headers = {}
+
+            def close(self):
+                closed.set()
+
+            def iter_lines(self):
+                closed.wait(1)
+                if False:
+                    yield b""
+
+        response = Response()
+        backend.session = SimpleNamespace(post=mock.Mock(return_value=response))
+        with (
+            mock.patch("services.openai_backend_api.TEXT_STREAM_HARD_CAP_SECS", 0.01),
+            mock.patch("services.openai_backend_api.time.monotonic", self.real_monotonic),
+        ):
+            with self.assertRaises(StreamHardTimeoutError):
+                next(backend.stream_conversation(prompt="hello"))
+        self.assertTrue(closed.is_set())
 
 
 class ConversationContinuationPayloadTests(unittest.TestCase):
@@ -216,6 +288,9 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
 
             def post(self, url, **kwargs):
                 self.calls.append((url, kwargs))
+                callback = kwargs.pop("_account_request_before_send", None)
+                if callable(callback):
+                    callback()
                 return self.responses[len(self.calls) - 1]
 
         backend = object.__new__(OpenAIBackendAPI)

@@ -20,6 +20,11 @@ from services.config import DATA_DIR, config
 from utils.log import logger
 
 
+class AccountRequestDeadlineExceeded(TimeoutError):
+    """A caller's finite request budget elapsed before an upstream send began."""
+    pass
+
+
 class AccountRequestClock:
     def __init__(self, account_key="", state_path: Path | None = None) -> None:
         self.account_key = account_key
@@ -78,12 +83,45 @@ class AccountRequestClock:
                         "retry_after_secs": retry_after, "cooldown_secs": max(fallback, retry_after)})
 
     def request(self, send, method, url, **kwargs):
+        deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
+        before_send = kwargs.pop("_account_request_before_send", None)
+        if not isinstance(deadline_at, (int, float)) or isinstance(deadline_at, bool):
+            deadline_at = None
+        if deadline_at is None:
+            timeout = kwargs.get("timeout")
+            if (isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+                    and math.isfinite(timeout) and timeout > 0):
+                deadline_at = time.monotonic() + float(timeout)
+
+        def remaining_budget() -> float | None:
+            if deadline_at is None:
+                return None
+            return float(deadline_at) - time.monotonic()
+
+        def acquire_with_budget(lock) -> None:
+            remaining = remaining_budget()
+            if remaining is None:
+                lock.acquire()
+                return
+            if remaining <= 0 or not lock.acquire(timeout=remaining):
+                raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
+
+        def cap_timeout_before_send() -> None:
+            remaining = remaining_budget()
+            if remaining is None:
+                return
+            if remaining <= 0:
+                raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
+            timeout = kwargs.get("timeout")
+            if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+                kwargs["timeout"] = max(0.001, min(float(timeout), remaining))
+
         path = urlparse(str(url)).path.rstrip("/")
         is_turn = str(method).upper() == "POST" and path.endswith("/conversation")
         # Serialize complete message streams, while allowing paced readback for
         # the active turn. Never hold the request lock while waiting for a turn.
         if is_turn:
-            self.turn_lock.acquire()
+            acquire_with_budget(self.turn_lock)
         held = is_turn
         release_lock = threading.Lock()
 
@@ -95,15 +133,20 @@ class AccountRequestClock:
                     self.turn_lock.release()
 
         try:
-            with self.lock:
+            acquire_with_budget(self.lock)
+            try:
                 if self.rate_failures and time.monotonic() - self.last_rate_limit >= 900:
                     self.rate_failures = 0
                 ready = max(self.next_request, self.cooldown_until,
                             self.next_turn if is_turn else 0.0)
                 delay = ready - time.monotonic()
                 if delay > 0:
+                    remaining = remaining_budget()
+                    if remaining is not None and delay >= remaining:
+                        raise AccountRequestDeadlineExceeded("account request deadline elapsed during cooldown wait")
                     time.sleep(delay)
                 now = time.monotonic()
+                cap_timeout_before_send()
                 factor = 2 ** min(self.rate_failures, 4)
                 self.next_request = now + min(60.0, config.account_request_interval_secs * factor)
                 if is_turn:
@@ -115,9 +158,19 @@ class AccountRequestClock:
                 # Reserve the interval before sending. Restarting after an
                 # unknown response must not erase the account's wait period.
                 self._save()
+                remaining = remaining_budget()
+                if remaining is not None and remaining <= 0:
+                    raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
+                if callable(before_send):
+                    before_send()
+                # Saving pacing state and the submission receipt can consume
+                # part of the declared budget; cap once more at the send edge.
+                cap_timeout_before_send()
                 response = send(method, url, **kwargs)
                 if response.status_code == 429:
                     self.limited(retry_after_seconds(response.headers.get("Retry-After")))
+            finally:
+                self.lock.release()
             if is_turn and kwargs.get("stream") and 200 <= response.status_code < 300:
                 close = response.close
                 def close_turn():

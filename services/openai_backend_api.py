@@ -53,7 +53,12 @@ class ImageContentPolicyError(ImageTaskError):
     pass
 
 
-class ImageStreamHardTimeoutError(RuntimeError):
+class StreamHardTimeoutError(TimeoutError):
+    """An upstream SSE stream exceeded its declared wall-clock budget."""
+    pass
+
+
+class ImageStreamHardTimeoutError(StreamHardTimeoutError):
     """图片 SSE 流读取超过硬上限时抛出，用于快速中断被挂起的长连接。"""
     pass
 
@@ -80,6 +85,7 @@ CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
 SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
+TEXT_STREAM_HARD_CAP_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
@@ -1148,17 +1154,25 @@ class OpenAIBackendAPI:
         record_submission_started = getattr(
             getattr(self, "progress_callback", None), "record_submission_started", None,
         )
-        if callable(record_submission_started):
-            # Persist the boundary before entering the network call. If the
-            # receipt cannot be updated, fail closed without making the POST.
-            record_submission_started()
-        self.image_submission_started = True
+        request_timeout = self._image_active_timeout(300)
+        request_deadline = time.monotonic() + request_timeout
+
+        def record_actual_submission() -> None:
+            if callable(record_submission_started):
+                # The pacing wrapper invokes this immediately before its
+                # underlying send. A deadline spent on an account lock or
+                # cooldown therefore remains known-not-submitted.
+                record_submission_started()
+            self.image_submission_started = True
+
         response = self.session.post(
             self.base_url + path,
             headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
             json=payload,
-            timeout=self._image_active_timeout(300),
+            timeout=request_timeout,
             stream=True,
+            _account_request_deadline_monotonic=request_deadline,
+            _account_request_before_send=record_actual_submission,
         )
         if response.status_code == 404:
             response.close()
@@ -1169,6 +1183,7 @@ class OpenAIBackendAPI:
                 json=payload,
                 timeout=self._image_active_timeout(300),
                 stream=True,
+                _account_request_deadline_monotonic=request_deadline,
             )
         ensure_ok(response, path)
         return response
@@ -2868,16 +2883,26 @@ class OpenAIBackendAPI:
             conversation_id=conversation_id,
             parent_message_id=parent_message_id,
         )
+        request_deadline = time.monotonic() + TEXT_STREAM_HARD_CAP_SECS
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),
             json=payload,
             timeout=300,
             stream=True,
+            _account_request_deadline_monotonic=request_deadline,
         )
         ensure_ok(response, path)
         try:
-            yield from iter_sse_payloads(response)
+            remaining_stream_budget = max(0.001, request_deadline - time.monotonic())
+            yield from self._iter_sse_payloads_capped(
+                response,
+                remaining_stream_budget,
+                timeout_error_type=StreamHardTimeoutError,
+                timeout_message=(
+                    f"conversation stream exceeded hard limit of {int(TEXT_STREAM_HARD_CAP_SECS)} seconds"
+                ),
+            )
         finally:
             response.close()
 
@@ -2930,7 +2955,14 @@ class OpenAIBackendAPI:
             self._image_active_timeout(float(config.image_poll_timeout_secs)),
         )
 
-    def _iter_sse_payloads_capped(self, response: Any, hard_cap_secs: float) -> Iterator[str]:
+    def _iter_sse_payloads_capped(
+            self,
+            response: Any,
+            hard_cap_secs: float,
+            *,
+            timeout_error_type: type[StreamHardTimeoutError] = ImageStreamHardTimeoutError,
+            timeout_message: str | None = None,
+    ) -> Iterator[str]:
         """按墙钟硬上限消费图片 SSE 流，避免上游异常时长连接被无限挂起。
 
         curl_cffi 在 stream=True + 标量 timeout 下不限制流式 body 的总读取时长，
@@ -2943,18 +2975,22 @@ class OpenAIBackendAPI:
         watchdog = threading.Timer(hard_cap_secs, response.close)
         watchdog.daemon = True
         watchdog.start()
-        timeout_message = f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
+        timeout_message = timeout_message or (
+            f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
+        )
         try:
             for payload in iter_sse_payloads(response):
                 yield payload
                 if time.monotonic() >= deadline:
-                    raise ImageStreamHardTimeoutError(timeout_message)
-        except ImageStreamHardTimeoutError:
+                    raise timeout_error_type(timeout_message)
+            if time.monotonic() >= deadline:
+                raise timeout_error_type(timeout_message)
+        except StreamHardTimeoutError:
             raise
         except Exception as exc:
             # 看门狗关闭连接后，底层读取会抛出 curl 错误，这里统一转成明确的硬上限错误
             if time.monotonic() >= deadline:
-                raise ImageStreamHardTimeoutError(timeout_message) from exc
+                raise timeout_error_type(timeout_message) from exc
             raise
         finally:
             watchdog.cancel()
