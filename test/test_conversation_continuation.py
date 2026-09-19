@@ -187,6 +187,7 @@ class AccountRequestPacingTests(unittest.TestCase):
             clock.request(
                 send, "POST", "https://chatgpt.com/backend-api/conversation",
                 timeout=2,
+                _account_request_deadline_monotonic=self.now + 2,
             )
         send.assert_not_called()
         self.assertEqual(held_lock.timeouts, [2])
@@ -201,12 +202,24 @@ class AccountRequestPacingTests(unittest.TestCase):
                 send, "POST", "https://chatgpt.com/backend-api/conversation",
                 timeout=5,
                 _account_request_before_send=before_send,
+                _account_request_deadline_monotonic=self.now + 5,
             )
         send.assert_not_called()
         before_send.assert_not_called()
         self.assertEqual(clock.cooldown_until, self.now + 30)
         self.assertTrue(clock.turn_lock.acquire(blocking=False))
         clock.turn_lock.release()
+
+    def test_metadata_requests_keep_network_timeout_after_pacing_wait(self):
+        clock = pacing.AccountRequestClock()
+        pacing.config.account_request_interval_secs = 10
+        sent = []
+        def send(_method, _url, **kwargs):
+            sent.append((self.now, kwargs["timeout"]))
+            return SimpleNamespace(status_code=200, headers={})
+        for _ in range(3):
+            clock.request(send, "GET", "https://chatgpt.com/backend-api/me", timeout=20)
+        self.assertEqual(sent, [(1000, 20), (1010, 20), (1020, 20)])
 
     def test_actual_backend_session_get_and_post_use_shared_account_pacing(self):
         def send(_session, method, url, **kwargs):
