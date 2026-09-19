@@ -87,11 +87,6 @@ class AccountRequestClock:
         before_send = kwargs.pop("_account_request_before_send", None)
         if not isinstance(deadline_at, (int, float)) or isinstance(deadline_at, bool):
             deadline_at = None
-        if deadline_at is None:
-            timeout = kwargs.get("timeout")
-            if (isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
-                    and math.isfinite(timeout) and timeout > 0):
-                deadline_at = time.monotonic() + float(timeout)
 
         def remaining_budget() -> float | None:
             if deadline_at is None:

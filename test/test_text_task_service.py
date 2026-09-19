@@ -1383,7 +1383,7 @@ class TextTaskTests(unittest.TestCase):
             finish.set()
             executor.shutdown()
 
-    def test_known_rejection_is_terminal_and_other_request_can_continue(self):
+    def test_prebinding_unavailable_reuses_same_original_request_once(self):
         def runner(body, on_cursor):
             if body["client_request_id"] == "attempt-1":
                 raise ConversationBindingError("no account", code="CONVERSATION_BINDING_UNAVAILABLE")
@@ -1392,9 +1392,27 @@ class TextTaskTests(unittest.TestCase):
         service.submit("owner", self.body)
         service.submit("owner", {**self.body, "client_request_id": "attempt-2"})
         self.queue.run()
-        self.assertEqual(service.read("owner", "attempt-1")["status"], "failed")
+        original = service.read("owner", "attempt-1")
+        self.assertEqual(original["status"], "not_started")
+        with self.assertRaises(ConversationBindingError):
+            service.submit("owner", {**self.body, "model": "changed"})
+        service.runner = lambda body, on_cursor: {"content": "recovered"}
+        service.submit("owner", self.body)
         self.queue.run()
         self.assertEqual(service.read("owner", "attempt-2")["status"], "succeeded")
+        self.queue.run()
+        recovered = service.read("owner", "attempt-1")
+        self.assertEqual(recovered["status"], "succeeded")
+        self.assertEqual(recovered["request_message_id"], original["request_message_id"])
+
+    def test_partial_prebinding_identity_does_not_rearm(self):
+        service = TextTaskService(self.path, executor=self.queue)
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="failed", error_code="CONVERSATION_BINDING_UNAVAILABLE",
+            provider_binding_id="binding-only",
+        )
+        self.assertEqual(service.read("owner", "attempt-1")["status"], "failed")
 
     def test_slow_upstream_does_not_block_submission_or_readback(self):
         started, finish = threading.Event(), threading.Event()

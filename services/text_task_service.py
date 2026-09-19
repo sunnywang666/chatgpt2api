@@ -462,11 +462,13 @@ class TextTaskService:
                 previous = json.loads(row[0])
                 if (previous["status"] == "failed"
                         and previous.get("error_code") == "CONVERSATION_BINDING_UNAVAILABLE"
-                        and previous.get("provider_binding_id")
-                        and previous.get("provider_account_identity")
-                        and not previous.get("conversation_id") and not previous.get("parent_message_id")):
+                        and not previous.get("conversation_id") and not previous.get("parent_message_id")
+                        and ((previous.get("provider_binding_id") and previous.get("provider_account_identity"))
+                             or (not previous.get("provider_binding_id") and not previous.get("provider_account_identity")))):
                     # This legacy failure occurred after selecting an account
                     # but before obtaining its text token / sending a turn.
+                    # A pre-binding failure has neither identity field; it is
+                    # equally known-not-submitted and can reuse this receipt.
                     # Keep the same request hash and message id for recovery.
                     previous = {**previous, "status": "not_started", "updated_at": now}
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
