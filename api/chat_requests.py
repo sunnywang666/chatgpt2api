@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
@@ -16,6 +17,7 @@ from services.log_service import LoggedCall
 from services.public_chat_service import (
     PublicChatContractError,
     project_public_chat_receipt,
+    require_public_reasoning_effort,
     require_public_text_model,
 )
 from services.text_task_service import text_task_service
@@ -31,6 +33,14 @@ class PublicChatRequest(BaseModel):
     )
     model: str = Field(min_length=1, max_length=200)
     messages: list[dict[str, object]] = Field(min_length=1, max_length=100)
+    reasoning_effort: Literal["high"] | None = None
+
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def reject_explicit_null_reasoning_effort(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("reasoning_effort must be omitted or 'high'")
+        return value
 
     @field_validator("client_request_id")
     @classmethod
@@ -64,7 +74,7 @@ def _server_conversation_id(owner: str, request_id: str) -> str:
 
 
 def _payload(owner: str, body: PublicChatRequest, messages: list[dict]) -> dict:
-    return {
+    payload = {
         "client_request_id": body.client_request_id,
         "model": body.model.strip(),
         "messages": messages,
@@ -72,6 +82,11 @@ def _payload(owner: str, body: PublicChatRequest, messages: list[dict]) -> dict:
         "_text_only_binding": True,
         "_public_route": "chat",
     }
+    # Absence retains the exact legacy identity; explicit high is persisted
+    # through the existing internal field and participates in conflict checks.
+    if body.reasoning_effort is not None:
+        payload["thinking_effort"] = body.reasoning_effort
+    return payload
 
 
 def _not_found(request_id: str) -> HTTPException:
@@ -145,6 +160,11 @@ def create_router() -> APIRouter:
             raise HTTPException(400, detail={"code": exc.code, "error": str(exc)}) from None
         except Exception:
             raise HTTPException(503, detail={"code": "MODEL_DISCOVERY_UNAVAILABLE"}) from None
+
+        try:
+            require_public_reasoning_effort(body.model, body.reasoning_effort)
+        except PublicChatContractError as exc:
+            raise HTTPException(400, detail={"code": exc.code, "error": str(exc)}) from None
 
         preview = request_text(messages)
         call = LoggedCall(

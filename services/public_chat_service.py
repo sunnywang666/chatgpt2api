@@ -9,6 +9,8 @@ from utils.helper import is_supported_image_model
 
 PAID_ACCOUNT_TYPES = frozenset({"Plus", "Pro", "ProLite", "Team", "Enterprise"})
 CHAT_IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"]
+# Only the model whose native thinking transport supports this public setting.
+PUBLIC_CHAT_REASONING_EFFORTS = {"gpt-5-6-thinking": ("high",)}
 CHAT_INPUT_LIMITS = {
     "max_messages": 100,
     "max_text_bytes": 1024 * 1024,
@@ -40,6 +42,18 @@ def is_public_text_model(model: object) -> bool:
         return False
     route = model_catalog_service.route_for_model(model_id)
     return bool(route.account_types & PAID_ACCOUNT_TYPES)
+
+
+def public_reasoning_efforts(model: object) -> list[str]:
+    return list(PUBLIC_CHAT_REASONING_EFFORTS.get(str(model or "").strip(), ()))
+
+
+def require_public_reasoning_effort(model: object, effort: object) -> None:
+    if effort is not None and effort not in public_reasoning_efforts(model):
+        raise PublicChatContractError(
+            "CHAT_REASONING_UNSUPPORTED",
+            "reasoning_effort=high is not supported for this model",
+        )
 
 
 def require_public_text_model(model: object) -> str:
@@ -77,11 +91,15 @@ def project_public_models(result: object) -> dict[str, Any]:
                 "input_limits": dict(IMAGE_OUTPUT_LIMITS),
             })
         elif is_public_text_model(model_id):
-            data.append({
+            item = {
                 **raw,
                 "capabilities": ["text", "image_input"],
                 "input_limits": dict(CHAT_INPUT_LIMITS),
-            })
+            }
+            efforts = public_reasoning_efforts(model_id)
+            if efforts:
+                item["reasoning_efforts"] = efforts
+            data.append(item)
     return {"object": "list", "data": data}
 
 

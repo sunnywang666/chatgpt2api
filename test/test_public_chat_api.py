@@ -61,7 +61,7 @@ def public_chat(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "services.public_chat_service.model_catalog_service.route_for_model",
         lambda model: SimpleNamespace(
-            account_types=frozenset({"Plus"}) if model in {"gpt-text", "gpt-text-2"} else frozenset(),
+            account_types=frozenset({"Plus"}) if model in {"gpt-text", "gpt-text-2", "gpt-5-6-thinking"} else frozenset(),
             allow_anonymous=False,
         ),
     )
@@ -113,6 +113,67 @@ def request_body(request_id="chat-1", *, text="describe", model="gpt-text"):
             ],
         }],
     }
+
+
+def test_public_chat_high_reaches_runner_without_changing_legacy_payload(public_chat):
+    legacy = request_body(request_id="legacy")
+    assert public_chat.client.post("/api/chat-requests", headers=public_chat.headers(), json=legacy).status_code == 202
+    legacy_payload = public_chat.queue.calls[0][1][2]
+    assert "thinking_effort" not in legacy_payload
+    assert set(legacy_payload) == {
+        "client_request_id", "model", "messages", "client_conversation_id",
+        "_text_only_binding", "_public_route",
+        "_request_message_id",
+    }
+    high = request_body(request_id="high", model="gpt-5-6-thinking")
+    high["reasoning_effort"] = "high"
+    assert public_chat.client.post("/api/chat-requests", headers=public_chat.headers(), json=high).status_code == 202
+    assert public_chat.queue.calls[1][1][2]["thinking_effort"] == "high"
+    public_chat.queue.run()
+    public_chat.queue.run()
+    assert "thinking_effort" not in public_chat.upstream.call_args_list[0].args[0]
+    assert public_chat.upstream.call_args_list[1].args[0]["thinking_effort"] == "high"
+    assert public_chat.client.post("/api/chat-requests", headers=public_chat.headers(), json=high).status_code == 200
+    assert public_chat.upstream.call_count == 2
+    assert public_chat.client.get("/api/chat-requests/high", headers=public_chat.headers(public_chat.secret_b)).status_code == 404
+
+
+@pytest.mark.parametrize("first_high", [False, True])
+def test_public_chat_reasoning_drift_conflicts_in_both_directions(public_chat, first_high):
+    body = request_body(request_id="effort-drift", model="gpt-5-6-thinking")
+    if first_high:
+        body["reasoning_effort"] = "high"
+    assert public_chat.client.post("/api/chat-requests", headers=public_chat.headers(), json=body).status_code == 202
+    if first_high:
+        del body["reasoning_effort"]
+    else:
+        body["reasoning_effort"] = "high"
+    conflict = public_chat.client.post("/api/chat-requests", headers=public_chat.headers(), json=body)
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "CHAT_REQUEST_CONFLICT"
+    assert len(public_chat.queue.calls) == 1
+
+
+@pytest.mark.parametrize("extra", [
+    {"reasoning_effort": None}, {"reasoning_effort": "low"},
+    {"reasoning_effort": "extended"}, {"reasoning_effort": True},
+    {"reasoning_effort": "high", "tools": []},
+    {"reasoning_effort": "high", "stream": False},
+])
+def test_public_chat_rejects_invalid_reasoning_and_generic_options(public_chat, extra):
+    body = request_body(model="gpt-5-6-thinking")
+    body.update(extra)
+    assert public_chat.client.post("/api/chat-requests", headers=public_chat.headers(), json=body).status_code == 422
+    assert public_chat.queue.calls == []
+
+
+def test_public_chat_high_requires_catalogued_support(public_chat):
+    body = request_body()
+    body["reasoning_effort"] = "high"
+    result = public_chat.client.post("/api/chat-requests", headers=public_chat.headers(), json=body)
+    assert result.status_code == 400
+    assert result.json()["detail"]["code"] == "CHAT_REASONING_UNSUPPORTED"
+    assert public_chat.queue.calls == []
 
 
 def test_durable_public_chat_submit_query_reuse_conflict_and_owner_isolation(public_chat):
@@ -544,6 +605,7 @@ def test_public_model_discovery_describes_text_image_input_and_generation(public
         "data": [
             {"id": "gpt-image-2", "object": "model"},
             {"id": "gpt-text", "object": "model"},
+            {"id": "gpt-5-6-thinking", "object": "model"},
             {"id": "unavailable", "object": "model"},
             {"id": "codex-gpt-image-2", "object": "model"},
         ],
@@ -552,7 +614,9 @@ def test_public_model_discovery_describes_text_image_input_and_generation(public
     public = public_chat.client.get("/v1/models", headers=public_chat.headers())
     assert public.status_code == 200, public.text
     by_id = {item["id"]: item for item in public.json()["data"]}
-    assert set(by_id) == {"gpt-image-2", "gpt-text"}
+    assert set(by_id) == {"gpt-image-2", "gpt-text", "gpt-5-6-thinking"}
+    assert by_id["gpt-5-6-thinking"]["reasoning_efforts"] == ["high"]
+    assert "reasoning_efforts" not in by_id["gpt-text"]
     assert by_id["gpt-text"]["capabilities"] == ["text", "image_input"]
     assert by_id["gpt-text"]["input_limits"]["max_text_bytes"] == 1024 * 1024
     assert by_id["gpt-image-2"]["capabilities"] == ["image_generation", "image_edit"]
