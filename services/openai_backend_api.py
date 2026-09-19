@@ -628,6 +628,11 @@ class OpenAIBackendAPI:
             },
         }
         normalized_effort = self._normalize_thinking_effort(thinking_effort or config.default_thinking_effort)
+        # The Chat conversation endpoint accepts `extended` for this text
+        # model. Keep the public request and its durable identity at `high`;
+        # this is only the final upstream transport representation.
+        if model == "gpt-5-6-thinking" and normalized_effort == "high":
+            normalized_effort = "extended"
         if normalized_effort:
             payload["thinking_effort"] = normalized_effort
         if conversation_id:

@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 import json
 import base64
+from types import SimpleNamespace
 
 from services.config import config
 from services.protocol import openai_v1_chat_complete, openai_v1_response
@@ -119,6 +120,45 @@ class ChatCompletionCacheTests(unittest.TestCase):
             openai_v1_response.handle(body)
 
         self.assertEqual(captured_efforts, ["extended"])
+
+    def test_target_high_reaches_the_actual_chat_and_responses_transport_payloads(self) -> None:
+        from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
+
+        def transport_backend():
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.access_token = "test-token"
+            backend.base_url = "https://unit.invalid"
+            backend.session = mock.Mock()
+            backend._bootstrap = mock.Mock()
+            backend._get_chat_requirements = mock.Mock(return_value=ChatRequirements(token="requirements"))
+            backend._conversation_headers = mock.Mock(return_value={})
+            response = mock.Mock()
+            response.status_code = 200
+            response.iter_lines.return_value = [
+                b'data: {"conversation_id":"conversation","message":{"content":{"parts":["ok"]}}}',
+                b"data: [DONE]",
+            ]
+            backend.session.post.return_value = response
+            return backend
+
+        chat_backend, response_backend = transport_backend(), transport_backend()
+        initial_backend = SimpleNamespace(access_token="test-token")
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=initial_backend),
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=initial_backend),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", side_effect=[chat_backend, response_backend]),
+            mock.patch("services.protocol.conversation.account_service.mark_text_used"),
+        ):
+            openai_v1_chat_complete.handle({
+                "model": "gpt-5-6-thinking", "reasoning_effort": "high",
+                "messages": [{"role": "user", "content": "chat"}],
+            })
+            openai_v1_response.handle({
+                "model": "gpt-5-6-thinking", "reasoning": {"effort": "high"}, "input": "responses",
+            })
+
+        self.assertEqual(chat_backend.session.post.call_args.kwargs["json"]["thinking_effort"], "extended")
+        self.assertEqual(response_backend.session.post.call_args.kwargs["json"]["thinking_effort"], "extended")
 
     def test_repeated_stream_text_completion_replays_cached_chunks(self) -> None:
         calls = 0
