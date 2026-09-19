@@ -163,7 +163,8 @@ class ImageTaskServiceTests(unittest.TestCase):
         backend.progress_callback = progress_callback
 
         class Session:
-            def post(self, *_args, **_kwargs):
+            def post(self, *_args, **kwargs):
+                kwargs["_account_request_before_send"]()
                 self.assert_boundary()
                 raise RuntimeError("generation POST timed out")
 
@@ -258,7 +259,15 @@ class ImageTaskServiceTests(unittest.TestCase):
 
         progress_callback.record_submission_started = record_submission_started
         backend.progress_callback = progress_callback
-        session = mock.Mock()
+        class Session:
+            def __init__(self):
+                self.send_called = False
+
+            def post(self, *_args, **kwargs):
+                kwargs["_account_request_before_send"]()
+                self.send_called = True
+
+        session = Session()
         backend.session = session
 
         with self.assertRaisesRegex(OSError, "receipt save failed"):
@@ -267,7 +276,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 conversation_id="conversation-1", parent_message_id="parent-1",
             )
 
-        session.post.assert_not_called()
+        self.assertFalse(session.send_called)
         self.assertFalse(backend.image_submission_started)
 
     def test_poll_successful_read_clears_a_prior_rate_limit(self):
