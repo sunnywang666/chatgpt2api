@@ -270,7 +270,7 @@ class ExternalImageAccessTests(unittest.TestCase):
         self.assertNotIn("private", str(account))
         self.assertEqual(self.account.list_owned_accounts("workbench:org:b"), [])
         receipt = self.account.import_owned_account("workbench:org:b", {"access_token": "private-upstream"})
-        self.assertEqual(set(receipt), {"import_status", "route", "capacity"})
+        self.assertEqual(set(receipt), {"authorization_ref", "import_status", "route", "capacity"})
         self.assertEqual(receipt["route"], "chat")
         self.assertEqual(self.account.list_owned_accounts("workbench:org:b"), [])
         self.account._apply_refreshed_tokens("private-upstream", {"access_token": "rotated-private"}, "test")
