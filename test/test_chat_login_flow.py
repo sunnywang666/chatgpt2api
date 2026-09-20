@@ -92,7 +92,9 @@ class FakeAccounts:
 
 def callback_for(started: dict, code: str = "private-code") -> str:
     state = parse_qs(urlsplit(started["authorize_url"]).query)["state"][0]
-    return "https://platform.openai.com/auth/callback?" + urlencode({"code": code, "state": state})
+    return "https://platform.openai.com/auth/callback?" + urlencode({
+        "code": code, "state": state, "scope": "openid profile email offline_access",
+    })
 
 
 @pytest.fixture
@@ -105,7 +107,8 @@ def make_service(root: Path, accounts: FakeAccounts, http: FakeHttp) -> ChatLogi
     return ChatLoginService(root / "chat_login_sessions.json", accounts, http.factory)
 
 
-def test_success_is_manual_callback_durable_redacted_and_idempotent(root):
+@pytest.mark.parametrize("include_scope", [True, False])
+def test_success_is_manual_callback_durable_redacted_and_idempotent(root, include_scope):
     accounts = FakeAccounts()
     tokens = {
         "access_token": "private-access",
@@ -120,7 +123,10 @@ def test_success_is_manual_callback_durable_redacted_and_idempotent(root):
     assert started["state"] == "pending_callback"
     assert started["return_mode"] == "manual_callback"
     assert started["authorize_url"].startswith(ChatLoginService.AUTHORIZE_URL + "?")
-    result = service.submit_callback(OWNER, "owned", started["id"], callback_for(started))
+    callback = callback_for(started)
+    if not include_scope:
+        callback = callback.split("&scope=", 1)[0]
+    result = service.submit_callback(OWNER, "owned", started["id"], callback)
 
     assert result["state"] == "succeeded"
     assert result["account_ref"] == ACCOUNT_REF
@@ -132,6 +138,8 @@ def test_success_is_manual_callback_durable_redacted_and_idempotent(root):
     assert http.calls[0][0] == ChatLoginService.TOKEN_URL
     assert http.calls[0][1]["allow_redirects"] is False
     assert http.calls[0][1]["json"]["client_id"] == ChatLoginService.CLIENT_ID
+    assert http.calls[0][1]["json"]["code"] == "private-code"
+    assert "scope" not in http.calls[0][1]["json"]
     assert accounts.imports[0][1]["source_type"] == "oauth_login"
     persisted = (root / "chat_login_sessions.json").read_text()
     assert os.stat(root / "chat_login_sessions.json").st_mode & 0o777 == 0o600
@@ -151,11 +159,16 @@ def test_callback_requires_exact_url_and_state_before_any_exchange(root):
         "https://evil.example/auth/callback?code=x&state=y",
         "https://platform.openai.com/other?code=x&state=y",
         "https://platform.openai.com/auth/callback?code=x&state=y#fragment",
+        callback_for(started) + "&scope=duplicate",
+        callback_for(started) + "&state=duplicate",
+        callback_for(started) + "&code=duplicate",
+        callback_for(started) + "&error=denied",
+        callback_for(started) + "&redirect_uri=https://evil.example/",
     ]
     for value in invalid:
         with pytest.raises(ChatLoginError, match="invalid_callback"):
             service.submit_callback(OWNER, "owned", started["id"], value)
-    wrong_state = "https://platform.openai.com/auth/callback?code=x&state=wrong"
+    wrong_state = "https://platform.openai.com/auth/callback?code=x&state=wrong&scope=openid+profile"
     with pytest.raises(ChatLoginError, match="state_mismatch"):
         service.submit_callback(OWNER, "owned", started["id"], wrong_state)
     assert service.get(OWNER, "owned", started["id"])["state"] == "pending_callback"

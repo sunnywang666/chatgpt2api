@@ -341,7 +341,8 @@ class ChatLoginService:
             query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
         except ValueError:
             raise ChatLoginError(422, "chat_login_invalid_callback") from None
-        allowed = {"code", "state", "error", "error_description"}
+        # OpenAI includes scope in the redirect. It is metadata, not a claim of granted access.
+        allowed = {"code", "state", "scope", "error", "error_description"}
         if set(query) - allowed or any(len(values) != 1 for values in query.values()):
             raise ChatLoginError(422, "chat_login_invalid_callback")
         state = str((query.get("state") or [""])[0]).strip()
