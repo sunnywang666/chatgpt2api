@@ -46,11 +46,56 @@ def _mask_identifier(value: object) -> str | None:
     return f"{raw[:4]}…{raw[-4:]}"
 
 
+def _stored_profile(account: dict) -> dict[str, str]:
+    """Display claims from already accepted credentials; never match or bind rows."""
+    from services.account_service import AccountService
+
+    identity = AccountService._account_identity(account)
+    if identity is None:
+        return {}
+    sources = [account]
+    attached = account.get("codex_credentials")
+    if isinstance(attached, dict) and AccountService._account_identity(attached) == identity:
+        sources.append(attached)
+    result: dict[str, str] = {}
+    for source in sources:
+        access = source.get("access_token")
+        id_token = source.get("id_token")
+        user_ids = AccountService._jwt_chat_user_ids(access, id_token)
+        stored_user = str(account.get("user_id") or "").strip()
+        if len(user_ids) > 1 or (stored_user and user_ids and user_ids != {stored_user}):
+            continue
+        access_payload = AccountService._decode_jwt_payload(access)
+        profile = access_payload.get("https://api.openai.com/profile")
+        id_payload = AccountService._decode_jwt_payload(id_token)
+        # A malformed or unrelated ID token must not contribute display claims.
+        claims = [profile] if isinstance(profile, dict) else []
+        if id_payload.get("sub") == identity[0]:
+            claims.append(id_payload)
+        for claim in claims:
+            for key in ("name", "email"):
+                value = claim.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                value = value.strip()
+                if len(value) > 160 or any(ord(char) < 32 for char in value):
+                    continue
+                # A profile name can itself be an email address.
+                if key == "name" and "@" in value:
+                    value = _mask_email(value)
+                    if not value:
+                        continue
+                result.setdefault(key, value)
+    return result
+
+
 def masked_identity(account: dict) -> dict[str, str | None]:
-    email = _mask_email(account.get("email"))
+    profile = _stored_profile(account)
+    email = _mask_email(account.get("email")) or _mask_email(profile.get("email"))
     account_id = _mask_identifier(account.get("account_id"))
     user_id = _mask_identifier(account.get("user_id"))
     return {
+        "name": profile.get("name"),
         "email": email,
         "account_id": account_id,
         "user_id": user_id,
@@ -129,13 +174,13 @@ def public_owned_account(account: dict) -> dict:
     codex = codex_service.account_projection(account)
     chat = chat_projection(account)
     masked = masked_identity(account)
-    fallback_label = identity_label(account)
+    fallback_label = masked["email"] or masked["account_id"] or masked["user_id"]
     status = str(account.get("status") or "")
     managed_disabled = bool(account.get("managed_disabled"))
     from services.account_service import AccountService
     result = {
         "id": account["managed_account_id"],
-        "label": str(account.get("managed_label") or "").strip() or fallback_label or "已接入账号",
+        "label": str(account.get("managed_label") or "").strip() or masked["name"] or fallback_label or "已接入账号",
         "identity": masked,
         "identity_label": fallback_label,
         "source_type": account.get("source_type", "web"),
@@ -160,7 +205,7 @@ def public_pool_account(account: dict) -> dict:
     codex = codex_service.account_projection(account)
     chat = chat_projection(account)
     masked = masked_identity(account)
-    fallback_label = identity_label(account)
+    fallback_label = masked["email"] or masked["account_id"] or masked["user_id"]
     status = str(account.get("status") or "")
     managed_disabled = bool(account.get("managed_disabled"))
     source = account.get("source_type")
@@ -169,7 +214,7 @@ def public_pool_account(account: dict) -> dict:
     result = {
         "id": account_ref,
         "account_ref": account_ref,
-        "label": str(account.get("managed_label") or "").strip() or fallback_label or "AI 账号",
+        "label": str(account.get("managed_label") or "").strip() or masked["name"] or fallback_label or "AI 账号",
         "identity": masked,
         "identity_label": fallback_label,
         "source_type": source if source in {"web", "codex", "oauth_login", "password"} else "unknown",
