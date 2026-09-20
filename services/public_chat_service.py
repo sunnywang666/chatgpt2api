@@ -118,6 +118,16 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
     error_code = receipt.get("error_code")
     if isinstance(error_code, str) and error_code:
         result["error_code"] = error_code
+    non_text_result = receipt.get("result")
+    if (result["status"] == "failed" and error_code == "CHAT_RESPONSE_NOT_TEXT"
+            and isinstance(non_text_result, dict) and non_text_result.get("type") == "non_text"
+            and non_text_result.get("artifact_type") == "image"
+            and type(non_text_result.get("artifact_count")) is int and non_text_result["artifact_count"] > 0):
+        # Original account/conversation/tool/asset references remain private
+        # in the owner-scoped durable receipt, never exposed as download URLs.
+        result["result"] = {
+            "type": "non_text", "artifact_type": "image", "artifact_count": non_text_result["artifact_count"],
+        }
     for field in ("created_at", "updated_at", "started_at", "finished_at"):
         value = receipt.get(field)
         if isinstance(value, (int, float)) and not isinstance(value, bool):

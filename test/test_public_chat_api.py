@@ -101,6 +101,48 @@ def png_data_url() -> str:
     return "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()
 
 
+def test_completed_native_image_is_queryable_without_public_resubmission(public_chat):
+    from services.conversation_binding_service import ConversationBindingService
+    from test.test_non_text_recovery import image_document
+
+    submitted = public_chat.client.post("/api/chat-requests", headers=public_chat.headers(), json=request_body())
+    assert submitted.status_code == 202
+    public_chat.tasks._update(
+        public_chat.key_a["id"], "chat-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+        provider_binding_id="private-binding", provider_account_identity="private-account",
+        conversation_id="original-chat", request_parent_message_id="prior-answer",
+    )
+    public_chat.tasks.recovery_reader = Mock(side_effect=lambda receipt: ConversationBindingService._read_text_request_result(
+        Mock(), receipt, document=image_document(receipt["request_message_id"]),
+    ))
+    result = public_chat.client.get("/api/chat-requests/chat-1", headers=public_chat.headers())
+    assert result.status_code == 200
+    receipt = result.json()
+    assert receipt["status"] == "failed"
+    assert receipt["error_code"] == "CHAT_RESPONSE_NOT_TEXT"
+    assert receipt["result"] == {"type": "non_text", "artifact_type": "image", "artifact_count": 1}
+    assert receipt["recovery"]["retryable"] is False
+    assert receipt["recovery"]["requires_new_conversation"] is False
+    assert receipt["recovery"]["upstream_outcome"] == "completed"
+    assert result.headers["cache-control"] == "private, no-store"
+    for method, path, body in (
+        ("post", "/api/chat-requests/chat-1/recover", {}),
+        ("post", "/api/chat-requests", request_body()),
+        ("get", "/api/chat-requests/chat-1", None),
+    ):
+        response = public_chat.client.request(method, path, headers=public_chat.headers(), **({"json": body} if body is not None else {}))
+        assert response.status_code == 200
+        assert response.json() == receipt
+    assert public_chat.client.get("/api/chat-requests/chat-1", headers=public_chat.headers(public_chat.secret_b)).status_code == 404
+    assert public_chat.client.post("/api/chat-requests/chat-1/recover", headers=public_chat.headers(public_chat.secret_b), json={}).status_code == 404
+    conflict = public_chat.client.post("/api/chat-requests", headers=public_chat.headers(), json=request_body(text="changed"))
+    assert conflict.status_code == 409
+    assert public_chat.tasks.recovery_reader.call_count == 1
+    assert len(public_chat.queue.calls) == 1
+    assert public_chat.upstream.call_count == 0
+    assert not any(secret in result.text for secret in ("private-binding", "private-account", "original-chat", "file-service://"))
+
+
 def request_body(request_id="chat-1", *, text="describe", model="gpt-text"):
     return {
         "client_request_id": request_id,
