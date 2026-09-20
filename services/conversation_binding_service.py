@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from datetime import datetime
 from enum import Enum
@@ -22,12 +23,80 @@ class TextRecoveryReason(str, Enum):
     REQUEST_RESULT_INCOMPLETE = "REQUEST_RESULT_INCOMPLETE"
     REQUEST_RESULT_NOT_FOUND = "REQUEST_RESULT_NOT_FOUND"
     REQUEST_RESULT_TERMINAL_EMPTY = "REQUEST_RESULT_TERMINAL_EMPTY"
+    REQUEST_RESULT_NON_TEXT = "REQUEST_RESULT_NON_TEXT"
     REQUEST_CONVERSATION_UNATTRIBUTABLE = "REQUEST_CONVERSATION_UNATTRIBUTABLE"
     REQUEST_CONVERSATION_SCAN_INCOMPLETE = "REQUEST_CONVERSATION_SCAN_INCOMPLETE"
     CONVERSATION_NOT_FOUND = "CONVERSATION_NOT_FOUND"
 
 
 _ACTIVE_TEXT_RESULT_STATUSES = frozenset({"in_progress", "running", "pending", "queued"})
+NON_TEXT_RESULT_FIELD = "_non_text_result"
+
+
+def is_recovery_image_pointer(value: object) -> bool:
+    # Retain an upstream reference, never a download URL or tool arguments.
+    return isinstance(value, str) and bool(re.fullmatch(
+        r"(?:file-service|sediment)://[A-Za-z0-9_-]{1,200}", value,
+    ))
+
+
+def _completed_image_result(mapping, children, request_message_id, conversation_id):
+    """Require one completed lineage from this user through an image to an empty final.
+
+    A generic empty answer, a tool invocation, a sibling result, or an input
+    attachment is not proof of this outcome. Later user turns are not ours.
+    """
+    node_id = request_message_id
+    visited = {node_id}
+    artifacts = []
+    while True:
+        successors = children.get(node_id, [])
+        if len(successors) != 1:
+            return None
+        node_id = successors[0]
+        if node_id in visited:
+            return None
+        visited.add(node_id)
+        node = mapping.get(node_id)
+        message = node.get("message") if isinstance(node, dict) else None
+        if not isinstance(message, dict) or message.get("id") != node_id:
+            return None
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        if role not in {"assistant", "tool"} or message.get("status") != "finished_successfully":
+            return None
+        content = message.get("content")
+        if not isinstance(content, dict):
+            return None
+        parts = content.get("parts")
+        if role == "tool" and content.get("content_type") == "multimodal_text" and isinstance(parts, list):
+            for part in parts:
+                if (isinstance(part, dict) and part.get("content_type") == "image_asset_pointer"
+                        and is_recovery_image_pointer(part.get("asset_pointer"))):
+                    artifact = {"tool_message_id": node_id, "asset_pointer": part["asset_pointer"]}
+                    if artifact not in artifacts:
+                        artifacts.append(artifact)
+        if role == "assistant" and message.get("end_turn") is True:
+            if (message.get("channel") != "final" or content.get("content_type") != "text"
+                    or not isinstance(parts, list) or not all(isinstance(part, str) for part in parts)
+                    or "".join(parts).strip() or not artifacts):
+                return None
+            # Nothing in the original result may still branch or continue
+            # after this final. Subsequent user turns remain separate.
+            for successor in children.get(node_id, []):
+                following = mapping.get(successor, {}).get("message")
+                if (not isinstance(following, dict) or following.get("id") != successor
+                        or not isinstance(following.get("author"), dict)
+                        or following["author"].get("role") != "user"):
+                    return None
+            return {
+                "conversation_id": conversation_id,
+                "request_message_id": request_message_id,
+                "final_message_id": node_id,
+                "artifacts": artifacts,
+            }
+
+
 RECOVERY_CONVERSATION_SCAN_FIELD = "_recovery_conversation_scan"
 RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD = "_recovery_conversation_coverage_version"
 _TEXT_FAILURE_PHASES = frozenset({"stream_open", "stream_event", "result_check", "cursor_read", "runner"})
@@ -869,6 +938,19 @@ class ConversationBindingService:
                 recovery_reason=TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value,
             )
         if not candidates:
+            non_text_result = None if active_result_seen else _completed_image_result(
+                mapping, children, request_message_id, conversation_id,
+            )
+            if non_text_result:
+                return {
+                    **result,
+                    "binding_status": "bound",
+                    "status": "failed",
+                    "error_code": "CHAT_RESPONSE_NOT_TEXT",
+                    "recovery_reason": TextRecoveryReason.REQUEST_RESULT_NON_TEXT.value,
+                    "parent_message_id": non_text_result["final_message_id"],
+                    NON_TEXT_RESULT_FIELD: non_text_result,
+                }
             if active_result_seen:
                 recovery_reason = TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
             elif terminal_empty_seen:

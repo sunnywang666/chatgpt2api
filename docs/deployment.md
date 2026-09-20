@@ -23,6 +23,10 @@ JSON 使用同路径文件锁与原子替换；SQL 使用事务（SQLite 写锁�
 
 `python scripts/reconcile_program_keys.py --assignments <reviewed-file>` 默认只读核对；必须一次覆盖全部启用且无政策的普通密钥，集合变化即失败。`--apply` 才写入。不再使用历史文本用途例外；允许Chat即可使用该端已支持操作。缩小允许端仍允许读取原有且同 owner 的任务/文件/回执，不重新生成，撤销则禁止全部调用。旧直接cursor的归档也仅限admin/Content；普通客户端直接绑定会话提交尚不支持，返回技术501，不能凭别人的binding写入。旧 `GET /api/conversation-bindings/text` 的直接 cursor 没有持久调用方归属，仅保留现有 admin/Content 路径；原内部回执继续保留。第三阶段新增公共 `/api/chat-requests` 提交与 `/{request_id}` 查询、`/{request_id}/recover` 原结果读取，使用同一TextTaskService按key ID归属；客户端不提供账号或cursor，不能凭他人的cursor取得文本。只精确开放这些公网路由及无秘密 `/ai/integration.md`，不得公开管理路由或整个 `/ai/`。
 
+公共 Chat 的 `GET /api/chat-requests/{id}` 和 `POST /api/chat-requests/{id}/recover` 可能返回 `status=failed`、`error_code=CHAT_RESPONSE_NOT_TEXT`：仅在原 user 的唯一已完成分支中确认图片工具产物、最终文字为空且无活动分支时成立。`result={"type":"non_text","artifact_type":"image","artifact_count":1}` 表示上游产物引用数量，不代表已经下载、图片质量通过或 Happy 图片任务成功。`recovery.reason=REQUEST_RESULT_NON_TEXT`、`upstream_outcome=completed`、`retryable=false`、`requires_new_conversation=false`；客户端停止自动恢复/重生成，保留原请求交由原消费者处理协议不符。同 ID 同输入仍只读原结果，不同输入冲突；换新 ID 也不是被授权的恢复方式。普通空文本、活动分支和无法归属继续沿现有 UNKNOWN 查询规则处理。
+
+原图片引用与 conversation/request/tool/final 的对应关系保存在同一 `text_tasks.sqlite3`、同一 owner/request 回执的内部 `_non_text_result` 字段；普通与管理投影都不输出原资产地址。没有新增下载接口或复制任务正本。发布和回退继续保留整个原数据库，不能删掉这些原产物引用来重试。
+
 正式切换遵循 Workbench 当前 `docs/runbooks/DEPLOYMENT_AND_ROLLBACK_P0_1.md`、唯一发布负责人及精确镜像 digest：先保存密钥存储与现役版本回退点，停止旧 Provider 写入者，使用已核对的完整映射迁移原记录，启动新 Provider 后发布兼容 BFF/页面，再独立读回。不得修改账号/任务正本或重建未变服务；生产预检还需验证镜像 Python 3.13 运行态。回退必须先停止新写入者，核对切换期间新增/修改/撤销的密钥，禁止盲目覆盖旧快照导致已撤销密钥复活。任何未知结果先读回，不重复迁移。
 
 ## 部署前准备

@@ -24,10 +24,12 @@ from pathlib import Path
 from services.config import DATA_DIR
 from services.conversation_binding_service import (
     ConversationBindingError,
+    NON_TEXT_RESULT_FIELD,
     RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
     RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
     conversation_binding_service,
+    is_recovery_image_pointer,
 )
 
 
@@ -141,6 +143,7 @@ class TextTaskService:
     _INTERNAL_RECEIPT_FIELDS = frozenset({
         "boot", "recovery_claim_id", "recovery_claimed_at", "recovery_lease_until",
         RECOVERY_CONVERSATION_SCAN_FIELD, RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
+        NON_TEXT_RESULT_FIELD,
     })
     _SAFE_RECOVERY_CODES = frozenset({
         "CONVERSATION_BINDING_UNAVAILABLE",
@@ -254,10 +257,43 @@ class TextTaskService:
         return raw if raw in cls._SAFE_RECOVERY_REASONS else None
 
     @classmethod
-    def _safe_recovery_result(cls, recovered):
+    def _safe_recovery_result(cls, recovered, receipt=None):
         if not isinstance(recovered, dict):
             return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
         status = recovered.get("status")
+        if status == "failed":
+            evidence = recovered.get(NON_TEXT_RESULT_FIELD)
+            receipt = receipt or {}
+            if (recovered.get("error_code") != "CHAT_RESPONSE_NOT_TEXT"
+                    or recovered.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_NON_TEXT.value
+                    or recovered.get("binding_status") != "bound"
+                    or not isinstance(evidence, dict)
+                    or set(evidence) != {"conversation_id", "request_message_id", "final_message_id", "artifacts"}
+                    or any(not isinstance(evidence.get(key), str) or not evidence[key].strip()
+                           for key in ("conversation_id", "request_message_id", "final_message_id"))
+                    or evidence["request_message_id"] != receipt.get("request_message_id")
+                    or evidence["final_message_id"] == evidence["request_message_id"]
+                    or evidence["final_message_id"] != recovered.get("parent_message_id")
+                    or evidence["conversation_id"] != recovered.get("conversation_id")
+                    or (receipt.get("conversation_id") and evidence["conversation_id"] != receipt["conversation_id"])
+                    or any(not receipt.get(key) or recovered.get(key) != receipt[key]
+                           for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))):
+                return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+            artifacts = evidence["artifacts"]
+            if (not isinstance(artifacts, list) or not artifacts or any(
+                not isinstance(artifact, dict) or set(artifact) != {"tool_message_id", "asset_pointer"}
+                or not isinstance(artifact["tool_message_id"], str) or not artifact["tool_message_id"].strip()
+                or artifact["tool_message_id"] in {evidence["request_message_id"], evidence["final_message_id"]}
+                or not is_recovery_image_pointer(artifact["asset_pointer"])
+                for artifact in artifacts
+            )):
+                return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+            return {
+                "status": "failed", "error_code": "CHAT_RESPONSE_NOT_TEXT", "binding_status": "bound",
+                "conversation_id": evidence["conversation_id"], "parent_message_id": evidence["final_message_id"],
+                NON_TEXT_RESULT_FIELD: evidence,
+                "result": {"type": "non_text", "artifact_type": "image", "artifact_count": len(artifacts)},
+            }, None, None, None
         if status == "succeeded":
             content = recovered.get("content")
             parent_message_id = recovered.get("parent_message_id")
@@ -364,9 +400,11 @@ class TextTaskService:
             if not row:
                 return {"request_id": request_id, "status": "not_found"}
             current = json.loads(row[0])
-            if current.get("status") == "succeeded":
-                # A late read result can never roll back an authoritative
-                # success, even if another writer did not clear the lease.
+            if current.get("status") == "succeeded" or (
+                current.get("status") == "failed" and current.get("error_code") == "CHAT_RESPONSE_NOT_TEXT"
+            ):
+                # A late read cannot roll back an authoritative terminal
+                # result, even if another writer did not clear the lease.
                 return self._public(current)
             if current.get("recovery_claim_id") != claim_id:
                 return self._public(current)
@@ -429,6 +467,19 @@ class TextTaskService:
                     # 404 must not force a new chat after the same chat becomes
                     # readable again.
                     "recovery_requires_new_conversation": requires_new_conversation,
+                }
+            elif (recovered or {}).get("status") == "failed":
+                changes = {
+                    **recovered,
+                    "finished_at": now,
+                    "upstream_outcome": "completed",
+                    "recovery_next_at": None,
+                    "recovery_error_code": "CHAT_RESPONSE_NOT_TEXT",
+                    "recovery_phase": "read_text_result",
+                    "recovery_retry_after_seconds": None,
+                    "recovery_reason": TextRecoveryReason.REQUEST_RESULT_NON_TEXT.value,
+                    "recovery_retryable": False,
+                    "recovery_requires_new_conversation": False,
                 }
             else:
                 changes = {
@@ -512,7 +563,7 @@ class TextTaskService:
         if recovery_claim:
             try:
                 recovered = self.recovery_reader(recovery_claim[1])
-                safe_result, error_code, phase, recovery_reason = self._safe_recovery_result(recovered)
+                safe_result, error_code, phase, recovery_reason = self._safe_recovery_result(recovered, recovery_claim[1])
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0], safe_result, error_code, phase,
                     recovery_reason, count_unrecoverable=allow_unrecoverable_retry,
@@ -604,9 +655,11 @@ class TextTaskService:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
             receipt = json.loads(row[0])
-            if receipt.get("status") == "succeeded":
-                # A late runner progress/error callback must not roll back an
-                # authoritative recovery result or its advanced cursor.
+            if receipt.get("status") == "succeeded" or (
+                receipt.get("status") == "failed" and receipt.get("error_code") == "CHAT_RESPONSE_NOT_TEXT"
+            ):
+                # A late runner callback must not reopen a recovered terminal
+                # result or replace its original result/cursor evidence.
                 return
             receipt = {**receipt, **changes, "updated_at": self._now()}
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
