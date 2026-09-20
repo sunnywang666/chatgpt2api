@@ -118,6 +118,9 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
     error_code = receipt.get("error_code")
     if isinstance(error_code, str) and error_code:
         result["error_code"] = error_code
+    for field in ("waiting", "rate_limit"):
+        if isinstance(receipt.get(field), dict):
+            result[field] = receipt[field]
     non_text_result = receipt.get("result")
     if (result["status"] == "failed" and error_code == "CHAT_RESPONSE_NOT_TEXT"
             and isinstance(non_text_result, dict) and non_text_result.get("type") == "non_text"

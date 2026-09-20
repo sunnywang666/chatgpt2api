@@ -1317,6 +1317,7 @@ class TextTaskTests(unittest.TestCase):
         writes = []
         service = TextTaskService(self.path, lambda body, on_cursor: writes.append(body) or {"content": "ok"}, self.queue)
         first = service.submit("owner", self.body)
+        service._update("owner", "attempt-1", _input_ref=None)  # Pre-migration receipt without durable input.
         restarted = TextTaskService(self.path, service.runner, self.queue)
         self.assertEqual(restarted.read("owner", "attempt-1")["status"], "not_started")
         with self.assertRaises(ConversationBindingError):
@@ -1565,6 +1566,7 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(review.call_count, 1)
         self.assertEqual(len(first_queue.calls), 1)
 
+        first_service._update("owner", "attempt-1", _input_ref=None)  # Pre-migration receipt.
         restarted_queue = QueuedExecutor()
         restarted = TextTaskService(self.path, executor=restarted_queue)
         self.assertEqual(restarted.read("owner", "attempt-1")["status"], "not_started")

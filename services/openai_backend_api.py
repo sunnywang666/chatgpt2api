@@ -201,6 +201,16 @@ class OpenAIBackendAPI:
         参数：
         - `access_token`：可选。传入后表示使用已登录链路；不传则使用未登录链路。
         """
+        from services.request_context import current_request
+        context = current_request.get()
+        if context is not None:
+            import uuid
+            receipt = context.receipt()
+            sequence = int(receipt.get("_send_sequence") or 0)
+            message_id = receipt.get("request_message_id") if sequence == 0 else None
+            message_id = message_id or str(uuid.uuid5(uuid.NAMESPACE_URL, context.owner + ":" + context.request_id + ":" + str(sequence)))
+            self.text_request_message_id = message_id
+            self.image_request_message_id = message_id
         self.base_url = "https://chatgpt.com"
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER

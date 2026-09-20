@@ -662,12 +662,14 @@ class ImageTaskServiceTests(unittest.TestCase):
                 raise error
 
             service = self.make_service(path, handler)
-            for index in range(10):
-                service._tasks[f"owner-1:occupant-{index}"] = {
-                    "id": f"occupant-{index}", "owner_id": "owner-1", "status": "error",
-                    "provider_account_identity": "account-1", "upstream_unfinished": True,
-                    "created_at": "2026-09-17 00:00:00", "updated_at": "2026-09-17 00:00:00",
-                }
+            with service._transaction():
+                for index in range(10):
+                    service._tasks[f"owner-1:occupant-{index}"] = {
+                        "id": f"occupant-{index}", "owner_id": "owner-1", "status": "error",
+                        "provider_account_identity": "account-1", "upstream_unfinished": True,
+                        "created_at": "2026-09-17 00:00:00", "updated_at": "2026-09-17 00:00:00",
+                    }
+                service._save_locked()
             queued_at = time.time()
             service.submit_generation(
                 OWNER, client_task_id="budget-task", prompt="cat", model="gpt-image-2", size=None,
@@ -797,6 +799,11 @@ class ImageTaskServiceTests(unittest.TestCase):
             active_started_at = failed["active_attempt_started_at"]
             active_deadline_at = failed["active_attempt_deadline_at"]
             service = self.make_service(path)
+            from services.pool_admission import PoolAdmission
+            # A restarted scheduler must recover the original captured result,
+            # including its new atomic read claim, without a client resubmit.
+            service.admission = PoolAdmission(service.store, None)
+            service.admission.recoveries["image"] = lambda owner, task_id: service.resume_poll({"id": owner, "role": "user"}, task_id)
 
             class DownloadBackend:
                 polls = 0
@@ -833,7 +840,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
                 mock.patch("services.openai_backend_api.OpenAIBackendAPI", DownloadBackend),
             ):
-                service.resume_poll(OWNER, "download-task", 30, "http://content-provider")
+                service.admission.recover_one()
                 succeeded = wait_for_task(service, OWNER, "download-task", "success")
 
             self.assertEqual(succeeded["image_session_parent_id"], "result-parent")

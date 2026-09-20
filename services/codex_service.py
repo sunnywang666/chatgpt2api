@@ -62,6 +62,9 @@ class CodexServiceError(RuntimeError):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.rate_limit = ({"layer": "provider_capacity", "origin": "local_guard", "phase": "admission",
+                            "retry_after_seconds": None, "cooldown_until": None}
+                           if status_code == 429 and code == "codex_busy" else None)
 
 
 @dataclass
@@ -754,7 +757,8 @@ class CodexService:
         return dict(value) if isinstance(value, dict) else {}
 
     def _persist_mapping(self, token: str, key: str, mapping_key: str, value: object, *, required: bool = False) -> bool:
-        with self._lock:
+        from contextlib import nullcontext
+        with getattr(self.accounts, "admission_transaction", nullcontext)(), self._lock:
             account = self.accounts.get_account(token)
             if not account:
                 if required:
@@ -807,6 +811,8 @@ class CodexService:
             return None
         token = str(account.get("access_token") or "")
         if not token or account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
+            return None
+        if float((account.get("codex_rate_limit") or {}).get("cooldown_until") or 0) > time.time():
             return None
         try:
             self._account_headers(account)
@@ -906,6 +912,17 @@ class CodexService:
             raise CodexServiceError(409, "codex_response_owner_unknown", "The previous response cannot be resumed safely")
         requested_model = str((payload or {}).get("model") or "").strip()
 
+        from services.request_context import current_request, AdmissionLost
+        context = current_request.get()
+        if context is not None:
+            selected = context.selected_account()
+            if selected is None:
+                raise AdmissionLost("original Codex account is unavailable")
+            admitted_token = str(selected["access_token"])
+            if forced_token and forced_token != admitted_token:
+                raise CodexServiceError(409, "codex_binding_conflict", "The original account differs from the previous response")
+            forced_token = admitted_token
+
         # Resolve the immutable session binding against the full pool before
         # considering availability.  A disabled, limited or stale bound
         # account is an explicit failure, never permission to change owners.
@@ -962,6 +979,10 @@ class CodexService:
         return account, token, affinity if bind_session else ""
 
     def _release_account(self, token: str, affinity: str, *, known_terminal: bool) -> None:
+        from services.request_context import current_request
+        context = current_request.get()
+        if context is not None:
+            context.terminal(known_terminal)
         with self._lock:
             self._inflight.discard(token)
         if not affinity:
@@ -1137,6 +1158,7 @@ class CodexService:
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
+                    self._observe_stream_limit(line, token, response)
                     is_terminal, response_id = self._terminal_from_line(line.rstrip(b"\r"))
                     terminal = terminal or is_terminal
                     if is_terminal:
@@ -1148,6 +1170,7 @@ class CodexService:
                         })
                 yield chunk
             if buffer:
+                self._observe_stream_limit(buffer, token, response)
                 is_terminal, response_id = self._terminal_from_line(buffer.rstrip(b"\r"))
                 terminal = terminal or is_terminal
                 if is_terminal:
@@ -1159,6 +1182,45 @@ class CodexService:
                     })
         finally:
             finish(terminal)
+
+    def _observe_stream_limit(self, line, token, response):
+        try:
+            if not line.startswith(b"data:"):
+                return
+            event = json.loads(line[5:].strip())
+            from services.request_context import current_request
+            context = current_request.get()
+            if event.get("type") == "response.failed" and context is not None:
+                context.admission.update_claim(context, _upstream_failed=True)
+            error = event.get("error") or ((event.get("response") or {}).get("error") if event.get("type") == "response.failed" else None)
+            if not isinstance(error, dict) or error.get("code", error.get("type")) not in {"rate_limit_exceeded", "rate_limit_error", "too_many_requests"}:
+                return
+            account = self.accounts.get_account(token)
+            if account:
+                self._mark_observation_state(token, "limited", "codex_sse_rate_limit", account, self._credential_digest(account))
+            self._record_limit(response, "sse_rate_limit", error.get("retry_after_seconds", error.get("retry_after")), token=token)
+        except (ValueError, TypeError, AttributeError):
+            return
+
+    def _record_limit(self, response, origin, retry=None, *, token=""):
+        from services.request_context import current_request
+        from services.account_request_pacing import retry_after_seconds
+        context = current_request.get()
+        headers = response.headers
+        value = str(retry if retry is not None else headers.get("retry-after", headers.get("Retry-After", "")))
+        request_id = headers.get("x-request-id") or headers.get("openai-request-id")
+        safe_id = request_id if isinstance(request_id, str) and len(request_id) <= 160 and request_id.isascii() and not any(c.isspace() for c in request_id) else None
+        evidence = {"layer": "upstream_codex", "origin": origin, "phase": "responses_stream" if origin == "sse_rate_limit" else "responses",
+                    "upstream_request_id": safe_id, "retry_after_seconds": retry_after_seconds(value),
+                    "retry_after_raw": value[:160] if value.isascii() else None,
+                    "observed_at": time.time(), "cooldown_until": time.time() + max(OBSERVATION_MAX_AGE_SECONDS, retry_after_seconds(value))}
+        if token:
+            self.accounts.update_account(token, {"codex_rate_limit": evidence}, quiet=True)
+        if context is not None:
+            context.record_limit({**evidence, **context.log_fields()})
+        from utils.log import logger
+        logger.warning({"event": "codex_rate_limited", **evidence})
+        return evidence
 
     def _managed_stream(self, response, token: str, affinity: str, owner: str, session) -> ManagedCodexStream:
         cleanup_lock = threading.Lock()
@@ -1228,6 +1290,10 @@ class CodexService:
             # From this point a transport error is an unknown POST outcome.  It
             # must never be retried or moved to another account.
             self._set_affinity_state(token, affinity, "pending")
+            from services.request_context import current_request
+            context = current_request.get()
+            if context is not None:
+                context.before_send()
             attempted = True
             response = session.post(
                 CODEX_COMPACT_URL if compact else CODEX_RESPONSES_URL,
@@ -1240,12 +1306,16 @@ class CodexService:
                 stream=True,
             )
             if response.status_code < 200 or response.status_code >= 300:
+                evidence = self._record_limit(response, "http_429", token=token) if response.status_code == 429 else None
                 try:
                     response.close()
                 except Exception:
                     pass
-                raise self._safe_upstream_error(response.status_code, token, affinity, post=True,
-                                                request_account=account, request_digest=request_digest)
+                error = self._safe_upstream_error(response.status_code, token, affinity, post=True,
+                                                  request_account=account, request_digest=request_digest)
+                if evidence:
+                    error.rate_limit = evidence
+                raise error
             headers_out = _response_headers(response.headers)
             content_type = headers_out.get("content-type", "").lower()
             if "text/event-stream" in content_type:

@@ -33,6 +33,10 @@ from services.conversation_binding_service import (
 )
 
 
+from services.task_store import TaskStore
+from services.request_context import current_request, AdmissionLost
+
+
 class TextTaskCapacityError(RuntimeError):
     pass
 
@@ -182,8 +186,10 @@ class TextTaskService:
         TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
     })
 
-    def __init__(self, path: Path, runner=None, executor=None, *, clock=None, recovery_reader=None):
+    def __init__(self, path: Path, runner=None, executor=None, *, clock=None, recovery_reader=None, admission=None):
         self.path = path
+        self.store = TaskStore(path)
+        self.admission = admission
         self.runner = runner or conversation_binding_service.complete_text
         self.executor = executor or ContinuationExecutor()
         self.clock = clock or time.time
@@ -195,19 +201,12 @@ class TextTaskService:
 
     @contextmanager
     def _db(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(self.path, timeout=10)
-        os.chmod(self.path, 0o600)
-        db.execute("CREATE TABLE IF NOT EXISTS requests (owner TEXT, id TEXT, request_hash TEXT, receipt TEXT, PRIMARY KEY(owner,id))")
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+        with self.store.connect() as db:
+            yield db
 
     @staticmethod
     def _public(receipt):
-        return {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS}
+        return {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
 
     @classmethod
     def _recovery_due(cls, receipt, now):
@@ -524,13 +523,13 @@ class TextTaskService:
                     previous = {**previous, "status": "not_started", "updated_at": now}
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
-                if previous["status"] == "queued" and previous["boot"] != self.boot:
+                if previous["status"] == "queued" and previous["boot"] != self.boot and not previous.get("_input_ref"):
                     # The atomic running claim never happened. Preserve identity
                     # and wait for the caller to supply the exact original body.
                     previous = {**previous, "status": "not_started", "updated_at": now}
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
-                if previous["status"] == "running" and previous["boot"] != self.boot:
+                if previous["status"] == "running" and previous["boot"] != self.boot and not previous.get("_claim_id"):
                     # Another process/restart cannot establish that the original
                     # write failed. Preserve its cursor and make the receipt
                     # eligible for the read-only recovery path.
@@ -655,6 +654,9 @@ class TextTaskService:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
             receipt = json.loads(row[0])
+            context = current_request.get()
+            if context is not None and (context.kind, context.owner, context.request_id) == ("text", owner, request_id) and receipt.get("_claim_id") != context.claim:
+                raise AdmissionLost("original text claim changed")
             if receipt.get("status") == "succeeded" or (
                 receipt.get("status") == "failed" and receipt.get("error_code") == "CHAT_RESPONSE_NOT_TEXT"
             ):
@@ -708,9 +710,15 @@ class TextTaskService:
             )
         return self._public(json.loads(previous[1])) if previous else None
 
-    def submit(self, owner: str, body: dict):
+    def submit(self, owner: str, body: dict, *, source: str | None = None):
         request_id, request_hash = self._submission_identity(owner, body)
         receipt = {"request_id": request_id, "client_conversation_id": body["client_conversation_id"],
+                   "_route": body.get("_route", "chat"), "_operation": body.get("_operation", "text"),
+                   "_forward_protocol": "editable_file" if body.get("_editable") else (body.get("_forward") or {}).get("protocol"),
+                   "_editable_task_id": (body.get("_editable") or {}).get("task_id"),
+                   "_editable_kind": (body.get("_editable") or {}).get("kind"),
+                   "_expected_sends": int(body.get("_expected_sends") or 1),
+                   "_previous_response_id": ((body.get("_forward") or {}).get("payload") or {}).get("previous_response_id"),
                    "route": str(body.get("_public_route") or ""),
                    "model": str(body.get("model") or "auto"),
                    "request_message_id": str(uuid.uuid4()),
@@ -745,11 +753,30 @@ class TextTaskService:
                 if safe_capacity_retry:
                     for field in ("error_code", "upstream_outcome", "finished_at"):
                         receipt.pop(field, None)
+                if not receipt.get("_input_ref"):
+                    # Original ID/hash already matched. Retain the actual input
+                    # of a legacy explicitly-unsent retry before accepting it.
+                    receipt.update(_input_ref=self.store.save_input(body),
+                                   _sequence=self.store.next_sequence(db),
+                                   _source=source or "key:" + owner,
+                                   _input_bytes=_retained_size(body),
+                                   _turn_reserved=False, _submission_started=False)
                 db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
                 schedule = True
             elif not previous:
+                receipt.update({"_input_ref": self.store.save_input(body),
+                                "_sequence": self.store.next_sequence(db),
+                                "_source": source or "key:" + owner,
+                                "_input_bytes": _retained_size(body),
+                                "_turn_reserved": False,
+                                "_submission_started": False})
+                for field in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id"):
+                    if body.get(field):
+                        receipt[field] = body[field]
                 db.execute("INSERT INTO requests VALUES(?,?,?,?)", (owner, request_id, request_hash, json.dumps(receipt)))
-        if schedule:
+        if schedule and self.admission is not None:
+            self.admission.wake()
+        elif schedule:
             try:
                 self.executor.submit(self._run, owner, request_id, {**body, "_request_message_id": receipt["request_message_id"]})
             except TextTaskCapacityError:
@@ -773,14 +800,25 @@ class TextTaskService:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
             receipt = json.loads(row[0])
-            if receipt["status"] != "queued" or receipt["boot"] != self.boot:
+            claim = body.get("_admission_claim")
+            if claim:
+                if receipt.get("_claim_id") != claim or receipt["status"] != "running":
+                    return
+            elif receipt["status"] != "queued" or receipt["boot"] != self.boot:
                 return
             receipt = {**receipt, "status": "running", "started_at": self._now()}
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
         def progress(cursor):
             self._update(owner, request_id, **cursor)
+        if body.get("_forward"):
+            from services.durable_forward import run
+            return run(self, owner, request_id, body)
         try:
-            result = self.runner(body, on_cursor=progress)
+            if body.get("_editable"):
+                from services.editable_file_task_service import editable_file_task_service
+                result = editable_file_task_service.run_admitted(body)
+            else:
+                result = self.runner(body, on_cursor=progress)
             self._update(owner, request_id, **{**result, "status": "succeeded", "finished_at": self._now()})
         except ConversationBindingError as exc:
             cursor = {k: getattr(exc, k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id") if getattr(exc, k, "")}

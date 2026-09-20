@@ -21,6 +21,9 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        from services.pool_admission import configure_original_task_admission
+        admission = configure_original_task_admission()
+        admission.start()
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
@@ -29,6 +32,13 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            admission.stop()
+            from services.text_task_service import text_task_service
+            from services.image_task_service import image_task_service
+            if text_task_service.admission is admission:
+                text_task_service.admission = None
+            if image_task_service.admission is admission:
+                image_task_service.admission = None
             stop_event.set()
             thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
