@@ -325,6 +325,18 @@ class AccountService:
         return result
 
     @classmethod
+    def _jwt_chat_user_ids(cls, *tokens: object) -> set[str]:
+        result: set[str] = set()
+        for token in tokens:
+            claim = cls._decode_jwt_payload(str(token or "")).get("https://api.openai.com/auth")
+            if isinstance(claim, dict):
+                for key in ("chatgpt_user_id", "user_id"):
+                    value = str(claim.get(key) or "").strip()
+                    if value:
+                        result.add(value)
+        return result
+
+    @classmethod
     def _validated_codex_credentials(cls, payload: object) -> dict[str, str]:
         if not isinstance(payload, dict):
             raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
@@ -389,6 +401,7 @@ class AccountService:
     def _verified_chat_import_material(
         self, payload: dict, source_type: str, previous: dict | None,
         identity_hint: tuple[str, str] | None, *, verified_oauth: bool = False,
+        observation: tuple[str, tuple[str, str], dict] | None = None,
     ) -> tuple[dict[str, str], tuple[str, str], dict]:
         """Authenticate new Chat material before it can create or rekey a row."""
         submitted_token = str(payload.get("access_token") or "").strip()
@@ -441,13 +454,32 @@ class AccountService:
         )
         if (access_subject and id_subject and access_subject != id_subject) or len(effective_workspaces) > 1:
             raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
-        verified_identity, info = self._verified_chat_info(replacement["access_token"])
+        if observation is not None and observation[0] == replacement["access_token"]:
+            chat_identity, info = observation[1:]
+        else:
+            chat_identity, info = self._verified_chat_info(replacement["access_token"])
+        # OAuth sub and /backend-api/me.id belong to different namespaces.
+        # The protected read authenticates the bearer; compare its Chat claims
+        # to me.id and its OAuth subject only to other OAuth subjects.
+        chat_claims = self._jwt_chat_user_ids(
+            submitted_token, submitted_id, replacement["access_token"], replacement.get("id_token"),
+        )
+        if (chat_claims and chat_claims != {chat_identity[0]}
+                or info.get("user_id") and str(info["user_id"]).strip() != chat_identity[0]
+                or info.get("account_id") and self._validated_workspace_id(info["account_id"]) != chat_identity[1]):
+            raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+        authenticated_subject = access_subject or self._jwt_subject(replacement.get("id_token"))
+        verified_identity = (authenticated_subject or chat_identity[0], chat_identity[1])
         if (identity_hint is not None and verified_identity != identity_hint
                 or claimed_subjects and claimed_subjects != {verified_identity[0]}
                 or claimed_workspaces and claimed_workspaces != {verified_identity[1]}
                 or access_subject and access_subject != verified_identity[0]
-                or id_subject and id_subject != verified_identity[0]
+                or authenticated_subject and id_subject and id_subject != authenticated_subject
                 or effective_workspaces and effective_workspaces != {verified_identity[1]}):
+            raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+        if (previous and self._chat_authorization_saved(previous)
+                and previous.get("capacity_observed_at")
+                and previous.get("user_id") and str(previous["user_id"]).strip() != chat_identity[0]):
             raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
         return replacement, verified_identity, info
 
@@ -1759,15 +1791,17 @@ class AccountService:
             if self._account_identity(account) == identity
         ]
 
-    def _chat_identity_matches_locked(self, identity: tuple[str, str]) -> list[tuple[str, dict]]:
+    def _chat_identity_matches_locked(
+        self, identity: tuple[str, str], chat_identity: tuple[str, str] | None = None,
+    ) -> list[tuple[str, dict]]:
         matches = self._identity_matches_locked(identity)
         known = {token for token, _account in matches}
         for token, account in self._accounts.items():
             if (token not in known and account.get("source_type") in {"web", "oauth_login", "password"}
-                    and not self._jwt_subject(token)
+                    and (not self._jwt_subject(token) or identity == chat_identity)
                     and account.get("capacity_observed_at")
-                    and str(account.get("user_id") or "").strip() == identity[0]
-                    and self._validated_workspace_id(account.get("account_id")) == identity[1]):
+                    and str(account.get("user_id") or "").strip() == (chat_identity or identity)[0]
+                    and self._validated_workspace_id(account.get("account_id")) == (chat_identity or identity)[1]):
                 matches.append((token, account))
         return matches
 
@@ -2509,7 +2543,7 @@ class AccountService:
         from services.owned_accounts import public_owned_account, utc_now
 
         token = str(payload.get("access_token") or "").strip()
-        subject = self._jwt_subject(token) or self._jwt_subject(payload.get("id_token"))
+        subject = self._jwt_subject(token) or (self._jwt_subject(payload.get("id_token")) if verified_oauth else "")
         workspace_ids = self._jwt_workspace_ids(token, payload.get("id_token"))
         supplied_workspace = str(payload.get("account_id") or "").strip()
         if supplied_workspace:
@@ -2521,6 +2555,7 @@ class AccountService:
             raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
         identity = (subject, next(iter(workspace_ids))) if subject and len(workspace_ids) == 1 else None
         related = None
+        observation = None
         with self._lock:
             if account_ref:
                 target_token, target = self._pool_account_locked(account_ref)
@@ -2575,11 +2610,13 @@ class AccountService:
                     related = (old_token, self._authorization_revision(old_account), dict(old_account))
 
         if related is None and identity is None:
-            identity, _preliminary_info = self._verified_chat_info(token)
+            chat_identity, preliminary_info = self._verified_chat_info(token)
+            observation = (token, chat_identity, preliminary_info)
+            identity = (subject or chat_identity[0], chat_identity[1])
             with self._lock:
                 if self._resolve_access_token_locked(token) != token or token in self._accounts:
                     raise CodexAuthorizationAttachError("chat_authorization_stale_target")
-                matches = self._chat_identity_matches_locked(identity)
+                matches = self._chat_identity_matches_locked(identity, chat_identity)
                 if len(matches) > 1:
                     raise CodexAuthorizationAttachError("chat_authorization_account_ambiguous")
                 if self._has_invalid_exact_identity_locked(identity):
@@ -2596,6 +2633,7 @@ class AccountService:
                 identity, _old_info = self._verified_chat_info(old_token)
             replacement, verified_identity, info = self._verified_chat_import_material(
                 payload, source_type, previous, identity, verified_oauth=verified_oauth,
+                observation=observation,
             )
             replacement["source_type"] = source_type
             stored_identity = (
@@ -2603,10 +2641,11 @@ class AccountService:
                 self._validated_workspace_id(previous.get("account_id")),
             )
             if (self._chat_authorization_saved(previous)
-                    and (not previous.get("capacity_observed_at") or stored_identity != verified_identity
+                    and (not previous.get("capacity_observed_at")
+                         or stored_identity != (info.get("user_id"), verified_identity[1])
                          or self._account_identity(previous) is None)):
                 old_identity, _old_info = self._verified_chat_info(old_token)
-                if old_identity != verified_identity:
+                if old_identity != (info.get("user_id"), verified_identity[1]):
                     raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
             try:
                 self._apply_refreshed_tokens(
@@ -2623,6 +2662,7 @@ class AccountService:
 
         replacement, verified_identity, info = self._verified_chat_import_material(
             payload, source_type, None, identity, verified_oauth=verified_oauth,
+            observation=observation,
         )
         replacement["source_type"] = source_type
         new_token = replacement["access_token"]
@@ -2630,7 +2670,7 @@ class AccountService:
         account = self._normalize_account({
             **replacement,
             "account_id": verified_identity[1],
-            "user_id": verified_identity[0],
+            "user_id": info.get("user_id"),
             "source_type": source_type if source_type in {"web", "oauth_login", "password"} else "web",
             "managed_owner": owner,
             "managed_account_id": uuid.uuid4().hex,
@@ -2668,7 +2708,7 @@ class AccountService:
                     if (saved is None or self._authorization_revision(saved) != self._authorization_revision(account)
                             or saved.get("managed_owner") != owner
                             or saved.get("managed_account_id") != account.get("managed_account_id")
-                            or str(saved.get("user_id") or "") != verified_identity[0]
+                            or str(saved.get("user_id") or "") != str(info.get("user_id") or "")
                             or self._validated_workspace_id(saved.get("account_id")) != verified_identity[1]):
                         raise RuntimeError("account import not confirmed")
                 except Exception:
