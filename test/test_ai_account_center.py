@@ -257,6 +257,48 @@ class AccountCenterTests(unittest.TestCase):
         self.assertEqual(current["limits_progress"][0]["remaining"], 2)
         self.assertEqual(current["capacity_observed_at"], "2026-09-18T00:00:00+00:00")
 
+    def test_chat_refresh_compares_chat_user_id_not_oauth_subject(self) -> None:
+        chat = credentials("chat-refresh", subject="oauth-principal")
+        codex = credentials("retained-codex")
+        self.accounts.add_account_items([{
+            **chat, "source_type": "web", "user_id": "chat-user-id",
+            "quota": 7, "limits_progress": [{"feature_name": "image_gen", "remaining": 7}],
+            "capacity_read_failed_at": "2026-09-20T07:46:00+00:00",
+            "codex_credentials": codex, "task_receipts": {"original": "keep"},
+        }])
+        ref = self.accounts.list_pool_accounts()[0]["account_ref"]
+        info = {"user_id": "chat-user-id", "account_id": ACCOUNT_ID, "quota": 9,
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 9}]}
+        with patch.object(self.accounts, "_verified_chat_info", return_value=(("chat-user-id", ACCOUNT_ID), info)):
+            result = self.accounts.refresh_pool_account(ref, ["chat"], False)
+        self.assertEqual(result["chat"]["state"], "observed")
+        self.assertEqual(result["capacity"]["remaining"], 9)
+        self.assertIsNone(result["capacity"]["failed_at"])
+        self.assertEqual(result["account_ref"], ref)
+        saved = self.accounts.list_accounts()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["access_token"], chat["access_token"])
+        self.assertEqual(saved[0]["codex_credentials"], codex)
+        self.assertEqual(saved[0]["task_receipts"], {"original": "keep"})
+
+    def test_chat_refresh_rejects_real_user_or_workspace_mismatch(self) -> None:
+        chat = credentials("chat-mismatch", subject="oauth-principal")
+        self.accounts.add_account_items([{
+            **chat, "source_type": "web", "user_id": "original-chat-user",
+            "quota": 7, "limits_progress": [{"feature_name": "image_gen", "remaining": 7}],
+        }])
+        ref = self.accounts.list_pool_accounts()[0]["account_ref"]
+        for identity in [("different-chat-user", ACCOUNT_ID), ("original-chat-user", OTHER_ACCOUNT_ID)]:
+            with self.subTest(identity=identity), patch.object(
+                    self.accounts, "_verified_chat_info", return_value=(identity, {"quota": 999})):
+                result = self.accounts.refresh_pool_account(ref, ["chat"], False)
+            self.assertEqual(result["chat"]["state"], "read_failed")
+            self.assertEqual(result["capacity"]["remaining"], 7)
+            saved = self.accounts.list_accounts()[0]
+            self.assertEqual(saved["user_id"], "original-chat-user")
+            self.assertEqual(saved["account_id"], ACCOUNT_ID)
+            self.assertEqual(saved["access_token"], chat["access_token"])
+
     def test_targeted_chat_import_preserves_codex_and_rejects_identity_mismatch(self) -> None:
         ref, codex = self.add_dual_account()
         chat = credentials("chat")

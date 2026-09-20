@@ -1865,14 +1865,15 @@ class AccountService:
             if not self._chat_authorization_saved(account):
                 return
             expected = (token, str(account.get("account_id") or ""))
-            expected_identity = self._account_identity(account)
-            if expected_identity is None:
-                subject = str(account.get("user_id") or "").strip()
-                workspace = self._validated_workspace_id(account.get("account_id"))
-                expected_identity = (subject, workspace) if subject and workspace else None
+            # /backend-api/me.id is a Chat user ID, not the OAuth JWT sub.
+            # Compare each upstream identity to its own persisted namespace.
+            # The credential CAS below still fences rotations of this row.
+            expected_user = str(account.get("user_id") or "").strip()
+            expected_workspace = self._validated_workspace_id(account.get("account_id"))
         try:
             observed_identity, info = self._verified_chat_info(token)
-            if expected_identity is not None and observed_identity != expected_identity:
+            if ((expected_user and observed_identity[0] != expected_user)
+                    or (expected_workspace and observed_identity[1] != expected_workspace)):
                 raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
         except Exception:
             self.update_account(
