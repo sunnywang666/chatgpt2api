@@ -61,6 +61,10 @@ class ModelCatalogService:
         for account in self._accounts.list_accounts():
             if not isinstance(account, dict) or account.get("status") in {"禁用", "异常"}:
                 continue
+            if str(account.get("source_type") or "").strip().lower() not in {"web", "oauth_login", "password"}:
+                # Codex authorization is a separate bearer and must never be
+                # sent to Chat's model-catalog endpoint.
+                continue
             access_token = str(account.get("access_token") or "").strip()
             account_type = self._accounts._normalize_account_type(account.get("type"))
             if access_token and account_type:
@@ -163,6 +167,77 @@ class ModelCatalogService:
             "object": "list",
             "data": [union[model_id] for model_id in sorted(union)],
         }
+
+    def management_models(self) -> list[dict[str, Any]]:
+        """Project the real Chat catalog without inventing per-account probes."""
+        self._ensure_catalog()
+        accounts = self._accounts.list_accounts()
+        with self._lock:
+            anonymous = {key: dict(value) for key, value in self._anonymous_models.items()}
+            by_type = {
+                account_type: {key: dict(value) for key, value in models.items()}
+                for account_type, models in self._models_by_account_type.items()
+            }
+        model_types: dict[str, set[str]] = {}
+        model_payloads: dict[str, dict[str, Any]] = dict(anonymous)
+        for account_type, models in by_type.items():
+            for model_id, payload in models.items():
+                model_types.setdefault(model_id, set()).add(account_type)
+                model_payloads.setdefault(model_id, payload)
+
+        from services.owned_accounts import public_pool_account
+        from services.public_chat_service import public_reasoning_efforts
+
+        result: list[dict[str, Any]] = []
+        for model_id in sorted(model_payloads):
+            supported_types = model_types.get(model_id, set())
+            projected_accounts = []
+            unavailable = 0
+            pending = 0
+            for account in accounts:
+                if str(account.get("source_type") or "").strip().lower() not in {"web", "oauth_login", "password"}:
+                    continue
+                account_type = self._accounts._normalize_account_type(account.get("type"))
+                if account_type not in supported_types:
+                    continue
+                safe = public_pool_account(account)
+                if account.get("managed_disabled") or account.get("status") == "禁用":
+                    state, reason = "unavailable", "disabled"
+                    unavailable += 1
+                elif account.get("status") == "异常":
+                    state, reason = "unavailable", "account_unavailable"
+                    unavailable += 1
+                else:
+                    # The cache proves support for this account type only. It
+                    # does not prove that every peer account was observed.
+                    state, reason = "unknown", "account_type_catalog_only"
+                    pending += 1
+                projected_accounts.append({
+                    "account_ref": safe["account_ref"],
+                    "label": safe["label"],
+                    "state": state,
+                    "reason": reason,
+                })
+            capabilities = (
+                ["image_generation", "image_edit"]
+                if model_id == "gpt-image-2" else ["text", "image_input"]
+            )
+            supported = len(projected_accounts)
+            state = "unavailable" if supported and unavailable == supported else "unknown"
+            result.append({
+                "id": model_id,
+                "label": str(model_payloads[model_id].get("label") or model_id)[:160],
+                "route": "chat",
+                "capabilities": capabilities,
+                "state": state,
+                "supported_accounts": supported,
+                "available_accounts": 0 if state == "unavailable" else None,
+                "pending_accounts": pending,
+                "unavailable_accounts": unavailable,
+                "accounts": projected_accounts,
+                "reasoning_efforts": public_reasoning_efforts(model_id),
+            })
+        return result
 
     def route_for_model(self, model: str) -> ModelRoute:
         model = str(model or "").strip()

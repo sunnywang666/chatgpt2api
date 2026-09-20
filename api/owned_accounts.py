@@ -7,6 +7,7 @@ from typing import Literal
 from api.support import require_admin
 from services.account_service import CodexAuthorizationAttachError, account_service
 from services.auth_service import auth_service
+from services.chat_login_service import ChatLoginError, chat_login_service
 from services.codex_login_service import CodexLoginError, codex_login_service
 from services.program_key_policy import PolicyError
 
@@ -18,10 +19,30 @@ class ImportAccount(BaseModel):
     id_token: SecretStr | None = None
     source_type: str = "web"
     account_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,200}$")
+    account_ref: str | None = Field(default=None, pattern=r"^car_[A-Za-z0-9_-]{43}$")
 
 
 class EnabledAccount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     enabled: bool
+
+
+class AccountLabel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: str = Field(max_length=80)
+
+
+class AccountRefresh(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    routes: list[Literal["chat", "codex"]] | None = Field(default=None, min_length=1, max_length=2)
+    stale_only: bool = False
+
+
+class ResourceSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_revision: int = Field(ge=0)
+    image_account_concurrency: int = Field(ge=1, le=16)
+    codex_max_concurrency: int = Field(ge=1, le=32)
 
 
 class CodexAuthorization(BaseModel):
@@ -43,6 +64,18 @@ class CodexLoginStart(BaseModel):
     client_request_id: str = Field(min_length=36, max_length=36)
     mode: Literal["import", "attach"]
     account_ref: str | None = Field(default=None, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+
+
+class ChatLoginStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    client_request_id: str = Field(min_length=36, max_length=36)
+    mode: Literal["import", "attach"]
+    account_ref: str | None = Field(default=None, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+
+
+class ChatLoginCallback(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    callback_url: SecretStr = Field(min_length=1, max_length=30_000)
 
 
 class KeyName(BaseModel):
@@ -86,6 +119,16 @@ async def login_operation(handler, *args):
         raise HTTPException(status, detail={"code": exc.code}) from None
 
 
+async def chat_login_operation(handler, *args):
+    try:
+        return await run_in_threadpool(handler, *args)
+    except ChatLoginError as exc:
+        raise HTTPException(exc.status_code, detail={"code": exc.code}) from None
+    except CodexAuthorizationAttachError as exc:
+        status = 404 if exc.code == "codex_authorization_account_not_found" else 409
+        raise HTTPException(status, detail={"code": exc.code}) from None
+
+
 def create_router() -> APIRouter:
     router = APIRouter(prefix="/api/workbench/ai")
 
@@ -98,6 +141,21 @@ def create_router() -> APIRouter:
     async def pool_accounts(authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner_scope(authorization, x_workbench_account_owner)
         return {"items": await run_in_threadpool(account_service.list_pool_accounts)}
+
+    @router.get("/pool/resources")
+    async def pool_resources(authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        from services.pool_resources import resource_snapshot
+        from services.image_task_service import image_task_service
+        from services.codex_service import codex_service
+        return await run_in_threadpool(resource_snapshot, account_service, image_task_service, codex_service)
+
+    @router.post("/pool/resource-settings")
+    async def resource_settings(body: ResourceSettings, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        from services.config import config
+        return await account_operation(config.update_resource_settings, body.expected_revision,
+                                       body.image_account_concurrency, body.codex_max_concurrency)
 
     @router.post("/accounts")
     async def import_account(body: ImportAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
@@ -122,6 +180,21 @@ def create_router() -> APIRouter:
         account_ref = payload.pop("account_ref", None)
         await account_operation(account_service.attach_codex_authorization, payload, account_ref)
         return {"attached": True}
+
+    @router.post("/pool/accounts/{account_ref}/enabled")
+    async def enable_pool_account(account_ref: str, body: EnabledAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        return {"item": await account_operation(account_service.set_pool_account_enabled, account_ref, body.enabled)}
+
+    @router.post("/pool/accounts/{account_ref}/label")
+    async def label_pool_account(account_ref: str, body: AccountLabel, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        return {"item": await account_operation(account_service.set_pool_account_label, account_ref, body.label)}
+
+    @router.post("/pool/accounts/{account_ref}/refresh")
+    async def refresh_pool_account(account_ref: str, body: AccountRefresh, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        return {"item": await account_operation(account_service.refresh_pool_account, account_ref, body.routes or ["chat", "codex"], body.stale_only)}
 
     @router.post("/codex-observation")
     async def refresh_owned_codex_observation(body: CodexObservationTarget, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
@@ -160,6 +233,32 @@ def create_router() -> APIRouter:
         owner = owner_scope(authorization, x_workbench_account_owner)
         return await login_operation(codex_login_service.cancel, owner, "owned", session_id)
 
+    @router.post("/chat-login")
+    async def start_chat_login(body: ChatLoginStart, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await chat_login_operation(
+            chat_login_service.start, owner, "owned", body.mode,
+            body.client_request_id, body.account_ref,
+        )
+
+    @router.get("/chat-login/{session_id}")
+    async def get_chat_login(session_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await chat_login_operation(chat_login_service.get, owner, "owned", session_id)
+
+    @router.post("/chat-login/{session_id}/callback")
+    async def submit_chat_login_callback(session_id: str, body: ChatLoginCallback, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await chat_login_operation(
+            chat_login_service.submit_callback, owner, "owned", session_id,
+            body.callback_url.get_secret_value(),
+        )
+
+    @router.delete("/chat-login/{session_id}")
+    async def cancel_chat_login(session_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await chat_login_operation(chat_login_service.cancel, owner, "owned", session_id)
+
     @router.post("/pool/codex-login")
     async def start_pool_codex_login(body: CodexLoginStart, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)
@@ -181,6 +280,32 @@ def create_router() -> APIRouter:
     async def cancel_pool_codex_login(session_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)
         return await login_operation(codex_login_service.cancel, owner, "pool", session_id)
+
+    @router.post("/pool/chat-login")
+    async def start_pool_chat_login(body: ChatLoginStart, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await chat_login_operation(
+            chat_login_service.start, owner, "pool", body.mode,
+            body.client_request_id, body.account_ref,
+        )
+
+    @router.get("/pool/chat-login/{session_id}")
+    async def get_pool_chat_login(session_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await chat_login_operation(chat_login_service.get, owner, "pool", session_id)
+
+    @router.post("/pool/chat-login/{session_id}/callback")
+    async def submit_pool_chat_login_callback(session_id: str, body: ChatLoginCallback, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await chat_login_operation(
+            chat_login_service.submit_callback, owner, "pool", session_id,
+            body.callback_url.get_secret_value(),
+        )
+
+    @router.delete("/pool/chat-login/{session_id}")
+    async def cancel_pool_chat_login(session_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+        owner = owner_scope(authorization, x_workbench_account_owner)
+        return await chat_login_operation(chat_login_service.cancel, owner, "pool", session_id)
 
     @router.post("/accounts/{account_id}/refresh")
     async def refresh_account(account_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):

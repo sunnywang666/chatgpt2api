@@ -524,6 +524,21 @@ class ImageTaskService:
             if changed:
                 self._save_locked()
 
+    def resource_occupancy(self) -> dict:
+        """Internal aggregate only: keep unfinished original receipts after restart."""
+        with self._lock:
+            held = {}
+            unattributed = 0
+            for task in self._tasks.values():
+                if not _holds_upstream_slot(task):
+                    continue
+                identity = str(task.get("provider_account_identity") or "")
+                if identity:
+                    held[identity] = held.get(identity, 0) + 1
+                else:
+                    unattributed += 1
+            return {"by_account": held, "unattributed": unattributed}
+
     def submit_generation(
         self,
         identity: dict[str, object],
