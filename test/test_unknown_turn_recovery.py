@@ -110,6 +110,40 @@ def test_nine_legacy_unknowns_keep_results_and_order_but_release_proven_ended_tu
     assert restarted.resource_snapshot()["chat_turn"]["inflight"] == 1
 
 
+@pytest.mark.parametrize("recovery", ["transport", "ended_empty", "completed"])
+def test_unrecoverable_result_is_not_proof_of_an_ended_model_turn(tmp_path, recovery):
+    service, admission, backend, legacy = migration(tmp_path)
+    original_id = legacy[0]["request_id"]
+    service._update("owner", original_id, status="failed", error_code="RESULT_UNRECOVERABLE",
+                    upstream_outcome="unknown", recovery_retryable=True)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    service.submit("owner", {"client_request_id": "next", "client_conversation_id": "client-0",
+                             "model": "fixture-text", "messages": []})
+    assert admission.claim_next() is None
+    def read(receipt):
+        if recovery == "transport":
+            raise ConnectionError("synthetic read failure")
+        doc = document(receipt)
+        if recovery == "completed":
+            doc["mapping"]["final-user-0"]["message"]["content"]["parts"] = ["original completed result"]
+        return ConversationBindingService._read_text_request_result(backend, receipt, document=doc)
+    service.recovery_reader = read
+    admission.recoveries["text"] = service.read
+    admission.recover_one()
+    with service.store.connect() as db:
+        actual = service.store.read_receipt(db, "text", "owner", original_id)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == (1 if recovery == "transport" else 0)
+    assert actual["request_message_id"] == legacy[0]["request_message_id"]
+    assert actual["provider_account_identity"] == legacy[0]["provider_account_identity"]
+    if recovery == "completed":
+        assert actual["status"] == "succeeded"
+        assert actual["upstream_outcome"] == "completed"
+        assert actual["recovery_retryable"] is False
+    else:
+        assert actual["status"] == "failed" and actual["upstream_outcome"] == "unknown"
+        assert admission.claim_next() is None
+
+
 @pytest.mark.parametrize("case", ["active", "no_result", "missing_user", "wrong_parent", "branch", "missing_status", "not_end_turn", "transport"])
 def test_age_missing_or_ambiguous_result_never_proves_idle(tmp_path, case):
     service, admission, backend, legacy = migration(tmp_path)

@@ -508,6 +508,8 @@ class TextTaskService:
                 changes = {
                     **(recovered or {}),
                     "status": "succeeded",
+                    "upstream_outcome": "completed",
+                    "recovery_retryable": False,
                     "finished_at": now,
                     "error_code": None,
                     "recovery_next_at": None,
@@ -527,6 +529,7 @@ class TextTaskService:
             return self._public(updated)
 
     def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False):
+        from services.pool_admission import unknown_text_result
         recovery_claim = None
         now = self._now()
         with self._db() as db:
@@ -560,7 +563,7 @@ class TextTaskService:
                     previous = {**previous, "status": "unknown", "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "updated_at": now}
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
-                if (previous["status"] == "unknown"
+                if (unknown_text_result(previous)
                         and previous.get("request_message_id")
                         and previous.get("provider_binding_id")
                         and previous.get("provider_account_identity")
@@ -671,7 +674,7 @@ class TextTaskService:
                 "recovery_requires_new_conversation": bool(
                     current.get("recovery_requires_new_conversation")
                 ),
-                "recovery_next_at": None,
+                "recovery_next_at": current.get("recovery_next_at") or now + self.RECOVERY_BASE_BACKOFF_SECONDS,
                 "recovery_claim_id": None,
                 "recovery_claimed_at": None,
                 "recovery_lease_until": None,

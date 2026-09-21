@@ -24,10 +24,16 @@ def account_clock_key(account):
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
+def unknown_text_result(receipt):
+    return (receipt.get("status") == "unknown"
+            or receipt.get("status") == "failed" and receipt.get("error_code") == "RESULT_UNRECOVERABLE"
+            and receipt.get("upstream_outcome") == "unknown")
+
+
 def unfinished(kind, receipt):
     if kind == "image":
         return receipt.get("upstream_unfinished") is True or receipt.get("status") in {"queued", "running"}
-    return receipt.get("status") in {"queued", "running", "unknown", "not_started"}
+    return receipt.get("status") in {"queued", "running", "not_started"} or unknown_text_result(receipt)
 
 
 def original_turn_ended(kind, receipt):
@@ -36,7 +42,7 @@ def original_turn_ended(kind, receipt):
     # Older public Chat code recorded a definitive validation rejection as
     # UNKNOWN. Only its exact model endpoint / pre-SSE HTTP evidence proves
     # that turn ended. Missing stages, timeouts and result age prove nothing.
-    return (kind == "text" and receipt.get("status") == "unknown"
+    return (kind == "text" and unknown_text_result(receipt)
             and receipt.get("_route", "chat") == "chat" and not receipt.get("_forward_protocol")
             and receipt.get("original_failure_phase") == "stream_open"
             and receipt.get("original_exception_category") == "http"
@@ -173,7 +179,7 @@ class PoolAdmission:
                 if not chat_recovery_supported(r):
                     continue
             if kind == "text":
-                due = r.get("status") == "unknown" and r.get("provider_binding_id") and float(r.get("recovery_next_at") or 0) <= now
+                due = unknown_text_result(r) and r.get("provider_binding_id") and float(r.get("recovery_next_at") or 0) <= now
             else:
                 due = (r.get("status") == "error" and r.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
                        and r.get("conversation_id") and r.get("request_message_id") and float(r.get("next_poll_at") or 0) <= now)
@@ -243,7 +249,8 @@ class PoolAdmission:
         for kind, owner, request_id, r in receipts:
             status = r.get("status")
             pending = unfinished(kind, r)
-            unknown = status == "unknown" or (kind == "image" and status == "error" and r.get("upstream_unfinished"))
+            unknown = (unknown_text_result(r) if kind == "text" else status == "unknown"
+                       or status == "error" and r.get("upstream_unfinished"))
             account = by_identity.get(str(r.get("provider_account_identity") or ""))
             resource = account_clock_key(account) if account else r.get("_account_resource")
             active = status == "running" or unknown
