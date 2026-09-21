@@ -34,9 +34,9 @@ class AccountStateLock:
                 if hasattr(self.owner, "_accounts"):
                     previous = self.owner._accounts
                     fresh = self.owner._load_accounts()
-                    by_id = {a.get("provider_account_identity"): token for token, a in fresh.items() if a.get("provider_account_identity")}
+                    by_id = {self.owner._stable_account_identity(a): token for token, a in fresh.items()}
                     for token, account in previous.items():
-                        next_token = by_id.get(account.get("provider_account_identity"))
+                        next_token = by_id.get(self.owner._stable_account_identity(account))
                         if next_token and next_token != token:
                             self.owner._token_aliases[token] = next_token
                             count = self.owner._image_inflight.pop(token, 0)

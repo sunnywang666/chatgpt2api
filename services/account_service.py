@@ -76,14 +76,22 @@ class AccountService:
         return self._lock
 
     def admission_accounts(self) -> list[dict]:
-        """Called inside admission_transaction; no network or credential copy."""
-        return [dict(account) for account in self._accounts.values()]
+        """Read-only internal view; old Codex-only rows need no image binding."""
+        return [{**account, "provider_account_identity": self._stable_account_identity(account)}
+                for account in self._accounts.values()]
+
+    @classmethod
+    def _stable_account_identity(cls, account: dict) -> str:
+        # Keep all issued identities. Until the first ordinary binding save,
+        # derive the same opaque identity from the existing, rotation-stable
+        # pool ref. Reading resources must not mutate the account authority.
+        return str(account.get("provider_account_identity") or "").strip() or "account_" + cls.pool_account_ref(account)[4:]
 
     def admission_binding(self, account_identity: str) -> str:
         """Bind the selected original account without selecting/probing again."""
         with self._lock:
             matches = [token for token, account in self._accounts.items()
-                       if account.get("provider_account_identity") == account_identity]
+                       if self._stable_account_identity(account) == account_identity]
             if len(matches) != 1:
                 raise RuntimeError("admission account identity is ambiguous")
             account = self._accounts[matches[0]]
@@ -1542,7 +1550,7 @@ class AccountService:
         identity = str(account.get("provider_account_identity") or "").strip()
         if identity:
             return identity
-        identity = f"account_{uuid.uuid4().hex}"
+        identity = self._stable_account_identity(account)
         account = dict(account)
         account["provider_account_identity"] = identity
         self._accounts[resolved] = account
