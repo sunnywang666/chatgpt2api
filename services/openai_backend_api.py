@@ -657,6 +657,16 @@ class OpenAIBackendAPI:
             payload["conversation_id"] = conversation_id
         elif parent_message_id:
             raise RuntimeError("parent_message_id requires conversation_id")
+        from services.request_context import current_request
+        context = current_request.get()
+        if context is not None and context.receipt().get("_chat_recovery"):
+            # Save the actual outbound cursor before the model POST. For a
+            # batched history the root parent is not the last user's parent;
+            # the original user UUID is subsequently located in the GET tree.
+            context.admission.update_claim(context,
+                request_parent_message_id=payload["parent_message_id"] if len(payload["messages"]) == 1 else "",
+                _submission_parent_message_id=payload["parent_message_id"],
+                **({"conversation_id": conversation_id} if conversation_id else {}))
         return payload
 
     def _image_model_settings(self, model: str) -> tuple[str, str]:

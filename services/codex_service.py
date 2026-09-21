@@ -1190,6 +1190,16 @@ class CodexService:
             event = json.loads(line[5:].strip())
             from services.request_context import current_request
             context = current_request.get()
+            if context is not None and isinstance(event, dict):
+                original_response = event.get("response")
+                response_id = (original_response.get("id") if isinstance(original_response, dict) else None) or event.get("response_id")
+                if isinstance(response_id, str) and response_id.strip():
+                    receipt = context.receipt()
+                    if receipt.get("upstream_response_id") and receipt["upstream_response_id"] != response_id:
+                        raise CodexServiceError(502, "codex_response_identity_mismatch", "Original response identity changed")
+                    if not receipt.get("upstream_response_id"):
+                        context.admission.update_claim(context, upstream_response_id=response_id,
+                            upstream_request_id=_response_headers(response.headers).get("x-request-id"))
             if event.get("type") == "response.failed" and context is not None:
                 context.admission.update_claim(context, _upstream_failed=True)
             error = event.get("error") or ((event.get("response") or {}).get("error") if event.get("type") == "response.failed" else None)
