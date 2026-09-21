@@ -1,0 +1,25 @@
+name: DSH repair source snapshot
+on:
+  push:
+    branches: [fix/dsh-session-continuity-20260921]
+    paths: [.github/workflows/dsh-repair-source.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Package tracked code only
+        run: |
+          mkdir -p "$RUNNER_TEMP/dsh-source"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/dsh-source/provider-source.tar.gz" HEAD api services utils test docs requirements.txt config.json
+          git rev-parse HEAD > "$RUNNER_TEMP/dsh-source/source-sha.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-repair-provider-source
+          path: ${{ runner.temp }}/dsh-source/
+          retention-days: 3
