@@ -42,7 +42,8 @@ def fixture_upstream(runtime, monkeypatch, *, fail_slot=1, saved_ids=False, curs
     from services.protocol import conversation
     runtime.admission.recoveries["text"] = lambda owner, rid: runtime.service.read(owner, rid)
     observed = SimpleNamespace(sends=[], reads=[], downloads=[], resolves=[], lists=[], active=False,
-                               download_failure=False, before_download=None, before_read=None, before_resolve=None)
+                               download_failure=False, before_download=None, before_read=None, before_resolve=None,
+                               extra_file_ids=[])
     def generate(req, index, total):
         ctx = current_request.get()
         assert ctx.selected_account()["provider_account_identity"] == "account-0"
@@ -77,7 +78,9 @@ def fixture_upstream(runtime, monkeypatch, *, fail_slot=1, saved_ids=False, curs
                 user: {"parent": "root", "message": message(user, "user", {"content_type": "text", "parts": ["original prompt"]})},
                 "original-image": {"parent": user, "message": message("original-image", "tool", {
                     "content_type": "multimodal_text", "parts": [{"content_type": "image_asset_pointer",
-                    "asset_pointer": "file-service://original-file-" + str(index)}]}, status="finished_successfully", create_time=1)},
+                    "asset_pointer": "file-service://original-file-" + str(index)}, *[
+                        {"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + fid}
+                        for fid in observed.extra_file_ids]]}, status="finished_successfully", create_time=1)},
                 "original-final": {"parent": "original-image", "message": message("original-final", "assistant",
                     {"content_type": "text", "parts": [""]}, channel="final",
                     status="in_progress" if observed.active else "finished_successfully", end_turn=not observed.active)},
@@ -351,4 +354,68 @@ def test_verified_turn_end_releases_model_during_download_failure(runtime, monke
     assert runtime.admission.resource_snapshot()["chat_turn"]["inflight"] == 0
     assert receipt["recovery_phase"] == "download_image"
     assert not receipt["_image_slots"]["0"].get("completed")
+    assert len(observed.sends) == 1
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_completed_branch_adds_results_missing_from_saved_ids(runtime, monkeypatch, cached):
+    observed = fixture_upstream(runtime, monkeypatch, saved_ids=True)
+    data = execute(runtime, "openai_v1_image_generations")
+    previous_ref = None
+    if cached:
+        observed.active = True
+        assert recover(runtime)["status"] == "unknown"
+        previous_ref = original(runtime)["_image_slots"]["0"]["output_ref"]
+        with runtime.store.output_file(previous_ref) as handle:
+            previous_bytes = handle.read()
+        observed.active = False
+    observed.extra_file_ids = ["original-file-2"]
+    assert recover(runtime)["status"] == "succeeded"
+    wire = json.loads(asyncio.run(response_bytes(runtime, "openai_v1_image_generations", data)))
+    assert [item["url"] for item in wire["data"]] == [image_url(image_bytes(1)), image_url(image_bytes(2))]
+    assert original(runtime)["_image_slots"]["0"]["file_ids"] == ["original-file-1", "original-file-2"]
+    assert len(observed.sends) == 1
+    if previous_ref:
+        with runtime.store.output_file(previous_ref) as handle:
+            assert handle.read() == previous_bytes
+
+
+def test_missing_terminal_result_download_failure_preserves_cached_output_until_complete(runtime, monkeypatch):
+    observed = fixture_upstream(runtime, monkeypatch, saved_ids=True)
+    data = execute(runtime, "openai_v1_image_generations")
+    observed.active = True
+    assert recover(runtime)["status"] == "unknown"
+    cached = original(runtime)["_image_slots"]["0"]["output_ref"]
+    observed.active = False
+    observed.extra_file_ids = ["original-file-2"]
+    def fail_second(index):
+        if index == 2:
+            raise ConnectionError("synthetic original second result download unavailable")
+    observed.before_resolve = fail_second
+    assert recover(runtime)["status"] == "unknown"
+    assert original(runtime)["_image_slots"]["0"]["output_ref"] == cached
+    assert not original(runtime)["_image_slots"]["0"].get("completed")
+    observed.before_resolve = None
+    assert recover(runtime)["status"] == "succeeded"
+    wire = json.loads(asyncio.run(response_bytes(runtime, "openai_v1_image_generations", data)))
+    assert len(wire["data"]) == 2 and len(observed.sends) == 1
+
+
+def test_duplicate_bytes_from_successful_original_urls_complete_without_repeated_downloads(runtime, monkeypatch):
+    from services import openai_backend_api
+    observed = fixture_upstream(runtime, monkeypatch)
+    observed.extra_file_ids = ["original-file-2"]
+    downloads = []
+    class Session:
+        def get(self, url, **kwargs):
+            downloads.append(url)
+            return SimpleNamespace(status_code=200, content=image_bytes(1))
+    monkeypatch.setattr(openai_backend_api.OpenAIBackendAPI, "session", Session(), raising=False)
+    monkeypatch.setattr(openai_backend_api.OpenAIBackendAPI, "download_image_bytes", OpenAIBackendAPI.download_image_bytes)
+    data = execute(runtime, "openai_v1_image_generations")
+    assert recover(runtime)["status"] == "succeeded"
+    wire = json.loads(asyncio.run(response_bytes(runtime, "openai_v1_image_generations", data)))
+    assert len(wire["data"]) == 1 and wire["data"][0]["url"] == image_url(image_bytes(1))
+    assert recover(runtime)["status"] == "succeeded"
+    assert downloads == ["https://download.example/1", "https://download.example/2"]
     assert len(observed.sends) == 1

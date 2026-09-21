@@ -209,6 +209,15 @@ def _resolve_original_urls(backend, conversation_id, file_ids, sediment_ids):
     return urls
 
 
+def _terminal_result_ids(backend, document, ended, message_id):
+    records = backend._extract_image_tool_records({**document, "current_node": ended["final_message_id"]}, message_id)
+    result = {key: list(dict.fromkeys(value for record in records for value in record[key]))
+              for key in ("file_ids", "sediment_ids")}
+    if not any(result.values()):
+        raise RuntimeError("original image is still unresolved")
+    return result
+
+
 def recover(service, owner, receipt):
     context = _RecoveryContext(service, owner, receipt)
     with executing(context):
@@ -241,6 +250,28 @@ def _recover(service, owner, receipt, context):
             try:
                 conversation_id = slot.get("conversation_id")
                 document = None
+                def download_results(result_ids):
+                    context.set_phase("resolve_image_download")
+                    urls = _resolve_original_urls(backend, conversation_id, **result_ids)
+                    context.set_phase("download_image")
+                    downloaded = []
+                    for url in urls:
+                        # The existing downloader deduplicates equal bytes.
+                        # First prove every URL succeeded, then deduplicate.
+                        images = backend.download_image_bytes([url])
+                        if len(images) != 1 or not images[0]:
+                            raise RuntimeError("original image download is incomplete")
+                        if images[0] not in downloaded:
+                            downloaded.append(images[0])
+                    if not downloaded:
+                        raise RuntimeError("original image download is incomplete")
+                    context.set_phase("save_image_result")
+                    data = format_image_result([{"b64_json": base64.b64encode(value).decode("ascii")} for value in downloaded],
+                                               _prompt(spec), metadata["response_format"], metadata["base_url"])["data"]
+                    ref = _save_outputs(service.store, [ImageOutput(kind="result", model=metadata["model"], index=index + 1,
+                                        total=metadata["n"], data=data, conversation_id=conversation_id)])
+                    save_slot_progress(output_ref=ref, output_result_ids=result_ids)
+
                 if not conversation_id:
                     located, document = ConversationBindingService._locate_text_request_conversation(backend, {
                         **receipt, "request_message_id": slot["request_message_id"], "conversation_id": "",
@@ -258,25 +289,11 @@ def _recover(service, owner, receipt, context):
                         raise RuntimeError("original image branch is not known to have ended")
                     receipt = service._update_recovery_claim(owner, receipt,
                         **_slot_changes(receipt, index, turn_end=ended), _upstream_terminal=True, _turn_reserved=False)
-                    records = backend._extract_image_tool_records({**document, "current_node": ended["final_message_id"]}, slot["request_message_id"])
-                    file_ids = list(dict.fromkeys(value for record in records for value in record["file_ids"]))
-                    sediment_ids = list(dict.fromkeys(value for record in records for value in record["sediment_ids"]))
-                    if not file_ids and not sediment_ids:
-                        raise RuntimeError("original image is still unresolved")
+                    result_ids = _terminal_result_ids(backend, document, ended, slot["request_message_id"])
+                    file_ids, sediment_ids = result_ids["file_ids"], result_ids["sediment_ids"]
                     save_slot_progress(file_ids=file_ids, sediment_ids=sediment_ids)
                 if not slot.get("output_ref"):
-                    context.set_phase("resolve_image_download")
-                    urls = _resolve_original_urls(backend, conversation_id, file_ids, sediment_ids)
-                    context.set_phase("download_image")
-                    downloaded = backend.download_image_bytes(urls) if urls else []
-                    if not downloaded or len(downloaded) != len(urls):
-                        raise RuntimeError("original image download is incomplete")
-                    context.set_phase("save_image_result")
-                    data = format_image_result([{"b64_json": base64.b64encode(value).decode("ascii")} for value in downloaded],
-                                               _prompt(spec), metadata["response_format"], metadata["base_url"])["data"]
-                    ref = _save_outputs(service.store, [ImageOutput(kind="result", model=metadata["model"], index=index + 1,
-                                        total=metadata["n"], data=data, conversation_id=conversation_id)])
-                    save_slot_progress(output_ref=ref)
+                    download_results({"file_ids": file_ids, "sediment_ids": sediment_ids})
                 # A saved image is not, by itself, proof that other work on the
                 # original branch ended. Keep the downloaded file while waiting.
                 context.set_phase("read_image_request")
@@ -284,6 +301,16 @@ def _recover(service, owner, receipt, context):
                 ended = _ended(document, conversation_id, slot["request_message_id"])
                 if not ended:
                     raise RuntimeError("original image branch is not known to have ended")
+                complete_ids = _terminal_result_ids(backend, document, ended, slot["request_message_id"])
+                # SSE IDs and cached output can precede additional results on
+                # the same original branch. Keep the cached file and its exact
+                # coverage until a complete replacement has been saved.
+                coverage = _slot(receipt, index).get("output_result_ids") or {"file_ids": file_ids, "sediment_ids": sediment_ids}
+                receipt = service._update_recovery_claim(owner, receipt,
+                    **_slot_changes(receipt, index, **complete_ids, output_result_ids=coverage, turn_end=ended),
+                    _upstream_terminal=True, _turn_reserved=False)
+                if any(set(complete_ids[key]) != set(coverage[key]) for key in complete_ids):
+                    download_results(complete_ids)
                 receipt = service._update_recovery_claim(owner, receipt,
                     **_slot_changes(receipt, index, completed=True, turn_end=ended), _completed_slot=index,
                     _upstream_terminal=True, _turn_reserved=False)
