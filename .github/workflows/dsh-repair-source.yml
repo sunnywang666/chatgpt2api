@@ -16,78 +16,64 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Apply exact bounded source edits
+      - name: Verify exact offline patch and scope
         shell: python
         run: |
+          import base64, zlib, hashlib, subprocess
           from pathlib import Path
-          def edit(name, old, new):
-              p=Path(name); s=p.read_text(); assert s.count(old)==1,(name,old[:100]);p.write_text(s.replace(old,new))
-          edit('api/chat_requests.py','from pydantic import BaseModel, ConfigDict, Field, field_validator','from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator')
-          edit('api/chat_requests.py','    reasoning_effort: Literal["high"] | None = None\n','''    reasoning_effort: Literal["high"] | None = None
-              # An application-owned work session, NOT an upstream conversation cursor.
-              client_conversation_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
-              previous_request_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
-
-              @field_validator("client_conversation_id", "previous_request_id", mode="before")
-              @classmethod
-              def valid_continuation_reference(cls, value):
-                  if not isinstance(value, str) or value in {".", ".."}:
-                      raise ValueError("continuation references must be omitted or valid identifiers")
-                  return value
-
-              @model_validator(mode="after")
-              def continuation_contract(self):
-                  if self.previous_request_id and (not self.client_conversation_id or self.previous_request_id == self.client_request_id):
-                      raise ValueError("a different predecessor and a work session are required")
-                  if self.client_conversation_id and self.messages[-1].get("role") != "user":
-                      raise ValueError("a sequential turn must end with its new user input")
-                  return self
-          '''.replace('\n    ','\n',1) if False else '''    reasoning_effort: Literal["high"] | None = None
-              # An application-owned work session, NOT an upstream conversation cursor.
-              client_conversation_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
-              previous_request_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
-
-              @field_validator("client_conversation_id", "previous_request_id", mode="before")
-              @classmethod
-              def valid_continuation_reference(cls, value):
-                  if not isinstance(value, str) or value in {".", ".."}:
-                      raise ValueError("continuation references must be omitted or valid identifiers")
-                  return value
-
-              @model_validator(mode="after")
-              def continuation_contract(self):
-                  if self.previous_request_id and (not self.client_conversation_id or self.previous_request_id == self.client_request_id):
-                      raise ValueError("a different predecessor and a work session are required")
-                  if self.client_conversation_id and self.messages[-1].get("role") != "user":
-                      raise ValueError("a sequential turn must end with its new user input")
-                  return self
-          ''')
-          # Source text above is indented relative to this Python block only by YAML.
-          # Restore the exact four-space class indentation.
-          p=Path('api/chat_requests.py');s=p.read_text();s=s.replace('\n              ','\n    ').replace('\n                  ','\n        ').replace('\n                      ','\n            ');p.write_text(s)
-          edit('api/chat_requests.py','    # Absence retains the exact legacy identity;', '''    if body.client_conversation_id is not None:
-                  digest = hashlib.sha256(f"{owner}\\0session\\0{body.client_conversation_id}".encode()).hexdigest()
-                  payload["client_conversation_id"] = f"public-session-{digest}"
-                  payload["_public_session_ref"] = body.client_conversation_id
-                  if body.previous_request_id is not None:
-                      payload["_previous_request_id"] = body.previous_request_id
-              # Absence retains the exact legacy identity;'''.replace('\n              ','\n    ').replace('\n                  ','\n        ').replace('\n                      ','\n            '))
-          edit('api/chat_requests.py','''                detail={"code": "CHAT_REQUEST_CONFLICT", "request_id": body.client_request_id},
-                      ) from exc
-                  except HTTPException as exc:'''.replace('\n                      ','\n            ').replace('\n                  ','\n        '),'''                detail={"code": exc.code if exc.code.startswith("CHAT_") else "CHAT_REQUEST_CONFLICT",
-                                  "request_id": body.client_request_id,
-                                  **({"previous_request_id": body.previous_request_id} if body.previous_request_id else {})},
-                      ) from exc
-                  except HTTPException as exc:'''.replace('\n                                  ','\n                        ').replace('\n                      ','\n            ').replace('\n                  ','\n        '))
-          print('API source candidate prepared')
-      - name: Record preparation result
+          encoded=''.join(Path(f'.repair-transfer-{n}.txt').read_text().strip() for n in (1,2))
+          patch=zlib.decompress(base64.b64decode(encoded,validate=True))
+          assert hashlib.sha256(patch).hexdigest()=='1f65b8f50fb76716ce6b628ec0b6132eb8dbe34a9361fc78065477145e7a3d1f'
+          subprocess.run(['git','apply','--check','--unidiff-zero','-'],input=patch,check=True)
+          subprocess.run(['git','apply','--unidiff-zero','-'],input=patch,check=True)
+          paths=['api/chat_requests.py','docs/external-image-client.md','services/conversation_binding_service.py','services/openai_backend_api.py','services/public_chat_service.py','services/text_task_service.py','test/test_public_chat_sessions.py']
+          subprocess.run(['git','add','--']+paths,check=True)
+          assert subprocess.check_output(['git','diff','--cached','--name-only']).decode().splitlines()==sorted(paths)
+          subprocess.run(['git','diff','--cached','--check'],check=True)
+          evidence=Path('/tmp/dsh-repair-evidence');evidence.mkdir()
+          (evidence/'source-sha256.txt').write_text('\n'.join(hashlib.sha256(Path(p).read_bytes()).hexdigest()+'  '+p for p in paths)+'\n')
+          (evidence/'candidate.patch').write_bytes(patch)
+      - name: Install locked runtime and test runner
         run: |
-          python -m py_compile api/chat_requests.py
-          mkdir -p "$RUNNER_TEMP/evidence"
-          git diff > "$RUNNER_TEMP/evidence/prepared.patch"
+          python -m pip install uv pytest pytest-subtests
+          uv sync --locked --group dev
+          uv pip install --python .venv/bin/python pytest pytest-subtests
+          .venv/bin/python -c "import tiktoken;tiktoken.get_encoding('o200k_base');tiktoken.get_encoding('cl100k_base')"
+          .venv/bin/python -m pip freeze > /tmp/dsh-repair-evidence/environment.txt || uv pip freeze --python .venv/bin/python > /tmp/dsh-repair-evidence/environment.txt
+      - name: New and affected regressions
+        run: |
+          set -o pipefail
+          .venv/bin/python -m pytest -q test/test_public_chat_sessions.py test/test_public_chat_api.py test/test_company_requests.py test/test_text_task_service.py 2>&1 | tee /tmp/dsh-repair-evidence/affected.log
+      - name: Owning isolated suite (no live model service)
+        shell: python
+        run: |
+          import subprocess
+          from pathlib import Path
+          live={'test_generations.py','test_generations_url.py','test_gpt_ppt.py','test_gpt_psd.py','test_image.py','test_image_output_tokens.py','test_v1_chat_completions.py','test_v1_images_edits.py','test_v1_images_generations.py','test_v1_messages.py','test_v1_models.py','test_v1_responses.py'}
+          paths=[str(p) for p in sorted(Path('test').glob('test_*.py')) if p.name not in live]
+          Path('/tmp/dsh-repair-evidence/manual-live-not-run.txt').write_text('\n'.join(sorted(live))+'\n')
+          result=subprocess.run(['.venv/bin/python','-m','pytest','-q',*paths],stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+          Path('/tmp/dsh-repair-evidence/owning.log').write_bytes(result.stdout)
+          print(result.stdout.decode(errors='replace'))
+          raise SystemExit(result.returncode)
+      - name: Commit only reviewed product paths to this branch
+        env:
+          PUSH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/fix/dsh-session-continuity-20260921
+          git diff --cached --check
+          git config user.name 'sunnywang666'
+          git config user.email '197755426+sunnywang666@users.noreply.github.com'
+          git commit -m 'fix: preserve original Chat work sessions across durable model turns'
+          ASKPASS="$RUNNER_TEMP/dsh-askpass"
+          printf '%s\n' '#!/bin/sh' 'case "$1" in *Username*) echo x-access-token;; *) printf "%s\n" "$PUSH_TOKEN";; esac' > "$ASKPASS"
+          chmod 700 "$ASKPASS"
+          GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/fix/dsh-session-continuity-20260921
+          git rev-parse HEAD > /tmp/dsh-repair-evidence/committed-sha.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: provider-sequential-preparation
-          path: ${{ runner.temp }}/evidence/
-          retention-days: 3
+          name: provider-sequential-repair-evidence
+          path: /tmp/dsh-repair-evidence/
+          retention-days: 7
