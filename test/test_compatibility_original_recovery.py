@@ -34,7 +34,7 @@ def original(runtime):
     return durable_forward.raw_receipt(runtime.service, WHO["id"], "original-wire")
 
 
-def upstream(runtime, monkeypatch, *, done=False, transport_error=False, text="original prefix"):
+def upstream(runtime, monkeypatch, *, done=False, transport_error=False, text="original prefix", text_chunks=None):
     sent = []
     from services.protocol import conversation, openai_v1_chat_complete, openai_v1_response, anthropic_v1_messages
     class Backend(OpenAIBackendAPI):
@@ -49,11 +49,12 @@ def upstream(runtime, monkeypatch, *, done=False, transport_error=False, text="o
             assert original(runtime)["_submission_parent_message_id"] == data["parent_message_id"]
             current_request.get().before_send()
             sent.append(data)
-            yield json.dumps({"conversation_id": "original-conversation", "message": {
-                "id": "original-assistant", "author": {"role": "assistant"},
-                "status": "in_progress", "end_turn": False,
-                "content": {"content_type": "text", "parts": [text]},
-            }})
+            for value in text_chunks or [text]:
+                yield json.dumps({"conversation_id": "original-conversation", "message": {
+                    "id": "original-assistant", "author": {"role": "assistant"},
+                    "status": "in_progress", "end_turn": False,
+                    "content": {"content_type": "text", "parts": [value]},
+                }})
             if transport_error:
                 raise ConnectionError("NEVER_PERSIST_PRIVATE_TRANSPORT_DETAIL")
             if done:
@@ -256,3 +257,53 @@ def test_anthropic_recovery_preserves_tool_id_already_emitted_before_output_fail
     _, wire = asyncio.run(response_bytes(runtime, data, protocol))
     assert tool_id.encode() in wire and b"message_stop" in wire
     assert len(sent) == 1
+
+
+@pytest.mark.parametrize("names,emitted", [(("lookup",), 1), (("lookup", "inspect"), 2),
+                                          (("lookup", "lookup"), 2), (("lookup", "inspect"), 1)])
+def test_anthropic_whitespace_chunks_preserve_every_emitted_tool_identity(runtime, monkeypatch, names, emitted):
+    text = "<tool_calls>" + "".join(
+        '<tool_call><tool_name>' + name + '</tool_name><parameters>{"index":' + str(index) + '}</parameters></tool_call>'
+        for index, name in enumerate(names)) + "</tool_calls>"
+    sent = upstream(runtime, monkeypatch, done=True, text_chunks=[" \n", " \n" + text])
+    protocol, data = "anthropic_v1_messages", payload("anthropic_v1_messages")
+    data["tools"] = [{"name": name, "input_schema": {"type": "object"}} for name in dict.fromkeys(names)]
+    update, failed = runtime.service._update, []
+
+    def disconnect_after_tools(owner, request_id, **changes):
+        result = update(owner, request_id, **changes)
+        receipt = original(runtime)
+        saved = receipt.get("_wire_identity", {}).get("tool_ids", {})
+        if "_wire_size" in changes and len(saved) == emitted and not failed:
+            with runtime.store.output_file(receipt["_wire_output"]) as handle:
+                sent_prefix = handle.read()
+            if all(tool["id"].encode() in sent_prefix for tool in saved.values()):
+                failed.append(True)
+                raise OSError("synthetic output interruption after emitted tools")
+        return result
+
+    monkeypatch.setattr(runtime.service, "_update", disconnect_after_tools)
+    runtime.service.submit(WHO["id"], durable_forward.envelope(WHO, data, request(), protocol))
+    runtime.admission.execute(runtime.admission.claim_next())
+    before = original(runtime)
+    assert before["status"] == "unknown"
+    saved = before["_wire_identity"]["tool_ids"]
+    # The whitespace opened text block zero before the tool markup arrived.
+    assert list(saved) == [str(index + 1) for index in range(emitted)]
+    with runtime.store.output_file(before["_wire_output"]) as handle:
+        prefix = handle.read()
+    assert all(tool["id"].encode() in prefix for tool in saved.values())
+    runtime.service.recovery_reader = lambda r: ConversationBindingService._read_text_request_result(
+        Mock(), r, document=result_document(r, text))
+    assert runtime.service.read(WHO["id"], "original-wire")["status"] == "succeeded"
+    _, wire = asyncio.run(response_bytes(runtime, data, protocol))
+    events = [json.loads(line[6:]) for line in wire.decode().splitlines() if line.startswith("data: ")]
+    tools = [event["content_block"] for event in events
+             if event.get("type") == "content_block_start" and event["content_block"]["type"] == "tool_use"]
+    assert [tool["name"] for tool in tools] == list(names)
+    assert [tool["id"] for tool in tools[:emitted]] == [saved[str(i + 1)]["id"] for i in range(emitted)]
+    after = original(runtime)
+    assert after["_wire_output"] != before["_wire_output"]
+    with runtime.store.output_file(before["_wire_output"]) as handle:
+        assert handle.read() == prefix
+    assert len(sent) == len(runtime.logs.list(type="call")) == 1

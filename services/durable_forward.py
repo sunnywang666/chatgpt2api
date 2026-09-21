@@ -116,14 +116,20 @@ def recovered_chat_wire(service, receipt, recovered):
         ], model, metadata["input_tokens"], lambda _: output_tokens, tools))
         events[0]["message"]["id"] = response["id"]
         events[-1]["created"] = created
-        for event in events:
-            if event.get("type") == "content_block_start":
-                saved = (identity.get("tool_ids") or {}).get(str(event["index"]))
-                block = event["content_block"]
-                if saved:
-                    if block.get("type") != "tool_use" or block.get("name") != saved["name"]:
-                        raise ValueError("original tool output identity mismatch")
-                    block["id"] = saved["id"]
+        # Text blocks depend on the original chunk boundaries (even a leading
+        # whitespace chunk can open one). Tool order does not. Match the saved
+        # emitted prefix by tool order and name, independently of block index.
+        saved_ids = identity.get("tool_ids") or {}
+        saved_tools = [saved_ids[index] for index in sorted(saved_ids, key=int)]
+        recovered_tools = [event["content_block"] for event in events
+                           if event.get("type") == "content_block_start"
+                           and event["content_block"].get("type") == "tool_use"]
+        if len(saved_tools) > len(recovered_tools):
+            raise ValueError("original tool output identity mismatch")
+        for saved, block in zip(saved_tools, recovered_tools):
+            if block.get("name") != saved["name"]:
+                raise ValueError("original tool output identity mismatch")
+            block["id"] = saved["id"]
     if stream:
         parts = [] if protocol == "anthropic_v1_messages" else [": stream-open\n\n"]
         for item in events:
