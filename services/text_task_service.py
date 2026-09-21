@@ -525,7 +525,7 @@ class TextTaskService:
                         )
                     ),
                     "recovery_error_code": error_code,
-                    "recovery_phase": phase or "read_text_request",
+                    "recovery_phase": phase or current.get("recovery_phase") or "read_text_request",
                     "recovery_retry_after_seconds": retry_after_seconds,
                     "recovery_reason": recovery_reason,
                     "recovery_no_result_reads": qualified_reads,
@@ -534,6 +534,11 @@ class TextTaskService:
                     # readable again.
                     "recovery_requires_new_conversation": requires_new_conversation,
                 }
+            elif (recovered or {}).get("status") == "queued":
+                # Legacy multi-image recovery has saved every submitted slot.
+                # Its unsent remainder competes in the original admission queue.
+                changes = {**recovered, "error_code": None, "recovery_next_at": None,
+                           "recovery_error_code": None, "recovery_phase": None, "finished_at": None}
             elif (recovered or {}).get("status") == "failed":
                 changes = {
                     **recovered,
@@ -570,6 +575,18 @@ class TextTaskService:
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
                        (json.dumps(updated), owner, request_id, row[0]))
             return self._public(updated)
+
+    def _update_recovery_claim(self, owner, receipt, **changes):
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            request_id = receipt["request_id"]
+            row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+            current = json.loads(row[0]) if row else {}
+            if not current.get("recovery_claim_id") or current["recovery_claim_id"] != receipt.get("recovery_claim_id"):
+                raise AdmissionLost("original image recovery claim changed")
+            current.update(changes, updated_at=self._now())
+            db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(current), owner, request_id))
+            return current
 
     def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False):
         from services.pool_admission import unknown_text_result
@@ -631,6 +648,13 @@ class TextTaskService:
             return {"request_id": request_id, "status": "not_found"}
         if recovery_claim:
             try:
+                from services import durable_image_forward
+                if durable_image_forward.supported(recovery_claim[1]):
+                    recovered = durable_image_forward.recover(self, owner, recovery_claim[1])
+                    result = self._finish_recovery(owner, request_id, recovery_claim[0], recovered)
+                    if self.admission is not None:
+                        self.admission.wake()
+                    return result
                 recovered = self.recovery_reader(recovery_claim[1])
                 safe_result, error_code, phase, recovery_reason = self._safe_recovery_result(recovered, recovery_claim[1])
                 if not error_code and recovery_claim[1].get("_forward_protocol"):
@@ -659,7 +683,7 @@ class TextTaskService:
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0],
                     recovery_evidence or None,
-                    error_code=recovery_error_code, phase="read_text_request",
+                    error_code=recovery_error_code,
                     recovery_reason=self._safe_recovery_reason(getattr(exc, "recovery_reason", "")),
                     retry_after_seconds=retry_after_seconds,
                     count_unrecoverable=allow_unrecoverable_retry,
@@ -671,7 +695,7 @@ class TextTaskService:
                 recovery_error_code, retry_after_seconds = self._recovery_failure(exc)
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0],
-                    error_code=recovery_error_code, phase="read_text_request",
+                    error_code=recovery_error_code,
                     retry_after_seconds=retry_after_seconds,
                     recovery_reason=None, count_unrecoverable=allow_unrecoverable_retry,
                 )

@@ -17,8 +17,12 @@ def test_original_task_backup_restores_private_input_and_committed_wire_prefix(t
     output = store.create_output()
     with store.output_file(output, append=True) as handle:
         handle.write(b"committed-uncommitted")
+    image_slot = store.create_output()
+    with store.output_file(image_slot, append=True) as handle:
+        handle.write(b'[{"kind":"result","data":[{"b64_json":"b3JpZ2luYWw="}]}]')
     receipt = {"id": "original", "owner_id": "owner", "status": "queued",
-               "_input_ref": ref, "_wire_output": output, "_wire_size": 9}
+               "_input_ref": ref, "_wire_output": output, "_wire_size": 9,
+               "_image_slots": {"0": {"output_ref": image_slot, "completed": True}}}
     with store.transaction() as db:
         db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("owner", "original", "fixture", json.dumps(receipt)))
     monkeypatch.setattr(backup_service, "DATA_DIR", source)
@@ -38,5 +42,7 @@ def test_original_task_backup_restores_private_input_and_committed_wire_prefix(t
     assert recovered.load_input(ref) == body
     with recovered.output_file(output) as handle:
         assert handle.read() == b"committed"
+    with recovered.output_file(image_slot) as handle:
+        assert json.load(handle)[0]["data"][0]["b64_json"] == "b3JpZ2luYWw="
     with sqlite3.connect(recovered.path) as db:
         assert recovered.read_receipt(db, "text", "owner", "original")["_input_ref"] == ref

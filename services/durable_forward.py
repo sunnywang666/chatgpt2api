@@ -25,6 +25,11 @@ SEARCH_RECOVERY_PROTOCOLS = {"openai_search", "openai_v1_chat_complete", "openai
 
 
 def chat_recovery_supported(receipt):
+    # Shared admission asks this for every compatibility protocol on the Chat
+    # route. Image recovery uses the same lease and original receipt.
+    from services.durable_image_forward import supported as image_recovery_supported
+    if image_recovery_supported(receipt):
+        return True
     metadata = receipt.get("_chat_recovery") or {}
     if not isinstance(metadata, dict):
         return False
@@ -181,17 +186,23 @@ def recovered_chat_wire(service, receipt, recovered):
             if block.get("name") != saved["name"]:
                 raise ValueError("original tool output identity mismatch")
             block["id"] = saved["id"]
+    return publish_recovered_wire(service, receipt, response, events, stream)
+
+
+def publish_recovered_wire(service, receipt, response, events, stream):
+    from services.log_service import _strip_internal_response_fields
+    protocol = receipt["_forward_protocol"]
     if stream:
         parts = [] if protocol == "anthropic_v1_messages" else [": stream-open\n\n"]
         for item in events:
             if protocol == "anthropic_v1_messages":
                 parts.append("event: " + item["type"] + "\n")
-            parts.append("data: " + json.dumps(item, ensure_ascii=False) + "\n\n")
+            parts.append("data: " + json.dumps(_strip_internal_response_fields(item), ensure_ascii=False) + "\n\n")
         if protocol != "anthropic_v1_messages":
             parts.append("data: [DONE]\n\n")
         data = "".join(parts).encode()
     else:
-        data = json.dumps(response, ensure_ascii=False).encode()
+        data = json.dumps(_strip_internal_response_fields(response), ensure_ascii=False).encode()
     if len(data) > MAX_OUTPUT_BYTES:
         raise ValueError("private output limit")
     output = service.store.create_output()
@@ -331,7 +342,7 @@ def run(service, owner, request_id, body):
     output = service.store.create_output()
     service._update(owner, request_id, _wire_output=output, _wire_size=0)
     protocol = spec["protocol"]
-    call = _compatibility_call(spec)
+    call = None if raw_receipt(service, owner, request_id).get("_wire_call_recorded") else _compatibility_call(spec)
     observed = {"urls": [], "_account_email": "", "_conversation_id": ""}
     stream = False
     deferred = False
@@ -451,6 +462,7 @@ def run(service, owner, request_id, body):
             receipt = raw_receipt(service, owner, request_id)
             context = current_request.get()
             if context is not None and receipt.get("_claim_id") == context.claim:
+                service._update(owner, request_id, _wire_call_recorded=True)
                 success = receipt.get("status") == "succeeded"
                 account = context.selected_account() or {}
                 call.log("流式调用结束" if success and stream else "调用完成" if success else "流式调用失败" if stream else "调用失败",
