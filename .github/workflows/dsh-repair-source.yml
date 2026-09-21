@@ -6,25 +6,24 @@ on:
 permissions:
   contents: read
 jobs:
-  source:
+  dependencies:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Package tracked code only
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Fetch Python wheels, no application execution
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/dsh-source"
-          paths=(api services utils test docs)
-          for f in pyproject.toml uv.lock config.json VERSION; do
-            if git cat-file -e "HEAD:$f" 2>/dev/null; then paths+=("$f"); fi
-          done
-          git archive --format=tar.gz --output="$RUNNER_TEMP/dsh-source/provider-source.tar.gz" HEAD "${paths[@]}"
-          git rev-parse HEAD > "$RUNNER_TEMP/dsh-source/source-sha.txt"
+          mkdir -p "$RUNNER_TEMP/check-deps/wheels"
+          python -c "import tomllib; p=tomllib.load(open('pyproject.toml','rb')); print('\n'.join(p['project']['dependencies'] + ['pytest','pytest-subtests','httpx']))" > "$RUNNER_TEMP/check-deps/requirements.txt"
+          python -m pip wheel -r "$RUNNER_TEMP/check-deps/requirements.txt" -w "$RUNNER_TEMP/check-deps/wheels"
       - uses: actions/upload-artifact@v4
         with:
-          name: dsh-repair-provider-source
-          path: ${{ runner.temp }}/dsh-source/
+          name: dsh-repair-python-test-dependencies
+          path: ${{ runner.temp }}/check-deps/
           retention-days: 3
