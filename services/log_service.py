@@ -300,7 +300,8 @@ class LoggedCall:
                          conversation_id=conversation_ids[0] if conversation_ids else "")
 
     def log(self, suffix: str, result: object = None, status: str = "success", error: str = "",
-            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "") -> None:
+            urls: list[str] | None = None, account_email: str = "", conversation_id: str = "",
+            request_id: str = "", provider_account_identity: str = "", rate_limit: dict | None = None) -> None:
         detail = {
             "key_id": self.identity.get("id"),
             "key_name": self.identity.get("name"),
@@ -312,6 +313,12 @@ class LoggedCall:
             "duration_ms": int((time.time() - self.started) * 1000),
             "status": status,
         }
+        if request_id:
+            detail["request_id"] = request_id
+        if provider_account_identity:
+            detail["provider_account_identity"] = provider_account_identity
+        if rate_limit:
+            detail["rate_limit"] = rate_limit
         request_excerpt = _request_excerpt(self.request_text)
         if request_excerpt:
             detail["request_text"] = request_excerpt

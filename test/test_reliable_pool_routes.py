@@ -15,7 +15,10 @@ from test.test_company_requests import company, body, PREFIX
 
 
 @pytest.fixture
-def runtime(tmp_path):
+def runtime(tmp_path, monkeypatch):
+    from services import log_service
+    logs = log_service.LogService(tmp_path / "calls.jsonl")
+    monkeypatch.setattr(log_service, "log_service", logs)
     account = {"access_token": "fixture-only-token", "account_id": "physical-account", "provider_account_identity": "account-0",
                "source_type": "web", "type": "Plus", "status": "正常", "quota": 99, "conversation_binding_ids": ["binding-0"]}
     (tmp_path / "accounts.json").write_text(json.dumps([account]))
@@ -23,7 +26,7 @@ def runtime(tmp_path):
     accounts, store, admission = build(tmp_path, clock)
     service = TextTaskService(store.path, admission=admission, clock=clock)
     admission.register("text", lambda ctx, payload: service._run(ctx.owner, ctx.request_id, payload))
-    return SimpleNamespace(accounts=accounts, store=store, admission=admission, service=service, clock=clock, account=account)
+    return SimpleNamespace(accounts=accounts, store=store, admission=admission, service=service, clock=clock, account=account, logs=logs)
 
 
 def request(request_id="original-wire"):
@@ -50,6 +53,9 @@ def test_wire_original_input_restart_and_repeat_returns_one_generation(runtime, 
         assert b"original answer" in result.body
         assert b"PRIVATE" not in result.body
     assert len(calls) == 1
+    entries = runtime.logs.list(type="call")
+    assert len(entries) == 1
+    assert entries[0]["detail"]["request_id"] == "original-wire"
     receipt = durable_forward.raw_receipt(restarted, "key-user", "original-wire")
     saved = runtime.store.load_input(receipt["_input_ref"])
     assert "NEVER_PERSIST_SECRET" not in json.dumps(saved)
@@ -81,10 +87,17 @@ def test_wire_consumer_disconnect_does_not_cancel_execution(runtime, monkeypatch
             await subscriber
         assert runtime.service.read("key-user", "original-wire")["status"] == "running"
         release.set()
-        return await durable_forward.respond(who, data, request(), "openai_v1_chat_complete", service=runtime.service)
+        response = await durable_forward.respond(who, data, request(), "openai_v1_chat_complete", service=runtime.service)
+        for _ in range(100):
+            if runtime.logs.list(type="call"):
+                break
+            await asyncio.sleep(.01)
+        return response
     try:
         assert asyncio.run(disconnect()).status_code == 200
         assert len(calls) == 1
+        assert len(runtime.logs.list(type="call")) == 1
+        assert runtime.logs.list(type="call")[0]["detail"]["status"] == "success"
     finally:
         release.set()
         runtime.admission.stop()

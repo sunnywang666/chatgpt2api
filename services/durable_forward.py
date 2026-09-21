@@ -5,6 +5,7 @@ bytes are private output files; repeating an original ID only subscribes again.
 No access token, cookie or arbitrary forwarded header is persisted.
 """
 import asyncio
+import itertools
 import json
 import os
 import uuid
@@ -12,13 +13,35 @@ import uuid
 from fastapi import HTTPException
 from fastapi.responses import Response, StreamingResponse
 
-from services.request_context import trusted_source
+from services.request_context import AdmissionLost, current_request, trusted_source
 
 
 FORWARDED_HEADERS = {"session-id", "thread-id", "x-client-request-id", "originator", "version", "user-agent", "openai-beta",
                      "x-codex-window-id", "x-codex-turn-metadata", "x-codex-beta-features"}
 OUTPUT_HEADERS = {"content-type", "cache-control", "x-request-id", "openai-request-id", "x-openai-request-id", "retry-after"}
 MAX_OUTPUT_BYTES = 128 * 1024 * 1024
+
+
+def _compatibility_call(spec):
+    """Recreate the existing route log in its executor, never its subscriber."""
+    from services.content_filter import request_text, request_shape
+    from services.log_service import LoggedCall
+    routes = {
+        "openai_v1_chat_complete": ("/v1/chat/completions", "文本生成", ("prompt", "messages"), "messages"),
+        "openai_v1_response": ("/v1/responses", "Responses", ("input", "instructions"), "input"),
+        "anthropic_v1_messages": ("/v1/messages", "Messages", ("system", "messages", "tools"), None),
+        "openai_search": ("/v1/search", "搜索", ("prompt",), None),
+        "openai_v1_image_generations": ("/v1/images/generations", "文生图", ("prompt",), None),
+        "openai_v1_image_edit": ("/v1/images/edits", "图生图", ("prompt",), None),
+    }
+    route = routes.get(spec["protocol"])
+    if route is None:  # Native Codex already owns its original call logging.
+        return None
+    endpoint, summary, fields, shape = route
+    payload = spec["payload"]
+    return LoggedCall(spec["identity"], endpoint, str(payload.get("model") or "auto"), summary,
+                      request_text=request_text(*(payload.get(key) for key in fields)),
+                      request_shape=request_shape(payload.get(shape)) if shape else None)
 
 
 def envelope(identity, payload, request, protocol, *, operation="text", compact=False):
@@ -65,9 +88,10 @@ async def respond(identity, payload, request, protocol, *, operation="text", com
         if head:
             break
         if r["status"] in {"unknown", "failed"}:
-            return Response(json.dumps({"error": {"code": r.get("error_code"), "request_id": request_id}, "status": r["status"], "rate_limit": r.get("rate_limit")}),
+            error = r.get("_wire_error_payload") or {"error": {"code": r.get("error_code"), "request_id": request_id}}
+            return Response(json.dumps({**error, "request_id": request_id, "status": r["status"], "rate_limit": r.get("rate_limit")}),
                             status_code=409 if r["status"] == "unknown" else int(r.get("_wire_error_status") or 503),
-                            headers={"X-Request-ID": request_id, "Cache-Control": "private, no-store"}, media_type="application/json")
+                            headers={**r.get("_wire_error_headers", {}), "X-Request-ID": request_id, "Cache-Control": "private, no-store"}, media_type="application/json")
         await asyncio.sleep(.1)
     headers = {**head["headers"], "X-Request-ID": request_id, "Cache-Control": "private, no-store"}
     if not head["stream"]:
@@ -103,6 +127,19 @@ def run(service, owner, request_id, body):
     output = service.store.create_output()
     service._update(owner, request_id, _wire_output=output, _wire_size=0)
     protocol = spec["protocol"]
+    call = _compatibility_call(spec)
+    observed = {"urls": [], "_account_email": "", "_conversation_id": ""}
+    stream = False
+    deferred = False
+
+    def observe(item):
+        from services.log_service import _collect_urls, _collect_account_emails, _collect_conversation_ids
+        observed["urls"].extend(_collect_urls(item))
+        for key, collect in (("_account_email", _collect_account_emails), ("_conversation_id", _collect_conversation_ids)):
+            values = collect(item)
+            if values and not observed[key]:
+                observed[key] = values[0]
+
     try:
         if protocol == "codex":
             from services.codex_service import codex_service
@@ -118,17 +155,32 @@ def run(service, owner, request_id, body):
             status = 200
             headers = {"content-type": "text/event-stream" if stream else "application/json"}
             from services.log_service import _strip_internal_response_fields
+            if stream:
+                # Match LoggedCall.run: a protocol rejection before the first
+                # event is still an HTTP error, not a committed HTTP-200 SSE.
+                iterator = iter(result)
+                missing = object()
+                first = next(iterator, missing)
+                result = iter(()) if first is missing else itertools.chain((first,), iterator)
+            else:
+                observe(result)
             def wire_events():
                 anthropic = protocol == "anthropic_v1_messages"
-                if not anthropic:
-                    yield ": stream-open\n\n"
-                for item in result:
-                    public = _strip_internal_response_fields(item)
-                    if anthropic:
-                        yield "event: " + str(public.get("type") or "message_delta") + "\n"
-                    yield "data: " + json.dumps(public, ensure_ascii=False) + "\n\n"
-                if not anthropic:
-                    yield "data: [DONE]\n\n"
+                try:
+                    if not anthropic:
+                        yield ": stream-open\n\n"
+                    for item in result:
+                        observe(item)
+                        public = _strip_internal_response_fields(item)
+                        if anthropic:
+                            yield "event: " + str(public.get("type") or "message_delta") + "\n"
+                        yield "data: " + json.dumps(public, ensure_ascii=False) + "\n\n"
+                    if not anthropic:
+                        yield "data: [DONE]\n\n"
+                finally:
+                    close = getattr(iterator, "close", None)
+                    if callable(close):
+                        close()
             parts = wire_events() if stream else [json.dumps(_strip_internal_response_fields(result), ensure_ascii=False).encode()]
         head = {"status": status, "headers": {k.lower(): str(v) for k, v in headers.items() if k.lower() in OUTPUT_HEADERS}, "stream": stream}
         # For non-stream output, publish headers only after all bytes persist.
@@ -158,12 +210,42 @@ def run(service, owner, request_id, body):
                         _wire_head=head, _turn_reserved=not terminal, finished_at=service._now())
     except Exception as exc:
         current = raw_receipt(service, owner, request_id)
-        code = getattr(exc, "code", "CONVERSATION_OUTCOME_UNKNOWN")
+        code = getattr(exc, "code", None)
         not_sent = not current.get("_submission_started")
-        if not_sent and code in {"codex_busy", "codex_bound_account_unavailable", "codex_transport_failed"}:
+        if not_sent and (isinstance(exc, AdmissionLost) or code in {
+                "codex_busy", "codex_bound_account_unavailable", "codex_transport_failed",
+                "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}):
+            deferred = True
             raise
         known_rejection = code in {"codex_limited", "codex_auth_required", "codex_permission_denied", "invalid_codex_request"}
+        raw_status = getattr(exc, "status_code", 503)
+        status_code = raw_status if type(raw_status) is int and 400 <= raw_status <= 599 else 503
+        if isinstance(exc, HTTPException) and not_sent:
+            # Deterministic protocol/validation failures must stay terminal.
+            # They never inherit the scheduler's UNKNOWN-before-send retry.
+            code = "PROTOCOL_REQUEST_REJECTED"
+        else:
+            code = code or ("PROVIDER_EXECUTION_FAILED" if not_sent else "CONVERSATION_OUTCOME_UNKNOWN")
+        from services.protocol.error_response import anthropic_error_response, openai_error_response
+        detail = exc.detail if isinstance(exc, HTTPException) else {"error": {"code": code, "message": code}}
+        formatter = anthropic_error_response if protocol == "anthropic_v1_messages" else openai_error_response
+        wire_error = formatter(detail, status_code)
+        error_headers = {key.lower(): value for key, value in (getattr(exc, "headers", None) or {}).items()
+                         if key.lower() == "retry-after"}
         service._update(owner, request_id, status="failed" if not_sent or known_rejection else "unknown",
                         error_code=code, _turn_reserved=not (not_sent or known_rejection),
-                        _wire_error_status=getattr(exc, "status_code", 503),
-                        upstream_outcome="not_sent" if not_sent else "rejected" if known_rejection else "unknown")
+                        _wire_error_status=status_code, _wire_error_payload=json.loads(wire_error.body), _wire_error_headers=error_headers,
+                        upstream_outcome="not_sent" if not_sent else "rejected" if known_rejection else "unknown", finished_at=service._now())
+    finally:
+        if call is not None and not deferred:
+            receipt = raw_receipt(service, owner, request_id)
+            context = current_request.get()
+            if context is not None and receipt.get("_claim_id") == context.claim:
+                success = receipt.get("status") == "succeeded"
+                account = context.selected_account() or {}
+                call.log("流式调用结束" if success and stream else "调用完成" if success else "流式调用失败" if stream else "调用失败",
+                         result=observed, status="success" if success else "failed",
+                         error="" if success else str(receipt.get("error_code") or "CONVERSATION_OUTCOME_UNKNOWN"),
+                         account_email=observed["_account_email"] or str(account.get("email") or ""),
+                         request_id=request_id, provider_account_identity=receipt.get("provider_account_identity"),
+                         rate_limit=receipt.get("rate_limit"))

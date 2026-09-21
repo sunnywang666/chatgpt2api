@@ -210,6 +210,10 @@ class TextTaskService:
 
     @classmethod
     def _recovery_due(cls, receipt, now):
+        if receipt.get("_forward_protocol"):
+            # Compatibility receipts retain wire bytes, not the full original
+            # upstream cursor required by the public durable Chat reader.
+            return False
         next_at = receipt.get("recovery_next_at")
         lease_until = receipt.get("recovery_lease_until")
         if lease_until is not None and now < float(lease_until):
