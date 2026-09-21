@@ -1001,6 +1001,17 @@ class ConversationBindingService:
                    and (ended := _completed_request_turn(mapping, children, request_message_id, conversation_id)) else {}),
             }
         parent_message_id, text = candidates[0]
+        ended = _completed_request_turn(mapping, children, request_message_id, conversation_id)
+        if not ended or ended["final_message_id"] != parent_message_id:
+            # One completed text message is insufficient when another branch
+            # remains active or ambiguous. Use the same positive evidence as
+            # empty-result recovery before declaring this request complete.
+            return {
+                **result, "binding_status": "unknown",
+                "status": "running" if active_result_seen else "unknown",
+                "recovery_reason": (TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value if active_result_seen
+                                    else TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value),
+            }
         return {
             **result,
             "binding_status": "bound",

@@ -178,6 +178,36 @@ def test_age_missing_or_ambiguous_result_never_proves_idle(tmp_path, case):
     assert row.get("_upstream_terminal") is not True
 
 
+@pytest.mark.parametrize("case", ["active_sibling", "empty_sibling", "analysis_sibling", "active_child", "later_user"])
+def test_completed_answer_needs_original_branch_terminal_proof(tmp_path, case):
+    service, admission, backend, legacy = migration(tmp_path)
+    doc = document(legacy[0])
+    mapping = doc["mapping"]
+    mapping["final-user-0"]["message"]["content"]["parts"] = ["original answer"]
+    parent = "final-user-0" if case in {"active_child", "later_user"} else "user-0"
+    if case == "later_user":
+        mapping["later-user"] = {"parent": parent, "message": {"id": "later-user", "author": {"role": "user"}}}
+        parent = "later-user"
+    mapping["other"] = {"parent": parent, "message": {
+        "id": "other", "author": {"role": "assistant"},
+        "status": "finished_successfully" if case in {"empty_sibling", "analysis_sibling"} else "in_progress",
+        "end_turn": case == "empty_sibling", "channel": "analysis" if case == "analysis_sibling" else "final",
+        "content": {"content_type": "text", "parts": [] if case == "empty_sibling" else ["other output"]},
+    }}
+    doc["current_node"] = "other"
+    backend._get_conversation.return_value = doc
+    service.recovery_reader = lambda row: ConversationBindingService._read_text_request_result(backend, row)
+    result = service.read("owner", "old-0")
+    proven = case == "later_user"
+    assert result["status"] == ("succeeded" if proven else "unknown")
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == (0 if proven else 1)
+    assert result.get("content") == ("original answer" if proven else None)
+    for key in ("request_id", "request_message_id", "provider_binding_id", "provider_account_identity", "client_conversation_id"):
+        assert result[key] == legacy[0][key]
+    assert backend._get_conversation.call_count == 1
+    assert not backend.session.post.called
+
+
 @pytest.mark.parametrize("field,value", [("conversation_id", "wrong"), ("request_message_id", "other-user"),
                                         ("final_message_id", "user-0"), ("observed_at", float("nan"))])
 def test_terminal_evidence_must_match_the_original_request(tmp_path, field, value):
