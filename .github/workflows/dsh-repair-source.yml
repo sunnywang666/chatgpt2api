@@ -1,25 +1,93 @@
-name: DSH repair source snapshot
+name: Verify sequential Chat repair
 on:
   push:
     branches: [fix/dsh-session-continuity-20260921]
     paths: [.github/workflows/dsh-repair-source.yml]
 permissions:
-  contents: read
+  contents: write
 jobs:
-  test-fixtures:
+  repair:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Package owning test dependencies from tracked source
-        shell: bash
-        run: |
-          mkdir -p "$RUNNER_TEMP/fixtures"
-          git archive --format=tar.gz --output="$RUNNER_TEMP/fixtures/provider-test-fixtures.tar.gz" HEAD scripts examples README.md .env.example
-      - uses: actions/upload-artifact@v4
+      - uses: actions/setup-python@v5
         with:
-          name: dsh-repair-provider-test-fixtures
-          path: ${{ runner.temp }}/fixtures/
+          python-version: '3.13'
+      - name: Apply exact bounded source edits
+        shell: python
+        run: |
+          from pathlib import Path
+          def edit(name, old, new):
+              p=Path(name); s=p.read_text(); assert s.count(old)==1,(name,old[:100]);p.write_text(s.replace(old,new))
+          edit('api/chat_requests.py','from pydantic import BaseModel, ConfigDict, Field, field_validator','from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator')
+          edit('api/chat_requests.py','    reasoning_effort: Literal["high"] | None = None\n','''    reasoning_effort: Literal["high"] | None = None
+              # An application-owned work session, NOT an upstream conversation cursor.
+              client_conversation_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
+              previous_request_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
+
+              @field_validator("client_conversation_id", "previous_request_id", mode="before")
+              @classmethod
+              def valid_continuation_reference(cls, value):
+                  if not isinstance(value, str) or value in {".", ".."}:
+                      raise ValueError("continuation references must be omitted or valid identifiers")
+                  return value
+
+              @model_validator(mode="after")
+              def continuation_contract(self):
+                  if self.previous_request_id and (not self.client_conversation_id or self.previous_request_id == self.client_request_id):
+                      raise ValueError("a different predecessor and a work session are required")
+                  if self.client_conversation_id and self.messages[-1].get("role") != "user":
+                      raise ValueError("a sequential turn must end with its new user input")
+                  return self
+          '''.replace('\n    ','\n',1) if False else '''    reasoning_effort: Literal["high"] | None = None
+              # An application-owned work session, NOT an upstream conversation cursor.
+              client_conversation_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
+              previous_request_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
+
+              @field_validator("client_conversation_id", "previous_request_id", mode="before")
+              @classmethod
+              def valid_continuation_reference(cls, value):
+                  if not isinstance(value, str) or value in {".", ".."}:
+                      raise ValueError("continuation references must be omitted or valid identifiers")
+                  return value
+
+              @model_validator(mode="after")
+              def continuation_contract(self):
+                  if self.previous_request_id and (not self.client_conversation_id or self.previous_request_id == self.client_request_id):
+                      raise ValueError("a different predecessor and a work session are required")
+                  if self.client_conversation_id and self.messages[-1].get("role") != "user":
+                      raise ValueError("a sequential turn must end with its new user input")
+                  return self
+          ''')
+          # Source text above is indented relative to this Python block only by YAML.
+          # Restore the exact four-space class indentation.
+          p=Path('api/chat_requests.py');s=p.read_text();s=s.replace('\n              ','\n    ').replace('\n                  ','\n        ').replace('\n                      ','\n            ');p.write_text(s)
+          edit('api/chat_requests.py','    # Absence retains the exact legacy identity;', '''    if body.client_conversation_id is not None:
+                  digest = hashlib.sha256(f"{owner}\\0session\\0{body.client_conversation_id}".encode()).hexdigest()
+                  payload["client_conversation_id"] = f"public-session-{digest}"
+                  payload["_public_session_ref"] = body.client_conversation_id
+                  if body.previous_request_id is not None:
+                      payload["_previous_request_id"] = body.previous_request_id
+              # Absence retains the exact legacy identity;'''.replace('\n              ','\n    ').replace('\n                  ','\n        ').replace('\n                      ','\n            '))
+          edit('api/chat_requests.py','''                detail={"code": "CHAT_REQUEST_CONFLICT", "request_id": body.client_request_id},
+                      ) from exc
+                  except HTTPException as exc:'''.replace('\n                      ','\n            ').replace('\n                  ','\n        '),'''                detail={"code": exc.code if exc.code.startswith("CHAT_") else "CHAT_REQUEST_CONFLICT",
+                                  "request_id": body.client_request_id,
+                                  **({"previous_request_id": body.previous_request_id} if body.previous_request_id else {})},
+                      ) from exc
+                  except HTTPException as exc:'''.replace('\n                                  ','\n                        ').replace('\n                      ','\n            ').replace('\n                  ','\n        '))
+          print('API source candidate prepared')
+      - name: Record preparation result
+        run: |
+          python -m py_compile api/chat_requests.py
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git diff > "$RUNNER_TEMP/evidence/prepared.patch"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: provider-sequential-preparation
+          path: ${{ runner.temp }}/evidence/
           retention-days: 3
