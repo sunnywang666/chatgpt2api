@@ -196,6 +196,35 @@ class TextTaskService:
         self.clock = clock or time.time
         self.recovery_reader = recovery_reader or conversation_binding_service.read_text_request
         self.boot = uuid.uuid4().hex
+        if self.store.path.exists():
+            self._refresh_queued_forward_models()
+
+    def _refresh_queued_forward_models(self):
+        # Upgrade only the derived dispatch model of unclaimed waiting calls.
+        # Read private inputs outside the DB transaction; a concurrent claim
+        # invalidates the final compare-and-set. Original hashes/inputs stay put.
+        from services.durable_forward import SEARCH_RECOVERY_PROTOCOLS, dispatch_model
+        with self._db() as db:
+            rows = db.execute("SELECT owner,id,request_hash,receipt FROM requests").fetchall()
+        for owner, request_id, request_hash, raw in rows:
+            receipt = json.loads(raw)
+            if (receipt.get("status") != "queued" or receipt.get("_claim_id")
+                    or receipt.get("_submission_started") or not receipt.get("_input_ref")
+                    or receipt.get("_forward_protocol") not in SEARCH_RECOVERY_PROTOCOLS):
+                continue
+            try:
+                body = self.store.load_input(receipt["_input_ref"])
+                if not isinstance(body, dict):
+                    continue
+                if self._submission_identity(owner, body) != (request_id, request_hash):
+                    continue  # Existing admission input validation owns this failure.
+                model = dispatch_model(body)
+            except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
+                continue
+            if model != receipt.get("model"):
+                with self._db() as db:
+                    db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
+                               (json.dumps({**receipt, "model": model}), owner, request_id, raw))
 
     def _now(self):
         return float(self.clock())
@@ -763,6 +792,7 @@ class TextTaskService:
         return self._public(json.loads(previous[1])) if previous else None
 
     def submit(self, owner: str, body: dict, *, source: str | None = None):
+        from services.durable_forward import dispatch_model
         request_id, request_hash = self._submission_identity(owner, body)
         receipt = {"request_id": request_id, "client_conversation_id": body["client_conversation_id"],
                    "_route": body.get("_route", "chat"), "_operation": body.get("_operation", "text"),
@@ -772,7 +802,7 @@ class TextTaskService:
                    "_expected_sends": int(body.get("_expected_sends") or 1),
                    "_previous_response_id": ((body.get("_forward") or {}).get("payload") or {}).get("previous_response_id"),
                    "route": str(body.get("_public_route") or ""),
-                   "model": str(body.get("model") or "auto"),
+                   "model": dispatch_model(body),
                    "request_message_id": str(uuid.uuid4()),
                    "request_parent_message_id": str(body.get("parent_message_id") or "").strip(),
                    "status": "queued", "boot": self.boot, "created_at": self._now(), "updated_at": self._now()}
@@ -799,6 +829,7 @@ class TextTaskService:
                 receipt = {
                     **previous_receipt,
                     "status": "queued",
+                    "model": dispatch_model(body),
                     "boot": self.boot,
                     "updated_at": self._now(),
                 }

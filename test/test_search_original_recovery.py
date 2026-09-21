@@ -1,5 +1,6 @@
 """Search protocol recovery through real formatters and original-branch reads."""
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -246,3 +247,71 @@ def test_stable_or_timed_out_search_fragments_never_complete(monkeypatch, status
     with pytest.raises(RuntimeError, match="timed out"):
         backend._wait_search_result("original-search", 4, 1)
     assert reads == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("protocol", ["openai_search", "openai_v1_chat_complete", "openai_v1_response"])
+@pytest.mark.parametrize("state", ["succeeded", "unknown", "queued"])
+def test_upgrade_reconnect_keeps_legacy_search_identity(runtime, monkeypatch, protocol, state):
+    from services.conversation_binding_service import ConversationBindingError
+    data = payload(protocol, False)
+    # Exact pre-PR46 envelope and SHA256 contract; derived dispatch-model
+    # changes must not invalidate a persisted request or its retained input.
+    legacy = durable_forward.envelope(WHO, data, request(), protocol)
+    legacy["model"] = data.get("model") or "auto"
+    expected_hash = hashlib.sha256(json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    runtime.service.submit(WHO["id"], legacy)
+    runtime.service._update(WHO["id"], "original-wire", model=legacy["model"], status=state,
+                            recovery_next_at=runtime.clock.now + 1000)
+    old_wire = b'{"id":"original-success","answer":"saved legacy answer"}'
+    if state == "succeeded":
+        output = runtime.store.create_output()
+        with runtime.store.output_file(output, append=True) as handle:
+            handle.write(old_wire)
+        # Import an already successful legacy receipt, not a newly executed call.
+        with runtime.store.transaction() as db:
+            receipt = runtime.store.read_receipt(db, "text", WHO["id"], "original-wire")
+            receipt.update(_wire_output=output, _wire_size=len(old_wire),
+                           _wire_head={"status": 200, "headers": {"content-type": "application/json"}, "stream": False})
+            runtime.store.write_receipt(db, "text", WHO["id"], "original-wire", receipt)
+    before = original(runtime)
+    input_bytes = (runtime.store.input_dir / before["_input_ref"]).read_bytes()
+    observed = upstream(runtime, monkeypatch, done=True)
+    # No client resubmission is required to repair a waiting receipt's model.
+    runtime.service = TextTaskService(runtime.store.path, admission=runtime.admission, clock=runtime.clock)
+    after_restart = original(runtime)
+    assert after_restart["model"] == (SEARCH_MODEL if state == "queued" else legacy["model"])
+    current = durable_forward.envelope(WHO, data, request(), protocol)
+    assert current == legacy
+    assert runtime.service._submission_identity(WHO["id"], current)[1] == expected_hash
+    assert runtime.service.submit(WHO["id"], current)["status"] == state
+    for key in ("request_id", "request_message_id", "_input_ref", "client_conversation_id", "_sequence"):
+        assert original(runtime)[key] == before[key]
+    assert (runtime.store.input_dir / before["_input_ref"]).read_bytes() == input_bytes
+    with runtime.store.connect() as db:
+        assert db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (WHO["id"], "original-wire")).fetchone()[0] == expected_hash
+    if state == "succeeded":
+        status, wire = asyncio.run(response_bytes(runtime, data, protocol))
+        assert status == 200 and wire == old_wire
+    elif state == "unknown":
+        status, wire = asyncio.run(response_bytes(runtime, data, protocol))
+        assert status == 409 and json.loads(wire)["status"] == "unknown"
+        assert b"REQUEST_ID_CONFLICT" not in wire
+    else:
+        runtime.accounts.update_account(runtime.account["access_token"], {"limits_progress": [{"feature_name": SEARCH_MODEL, "remaining": 0}]})
+        assert runtime.admission.claim_next() is None
+        runtime.accounts.update_account(runtime.account["access_token"], {"limits_progress": []})
+        runtime.admission.execute(runtime.admission.claim_next())
+        assert original(runtime)["status"] == "succeeded"
+    for field in ("query", "model"):
+        changed = {**data}
+        if field == "model":
+            changed["model"] = "different-client-model"
+        elif protocol == "openai_search":
+            changed["prompt"] = "different query"
+        elif protocol == "openai_v1_response":
+            changed["input"] = "different query"
+        else:
+            changed["messages"] = [{"role": "user", "content": "different query"}]
+        with pytest.raises(ConversationBindingError, match="different input"):
+            runtime.service.submit(WHO["id"], durable_forward.envelope(WHO, changed, request(), protocol))
+    assert len(observed.sends) == (1 if state == "queued" else 0)

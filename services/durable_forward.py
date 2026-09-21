@@ -226,12 +226,12 @@ def _compatibility_call(spec):
                       request_shape=request_shape(payload.get(shape)) if shape else None)
 
 
-def envelope(identity, payload, request, protocol, *, operation="text", compact=False):
-    headers = {k.lower(): v for k, v in request.headers.items() if k.lower() in FORWARDED_HEADERS}
-    request_id = str(headers.get("x-client-request-id") or payload.get("client_request_id") or uuid.uuid4().hex)
-    route = "codex" if protocol == "codex" else "chat"
-    model = str(payload.get("model") or "auto")
-    if operation == "text" and protocol in SEARCH_RECOVERY_PROTOCOLS:
+def dispatch_model(body):
+    """Derived admission data must not change the original input envelope/hash."""
+    spec = body.get("_forward") or {}
+    protocol, payload = spec.get("protocol"), spec.get("payload") or {}
+    model = str(body.get("model") or "auto")
+    if body.get("_operation") == "text" and protocol in SEARCH_RECOVERY_PROTOCOLS:
         from services.protocol.web_search_tool import (WEB_SEARCH_TOOL_TYPES, has_unsupported_tools,
             has_web_search_tool, is_web_search_chat_request)
         from services.protocol.openai_v1_response import has_unsupported_response_tools
@@ -240,10 +240,16 @@ def envelope(identity, payload, request, protocol, *, operation="text", compact=
                    and not has_unsupported_tools(payload, WEB_SEARCH_TOOL_TYPES)
                 or protocol == "openai_v1_response" and has_web_search_tool(payload)
                    and not has_unsupported_response_tools(payload)):
-            # Formatting keeps the requested alias in the private payload;
-            # admission must check the model the existing search route sends.
             from services.openai_backend_api import SEARCH_MODEL
             model = SEARCH_MODEL
+    return model
+
+
+def envelope(identity, payload, request, protocol, *, operation="text", compact=False):
+    headers = {k.lower(): v for k, v in request.headers.items() if k.lower() in FORWARDED_HEADERS}
+    request_id = str(headers.get("x-client-request-id") or payload.get("client_request_id") or uuid.uuid4().hex)
+    route = "codex" if protocol == "codex" else "chat"
+    model = str(payload.get("model") or "auto")
     from utils.helper import is_codex_image_model
     if operation == "image" and is_codex_image_model(model):
         from services.openai_backend_api import CODEX_RESPONSES_MODEL
