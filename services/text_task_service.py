@@ -306,6 +306,20 @@ class TextTaskService:
                     or not isinstance(parent_message_id, str) or not parent_message_id.strip()):
                 return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
             result = {key: recovered[key] for key in cls._SUCCESS_RECOVERY_FIELDS if key in recovered}
+            if ((receipt or {}).get("_chat_recovery") or {}).get("kind") == "search":
+                search = recovered.get("_search_result")
+                if (not isinstance(search, dict)
+                        or set(search) != {"conversation_id", "status", "answer", "sources", "assistant_message_id", "create_time"}
+                        or search["conversation_id"] != recovered.get("conversation_id")
+                        or search["assistant_message_id"] != parent_message_id
+                        or search["answer"] != content or search["status"] != "finished_successfully"
+                        or type(search["create_time"]) not in {int, float} or not math.isfinite(search["create_time"])
+                        or not isinstance(search["sources"], list)
+                        or any(not isinstance(source, dict) or set(source) != {"title", "url", "snippet", "source_type"}
+                               or any(not isinstance(value, str) for value in source.values())
+                               for source in search["sources"])):
+                    return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+                result["_search_result"] = search
             scan = cls._safe_recovery_scan(recovered.get(RECOVERY_CONVERSATION_SCAN_FIELD))
             if scan is not None:
                 result[RECOVERY_CONVERSATION_SCAN_FIELD] = scan
