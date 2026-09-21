@@ -14,9 +14,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Package tracked code only
+        shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/dsh-source"
-          git archive --format=tar.gz --output="$RUNNER_TEMP/dsh-source/provider-source.tar.gz" HEAD api services utils test docs requirements.txt config.json
+          paths=(api services utils test docs)
+          for f in pyproject.toml uv.lock config.json VERSION; do
+            if git cat-file -e "HEAD:$f" 2>/dev/null; then paths+=("$f"); fi
+          done
+          git archive --format=tar.gz --output="$RUNNER_TEMP/dsh-source/provider-source.tar.gz" HEAD "${paths[@]}"
           git rev-parse HEAD > "$RUNNER_TEMP/dsh-source/source-sha.txt"
       - uses: actions/upload-artifact@v4
         with:
