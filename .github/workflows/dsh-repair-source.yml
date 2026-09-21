@@ -6,24 +6,20 @@ on:
 permissions:
   contents: read
 jobs:
-  dependencies:
+  test-fixtures:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      - name: Fetch Python wheels, no application execution
+      - name: Package owning test dependencies from tracked source
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/check-deps/wheels"
-          python -c "import tomllib; p=tomllib.load(open('pyproject.toml','rb')); print('\n'.join(p['project']['dependencies'] + ['pytest','pytest-subtests','httpx']))" > "$RUNNER_TEMP/check-deps/requirements.txt"
-          python -m pip wheel -r "$RUNNER_TEMP/check-deps/requirements.txt" -w "$RUNNER_TEMP/check-deps/wheels"
+          mkdir -p "$RUNNER_TEMP/fixtures"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/fixtures/provider-test-fixtures.tar.gz" HEAD scripts examples README.md .env.example
       - uses: actions/upload-artifact@v4
         with:
-          name: dsh-repair-python-test-dependencies
-          path: ${{ runner.temp }}/check-deps/
+          name: dsh-repair-provider-test-fixtures
+          path: ${{ runner.temp }}/fixtures/
           retention-days: 3
