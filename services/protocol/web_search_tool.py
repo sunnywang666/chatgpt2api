@@ -153,8 +153,17 @@ def text_with_url_citations(result: dict[str, Any]) -> tuple[str, list[dict[str,
     return text.strip(), annotations
 
 
-def run_web_search(query: str) -> dict[str, Any]:
+def run_web_search(query: str, *, model="auto", messages=None) -> dict[str, Any]:
+    from services.durable_forward import prepare_chat_recovery
+    from services.request_context import current_request
+    context = current_request.get()
+    if context is not None:
+        prepare_chat_recovery(context, model, messages or [{"role": "user", "content": query}], search=True)
     token = account_service.get_text_access_token()
-    result = OpenAIBackendAPI(token).search(query)
+    backend = OpenAIBackendAPI(token)
+    try:
+        result = backend.search(query)
+    finally:
+        backend.close()
     account_service.mark_text_used(token)
     return result

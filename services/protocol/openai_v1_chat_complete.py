@@ -202,7 +202,7 @@ def web_search_chat_response(messages: list[dict[str, Any]], model: str) -> dict
     query = search_query_from_messages(messages)
     if not query:
         raise HTTPException(status_code=400, detail={"error": "messages or prompt is required for web search"})
-    text, annotations = text_with_url_citations(run_web_search(query))
+    text, annotations = text_with_url_citations(run_web_search(query, model=model, messages=messages))
     return completion_response(
         model,
         text,
@@ -215,7 +215,7 @@ def stream_web_search_chat_completion(messages: list[dict[str, Any]], model: str
     query = search_query_from_messages(messages)
     if not query:
         raise HTTPException(status_code=400, detail={"error": "messages or prompt is required for web search"})
-    text, _annotations = text_with_url_citations(run_web_search(query))
+    text, _annotations = text_with_url_citations(run_web_search(query, model=model, messages=messages))
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     yield completion_chunk(model, {"role": "assistant", "content": text}, None, completion_id, created)

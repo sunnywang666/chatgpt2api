@@ -1012,12 +1012,17 @@ class ConversationBindingService:
                 "recovery_reason": (TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value if active_result_seen
                                     else TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value),
             }
+        search_result = None
+        if (receipt.get("_chat_recovery") or {}).get("kind") == "search":
+            search_result = backend._search_result_from_message(conversation_id, mapping[parent_message_id]["message"])
+            text = search_result["answer"]
         return {
             **result,
             "binding_status": "bound",
             "status": "succeeded",
             "parent_message_id": parent_message_id,
             "content": text,
+            **({"_search_result": search_result} if search_result is not None else {}),
         }
 
     def complete_text(self, body: dict[str, Any], *, on_cursor=None) -> dict[str, Any]:

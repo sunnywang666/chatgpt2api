@@ -21,21 +21,25 @@ FORWARDED_HEADERS = {"session-id", "thread-id", "x-client-request-id", "originat
 OUTPUT_HEADERS = {"content-type", "cache-control", "x-request-id", "openai-request-id", "x-openai-request-id", "retry-after"}
 MAX_OUTPUT_BYTES = 128 * 1024 * 1024
 TEXT_RECOVERY_PROTOCOLS = {"openai_v1_chat_complete", "openai_v1_response", "anthropic_v1_messages"}
+SEARCH_RECOVERY_PROTOCOLS = {"openai_search", "openai_v1_chat_complete", "openai_v1_response"}
 
 
 def chat_recovery_supported(receipt):
     metadata = receipt.get("_chat_recovery") or {}
+    if not isinstance(metadata, dict):
+        return False
+    protocols = SEARCH_RECOVERY_PROTOCOLS if metadata.get("kind") == "search" else TEXT_RECOVERY_PROTOCOLS
     return (receipt.get("_route") == "chat" and receipt.get("_input_ref")
-            and isinstance(metadata, dict)
-            and receipt.get("_forward_protocol") in TEXT_RECOVERY_PROTOCOLS
+            and receipt.get("_forward_protocol") in protocols
             and metadata.get("protocol") == receipt["_forward_protocol"])
 
 
-def prepare_chat_recovery(context, model, messages):
+def prepare_chat_recovery(context, model, messages, *, search=False):
     """Retain the actual text route's formatting inputs before its model POST."""
     receipt = context.receipt()
     protocol = receipt.get("_forward_protocol")
-    if receipt.get("_route") != "chat" or protocol not in TEXT_RECOVERY_PROTOCOLS:
+    protocols = SEARCH_RECOVERY_PROTOCOLS if search else TEXT_RECOVERY_PROTOCOLS
+    if receipt.get("_route") != "chat" or protocol not in protocols:
         return False
     from services.protocol.conversation import count_message_text_tokens, count_message_image_tokens
     input_text, input_image = count_message_text_tokens(messages, model), count_message_image_tokens(messages, model)
@@ -43,6 +47,7 @@ def prepare_chat_recovery(context, model, messages):
         "protocol": protocol, "model": model,
         "input_text_tokens": input_text, "input_image_tokens": input_image,
         "input_tokens": input_text + input_image,
+        **({"kind": "search"} if search else {}),
     }, client_conversation_id=receipt.get("client_conversation_id") or "compat-" + context.request_id)
     return True
 
@@ -60,11 +65,55 @@ def _wire_identity(item):
         if type(created) is int:
             identity["created"] = created
     if item.get("type") == "response.output_item.added" and isinstance(item.get("item"), dict):
-        identity["item_id"] = item["item"].get("id")
+        key = "search_id" if item["item"].get("type") == "web_search_call" else "item_id"
+        identity[key] = item["item"].get("id")
     block = item.get("content_block")
     if item.get("type") == "content_block_start" and isinstance(block, dict) and block.get("type") == "tool_use":
         identity["tool_ids"] = {str(item["index"]): {"id": block["id"], "name": block["name"]}}
     return identity
+
+
+def _recovered_search_response(metadata, payload, identity, created, result):
+    from services.protocol import openai_v1_chat_complete as chat, openai_v1_response as responses
+    from services.protocol.conversation import count_text_tokens
+    from services.protocol.web_search_tool import normalized_sources, search_query_from_messages, text_with_url_citations
+    from utils.image_tokens import token_usage
+    protocol, model = metadata["protocol"], metadata["model"]
+    if protocol == "openai_search":
+        return result, []
+    text, annotations = text_with_url_citations(result)
+    output_tokens = count_text_tokens(text, model)
+    if protocol == "openai_v1_chat_complete":
+        response = chat.completion_response(model, text, created, annotations=chat.chat_completion_annotations(annotations))
+        response["id"] = identity.get("id") or response["id"]
+        response["usage"].update(prompt_tokens=metadata["input_tokens"], completion_tokens=output_tokens,
+                                 total_tokens=metadata["input_tokens"] + output_tokens)
+        response["usage"]["prompt_tokens_details"].update(text_tokens=metadata["input_text_tokens"], image_tokens=metadata["input_image_tokens"])
+        response["usage"]["completion_tokens_details"]["text_tokens"] = output_tokens
+        return response, [chat.completion_chunk(model, {"role": "assistant", "content": text}, None, response["id"], created),
+                          chat.completion_chunk(model, {}, "stop", response["id"], created)]
+    _, messages = responses.text_response_parts(payload)
+    query = search_query_from_messages(messages)
+    response_id = identity.get("id") or "resp_" + uuid.uuid4().hex
+    search_id = identity.get("search_id") or "ws_" + uuid.uuid4().hex
+    item_id = identity.get("item_id") or "msg_" + uuid.uuid4().hex
+    searching = responses.web_search_call_item(query, search_id, "in_progress")
+    search = responses.web_search_call_item(query, search_id, "completed", normalized_sources(result))
+    message = responses.text_output_item(text, item_id, "completed", annotations)
+    final = responses.response_completed(response_id, model, created, [search, message], token_usage(
+        input_text_tokens=metadata["input_text_tokens"], input_image_tokens=metadata["input_image_tokens"], output_text_tokens=output_tokens))
+    return final["response"], [
+        responses.response_created(response_id, model, created),
+        {"type": "response.output_item.added", "output_index": 0, "item": searching},
+        {"type": "response.web_search_call.in_progress", "output_index": 0, "item_id": search_id},
+        {"type": "response.web_search_call.searching", "output_index": 0, "item_id": search_id},
+        {"type": "response.web_search_call.completed", "output_index": 0, "item_id": search_id},
+        {"type": "response.output_item.done", "output_index": 0, "item": search},
+        {"type": "response.output_item.added", "output_index": 1, "item": responses.text_output_item("", item_id, "in_progress", annotations)},
+        {"type": "response.output_text.delta", "item_id": item_id, "output_index": 1, "content_index": 0, "delta": text},
+        {"type": "response.output_text.done", "item_id": item_id, "output_index": 1, "content_index": 0, "text": text},
+        {"type": "response.output_item.done", "output_index": 1, "item": message}, final,
+    ]
 
 
 def recovered_chat_wire(service, receipt, recovered):
@@ -83,8 +132,10 @@ def recovered_chat_wire(service, receipt, recovered):
     protocol, text = metadata["protocol"], sanitize_output_text(recovered["content"])
     model, created = metadata["model"], identity.get("created") or int(receipt["created_at"])
     output_tokens = count_text_tokens(text, model)
-    stream = bool(spec["payload"].get("stream"))
-    if protocol == "openai_v1_chat_complete":
+    stream = protocol != "openai_search" and bool(spec["payload"].get("stream"))
+    if metadata.get("kind") == "search":
+        response, events = _recovered_search_response(metadata, spec["payload"], identity, created, recovered["_search_result"])
+    elif protocol == "openai_v1_chat_complete":
         response = chat.completion_response(model, text, created)
         response["id"] = identity.get("id") or response["id"]
         input_text, input_image = metadata["input_text_tokens"], metadata["input_image_tokens"]
@@ -173,6 +224,25 @@ def _compatibility_call(spec):
     return LoggedCall(spec["identity"], endpoint, str(payload.get("model") or "auto"), summary,
                       request_text=request_text(*(payload.get(key) for key in fields)),
                       request_shape=request_shape(payload.get(shape)) if shape else None)
+
+
+def dispatch_model(body):
+    """Derived admission data must not change the original input envelope/hash."""
+    spec = body.get("_forward") or {}
+    protocol, payload = spec.get("protocol"), spec.get("payload") or {}
+    model = str(body.get("model") or "auto")
+    if body.get("_operation") == "text" and protocol in SEARCH_RECOVERY_PROTOCOLS:
+        from services.protocol.web_search_tool import (WEB_SEARCH_TOOL_TYPES, has_unsupported_tools,
+            has_web_search_tool, is_web_search_chat_request)
+        from services.protocol.openai_v1_response import has_unsupported_response_tools
+        if (protocol == "openai_search"
+                or protocol == "openai_v1_chat_complete" and is_web_search_chat_request(payload)
+                   and not has_unsupported_tools(payload, WEB_SEARCH_TOOL_TYPES)
+                or protocol == "openai_v1_response" and has_web_search_tool(payload)
+                   and not has_unsupported_response_tools(payload)):
+            from services.openai_backend_api import SEARCH_MODEL
+            model = SEARCH_MODEL
+    return model
 
 
 def envelope(identity, payload, request, protocol, *, operation="text", compact=False):

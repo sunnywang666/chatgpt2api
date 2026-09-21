@@ -338,7 +338,7 @@ def stream_web_search_response(body: dict[str, Any], messages: list[dict[str, An
     yield {"type": "response.output_item.added", "output_index": 0, "item": searching_item}
     yield {"type": "response.web_search_call.in_progress", "output_index": 0, "item_id": search_id}
     yield {"type": "response.web_search_call.searching", "output_index": 0, "item_id": search_id}
-    result = run_web_search(query)
+    result = run_web_search(query, model=model, messages=messages)
     search_item = web_search_call_item(query, search_id, "completed", normalized_sources(result))
     yield {"type": "response.web_search_call.completed", "output_index": 0, "item_id": search_id}
     yield {"type": "response.output_item.done", "output_index": 0, "item": search_item}
