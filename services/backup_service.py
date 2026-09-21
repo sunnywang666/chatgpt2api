@@ -653,6 +653,14 @@ class BackupService:
                                     with store.output_file(name) as handle:
                                         payload = handle.read(receipt.get("_wire_size", 0))
                                 self._add_bytes_to_archive(archive, "data/" + store.input_dir.name + "/" + name, payload, mode=0o600)
+                            # Completed legacy image slots are immutable private
+                            # outputs too; losing them would lose restart input.
+                            for slot in (receipt.get("_image_slots") or {}).values():
+                                name = slot.get("output_ref")
+                                if name:
+                                    with store.output_file(name) as handle:
+                                        payload = handle.read()
+                                    self._add_bytes_to_archive(archive, "data/" + store.input_dir.name + "/" + name, payload, mode=0o600)
                 self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")
             if include.get("accounts_snapshot"):
                 self._add_bytes_to_archive(

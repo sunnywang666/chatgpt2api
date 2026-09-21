@@ -366,9 +366,12 @@ def stream_image_response(
     input_image_tokens: int = 0,
     size: object = None,
     quality: str = "auto",
+    *, identity=None,
 ) -> Iterator[dict[str, Any]]:
-    response_id = f"resp_{uuid.uuid4().hex}"
-    created = int(time.time())
+    from services.durable_image_forward import wire_identity
+    identity = wire_identity() if identity is None else identity
+    response_id = identity.get("id") or f"resp_{uuid.uuid4().hex}"
+    created = identity.get("created") or int(time.time())
     yield response_created(response_id, model, created)
     for output in image_outputs:
         if output.kind == "message":
