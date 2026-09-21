@@ -780,6 +780,10 @@ def text_backend(model: str = "auto") -> OpenAIBackendAPI:
 
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
+    from services.request_context import current_request
+    from services.durable_forward import prepare_chat_recovery
+    context = current_request.get()
+    recoverable = context is not None and prepare_chat_recovery(context, request.model, request.messages)
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
@@ -791,6 +795,9 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         active_backend = None
         try:
             active_backend = OpenAIBackendAPI(access_token=token)
+            if recoverable:
+                active_backend.retain_bound_conversation = True
+            done = False
             for event in conversation_events(
                 active_backend,
                 messages=request.messages,
@@ -798,17 +805,33 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                 prompt=request.prompt,
                 thinking_effort=request.thinking_effort,
             ):
+                if recoverable:
+                    receipt = context.receipt()
+                    conversation_id = str(event.get("conversation_id") or "")
+                    if conversation_id and conversation_id != receipt.get("conversation_id"):
+                        if receipt.get("conversation_id"):
+                            raise RuntimeError("original conversation identity changed")
+                        context.admission.update_claim(context, conversation_id=conversation_id)
+                    if event.get("type") == "conversation.done":
+                        done = True
+                        context.terminal(True)
                 if event.get("type") != "conversation.delta":
                     continue
                 delta = str(event.get("delta") or "")
                 if delta:
                     emitted = True
                     yield delta
+            if recoverable and not done:
+                # A transport EOF cannot authorize the formatter's final event.
+                from services.conversation_binding_service import ConversationBindingError
+                raise ConversationBindingError("original stream ended without its terminal event",
+                                               code="CONVERSATION_OUTCOME_UNKNOWN")
             account_service.mark_text_used(token)
             return
         except Exception as exc:
             error_message = str(exc)
-            if token and not emitted and is_token_invalid_error(error_message):
+            submitted = context is not None and context.receipt().get("_submission_started")
+            if token and not emitted and not submitted and is_token_invalid_error(error_message):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
                     token = refreshed_token

@@ -28,6 +28,7 @@ from services.conversation_binding_service import (
     RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
     RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
+    TURN_END_EVIDENCE_FIELD,
     conversation_binding_service,
     is_recovery_image_pointer,
 )
@@ -211,9 +212,9 @@ class TextTaskService:
     @classmethod
     def _recovery_due(cls, receipt, now):
         if receipt.get("_forward_protocol"):
-            # Compatibility receipts retain wire bytes, not the full original
-            # upstream cursor required by the public durable Chat reader.
-            return False
+            from services.durable_forward import chat_recovery_supported
+            if not chat_recovery_supported(receipt):
+                return False
         next_at = receipt.get("recovery_next_at")
         lease_until = receipt.get("recovery_lease_until")
         if lease_until is not None and now < float(lease_until):
@@ -322,6 +323,25 @@ class TextTaskService:
             scan = cls._safe_recovery_scan(recovered.get(RECOVERY_CONVERSATION_SCAN_FIELD))
             if scan is not None:
                 anchor[RECOVERY_CONVERSATION_SCAN_FIELD] = scan
+            ended = recovered.get(TURN_END_EVIDENCE_FIELD)
+            if ended is not None:
+                receipt = receipt or {}
+                if (status != "unknown"
+                        or recovered.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
+                        or not isinstance(ended, dict)
+                        or set(ended) != {"conversation_id", "request_message_id", "final_message_id", "observed_at"}
+                        or any(not isinstance(ended.get(k), str) or not ended[k].strip()
+                               for k in ("conversation_id", "request_message_id", "final_message_id"))
+                        or ended["request_message_id"] != receipt.get("request_message_id")
+                        or ended["final_message_id"] == ended["request_message_id"]
+                        or ended["conversation_id"] != recovered.get("conversation_id")
+                        or receipt.get("conversation_id") and ended["conversation_id"] != receipt["conversation_id"]
+                        or type(ended["observed_at"]) not in {int, float} or not math.isfinite(ended["observed_at"])
+                        or ended["observed_at"] <= 0
+                        or any(not receipt.get(k) or recovered.get(k) != receipt[k]
+                               for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))):
+                    return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+                anchor.update({TURN_END_EVIDENCE_FIELD: dict(ended), "_upstream_terminal": True, "_turn_reserved": False})
             return anchor or None, "UPSTREAM_OUTCOME_UNKNOWN", "read_text_result", cls._safe_recovery_reason(recovered.get("recovery_reason"))
         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
 
@@ -442,7 +462,7 @@ class TextTaskService:
                 recovered_anchor = {
                     key: value for key, value in (recovered or {}).items()
                     if (
-                        key == RECOVERY_CONVERSATION_SCAN_FIELD
+                        key in {RECOVERY_CONVERSATION_SCAN_FIELD, TURN_END_EVIDENCE_FIELD, "_upstream_terminal", "_turn_reserved"}
                         or key == RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD
                         or key in {"conversation_id", "parent_message_id", "request_parent_message_id"}
                         and not current.get(key)
@@ -488,6 +508,8 @@ class TextTaskService:
                 changes = {
                     **(recovered or {}),
                     "status": "succeeded",
+                    "upstream_outcome": "completed",
+                    "recovery_retryable": False,
                     "finished_at": now,
                     "error_code": None,
                     "recovery_next_at": None,
@@ -507,6 +529,7 @@ class TextTaskService:
             return self._public(updated)
 
     def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False):
+        from services.pool_admission import unknown_text_result
         recovery_claim = None
         now = self._now()
         with self._db() as db:
@@ -540,7 +563,7 @@ class TextTaskService:
                     previous = {**previous, "status": "unknown", "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "updated_at": now}
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
-                if (previous["status"] == "unknown"
+                if (unknown_text_result(previous)
                         and previous.get("request_message_id")
                         and previous.get("provider_binding_id")
                         and previous.get("provider_account_identity")
@@ -567,6 +590,17 @@ class TextTaskService:
             try:
                 recovered = self.recovery_reader(recovery_claim[1])
                 safe_result, error_code, phase, recovery_reason = self._safe_recovery_result(recovered, recovery_claim[1])
+                if not error_code and recovery_claim[1].get("_forward_protocol"):
+                    from services.durable_forward import recovered_chat_wire
+                    if recovered.get("status") == "succeeded":
+                        safe_result.update(recovered_chat_wire(self, recovery_claim[1], {**safe_result, "status": "succeeded"}))
+                    else:
+                        # A non-text upstream result is not a completed text
+                        # compatibility response. Preserve its authoritative
+                        # result without replaying the original model call.
+                        safe_result = {**(safe_result or {}), "_upstream_terminal": True, "_turn_reserved": False,
+                                       "_wire_head": None, "_wire_error_status": 422,
+                                       "_wire_error_payload": {"error": {"code": "CHAT_RESPONSE_NOT_TEXT"}}}
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0], safe_result, error_code, phase,
                     recovery_reason, count_unrecoverable=allow_unrecoverable_retry,
@@ -640,7 +674,7 @@ class TextTaskService:
                 "recovery_requires_new_conversation": bool(
                     current.get("recovery_requires_new_conversation")
                 ),
-                "recovery_next_at": None,
+                "recovery_next_at": current.get("recovery_next_at") or now + self.RECOVERY_BASE_BACKOFF_SECONDS,
                 "recovery_claim_id": None,
                 "recovery_claimed_at": None,
                 "recovery_lease_until": None,

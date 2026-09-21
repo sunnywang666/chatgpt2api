@@ -31,6 +31,39 @@ class TextRecoveryReason(str, Enum):
 
 _ACTIVE_TEXT_RESULT_STATUSES = frozenset({"in_progress", "running", "pending", "queued"})
 NON_TEXT_RESULT_FIELD = "_non_text_result"
+TURN_END_EVIDENCE_FIELD = "_turn_end_evidence"
+
+
+def _completed_request_turn(mapping, children, request_message_id, conversation_id):
+    """Positive terminal evidence for the exact original branch, even without a usable answer."""
+    node_id, visited = request_message_id, {request_message_id}
+    while True:
+        successors = children.get(node_id, [])
+        if len(successors) != 1:
+            return None
+        node_id = successors[0]
+        if node_id in visited:
+            return None
+        visited.add(node_id)
+        node = mapping.get(node_id)
+        message = node.get("message") if isinstance(node, dict) else None
+        if not isinstance(message, dict) or message.get("id") != node_id:
+            return None
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        if role not in {"assistant", "tool"} or message.get("status") != "finished_successfully":
+            return None
+        if role == "assistant" and message.get("end_turn") is True:
+            if message.get("channel") not in {None, "final"}:
+                return None
+            for successor in children.get(node_id, []):
+                following = mapping.get(successor, {}).get("message")
+                if (not isinstance(following, dict) or following.get("id") != successor
+                        or not isinstance(following.get("author"), dict)
+                        or following["author"].get("role") != "user"):
+                    return None
+            return {"conversation_id": conversation_id, "request_message_id": request_message_id,
+                    "final_message_id": node_id, "observed_at": time.time()}
 
 
 def is_recovery_image_pointer(value: object) -> bool:
@@ -964,6 +997,8 @@ class ConversationBindingService:
                 "binding_status": "unknown",
                 "status": "running" if active_result_seen else "unknown",
                 "recovery_reason": recovery_reason,
+                **({TURN_END_EVIDENCE_FIELD: ended} if not active_result_seen and terminal_empty_seen
+                   and (ended := _completed_request_turn(mapping, children, request_message_id, conversation_id)) else {}),
             }
         parent_message_id, text = candidates[0]
         return {

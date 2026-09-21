@@ -24,10 +24,30 @@ def account_clock_key(account):
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
+def unknown_text_result(receipt):
+    return (receipt.get("status") == "unknown"
+            or receipt.get("status") == "failed" and receipt.get("error_code") == "RESULT_UNRECOVERABLE"
+            and receipt.get("upstream_outcome") == "unknown")
+
+
 def unfinished(kind, receipt):
     if kind == "image":
         return receipt.get("upstream_unfinished") is True or receipt.get("status") in {"queued", "running"}
-    return receipt.get("status") in {"queued", "running", "unknown", "not_started"}
+    return receipt.get("status") in {"queued", "running", "not_started"} or unknown_text_result(receipt)
+
+
+def original_turn_ended(kind, receipt):
+    if receipt.get("_upstream_terminal") is True:
+        return True
+    # Older public Chat code recorded a definitive validation rejection as
+    # UNKNOWN. Only its exact model endpoint / pre-SSE HTTP evidence proves
+    # that turn ended. Missing stages, timeouts and result age prove nothing.
+    return (kind == "text" and unknown_text_result(receipt)
+            and receipt.get("_route", "chat") == "chat" and not receipt.get("_forward_protocol")
+            and receipt.get("original_failure_phase") == "stream_open"
+            and receipt.get("original_exception_category") == "http"
+            and receipt.get("original_upstream_request_stage") == "conversation"
+            and type(receipt.get("original_http_status")) is int and receipt["original_http_status"] == 422)
 
 
 def image_capacity(account, settings):
@@ -147,11 +167,19 @@ class PoolAdmission:
         now = float(self.clock())
         with self.store.connect() as db:
             rows = list(self.store.receipts(db))
+        # Use the existing persisted retry timestamps. A short-backoff legacy
+        # scan must not monopolize recovery ahead of other overdue originals.
+        rows.sort(key=lambda row: float(row[3].get("recovery_next_at" if row[0] == "text" else "next_poll_at")
+                                        or row[3].get("created_at") or 0))
         for kind, owner, request_id, r in rows:
-            if kind not in self.recoveries or r.get("_forward_protocol"):
+            if kind not in self.recoveries:
                 continue
+            if r.get("_forward_protocol"):
+                from services.durable_forward import chat_recovery_supported
+                if not chat_recovery_supported(r):
+                    continue
             if kind == "text":
-                due = r.get("status") == "unknown" and r.get("provider_binding_id") and float(r.get("recovery_next_at") or 0) <= now
+                due = unknown_text_result(r) and r.get("provider_binding_id") and float(r.get("recovery_next_at") or 0) <= now
             else:
                 due = (r.get("status") == "error" and r.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
                        and r.get("conversation_id") and r.get("request_message_id") and float(r.get("next_poll_at") or 0) <= now)
@@ -221,18 +249,23 @@ class PoolAdmission:
         for kind, owner, request_id, r in receipts:
             status = r.get("status")
             pending = unfinished(kind, r)
-            unknown = status == "unknown" or (kind == "image" and status == "error" and r.get("upstream_unfinished"))
+            unknown = (unknown_text_result(r) if kind == "text" else status == "unknown"
+                       or status == "error" and r.get("upstream_unfinished"))
             account = by_identity.get(str(r.get("provider_account_identity") or ""))
             resource = account_clock_key(account) if account else r.get("_account_resource")
             active = status == "running" or unknown
+            # An unresolved result and an executing model turn are distinct.
+            # Only positive original-turn terminal evidence can clear UNKNOWN
+            # occupancy; age, a closed socket or a missing result cannot.
+            turn_active = active and not original_turn_ended(kind, r)
             if status == "running" and r.get("_executing") and float(r.get("_claim_until") or 0) > now:
                 active_bytes += int(r.get("_input_bytes") or 0)
                 if kind == "text" and r.get("_route", "chat") == "chat":
                     active_text += 1
-            if active and not resource:
+            if turn_active and not resource:
                 unknown_unbound = True
             route = r.get("_route", "chat")
-            if resource and active and (unknown or r.get("_turn_reserved", True)):
+            if resource and turn_active and (unknown or r.get("_turn_reserved", True)):
                 key = route + "_turn:" + resource
                 occupied[key] = occupied.get(key, 0) + 1
             if resource and (kind == "image" or r.get("_operation") == "image") and (r.get("upstream_unfinished") or active):
