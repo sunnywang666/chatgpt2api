@@ -196,6 +196,35 @@ class TextTaskService:
         self.clock = clock or time.time
         self.recovery_reader = recovery_reader or conversation_binding_service.read_text_request
         self.boot = uuid.uuid4().hex
+        if self.store.path.exists():
+            self._refresh_queued_forward_models()
+
+    def _refresh_queued_forward_models(self):
+        # Upgrade only the derived dispatch model of unclaimed waiting calls.
+        # Read private inputs outside the DB transaction; a concurrent claim
+        # invalidates the final compare-and-set. Original hashes/inputs stay put.
+        from services.durable_forward import SEARCH_RECOVERY_PROTOCOLS, dispatch_model
+        with self._db() as db:
+            rows = db.execute("SELECT owner,id,request_hash,receipt FROM requests").fetchall()
+        for owner, request_id, request_hash, raw in rows:
+            receipt = json.loads(raw)
+            if (receipt.get("status") != "queued" or receipt.get("_claim_id")
+                    or receipt.get("_submission_started") or not receipt.get("_input_ref")
+                    or receipt.get("_forward_protocol") not in SEARCH_RECOVERY_PROTOCOLS):
+                continue
+            try:
+                body = self.store.load_input(receipt["_input_ref"])
+                if not isinstance(body, dict):
+                    continue
+                if self._submission_identity(owner, body) != (request_id, request_hash):
+                    continue  # Existing admission input validation owns this failure.
+                model = dispatch_model(body)
+            except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
+                continue
+            if model != receipt.get("model"):
+                with self._db() as db:
+                    db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
+                               (json.dumps({**receipt, "model": model}), owner, request_id, raw))
 
     def _now(self):
         return float(self.clock())
@@ -306,6 +335,20 @@ class TextTaskService:
                     or not isinstance(parent_message_id, str) or not parent_message_id.strip()):
                 return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
             result = {key: recovered[key] for key in cls._SUCCESS_RECOVERY_FIELDS if key in recovered}
+            if ((receipt or {}).get("_chat_recovery") or {}).get("kind") == "search":
+                search = recovered.get("_search_result")
+                if (not isinstance(search, dict)
+                        or set(search) != {"conversation_id", "status", "answer", "sources", "assistant_message_id", "create_time"}
+                        or search["conversation_id"] != recovered.get("conversation_id")
+                        or search["assistant_message_id"] != parent_message_id
+                        or search["answer"] != content or search["status"] != "finished_successfully"
+                        or type(search["create_time"]) not in {int, float} or not math.isfinite(search["create_time"])
+                        or not isinstance(search["sources"], list)
+                        or any(not isinstance(source, dict) or set(source) != {"title", "url", "snippet", "source_type"}
+                               or any(not isinstance(value, str) for value in source.values())
+                               for source in search["sources"])):
+                    return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+                result["_search_result"] = search
             scan = cls._safe_recovery_scan(recovered.get(RECOVERY_CONVERSATION_SCAN_FIELD))
             if scan is not None:
                 result[RECOVERY_CONVERSATION_SCAN_FIELD] = scan
@@ -482,7 +525,7 @@ class TextTaskService:
                         )
                     ),
                     "recovery_error_code": error_code,
-                    "recovery_phase": phase or "read_text_request",
+                    "recovery_phase": phase or current.get("recovery_phase") or "read_text_request",
                     "recovery_retry_after_seconds": retry_after_seconds,
                     "recovery_reason": recovery_reason,
                     "recovery_no_result_reads": qualified_reads,
@@ -491,6 +534,11 @@ class TextTaskService:
                     # readable again.
                     "recovery_requires_new_conversation": requires_new_conversation,
                 }
+            elif (recovered or {}).get("status") == "queued":
+                # Legacy multi-image recovery has saved every submitted slot.
+                # Its unsent remainder competes in the original admission queue.
+                changes = {**recovered, "error_code": None, "recovery_next_at": None,
+                           "recovery_error_code": None, "recovery_phase": None, "finished_at": None}
             elif (recovered or {}).get("status") == "failed":
                 changes = {
                     **recovered,
@@ -527,6 +575,18 @@ class TextTaskService:
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
                        (json.dumps(updated), owner, request_id, row[0]))
             return self._public(updated)
+
+    def _update_recovery_claim(self, owner, receipt, **changes):
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            request_id = receipt["request_id"]
+            row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+            current = json.loads(row[0]) if row else {}
+            if not current.get("recovery_claim_id") or current["recovery_claim_id"] != receipt.get("recovery_claim_id"):
+                raise AdmissionLost("original image recovery claim changed")
+            current.update(changes, updated_at=self._now())
+            db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(current), owner, request_id))
+            return current
 
     def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False):
         from services.pool_admission import unknown_text_result
@@ -588,6 +648,13 @@ class TextTaskService:
             return {"request_id": request_id, "status": "not_found"}
         if recovery_claim:
             try:
+                from services import durable_image_forward
+                if durable_image_forward.supported(recovery_claim[1]):
+                    recovered = durable_image_forward.recover(self, owner, recovery_claim[1])
+                    result = self._finish_recovery(owner, request_id, recovery_claim[0], recovered)
+                    if self.admission is not None:
+                        self.admission.wake()
+                    return result
                 recovered = self.recovery_reader(recovery_claim[1])
                 safe_result, error_code, phase, recovery_reason = self._safe_recovery_result(recovered, recovery_claim[1])
                 if not error_code and recovery_claim[1].get("_forward_protocol"):
@@ -616,7 +683,7 @@ class TextTaskService:
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0],
                     recovery_evidence or None,
-                    error_code=recovery_error_code, phase="read_text_request",
+                    error_code=recovery_error_code,
                     recovery_reason=self._safe_recovery_reason(getattr(exc, "recovery_reason", "")),
                     retry_after_seconds=retry_after_seconds,
                     count_unrecoverable=allow_unrecoverable_retry,
@@ -628,7 +695,7 @@ class TextTaskService:
                 recovery_error_code, retry_after_seconds = self._recovery_failure(exc)
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0],
-                    error_code=recovery_error_code, phase="read_text_request",
+                    error_code=recovery_error_code,
                     retry_after_seconds=retry_after_seconds,
                     recovery_reason=None, count_unrecoverable=allow_unrecoverable_retry,
                 )
@@ -749,6 +816,7 @@ class TextTaskService:
         return self._public(json.loads(previous[1])) if previous else None
 
     def submit(self, owner: str, body: dict, *, source: str | None = None):
+        from services.durable_forward import dispatch_model
         request_id, request_hash = self._submission_identity(owner, body)
         receipt = {"request_id": request_id, "client_conversation_id": body["client_conversation_id"],
                    "_route": body.get("_route", "chat"), "_operation": body.get("_operation", "text"),
@@ -758,7 +826,7 @@ class TextTaskService:
                    "_expected_sends": int(body.get("_expected_sends") or 1),
                    "_previous_response_id": ((body.get("_forward") or {}).get("payload") or {}).get("previous_response_id"),
                    "route": str(body.get("_public_route") or ""),
-                   "model": str(body.get("model") or "auto"),
+                   "model": dispatch_model(body),
                    "request_message_id": str(uuid.uuid4()),
                    "request_parent_message_id": str(body.get("parent_message_id") or "").strip(),
                    "status": "queued", "boot": self.boot, "created_at": self._now(), "updated_at": self._now()}
@@ -785,6 +853,7 @@ class TextTaskService:
                 receipt = {
                     **previous_receipt,
                     "status": "queued",
+                    "model": dispatch_model(body),
                     "boot": self.boot,
                     "updated_at": self._now(),
                 }

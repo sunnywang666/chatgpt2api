@@ -200,7 +200,7 @@ def test_duplicate_send_inside_original_runner_is_fenced(runtime):
 
 
 def test_legacy_multi_image_slots_cannot_escape_claim_or_redraw_a_slot(runtime, monkeypatch):
-    from services.protocol.conversation import ConversationRequest, stream_image_outputs_with_pool
+    from services.protocol.conversation import ConversationRequest, ImageOutput, stream_image_outputs_with_pool
     from services.request_context import executing, AdmissionLost
     saved = durable_forward.envelope({"id": "owner", "role": "user"}, {"model": "gpt-image-2", "n": 2}, request(), "openai_v1_image_generations", operation="image")
     runtime.service.submit("owner", saved)
@@ -212,8 +212,8 @@ def test_legacy_multi_image_slots_cannot_escape_claim_or_redraw_a_slot(runtime, 
         with pytest.raises(AdmissionLost):
             ctx.before_send()
         sent.append(index)
-        return [index]
+        return [ImageOutput(kind="result", model=req.model, index=index, total=total, data=[{"url": "https://image.example/" + str(index)}])]
     monkeypatch.setattr("services.protocol.conversation._generate_single_image", generate)
     with executing(ctx):
-        assert list(stream_image_outputs_with_pool(ConversationRequest(prompt="test", model="gpt-image-2", n=2))) == [1, 2]
+        assert [item.index for item in stream_image_outputs_with_pool(ConversationRequest(prompt="test", model="gpt-image-2", n=2))] == [1, 2]
     assert sent == [1, 2]

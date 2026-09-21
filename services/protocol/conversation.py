@@ -1794,10 +1794,19 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         # The admitted legacy multi-output call retains one account reservation
         # and executes its bounded slots in order. It cannot escape the original
         # claim through context-less ThreadPoolExecutor workers or retry a slot.
+        from services import durable_image_forward
+        recoverable = durable_image_forward.prepare(context, request)
         for index in range(request.n):
+            if recoverable and (saved := durable_image_forward.cached_slot(context, index)) is not None:
+                yield from saved
+                continue
             context.image_slot(index)
-            outputs = _generate_single_image(request, index + 1, request.n)
-            context.image_slot_complete(index)
+            slot_request = durable_image_forward.slot_request(context, request, index) if recoverable else request
+            outputs = _generate_single_image(slot_request, index + 1, request.n)
+            if recoverable:
+                durable_image_forward.save_slot(context, index, outputs)
+            else:
+                context.image_slot_complete(index)
             yield from outputs
         return
 

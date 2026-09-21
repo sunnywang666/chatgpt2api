@@ -202,7 +202,7 @@ def web_search_chat_response(messages: list[dict[str, Any]], model: str) -> dict
     query = search_query_from_messages(messages)
     if not query:
         raise HTTPException(status_code=400, detail={"error": "messages or prompt is required for web search"})
-    text, annotations = text_with_url_citations(run_web_search(query))
+    text, annotations = text_with_url_citations(run_web_search(query, model=model, messages=messages))
     return completion_response(
         model,
         text,
@@ -215,7 +215,7 @@ def stream_web_search_chat_completion(messages: list[dict[str, Any]], model: str
     query = search_query_from_messages(messages)
     if not query:
         raise HTTPException(status_code=400, detail={"error": "messages or prompt is required for web search"})
-    text, _annotations = text_with_url_citations(run_web_search(query))
+    text, _annotations = text_with_url_citations(run_web_search(query, model=model, messages=messages))
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     yield completion_chunk(model, {"role": "assistant", "content": text}, None, completion_id, created)
@@ -239,6 +239,10 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         images=encode_images(images) or None,
     )))
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
+    from services.durable_image_forward import wire_identity
+    identity = wire_identity()
+    response["id"] = identity.get("id") or response["id"]
+    response["created"] = identity.get("created") or response["created"]
     usage = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         input_image_tokens=count_image_inputs_tokens(images, model),
@@ -260,9 +264,11 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     yield from stream_image_chat_completion(image_outputs, model)
 
 
-def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: str) -> Iterator[dict[str, Any]]:
-    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-    created = int(time.time())
+def stream_image_chat_completion(image_outputs: Iterable[ImageOutput], model: str, *, identity=None) -> Iterator[dict[str, Any]]:
+    from services.durable_image_forward import wire_identity
+    identity = wire_identity() if identity is None else identity
+    completion_id = identity.get("id") or f"chatcmpl-{uuid.uuid4().hex}"
+    created = identity.get("created") or int(time.time())
     sent_role = False
     sent_text = ""
     for output in image_outputs:

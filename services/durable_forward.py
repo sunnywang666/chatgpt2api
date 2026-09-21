@@ -21,21 +21,30 @@ FORWARDED_HEADERS = {"session-id", "thread-id", "x-client-request-id", "originat
 OUTPUT_HEADERS = {"content-type", "cache-control", "x-request-id", "openai-request-id", "x-openai-request-id", "retry-after"}
 MAX_OUTPUT_BYTES = 128 * 1024 * 1024
 TEXT_RECOVERY_PROTOCOLS = {"openai_v1_chat_complete", "openai_v1_response", "anthropic_v1_messages"}
+SEARCH_RECOVERY_PROTOCOLS = {"openai_search", "openai_v1_chat_complete", "openai_v1_response"}
 
 
 def chat_recovery_supported(receipt):
+    # Shared admission asks this for every compatibility protocol on the Chat
+    # route. Image recovery uses the same lease and original receipt.
+    from services.durable_image_forward import supported as image_recovery_supported
+    if image_recovery_supported(receipt):
+        return True
     metadata = receipt.get("_chat_recovery") or {}
+    if not isinstance(metadata, dict):
+        return False
+    protocols = SEARCH_RECOVERY_PROTOCOLS if metadata.get("kind") == "search" else TEXT_RECOVERY_PROTOCOLS
     return (receipt.get("_route") == "chat" and receipt.get("_input_ref")
-            and isinstance(metadata, dict)
-            and receipt.get("_forward_protocol") in TEXT_RECOVERY_PROTOCOLS
+            and receipt.get("_forward_protocol") in protocols
             and metadata.get("protocol") == receipt["_forward_protocol"])
 
 
-def prepare_chat_recovery(context, model, messages):
+def prepare_chat_recovery(context, model, messages, *, search=False):
     """Retain the actual text route's formatting inputs before its model POST."""
     receipt = context.receipt()
     protocol = receipt.get("_forward_protocol")
-    if receipt.get("_route") != "chat" or protocol not in TEXT_RECOVERY_PROTOCOLS:
+    protocols = SEARCH_RECOVERY_PROTOCOLS if search else TEXT_RECOVERY_PROTOCOLS
+    if receipt.get("_route") != "chat" or protocol not in protocols:
         return False
     from services.protocol.conversation import count_message_text_tokens, count_message_image_tokens
     input_text, input_image = count_message_text_tokens(messages, model), count_message_image_tokens(messages, model)
@@ -43,6 +52,7 @@ def prepare_chat_recovery(context, model, messages):
         "protocol": protocol, "model": model,
         "input_text_tokens": input_text, "input_image_tokens": input_image,
         "input_tokens": input_text + input_image,
+        **({"kind": "search"} if search else {}),
     }, client_conversation_id=receipt.get("client_conversation_id") or "compat-" + context.request_id)
     return True
 
@@ -60,11 +70,55 @@ def _wire_identity(item):
         if type(created) is int:
             identity["created"] = created
     if item.get("type") == "response.output_item.added" and isinstance(item.get("item"), dict):
-        identity["item_id"] = item["item"].get("id")
+        key = "search_id" if item["item"].get("type") == "web_search_call" else "item_id"
+        identity[key] = item["item"].get("id")
     block = item.get("content_block")
     if item.get("type") == "content_block_start" and isinstance(block, dict) and block.get("type") == "tool_use":
         identity["tool_ids"] = {str(item["index"]): {"id": block["id"], "name": block["name"]}}
     return identity
+
+
+def _recovered_search_response(metadata, payload, identity, created, result):
+    from services.protocol import openai_v1_chat_complete as chat, openai_v1_response as responses
+    from services.protocol.conversation import count_text_tokens
+    from services.protocol.web_search_tool import normalized_sources, search_query_from_messages, text_with_url_citations
+    from utils.image_tokens import token_usage
+    protocol, model = metadata["protocol"], metadata["model"]
+    if protocol == "openai_search":
+        return result, []
+    text, annotations = text_with_url_citations(result)
+    output_tokens = count_text_tokens(text, model)
+    if protocol == "openai_v1_chat_complete":
+        response = chat.completion_response(model, text, created, annotations=chat.chat_completion_annotations(annotations))
+        response["id"] = identity.get("id") or response["id"]
+        response["usage"].update(prompt_tokens=metadata["input_tokens"], completion_tokens=output_tokens,
+                                 total_tokens=metadata["input_tokens"] + output_tokens)
+        response["usage"]["prompt_tokens_details"].update(text_tokens=metadata["input_text_tokens"], image_tokens=metadata["input_image_tokens"])
+        response["usage"]["completion_tokens_details"]["text_tokens"] = output_tokens
+        return response, [chat.completion_chunk(model, {"role": "assistant", "content": text}, None, response["id"], created),
+                          chat.completion_chunk(model, {}, "stop", response["id"], created)]
+    _, messages = responses.text_response_parts(payload)
+    query = search_query_from_messages(messages)
+    response_id = identity.get("id") or "resp_" + uuid.uuid4().hex
+    search_id = identity.get("search_id") or "ws_" + uuid.uuid4().hex
+    item_id = identity.get("item_id") or "msg_" + uuid.uuid4().hex
+    searching = responses.web_search_call_item(query, search_id, "in_progress")
+    search = responses.web_search_call_item(query, search_id, "completed", normalized_sources(result))
+    message = responses.text_output_item(text, item_id, "completed", annotations)
+    final = responses.response_completed(response_id, model, created, [search, message], token_usage(
+        input_text_tokens=metadata["input_text_tokens"], input_image_tokens=metadata["input_image_tokens"], output_text_tokens=output_tokens))
+    return final["response"], [
+        responses.response_created(response_id, model, created),
+        {"type": "response.output_item.added", "output_index": 0, "item": searching},
+        {"type": "response.web_search_call.in_progress", "output_index": 0, "item_id": search_id},
+        {"type": "response.web_search_call.searching", "output_index": 0, "item_id": search_id},
+        {"type": "response.web_search_call.completed", "output_index": 0, "item_id": search_id},
+        {"type": "response.output_item.done", "output_index": 0, "item": search},
+        {"type": "response.output_item.added", "output_index": 1, "item": responses.text_output_item("", item_id, "in_progress", annotations)},
+        {"type": "response.output_text.delta", "item_id": item_id, "output_index": 1, "content_index": 0, "delta": text},
+        {"type": "response.output_text.done", "item_id": item_id, "output_index": 1, "content_index": 0, "text": text},
+        {"type": "response.output_item.done", "output_index": 1, "item": message}, final,
+    ]
 
 
 def recovered_chat_wire(service, receipt, recovered):
@@ -83,8 +137,10 @@ def recovered_chat_wire(service, receipt, recovered):
     protocol, text = metadata["protocol"], sanitize_output_text(recovered["content"])
     model, created = metadata["model"], identity.get("created") or int(receipt["created_at"])
     output_tokens = count_text_tokens(text, model)
-    stream = bool(spec["payload"].get("stream"))
-    if protocol == "openai_v1_chat_complete":
+    stream = protocol != "openai_search" and bool(spec["payload"].get("stream"))
+    if metadata.get("kind") == "search":
+        response, events = _recovered_search_response(metadata, spec["payload"], identity, created, recovered["_search_result"])
+    elif protocol == "openai_v1_chat_complete":
         response = chat.completion_response(model, text, created)
         response["id"] = identity.get("id") or response["id"]
         input_text, input_image = metadata["input_text_tokens"], metadata["input_image_tokens"]
@@ -116,25 +172,37 @@ def recovered_chat_wire(service, receipt, recovered):
         ], model, metadata["input_tokens"], lambda _: output_tokens, tools))
         events[0]["message"]["id"] = response["id"]
         events[-1]["created"] = created
-        for event in events:
-            if event.get("type") == "content_block_start":
-                saved = (identity.get("tool_ids") or {}).get(str(event["index"]))
-                block = event["content_block"]
-                if saved:
-                    if block.get("type") != "tool_use" or block.get("name") != saved["name"]:
-                        raise ValueError("original tool output identity mismatch")
-                    block["id"] = saved["id"]
+        # Text blocks depend on the original chunk boundaries (even a leading
+        # whitespace chunk can open one). Tool order does not. Match the saved
+        # emitted prefix by tool order and name, independently of block index.
+        saved_ids = identity.get("tool_ids") or {}
+        saved_tools = [saved_ids[index] for index in sorted(saved_ids, key=int)]
+        recovered_tools = [event["content_block"] for event in events
+                           if event.get("type") == "content_block_start"
+                           and event["content_block"].get("type") == "tool_use"]
+        if len(saved_tools) > len(recovered_tools):
+            raise ValueError("original tool output identity mismatch")
+        for saved, block in zip(saved_tools, recovered_tools):
+            if block.get("name") != saved["name"]:
+                raise ValueError("original tool output identity mismatch")
+            block["id"] = saved["id"]
+    return publish_recovered_wire(service, receipt, response, events, stream)
+
+
+def publish_recovered_wire(service, receipt, response, events, stream):
+    from services.log_service import _strip_internal_response_fields
+    protocol = receipt["_forward_protocol"]
     if stream:
         parts = [] if protocol == "anthropic_v1_messages" else [": stream-open\n\n"]
         for item in events:
             if protocol == "anthropic_v1_messages":
                 parts.append("event: " + item["type"] + "\n")
-            parts.append("data: " + json.dumps(item, ensure_ascii=False) + "\n\n")
+            parts.append("data: " + json.dumps(_strip_internal_response_fields(item), ensure_ascii=False) + "\n\n")
         if protocol != "anthropic_v1_messages":
             parts.append("data: [DONE]\n\n")
         data = "".join(parts).encode()
     else:
-        data = json.dumps(response, ensure_ascii=False).encode()
+        data = json.dumps(_strip_internal_response_fields(response), ensure_ascii=False).encode()
     if len(data) > MAX_OUTPUT_BYTES:
         raise ValueError("private output limit")
     output = service.store.create_output()
@@ -167,6 +235,25 @@ def _compatibility_call(spec):
     return LoggedCall(spec["identity"], endpoint, str(payload.get("model") or "auto"), summary,
                       request_text=request_text(*(payload.get(key) for key in fields)),
                       request_shape=request_shape(payload.get(shape)) if shape else None)
+
+
+def dispatch_model(body):
+    """Derived admission data must not change the original input envelope/hash."""
+    spec = body.get("_forward") or {}
+    protocol, payload = spec.get("protocol"), spec.get("payload") or {}
+    model = str(body.get("model") or "auto")
+    if body.get("_operation") == "text" and protocol in SEARCH_RECOVERY_PROTOCOLS:
+        from services.protocol.web_search_tool import (WEB_SEARCH_TOOL_TYPES, has_unsupported_tools,
+            has_web_search_tool, is_web_search_chat_request)
+        from services.protocol.openai_v1_response import has_unsupported_response_tools
+        if (protocol == "openai_search"
+                or protocol == "openai_v1_chat_complete" and is_web_search_chat_request(payload)
+                   and not has_unsupported_tools(payload, WEB_SEARCH_TOOL_TYPES)
+                or protocol == "openai_v1_response" and has_web_search_tool(payload)
+                   and not has_unsupported_response_tools(payload)):
+            from services.openai_backend_api import SEARCH_MODEL
+            model = SEARCH_MODEL
+    return model
 
 
 def envelope(identity, payload, request, protocol, *, operation="text", compact=False):
@@ -255,7 +342,7 @@ def run(service, owner, request_id, body):
     output = service.store.create_output()
     service._update(owner, request_id, _wire_output=output, _wire_size=0)
     protocol = spec["protocol"]
-    call = _compatibility_call(spec)
+    call = None if raw_receipt(service, owner, request_id).get("_wire_call_recorded") else _compatibility_call(spec)
     observed = {"urls": [], "_account_email": "", "_conversation_id": ""}
     stream = False
     deferred = False
@@ -375,6 +462,7 @@ def run(service, owner, request_id, body):
             receipt = raw_receipt(service, owner, request_id)
             context = current_request.get()
             if context is not None and receipt.get("_claim_id") == context.claim:
+                service._update(owner, request_id, _wire_call_recorded=True)
                 success = receipt.get("status") == "succeeded"
                 account = context.selected_account() or {}
                 call.log("流式调用结束" if success and stream else "调用完成" if success else "流式调用失败" if stream else "调用失败",

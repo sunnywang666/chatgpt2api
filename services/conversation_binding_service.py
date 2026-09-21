@@ -1001,12 +1001,28 @@ class ConversationBindingService:
                    and (ended := _completed_request_turn(mapping, children, request_message_id, conversation_id)) else {}),
             }
         parent_message_id, text = candidates[0]
+        ended = _completed_request_turn(mapping, children, request_message_id, conversation_id)
+        if not ended or ended["final_message_id"] != parent_message_id:
+            # One completed text message is insufficient when another branch
+            # remains active or ambiguous. Use the same positive evidence as
+            # empty-result recovery before declaring this request complete.
+            return {
+                **result, "binding_status": "unknown",
+                "status": "running" if active_result_seen else "unknown",
+                "recovery_reason": (TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value if active_result_seen
+                                    else TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value),
+            }
+        search_result = None
+        if (receipt.get("_chat_recovery") or {}).get("kind") == "search":
+            search_result = backend._search_result_from_message(conversation_id, mapping[parent_message_id]["message"])
+            text = search_result["answer"]
         return {
             **result,
             "binding_status": "bound",
             "status": "succeeded",
             "parent_message_id": parent_message_id,
             "content": text,
+            **({"_search_result": search_result} if search_result is not None else {}),
         }
 
     def complete_text(self, body: dict[str, Any], *, on_cursor=None) -> dict[str, Any]:
