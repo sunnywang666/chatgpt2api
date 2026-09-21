@@ -67,8 +67,10 @@ class PoolResourceTests(unittest.TestCase):
 
     def test_resource_totals_unknown_zero_and_overlap_bounds_preserve_original_receipt(self):
         tasks = ImageTaskService(Path(self.tmp.name) / "tasks.json")
-        tasks._tasks = {"original": {"provider_account_identity": "a", "upstream_unfinished": True,
-                                      "status": "error", "error_code": "CONVERSATION_OUTCOME_UNKNOWN"}}
+        with tasks._transaction():
+            tasks._tasks = {"owner:original": {"id": "original", "owner_id": "owner", "provider_account_identity": "a", "upstream_unfinished": True,
+                                              "status": "error", "error_code": "CONVERSATION_OUTCOME_UNKNOWN"}}
+            tasks._save_locked()
         rows = [
             {"provider_account_identity": "a", "quota": 9, "image_inflight": 1,
              "limits_progress": [{"feature_name": "image_gen", "remaining": 9}]},
@@ -91,7 +93,7 @@ class PoolResourceTests(unittest.TestCase):
         self.assertEqual(image["total_accounts"], 3)
         self.assertIsNone(image["slots_free"])
         self.assertEqual((image["slots_free_min"], image["slots_free_max"]), (1, 2))
-        self.assertEqual(tasks._tasks["original"]["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+        self.assertEqual(tasks._tasks["owner:original"]["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
         rows[0]["image_inflight"] = 0
         with patch("services.pool_resources.config", self.config):
             self.assertEqual(resource_snapshot(accounts, tasks, codex)["image"]["slots_free"], 2)

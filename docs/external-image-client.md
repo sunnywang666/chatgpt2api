@@ -10,6 +10,7 @@
 - 在工作台“AI 服务连接”中创建普通调用密钥，仅通过私有渠道交付，填入本地权限为 `600` 的环境文件。它没有账号池管理员能力；撤销后原密钥立即失效。
 - 用下面的 `submit` 保存原任务号，再用 `status` 查询、`download` 保存图片。编辑时加 `--image 本地图片`，可传多张参考图。
 - 进程退出、网络超时或结果未知后，继续使用原状态文件和任务号。客户端不会自动换号或重新生成。
+- 可靠共用候选完整受理后先持久保存实际输入；池满返回原 `queued` 回执，新增/恢复账号后服务自动派发，服务重启也不要求重提。`waiting` 描述当前原因。部署前后的行为以实际版本为准，见[部署说明](deployment.md#可靠共用与动态容量候选2026-09-20)。
 - 账号界面只管理自己导入的账号，显示上游观测值与更新时间；未知、真实零、读取失败和调用后待刷新分开。没有内部预算或张数分配。
 - 同源工作台界面无需 CORS。跨域浏览器调用默认关闭；管理员需将明确来源写入 `CHATGPT2API_CORS_ORIGINS`（逗号分隔）或配置 `cors_origins`，不开放凭据通配来源。普通后台 HTTP 程序不受 CORS 影响。
 - 本接入包不等于小乐的程序已接通。她的调用位置确定后，才能核对 SDK、DSH 或其它调用方式的最小适配。
@@ -54,7 +55,7 @@ The public external image service accepts only `gpt-image-2`, one output per tas
 
 Execution currently reuses the service's existing paid-account conversation-binding route. Free accounts are not eligible for this route. A response saying that no eligible image resource was admitted describes the route at that moment; it is not evidence that every account in the private pool has exhausted an upstream quota.
 
-The synchronous-compatible routes use the same persistent receipt machinery as `/api/image-tasks`; they are not a separate direct-generation path. Supply a stable `client_task_id` on every synchronous request. A completed request returns HTTP 200 with `b64_json` data and the original task ID. A request still running or awaiting authoritative recovery returns HTTP 202 with that same ID so the caller can query the persistent task. A known resource-admission failure returns HTTP 429, and other known terminal failures return HTTP 502, with the retained task ID in either case. Do not automatically create a new ID after any timeout or non-200 response.
+The synchronous-compatible routes use the same persistent receipt machinery as `/api/image-tasks`. Supply a stable `client_task_id` on every synchronous request. A completed request returns HTTP 200 with `b64_json` data and the original task ID. Queued/running requests or requests awaiting authoritative recovery return HTTP 202 with that same ID. In the reliable-sharing candidate, accepted requests wait durably for account capacity; an older retained resource-admission failure may still return HTTP 429, and other known terminal failures return HTTP 502. Transport/body-reader 429 before acceptance is distinct from upstream 429: inspect `rate_limit.layer`, phase, request ID and Retry-After. Never create a new ID automatically after timeout or non-200. Poll original receipts; generated-but-undownloaded results resume downloads only.
 
 ## Commands
 

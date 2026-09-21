@@ -264,6 +264,7 @@ def test_public_chat_never_resubmits_cross_process_not_started_receipt(public_ch
     ).status_code == 202
     assert len(public_chat.queue.calls) == 1
 
+    public_chat.tasks._update(public_chat.key_a["id"], "cross-process", _input_ref=None)  # Legacy receipt.
     second_queue = QueuedExecutor()
     restarted = TextTaskService(
         public_chat.tasks.path,
@@ -301,6 +302,7 @@ def test_text_task_service_atomically_blocks_public_not_started_resubmit(tmp_pat
     assert original.submit("owner", body)["status"] == "queued"
     assert len(first_queue.calls) == 1
 
+    original._update("owner", "atomic-public", _input_ref=None)  # Legacy receipt.
     restarted = TextTaskService(path, runner=upstream, executor=second_queue)
     assert restarted.read("owner", "atomic-public")["status"] == "not_started"
     # This calls the atomic service method directly, covering a
@@ -472,6 +474,9 @@ def test_public_chat_body_reader_capacity_is_nonblocking_and_released(monkeypatc
         response = asyncio.run(external_image_boundary(saturated, lambda _request: None))
         assert response.status_code == 429
         assert json.loads(response.body)["detail"]["code"] == "CHAT_BODY_READER_CAPACITY_EXCEEDED"
+        limit = json.loads(response.body)["detail"]["rate_limit"]
+        assert limit["layer"] == "provider_capacity" and limit["phase"] == "before_acceptance"
+        assert limit["cooldown_until"] is None and limit["retry_after_seconds"] == 1
         assert consumed["value"] is False
     finally:
         with external_images._public_chat_body_reader_lock:

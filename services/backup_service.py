@@ -630,6 +630,29 @@ class BackupService:
                 self._add_file_to_archive(archive, DATA_DIR / "logs.jsonl", "data/logs.jsonl")
             if include.get("image_tasks"):
                 self._add_file_to_archive(archive, DATA_DIR / "image_tasks.json", "data/image_tasks.json")
+                # Text and migrated image receipts now share the existing
+                # SQLite DB. SQLite backup supplies a consistent receipt view;
+                # immutable input files were fsynced before those rows existed.
+                import sqlite3
+                from services.task_store import TaskStore
+                path = DATA_DIR / "text_tasks.sqlite3"
+                if path.exists():
+                    store = TaskStore(path)
+                    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as source, sqlite3.connect(":memory:") as copy:
+                        source.backup(copy)
+                        self._add_bytes_to_archive(archive, "data/text_tasks.sqlite3", copy.serialize(), mode=0o600)
+                        for _, _, _, receipt in store.receipts(copy):
+                            for field in ("_input_ref", "_wire_output"):
+                                name = receipt.get(field)
+                                if not name:
+                                    continue
+                                if field == "_input_ref":
+                                    store.load_input(name)  # validate ownership and the controlled reference
+                                    payload = (store.input_dir / name).read_bytes()
+                                else:
+                                    with store.output_file(name) as handle:
+                                        payload = handle.read(receipt.get("_wire_size", 0))
+                                self._add_bytes_to_archive(archive, "data/" + store.input_dir.name + "/" + name, payload, mode=0o600)
                 self._add_file_to_archive(archive, IMAGE_INDEX_FILE, "data/image_index.json")
             if include.get("accounts_snapshot"):
                 self._add_bytes_to_archive(
@@ -648,8 +671,9 @@ class BackupService:
                 self._add_directory_to_archive(archive, config.images_dir, "data/images")
         return buffer.getvalue()
 
-    def _add_bytes_to_archive(self, archive: tarfile.TarFile, name: str, payload: bytes) -> None:
+    def _add_bytes_to_archive(self, archive: tarfile.TarFile, name: str, payload: bytes, *, mode: int = 0o644) -> None:
         info = tarfile.TarInfo(name=name)
+        info.mode = mode
         info.size = len(payload)
         info.mtime = int(_utc_now().timestamp())
         archive.addfile(info, io.BytesIO(payload))

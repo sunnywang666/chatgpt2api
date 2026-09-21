@@ -86,9 +86,13 @@ async def external_image_boundary(request: Request, call_next):
         if rejected is not None:
             return rejected
         if not _try_acquire_public_chat_body_reader():
+            import uuid
             return JSONResponse(
-                {"detail": {"code": "CHAT_BODY_READER_CAPACITY_EXCEEDED"}},
+                {"detail": {"code": "CHAT_BODY_READER_CAPACITY_EXCEEDED", "upstream_outcome": "not_sent",
+                            "rate_limit": {"layer": "provider_capacity", "origin": "body_reader", "phase": "before_acceptance",
+                                           "transport_request_id": uuid.uuid4().hex, "retry_after_seconds": 1, "cooldown_until": None}}},
                 status_code=429,
+                headers={"Retry-After": "1"},
             )
         try:
             rejected = await _buffer_bounded_body(

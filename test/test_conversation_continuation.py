@@ -150,10 +150,15 @@ class AccountRequestPacingTests(unittest.TestCase):
 
     def test_http_200_stream_rate_error_cools_whole_account_and_releases_turn(self):
         clock = pacing.AccountRequestClock()
-        response = SimpleNamespace(status_code=200, headers={}, close=lambda: None,
+        response = SimpleNamespace(status_code=200, headers={"x-request-id": "original-upstream-id"}, close=lambda: None,
             iter_lines=lambda: iter([b'data: {"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}']))
         clock.request(lambda *a, **k: response, "POST", "https://chatgpt.com/backend-api/conversation", stream=True)
-        list(response.iter_lines())
+        with mock.patch.object(pacing.logger, "warning") as log:
+            list(response.iter_lines())
+        evidence = log.call_args.args[0]
+        self.assertEqual(evidence["upstream_request_id"], "original-upstream-id")
+        self.assertEqual(evidence["origin"], "sse_rate_limit")
+        self.assertEqual(evidence["layer"], "upstream_chatgpt")
         self.assertEqual(clock.rate_failures, 1)
         self.assertEqual(clock.cooldown_until, 1060)
         self.assertTrue(clock.turn_lock.acquire(blocking=False))

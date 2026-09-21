@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR, config
+from services.task_store import TaskStore
+from contextlib import contextmanager
+from services.request_context import current_request, AdmissionLost
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
@@ -434,6 +437,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "client_conversation_id",
         "binding_status",
         "error_code",
+        "waiting",
+        "rate_limit",
         "upstream_model",
         "next_poll_at",
         "active_attempt_started_at",
@@ -508,8 +513,13 @@ class ImageTaskService:
         generation_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_generations.handle,
         edit_handler: Callable[[dict[str, Any]], dict[str, Any]] = openai_v1_image_edit.handle,
         retention_days_getter: Callable[[], int] | None = None,
+        admission=None,
+        store: TaskStore | None = None,
     ):
         self.path = path
+        self.store = store or TaskStore(path.parent / "text_tasks.sqlite3")
+        self.admission = admission
+        self._transaction_local = threading.local()
         self.generation_handler = generation_handler
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
@@ -517,16 +527,36 @@ class ImageTaskService:
         self._slot_condition = threading.Condition(self._lock)
         self._tasks: dict[str, dict[str, Any]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock:
-            self._tasks = self._load_locked()
+        with self._transaction():
+            # Import once into the existing receipt database. The legacy file
+            # stays in place for rollback; it is no longer a second writer.
+            imported = self.store.runtime(self._transaction_local.db, "image_json_imported", False)
+            if not imported:
+                self._tasks = self._load_locked()
+                self._save_locked()
+                self.store.set_runtime(self._transaction_local.db, "image_json_imported", True)
             changed = self._recover_unfinished_locked()
             changed = self._cleanup_locked() or changed
             if changed:
                 self._save_locked()
 
+    @contextmanager
+    def _transaction(self):
+        with self._lock:
+            if getattr(self._transaction_local, "db", None) is not None:
+                yield self._transaction_local.db
+                return
+            with self.store.transaction() as db:
+                self._transaction_local.db = db
+                try:
+                    self._tasks = {key: json.loads(raw) for key, raw in db.execute("SELECT task_key,receipt FROM image_requests")}
+                    yield db
+                finally:
+                    self._transaction_local.db = None
+
     def resource_occupancy(self) -> dict:
         """Internal aggregate only: keep unfinished original receipts after restart."""
-        with self._lock:
+        with self._transaction():
             held = {}
             unattributed = 0
             for task in self._tasks.values():
@@ -618,7 +648,7 @@ class ImageTaskService:
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
-        with self._lock:
+        with self._transaction():
             if self._cleanup_locked():
                 self._save_locked()
             items = []
@@ -654,7 +684,7 @@ class ImageTaskService:
         key = _task_key(owner, task_id)
         now = _now_iso()
         should_start = False
-        with self._lock:
+        with self._transaction():
             cleaned = self._cleanup_locked()
             task = self._tasks.get(key)
             if task is not None:
@@ -686,12 +716,20 @@ class ImageTaskService:
                 "request_hash": _request_hash(mode, payload),
                 "upstream_unfinished": False,
                 "admission_recorded": True,
+                "_input_ref": self.store.save_input({"payload": payload, "identity": {k: identity[k] for k in ("id", "name", "role", "external_image_client", "_trusted_source") if k in identity}, "mode": mode}),
+                "_sequence": self.store.next_sequence(self._transaction_local.db),
+                "_source": str(identity.get("_trusted_source") or "key:" + owner),
+                "_input_bytes": __import__("services.text_task_service", fromlist=["_retained_size"])._retained_size(payload),
+                "_submission_started": False,
+                "_turn_reserved": False,
             }
             self._tasks[key] = task
             self._save_locked()
             should_start = True
 
-        if should_start:
+        if should_start and self.admission is not None:
+            self.admission.wake()
+        elif should_start:
             thread = threading.Thread(
                 target=self._run_task,
                 args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
@@ -709,7 +747,7 @@ class ImageTaskService:
         identity: dict[str, object],
         model: str,
     ) -> None:
-        if identity.get("external_image_client"):
+        if identity.get("external_image_client") and not payload.get("_admission_claim"):
             # Allocate once for this newly persisted task, before any generation.
             # Duplicate submissions never enter this thread. Account selection
             # only performs readiness reads; a failure here is NOT submitted.
@@ -719,7 +757,7 @@ class ImageTaskService:
                 capacities = {str(item.get("provider_account_identity") or ""): min(
                     max(1, int(config.image_account_concurrency)), max(0, int(item.get("quota") or 0)))
                     for item in account_service.list_accounts()}
-                with self._lock:
+                with self._transaction():
                     held = {}
                     for other in self._tasks.values():
                         identity_id = str(other.get("provider_account_identity") or "")
@@ -739,7 +777,7 @@ class ImageTaskService:
                 selected = account_service.get_account(token) or {}
                 capacity = min(max(1, int(config.image_account_concurrency)),
                                max(0, int(selected.get("quota") or 0)))
-                with self._slot_condition:
+                with self._transaction():
                     occupied = sum(1 for other_key, other in self._tasks.items()
                                    if other_key != key and other.get("provider_account_identity") == account_identity
                                    and _holds_upstream_slot(other))
@@ -761,15 +799,20 @@ class ImageTaskService:
         # Persist account admission before calling the handler. A query timeout
         # or process restart must not make another upstream generation fit.
         account = _clean(payload.get("provider_account_identity"))
-        if account and not identity.get("external_image_client"):
-            with self._slot_condition:
-                while sum(1 for other_key, task in self._tasks.items()
-                          if other_key != key and task.get("provider_account_identity") == account
-                          and _holds_upstream_slot(task)) >= max(1, int(config.image_account_concurrency)):
-                    self._slot_condition.wait(timeout=1)
-                self._update_task(key, upstream_unfinished=True)
+        if account and not identity.get("external_image_client") and not payload.get("_admission_claim"):
+            while True:
+                with self._transaction():
+                    occupied = sum(1 for other_key, task in self._tasks.items()
+                                   if other_key != key and task.get("provider_account_identity") == account
+                                   and _holds_upstream_slot(task))
+                    if occupied < max(1, int(config.image_account_concurrency)):
+                        self._update_task(key, upstream_unfinished=True)
+                        break
+                # Legacy injected executors also wait without holding SQLite.
+                with self._slot_condition:
+                    self._slot_condition.wait(timeout=0.1)
         started = time.time()
-        with self._lock:
+        with self._transaction():
             current = self._tasks.get(key) or {}
             active_started_at = current.get("active_attempt_started_at")
             active_deadline_at = current.get("active_attempt_deadline_at")
@@ -787,7 +830,7 @@ class ImageTaskService:
         if submission_boundary_covered:
             self._update_task(key, upstream_submission_started=False)
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
-        with self._lock:
+        with self._transaction():
             task = self._tasks.get(key) or {}
             request_message_id = _clean(task.get("request_message_id"))
         if not request_message_id:
@@ -807,7 +850,7 @@ class ImageTaskService:
 
         def start_active_attempt() -> float:
             nonlocal active_started_at, active_deadline_at
-            with self._lock:
+            with self._transaction():
                 current = self._tasks.get(key) or {}
                 saved_start = current.get("active_attempt_started_at")
                 saved_deadline = current.get("active_attempt_deadline_at")
@@ -924,7 +967,7 @@ class ImageTaskService:
             )
         except Exception as exc:
             error_message = str(exc) or "image task failed"
-            with self._lock:
+            with self._transaction():
                 current = dict(self._tasks.get(key) or {})
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(
@@ -1083,10 +1126,13 @@ class ImageTaskService:
             pass
 
     def _update_task(self, key: str, **updates: Any) -> None:
-        with self._lock:
+        with self._transaction():
             task = self._tasks.get(key)
             if task is None:
                 return
+            context = current_request.get()
+            if context is not None and context.kind == "image" and key == _task_key(context.owner, context.request_id) and task.get("_claim_id") != context.claim:
+                raise AdmissionLost("original image claim changed")
             if task.get("status") == TASK_STATUS_SUCCESS and updates.get("status") not in (None, TASK_STATUS_SUCCESS):
                 return
             task.update(updates)
@@ -1201,14 +1247,23 @@ class ImageTaskService:
         return tasks
 
     def _save_locked(self) -> None:
-        items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp_path.replace(self.path)
+        db = getattr(self._transaction_local, "db", None)
+        if db is None:
+            # Compatibility for existing maintenance/tests using the local lock.
+            with self.store.transaction() as db:
+                for task in self._tasks.values():
+                    self.store.write_receipt(db, "image", task["owner_id"], task["id"], task)
+            return
+        for task in self._tasks.values():
+            self.store.write_receipt(db, "image", task["owner_id"], task["id"], task)
 
     def _recover_unfinished_locked(self) -> bool:
         changed = False
         for task in self._tasks.values():
+            if task.get("_input_ref") and (task.get("status") == TASK_STATUS_QUEUED or task.get("_claim_id")):
+                # The shared scheduler fences expired claims. Starting a second
+                # worker must never interrupt another worker's active request.
+                continue
             if task.get("status") in UNFINISHED_STATUSES:
                 result_captured = bool(
                     task.get("result_file_ids") or task.get("result_sediment_ids")
@@ -1275,6 +1330,7 @@ class ImageTaskService:
         ]
         for key in removed_keys:
             self._tasks.pop(key, None)
+            self._transaction_local.db.execute("DELETE FROM image_requests WHERE task_key=?", (key,))
         return bool(removed_keys)
 
     def resume_poll(
@@ -1288,7 +1344,7 @@ class ImageTaskService:
         """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
         owner = _owner_id(identity)
         key = _task_key(owner, _clean(task_id))
-        with self._lock:
+        with self._transaction():
             task = self._tasks.get(key)
             if task is None:
                 raise ValueError("task not found")
@@ -1340,6 +1396,13 @@ class ImageTaskService:
                 return _public_task(task)
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
+            recovery_context = None
+            if self.admission is not None:
+                from services.pool_admission import ExecutionContext
+                claim = uuid.uuid4().hex
+                task.update(_claim_id=claim, _claim_until=self.admission.clock() + self.admission.CLAIM_SECONDS,
+                            _submission_started=True, _executing=True, _turn_reserved=False)
+                recovery_context = ExecutionContext(self.admission, "image", owner, _clean(task_id), claim)
             # 将任务状态重置为 running
             self._update_task(
                 key,
@@ -1349,10 +1412,11 @@ class ImageTaskService:
             )
 
         # 启动新线程继续轮询
+        arguments = (key, conversation_id, extra_timeout_secs, base_url, dict(identity), mode, model,
+                     bool(allow_unrecoverable_retry), bool(deadline_expired))
         thread = threading.Thread(
-            target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, base_url, dict(identity), mode, model,
-                  bool(allow_unrecoverable_retry), bool(deadline_expired)),
+            target=self.admission.run_recovery if recovery_context is not None else self._run_resume_poll,
+            args=(recovery_context, self._run_resume_poll, arguments) if recovery_context is not None else arguments,
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -1386,7 +1450,7 @@ class ImageTaskService:
         expected_source_request = _clean(source_request_message_id)
         expected_source_image = _clean(source_image_message_id)
 
-        with self._lock:
+        with self._transaction():
             task = self._tasks.get(key)
             if task is None:
                 raise ConversationImageAdoptionError("task not found")
@@ -1517,7 +1581,7 @@ class ImageTaskService:
             if not data:
                 raise ConversationImageAdoptionError("latest manual image could not be stored")
 
-            with self._lock:
+            with self._transaction():
                 current = self._tasks.get(key)
                 if current is None:
                     raise ConversationImageAdoptionError("task not found")
@@ -1604,7 +1668,7 @@ class ImageTaskService:
             from services.openai_backend_api import ImageContentPolicyError, OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
-            with self._lock:
+            with self._transaction():
                 task = self._tasks.get(key)
                 binding_id = _clean(task.get("provider_binding_id")) if task else ""
                 account_identity = _clean(task.get("provider_account_identity")) if task else ""
@@ -1849,7 +1913,7 @@ class ImageTaskService:
             error_message = str(exc) or "resume poll failed"
             duration_ms = int((time.time() - started) * 1000)
             error_code = _clean(getattr(exc, "code", ""))
-            with self._lock:
+            with self._transaction():
                 current = self._tasks.get(key, {})
                 failures = int(current.get("poll_failures") or 0) + 1
                 qualified_reads = int(current.get("recovery_no_result_reads") or 0)

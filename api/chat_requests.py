@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from services.request_context import trusted_source
+
 import hashlib
 import re
 from typing import Literal
@@ -178,7 +180,7 @@ def create_router() -> APIRouter:
         )
         try:
             await run_in_threadpool(check_request, preview)
-            receipt = await run_in_threadpool(text_task_service.submit, owner, payload)
+            receipt = await run_in_threadpool(text_task_service.submit, owner, payload, source=trusted_source(identity, request))
         except ConversationBindingError as exc:
             call.log("提交失败", status="failed", error=exc.code)
             raise HTTPException(
