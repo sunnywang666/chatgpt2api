@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from services.request_context import trusted_source
+
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
@@ -88,7 +90,7 @@ def create_router() -> APIRouter:
         try:
             result = await run_in_threadpool(
                 image_task_service.submit_generation,
-                {**identity, "external_image_client": is_external(request)},
+                {**identity, "external_image_client": is_external(request), "_trusted_source": trusted_source(identity, request)},
                 client_task_id=body.client_task_id,
                 prompt=body.prompt,
                 model=body.model,
@@ -128,7 +130,7 @@ def create_router() -> APIRouter:
         try:
             result = await run_in_threadpool(
                 image_task_service.submit_edit,
-                {**identity, "external_image_client": is_external(request)},
+                {**identity, "external_image_client": is_external(request), "_trusted_source": trusted_source(identity, request)},
                 client_task_id=client_task_id,
                 prompt=prompt,
                 model=model,

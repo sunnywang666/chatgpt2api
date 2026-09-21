@@ -6,6 +6,7 @@ from services.owned_accounts import chat_projection, observed_capacity
 
 
 def resource_snapshot(accounts, image_tasks, codex) -> dict:
+    admission = getattr(image_tasks, "admission", None)
     rows = [row for row in accounts.list_accounts()
             if chat_projection(row)["authorization_status"] == "saved"]
     settings = config.resource_settings()
@@ -49,7 +50,7 @@ def resource_snapshot(accounts, image_tasks, codex) -> dict:
     if unattributed:
         uncertain = True
         free_min = 0
-    return {
+    result = {
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "settings": settings,
         "image": {"remaining": sum(known) if rows and observed == len(rows) else None,
@@ -64,3 +65,14 @@ def resource_snapshot(accounts, image_tasks, codex) -> dict:
         "codex": codex.resource_snapshot(),
         "queue": {"mode": "immediate_or_existing_wait", "queued": None},
     }
+    if admission is not None:
+        shared = admission.resource_snapshot()
+        free = shared["image"]["slots_free"]
+        image = {**result["image"], **shared["image"],
+                 "slots_free_min": free if free is not None else 0,
+                 "slots_free_max": free if free is not None else shared["image"]["slots_total"],
+                 "durable_inflight": shared["image"]["inflight"], "occupancy_uncertain": free is None,
+                 "eligible_accounts": sum(a["image"]["capacity"] > 0 for a in shared["accounts"])}
+        result.update(shared)
+        result["image"] = image
+    return result

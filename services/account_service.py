@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from services.config import config
+from services.account_state_lock import AccountStateLock
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
@@ -58,7 +59,8 @@ class AccountService:
 
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
-        self._lock = Lock()
+        file_path = getattr(storage_backend, "file_path", None)
+        self._lock = AccountStateLock(self, file_path.with_suffix(file_path.suffix + ".pool-lock") if isinstance(file_path, Path) else None)
         self._token_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
@@ -69,6 +71,33 @@ class AccountService:
         self._pool_refresh_lock = Lock()
         self._pool_refreshes: dict[str, tuple[tuple[tuple[str, ...], bool], Future]] = {}
         self._cumulative_total = self._load_cumulative_total()
+
+    def admission_transaction(self):
+        return self._lock
+
+    def admission_accounts(self) -> list[dict]:
+        """Read-only internal view; old Codex-only rows need no image binding."""
+        return [{**account, "provider_account_identity": self._stable_account_identity(account)}
+                for account in self._accounts.values()]
+
+    @classmethod
+    def _stable_account_identity(cls, account: dict) -> str:
+        # Keep all issued identities. Until the first ordinary binding save,
+        # derive the same opaque identity from the existing, rotation-stable
+        # pool ref. Reading resources must not mutate the account authority.
+        return str(account.get("provider_account_identity") or "").strip() or "account_" + cls.pool_account_ref(account)[4:]
+
+    def admission_binding(self, account_identity: str) -> str:
+        """Bind the selected original account without selecting/probing again."""
+        with self._lock:
+            matches = [token for token, account in self._accounts.items()
+                       if self._stable_account_identity(account) == account_identity]
+            if len(matches) != 1:
+                raise RuntimeError("admission account identity is ambiguous")
+            account = self._accounts[matches[0]]
+            bindings = list(account.get("conversation_binding_ids") or [])
+            legacy = str(account.get("conversation_binding_id") or "")
+            return legacy or (bindings[0] if bindings else self._conversation_binding_for_token_locked(matches[0]))
 
     def conversation_binding_lock(self, binding_id: str, client_conversation_id: str = "") -> Lock:
         expected = str(binding_id or "").strip()
@@ -1451,6 +1480,13 @@ class AccountService:
         基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
+        from services.request_context import current_request, AdmissionLost
+        context = current_request.get()
+        if context is not None:
+            selected = context.selected_account()
+            if not selected or selected.get("access_token") in (excluded_tokens or ()):
+                raise AdmissionLost("original image account cannot be replaced")
+            return str(selected["access_token"])
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set(excluded_tokens or ())
         for _attempt in range(max_attempts):
@@ -1514,7 +1550,7 @@ class AccountService:
         identity = str(account.get("provider_account_identity") or "").strip()
         if identity:
             return identity
-        identity = f"account_{uuid.uuid4().hex}"
+        identity = self._stable_account_identity(account)
         account = dict(account)
         account["provider_account_identity"] = identity
         self._accounts[resolved] = account
@@ -1689,6 +1725,14 @@ class AccountService:
             excluded_tokens: set[str] | None = None,
             model: str = "auto",
     ) -> str:
+        from services.request_context import current_request, AdmissionLost
+        context = current_request.get()
+        if context is not None:
+            selected = context.selected_account()
+            if not selected or selected.get("access_token") in (excluded_tokens or ()):
+                raise AdmissionLost("original text account cannot be replaced")
+            token = str(selected["access_token"])
+            return self.refresh_access_token(token, event="admitted_text_request") or token
         excluded = set(excluded_tokens or set())
         requested_model = str(model or "auto").strip() or "auto"
         route = None

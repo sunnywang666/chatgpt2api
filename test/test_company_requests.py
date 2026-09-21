@@ -135,6 +135,8 @@ def test_durable_chat_restart_cookie_renewal_and_old_key_isolation(company, monk
 
 def test_company_unknown_submission_is_not_reexecuted_after_restart(company, monkeypatch):
     assert company.client.post(PREFIX + "/api/chat-requests", headers=company.headers(), json=body()).status_code == 202
+    owner = company_identity("company", "employee", CONNECTOR)["id"]
+    company.text_tasks._update(owner, "original-chat", _input_ref=None)  # Legacy input-less receipt.
     queue = Queue()
     restarted = TextTaskService(company.text_tasks.path, runner=company.runner, executor=queue)
     monkeypatch.setattr(chat_requests, "text_task_service", restarted)

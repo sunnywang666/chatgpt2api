@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from services.request_context import trusted_source
+
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
@@ -146,7 +148,10 @@ def create_router() -> APIRouter:
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
         if is_external(request):
-            return await synchronous_external_task(identity, payload, edit=False)
+            return await synchronous_external_task({**identity, "_trusted_source": trusted_source(identity, request)}, payload, edit=False)
+        if text_task_service.admission is not None:
+            from services.durable_forward import respond
+            return await respond(identity, payload, request, "openai_v1_image_generations", operation="image")
         return client_sync_result(await call.run(openai_v1_image_generations.handle, payload), request)
 
     @router.post("/v1/images/edits")
@@ -167,11 +172,14 @@ def create_router() -> APIRouter:
             payload["mask"] = await read_image_sources(mask_sources)
         payload["base_url"] = resolve_image_base_url(request)
         if is_external(request):
-            return await synchronous_external_task(identity, payload, edit=True)
+            return await synchronous_external_task({**identity, "_trusted_source": trusted_source(identity, request)}, payload, edit=True)
+        if text_task_service.admission is not None:
+            from services.durable_forward import respond
+            return await respond(identity, payload, request, "openai_v1_image_edit", operation="image")
         return client_sync_result(await call.run(openai_v1_image_edit.handle, payload), request)
 
     @router.post("/v1/chat/completions")
-    async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
+    async def create_chat_completion(body: ChatCompletionRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         if is_image_chat_request(payload):
@@ -189,10 +197,13 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("messages")),
         )
         await filter_or_log(call, request_preview)
+        if text_task_service.admission is not None:
+            from services.durable_forward import respond
+            return await respond(identity, payload, request, "openai_v1_chat_complete", operation="image" if is_image_chat_request(payload) else "text")
         return await call.run(openai_v1_chat_complete.handle, payload)
 
     @router.post("/v1/responses")
-    async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
+    async def create_response(body: ResponseCreateRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         if has_response_image_generation_tool(payload):
@@ -210,6 +221,9 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("input")),
         )
         await filter_or_log(call, request_preview)
+        if text_task_service.admission is not None:
+            from services.durable_forward import respond
+            return await respond(identity, payload, request, "openai_v1_response", operation="image" if has_response_image_generation_tool(payload) else "text")
         return await call.run(openai_v1_response.handle, payload)
 
     @router.post("/api/conversation-bindings/archive")
@@ -272,6 +286,7 @@ def create_router() -> APIRouter:
     @router.post("/api/conversation-bindings/text")
     async def continue_bound_text(
             body: ConversationBindingTextRequest,
+            request: Request,
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
@@ -292,7 +307,7 @@ def create_router() -> APIRouter:
                 if existing is not None:
                     if existing.get("status") == "not_started":
                         return await run_in_threadpool(
-                            text_task_service.submit, owner, payload,
+                            text_task_service.submit, owner, payload, source=trusted_source(identity, request),
                         )
                     return existing
             request_preview = request_text(payload.get("messages"))
@@ -307,7 +322,11 @@ def create_router() -> APIRouter:
                 request_preview,
             )
             if body.client_request_id:
-                return await run_in_threadpool(text_task_service.submit, owner, payload)
+                return await run_in_threadpool(text_task_service.submit, owner, payload, source=trusted_source(identity, request))
+            if text_task_service.admission is not None:
+                import uuid
+                payload["client_request_id"] = request.headers.get("x-client-request-id") or uuid.uuid4().hex
+                return await run_in_threadpool(text_task_service.submit, owner, payload, source=trusted_source(identity, request))
             return await run_in_threadpool(conversation_binding_service.complete_text, payload)
         except ConversationBindingError as exc:
             detail = {"code": exc.code, "error": str(exc)}
@@ -331,6 +350,7 @@ def create_router() -> APIRouter:
     @router.post("/v1/messages")
     async def create_message(
             body: AnthropicMessageRequest,
+            request: Request,
             authorization: str | None = Header(default=None),
             x_api_key: str | None = Header(default=None, alias="x-api-key"),
             anthropic_version: str | None = Header(default=None, alias="anthropic-version"),
@@ -342,14 +362,20 @@ def create_router() -> APIRouter:
         request_preview = request_text(payload.get("system"), payload.get("messages"), payload.get("tools"))
         call = LoggedCall(identity, "/v1/messages", model, "Messages", request_text=request_preview)
         await filter_or_log(call, request_preview)
+        if text_task_service.admission is not None:
+            from services.durable_forward import respond
+            return await respond(identity, payload, request, "anthropic_v1_messages", operation="text")
         return await call.run(anthropic_v1_messages.handle, payload, sse="anthropic")
 
     @router.post("/v1/search")
-    async def search(body: SearchRequest, authorization: str | None = Header(default=None)):
+    async def search(body: SearchRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         require_chat_text_policy(identity)
         call = LoggedCall(identity, "/v1/search", openai_search.MODEL, "搜索", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
+        if text_task_service.admission is not None:
+            from services.durable_forward import respond
+            return await respond(identity, {**body.model_dump(mode="python"), "model": openai_search.MODEL}, request, "openai_search")
         return await call.run(openai_search.handle, body.model_dump(mode="python"))
 
     @router.get("/v1/editable-file-tasks")
@@ -366,32 +392,28 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=404, detail={"error": "file not found"}) from exc
         return FileResponse(path, filename=path.name)
 
+    async def submit_file_task(handler, identity, request, body):
+        try:
+            return await run_in_threadpool(
+                handler, {**identity, "_trusted_source": trusted_source(identity, request)},
+                client_task_id=body.client_task_id or "", prompt=body.prompt,
+                base64_images=body.base64_images, base_url=resolve_image_base_url(request),
+            )
+        except ConversationBindingError as exc:
+            raise HTTPException(409, detail={"code": exc.code, "task_id": body.client_task_id}) from None
+
     @router.post("/v1/ppt/generations")
     async def create_ppt_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         require_chat_text_policy(identity)
         await filter_or_log(LoggedCall(identity, "/v1/ppt/generations", "gpt-5-5-thinking", "PPT生成任务", request_text=body.prompt), body.prompt)
-        return await run_in_threadpool(
-            editable_file_task_service.submit_ppt,
-            identity,
-            client_task_id=body.client_task_id or "",
-            prompt=body.prompt,
-            base64_images=body.base64_images,
-            base_url=resolve_image_base_url(request),
-        )
+        return await submit_file_task(editable_file_task_service.submit_ppt, identity, request, body)
 
     @router.post("/v1/psd/generations")
     async def create_psd_task(body: EditableFileTaskRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         require_chat_text_policy(identity)
         await filter_or_log(LoggedCall(identity, "/v1/psd/generations", "gpt-5-5-thinking", "PSD生成任务", request_text=body.prompt), body.prompt)
-        return await run_in_threadpool(
-            editable_file_task_service.submit_psd,
-            identity,
-            client_task_id=body.client_task_id or "",
-            prompt=body.prompt,
-            base64_images=body.base64_images,
-            base_url=resolve_image_base_url(request),
-        )
+        return await submit_file_task(editable_file_task_service.submit_psd, identity, request, body)
 
     return router

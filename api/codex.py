@@ -24,7 +24,7 @@ def _ordinary_identity(authorization: str | None) -> dict:
 def _error(exc: CodexServiceError) -> HTTPException:
     return HTTPException(
         status_code=exc.status_code,
-        detail={"error": {"code": exc.code, "message": str(exc)}},
+        detail={"error": {"code": exc.code, "message": str(exc)}, "rate_limit": exc.rate_limit},
     )
 
 
@@ -112,6 +112,10 @@ def create_router() -> APIRouter:
         identity = _ordinary_identity(authorization)
         payload = await _payload(request)
         require_codex_policy(identity, payload)
+        from services.durable_forward import respond
+        from services.text_task_service import text_task_service
+        if text_task_service.admission is not None:
+            return await respond(identity, payload, request, "codex", compact=compact)
         try:
             result = await run_in_threadpool(
                 codex_service.submit,

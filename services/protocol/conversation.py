@@ -1765,6 +1765,19 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
 
+    from services.request_context import current_request
+    context = current_request.get()
+    if context is not None:
+        # The admitted legacy multi-output call retains one account reservation
+        # and executes its bounded slots in order. It cannot escape the original
+        # claim through context-less ThreadPoolExecutor workers or retry a slot.
+        for index in range(request.n):
+            context.image_slot(index)
+            outputs = _generate_single_image(request, index + 1, request.n)
+            context.image_slot_complete(index)
+            yield from outputs
+        return
+
     if request.n <= 1:
         # 单张图片，直接执行（无需线程池开销）
         outputs = _generate_single_image(request, 1, 1)

@@ -1,0 +1,251 @@
+"""Compatibility transports backed by the original text-request receipt.
+
+Disconnecting a subscriber never cancels the accepted executor. Native wire
+bytes are private output files; repeating an original ID only subscribes again.
+No access token, cookie or arbitrary forwarded header is persisted.
+"""
+import asyncio
+import itertools
+import json
+import os
+import uuid
+
+from fastapi import HTTPException
+from fastapi.responses import Response, StreamingResponse
+
+from services.request_context import AdmissionLost, current_request, trusted_source
+
+
+FORWARDED_HEADERS = {"session-id", "thread-id", "x-client-request-id", "originator", "version", "user-agent", "openai-beta",
+                     "x-codex-window-id", "x-codex-turn-metadata", "x-codex-beta-features"}
+OUTPUT_HEADERS = {"content-type", "cache-control", "x-request-id", "openai-request-id", "x-openai-request-id", "retry-after"}
+MAX_OUTPUT_BYTES = 128 * 1024 * 1024
+
+
+def _compatibility_call(spec):
+    """Recreate the existing route log in its executor, never its subscriber."""
+    from services.content_filter import request_text, request_shape
+    from services.log_service import LoggedCall
+    routes = {
+        "openai_v1_chat_complete": ("/v1/chat/completions", "文本生成", ("prompt", "messages"), "messages"),
+        "openai_v1_response": ("/v1/responses", "Responses", ("input", "instructions"), "input"),
+        "anthropic_v1_messages": ("/v1/messages", "Messages", ("system", "messages", "tools"), None),
+        "openai_search": ("/v1/search", "搜索", ("prompt",), None),
+        "openai_v1_image_generations": ("/v1/images/generations", "文生图", ("prompt",), None),
+        "openai_v1_image_edit": ("/v1/images/edits", "图生图", ("prompt",), None),
+    }
+    route = routes.get(spec["protocol"])
+    if route is None:  # Native Codex already owns its original call logging.
+        return None
+    endpoint, summary, fields, shape = route
+    payload = spec["payload"]
+    return LoggedCall(spec["identity"], endpoint, str(payload.get("model") or "auto"), summary,
+                      request_text=request_text(*(payload.get(key) for key in fields)),
+                      request_shape=request_shape(payload.get(shape)) if shape else None)
+
+
+def envelope(identity, payload, request, protocol, *, operation="text", compact=False):
+    headers = {k.lower(): v for k, v in request.headers.items() if k.lower() in FORWARDED_HEADERS}
+    request_id = str(headers.get("x-client-request-id") or payload.get("client_request_id") or uuid.uuid4().hex)
+    route = "codex" if protocol == "codex" else "chat"
+    model = str(payload.get("model") or "auto")
+    from utils.helper import is_codex_image_model
+    if operation == "image" and is_codex_image_model(model):
+        from services.openai_backend_api import CODEX_RESPONSES_MODEL
+        route, model = "codex", CODEX_RESPONSES_MODEL
+    body = {"client_request_id": request_id, "client_conversation_id": str(payload.get("client_conversation_id") or headers.get("session-id") or headers.get("thread-id") or ""),
+            "model": model, "_route": route, "_operation": operation,
+            "_expected_sends": max(1, min(4, int(payload.get("n") or 1))) if operation == "image" else 1,
+            "_forward": {"protocol": protocol, "payload": payload, "headers": headers,
+                         "identity": {k: identity[k] for k in ("id", "name", "role") if k in identity}, "compact": compact}}
+    if route == "codex":
+        from services.codex_service import codex_service
+        body["client_conversation_id"] = codex_service._affinity_key(identity, headers, payload)
+    return body
+
+
+def raw_receipt(service, owner, request_id):
+    with service.store.connect() as db:
+        return service.store.read_receipt(db, "text", owner, request_id)
+
+
+async def respond(identity, payload, request, protocol, *, operation="text", compact=False, service=None):
+    if service is None:
+        from services.text_task_service import text_task_service as service
+    body = envelope(identity, payload, request, protocol, operation=operation, compact=compact)
+    owner, request_id = str(identity["id"]), body["client_request_id"]
+    from fastapi.concurrency import run_in_threadpool
+    from services.conversation_binding_service import ConversationBindingError
+    try:
+        await run_in_threadpool(service.submit, owner, body, source=trusted_source(identity, request))
+    except ConversationBindingError:
+        raise HTTPException(409, detail={"code": "REQUEST_ID_CONFLICT", "request_id": request_id}) from None
+    # Async waiting consumes no executor worker. HTTP cancellation affects only
+    # this subscriber, not the original receipt or its independently held claim.
+    while True:
+        r = await run_in_threadpool(raw_receipt, service, owner, request_id)
+        head = r.get("_wire_head")
+        if head:
+            break
+        if r["status"] in {"unknown", "failed"}:
+            error = r.get("_wire_error_payload") or {"error": {"code": r.get("error_code"), "request_id": request_id}}
+            return Response(json.dumps({**error, "request_id": request_id, "status": r["status"], "rate_limit": r.get("rate_limit")}),
+                            status_code=409 if r["status"] == "unknown" else int(r.get("_wire_error_status") or 503),
+                            headers={**r.get("_wire_error_headers", {}), "X-Request-ID": request_id, "Cache-Control": "private, no-store"}, media_type="application/json")
+        await asyncio.sleep(.1)
+    headers = {**head["headers"], "X-Request-ID": request_id, "Cache-Control": "private, no-store"}
+    if not head["stream"]:
+        while r["status"] in {"queued", "running"}:
+            await asyncio.sleep(.1)
+            r = await run_in_threadpool(raw_receipt, service, owner, request_id)
+        with service.store.output_file(r["_wire_output"]) as handle:
+            data = handle.read(r.get("_wire_size", 0))
+        return Response(data, status_code=head["status"], headers=headers)
+    async def chunks():
+        offset = 0
+        while True:
+            r = await run_in_threadpool(raw_receipt, service, owner, request_id)
+            size = r.get("_wire_size", 0)
+            if size > offset:
+                with service.store.output_file(r["_wire_output"]) as handle:
+                    handle.seek(offset)
+                    data = handle.read(min(65536, size - offset))
+                if data:
+                    offset += len(data)
+                    yield data
+                    continue
+            if r["status"] not in {"queued", "running"}:
+                # An incomplete original stream ends incomplete, never with a
+                # fabricated success marker or an automatic upstream replay.
+                return
+            await asyncio.sleep(.1)
+    return StreamingResponse(chunks(), status_code=head["status"], headers=headers)
+
+
+def run(service, owner, request_id, body):
+    spec = body["_forward"]
+    output = service.store.create_output()
+    service._update(owner, request_id, _wire_output=output, _wire_size=0)
+    protocol = spec["protocol"]
+    call = _compatibility_call(spec)
+    observed = {"urls": [], "_account_email": "", "_conversation_id": ""}
+    stream = False
+    deferred = False
+
+    def observe(item):
+        from services.log_service import _collect_urls, _collect_account_emails, _collect_conversation_ids
+        observed["urls"].extend(_collect_urls(item))
+        for key, collect in (("_account_email", _collect_account_emails), ("_conversation_id", _collect_conversation_ids)):
+            values = collect(item)
+            if values and not observed[key]:
+                observed[key] = values[0]
+
+    try:
+        if protocol == "codex":
+            from services.codex_service import codex_service
+            result = codex_service.submit(spec["identity"], spec["payload"], spec["headers"], compact=spec["compact"])
+            status, headers = result.status_code, result.headers
+            stream = result.stream is not None
+            parts = result.stream if stream else [result.body or b""]
+        else:
+            from importlib import import_module
+            handler = import_module("services.protocol." + protocol).handle
+            result = handler(spec["payload"])
+            stream = not isinstance(result, (dict, list, str, bytes, bytearray))
+            status = 200
+            headers = {"content-type": "text/event-stream" if stream else "application/json"}
+            from services.log_service import _strip_internal_response_fields
+            if stream:
+                # Match LoggedCall.run: a protocol rejection before the first
+                # event is still an HTTP error, not a committed HTTP-200 SSE.
+                iterator = iter(result)
+                missing = object()
+                first = next(iterator, missing)
+                result = iter(()) if first is missing else itertools.chain((first,), iterator)
+            else:
+                observe(result)
+            def wire_events():
+                anthropic = protocol == "anthropic_v1_messages"
+                try:
+                    if not anthropic:
+                        yield ": stream-open\n\n"
+                    for item in result:
+                        observe(item)
+                        public = _strip_internal_response_fields(item)
+                        if anthropic:
+                            yield "event: " + str(public.get("type") or "message_delta") + "\n"
+                        yield "data: " + json.dumps(public, ensure_ascii=False) + "\n\n"
+                    if not anthropic:
+                        yield "data: [DONE]\n\n"
+                finally:
+                    close = getattr(iterator, "close", None)
+                    if callable(close):
+                        close()
+            parts = wire_events() if stream else [json.dumps(_strip_internal_response_fields(result), ensure_ascii=False).encode()]
+        head = {"status": status, "headers": {k.lower(): str(v) for k, v in headers.items() if k.lower() in OUTPUT_HEADERS}, "stream": stream}
+        # For non-stream output, publish headers only after all bytes persist.
+        if stream:
+            service._update(owner, request_id, _wire_head=head)
+        size = 0
+        try:
+            with service.store.output_file(output, append=True) as handle:
+                for part in parts:
+                    data = part.encode() if isinstance(part, str) else bytes(part)
+                    size += len(data)
+                    if size > MAX_OUTPUT_BYTES:
+                        raise RuntimeError("private output limit")
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    service._update(owner, request_id, _wire_size=size)
+        finally:
+            close = getattr(parts, "close", None)
+            if callable(close):
+                close()
+        current = raw_receipt(service, owner, request_id)
+        terminal = protocol != "codex" or current.get("_upstream_terminal") is True
+        failed = bool(current.get("_upstream_failed"))
+        service._update(owner, request_id, status="failed" if failed and terminal else "succeeded" if terminal else "unknown",
+                        error_code="codex_response_failed" if failed and terminal else None if terminal else "codex_upstream_outcome_unknown",
+                        _wire_head=head, _turn_reserved=not terminal, finished_at=service._now())
+    except Exception as exc:
+        current = raw_receipt(service, owner, request_id)
+        code = getattr(exc, "code", None)
+        not_sent = not current.get("_submission_started")
+        if not_sent and (isinstance(exc, AdmissionLost) or code in {
+                "codex_busy", "codex_bound_account_unavailable", "codex_transport_failed",
+                "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}):
+            deferred = True
+            raise
+        known_rejection = code in {"codex_limited", "codex_auth_required", "codex_permission_denied", "invalid_codex_request"}
+        raw_status = getattr(exc, "status_code", 503)
+        status_code = raw_status if type(raw_status) is int and 400 <= raw_status <= 599 else 503
+        if isinstance(exc, HTTPException) and not_sent:
+            # Deterministic protocol/validation failures must stay terminal.
+            # They never inherit the scheduler's UNKNOWN-before-send retry.
+            code = "PROTOCOL_REQUEST_REJECTED"
+        else:
+            code = code or ("PROVIDER_EXECUTION_FAILED" if not_sent else "CONVERSATION_OUTCOME_UNKNOWN")
+        from services.protocol.error_response import anthropic_error_response, openai_error_response
+        detail = exc.detail if isinstance(exc, HTTPException) else {"error": {"code": code, "message": code}}
+        formatter = anthropic_error_response if protocol == "anthropic_v1_messages" else openai_error_response
+        wire_error = formatter(detail, status_code)
+        error_headers = {key.lower(): value for key, value in (getattr(exc, "headers", None) or {}).items()
+                         if key.lower() == "retry-after"}
+        service._update(owner, request_id, status="failed" if not_sent or known_rejection else "unknown",
+                        error_code=code, _turn_reserved=not (not_sent or known_rejection),
+                        _wire_error_status=status_code, _wire_error_payload=json.loads(wire_error.body), _wire_error_headers=error_headers,
+                        upstream_outcome="not_sent" if not_sent else "rejected" if known_rejection else "unknown", finished_at=service._now())
+    finally:
+        if call is not None and not deferred:
+            receipt = raw_receipt(service, owner, request_id)
+            context = current_request.get()
+            if context is not None and receipt.get("_claim_id") == context.claim:
+                success = receipt.get("status") == "succeeded"
+                account = context.selected_account() or {}
+                call.log("流式调用结束" if success and stream else "调用完成" if success else "流式调用失败" if stream else "调用失败",
+                         result=observed, status="success" if success else "failed",
+                         error="" if success else str(receipt.get("error_code") or "CONVERSATION_OUTCOME_UNKNOWN"),
+                         account_email=observed["_account_email"] or str(account.get("email") or ""),
+                         request_id=request_id, provider_account_identity=receipt.get("provider_account_identity"),
+                         rate_limit=receipt.get("rate_limit"))
