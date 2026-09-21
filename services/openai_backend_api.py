@@ -656,6 +656,18 @@ class OpenAIBackendAPI:
             payload["conversation_id"] = conversation_id
         elif parent_message_id:
             raise RuntimeError("parent_message_id requires conversation_id")
+        cursor_callback = getattr(self, "text_cursor_callback", None)
+        if cursor_callback is not None:
+            # Several context messages may be batched into ONE model POST. The
+            # final user UUID's parent is not necessarily the submission root.
+            index = next((i for i, item in enumerate(payload["messages"])
+                          if item["id"] == getattr(self, "text_request_message_id", "")), None)
+            if index is None:
+                raise RuntimeError("original text request user is missing")
+            self.text_request_parent_message_id = (payload["messages"][index - 1]["id"]
+                                                    if index else payload["parent_message_id"])
+            cursor_callback({"request_parent_message_id": self.text_request_parent_message_id,
+                             "_submission_parent_message_id": payload["parent_message_id"]})
         from services.request_context import current_request
         context = current_request.get()
         if context is not None and context.receipt().get("_chat_recovery"):
