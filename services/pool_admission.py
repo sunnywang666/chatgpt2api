@@ -116,6 +116,8 @@ class PoolAdmission:
         self.model_types = model_types
         self.pacing = pacing
         self.codex = codex
+        if codex is not None:
+            codex.admission = self
         self.text_workers = text_workers
         self.handlers = {}
         self.recoveries = {}
@@ -319,8 +321,10 @@ class PoolAdmission:
                     eligible = self.codex is not None and self.codex._eligible_account(account, model, allow_probe=False) is not None
                     if request.operation == "image":
                         eligible = eligible and account.get("source_type") == "codex"
+                    decision = self.codex.quota_decision(account, model) if eligible and hasattr(self.codex, "quota_decision") else {}
                     offers.append(Offer(identity, "codex", model, request.operation,
-                                        (Need(codex_key), Need("codex_server")), enabled=bool(eligible)))
+                                        (Need(codex_key), Need("codex_server")), enabled=bool(eligible),
+                                        preference=0 if decision.get("quota_bucket") == "gpt-reserve" else 1))
                     continue
                 enabled = not disabled and chat_saved and paid
                 if request.operation == "image":
@@ -418,6 +422,55 @@ class PoolAdmission:
                 "queue": {"mode": "durable_original_receipts", "queued": len(queued), "by_source": sources},
                 "execution": {"active_input_bytes": resources["execution_input_bytes"].occupied, "max_input_bytes": self.MAX_ACTIVE_INPUT_BYTES,
                               "chat_workers_active": resources["chat_executor"].occupied, "chat_workers_limit": self.text_workers}}
+
+    def model_resources(self, model_ids):
+        """Exact-model readback of original physical turns, no additional pool."""
+        from services.owned_accounts import public_pool_account
+        now = float(self.clock())
+        with self.store.connect() as db, self._account_guard():
+            rows = self._rows()
+            snapshot = self._snapshot(rows, list(self.store.receipts(db)), self._settings(), {}, now, {})
+        resources = {resource.key: resource for resource in snapshot.resources}
+        server = resources["codex_server"]
+        server_free = None if server.occupied is None else max(0, server.capacity - server.occupied)
+        result = {}
+        for model in model_ids:
+            seen = set()
+            details = []
+            for account in rows:
+                key = account_clock_key(account)
+                if key in seen:
+                    continue
+                seen.add(key)
+                projection = self.codex.account_projection(account)
+                known = {item["id"] for item in projection["models"]}
+                if "gpt-reserve" in known and any(limit.get("id") == "gpt-reserve" and limit.get("normal_model_slug") == "gpt-5.6-luna" for limit in projection["limits"]):
+                    known.add("gpt-5.6-luna")
+                if model not in known:
+                    continue
+                decision = self.codex.quota_decision(account, model)
+                if decision["reason"] == "model_not_supported":
+                    continue
+                resource = resources.get("codex_turn:" + key)
+                occupied = resource.occupied if resource else None
+                eligible = decision["state"] == "available"
+                unknown = decision["state"] == "unknown" or occupied is None or server_free is None
+                free = None if unknown else int(eligible and occupied == 0 and server_free > 0)
+                reason = decision["reason"]
+                if eligible:
+                    reason = "occupancy_unknown" if unknown else "account_busy" if occupied else "server_busy" if server_free == 0 else "ready"
+                details.append({"account_ref": public_pool_account(account)["account_ref"],
+                                "eligible": eligible, "state": decision["state"], "reason": decision["reason"],
+                                "quota_bucket": decision["quota_bucket"], "occupied": occupied, "dispatchable_now": free,
+                                "next_at": now if free else decision["next_at"], "dispatch_reason": reason})
+            eligible_rows = [row for row in details if row["eligible"]]
+            ready = None if any(row["dispatchable_now"] is None for row in details) else min(server_free or 0, sum(row["dispatchable_now"] for row in details))
+            occupied = None if any(row["occupied"] is None for row in details) else sum(row["occupied"] for row in details)
+            next_times = [row["next_at"] for row in details if row["next_at"] is not None]
+            result[model] = {"eligible_accounts": len(eligible_rows), "occupied": occupied,
+                             "dispatchable_now": ready, "next_at": min(next_times) if next_times else None,
+                             "accounts": details}
+        return result
 
     def claim_next(self):
         # Catalog lookup may perform a metadata read; never do that under the
@@ -537,6 +590,9 @@ class PoolAdmission:
             if r.get("_route") == "codex":
                 if self.codex is None or self.codex._eligible_account(selected, r.get("model", ""), allow_probe=False) is None:
                     raise AdmissionLost("original Codex model is unavailable before send")
+                expected = getattr(context, "expected_codex_quota_bucket", None)
+                if expected is not None and self.codex.quota_decision(selected, r.get("model", ""))["quota_bucket"] != expected:
+                    raise AdmissionLost("original Codex quota changed before send")
             else:
                 if context.kind == "image" or r.get("_operation") == "image":
                     capacity = image_capacity(selected, self._settings())

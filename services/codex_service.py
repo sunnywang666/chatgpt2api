@@ -1,7 +1,8 @@
 """Native Codex HTTP bridge over the existing ChatGPT account pool.
 
 The bridge deliberately has no OpenAI-compatible translation layer.  Request
-bodies and successful upstream payloads are relayed byte-for-byte; only
+bodies (except explicitly mapped Luna Reserve selection) and successful upstream
+payloads are relayed without translation; only
 credentials, account selection and bounded safety metadata are owned here.
 """
 
@@ -37,6 +38,8 @@ MAX_STREAM_SECONDS = 20 * 60
 OBSERVATION_MAX_AGE_SECONDS = 5 * 60
 MAX_OPAQUE_BINDINGS_PER_ACCOUNT = 256
 MAX_SELECTION_PROBES = 3
+LUNA_MODEL = "gpt-5.6-luna"
+RESERVE_MODEL = "gpt-reserve"
 
 _FORWARDED_HEADERS = {
     "session-id",
@@ -236,6 +239,20 @@ def _usage_windows(item: dict) -> list[dict]:
     return windows
 
 
+def _limit_metadata(item: dict) -> dict:
+    """Only quota flags and a bounded model ID cross the management boundary."""
+    result = {key: item[key] for key in ("allowed", "limit_reached") if isinstance(item.get(key), bool)}
+    slug = item.get("normal_model_slug")
+    if isinstance(slug, str) and 0 < len(slug) <= 160 and all(c.isalnum() or c in "-._" for c in slug):
+        result["normal_model_slug"] = slug
+    return result
+
+
+def _bucket_exhausted(limit: dict) -> bool:
+    return (limit.get("allowed") is False or limit.get("limit_reached") is True
+            or any(w["used_percent"] >= 100 for w in limit["windows"]))
+
+
 def _project_limits(payload: object) -> tuple[list[dict], bool]:
     if not isinstance(payload, dict):
         raise ValueError("usage payload is invalid")
@@ -261,6 +278,7 @@ def _project_limits(payload: object) -> tuple[list[dict], bool]:
                 "limit_id": str(outer.get("limit_id") or name),
                 "limit_name": name,
                 **outer["rate_limit"],
+                "normal_model_slug": outer.get("normal_model_slug"),
             })
     if not candidates and any(key in payload for key in ("primary", "secondary", "limit_id")):
         candidates.append(payload)
@@ -289,6 +307,7 @@ def _project_limits(payload: object) -> tuple[list[dict], bool]:
         result.append({
             "id": limit_id,
             "label": str(item.get("limit_name") or item.get("label") or limit_id).strip()[:160],
+            **_limit_metadata(item),
             "windows": windows,
         })
     if not result:
@@ -420,6 +439,7 @@ class CodexService:
             limits.append({
                 "id": str(item.get("id") or "")[:120],
                 "label": str(item.get("label") or item.get("id") or "")[:160],
+                **_limit_metadata(item),
                 "windows": windows,
             })
         # Credential presence is independent of quota observations and execution
@@ -443,21 +463,21 @@ class CodexService:
     def management_models(self) -> dict:
         by_id: dict[str, dict] = {}
         newest: str | None = None
+        seen_accounts: set[str] = set()
         for account in self.accounts.list_accounts():
+            from services.pool_admission import account_clock_key
+            key = account_clock_key(account)
+            if key in seen_accounts:
+                continue
+            seen_accounts.add(key)
             projection = self.account_projection(account)
-            active = not account.get("managed_disabled") and account.get("status") not in {"禁用", "异常"}
-            fresh = self._observation_fresh(projection)
-            exhausted_model_limits = {
-                limit["id"].strip().casefold()
-                for limit in projection["limits"]
-                if any(window["used_percent"] >= 100 for window in limit["windows"])
-            }
-            # WHAM can use a display-cased model ID as limit_name, which the
-            # usage projection preserves as its fallback ID. Only case/space
-            # normalization is justified; do not guess aliases from labels.
-            known_model_ids = {model["id"].strip().casefold() for model in projection["models"]}
-            unmapped_exhausted_limit = bool(exhausted_model_limits - known_model_ids - {"codex"})
-            for model in projection["models"]:
+            models = list(projection["models"])
+            reserve = next((limit for limit in projection["limits"] if limit["id"] == RESERVE_MODEL), None)
+            route = next((model for model in models if model["id"] == RESERVE_MODEL), None)
+            if reserve and route and reserve.get("normal_model_slug") == LUNA_MODEL and not any(m["id"] == LUNA_MODEL for m in models):
+                # An explicit upstream mapping, never a guessed alias.
+                models.append({**route, "id": LUNA_MODEL, "label": LUNA_MODEL})
+            for model in models:
                 current = by_id.setdefault(model["id"], {
                     "id": model["id"],
                     "label": model["label"],
@@ -474,38 +494,21 @@ class CodexService:
                 from services.owned_accounts import public_pool_account
                 safe = public_pool_account(account)
                 current["supported_accounts"] += 1
-                if (active and fresh and projection["state"] == "observed"
-                        and model["id"].strip().casefold() in exhausted_model_limits):
-                    current["unavailable_accounts"] += 1
-                    account_state, reason = "unavailable", "model_limited"
-                elif active and fresh and projection["state"] == "observed" and unmapped_exhausted_limit:
-                    # An exhausted bucket of unproven scope cannot establish
-                    # that this model is either available or exhausted.
-                    current["pending_accounts"] += 1
-                    account_state, reason = "unknown", "unknown"
-                elif active and fresh and projection["state"] == "observed":
+                decision = self.quota_decision(account, model["id"])
+                account_state, reason = decision["state"], decision["reason"]
+                if account_state == "available":
                     current["available_accounts"] = int(current["available_accounts"] or 0) + 1
                     current["state"] = "available"
-                    account_state, reason = "available", "observed"
-                elif not active:
+                elif account_state == "unavailable":
                     current["unavailable_accounts"] += 1
-                    account_state, reason = "unavailable", "disabled" if account.get("managed_disabled") or account.get("status") == "禁用" else "account_unavailable"
-                elif fresh and projection["state"] in {"limited", "auth_required"}:
-                    current["unavailable_accounts"] += 1
-                    account_state, reason = "unavailable", "limited" if projection["state"] == "limited" else "auth_required"
                 else:
                     current["pending_accounts"] += 1
-                    account_state = "unknown"
-                    reason = (
-                        projection["state"]
-                        if projection["state"] in {"unknown", "read_failed"}
-                        else "stale"
-                    )
                 current["accounts"].append({
                     "account_ref": safe["account_ref"],
                     "label": safe["label"],
                     "state": account_state,
                     "reason": reason,
+                    "quota_bucket": decision["quota_bucket"],
                 })
                 for effort in model["reasoning_efforts"]:
                     if effort not in current["reasoning_efforts"]:
@@ -517,6 +520,22 @@ class CodexService:
             if item["state"] != "available" and item["pending_accounts"] == 0 and item["unavailable_accounts"]:
                 item["state"] = "unavailable"
                 item["available_accounts"] = 0
+        admission = getattr(self, "admission", None)
+        if admission is not None:
+            resources = admission.model_resources(tuple(by_id))
+            for model_id, current in by_id.items():
+                projection = resources.get(model_id, {})
+                current.update({key: projection.get(key) for key in ("eligible_accounts", "occupied", "dispatchable_now", "next_at")})
+                details = {row["account_ref"]: row for row in projection.get("accounts", [])}
+                for row in current["accounts"]:
+                    detail = details.get(row["account_ref"])
+                    if detail:
+                        row.update({key: detail[key] for key in ("occupied", "dispatchable_now", "next_at", "dispatch_reason", "state", "reason", "quota_bucket")})
+                current["pending_accounts"] = sum(row["state"] == "unknown" for row in current["accounts"])
+                current["unavailable_accounts"] = sum(row["state"] == "unavailable" for row in current["accounts"])
+                available = sum(row["state"] == "available" for row in current["accounts"])
+                current["available_accounts"] = available if available or not current["pending_accounts"] else None
+                current["state"] = "available" if available else "unknown" if current["pending_accounts"] else "unavailable"
         items = list(by_id.values())
         if self._chat_catalog is not None:
             items.extend(self._chat_catalog.management_models())
@@ -543,6 +562,7 @@ class CodexService:
         if account_id:
             headers["chatgpt-account-id"] = account_id
         headers["accept"] = "text/event-stream, application/json"
+        headers["x-openai-codex-luna-reserve"] = "1"
         return headers
 
     @classmethod
@@ -722,7 +742,7 @@ class CodexService:
         observed_at = _parse_iso(projection.get("observed_at"))
         if observed_at is None:
             return False
-        return (datetime.now(timezone.utc) - observed_at).total_seconds() <= OBSERVATION_MAX_AGE_SECONDS
+        return 0 <= (datetime.now(timezone.utc) - observed_at).total_seconds() <= OBSERVATION_MAX_AGE_SECONDS
 
     def _record_model_catalog(self, token: str, request_account: dict, models: list[dict]) -> None:
         account = self.accounts.get_account(token)
@@ -800,6 +820,59 @@ class CodexService:
             **current, "state": state, "updated_at": _utc_now(),
         }, required=True)
 
+    def quota_decision(self, account: dict, requested_model: str = "") -> dict:
+        """No I/O. The same exact-model decision feeds admission and the UI."""
+        def result(state, reason, bucket=None, upstream=None):
+            return {"state": state, "reason": reason, "quota_bucket": bucket,
+                    "upstream_model": upstream, "next_at": None}
+        if account.get("managed_disabled") or account.get("status") in {"禁用", "异常", "限流"}:
+            return result("unavailable", "disabled")
+        try:
+            self._account_headers(account)
+        except CodexServiceError:
+            return result("unavailable", "auth_required")
+        projection = self.account_projection(account)
+        if projection["state"] == "auth_required":
+            return result("unavailable", "auth_required")
+        if not self._observation_fresh(projection):
+            return result("unknown", "stale")
+        if projection["state"] not in {"observed", "limited"}:
+            return result("unknown", projection["state"])
+        cooldown = float((account.get("codex_rate_limit") or {}).get("cooldown_until") or 0)
+        if cooldown > time.time():
+            return {**result("unavailable", "cooldown"), "next_at": cooldown}
+        models = {m["id"] for m in projection["models"]}
+        limits = {limit["id"].strip().casefold(): limit for limit in projection["limits"]}
+        main = limits.get("codex")
+        reserve = limits.get(RESERVE_MODEL)
+        main_exhausted = main is not None and _bucket_exhausted(main)
+        if requested_model in {LUNA_MODEL, RESERVE_MODEL} and main_exhausted:
+            if not reserve or reserve.get("normal_model_slug") != LUNA_MODEL or RESERVE_MODEL not in models:
+                return result("unavailable", "reserve_mapping_unavailable")
+            if reserve.get("allowed") is not True:
+                return result("unavailable" if reserve.get("allowed") is False else "unknown", "reserve_not_allowed")
+            if _bucket_exhausted(reserve):
+                return result("unavailable", "reserve_limited")
+            # Expired windows require a fresh upstream read, not a local reset.
+            if any(w.get("resets_at") and w["resets_at"] <= time.time() for w in reserve["windows"]):
+                return result("unknown", "stale")
+            return result("available", "reserve", RESERVE_MODEL, RESERVE_MODEL)
+        if requested_model == RESERVE_MODEL:
+            return result("unavailable", "model_limited" if reserve and _bucket_exhausted(reserve) else "reserve_not_active")
+        if requested_model and requested_model not in models:
+            return result("unavailable", "model_not_supported")
+        if main_exhausted or projection["state"] == "limited":
+            return result("unavailable", "limited")
+        exhausted = {key for key, value in limits.items() if _bucket_exhausted(value)}
+        known = {model.casefold() for model in models}
+        if requested_model and requested_model.casefold() in exhausted:
+            return result("unavailable", "model_limited")
+        if exhausted - known - {"codex", RESERVE_MODEL}:
+            return result("unknown", "unknown")
+        if not requested_model and not known - exhausted - {RESERVE_MODEL}:
+            return result("unavailable", "model_not_supported")
+        return result("available", "observed", "codex", requested_model)
+
     def _eligible_account(
         self,
         account: dict | None,
@@ -824,19 +897,7 @@ class CodexService:
                 return None
             projection = self.refresh_account(token)
             account = self.accounts.get_account(token) or account
-        model_ids = {item["id"] for item in projection["models"]}
-        if projection["state"] != "observed" or (requested_model and requested_model not in model_ids):
-            return None
-        exhausted = {limit["id"].strip().casefold() for limit in projection["limits"]
-                     if any(window["used_percent"] >= 100 for window in limit["windows"])}
-        known_ids = {model.casefold() for model in model_ids}
-        if "codex" in exhausted or exhausted - known_ids - {"codex"}:
-            return None
-        if requested_model and requested_model.casefold() in exhausted:
-            return None
-        if not requested_model and not known_ids - exhausted:
-            return None
-        return account
+        return account if self.quota_decision(account, requested_model)["state"] == "available" else None
 
     def _eligible_accounts(self, requested_model: str = "") -> list[dict]:
         accounts = self.accounts.list_accounts()
@@ -848,7 +909,7 @@ class CodexService:
             )) is not None
         ]
         if fresh:
-            return fresh
+            return sorted(fresh, key=lambda a: self.quota_decision(a, requested_model)["quota_bucket"] != RESERVE_MODEL)
 
         probe_candidates: list[dict] = []
         for account in accounts:
@@ -1293,6 +1354,11 @@ class CodexService:
         attempted = False
         try:
             account, token, affinity = self._select_account(identity, forwarded_headers, payload)
+            decision = self.quota_decision(account, str(payload.get("model") or ""))
+            if decision["state"] != "available":
+                raise CodexServiceError(503, "codex_bound_account_unavailable", "The selected model is no longer available")
+            if decision["quota_bucket"] == RESERVE_MODEL:
+                raw = json.dumps({**payload, "model": RESERVE_MODEL}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             headers = self._account_headers(account, forwarded_headers)
             request_digest = self._credential_digest(account)
             headers["content-type"] = "application/json"
@@ -1303,6 +1369,7 @@ class CodexService:
             from services.request_context import current_request
             context = current_request.get()
             if context is not None:
+                context.expected_codex_quota_bucket = decision["quota_bucket"]
                 context.before_send()
             attempted = True
             response = session.post(
