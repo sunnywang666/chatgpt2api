@@ -59,7 +59,7 @@ def decode_event(line):
     clean['model'] = obj.get('model') if isinstance(obj.get('model'), str) and MODEL.fullmatch(obj['model']) else None
     for name, allowed in {
         'layer': {'upstream_chatgpt', 'upstream_codex', 'provider_capacity', 'company_transport'},
-        'phase': {'conversation', 'prepare', 'account_read', 'sse', 'stream', 'unknown'},
+        'phase': {'conversation', 'conversation_stream', 'prepare', 'account_read', 'sse', 'stream', 'unknown'},
         'origin': {'http_429', 'sse_rate_limit'},
         'operation': {'text', 'image', 'search'},
         'route': {'chat', 'codex'},
