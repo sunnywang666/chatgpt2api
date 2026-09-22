@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only local extractor for the two existing Provider clock log events.
+"""Read-only local extractor for Provider clock and execution timeline events.
 
 Pipe a bounded `docker logs --timestamps --since ...` export on the owning host.
 No application import, database access, HTTP request, credentials, configuration
@@ -17,7 +17,7 @@ import math
 import re
 import sys
 
-EVENTS = frozenset({'account_message_start', 'account_rate_limited'})
+EVENTS = frozenset({'account_message_start', 'account_rate_limited', 'pool_execution_stage'})
 ACCOUNT = re.compile(r'^[0-9a-f]{12}$')
 REQUEST_REF = re.compile(r'^[0-9a-f]{24}$')
 MODEL = re.compile(r'^(?:gpt-(?:image-)?[0-9][a-z0-9.-]{0,100}|o[1-9][a-z0-9.-]{0,100}|auto)$')
@@ -46,11 +46,19 @@ def decode_event(line):
     if not isinstance(obj, dict) or obj.get('event') not in EVENTS:
         return None
     account = obj.get('account')
-    if not isinstance(account, str) or not ACCOUNT.fullmatch(account):
+    account_ref = obj.get('account_ref')
+    if obj.get('event') == 'pool_execution_stage':
+        account = account_ref
+        valid_account = isinstance(account, str) and REQUEST_REF.fullmatch(account)
+    else:
+        valid_account = isinstance(account, str) and ACCOUNT.fullmatch(account)
+    if not valid_account:
         return None
     # Keep only the two fixed event names, the provider's opaque hash and numbers.
     clean = {'event': obj['event'], 'account': account}
-    fields = ('since_previous_secs', 'minimum_interval_secs') if obj['event'] == 'account_message_start' else ('consecutive_limits', 'retry_after_secs', 'cooldown_secs')
+    fields = (('since_previous_secs', 'minimum_interval_secs') if obj['event'] == 'account_message_start'
+              else ('consecutive_limits', 'retry_after_secs', 'cooldown_secs') if obj['event'] == 'account_rate_limited'
+              else ('status_code', 'input_bytes', 'config_revision'))
     for name in fields:
         clean[name] = numeric(obj.get(name))
     # These fields are emitted by the existing durable request context. Missing
@@ -72,6 +80,10 @@ def decode_event(line):
     # of copying a potentially sensitive header value into the shared report.
     upstream = obj.get('upstream_request_id')
     clean['upstream_request_ref'] = hashlib.sha256(upstream.encode()).hexdigest()[:24] if isinstance(upstream, str) and 0 < len(upstream) <= 160 else None
+    clean['account_ref'] = account
+    clean['stage'] = obj.get('stage') if obj['event'] == 'pool_execution_stage' and isinstance(obj.get('stage'), str) else None
+    source = obj.get('source')
+    clean['source'] = source if isinstance(source, str) and len(source) <= 160 and all(ord(c) >= 32 for c in source) else None
     if match and match.group('time'):
         clean['timestamp'] = match.group('time')
     return clean
@@ -82,7 +94,7 @@ def _range(values):
 
 
 def analyze(lines, *, input_complete=True):
-    rows = defaultdict(lambda: {'starts': 0, 'limits': 0, 'interval': [], 'local_minimum': [], 'retry_after': [], 'cooldown': [], 'times': []})
+    rows = defaultdict(lambda: {'starts': 0, 'limits': 0, 'stages': 0, 'interval': [], 'local_minimum': [], 'retry_after': [], 'cooldown': [], 'times': []})
     ignored = total = recognized = attributed = 0
     samples = []
     for line in lines:
@@ -104,15 +116,18 @@ def analyze(lines, *, input_complete=True):
             for field, dest in [('since_previous_secs', 'interval'), ('minimum_interval_secs', 'local_minimum')]:
                 if event[field] is not None:
                     row[dest].append(event[field])
-        else:
+        elif event['event'] == 'account_rate_limited':
             row['limits'] += 1
             for field, dest in [('retry_after_secs', 'retry_after'), ('cooldown_secs', 'cooldown')]:
                 if event[field] is not None:
                     row[dest].append(event[field])
+        else:
+            row['stages'] += 1
     accounts = []
     for account, row in sorted(rows.items()):
         accounts.append({
             'account_ref': account, 'start_events': row['starts'], 'rate_limit_events': row['limits'],
+            'execution_stage_events': row['stages'],
             'start_spacing_seconds': _range(row['interval']),
             'configured_start_spacing_seconds': _range(row['local_minimum']),
             'retry_after_seconds': _range(row['retry_after']), 'cooldown_seconds': _range(row['cooldown']),
@@ -120,7 +135,7 @@ def analyze(lines, *, input_complete=True):
             'model': None, 'operation': None, 'safe_concurrency': None, 'recommended_interval_seconds': None,
         })
     return {
-        'schema': 1, 'mode': 'read_only_existing_clock_events',
+        'schema': 1, 'mode': 'read_only_clock_and_execution_events',
         'coverage': {'input_complete': input_complete, 'lines_read': total, 'recognized_events': recognized, 'ignored_lines': ignored,
                      'request_attributed_events': attributed, 'sampled_events': len(samples),
                      'omitted_samples': recognized - len(samples)},
@@ -128,14 +143,14 @@ def analyze(lines, *, input_complete=True):
         'samples': samples,
         'limitations': [
             'Counts are observed log events, not all requests, success rates, model usage or billable generations.',
-            'Old clock events lack per-event attribution; current events may include model, operation, persisted input bytes and the owner/request hash.',
-            'Neither format records concurrent occupancy or trusted caller source. Join original receipts and an observed pool snapshot; do not infer either from spacing.',
+            'Old clock events lack per-event attribution; current clock and execution-stage events may include model, operation, persisted input bytes and the owner/request hash.',
+            'Execution-stage events provide send/result boundaries; they still require the original receipt and an observed pool snapshot to establish occupancy.',
             'A message-start event precedes final send guards and is not proof that the model received the request. Confirm the original receipt/result.',
             'Request refs use the existing first 24 hex characters of SHA256(owner + colon + request ID); upstream header IDs are separately hashed for safe correlation.',
             'Samples are bounded and omitted_samples reports truncation; account totals still cover every recognized event in the input.',
             'Duplicate or overlapping log exports cannot be deduplicated without event IDs.',
             'No events is missing evidence, not zero rate limits. The first spacing sample can precede the selected time window.',
-            'Company ingress and Provider admission errors require their own evidence; these two event types only describe the account clock.',
+            'Company ingress and Provider admission errors require their own evidence; these events do not classify a transport-layer 429 as an upstream limit.',
             'No safe concurrency or production setting is inferred or changed.',
         ],
     }

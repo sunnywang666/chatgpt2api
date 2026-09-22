@@ -32,6 +32,16 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(result['coverage']['request_attributed_events'],2)
         self.assertIsNone(result['accounts'][0]['safe_concurrency'])
 
+    def test_execution_stage_events_are_attributed_without_full_request_data(self):
+        result = analyze([line('pool_execution_stage', account_ref='b' * 24, stage='send_call_started',
+                               model='gpt-5-6-thinking', source='internal:happy', input_bytes=4096,
+                               config_revision=7)])
+        self.assertEqual(result['coverage']['recognized_events'], 1)
+        self.assertEqual(result['coverage']['request_attributed_events'], 0)
+        self.assertEqual(result['samples'][0]['stage'], 'send_call_started')
+        self.assertEqual(result['accounts'][0]['execution_stage_events'], 1)
+        self.assertEqual(result['samples'][0]['source'], 'internal:happy')
+
     def test_missing_or_untrusted_attribution_is_not_invented_or_exposed(self):
         result=analyze([line(),line(model='PRIVATE_TOKEN_VALUE',request_ref='PRIVATE_REQUEST',
             layer='PRIVATE_LAYER',phase='PRIVATE_PHASE',operation=['PRIVATE_OPERATION'],

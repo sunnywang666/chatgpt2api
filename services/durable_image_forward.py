@@ -142,6 +142,8 @@ def save_slot(context, index, outputs):
     ref = _save_outputs(context.admission.store, outputs)
     context.admission.update_claim(context, **_slot_changes(context.receipt(), index, output_ref=ref, completed=True),
                                    _completed_slot=index)
+    if hasattr(context, "record_stage"):
+        context.record_stage("artifact_saved", output_ref=ref)
 
 
 def _prompt(spec):

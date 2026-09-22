@@ -921,7 +921,8 @@ class TextTaskService:
                    "model": dispatch_model(body),
                    "request_message_id": str(uuid.uuid4()),
                    "request_parent_message_id": str(body.get("parent_message_id") or "").strip(),
-                   "status": "queued", "boot": self.boot, "created_at": self._now(), "updated_at": self._now()}
+                   "status": "queued", "boot": self.boot, "created_at": self._now(), "updated_at": self._now(),
+                   "_execution_timeline": [{"stage": "accepted", "at": self._now()}]}
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             previous = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
@@ -960,6 +961,7 @@ class TextTaskService:
                                    _source=source or "key:" + owner,
                                    _input_bytes=_retained_size(body),
                                    _turn_reserved=False, _submission_started=False)
+                receipt.setdefault("_execution_timeline", [{"stage": "accepted", "at": self._now()}])
                 db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
                 schedule = True
             elif not previous:
@@ -1050,6 +1052,9 @@ class TextTaskService:
             else:
                 result = self.runner(body, on_cursor=progress)
             self._update(owner, request_id, **{**result, "status": "succeeded", "finished_at": self._now()})
+            context = current_request.get()
+            if context is not None and hasattr(context, "record_stage"):
+                context.record_stage("artifact_saved")
         except ConversationBindingError as exc:
             cursor = {k: getattr(exc, k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id") if getattr(exc, k, "")}
             diagnostic = {

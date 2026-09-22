@@ -177,19 +177,27 @@ class AccountRequestClock:
         raw_model = (kwargs.get("json") or {}).get("model") if isinstance(kwargs.get("json"), dict) else None
         model = raw_model if isinstance(raw_model, str) and len(raw_model) <= 160 else None
         request_ref = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24] if context else None
-        # Serialize complete message streams, while allowing paced readback for
-        # the active turn. Never hold the request lock while waiting for a turn.
+        # Serialize only the send edge. The account activity reservation lives
+        # in PoolAdmission until the response stream is terminal; holding this
+        # file lock for the whole stream would silently force capacity back to 1.
         if is_turn:
             acquire_with_budget(self.turn_lock)
-        held = is_turn
+        pacing_held = is_turn
+        turn_held = is_turn
         release_lock = threading.Lock()
 
-        def release():
-            nonlocal held
+        def release_pacing():
+            nonlocal pacing_held
             with release_lock:
-                if held:
-                    held = False
+                if pacing_held:
+                    pacing_held = False
                     self.turn_lock.release()
+
+        def release_turn():
+            nonlocal turn_held
+            with release_lock:
+                if turn_held:
+                    turn_held = False
                     if context is not None:
                         context.release_turn()
 
@@ -226,18 +234,24 @@ class AccountRequestClock:
                     raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
                 if context is not None and is_turn:
                     context.before_send()
+                    if hasattr(context, "record_stage"):
+                        context.record_stage("send_call_started")
                 if callable(before_send):
                     before_send()
                 # Saving pacing state and the submission receipt can consume
                 # part of the declared budget; cap once more at the send edge.
                 cap_timeout_before_send()
                 response = send(method, url, **kwargs)
+                release_pacing()
                 response_headers = getattr(response, "headers", {}) or {}
                 upstream_id = response_headers.get("x-request-id") or response_headers.get("openai-request-id")
                 safe_id = upstream_id if isinstance(upstream_id, str) and len(upstream_id) <= 160 and upstream_id.isascii() and not any(c.isspace() for c in upstream_id) else None
                 if response.status_code == 429:
                     self.limited(retry_after_seconds(response.headers.get("Retry-After")),
                                  evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id})
+                if context is not None and is_turn and hasattr(context, "record_stage"):
+                    context.record_stage("response_headers_received", status_code=response.status_code,
+                                         upstream_request_id=safe_id)
             finally:
                 self.lock.release()
             if is_turn and kwargs.get("stream") and 200 <= response.status_code < 300:
@@ -246,15 +260,20 @@ class AccountRequestClock:
                     try:
                         return close()
                     finally:
-                        release()
+                        release_turn()
                 response.close = close_turn
                 # Some upstream limits arrive inside HTTP-200 SSE. Observe only
                 # explicit error envelopes, never the assistant's text content.
                 lines = response.iter_lines
                 def paced_lines(*args, **line_kwargs):
                     limited = False
+                    first_output = False
                     try:
                         for line in lines(*args, **line_kwargs):
+                            if not first_output and line:
+                                first_output = True
+                                if context is not None and hasattr(context, "record_stage"):
+                                    context.record_stage("first_output")
                             if not limited and rate_limited_event(line):
                                 with self.lock:
                                     self.limited(rate_limit_retry_after(line), evidence={"phase": "conversation_stream", "model": model, "origin": "sse_rate_limit", "upstream_request_id": safe_id})
@@ -264,10 +283,11 @@ class AccountRequestClock:
                         close_turn()
                 response.iter_lines = paced_lines
             else:
-                release()
+                release_turn()
             return response
         except BaseException:
-            release()
+            release_pacing()
+            release_turn()
             raise
 
 

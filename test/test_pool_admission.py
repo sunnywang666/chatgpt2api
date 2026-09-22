@@ -178,6 +178,23 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.calls[0][2]["provider_account_identity"], "account-1")
         self.assertEqual(self.read("text", "happy", "a")["_claim_id"], first.claim)
 
+    def test_same_account_chat_capacity_can_overlap_without_changing_image_capacity(self):
+        self.admission.settings = lambda: {
+            "image_account_concurrency": 4,
+            "chat_account_concurrency": 2,
+            "codex_max_concurrency": 4,
+        }
+        self.submit("first", owner="happy", client_conversation_id="session-a")
+        self.submit("second", owner="wb", client_conversation_id="session-b")
+        first = self.admission.claim_next()
+        first.before_send()
+        second = self.admission.claim_next()
+        self.assertIsNotNone(second)
+        self.assertEqual(first.receipt()["provider_account_identity"], second.receipt()["provider_account_identity"])
+        self.assertEqual(self.admission.resource_snapshot()["accounts"][0]["chat_turn"]["capacity"], 2)
+        timeline = self.read("text", "happy", "first")["_execution_timeline"]
+        self.assertEqual([item["stage"] for item in timeline], ["accepted", "execution_claimed", "send_guard_passed"])
+
     def test_disable_restore_and_quota_restore_wake_original_image(self):
         self.rows[0]["managed_disabled"] = True
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
