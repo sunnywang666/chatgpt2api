@@ -4,26 +4,29 @@ on:
     branches: [fix/recovery-scan-progress-20260922]
     paths: ['.recovery-apply-ready']
 permissions:
-  contents: write
+  contents: read
 jobs:
   review:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Apply reviewed source and verify all bytes
+      - name: Verify committed source bytes
         run: |
           set -euo pipefail
           mkdir -p /tmp/recovery-evidence
           git rev-parse HEAD > /tmp/recovery-evidence/input-sha.txt
-          git apply --check .recovery-existing.patch
-          git apply .recovery-existing.patch
+          echo 79c745136e3f264eec59f0411e8fc25cdb3465a9 > /tmp/recovery-evidence/product-sha.txt
+          git merge-base --is-ancestor d92214f91d822b44c8a6d69ae0e8b929833c6d09 HEAD
           sha256sum -c .recovery-source.sha256 | tee /tmp/recovery-evidence/source-hashes.log
           cp .recovery-source.sha256 /tmp/recovery-evidence/source.sha256
-          git diff --check
+          git diff --exit-code
       - name: Install locked dependencies
         env:
           TIKTOKEN_CACHE_DIR: /tmp/recovery-tiktoken
@@ -44,16 +47,10 @@ jobs:
           uv run pytest -q test/test_recovery_scan_progress.py test/test_recovery_scan_audit.py 2>&1 | tee /tmp/recovery-evidence/targeted.log
           uv run pytest -q test --ignore=test/test_generations.py --ignore=test/test_generations_url.py --ignore=test/test_gpt_ppt.py --ignore=test/test_gpt_psd.py --ignore=test/test_image.py --ignore=test/test_image_output_tokens.py --ignore=test/test_v1_chat_completions.py --ignore=test/test_v1_images_edits.py --ignore=test/test_v1_images_generations.py --ignore=test/test_v1_messages.py --ignore=test/test_v1_models.py --ignore=test/test_v1_responses.py 2>&1 | tee /tmp/recovery-evidence/owning.log
           sha256sum -c .recovery-source.sha256
-          git diff --check
-      - name: Commit only the tested bounded product delta
+          git diff --exit-code
+      - name: Export exact tested source and evidence
         run: |
           set -euo pipefail
-          git add -- docs/deployment.md scripts/audit_recovery_scan.py services/conversation_binding_service.py services/public_chat_service.py services/text_task_service.py test/test_conversation_continuation.py test/test_recovery_scan_audit.py test/test_recovery_scan_progress.py
-          git config user.name 'sunnywang666'
-          git config user.email '197755426+sunnywang666@users.noreply.github.com'
-          git commit -m 'fix: retain failed recovery candidates without blocking scan progress'
-          git push origin HEAD:refs/heads/fix/recovery-scan-progress-20260922
-          git rev-parse HEAD > /tmp/recovery-evidence/product-sha.txt
           git status --porcelain > /tmp/recovery-evidence/worktree-status.txt
           git diff --binary d92214f91d822b44c8a6d69ae0e8b929833c6d09 HEAD -- docs/deployment.md scripts/audit_recovery_scan.py services/conversation_binding_service.py services/public_chat_service.py services/text_task_service.py test/test_conversation_continuation.py test/test_recovery_scan_audit.py test/test_recovery_scan_progress.py > /tmp/recovery-evidence/product.patch
           git archive --format=zip HEAD docs/deployment.md scripts/audit_recovery_scan.py services/conversation_binding_service.py services/public_chat_service.py services/text_task_service.py test/test_conversation_continuation.py test/test_recovery_scan_audit.py test/test_recovery_scan_progress.py > /tmp/recovery-evidence/tested-source.zip
