@@ -24,13 +24,26 @@ def account_clock_key(account):
     return hashlib.sha256(identity.encode()).hexdigest()
 
 
+def recovery_suppressed(receipt):
+    """Return whether an explicit operator marker stops old recovery work.
+
+    The marker is deliberately separate from status/error fields: setting it
+    does not rewrite the original outcome or any request identity, and removing
+    it is the reversible way to resume the existing recovery path.
+    """
+    return receipt.get("_recovery_suppressed") is True
+
+
 def unknown_text_result(receipt):
-    return (receipt.get("status") == "unknown"
+    return (not recovery_suppressed(receipt)
+            and (receipt.get("status") == "unknown"
             or receipt.get("status") == "failed" and receipt.get("error_code") == "RESULT_UNRECOVERABLE"
-            and receipt.get("upstream_outcome") == "unknown")
+            and receipt.get("upstream_outcome") == "unknown"))
 
 
 def unfinished(kind, receipt):
+    if recovery_suppressed(receipt):
+        return False
     if kind == "image":
         return receipt.get("upstream_unfinished") is True or receipt.get("status") in {"queued", "running"}
     return receipt.get("status") in {"queued", "running", "not_started"} or unknown_text_result(receipt)
@@ -176,6 +189,8 @@ class PoolAdmission:
         rows.sort(key=lambda row: float(row[3].get("recovery_next_at" if row[0] == "text" else "next_poll_at")
                                         or 0))
         for kind, owner, request_id, r in rows:
+            if recovery_suppressed(r):
+                continue
             if kind not in self.recoveries:
                 continue
             if r.get("_forward_protocol"):
@@ -253,8 +268,9 @@ class PoolAdmission:
         for kind, owner, request_id, r in receipts:
             status = r.get("status")
             pending = unfinished(kind, r)
-            unknown = (unknown_text_result(r) if kind == "text" else status == "unknown"
-                       or status == "error" and r.get("upstream_unfinished"))
+            unknown = (unknown_text_result(r) if kind == "text" else
+                       (not recovery_suppressed(r) and
+                        (status == "unknown" or status == "error" and r.get("upstream_unfinished"))))
             account = by_identity.get(str(r.get("provider_account_identity") or ""))
             resource = account_clock_key(account) if account else r.get("_account_resource")
             active = status == "running" or unknown
