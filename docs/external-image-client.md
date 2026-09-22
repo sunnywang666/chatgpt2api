@@ -142,6 +142,8 @@ An HTTP response is recorded in the local state. A timeout, disconnect, invalid 
 
 Do not put the bearer token in command arguments, task state, logs, screenshots, or source control. Keep the filled env file private.
 
+For the authorized joint observation window, the existing `scripts/audit_pacing_log.py` reads a bounded local log export from stdin. Current clock events retain an opaque original-request reference, model, operation, persisted input size, send sequence, layer/phase and rate-limit evidence in the report; old missing fields stay unknown. Upstream header IDs are hashed, and `coverage.omitted_samples` discloses any sample truncation. This script makes no network calls. A message-start event occurs before final send guards and is not proof of a completed upstream send. Correlate it with the original receipt/result and an observed pool snapshot: current clock logs alone do not record concurrent occupancy or trusted source, and cannot establish a safe concurrency or interval.
+
 
 Codex coding is a separate route (`/ai/codex/v1`) documented in [the Codex CLI package](codex-client.md). It does not replace these image-task endpoints or change their supported image model. Its deployment and real CLI acceptance are tracked separately.
 

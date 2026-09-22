@@ -3,10 +3,10 @@
 
 Pipe a bounded `docker logs --timestamps --since ...` export on the owning host.
 No application import, database access, HTTP request, credentials, configuration
-write or automatic parameter change. It deliberately cannot derive a safe N
-from event counts: old events do not identify model, operation or active work.
-Only explicitly allowlisted numeric fields and existing opaque account references
-reach stdout; source lines and arbitrary exception text are never printed.
+write or automatic parameter change. Preserve current request/model attribution
+while keeping old events explicitly incomplete. Neither format proves active
+occupancy or a safe N. Only allowlisted fields reach stdout; source lines and
+arbitrary exception text are never printed.
 """
 from __future__ import annotations
 import argparse
@@ -19,6 +19,9 @@ import sys
 
 EVENTS = frozenset({'account_message_start', 'account_rate_limited'})
 ACCOUNT = re.compile(r'^[0-9a-f]{12}$')
+REQUEST_REF = re.compile(r'^[0-9a-f]{24}$')
+MODEL = re.compile(r'^(?:gpt-(?:image-)?[0-9][a-z0-9.-]{0,100}|o[1-9][a-z0-9.-]{0,100}|auto)$')
+MAX_SAMPLES = 2000
 PREFIX = re.compile(r'^(?:(?P<time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))\s+)?\[(?:INFO|WARNING)\]\s+')
 MAX_LINE = 64 * 1024
 
@@ -50,6 +53,25 @@ def decode_event(line):
     fields = ('since_previous_secs', 'minimum_interval_secs') if obj['event'] == 'account_message_start' else ('consecutive_limits', 'retry_after_secs', 'cooldown_secs')
     for name in fields:
         clean[name] = numeric(obj.get(name))
+    # These fields are emitted by the existing durable request context. Missing
+    # values in old logs stay missing; do not infer them from neighbouring lines.
+    clean['request_ref'] = obj.get('request_ref') if isinstance(obj.get('request_ref'), str) and REQUEST_REF.fullmatch(obj['request_ref']) else None
+    clean['model'] = obj.get('model') if isinstance(obj.get('model'), str) and MODEL.fullmatch(obj['model']) else None
+    for name, allowed in {
+        'layer': {'upstream_chatgpt', 'upstream_codex', 'provider_capacity', 'company_transport'},
+        'phase': {'conversation', 'prepare', 'account_read', 'sse', 'stream', 'unknown'},
+        'origin': {'http_429', 'sse_rate_limit'},
+        'operation': {'text', 'image', 'search'},
+        'route': {'chat', 'codex'},
+    }.items():
+        value = obj.get(name)
+        clean[name] = value if isinstance(value, str) and value in allowed else None
+    for name in ('retained_input_bytes', 'send_sequence', 'observed_at', 'cooldown_until'):
+        clean[name] = numeric(obj.get(name))
+    # Upstream IDs can be arbitrary strings. Keep a correlatable digest instead
+    # of copying a potentially sensitive header value into the shared report.
+    upstream = obj.get('upstream_request_id')
+    clean['upstream_request_ref'] = hashlib.sha256(upstream.encode()).hexdigest()[:24] if isinstance(upstream, str) and 0 < len(upstream) <= 160 else None
     if match and match.group('time'):
         clean['timestamp'] = match.group('time')
     return clean
@@ -61,7 +83,8 @@ def _range(values):
 
 def analyze(lines, *, input_complete=True):
     rows = defaultdict(lambda: {'starts': 0, 'limits': 0, 'interval': [], 'local_minimum': [], 'retry_after': [], 'cooldown': [], 'times': []})
-    ignored = total = recognized = 0
+    ignored = total = recognized = attributed = 0
+    samples = []
     for line in lines:
         total += 1
         event = decode_event(line)
@@ -69,6 +92,10 @@ def analyze(lines, *, input_complete=True):
             ignored += 1
             continue
         recognized += 1
+        if event['request_ref'] is not None:
+            attributed += 1
+        if len(samples) < MAX_SAMPLES:
+            samples.append(event)
         row = rows[event['account']]
         if 'timestamp' in event:
             row['times'].append(event['timestamp'])
@@ -94,11 +121,18 @@ def analyze(lines, *, input_complete=True):
         })
     return {
         'schema': 1, 'mode': 'read_only_existing_clock_events',
-        'coverage': {'input_complete': input_complete, 'lines_read': total, 'recognized_events': recognized, 'ignored_lines': ignored},
+        'coverage': {'input_complete': input_complete, 'lines_read': total, 'recognized_events': recognized, 'ignored_lines': ignored,
+                     'request_attributed_events': attributed, 'sampled_events': len(samples),
+                     'omitted_samples': recognized - len(samples)},
         'accounts': accounts,
+        'samples': samples,
         'limitations': [
             'Counts are observed log events, not all requests, success rates, model usage or billable generations.',
-            'Old clock events lack per-event model, endpoint, original request ID and concurrent occupancy.',
+            'Old clock events lack per-event attribution; current events may include model, operation, persisted input bytes and the owner/request hash.',
+            'Neither format records concurrent occupancy or trusted caller source. Join original receipts and an observed pool snapshot; do not infer either from spacing.',
+            'A message-start event precedes final send guards and is not proof that the model received the request. Confirm the original receipt/result.',
+            'Request refs use the existing first 24 hex characters of SHA256(owner + colon + request ID); upstream header IDs are separately hashed for safe correlation.',
+            'Samples are bounded and omitted_samples reports truncation; account totals still cover every recognized event in the input.',
             'Duplicate or overlapping log exports cannot be deduplicated without event IDs.',
             'No events is missing evidence, not zero rate limits. The first spacing sample can precede the selected time window.',
             'Company ingress and Provider admission errors require their own evidence; these two event types only describe the account clock.',
