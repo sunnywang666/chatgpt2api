@@ -41,6 +41,12 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(result['coverage']['request_attributed_events'],0)
         self.assertNotIn('PRIVATE_',json.dumps(result))
 
+    def test_sse_limit_preserves_the_exact_phase_emitted_by_account_clock(self):
+        result=analyze([line('account_rate_limited',request_ref='b'*24,layer='upstream_chatgpt',
+                            phase='conversation_stream',origin='sse_rate_limit',retry_after_secs=60)])
+        self.assertEqual(result['samples'][0]['phase'],'conversation_stream')
+        self.assertEqual(result['samples'][0]['origin'],'sse_rate_limit')
+
     def test_sample_bound_does_not_hide_aggregate_counts_or_truncation(self):
         result=analyze(line(request_ref='a'*24) for _ in range(MAX_SAMPLES+1))
         self.assertEqual(len(result['samples']),MAX_SAMPLES)
