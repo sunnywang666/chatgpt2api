@@ -1,0 +1,37 @@
+name: Recovery scan isolated review
+on:
+  push:
+    branches: [fix/recovery-scan-progress-20260922]
+permissions:
+  contents: read
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive exact tracked source only
+        run: |
+          mkdir -p /tmp/recovery-evidence
+          git rev-parse HEAD > /tmp/recovery-evidence/source-sha.txt
+          git archive --format=zip HEAD > /tmp/recovery-evidence/source.zip
+          find . -name AGENTS.md -not -path './.git/*' -print > /tmp/recovery-evidence/rules-paths.txt
+      - name: Owning checks when repair exists
+        if: hashFiles('test/test_recovery_scan_progress.py') != ''
+        run: |
+          set -euo pipefail
+          python3 -m pip install uv
+          uv sync --locked
+          uv pip install pytest pytest-subtests
+          mkdir -p /tmp/recovery-data
+          DATA_DIR=/tmp/recovery-data uv run pytest -q test/test_recovery_scan_progress.py 2>&1 | tee /tmp/recovery-evidence/targeted.log
+          DATA_DIR=/tmp/recovery-data uv run pytest -q test 2>&1 | tee /tmp/recovery-evidence/owning.log
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recovery-scan-review
+          path: /tmp/recovery-evidence/
+          retention-days: 7
