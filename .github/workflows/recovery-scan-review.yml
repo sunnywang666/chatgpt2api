@@ -21,18 +21,21 @@ jobs:
           git rev-parse HEAD > /tmp/recovery-evidence/source-sha.txt
           git archive --format=zip HEAD > /tmp/recovery-evidence/source.zip
           find . -name AGENTS.md -not -path './.git/*' -print > /tmp/recovery-evidence/rules-paths.txt
-      - name: Prepare locked dependencies
+      - name: Prepare locked dependencies and public tokenizer data
+        env:
+          TIKTOKEN_CACHE_DIR: /tmp/recovery-evidence/tiktoken
         run: |
           set -euo pipefail
           python3 -m pip install uv
           uv sync --locked
           uv pip install pytest pytest-subtests requests
           uv pip freeze > /tmp/recovery-evidence/requirements.txt
-          python3 -m pip download --dest /tmp/recovery-evidence/wheels -r /tmp/recovery-evidence/requirements.txt
+          uv run python -c 'import tiktoken; [tiktoken.get_encoding(name) for name in tiktoken.list_encoding_names()]'
       - name: Owning checks when repair exists
         if: hashFiles('test/test_recovery_scan_progress.py') != ''
         env:
           PROVIDER_DATA_DIR: /tmp/recovery-data
+          TIKTOKEN_CACHE_DIR: /tmp/recovery-evidence/tiktoken
         run: |
           set -euo pipefail
           mkdir -p /tmp/recovery-data
