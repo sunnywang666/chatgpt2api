@@ -1342,8 +1342,16 @@ class TextResultRecoveryTests(unittest.TestCase):
 
         self.assertEqual(complete.exception.code, "RECOVERY_READ_FAILED")
         self.assertFalse(complete.exception.recovery_reason)
-        self.assertEqual(complete.exception.recovery_scan["next_index"], 0)
-        self.assertEqual(backend._get_conversation.call_count, 1)
+        # A missing candidate remains unresolved, but cannot prevent reading
+        # later candidates. The checked count excludes the unread 404.
+        self.assertEqual(complete.exception.recovery_scan["next_index"], 1)
+        self.assertEqual(backend._get_conversation.call_count, 2)
+        self.assertEqual(complete.exception.recovery_scan["conversation_ids"],
+                         ["unrelated-conversation", "deleted-conversation"])
+        failure = complete.exception.recovery_scan["failed_reads"]["deleted-conversation"]
+        self.assertEqual(failure["error"]["http_status"], 404)
+        self.assertEqual(failure["attempts"], 1)
+        self.assertEqual(complete.exception.recovery_scan["matches"], [])
 
     def test_missing_conversation_scan_identity_change_starts_a_fresh_snapshot(self):
         receipt = self.request_receipt()

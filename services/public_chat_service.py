@@ -151,6 +151,8 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
         "recovery_retryable": "retryable",
         "recovery_requires_new_conversation": "requires_new_conversation",
         "upstream_outcome": "upstream_outcome",
+        "recovery_scan_progress": "scan",
+        "recovery_last_read_error": "last_read_error",
     }
     recovery = {
         public_name: receipt[internal_name]

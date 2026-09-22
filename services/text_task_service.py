@@ -28,6 +28,8 @@ from services.conversation_binding_service import (
     RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
     RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
+    safe_scan_failures,
+    safe_recovery_read_error,
     TURN_END_EVIDENCE_FIELD,
     conversation_binding_service,
     is_recovery_image_pointer,
@@ -237,6 +239,24 @@ class TextTaskService:
     @staticmethod
     def _public(receipt):
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
+        # Derive diagnostics only from validated private records. Never trust a
+        # stored projection or arbitrary exception content at the public edge.
+        result.pop("recovery_scan_progress", None)
+        result.pop("recovery_last_read_error", None)
+        read_error = safe_recovery_read_error(receipt.get("recovery_last_read_error"))
+        if read_error is not None:
+            result["recovery_last_read_error"] = read_error
+        scan = TextTaskService._safe_recovery_scan(receipt.get(RECOVERY_CONVERSATION_SCAN_FIELD))
+        if scan:
+            failures = scan.get("failed_reads", {})
+            result["recovery_scan_progress"] = {
+                "list_complete": scan["coverage_complete"], "listed_total": scan["next_offset"],
+                "window_candidates": len(scan["conversation_ids"]), "window_checked": scan["next_index"],
+                "window_pending": len(scan["conversation_ids"]) - scan["next_index"],
+                "matches": len(scan["matches"]),
+                "failed_reads": [{**row["error"], "attempts": row["attempts"], "next_at": row["next_at"]}
+                                 for row in failures.values()],
+            }
         if receipt.get("_public_session_ref"):
             result["conversation"] = {"client_conversation_id": receipt["_public_session_ref"],
                                       "previous_request_id": receipt.get("_previous_request_id"),
@@ -267,13 +287,16 @@ class TextTaskService:
 
     @classmethod
     def _recovery_failure(cls, exc):
-        status = getattr(exc, "status_code", None)
+        evidence = safe_recovery_read_error(getattr(exc, "recovery_read_error", None)) or {}
+        status = getattr(exc, "status_code", None) or evidence.get("http_status")
         retry_after = getattr(exc, "retry_after", None)
+        if retry_after is None:
+            retry_after = evidence.get("retry_after_seconds")
         safe_retry_after = (
             int(retry_after)
             if isinstance(retry_after, (int, float))
             and not isinstance(retry_after, bool)
-            and retry_after >= 0
+            and math.isfinite(retry_after) and 0 <= retry_after <= 2147483647
             else None
         )
         if status == 429:
@@ -287,7 +310,7 @@ class TextTaskService:
             or any(marker in type_name for marker in ("curl_cffi", "connection", "network"))
         ):
             return "RECOVERY_TRANSPORT_FAILED", None
-        return cls._safe_recovery_code(exc), None
+        return cls._safe_recovery_code(exc), safe_retry_after if evidence else None
 
     @classmethod
     def _safe_recovery_reason(cls, value):
@@ -408,7 +431,7 @@ class TextTaskService:
         next_index = value.get("next_index")
         matches = value.get("matches")
         if (
-            set(value) != {
+            set(value) - {"failed_reads"} != {
                 "identity", "conversation_ids", "next_offset", "coverage_complete",
                 "time_order_valid", "last_update_time", "next_index", "matches",
             }
@@ -440,6 +463,9 @@ class TextTaskService:
             or not isinstance(matches, list) or len(matches) > 2
         ):
             return None
+        failures = safe_scan_failures(value.get("failed_reads", {}), conversation_ids[next_index:])
+        if failures is None:
+            return None
         for match in matches:
             if (
                 not isinstance(match, dict)
@@ -458,11 +484,13 @@ class TextTaskService:
             "last_update_time": last_update_time,
             "next_index": next_index,
             "matches": [dict(match) for match in matches],
+            **({"failed_reads": failures} if failures else {}),
         }
 
     def _finish_recovery(
         self, owner, request_id, claim_id, recovered=None, error_code=None,
         phase=None, recovery_reason=None, retry_after_seconds=None, *, count_unrecoverable=False,
+        read_error=None,
     ):
         now = self._now()
         with self._db() as db:
@@ -530,6 +558,7 @@ class TextTaskService:
                         )
                     ),
                     "recovery_error_code": error_code,
+                    "recovery_last_read_error": safe_recovery_read_error(read_error),
                     "recovery_phase": phase or current.get("recovery_phase") or "read_text_request",
                     "recovery_retry_after_seconds": retry_after_seconds,
                     "recovery_reason": recovery_reason,
@@ -572,6 +601,8 @@ class TextTaskService:
                     "recovery_reason": None,
                     "recovery_requires_new_conversation": False,
                 }
+            if not error_code:
+                changes["recovery_last_read_error"] = None
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}
@@ -697,6 +728,8 @@ class TextTaskService:
                     owner, request_id, recovery_claim[0],
                     recovery_evidence or None,
                     error_code=recovery_error_code,
+                    phase=(safe_recovery_read_error(getattr(exc, "recovery_read_error", None)) or {}).get("phase"),
+                    read_error=getattr(exc, "recovery_read_error", None),
                     recovery_reason=self._safe_recovery_reason(getattr(exc, "recovery_reason", "")),
                     retry_after_seconds=retry_after_seconds,
                     count_unrecoverable=allow_unrecoverable_retry,

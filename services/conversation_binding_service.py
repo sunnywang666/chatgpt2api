@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import time
@@ -226,6 +227,49 @@ def _text_failure_category(exc: Exception) -> str:
     return "other"
 
 
+# Only typed, bounded evidence is persisted. Exception text, response bodies,
+# URLs, tokens and conversation titles must never enter a recovery diagnostic.
+_READ_PHASES = frozenset({"conversation_list", "conversation_detail", "matched_conversation"})
+_READ_CATEGORIES = frozenset({"http", "timeout", "transport", "parse", "other"})
+_READ_CODES = frozenset({"RECOVERY_READ_FAILED", "CONVERSATION_BINDING_CONTRACT_INVALID",
+                         "CONVERSATION_BINDING_MISMATCH"})
+
+
+def safe_recovery_read_error(value):
+    if not isinstance(value, dict) or set(value) != {
+        "phase", "category", "http_status", "retry_after_seconds", "candidate_ref",
+    }:
+        return None
+    status, delay = value["http_status"], value["retry_after_seconds"]
+    ref = value["candidate_ref"]
+    if (not isinstance(value["phase"], str) or value["phase"] not in _READ_PHASES
+            or not isinstance(value["category"], str) or value["category"] not in _READ_CATEGORIES
+            or status is not None and (type(status) is not int or not 100 <= status <= 599)
+            or delay is not None and (type(delay) is not int or not 0 <= delay <= 2147483647)
+            or ref is not None and (not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{16}", ref))):
+        return None
+    return dict(value)
+
+
+def safe_scan_failures(value, uninspected_ids):
+    if not isinstance(value, dict) or len(value) > 100 or set(value) - set(uninspected_ids):
+        return None
+    result = {}
+    for candidate, row in value.items():
+        if not isinstance(row, dict) or set(row) != {"code", "error", "attempts", "next_at"}:
+            return None
+        error = safe_recovery_read_error(row["error"])
+        if (not isinstance(row["code"], str) or row["code"] not in _READ_CODES or error is None
+                or error["phase"] != "conversation_detail"
+                or error["candidate_ref"] != hashlib.sha256(candidate.encode()).hexdigest()[:16]
+                or type(row["attempts"]) is not int or not 1 <= row["attempts"] <= 2147483647
+                or type(row["next_at"]) not in {int, float}
+                or not math.isfinite(row["next_at"]) or row["next_at"] < 0):
+            return None
+        result[candidate] = {**row, "error": error}
+    return result
+
+
 class ConversationBindingError(RuntimeError):
     def __init__(
         self,
@@ -239,6 +283,7 @@ class ConversationBindingError(RuntimeError):
         recovery_reason: str = "",
         recovery_scan: dict[str, Any] | None = None,
         recovery_coverage_version: int | None = None,
+        recovery_read_error: dict[str, Any] | None = None,
         original_failure_phase: str = "",
         original_http_status: int | None = None,
         original_exception_category: str = "",
@@ -254,6 +299,7 @@ class ConversationBindingError(RuntimeError):
         self.parent_message_id = parent_message_id
         self.recovery_reason = recovery_reason
         self.recovery_scan = recovery_scan
+        self.recovery_read_error = safe_recovery_read_error(recovery_read_error)
         self.recovery_coverage_version = recovery_coverage_version
         self.original_failure_phase = (
             original_failure_phase if original_failure_phase in _TEXT_FAILURE_PHASES else ""
@@ -404,7 +450,7 @@ class ConversationBindingService:
                     strict_schema=True,
                 )
             except Exception as exc:
-                raise cls._scan_read_failed(scan) from exc
+                raise cls._scan_read_failed(scan, exc, phase="conversation_list") from exc
             raw_page_ids = [
                 str(item.get("id") or item.get("conversation_id") or "").strip()
                 for item in recent
@@ -449,50 +495,59 @@ class ConversationBindingService:
 
         conversation_ids = scan["conversation_ids"]
         matches = scan["matches"]
+        failed_reads = scan.get("failed_reads", {})
+        visited_this_round = set()
+        last_failure = None
         while scan["next_index"] < len(conversation_ids):
-            conversation_id = conversation_ids[scan["next_index"]]
-            try:
-                detail_timeout = remaining_timeout()
-                # Do not start another upstream GET with only the tail of this
-                # recovery window. Persist progress and give it a fresh window.
-                if detail_timeout < cls.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS:
-                    raise cls._scan_incomplete(scan)
-                document = backend._get_conversation(
-                    conversation_id,
-                    timeout_secs=detail_timeout,
-                )
-            except UpstreamHTTPError as exc:
-                if exc.status_code == 404:
-                    # Without a persisted conversation id, a missing candidate
-                    # cannot prove that the original request was absent.
-                    raise cls._scan_read_failed(scan) from exc
-                raise cls._scan_read_failed(scan) from exc
-            except ConversationBindingError:
-                raise
-            except Exception as exc:
-                raise cls._scan_read_failed(scan) from exc
-            if not isinstance(document, dict):
-                raise ConversationBindingError(
-                    "conversation document is invalid",
-                    code="CONVERSATION_BINDING_CONTRACT_INVALID",
-                    recovery_scan=scan,
-                )
-            request_parent_message_id = cls._request_anchor_from_document(
-                document,
-                conversation_id,
-                request_message_id,
-                recovery_scan=scan,
-            )
-            if request_parent_message_id is None:
-                scan["next_index"] += 1
-                continue
-            matches.append({
-                "conversation_id": conversation_id,
-                "request_parent_message_id": request_parent_message_id,
-            })
-            scan["next_index"] += 1
-            if len(matches) > 1:
+            index = scan["next_index"]
+            conversation_id = conversation_ids[index]
+            # Failed/unread candidates remain in the tail. Inspect each at most
+            # once per recovery window; a bad candidate cannot starve later ones.
+            if conversation_id in visited_this_round:
                 break
+            prior_failure = failed_reads.get(conversation_id)
+            if prior_failure and time.time() < prior_failure["next_at"]:
+                visited_this_round.add(conversation_id)
+                conversation_ids.append(conversation_ids.pop(index))
+                continue
+            detail_timeout = remaining_timeout()
+            if detail_timeout < cls.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS:
+                raise cls._scan_incomplete(scan)
+            visited_this_round.add(conversation_id)
+            try:
+                document = backend._get_conversation(conversation_id, timeout_secs=detail_timeout)
+                if not isinstance(document, dict):
+                    raise ConversationBindingError("conversation document is invalid",
+                                                   code="CONVERSATION_BINDING_CONTRACT_INVALID")
+                request_parent_message_id = cls._request_anchor_from_document(
+                    document, conversation_id, request_message_id, recovery_scan=scan,
+                )
+            except Exception as exc:
+                failure = cls._scan_read_failed(scan, exc, candidate=conversation_id)
+                # Auth and rate limiting affect the account, not only one
+                # document. Stop immediately; outer recovery honors Retry-After.
+                if failure.recovery_read_error["http_status"] in {401, 403, 429}:
+                    raise failure from exc
+                attempts = min(2147483647, int((prior_failure or {}).get("attempts", 0)) + 1)
+                delay = max(min(900, 30 * 2 ** min(attempts - 1, 5)),
+                            failure.recovery_read_error["retry_after_seconds"] or 0)
+                failed_reads[conversation_id] = {
+                    "code": failure.code, "error": failure.recovery_read_error,
+                    "attempts": attempts, "next_at": time.time() + delay,
+                }
+                scan["failed_reads"] = failed_reads
+                conversation_ids.append(conversation_ids.pop(index))
+                last_failure = failure
+                continue
+            failed_reads.pop(conversation_id, None)
+            if not failed_reads:
+                scan.pop("failed_reads", None)
+            scan["next_index"] += 1
+            if request_parent_message_id is not None:
+                matches.append({"conversation_id": conversation_id,
+                                "request_parent_message_id": request_parent_message_id})
+                if len(matches) > 1:
+                    break
 
         if len(matches) > 1:
             raise ConversationBindingError(
@@ -504,11 +559,20 @@ class ConversationBindingService:
             # All candidates in this bounded window were inspected. Retain a
             # found match for uniqueness checking, discard completed unrelated
             # ids, and continue from next_offset on the next short-delay read.
-            scan["conversation_ids"] = [
-                str(match["conversation_id"]) for match in matches
-            ]
-            scan["next_index"] = len(scan["conversation_ids"])
+            retained_matches = [str(match["conversation_id"]) for match in matches]
+            scan["conversation_ids"] = retained_matches + conversation_ids[scan["next_index"]:]
+            scan["next_index"] = len(retained_matches)
             raise cls._scan_incomplete(scan)
+        if failed_reads:
+            # A match behind a failed read is provisional, not proven unique.
+            # Never turn unread evidence into absence, success or freed capacity.
+            first = min(failed_reads.values(), key=lambda row: row["next_at"])
+            failure = last_failure or ConversationBindingError(
+                "candidate reads remain unresolved", code=first["code"],
+                recovery_scan=scan, recovery_read_error=first["error"],
+            )
+            failure.retry_after = max(1, math.ceil(first["next_at"] - time.time()))
+            raise failure
         if not matches:
             raise ConversationBindingError(
                 "original request conversation cannot be attributed uniquely",
@@ -544,11 +608,11 @@ class ConversationBindingService:
                     recovery_reason=TextRecoveryReason.CONVERSATION_NOT_FOUND.value,
                     recovery_scan={},
                 ) from exc
-            raise cls._scan_read_failed(scan) from exc
+            raise cls._scan_read_failed(scan, exc, phase="matched_conversation", candidate=conversation_id) from exc
         except ConversationBindingError:
             raise
         except Exception as exc:
-            raise cls._scan_read_failed(scan) from exc
+            raise cls._scan_read_failed(scan, exc, phase="matched_conversation", candidate=conversation_id) from exc
         fresh_request_parent_message_id = cls._request_anchor_from_document(
             document,
             conversation_id,
@@ -663,7 +727,7 @@ class ConversationBindingService:
         next_index = value.get("next_index")
         matches = value.get("matches")
         if (
-            set(value) != {
+            set(value) - {"failed_reads"} != {
                 "identity", "conversation_ids", "next_offset", "coverage_complete",
                 "time_order_valid", "last_update_time", "next_index", "matches",
             }
@@ -686,6 +750,9 @@ class ConversationBindingService:
             or next_index < 0 or next_index > len(conversation_ids)
             or not isinstance(matches, list) or len(matches) > 2
         ):
+            return None
+        failures = safe_scan_failures(value.get("failed_reads", {}), conversation_ids[next_index:])
+        if failures is None:
             return None
         safe_matches = []
         for match in matches:
@@ -713,6 +780,7 @@ class ConversationBindingService:
             "last_update_time": last_update_time,
             "next_index": next_index,
             "matches": safe_matches,
+            **({"failed_reads": failures} if failures else {}),
         }
 
     @staticmethod
@@ -725,11 +793,23 @@ class ConversationBindingService:
         )
 
     @staticmethod
-    def _scan_read_failed(scan: dict[str, Any] | None = None) -> ConversationBindingError:
+    def _scan_read_failed(scan=None, cause=None, *, phase="conversation_detail", candidate=None):
+        status = getattr(cause, "status_code", None)
+        status = status if type(status) is int and 100 <= status <= 599 else None
+        delay = getattr(cause, "retry_after", None)
+        delay = (math.ceil(delay) if type(delay) in {int, float} and math.isfinite(delay)
+                 and 0 <= delay <= 2147483647 else None)
+        category = _text_failure_category(cause) if cause is not None else "other"
+        if isinstance(cause, ConversationBindingError):
+            category = "parse"
+        code = getattr(cause, "code", "RECOVERY_READ_FAILED")
         return ConversationBindingError(
             "bounded recent conversation read failed",
-            code="RECOVERY_READ_FAILED",
+            code=code if code in _READ_CODES else "RECOVERY_READ_FAILED",
             recovery_scan=scan,
+            recovery_read_error={"phase": phase, "category": category,
+                "http_status": status, "retry_after_seconds": delay,
+                "candidate_ref": hashlib.sha256(candidate.encode()).hexdigest()[:16] if candidate else None},
         )
 
     @staticmethod
