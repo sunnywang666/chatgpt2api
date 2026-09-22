@@ -1147,12 +1147,24 @@ class ConversationBindingService:
                     # Neither a socket EOF nor the conversation's latest answer
                     # proves our turn finished. Use this request's unique branch.
                     failure_phase = "cursor_read"
-                    recovered = self._read_text_request_result(backend, {
-                        "provider_binding_id": binding_id, "provider_account_identity": account_identity,
-                        "client_conversation_id": client_conversation_id, "conversation_id": returned_conversation_id,
-                        "request_message_id": backend.text_request_message_id,
-                        "request_parent_message_id": getattr(backend, "text_request_parent_message_id", ""),
-                    })
+                    try:
+                        recovered = self._read_text_request_result(backend, {
+                            "provider_binding_id": binding_id, "provider_account_identity": account_identity,
+                            "client_conversation_id": client_conversation_id, "conversation_id": returned_conversation_id,
+                            "request_message_id": backend.text_request_message_id,
+                            "request_parent_message_id": getattr(backend, "text_request_parent_message_id", ""),
+                        })
+                    except ConversationBindingError as exc:
+                        # The model turn was sent. An unproven GET result must
+                        # retain occupancy and original-request recovery, even
+                        # when the returned document has a foreign cursor.
+                        raise ConversationBindingError(
+                            "original sequential response could not be verified",
+                            code="CONVERSATION_OUTCOME_UNKNOWN",
+                            provider_binding_id=binding_id, provider_account_identity=account_identity,
+                            conversation_id=returned_conversation_id,
+                            original_failure_phase=failure_phase, original_exception_category="provider_error",
+                        ) from exc
                     if recovered.get("status") != "succeeded":
                         raise ConversationBindingError(
                             "original sequential response is not complete", code="CONVERSATION_OUTCOME_UNKNOWN",

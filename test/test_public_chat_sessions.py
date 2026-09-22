@@ -240,3 +240,101 @@ def test_company_ingress_continuation_keeps_real_owner_and_cursor(company):
     h.queue.run()
     sent=h.runner.call_args.args[0]
     assert sent['conversation_id']=='private-conversation' and sent['parent_message_id']=='private-answer'
+
+
+@pytest.mark.parametrize('readback', [
+    'missing_request', 'invalid_mapping', 'ambiguous', 'foreign_conversation', 'foreign_parent',
+])
+def test_sequential_readback_errors_keep_original_unknown_until_get_recovers(tmp_path, readback):
+    from services.openai_backend_api import OpenAIBackendAPI
+    from services.request_context import current_request
+    from test.test_pool_admission import build
+
+    (tmp_path / 'accounts.json').write_text(json.dumps([{
+        'access_token': 'fixture-token', 'account_id': 'fixture-upstream',
+        'provider_account_identity': 'original-account', 'type': 'Plus', 'status': '正常',
+        'quota': 999, 'source_type': 'web', 'conversation_binding_ids': ['original-binding'],
+    }]))
+    accounts, store, admission = build(tmp_path)
+    service = ConversationBindingService()
+    tasks = TextTaskService(store.path, runner=service.complete_text,
+                            recovery_reader=service.read_text_request, admission=admission,
+                            clock=lambda: 1000.0)
+    admission.register('text', lambda ctx, body: tasks._run(ctx.owner, ctx.request_id, body))
+    backend = object.__new__(OpenAIBackendAPI)
+    backend.access_token = 'fixture-token'
+    backend.close = Mock()
+    backend.get_conversation_parent_message_id = Mock()
+    valid_readback = False
+
+    def document(_conversation_id):
+        user = backend.text_request_message_id
+        answer = {'parent': user, 'message': {
+            'id': 'original-final', 'author': {'role': 'assistant'},
+            'status': 'finished_successfully', 'end_turn': True, 'channel': 'final',
+            'content': {'content_type': 'text', 'parts': ['complete answer']},
+        }}
+        result = {'conversation_id': 'original-chat', 'mapping': {
+            user: {'parent': backend.text_request_parent_message_id,
+                   'message': {'id': user, 'author': {'role': 'user'}}},
+            'original-final': answer,
+        }}
+        if not valid_readback:
+            if readback == 'missing_request':
+                result['mapping'] = {}
+            elif readback == 'invalid_mapping':
+                result['mapping'] = None
+            elif readback == 'ambiguous':
+                result['mapping']['other-final'] = {
+                    **answer, 'message': {**answer['message'], 'id': 'other-final'},
+                }
+            elif readback == 'foreign_conversation':
+                result['conversation_id'] = 'foreign-chat'
+            elif readback == 'foreign_parent':
+                result['mapping'][user]['parent'] = 'foreign-parent'
+        return result
+
+    backend._get_conversation = Mock(side_effect=document)
+
+    def stream(actual_backend, **kwargs):
+        actual_backend._conversation_payload(timezone='UTC', **kwargs)
+        current_request.get().before_send()
+        yield {'type': 'conversation.delta', 'conversation_id': 'original-chat', 'delta': 'answer'}
+
+    body = {'client_request_id': 'original-request', 'client_conversation_id': 'original-session',
+            '_public_session_ref': 'work-session', '_public_route': 'chat', '_text_only_binding': True,
+            'model': 'auto', 'messages': [{'role': 'user', 'content': 'original input'}]}
+    with patch('services.conversation_binding_service.account_service', accounts), \
+         patch.object(accounts, 'get_bound_text_access_token', return_value='fixture-token'), \
+         patch('services.conversation_binding_service.OpenAIBackendAPI', return_value=backend), \
+         patch('services.conversation_binding_service.conversation_events', side_effect=stream) as sends:
+        tasks.submit('owner', body)
+        admission.execute(admission.claim_next())
+        with store.connect() as db:
+            original = store.read_receipt(db, 'text', 'owner', 'original-request')
+        assert original['status'] == 'unknown'
+        assert original['error_code'] == 'CONVERSATION_OUTCOME_UNKNOWN'
+        assert original['original_failure_phase'] == 'cursor_read'
+        assert original['original_exception_category'] == 'provider_error'
+        assert original['_submission_started'] is True
+        assert original['provider_binding_id'] == 'original-binding'
+        assert original['provider_account_identity'] == 'original-account'
+        assert original['conversation_id'] == 'original-chat'
+        assert original['request_parent_message_id'] == backend.text_request_parent_message_id
+        assert original.get('parent_message_id') != 'foreign-parent'
+        assert admission.resource_snapshot()['chat_turn']['inflight'] == 1
+
+        valid_readback = True
+        recovered = tasks.recover('owner', 'original-request')
+        assert recovered['status'] == 'succeeded'
+        assert recovered['content'] == 'complete answer'
+        assert recovered['parent_message_id'] == 'original-final'
+        for key in ('request_message_id', 'provider_binding_id', 'provider_account_identity',
+                    'client_conversation_id', 'conversation_id', 'request_parent_message_id'):
+            assert recovered[key] == original[key]
+        assert admission.resource_snapshot()['chat_turn']['inflight'] == 0
+        assert tasks.submit('owner', body)['status'] == 'succeeded'
+        assert admission.claim_next() is None
+        assert sends.call_count == 1
+        assert backend._get_conversation.call_count == 2
+        backend.get_conversation_parent_message_id.assert_not_called()
