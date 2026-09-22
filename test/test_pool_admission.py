@@ -137,6 +137,32 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(recovered, [("image", "unknown-image"), ("text", "unknown-text")])
         self.assertEqual(self.calls, [])
 
+    def test_explicit_recovery_suppression_preserves_receipt_and_stops_recovery(self):
+        self.submit("suppressed-text", provider_binding_id="binding-0", provider_account_identity="account-0")
+        self.image("suppressed-image")
+        with self.store.transaction() as db:
+            text = self.store.read_receipt(db, "text", "happy", "suppressed-text")
+            text.update(status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                        request_message_id="text-message", recovery_next_at=0,
+                        _recovery_suppressed=True, _recovery_suppressed_reason="manual_reset")
+            self.store.write_receipt(db, "text", "happy", "suppressed-text", text)
+            image = self.store.read_receipt(db, "image", "happy", "suppressed-image")
+            image.update(status="error", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                         conversation_id="image-conversation", request_message_id="image-message",
+                         upstream_unfinished=True, next_poll_at=0,
+                         _recovery_suppressed=True, _recovery_suppressed_reason="manual_reset")
+            self.store.write_receipt(db, "image", "happy", "suppressed-image", image)
+        recovered = []
+        self.admission.recoveries["text"] = lambda owner, request_id: recovered.append(("text", request_id))
+        self.admission.recoveries["image"] = lambda owner, request_id: recovered.append(("image", request_id))
+        self.admission.recover_one()
+        self.assertEqual(recovered, [])
+        self.assertEqual(self.admission.resource_snapshot()["chat_turn"]["inflight"], 0)
+        saved_text = self.read("text", "happy", "suppressed-text")
+        self.assertEqual(saved_text["status"], "unknown")
+        self.assertTrue(saved_text["_recovery_suppressed"])
+        self.assertEqual(saved_text["request_message_id"], "text-message")
+
     def test_full_waiting_request_uses_new_account_without_resubmit(self):
         self.submit("a")
         first = self.admission.claim_next()

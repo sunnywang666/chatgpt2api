@@ -1260,6 +1260,8 @@ class ImageTaskService:
     def _recover_unfinished_locked(self) -> bool:
         changed = False
         for task in self._tasks.values():
+            if task.get("_recovery_suppressed") is True:
+                continue
             if task.get("_input_ref") and (task.get("status") == TASK_STATUS_QUEUED or task.get("_claim_id")):
                 # The shared scheduler fences expired claims. Starting a second
                 # worker must never interrupt another worker's active request.
@@ -1348,6 +1350,10 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 raise ValueError("task not found")
+            if task.get("_recovery_suppressed") is True:
+                # Keep this endpoint observational while an operator has
+                # explicitly stopped the old recovery path.
+                return _public_task(task)
             if task.get("status") in {TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS}:
                 return _public_task(task)
             if task.get("status") != TASK_STATUS_ERROR:

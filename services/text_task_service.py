@@ -602,7 +602,12 @@ class TextTaskService:
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
             if row:
                 previous = json.loads(row[0])
-                if (previous["status"] == "failed"
+                if previous.get("_recovery_suppressed") is True:
+                    # An explicit operator stop preserves the original
+                    # receipt and makes reads observational until the marker is
+                    # removed. Never claim or reissue this UNKNOWN here.
+                    row = (json.dumps(previous),)
+                elif (previous["status"] == "failed"
                         and previous.get("error_code") == "CONVERSATION_BINDING_UNAVAILABLE"
                         and not previous.get("conversation_id") and not previous.get("parent_message_id")
                         and ((previous.get("provider_binding_id") and previous.get("provider_account_identity"))
@@ -615,20 +620,23 @@ class TextTaskService:
                     previous = {**previous, "status": "not_started", "updated_at": now}
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
-                if previous["status"] == "queued" and previous["boot"] != self.boot and not previous.get("_input_ref"):
+                if (previous.get("_recovery_suppressed") is not True
+                        and previous["status"] == "queued" and previous["boot"] != self.boot and not previous.get("_input_ref")):
                     # The atomic running claim never happened. Preserve identity
                     # and wait for the caller to supply the exact original body.
                     previous = {**previous, "status": "not_started", "updated_at": now}
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
-                if previous["status"] == "running" and previous["boot"] != self.boot and not previous.get("_claim_id"):
+                if (previous.get("_recovery_suppressed") is not True
+                        and previous["status"] == "running" and previous["boot"] != self.boot and not previous.get("_claim_id")):
                     # Another process/restart cannot establish that the original
                     # write failed. Preserve its cursor and make the receipt
                     # eligible for the read-only recovery path.
                     previous = {**previous, "status": "unknown", "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "updated_at": now}
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
-                if (unknown_text_result(previous)
+                if (previous.get("_recovery_suppressed") is not True
+                        and unknown_text_result(previous)
                         and previous.get("request_message_id")
                         and previous.get("provider_binding_id")
                         and previous.get("provider_account_identity")
