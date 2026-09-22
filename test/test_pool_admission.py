@@ -93,6 +93,50 @@ class AdmissionTests(unittest.TestCase):
         with self.store.connect() as db:
             return self.store.read_receipt(db, kind, owner, name)
 
+    def test_completed_image_with_iso_creation_time_cannot_stop_text_recovery(self):
+        self.image("saved-image")
+        self.submit("original", provider_binding_id="binding-0", provider_account_identity="account-0")
+        with self.store.transaction() as db:
+            image = self.store.read_receipt(db, "image", "happy", "saved-image")
+            self.assertIsInstance(image["created_at"], str)
+            image.update(status="success", next_poll_at=0)
+            self.store.write_receipt(db, "image", "happy", "saved-image", image)
+            original = self.store.read_receipt(db, "text", "happy", "original")
+            original.update(status="unknown", request_message_id="original-user-message", recovery_next_at=900)
+            self.store.write_receipt(db, "text", "happy", "original", original)
+        recovered = []
+        self.admission.recoveries["text"] = lambda owner, request_id: recovered.append((owner, request_id))
+        self.admission.recover_one()
+        self.assertEqual(recovered, [("happy", "original")])
+        self.assertEqual(self.read("image", "happy", "saved-image"), image)
+        self.assertEqual(self.read("text", "happy", "original"), original)
+        self.assertEqual(self.calls, [])
+
+    def test_recovery_order_uses_retry_clocks_across_text_and_iso_dated_images(self):
+        self.image("unknown-image")
+        self.submit("unknown-text", provider_binding_id="binding-0", provider_account_identity="account-0")
+        with self.store.transaction() as db:
+            image = self.store.read_receipt(db, "image", "happy", "unknown-image")
+            image.update(status="error", error_code="CONVERSATION_OUTCOME_UNKNOWN", conversation_id="original-conversation",
+                         request_message_id="image-message", next_poll_at=0)
+            self.store.write_receipt(db, "image", "happy", "unknown-image", image)
+            original = self.store.read_receipt(db, "text", "happy", "unknown-text")
+            original.update(status="unknown", request_message_id="text-message", recovery_next_at=950)
+            self.store.write_receipt(db, "text", "happy", "unknown-text", original)
+        recovered = []
+        def read_image(owner, request_id):
+            recovered.append(("image", request_id))
+            with self.store.transaction() as db:
+                row = self.store.read_receipt(db, "image", owner, request_id)
+                row["next_poll_at"] = self.clock() + 60
+                self.store.write_receipt(db, "image", owner, request_id, row)
+        self.admission.recoveries["image"] = read_image
+        self.admission.recoveries["text"] = lambda owner, request_id: recovered.append(("text", request_id))
+        self.admission.recover_one()
+        self.admission.recover_one()
+        self.assertEqual(recovered, [("image", "unknown-image"), ("text", "unknown-text")])
+        self.assertEqual(self.calls, [])
+
     def test_full_waiting_request_uses_new_account_without_resubmit(self):
         self.submit("a")
         first = self.admission.claim_next()

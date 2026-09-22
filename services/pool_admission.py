@@ -171,8 +171,10 @@ class PoolAdmission:
             rows = list(self.store.receipts(db))
         # Use the existing persisted retry timestamps. A short-backoff legacy
         # scan must not monopolize recovery ahead of other overdue originals.
+        # Missing/zero retry times are immediately due. Image created_at is a
+        # formatted string, so it must not enter this numeric retry ordering.
         rows.sort(key=lambda row: float(row[3].get("recovery_next_at" if row[0] == "text" else "next_poll_at")
-                                        or row[3].get("created_at") or 0))
+                                        or 0))
         for kind, owner, request_id, r in rows:
             if kind not in self.recoveries:
                 continue
