@@ -12,22 +12,32 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
       - name: Archive exact tracked source only
         run: |
           mkdir -p /tmp/recovery-evidence
           git rev-parse HEAD > /tmp/recovery-evidence/source-sha.txt
           git archive --format=zip HEAD > /tmp/recovery-evidence/source.zip
           find . -name AGENTS.md -not -path './.git/*' -print > /tmp/recovery-evidence/rules-paths.txt
-      - name: Owning checks when repair exists
-        if: hashFiles('test/test_recovery_scan_progress.py') != ''
+      - name: Prepare locked dependencies
         run: |
           set -euo pipefail
           python3 -m pip install uv
           uv sync --locked
-          uv pip install pytest pytest-subtests
+          uv pip install pytest pytest-subtests requests
+          uv pip freeze > /tmp/recovery-evidence/requirements.txt
+          python3 -m pip download --dest /tmp/recovery-evidence/wheels -r /tmp/recovery-evidence/requirements.txt
+      - name: Owning checks when repair exists
+        if: hashFiles('test/test_recovery_scan_progress.py') != ''
+        env:
+          PROVIDER_DATA_DIR: /tmp/recovery-data
+        run: |
+          set -euo pipefail
           mkdir -p /tmp/recovery-data
-          DATA_DIR=/tmp/recovery-data uv run pytest -q test/test_recovery_scan_progress.py 2>&1 | tee /tmp/recovery-evidence/targeted.log
-          DATA_DIR=/tmp/recovery-data uv run pytest -q test 2>&1 | tee /tmp/recovery-evidence/owning.log
+          uv run pytest -q test/test_recovery_scan_progress.py 2>&1 | tee /tmp/recovery-evidence/targeted.log
+          uv run pytest -q test 2>&1 | tee /tmp/recovery-evidence/owning.log
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
