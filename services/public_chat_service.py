@@ -112,6 +112,11 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
         "model": str(receipt.get("model") or ""),
         "status": str(receipt.get("status") or "unknown"),
     }
+    conversation = receipt.get("conversation")
+    if isinstance(conversation, dict) and conversation.get("protocol") == "sequential-v1":
+        result["conversation"] = {key: conversation.get(key) for key in (
+            "client_conversation_id", "previous_request_id", "protocol",
+        )}
     content = receipt.get("content")
     if isinstance(content, str) and content:
         result["content"] = content

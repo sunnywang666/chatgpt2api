@@ -236,7 +236,12 @@ class TextTaskService:
 
     @staticmethod
     def _public(receipt):
-        return {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
+        result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
+        if receipt.get("_public_session_ref"):
+            result["conversation"] = {"client_conversation_id": receipt["_public_session_ref"],
+                                      "previous_request_id": receipt.get("_previous_request_id"),
+                                      "protocol": "sequential-v1"}
+        return result
 
     @classmethod
     def _recovery_due(cls, receipt, now):
@@ -815,6 +820,52 @@ class TextTaskService:
             )
         return self._public(json.loads(previous[1])) if previous else None
 
+    def _continue_public_session(self, db, owner, body, receipt):
+        """Validate the predecessor and bind this turn atomically, without a second queue.
+
+        Same-ID retries are handled before here. One predecessor has one successor,
+        across processes and restarts. A completed legacy receipt may be explicitly
+        continued by its owner; no old receipt or input hash is rewritten.
+        """
+        if not body.get("_public_session_ref"):
+            return
+        group = body["client_conversation_id"]
+        previous_id = body.get("_previous_request_id")
+        members = {request_id: json.loads(raw) for request_id, raw in db.execute(
+            "SELECT id,receipt FROM requests WHERE owner=? AND json_extract(receipt,'$.client_conversation_id')=?",
+            (owner, group),
+        )}
+        def reject(code):
+            raise ConversationBindingError("sequential Chat request cannot advance", code=code)
+        if not previous_id:
+            if members:
+                reject("CHAT_PREVIOUS_REQUEST_REQUIRED")
+        else:
+            previous = self.store.read_receipt(db, "text", owner, previous_id)
+            if previous is None or previous.get("route") != "chat":
+                reject("CHAT_PREVIOUS_REQUEST_NOT_FOUND")
+            # A new session cannot steal an existing sequential session. A legacy
+            # successful request has no session reference and is an explicit anchor.
+            if ((previous.get("_public_session_ref") and previous.get("client_conversation_id") != group)
+                    or (members and previous_id not in members)):
+                reject("CHAT_CONVERSATION_CONFLICT")
+            if db.execute("SELECT 1 FROM requests WHERE owner=? AND json_extract(receipt,'$._previous_request_id')=? LIMIT 1",
+                          (owner, previous_id)).fetchone():
+                reject("CHAT_CONVERSATION_CONFLICT")
+            if previous.get("status") != "succeeded":
+                reject("CHAT_PREVIOUS_REQUEST_PENDING")
+            anchors = ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id")
+            if not all(isinstance(previous.get(key), str) and previous[key] for key in anchors):
+                reject("CHAT_CONTINUATION_UNAVAILABLE")
+            receipt.update({key: previous[key] for key in anchors})
+            # The actual last-user parent is filled by the final upstream payload;
+            # it differs from the submission parent for multi-message input.
+            receipt["_previous_request_id"] = previous_id
+            if not previous.get("_public_session_ref"):
+                receipt["_legacy_session_anchor"] = previous_id
+            receipt["_submission_parent_message_id"] = previous["parent_message_id"]
+        receipt["_public_session_ref"] = body["_public_session_ref"]
+
     def submit(self, owner: str, body: dict, *, source: str | None = None):
         from services.durable_forward import dispatch_model
         request_id, request_hash = self._submission_identity(owner, body)
@@ -871,6 +922,7 @@ class TextTaskService:
                 db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
                 schedule = True
             elif not previous:
+                self._continue_public_session(db, owner, body, receipt)
                 receipt.update({"_input_ref": self.store.save_input(body),
                                 "_sequence": self.store.next_sequence(db),
                                 "_source": source or "key:" + owner,
@@ -915,12 +967,42 @@ class TextTaskService:
                 return
             receipt = {**receipt, "status": "running", "started_at": self._now()}
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
+            if receipt.get("_public_session_ref"):
+                # Keep the immutable submitted envelope unchanged in storage.
+                # Only the execution copy receives server-owned account/cursors.
+                body = {**body, **{key: receipt[key] for key in (
+                    "provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id",
+                ) if receipt.get(key)}}
         def progress(cursor):
             self._update(owner, request_id, **cursor)
         if body.get("_forward"):
             from services.durable_forward import run
             return run(self, owner, request_id, body)
         try:
+            if receipt.get("_legacy_session_anchor"):
+                with self._db() as db:
+                    previous = self.store.read_receipt(db, "text", owner, receipt["_legacy_session_anchor"])
+                try:
+                    proven = self.recovery_reader(previous)
+                except Exception:
+                    proven = None
+                if not proven or proven.get("status") != "succeeded":
+                    changes = {"error_code": "CHAT_LEGACY_ANCHOR_UNVERIFIED", "upstream_outcome": "not_sent",
+                               "_turn_reserved": False, "_executing": False}
+                    if self.admission is not None:
+                        changes.update(status="queued", _ready_at=self._now() + self.RECOVERY_BASE_BACKOFF_SECONDS,
+                                       _claim_id=None, _claim_until=None,
+                                       waiting={"reason": "previous_result_unverified"})
+                    else:
+                        changes.update(status="failed")
+                    self._update(owner, request_id, **changes)
+                    return
+                if any(proven.get(key) != receipt.get(key) for key in (
+                    "provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id",
+                )):
+                    self._update(owner, request_id, status="failed", error_code="CHAT_LEGACY_ANCHOR_CHANGED",
+                                 upstream_outcome="not_sent", _turn_reserved=False)
+                    return
             if body.get("_editable"):
                 from services.editable_file_task_service import editable_file_task_service
                 result = editable_file_task_service.run_admitted(body)

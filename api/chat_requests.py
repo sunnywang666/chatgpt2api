@@ -8,7 +8,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from api.image_inputs import normalize_inline_chat_messages
 from api.key_policy import require_chat_text_policy
@@ -36,6 +36,24 @@ class PublicChatRequest(BaseModel):
     model: str = Field(min_length=1, max_length=200)
     messages: list[dict[str, object]] = Field(min_length=1, max_length=100)
     reasoning_effort: Literal["high"] | None = None
+    # An application-owned work session, NOT an upstream conversation cursor.
+    client_conversation_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
+    previous_request_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
+
+    @field_validator("client_conversation_id", "previous_request_id", mode="before")
+    @classmethod
+    def valid_continuation_reference(cls, value):
+        if not isinstance(value, str) or value in {".", ".."}:
+            raise ValueError("continuation references must be omitted or valid identifiers")
+        return value
+
+    @model_validator(mode="after")
+    def continuation_contract(self):
+        if self.previous_request_id and (not self.client_conversation_id or self.previous_request_id == self.client_request_id):
+            raise ValueError("a different predecessor and a work session are required")
+        if self.client_conversation_id and self.messages[-1].get("role") != "user":
+            raise ValueError("a sequential turn must end with its new user input")
+        return self
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
@@ -84,6 +102,12 @@ def _payload(owner: str, body: PublicChatRequest, messages: list[dict]) -> dict:
         "_text_only_binding": True,
         "_public_route": "chat",
     }
+    if body.client_conversation_id is not None:
+        digest = hashlib.sha256(f"{owner}\0session\0{body.client_conversation_id}".encode()).hexdigest()
+        payload["client_conversation_id"] = f"public-session-{digest}"
+        payload["_public_session_ref"] = body.client_conversation_id
+        if body.previous_request_id is not None:
+            payload["_previous_request_id"] = body.previous_request_id
     # Absence retains the exact legacy identity; explicit high is persisted
     # through the existing internal field and participates in conflict checks.
     if body.reasoning_effort is not None:
@@ -185,7 +209,9 @@ def create_router() -> APIRouter:
             call.log("提交失败", status="failed", error=exc.code)
             raise HTTPException(
                 409,
-                detail={"code": "CHAT_REQUEST_CONFLICT", "request_id": body.client_request_id},
+                detail={"code": exc.code if exc.code.startswith("CHAT_") else "CHAT_REQUEST_CONFLICT",
+                        "request_id": body.client_request_id,
+                        **({"previous_request_id": body.previous_request_id} if body.previous_request_id else {})},
             ) from exc
         except HTTPException as exc:
             call.log("提交失败", status="failed", error=str(exc.detail))
