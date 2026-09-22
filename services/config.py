@@ -448,15 +448,24 @@ class ConfigStore:
         value = self._resource_data().get("codex_max_concurrency", self.data.get("codex_max_concurrency", 4))
         return value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 32 else 4
 
+    @property
+    def chat_account_concurrency(self) -> int:
+        value = self._resource_data().get("chat_account_concurrency", self.data.get("chat_account_concurrency", 1))
+        return value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 16 else 1
+
     def _resource_data(self) -> dict:
         from services.storage.json_storage import JSONStorageBackend
         values = JSONStorageBackend._load_json_list(self._resource_path)
         if not values:
             return {}
-        if (len(values) != 1 or set(values[0]) != {"revision", "image_account_concurrency", "codex_max_concurrency"}
+        allowed = {"revision", "image_account_concurrency", "codex_max_concurrency", "chat_account_concurrency"}
+        if (len(values) != 1 or not set(values[0]).issubset(allowed)
+                or not {"revision", "image_account_concurrency", "codex_max_concurrency"}.issubset(values[0])
                 or any(type(value) is not int for value in values[0].values())
                 or values[0]["revision"] < 1 or not 1 <= values[0]["image_account_concurrency"] <= 16
-                or not 1 <= values[0]["codex_max_concurrency"] <= 32):
+                or not 1 <= values[0]["codex_max_concurrency"] <= 32
+                or ("chat_account_concurrency" in values[0]
+                    and not 1 <= values[0]["chat_account_concurrency"] <= 16)):
             raise RuntimeError("resource settings are invalid")
         return values[0]
 
@@ -470,15 +479,22 @@ class ConfigStore:
             codex_limit = snapshot.get("codex_max_concurrency", self.data.get("codex_max_concurrency", 4))
             if type(codex_limit) is not int or not 1 <= codex_limit <= 32:
                 codex_limit = 4
+            chat_limit = snapshot.get("chat_account_concurrency", self.data.get("chat_account_concurrency", 1))
+            if type(chat_limit) is not int or not 1 <= chat_limit <= 16:
+                chat_limit = 1
             return {"revision": snapshot.get("revision", 0),
                     "image_account_concurrency": image_limit,
-                    "codex_max_concurrency": codex_limit}
+                    "codex_max_concurrency": codex_limit,
+                    "chat_account_concurrency": chat_limit}
 
-    def update_resource_settings(self, expected_revision: int, image_account_concurrency: int, codex_max_concurrency: int) -> dict:
+    def update_resource_settings(self, expected_revision: int, image_account_concurrency: int,
+                                 codex_max_concurrency: int, chat_account_concurrency: int | None = None) -> dict:
         from services.storage.json_storage import JSONStorageBackend
         from services.storage.base import AccountCommitUncertain
         if (type(image_account_concurrency) is not int or not 1 <= image_account_concurrency <= 16
-                or type(codex_max_concurrency) is not int or not 1 <= codex_max_concurrency <= 32):
+                or type(codex_max_concurrency) is not int or not 1 <= codex_max_concurrency <= 32
+                or (chat_account_concurrency is not None
+                    and (type(chat_account_concurrency) is not int or not 1 <= chat_account_concurrency <= 16))):
             raise ValueError("resource_settings_invalid")
         self._resource_path.parent.mkdir(parents=True, exist_ok=True)
         with self._update_lock, self._resource_path.with_suffix(".lock").open("a+b") as lock:
@@ -487,9 +503,11 @@ class ConfigStore:
                 current = self.resource_settings()
                 if current["revision"] != expected_revision:
                     raise ValueError("resource_settings_conflict")
+                chat_limit = current["chat_account_concurrency"] if chat_account_concurrency is None else chat_account_concurrency
                 result = {"revision": expected_revision + 1,
                           "image_account_concurrency": image_account_concurrency,
-                          "codex_max_concurrency": codex_max_concurrency}
+                          "codex_max_concurrency": codex_max_concurrency,
+                          "chat_account_concurrency": chat_limit}
                 if all(result[key] == current[key] for key in result if key != "revision"):
                     return current
                 # Reuse the pool's atomic JSON persistence; only technical
@@ -720,7 +738,7 @@ class ConfigStore:
                     incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
             next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
         next_data.pop("backup_state", None)
-        resource_keys = {"image_account_concurrency", "codex_max_concurrency"}
+        resource_keys = {"image_account_concurrency", "codex_max_concurrency", "chat_account_concurrency"}
         if resource_keys.intersection(data):
             current = self.resource_settings()
             if any(data[key] != current[key] for key in resource_keys.intersection(data)):

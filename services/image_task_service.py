@@ -722,6 +722,7 @@ class ImageTaskService:
                 "_input_bytes": __import__("services.text_task_service", fromlist=["_retained_size"])._retained_size(payload),
                 "_submission_started": False,
                 "_turn_reserved": False,
+                "_execution_timeline": [{"stage": "accepted", "at": time.time()}],
             }
             self._tasks[key] = task
             self._save_locked()

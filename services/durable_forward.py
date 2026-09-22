@@ -423,6 +423,9 @@ def run(service, owner, request_id, body):
             close = getattr(parts, "close", None)
             if callable(close):
                 close()
+        context = current_request.get()
+        if context is not None and hasattr(context, "record_stage"):
+            context.record_stage("artifact_saved", output_ref=output)
         current = raw_receipt(service, owner, request_id)
         terminal = protocol != "codex" or current.get("_upstream_terminal") is True
         failed = bool(current.get("_upstream_failed"))

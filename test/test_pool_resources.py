@@ -25,7 +25,8 @@ class PoolResourceTests(unittest.TestCase):
         self.config.update_resource_settings(0, 2, 3)
         reopened = ConfigStore(self.path)
         self.assertEqual(reopened.resource_settings(), {
-            "revision": 1, "image_account_concurrency": 2, "codex_max_concurrency": 3})
+            "revision": 1, "image_account_concurrency": 2, "codex_max_concurrency": 3,
+            "chat_account_concurrency": 1})
         self.assertEqual(reopened.auth_key, self.config.auth_key)
         with self.assertRaises(ValueError):
             self.config.update_resource_settings(0, 1, 1)
@@ -120,13 +121,21 @@ class PoolResourceTests(unittest.TestCase):
     def test_settings_read_one_snapshot_and_legacy_form_cannot_partially_commit(self):
         snapshot = {"revision": 1, "image_account_concurrency": 2, "codex_max_concurrency": 3}
         with patch.object(self.config, "_resource_data", return_value=snapshot) as read:
-            self.assertEqual(self.config.resource_settings(), snapshot)
+            self.assertEqual(self.config.resource_settings(), {**snapshot, "chat_account_concurrency": 1})
             read.assert_called_once()
         before = self.path.read_bytes()
         with self.assertRaisesRegex(ValueError, "resource-settings"):
             self.config.update({"image_account_concurrency": 1, "auth-key": "replacement"})
         self.assertFalse(self.config._resource_path.exists())
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_chat_account_activity_limit_is_persisted_separately_from_image_limit(self):
+        result = self.config.update_resource_settings(0, 4, 3, 2)
+        self.assertEqual(result["chat_account_concurrency"], 2)
+        self.assertEqual(ConfigStore(self.path).chat_account_concurrency, 2)
+        # An old caller that omits the new optional field preserves the value.
+        result = self.config.update_resource_settings(1, 4, 3)
+        self.assertEqual(result["chat_account_concurrency"], 2)
 
     def test_codex_unobserved_capacity_is_unknown_not_zero(self):
         record = account(source_type="codex")

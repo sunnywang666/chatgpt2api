@@ -13,8 +13,9 @@ import time
 import uuid
 
 from services.admission_planner import Need, Resource, Offer, RequestRef, WaitingRequest, Snapshot, choose_next
-from services.request_context import AdmissionLost, executing
+from services.request_context import AdmissionLost, executing, safe_account_ref
 from services.task_store import TaskStore
+from utils.log import logger
 
 
 def account_clock_key(account):
@@ -98,11 +99,41 @@ class ExecutionContext:
     def record_limit(self, evidence):
         self.admission.update_claim(self, rate_limit=evidence)
 
+    def record_stage(self, stage, **extra):
+        """Persist and log a safe stage in the original request timeline."""
+        receipt = self.receipt()
+        settings = self.admission._settings()
+        entry = {
+            "stage": str(stage),
+            "at": time.time(),
+            "request_ref": hashlib.sha256((self.owner + ":" + self.request_id).encode()).hexdigest()[:24],
+            "account_ref": safe_account_ref(receipt.get("provider_account_identity")),
+            "model": receipt.get("model"),
+            "operation": receipt.get("_operation", "image" if self.kind == "image" else "text"),
+            "source": receipt.get("_source"),
+            "input_bytes": receipt.get("_input_bytes"),
+            "config_revision": settings.get("revision") if isinstance(settings, dict) else None,
+            **{key: value for key, value in extra.items()
+               if key in {"status_code", "upstream_request_id", "output_ref", "known"}},
+        }
+        timeline = list(receipt.get("_execution_timeline") or [])
+        timeline.append(entry)
+        try:
+            self.admission.update_claim(self, _execution_timeline=timeline[-32:])
+        except AdmissionLost:
+            # Telemetry must never turn an expired original into a retry.
+            pass
+        logger.info({"event": "pool_execution_stage", **entry})
+        return entry
+
     def log_fields(self):
         r = self.receipt()
+        settings = self.admission._settings()
         return {"model": r.get("model"), "operation": r.get("_operation", "image" if self.kind == "image" else "text"),
                 "retained_input_bytes": r.get("_input_bytes"), "send_sequence": r.get("_send_sequence", 0),
-                "route": r.get("_route", "chat")}
+                "route": r.get("_route", "chat"), "source": r.get("_source"),
+                "config_revision": settings.get("revision") if isinstance(settings, dict) else None,
+                "account_ref": safe_account_ref(r.get("provider_account_identity"))}
 
     def receipt(self):
         with self.admission.store.connect() as db:
@@ -114,6 +145,7 @@ class ExecutionContext:
 
     def terminal(self, known):
         self.admission.update_claim(self, _upstream_terminal=bool(known), _turn_reserved=not known)
+        self.record_stage("upstream_terminal", known=bool(known))
 
 
 class PoolAdmission:
@@ -322,7 +354,11 @@ class PoolAdmission:
             paid = plan in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
             image_slots = image_capacity(account, settings)
             turn_key, image_key = "chat_turn:" + key, "image:" + key
-            new = Resource(turn_key, 1, None if unknown_unbound else occupied.get(turn_key, 0), pace.get("next_at"))
+            # Account activity and send pacing are separate controls. The
+            # default remains one active Chat turn per account; a validated
+            # setting may raise it without changing the 10/60s pacing clocks.
+            chat_capacity = max(1, int(settings.get("chat_account_concurrency", 1)))
+            new = Resource(turn_key, chat_capacity, None if unknown_unbound else occupied.get(turn_key, 0), pace.get("next_at"))
             resources[turn_key] = new
             previous = resources.get(image_key)
             resources[image_key] = Resource(image_key, min(previous.capacity, image_slots) if previous else image_slots,
@@ -564,9 +600,12 @@ class PoolAdmission:
             binding = r.get("provider_binding_id") or (self.accounts.admission_binding(pick.account) if r.get("_route", "chat") == "chat" else None)
             rows = {a["provider_account_identity"]: a for a in self._rows()}
             claim = uuid.uuid4().hex
+            timeline = list(r.get("_execution_timeline") or [])
+            timeline.append({"stage": "execution_claimed", "at": now})
             r.update(status="running", _claim_id=claim, _claim_until=now + self.CLAIM_SECONDS,
                      _turn_reserved=True, _submission_started=False, _executing=True,
                      _account_resource=account_clock_key(rows[pick.account]),
+                     _execution_timeline=timeline[-32:],
                      provider_binding_id=binding, provider_account_identity=pick.account)
             if r.get("_route") == "codex" and self.codex is not None and r.get("_forward_protocol") == "codex":
                 account = rows[pick.account]
@@ -623,7 +662,10 @@ class PoolAdmission:
                 if any(isinstance(limit, dict) and limit.get("feature_name") == r.get("model") and limit.get("remaining") == 0
                        for limit in selected.get("limits_progress") or []):
                     raise AdmissionLost("original model quota is unavailable before send")
-            r.update(_submission_started=True, _last_sent_sequence=sequence, _turn_reserved=True, _claim_until=now + self.CLAIM_SECONDS)
+            timeline = list(r.get("_execution_timeline") or [])
+            timeline.append({"stage": "send_guard_passed", "at": now})
+            r.update(_submission_started=True, _last_sent_sequence=sequence, _turn_reserved=True,
+                     _claim_until=now + self.CLAIM_SECONDS, _execution_timeline=timeline[-32:])
             self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
 
     def execute(self, context):

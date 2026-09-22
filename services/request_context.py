@@ -1,12 +1,18 @@
 """The current original receipt at the upstream send boundary."""
 from contextvars import ContextVar
 from contextlib import contextmanager
+import hashlib
 
 current_request = ContextVar("provider_original_request", default=None)
 
 
 class AdmissionLost(RuntimeError):
     """The original claim is no longer allowed to send."""
+
+
+def safe_account_ref(identity):
+    value = str(identity or "")
+    return hashlib.sha256(value.encode()).hexdigest()[:24] if value else None
 
 
 @contextmanager

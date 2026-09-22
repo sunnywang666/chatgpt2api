@@ -43,6 +43,9 @@ class ResourceSettings(BaseModel):
     expected_revision: int = Field(ge=0)
     image_account_concurrency: int = Field(ge=1, le=16)
     codex_max_concurrency: int = Field(ge=1, le=32)
+    # Optional for old Workbench clients. Omitted means keep the current value,
+    # so an older client cannot silently reset the new account activity limit.
+    chat_account_concurrency: int | None = Field(default=None, ge=1, le=16)
 
 
 class CodexAuthorization(BaseModel):
@@ -155,7 +158,8 @@ def create_router() -> APIRouter:
         owner_scope(authorization, x_workbench_account_owner)
         from services.config import config
         return await account_operation(config.update_resource_settings, body.expected_revision,
-                                       body.image_account_concurrency, body.codex_max_concurrency)
+                                       body.image_account_concurrency, body.codex_max_concurrency,
+                                       body.chat_account_concurrency)
 
     @router.post("/accounts")
     async def import_account(body: ImportAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
