@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small durable client for chatgpt2api's persistent image-task API."""
+"""Small durable client for chatgpt2api's persistent image and Chat APIs."""
 
 from __future__ import annotations
 
@@ -565,12 +565,22 @@ def _chat_request_id(args: argparse.Namespace, state: dict[str, Any] | None) -> 
     return _validate_task_id(explicit)
 
 
-def _chat_receipt(api: ApiClient, request_id: str, *, recover: bool = False) -> dict[str, Any]:
+def _verify_chat_receipt(result: dict[str, Any], request_id: str,
+                         conversation: dict[str, Any] | None = None) -> None:
+    if result.get("request_id") != request_id or result.get("route") != "chat":
+        raise ClientError("Chat response changed the original request ID or route")
+    if conversation is not None:
+        actual = result.get("conversation")
+        if not isinstance(actual, dict) or any(key not in actual or actual[key] != value for key, value in conversation.items()):
+            raise ClientError("Chat response does not confirm the original sequential-v1 session; query the original ID, do not resubmit")
+
+
+def _chat_receipt(api: ApiClient, request_id: str, *, recover: bool = False,
+                  conversation: dict[str, Any] | None = None) -> dict[str, Any]:
     path = f"/api/chat-requests/{parse.quote(request_id, safe='')}"
     result = api.json("POST" if recover else "GET", path + ("/recover" if recover else ""),
                       payload={} if recover else None)
-    if result.get("request_id") != request_id:
-        raise ClientError("Chat response changed the original request ID")
+    _verify_chat_receipt(result, request_id, conversation)
     return result
 
 
@@ -583,6 +593,15 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
         parts.append({"type": "image_url", "image_url": {"url":
             f"data:{item['content_type']};base64," + base64.b64encode(item["data"]).decode("ascii")}})
     body = {"model": args.model, "messages": [{"role": "user", "content": parts}]}
+    conversation = None
+    if args.previous_request_id is not None and args.session_id is None:
+        raise ClientError("--previous-request-id requires --session-id")
+    if args.session_id is not None:
+        body["client_conversation_id"] = _validate_task_id(args.session_id)
+        if args.previous_request_id is not None:
+            body["previous_request_id"] = _validate_task_id(args.previous_request_id)
+        conversation = {"protocol": "sequential-v1", "client_conversation_id": args.session_id,
+                        "previous_request_id": args.previous_request_id}
     fingerprint = _fingerprint(body)
     state_path = _chat_state_path(args)
     with _state_lock(state_path):
@@ -591,16 +610,26 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
             request_id = _chat_request_id(args, state)
             if fingerprint != state.get("input_fingerprint"):
                 raise ClientError("Chat request already belongs to different immutable input")
-            _emit(_chat_receipt(api, request_id))
+            _emit(_chat_receipt(api, request_id, conversation=conversation))
             return 0
         request_id = _validate_task_id(args.request_id or f"chat-{uuid.uuid4()}")
+        if args.previous_request_id:
+            if request_id == args.previous_request_id:
+                raise ClientError("a new turn must have a different request ID from its predecessor")
+            previous = _chat_receipt(api, args.previous_request_id)
+            prior_session = previous.get("conversation")
+            if not isinstance(prior_session, dict) or prior_session.get("protocol") != "sequential-v1" or prior_session.get("client_conversation_id") != args.session_id:
+                raise ClientError("previous Chat request does not belong to this sequential-v1 session")
+            if previous.get("status") != "succeeded":
+                raise ClientError("previous Chat request is not succeeded; query its original ID before submitting this turn")
         state = {"schema": "chatgpt2api.chat-request.v1", "request_id": request_id,
                  "input_fingerprint": fingerprint, "phase": "prepared", "created_at": _utc_now()}
+        if conversation is not None:
+            state["conversation"] = conversation
         _atomic_write_state(state_path, state)
         try:
             result = api.json("POST", "/api/chat-requests", payload={"client_request_id": request_id, **body})
-            if result.get("request_id") != request_id:
-                raise ClientError("Chat response changed the original request ID")
+            _verify_chat_receipt(result, request_id, conversation)
         except (ClientError, KeyboardInterrupt):
             state.update(phase="unknown", updated_at=_utc_now())
             _atomic_write_state(state_path, state)
@@ -612,8 +641,10 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
 
 
 def _command_chat_status(api: ApiClient, args: argparse.Namespace) -> int:
-    request_id = _chat_request_id(args, _load_chat_state(_chat_state_path(args)))
-    _emit(_chat_receipt(api, request_id, recover=args.command == "chat-recover"))
+    state = _load_chat_state(_chat_state_path(args))
+    request_id = _chat_request_id(args, state)
+    _emit(_chat_receipt(api, request_id, recover=args.command == "chat-recover",
+                        conversation=state.get("conversation") if state else None))
     return 0
 
 
@@ -652,6 +683,8 @@ def _parser() -> argparse.ArgumentParser:
     chat = subparsers.add_parser("chat-submit", help="submit one durable Chat text/image request, or read its original result")
     chat.add_argument("--state")
     chat.add_argument("--request-id")
+    chat.add_argument("--session-id", help="application work session; requires Provider sequential-v1")
+    chat.add_argument("--previous-request-id", help="previous succeeded request in the same session; checked before a new submit")
     chat.add_argument("--model", required=True)
     chat.add_argument("--prompt", required=True)
     chat.add_argument("--image", action="append", default=[])

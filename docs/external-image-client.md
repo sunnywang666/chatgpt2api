@@ -55,7 +55,7 @@ The public external image service accepts only `gpt-image-2`, one output per tas
 
 Execution currently reuses the service's existing paid-account conversation-binding route. Free accounts are not eligible for this route. A response saying that no eligible image resource was admitted describes the route at that moment; it is not evidence that every account in the private pool has exhausted an upstream quota.
 
-The synchronous-compatible routes use the same persistent receipt machinery as `/api/image-tasks`. Supply a stable `client_task_id` on every synchronous request. A completed request returns HTTP 200 with `b64_json` data and the original task ID. Queued/running requests or requests awaiting authoritative recovery return HTTP 202 with that same ID. In the reliable-sharing candidate, accepted requests wait durably for account capacity; an older retained resource-admission failure may still return HTTP 429, and other known terminal failures return HTTP 502. Transport/body-reader 429 before acceptance is distinct from upstream 429: inspect `rate_limit.layer`, phase, request ID and Retry-After. Never create a new ID automatically after timeout or non-200. Poll original receipts; generated-but-undownloaded results resume downloads only.
+The synchronous-compatible routes use the same persistent receipt machinery as `/api/image-tasks`. Supply a stable `client_task_id` on every synchronous request. A completed request returns HTTP 200 with `b64_json` data and the original task ID. Queued/running requests or requests awaiting authoritative recovery return HTTP 202 with that same ID. With durable admission enabled, accepted requests wait durably for account capacity; an older retained resource-admission failure may still return HTTP 429, and other known terminal failures return HTTP 502. Transport/body-reader 429 before acceptance is distinct from upstream 429: inspect `rate_limit.layer`, phase, request ID and Retry-After. Never create a new ID automatically after timeout or non-200. Poll original receipts; generated-but-undownloaded results resume downloads only.
 
 ## Commands
 
@@ -135,12 +135,14 @@ The client prints JSON to stdout on success and a JSON error to stderr on failur
 - `401`: missing, invalid, or expired bearer credential;
 - `403`: the ordinary identity is authenticated but not permitted to perform the operation;
 - `409`: the caller reused a durable task ID with different immutable input;
-- `429`: no currently eligible provider resource was admitted; this does not by itself prove a global upstream quota value;
+- `429`: classify the source before acting: company transport protection (`company_transport`), Provider technical protection (`provider_capacity`), or real upstream ChatGPT/Codex rate limits (`upstream_chatgpt` / `upstream_codex`). Retain the original request ID, `rate_limit` origin/phase/request IDs and Retry-After/cooldown evidence. A busy company entrance must not cool down a ChatGPT account; an upstream limit does not authorize resubmitting an UNKNOWN request on another account;
 - `5xx`: the server or its upstream path failed.
 
 An HTTP response is recorded in the local state. A timeout, disconnect, invalid response, or interruption after the state was prepared has an unknown submission outcome. The client never converts that uncertainty into a new ID and never silently retries the submit POST. Restart with the same state and run `status`, or run the identical `submit` command, which performs the same status lookup. If the server reports that the original ID is missing, the client stops; deciding to create a different task requires an explicit new state file and ID.
 
 Do not put the bearer token in command arguments, task state, logs, screenshots, or source control. Keep the filled env file private.
+
+For the authorized joint observation window, the existing `scripts/audit_pacing_log.py` reads a bounded local log export from stdin. Current clock events retain an opaque original-request reference, model, operation, persisted input size, send sequence, layer/phase and rate-limit evidence in the report; old missing fields stay unknown. Upstream header IDs are hashed, and `coverage.omitted_samples` discloses any sample truncation. This script makes no network calls. A message-start event occurs before final send guards and is not proof of a completed upstream send. Correlate it with the original receipt/result and an observed pool snapshot: current clock logs alone do not record concurrent occupancy or trusted source, and cannot establish a safe concurrency or interval.
 
 
 Codex coding is a separate route (`/ai/codex/v1`) documented in [the Codex CLI package](codex-client.md). It does not replace these image-task endpoints or change their supported image model. Its deployment and real CLI acceptance are tracked separately.
@@ -160,7 +162,7 @@ python3 examples/image_client.py --env-file .image-client.env chat-recover --sta
 
 纯文字省略 `--image`。本地图片转为data URL字节，不把路径传给服务器。提交前原子保存request_id及输入指纹，状态文件不存密钥、提示词或图片字节；相同输入再次执行只查询，漂移在本地拒绝。收到202、断线或超时后退出再运行status，绝不新开ID自动重试。404表示未在当前身份找到原回执，需要调查，不证明可以重发。
 
-技术保护按服务进程限制为2个请求体读取、32个执行或等待的文字任务、256MiB保留输入内存，不是密钥预算。429 `CHAT_BODY_READER_CAPACITY_EXCEEDED` 表示读取繁忙。队列满会保存原ID回执：`failed` / `TEXT_TASK_CAPACITY_EXCEEDED` / `recovery.upstream_outcome=not_sent`；只有这项明确未发送证据允许应用退避后原ID原输入再次POST。示例客户端保持查询优先，不自动执行这个重试，也不能删除状态文件换ID绕过保护。
+完整受理后的原请求及实际输入由服务器持久保存。满载时返回202并以原ID等待；新增符合条件的账号、账号恢复或原占用释放后自动派发，不要求客户端换Key、重启或重提。服务重启后尚未发送的请求沿持久输入继续，已发送/UNKNOWN仍绑定原账号查结果。等待不再受旧32个内存任务上限拒绝。请求体读取仍有2个并行读取及执行输入256MiB等技术保护，和账号额度、会话数量分开；429 `CHAT_BODY_READER_CAPACITY_EXCEEDED` 属于受理前读取繁忙。旧版 `failed` / `TEXT_TASK_CAPACITY_EXCEEDED` / `recovery.upstream_outcome=not_sent` 回执才允许退避后原ID原输入再次POST。示例客户端保持查询优先，不自动执行这个重试，也不能删除状态文件换ID绕过保护。`waiting.next_check_at`、`recovery.next_at`是退避证据，不是客户端重新提交指令。
 
 Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `success`，不要混用。只有实际取得的上游usage才可报告，当前未返回usage时应显示未知。现有公共Chat不提供工具执行或结构化输出保证；应用自行校验模型文本，不把JSON解析失败包装为成功。
 
@@ -170,6 +172,39 @@ Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `
 持续推进的应用可在现有 `/api/chat-requests` 请求中提供 `client_conversation_id`；这是调用者的工作会话引用，不是上游 ChatGPT conversation ID。每轮使用不同的 `client_request_id`，除首轮外传 `previous_request_id` 指向已成功的原请求。每次只提供新增输入/工具结果与必要附件，不把全部旧历史再次追加。服务在原 owner 范围和原 SQLite 插入事务中核对前序、唯一后继，并沿前轮实际账号、上游会话和已证明最终回答承接；不允许客户端传管理绑定或原始上游游标。
 
 回执增加 `conversation={protocol:"sequential-v1",client_conversation_id,previous_request_id}`，不暴露池账号/上游ID。前序待定返回409 `CHAT_PREVIOUS_REQUEST_PENDING`；漏前序、跨会话或已有后继返回明确409；这些拒绝不代表新请求已受理。查询原前序，不换新ID绕过。客户端确认原前序 succeeded 后才提交后轮。重复同ID同输入仍返回原回执，即使会话已推进到更后面；旧不带此字段的请求保持原哈希及单次调用方式。
+
+公共客户端现支持 `--session-id` 和 `--previous-request-id`，用于从新会话开始的连续工作，不自动承接缺少sequential-v1回执的旧请求。每轮使用独立的 `--state` 文件，先把上一轮查到 `succeeded` 再提交下一轮；客户端还会在新POST前读取前序并核对协议、会话和成功状态，服务端最终原子核对唯一后继。下面三轮不依赖Happy或DSH；示例ID须替换为实际工作持久保存的ID，模型须从实时目录选择。先运行第一轮：
+
+```sh
+python3 examples/image_client.py --env-file .image-client.env chat-submit \
+  --state ./work-1.json --request-id work-example-1 --session-id work-example \
+  --model DISCOVERED_TEXT_MODEL --prompt '先给出商品文案的事实核对步骤。'
+python3 examples/image_client.py --env-file .image-client.env chat-status --state ./work-1.json
+```
+
+第一轮成功后，只提供新增事实：
+
+```sh
+python3 examples/image_client.py --env-file .image-client.env chat-submit \
+  --state ./work-2.json --request-id work-example-2 --session-id work-example \
+  --previous-request-id work-example-1 --model DISCOVERED_TEXT_MODEL \
+  --prompt '已核实商品为蓝色发夹，包装内2个，请继续核对。'
+python3 examples/image_client.py --env-file .image-client.env chat-status --state ./work-2.json
+```
+
+第二轮成功后，沿同一会话继续：
+
+```sh
+python3 examples/image_client.py --env-file .image-client.env chat-submit \
+  --state ./work-3.json --request-id work-example-3 --session-id work-example \
+  --previous-request-id work-example-2 --model DISCOVERED_TEXT_MODEL \
+  --prompt '请按已核实事实给出一句中文描述，不增加未证实属性。'
+python3 examples/image_client.py --env-file .image-client.env chat-status --state ./work-3.json
+```
+
+收到202、断线或进程退出后，以该轮原状态文件运行 `chat-status`；需要有界读取上游时运行 `chat-recover`。相同 `chat-submit` 重入也只查该轮原ID，不重发。`unknown`、前轮不成功、会话或协议不符时不能推进后轮；服务器拒绝字段或回执不确认sequential-v1时也不能去掉会话字段重试。客户端保存会话/前序身份且将其纳入原输入指纹，恢复时核对原回执，不把最新一轮结果当旧轮结果。保存状态文件不是保存全部输入；应用仍应保留原提示词/附件，服务器正式受理后的恢复依赖其持久输入，不能用历史缺输入请求冒充新协议验收。
+
+应用工具结果须在实际执行后作为下一轮新增user文本提交；这不是服务端工具调用协议，不发送 `role=tool` 或 `tools`。每轮最后一条消息必须是user。`client_conversation_id`、`previous_request_id`遵循原请求ID字符规则，缺省字段省略而非null。账号、上游会话和父消息位置由服务器保留；客户端不能用这些字段选账号，也不要把保存的会话数当执行占用。
 
 服务端在模型发送前持久保存本轮最后一个 user 的实际父消息和整次上传的根父消息，二者在多段上下文时不同。新连续会话必须取得本请求唯一终态分支，不能用流断开或聊天的“最新回答”推进下一轮。显式承接旧已成功的原请求时，先重新读取证明原结果及游标；缺证明则保留等待（旧非准入执行模式明确失败），不重新建聊、不改旧收据。原 UNKNOWN 不自动迁移。新客户端需与本协议的 Provider 成对部署；无此协议的服务会拒绝字段，不能静默退回每轮新聊。
 

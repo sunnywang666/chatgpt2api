@@ -5,13 +5,48 @@ import sys
 import unittest
 from pathlib import Path
 
-from scripts.audit_pacing_log import analyze, decode_event, MAX_LINE
+from scripts.audit_pacing_log import analyze, decode_event, MAX_LINE, MAX_SAMPLES
 REF='0123456789ab'
 
 def line(event='account_message_start', **kw):
     return '[INFO] '+json.dumps({'event':event,'account':REF,**kw})
 
 class AuditTests(unittest.TestCase):
+    def test_current_events_retain_request_model_input_and_rate_evidence(self):
+        result=analyze([
+            line(request_ref='a'*24,model='gpt-5-6-thinking',operation='text',route='chat',
+                 retained_input_bytes=2048,send_sequence=0,layer='upstream_chatgpt',phase='conversation'),
+            line('account_rate_limited',request_ref='a'*24,model='gpt-5-6-thinking',
+                 layer='upstream_chatgpt',phase='conversation',origin='http_429',
+                 upstream_request_id='request-from-upstream',retry_after_secs=120,cooldown_secs=180),
+        ])
+        first,limited=result['samples']
+        self.assertEqual(first['request_ref'],limited['request_ref'])
+        self.assertEqual(first['model'],'gpt-5-6-thinking')
+        self.assertEqual(first['retained_input_bytes'],2048)
+        self.assertEqual(first['send_sequence'],0)
+        self.assertEqual(limited['origin'],'http_429')
+        self.assertEqual(limited['retry_after_secs'],120)
+        self.assertEqual(len(limited['upstream_request_ref']),24)
+        self.assertNotIn('request-from-upstream',json.dumps(result))
+        self.assertEqual(result['coverage']['request_attributed_events'],2)
+        self.assertIsNone(result['accounts'][0]['safe_concurrency'])
+
+    def test_missing_or_untrusted_attribution_is_not_invented_or_exposed(self):
+        result=analyze([line(),line(model='PRIVATE_TOKEN_VALUE',request_ref='PRIVATE_REQUEST',
+            layer='PRIVATE_LAYER',phase='PRIVATE_PHASE',operation=['PRIVATE_OPERATION'],
+            retained_input_bytes='PRIVATE_INPUT',upstream_request_id='PRIVATE_HEADER')])
+        for field in ('model','request_ref','layer','phase','operation','retained_input_bytes'):
+            self.assertIsNone(result['samples'][1][field])
+        self.assertEqual(result['coverage']['request_attributed_events'],0)
+        self.assertNotIn('PRIVATE_',json.dumps(result))
+
+    def test_sample_bound_does_not_hide_aggregate_counts_or_truncation(self):
+        result=analyze(line(request_ref='a'*24) for _ in range(MAX_SAMPLES+1))
+        self.assertEqual(len(result['samples']),MAX_SAMPLES)
+        self.assertEqual(result['coverage']['omitted_samples'],1)
+        self.assertEqual(result['accounts'][0]['start_events'],MAX_SAMPLES+1)
+
     def test_existing_json_log_format(self):
         result=analyze([line(since_previous_secs=61,minimum_interval_secs=60)])
         self.assertEqual(result['accounts'][0]['start_spacing_seconds']['min'],61)
