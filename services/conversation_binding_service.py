@@ -1100,6 +1100,8 @@ class ConversationBindingService:
             backend = OpenAIBackendAPI(access_token=access_token)
             backend.retain_bound_conversation = True
             backend.text_request_message_id = str(body.get("_request_message_id") or "")
+            if body.get("_public_session_ref"):
+                backend.text_cursor_callback = on_cursor
             failure_phase = "stream_open"
             try:
                 parts: list[str] = []
@@ -1141,6 +1143,37 @@ class ConversationBindingService:
                         provider_account_identity=account_identity,
                         conversation_id=returned_conversation_id,
                     )
+                if body.get("_public_session_ref"):
+                    # Neither a socket EOF nor the conversation's latest answer
+                    # proves our turn finished. Use this request's unique branch.
+                    failure_phase = "cursor_read"
+                    try:
+                        recovered = self._read_text_request_result(backend, {
+                            "provider_binding_id": binding_id, "provider_account_identity": account_identity,
+                            "client_conversation_id": client_conversation_id, "conversation_id": returned_conversation_id,
+                            "request_message_id": backend.text_request_message_id,
+                            "request_parent_message_id": getattr(backend, "text_request_parent_message_id", ""),
+                        })
+                    except ConversationBindingError as exc:
+                        # The model turn was sent. An unproven GET result must
+                        # retain occupancy and original-request recovery, even
+                        # when the returned document has a foreign cursor.
+                        raise ConversationBindingError(
+                            "original sequential response could not be verified",
+                            code="CONVERSATION_OUTCOME_UNKNOWN",
+                            provider_binding_id=binding_id, provider_account_identity=account_identity,
+                            conversation_id=returned_conversation_id,
+                            original_failure_phase=failure_phase, original_exception_category="provider_error",
+                        ) from exc
+                    if recovered.get("status") != "succeeded":
+                        raise ConversationBindingError(
+                            "original sequential response is not complete", code="CONVERSATION_OUTCOME_UNKNOWN",
+                            provider_binding_id=binding_id, provider_account_identity=account_identity,
+                            conversation_id=returned_conversation_id,
+                            original_failure_phase=failure_phase, original_exception_category="empty_result",
+                        )
+                    account_service.mark_text_used(access_token)
+                    return {**recovered, "_upstream_terminal": True}
                 content = "".join(parts).strip()
                 if not content:
                     raise ConversationBindingError(
@@ -1181,7 +1214,7 @@ class ConversationBindingService:
                         )
                         # A stream timeout may happen after the answer was saved.
                         # Read that turn once, never regenerate it or accept an old continuation answer.
-                        if recovered_parent and not conversation_id:
+                        if recovered_parent and not conversation_id and not body.get("_public_session_ref"):
                             recovered = self._read_text_result(backend, {
                                 "provider_binding_id": binding_id,
                                 "provider_account_identity": account_identity,

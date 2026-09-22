@@ -163,3 +163,14 @@ python3 examples/image_client.py --env-file .image-client.env chat-recover --sta
 技术保护按服务进程限制为2个请求体读取、32个执行或等待的文字任务、256MiB保留输入内存，不是密钥预算。429 `CHAT_BODY_READER_CAPACITY_EXCEEDED` 表示读取繁忙。队列满会保存原ID回执：`failed` / `TEXT_TASK_CAPACITY_EXCEEDED` / `recovery.upstream_outcome=not_sent`；只有这项明确未发送证据允许应用退避后原ID原输入再次POST。示例客户端保持查询优先，不自动执行这个重试，也不能删除状态文件换ID绕过保护。
 
 Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `success`，不要混用。只有实际取得的上游usage才可报告，当前未返回usage时应显示未知。现有公共Chat不提供工具执行或结构化输出保证；应用自行校验模型文本，不把JSON解析失败包装为成功。
+
+
+### 连续工作会话（sequential-v1 增量）
+
+持续推进的应用可在现有 `/api/chat-requests` 请求中提供 `client_conversation_id`；这是调用者的工作会话引用，不是上游 ChatGPT conversation ID。每轮使用不同的 `client_request_id`，除首轮外传 `previous_request_id` 指向已成功的原请求。每次只提供新增输入/工具结果与必要附件，不把全部旧历史再次追加。服务在原 owner 范围和原 SQLite 插入事务中核对前序、唯一后继，并沿前轮实际账号、上游会话和已证明最终回答承接；不允许客户端传管理绑定或原始上游游标。
+
+回执增加 `conversation={protocol:"sequential-v1",client_conversation_id,previous_request_id}`，不暴露池账号/上游ID。前序待定返回409 `CHAT_PREVIOUS_REQUEST_PENDING`；漏前序、跨会话或已有后继返回明确409；这些拒绝不代表新请求已受理。查询原前序，不换新ID绕过。客户端确认原前序 succeeded 后才提交后轮。重复同ID同输入仍返回原回执，即使会话已推进到更后面；旧不带此字段的请求保持原哈希及单次调用方式。
+
+服务端在模型发送前持久保存本轮最后一个 user 的实际父消息和整次上传的根父消息，二者在多段上下文时不同。新连续会话必须取得本请求唯一终态分支，不能用流断开或聊天的“最新回答”推进下一轮。显式承接旧已成功的原请求时，先重新读取证明原结果及游标；缺证明则保留等待（旧非准入执行模式明确失败），不重新建聊、不改旧收据。原 UNKNOWN 不自动迁移。新客户端需与本协议的 Provider 成对部署；无此协议的服务会拒绝字段，不能静默退回每轮新聊。
+
+Happy 主循环依据原生 DSH 消息 `source.replayState.response.requestId` 承接，并保留收到的消息指纹和系统/工具版本指纹。截图内多个连续 user 气泡可能是一次请求中的上下文数组，不应据此判断有几次上游发送。图片工具仍有独立持久图片任务；主推理的会话连续不等于把独立图片任务合并成一条图片请求。本增量不改变额度、并发设置、员工权限或原生 Codex 路线。
