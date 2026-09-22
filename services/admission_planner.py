@@ -97,6 +97,7 @@ class Offer:
     operation: str
     needs: tuple[Need, ...]
     enabled: bool = True
+    preference: int = 0          # server-owned, only after source/request fairness
 
     def __post_init__(self) -> None:
         for value in (self.account, self.route, self.model, self.operation):
@@ -104,6 +105,7 @@ class Offer:
         if type(self.enabled) is not bool or not self.needs:
             raise InvalidSnapshot('invalid account offer')
         _unique_needs(self.needs)
+        _integer(self.preference)
 
     @property
     def key(self) -> tuple[str, str, str, str]:
@@ -277,7 +279,7 @@ def choose_next(snapshot: Snapshot, now: float) -> Selection:
                        and (request.bound_account is None or request.bound_account == o.account)]
             account_order = _rotate([o.account for o in matches], snapshot.last_account)
             position = {name: i for i, name in enumerate(account_order)}
-            matches.sort(key=lambda o: position[o.account])
+            matches.sort(key=lambda o: (o.preference, position[o.account]))
             possible_wakeups: list[float] = []
             if not matches:
                 reasons.add('bound_account_unavailable' if request.bound_account else 'no_matching_account')
