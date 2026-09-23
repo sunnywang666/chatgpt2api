@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from services.image_thread import finished_parent, ImageThreadError
+
 import base64
 import json
 import re
@@ -358,6 +360,7 @@ class ImageOutput:
     provider_binding_id: str = ""
     provider_account_identity: str = ""
     parent_message_id: str = ""
+    image_thread_terminal: bool = False
 
     def to_chunk(self) -> dict[str, Any]:
         chunk: dict[str, Any] = {
@@ -380,6 +383,8 @@ class ImageOutput:
             chunk["_provider_account_identity"] = self.provider_account_identity
         if self.parent_message_id:
             chunk["_parent_message_id"] = self.parent_message_id
+        if self.image_thread_terminal:
+            chunk["_image_thread_terminal"] = True
         if self.kind == "message":
             chunk.update({
                 "object": "image.generation.message",
@@ -1431,7 +1436,17 @@ def _generate_bound_single_image(
             backend.image_upstream_model = request.upstream_model
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
+            thread = getattr(request.progress_callback, "image_thread", None)
             try:
+                if thread and request.conversation_id:
+                    try:
+                        prior_message = getattr(request.progress_callback, "image_thread_predecessor_message", None)
+                        parent = finished_parent(backend._get_conversation(request.conversation_id), request.conversation_id, prior_message)
+                        if parent != request.parent_message_id:
+                            raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                    except Exception as exc:
+                        raise ImageGenerationError("Original image conversation cannot yet be continued",
+                            code=getattr(exc, "code", "IMAGE_THREAD_PREVIOUS_UNCONFIRMED"), upstream_submitted=False) from exc
                 for output in stream_image_outputs(backend, request, index, total):
                     last_conversation_id = output.conversation_id or last_conversation_id
                     output.account_email = output.account_email or account_email
@@ -1467,12 +1482,17 @@ def _generate_bound_single_image(
                         provider_binding_id=binding_id,
                         conversation_id=last_conversation_id,
                     )
-                next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
+                if thread:
+                    next_parent_message_id = finished_parent(backend._get_conversation(last_conversation_id),
+                        last_conversation_id, str(getattr(backend, "image_request_message_id", "")), expected_parent=request.parent_message_id or None)
+                else:
+                    next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
                 for output in outputs:
                     output.provider_binding_id = binding_id
                     output.provider_account_identity = account_identity
                     output.conversation_id = last_conversation_id
                     output.parent_message_id = next_parent_message_id
+                    output.image_thread_terminal = bool(thread)
                 image_result_marked = True
                 account_service.mark_image_result(token, True)
                 return outputs
@@ -1484,7 +1504,7 @@ def _generate_bound_single_image(
                 parent_message_id = str(getattr(exc, "parent_message_id", "") or "")
                 request_message_id = str(getattr(backend, "image_request_message_id", "") or "")
                 upstream_submitted = getattr(backend, "image_submission_started", None)
-                if conversation_id and backend is not None and not parent_message_id:
+                if not thread and conversation_id and backend is not None and not parent_message_id:
                     try:
                         parent_message_id = backend.get_conversation_parent_message_id(conversation_id)
                     except Exception:
@@ -1906,6 +1926,7 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     provider_account_identity = ""
     conversation_id = ""
     parent_message_id = ""
+    image_thread_terminal = False
     for output in outputs:
         created = created or output.created
         if output.account_email and not account_email:
@@ -1914,6 +1935,7 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
         provider_account_identity = output.provider_account_identity or provider_account_identity
         conversation_id = output.conversation_id or conversation_id
         parent_message_id = output.parent_message_id or parent_message_id
+        image_thread_terminal = output.image_thread_terminal or image_thread_terminal
         if output.kind == "progress" and output.text:
             progress_parts.append(output.text)
         elif output.kind == "message":
@@ -1936,4 +1958,6 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
         result["_conversation_id"] = conversation_id
     if parent_message_id:
         result["_parent_message_id"] = parent_message_id
+    if image_thread_terminal:
+        result["_image_thread_terminal"] = True
     return result

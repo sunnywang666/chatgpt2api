@@ -127,7 +127,12 @@ def create_router() -> APIRouter:
         try:
             result = await run_in_threadpool(openai_v1_models.list_models)
             if is_external(request):
-                return await run_in_threadpool(project_public_models, result)
+                result = await run_in_threadpool(project_public_models, result)
+                from services.image_thread import PROTOCOL
+                from services.image_task_service import image_task_service
+                return {**result, "service_capabilities": {"image_thread": PROTOCOL if image_task_service.admission is not None else None}}
+            # Preserve the private model-discovery contract. Public/company
+            # callers receive this capability on the marked ingress only.
             return result
         except PublicChatContractError as exc:
             raise HTTPException(status_code=502, detail={"code": exc.code}) from exc
@@ -142,7 +147,11 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
-        validate_external_input(request, payload, synchronous=True)
+        raw = await request.json()
+        # This compatibility endpoint has no thread contract. Reject rather
+        # than silently ignore thread fields; keep ordinary legacy hashes.
+        thread_fields = {k: raw[k] for k in ("image_thread_id", "edit_source_task_id", "edit_source_index") if k in raw}
+        validate_external_input(request, {**payload, **thread_fields}, synchronous=True)
         require_image_policy(identity, payload.get("model"))
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)

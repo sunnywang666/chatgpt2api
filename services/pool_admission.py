@@ -6,6 +6,8 @@ Expired claims are fenced at the model-send edge, never inferred to be unsent.
 """
 from __future__ import annotations
 
+from services.image_thread import bind_waiting_threads, predecessor_state
+
 from contextlib import nullcontext
 import hashlib
 import threading
@@ -297,6 +299,11 @@ class PoolAdmission:
         active_bytes = 0
         active_text = 0
         requests = []
+        thread_resources = []
+        image_receipts = {}
+        for kind, owner, request_id, r in receipts:
+            if kind == "image":
+                image_receipts.setdefault(owner, {})[request_id] = r
         for kind, owner, request_id, r in receipts:
             status = r.get("status")
             pending = unfinished(kind, r)
@@ -324,6 +331,12 @@ class PoolAdmission:
                 key = "image:" + resource
                 occupied[key] = occupied.get(key, 0) + 1
             state = "unknown" if unknown else "queued" if status in {"queued", "not_started"} else "active" if active else "succeeded"
+            thread_needs = ()
+            if kind == "image" and r.get("_image_thread"):
+                _, blocked = predecessor_state(r, image_receipts.get(owner, {}))
+                dependency = "image_thread:" + hashlib.sha256((owner + "\0" + request_id).encode()).hexdigest()
+                thread_resources.append(Resource(dependency, 0 if blocked else 1, 0, now))
+                thread_needs = (Need(dependency),)
             # Legacy pending rows still protect their conversation order, but
             # cannot execute without a durable input reference.
             requests.append(WaitingRequest(
@@ -334,13 +347,14 @@ class PoolAdmission:
                 bound_account=str(r.get("provider_account_identity") or "") or None,
                 order_group=str(r.get("client_conversation_id") or "") or None,
                 ready_at=float(r.get("_ready_at") or 0),
-                needs=(Need("execution_input_bytes", max(1, int(r.get("_input_bytes") or 1))),)
+                needs=thread_needs + (Need("execution_input_bytes", max(1, int(r.get("_input_bytes") or 1))),)
                       + ((Need("chat_executor"),) if kind == "text" and route == "chat" else ()),
             ))
         codex_used = sum(value for key, value in occupied.items() if key.startswith("codex_turn:"))
         resources = {"execution_input_bytes": Resource("execution_input_bytes", self.MAX_ACTIVE_INPUT_BYTES, active_bytes, now),
                      "chat_executor": Resource("chat_executor", self.text_workers, active_text, now),
                      "codex_server": Resource("codex_server", int(settings.get("codex_max_concurrency", 4)), codex_used, now)}
+        resources.update({resource.key: resource for resource in thread_resources})
         offers = []
         for account in rows:
             identity = str(account.get("provider_account_identity") or "")
@@ -563,6 +577,7 @@ class PoolAdmission:
         with self.store.transaction() as db, self._account_guard():
             receipts = list(self.store.receipts(db))
             self._recover_claims(db, receipts, now)
+            bind_waiting_threads(self.store, db, receipts)
             if self.codex is not None:
                 rows = self._rows()
                 for kind, owner, request_id, r in receipts:
@@ -586,7 +601,7 @@ class PoolAdmission:
             selection = choose_next(snapshot, now)
             for deferred in selection.deferred:
                 r = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id)
-                r["waiting"] = {"reasons": list(deferred.reasons), "next_check_at": deferred.next_at}
+                r["waiting"] = {"reasons": ([r["_image_thread_waiting_reason"]] if r.get("_image_thread_waiting_reason") else list(deferred.reasons)), "next_check_at": deferred.next_at}
                 self.store.write_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id, r)
             if selection.dispatch is None:
                 return None
@@ -638,6 +653,11 @@ class PoolAdmission:
             if (r is None or r.get("_claim_id") != context.claim or r.get("status") != "running"
                     or float(r.get("_claim_until") or 0) <= now):
                 raise AdmissionLost("original task claim expired")
+            if context.kind == "image" and r.get("_image_thread"):
+                owned = {task_id: task for kind, owner, task_id, task in self.store.receipts(db) if kind == "image" and owner == context.owner}
+                binding, blocked = predecessor_state(r, owned)
+                if blocked or any(r.get(k) != v for k, v in binding.items()):
+                    raise AdmissionLost("original image thread predecessor changed before send")
             sequence = int(r.get("_send_sequence") or 0)
             if r.get("_submission_started") and sequence <= int(r.get("_last_sent_sequence") or 0):
                 raise AdmissionLost("original model request was already submitted")
@@ -700,6 +720,9 @@ class PoolAdmission:
                 return
             payload = body["payload"] if context.kind == "image" else body
             payload.update({k: r[k] for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id") if r.get(k)})
+            if context.kind == "image" and r.get("_image_thread"):
+                payload.update({k: r[k] for k in ("_image_thread", "_image_thread_predecessor_message", "conversation_id", "parent_message_id") if r.get(k)})
+                self.update_claim(context, _image_thread_request_parent=r.get("parent_message_id") or None)
             payload["_admission_claim"] = context.claim
             payload["_request_message_id"] = r.get("request_message_id")
             with executing(context):

@@ -122,27 +122,32 @@ class AccountRequestPacingTests(unittest.TestCase):
         session.request("GET", "https://chatgpt.com/backend-api/tasks")
         self.assertEqual([row[1] for row in self.calls], [1000, 1060, 1070, 1190])
 
-    def test_message_stream_serializes_other_turn_but_allows_original_result_read(self):
+    def test_message_stream_preserves_send_spacing_without_holding_account_for_whole_reply(self):
+        # The current production clock reserves send starts, not whole SSE
+        # lifetimes. PoolAdmission owns active capacity and conversation order.
         clock = pacing.AccountRequestClock()
         entered = threading.Event()
-        attempted = threading.Event()
-        first = SimpleNamespace(status_code=200, headers={}, close=lambda: None, iter_lines=lambda: iter([]))
+        starts = []
+        close = mock.Mock()
+        first = SimpleNamespace(status_code=200, headers={}, close=close, iter_lines=lambda: iter([]))
         clock.request(lambda *a, **k: first, "POST", "https://chatgpt.com/backend-api/conversation", stream=True)
         def send(*args, **kwargs):
+            starts.append(self.now)
             entered.set()
             return SimpleNamespace(status_code=200, headers={})
-        def second_turn():
-            attempted.set()
-            clock.request(send, "POST", "https://chatgpt.com/backend-api/f/conversation")
-        worker = threading.Thread(target=second_turn)
+        worker = threading.Thread(target=lambda: clock.request(
+            send, "POST", "https://chatgpt.com/backend-api/f/conversation"))
         worker.start()
         try:
-            self.assertTrue(attempted.wait(1))
-            clock.request(lambda *a, **k: SimpleNamespace(status_code=200, headers={}), "GET", "https://chatgpt.com/backend-api/conversation/original")
-            self.assertFalse(entered.is_set(), "HTTP headers alone cannot release the account turn")
+            self.assertTrue(entered.wait(1), "an independent turn may start while the first stream is still open")
+            close.assert_not_called()
+            self.assertEqual(starts, [1030.0], "starting another turn must still obey message spacing")
+            read = mock.Mock(return_value=SimpleNamespace(status_code=200, headers={}))
+            clock.request(read, "GET", "https://chatgpt.com/backend-api/conversation/original")
+            read.assert_called_once()
+            self.assertEqual(self.now, 1035.0, "original-result reads retain request spacing")
             first.close()
             first.close()  # Watchdog and generator cleanup can both close it.
-            self.assertTrue(entered.wait(1))
         finally:
             first.close()
             worker.join(1)
