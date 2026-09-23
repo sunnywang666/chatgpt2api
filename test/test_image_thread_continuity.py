@@ -60,7 +60,7 @@ def runtime(tmp_path, monkeypatch):
     service = ImageTaskService(tmp_path / "images.json", store=store, admission=admission)
     admission.register("image", lambda ctx, body: service._run_task(ctx.owner+":"+ctx.request_id,
         body["mode"], {**body["payload"], "retain_conversation": True}, body["identity"], body["payload"]["model"]))
-    state = SimpleNamespace(sends=[], documents={}, fail_after_send=False, drift=False, final_pending=False, reads=[], naive_reads=0)
+    state = SimpleNamespace(sends=[], documents={}, fail_after_send=False, drift=False, final_pending=False, reads=[], naive_reads=0, archive_actions=[])
     account_stub = SimpleNamespace(get_bound_account_identity=lambda _b: "account-0",
         acquire_bound_image_access_token=lambda *a, **k: "fixture-token", get_account=lambda _t: rows[0],
         conversation_binding_lock=lambda *a: nullcontext(), mark_image_result=lambda *a: None,
@@ -84,6 +84,13 @@ def runtime(tmp_path, monkeypatch):
         def get_conversation_parent_message_id(self, cid):
             state.naive_reads += 1
             raise AssertionError("new thread may not accept arbitrary current_node")
+        def set_conversation_archived(self, cid, parent, archived):
+            assert parent in state.documents[cid]["mapping"]
+            state.documents[cid]["is_archived"] = archived
+            state.archive_actions.append((cid, archived))
+            return {"archived": archived}
+        def archive_conversation(self, cid, parent):
+            return self.set_conversation_archived(cid, parent, True)
         def resolve_conversation_image_urls(self, cid, files, sediment, **kwargs):
             assert kwargs["request_message_id"] in state.documents[cid]["mapping"]
             return ["https://fixture.invalid/original.png"]
@@ -162,6 +169,74 @@ def test_same_product_images_and_edit_of_earlier_image_use_original_real_convers
     assert third["_image_thread"]["edit_source_task_id"] == "main-v1"
     assert r.read("main-v1")["data"] == first["data"]
     assert r.state.naive_reads == 0
+
+
+def test_review_approval_archives_exact_image_thread_and_later_edit_restores_it(runtime):
+    r = runtime
+    r.submit("main-v1"); first = run_next(r, "main-v1")
+    result = r.service.archive_thread(WHO, "main-v1")
+    assert result["archived"] is True
+    assert r.state.archive_actions == [(first["conversation_id"], True)]
+    assert r.service.archive_thread(WHO, "main-v1")["archived"] is True
+    r.submit("main-v2", source="main-v1")
+    run_next(r, "main-v2")
+    assert r.state.archive_actions[-1] == (first["conversation_id"], False)
+
+
+def test_unarchive_timeout_requeues_original_image_request_before_any_new_send(runtime, monkeypatch):
+    r = runtime
+    r.submit("main-v1"); first = run_next(r, "main-v1")
+    r.service.archive_thread(WHO, "main-v1")
+    original = conversation.OpenAIBackendAPI.set_conversation_archived
+    attempts = 0
+    def unarchive_once(self, cid, parent, archived):
+        nonlocal attempts
+        if not archived and attempts == 0:
+            attempts += 1
+            raise TimeoutError("fixture unarchive response lost")
+        return original(self, cid, parent, archived)
+    monkeypatch.setattr(conversation.OpenAIBackendAPI, "set_conversation_archived", unarchive_once)
+    r.submit("main-v2", source="main-v1")
+    before = r.read("main-v2")
+    claim = r.admission.claim_next(); assert claim and claim.request_id == "main-v2"
+    r.admission.execute(claim)
+    waiting = r.read("main-v2")
+    assert waiting["status"] == "queued" and waiting["upstream_outcome"] == "not_submitted"
+    assert waiting["request_hash"] == before["request_hash"]
+    assert len(r.state.sends) == 1
+    assert r.admission.claim_next() is None
+    r.admission.clock = lambda: 1100.0
+    recovered = run_next(r, "main-v2")
+    assert not recovered.get("error_code") and not recovered.get("waiting")
+    assert len(r.state.sends) == 2
+    assert r.state.sends[-1]["conversation"] == first["conversation_id"]
+    assert r.state.archive_actions == [(first["conversation_id"], True), (first["conversation_id"], False)]
+
+
+def test_old_or_unfinished_image_task_cannot_archive_newer_work(runtime):
+    r = runtime
+    r.submit("main-v1"); run_next(r, "main-v1")
+    r.submit("selling-v1")
+    with pytest.raises(ImageThreadError, match="IMAGE_THREAD_NOT_TERMINAL"):
+        r.service.archive_thread(WHO, "main-v1")
+    assert not r.state.archive_actions
+
+
+def test_image_archive_route_uses_original_owner_task_and_no_upstream_cursor(runtime, monkeypatch):
+    r = runtime
+    r.submit("main-v1"); run_next(r, "main-v1")
+    import api.image_tasks as routes
+    monkeypatch.setattr(routes, "image_task_service", r.service)
+    monkeypatch.setattr(routes, "require_identity", lambda *a, **k: WHO)
+    app = FastAPI(); app.include_router(routes.create_router())
+    with TestClient(app) as client:
+        assert client.post("/api/image-tasks/main-v1/archive-thread", json={"conversation_id": "forged"}).status_code == 422
+        response = client.post("/api/image-tasks/main-v1/archive-thread", json={})
+        assert response.status_code == 200, response.text
+        assert response.json() == {"image_thread": {"protocol": PROTOCOL, "id": "product-a",
+            "previous_task_id": None, "edit_source_task_id": None}, "archived": True, "task_id": "main-v1"}
+        assert client.post("/api/image-tasks/unknown/archive-thread", json={}).status_code == 404
+    assert len(r.state.archive_actions) == 1
 
 
 def test_same_thread_waits_but_another_product_keeps_its_independent_capacity(runtime):

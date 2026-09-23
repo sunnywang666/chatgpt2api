@@ -1538,6 +1538,12 @@ class ProductConversationArchiveTests(unittest.TestCase):
         self.assertTrue(backend.archive_conversation("chat-a", "original")["archived"])
         backend.session.patch.assert_not_called()
 
+    def test_review_reversal_restores_same_archived_chat_with_readback(self):
+        backend = self.backend([{"mapping": {"original": {}}, "is_archived": True}, {"is_archived": False}])
+        result = backend.set_conversation_archived("chat-a", "original", False)
+        self.assertFalse(result["archived"])
+        self.assertEqual(backend.session.patch.call_args.kwargs["json"], {"is_archived": False})
+
     def test_missing_original_turn_never_archives_a_different_chat(self):
         backend = self.backend([{"mapping": {"other": {}}}])
         with self.assertRaises(RuntimeError):

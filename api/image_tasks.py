@@ -8,7 +8,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
 from api.external_images import client_task, task_image_bytes, validate_external_input, is_external
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
@@ -40,6 +40,10 @@ class ImageGenerationTaskRequest(BaseModel):
 class ResumePollRequest(BaseModel):
     extra_timeout_secs: float = Field(default=30.0, ge=5.0, le=120.0)
     allow_unrecoverable_retry: bool = False
+
+
+class ArchiveImageThreadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 class AdoptLatestConversationImageRequest(BaseModel):
@@ -193,6 +197,17 @@ def create_router() -> APIRouter:
                 raise HTTPException(404, detail={"code": "IMAGE_TASK_NOT_FOUND"}) from None
             status = 409 if "different immutable request" in str(exc) else 400
             raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-tasks/{task_id}/archive-thread")
+    async def archive_image_thread(task_id: str, body: ArchiveImageThreadRequest, request: Request,
+                                   authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization, request=request)
+        try:
+            return await run_in_threadpool(image_task_service.archive_thread, identity, task_id)
+        except ImageThreadError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except Exception as exc:
+            raise HTTPException(503, detail={"code": "IMAGE_THREAD_ARCHIVE_UNCONFIRMED"}) from exc
 
     @router.post("/api/image-tasks/{task_id}/adopt-latest-conversation-image")
     async def adopt_latest_conversation_image(

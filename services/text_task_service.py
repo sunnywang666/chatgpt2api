@@ -624,6 +624,25 @@ class TextTaskService:
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(current), owner, request_id))
             return current
 
+    def archive_public_session(self, owner: str, request_id: str) -> dict[str, object]:
+        """Archive one completed owner session by its original final request ID."""
+        with self._db() as db:
+            receipt = self.store.read_receipt(db, "text", owner, request_id)
+            if not receipt or receipt.get("route") != "chat" or not receipt.get("_public_session_ref"):
+                raise ConversationBindingError("product session not found", code="CHAT_REQUEST_NOT_FOUND")
+            if receipt.get("status") != "succeeded" or db.execute(
+                "SELECT 1 FROM requests WHERE owner=? AND json_extract(receipt,'$._previous_request_id')=? LIMIT 1",
+                (owner, request_id),
+            ).fetchone():
+                raise ConversationBindingError("product session is not complete", code="CHAT_SESSION_NOT_TERMINAL")
+            required = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
+                        "conversation_id", "parent_message_id")
+            if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in required):
+                raise ConversationBindingError("original conversation cursor unavailable", code="CHAT_SESSION_UNCONFIRMED")
+        conversation_binding_service.archive(receipt)
+        return {"request_id": request_id, "archived": True,
+                "conversation": {"client_conversation_id": receipt["_public_session_ref"], "protocol": "sequential-v1"}}
+
     def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False):
         from services.pool_admission import unknown_text_result
         recovery_claim = None
@@ -1057,6 +1076,16 @@ class TextTaskService:
                 context.record_stage("artifact_saved")
         except ConversationBindingError as exc:
             cursor = {k: getattr(exc, k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id") if getattr(exc, k, "")}
+            if exc.code == "CHAT_ARCHIVE_RESTORE_UNCONFIRMED":
+                changes = {"error_code": exc.code, "upstream_outcome": "not_sent", "_turn_reserved": False,
+                           "_executing": False, "waiting": {"reason": "archive_restore"}}
+                if self.admission is not None:
+                    changes.update(status="queued", _ready_at=self._now()+self.RECOVERY_BASE_BACKOFF_SECONDS,
+                                   _claim_id=None, _claim_until=None)
+                else:
+                    changes.update(status="failed", finished_at=self._now())
+                self._update(owner, request_id, **cursor, **changes)
+                return
             diagnostic = {
                 key: value for key in (
                     "original_failure_phase", "original_http_status", "original_exception_category",

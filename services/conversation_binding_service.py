@@ -344,6 +344,8 @@ class ConversationBindingService:
         with account_service.conversation_binding_lock(binding, body["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:
+                if body.get("_public_session_ref") and backend._get_conversation(body["conversation_id"]).get("current_node") != body["parent_message_id"]:
+                    raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH")
                 result = backend.archive_conversation(body["conversation_id"], body["parent_message_id"])
                 return {**body, **result}
             finally:
@@ -1184,6 +1186,20 @@ class ConversationBindingService:
                 backend.text_cursor_callback = on_cursor
             failure_phase = "stream_open"
             try:
+                if body.get("_public_session_ref") and conversation_id:
+                    try:
+                        document = backend._get_conversation(conversation_id)
+                    except Exception as exc:
+                        raise ConversationBindingError("original conversation read is temporarily unavailable",
+                                                       code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED") from exc
+                    if document.get("current_node") != parent_message_id:
+                        raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH")
+                    if document.get("is_archived") is True:
+                        try:
+                            backend.set_conversation_archived(conversation_id, parent_message_id, False)
+                        except Exception as exc:
+                            raise ConversationBindingError("original conversation restore is temporarily unavailable",
+                                                           code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED") from exc
                 parts: list[str] = []
                 returned_conversation_id = ""
                 for event in conversation_events(

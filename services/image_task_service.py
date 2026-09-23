@@ -684,6 +684,52 @@ class ImageTaskService:
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
 
+    def archive_thread(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        """Archive only the owner's latest, fully recovered image conversation."""
+        from services.account_service import account_service
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        owner = _owner_id(identity)
+        key = _task_key(owner, _clean(task_id))
+        with self._transaction():
+            task = self._tasks.get(key)
+            if not task or not task.get("_image_thread"):
+                raise ImageThreadError("IMAGE_THREAD_NOT_FOUND", status=404)
+            binding = _clean(task.get("provider_binding_id"))
+            account = _clean(task.get("provider_account_identity"))
+            client = _clean(task.get("client_conversation_id"))
+        if not binding or not account or not client:
+            raise ImageThreadError("IMAGE_THREAD_BINDING_UNAVAILABLE")
+        if account_service.get_bound_account_identity(binding) != account:
+            raise ImageThreadError("IMAGE_THREAD_BINDING_CHANGED")
+        token = account_service.get_bound_text_access_token(binding, model="auto")
+        with account_service.conversation_binding_lock(binding, client):
+            # Generation on this conversation uses the same lock. Recheck after
+            # obtaining it so an in-flight result or newer revision cannot be
+            # hidden by an old approval event.
+            with self._transaction():
+                task = self._tasks.get(key)
+                thread = (task or {}).get("_image_thread") or {}
+                members = [item for item in self._tasks.values()
+                    if item.get("owner_id") == owner and (item.get("_image_thread") or {}).get("id") == thread.get("id")]
+                if (not thread or not members or max(members, key=lambda item: item.get("_sequence", 0)) is not task
+                        or any(item.get("status") != TASK_STATUS_SUCCESS or not item.get("_image_thread_terminal") for item in members)):
+                    raise ImageThreadError("IMAGE_THREAD_NOT_TERMINAL")
+                conversation_id = _clean(task.get("conversation_id"))
+                parent_id = _clean(task.get("parent_message_id"))
+                request_id = _clean(task.get("adopted_source_request_message_id") or task.get("request_message_id"))
+                if not conversation_id or not parent_id or not request_id:
+                    raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED")
+            backend = OpenAIBackendAPI(access_token=token)
+            try:
+                actual_parent = finished_parent(backend._get_conversation(conversation_id), conversation_id, request_id)
+                if actual_parent != parent_id:
+                    raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                backend.archive_conversation(conversation_id, parent_id)
+            finally:
+                backend.close()
+        return {"image_thread": public_thread(task), "archived": True, "task_id": task_id}
+
     def _submit(
         self,
         identity: dict[str, object],
@@ -983,6 +1029,9 @@ class ImageTaskService:
                 data=data,
                 usage=usage,
                 error="",
+                error_code="",
+                waiting={},
+                _ready_at=0,
                 duration_ms=duration_ms,
                 provider_binding_id=provider_binding_id,
                 provider_account_identity=provider_account_identity,
@@ -1037,6 +1086,26 @@ class ImageTaskService:
             error_code = _clean(getattr(exc, "code", ""))
             upstream_submitted = getattr(exc, "upstream_submitted", None)
             known_not_submitted = upstream_submitted is False
+            if (known_not_submitted and error_code == "IMAGE_THREAD_PREVIOUS_UNCONFIRMED"
+                    and self.admission is not None and payload.get("_admission_claim")
+                    and current.get("_submission_started") is False):
+                # A failed read or unarchive happened before the image POST.
+                # Keep the same durable request and thread cursor in admission;
+                # the scheduler retries after a bounded delay without another
+                # client submission or a second image-task identity.
+                attempts = int(current.get("_archive_restore_attempts") or 0) + 1
+                delay = min(60, 2 ** min(attempts, 6))
+                self._update_task(
+                    key, status=TASK_STATUS_QUEUED, error="原生图会话恢复待重试",
+                    error_code=error_code, upstream_unfinished=False,
+                    upstream_submission_started=False, upstream_outcome="not_submitted",
+                    _archive_restore_attempts=attempts,
+                    _ready_at=self.admission.clock() + delay,
+                    _claim_id=None, _executing=False, _turn_reserved=False,
+                    waiting={"reason": "archive_restore", "next_check_at": self.admission.clock() + delay},
+                    active_attempt_started_at=None, active_attempt_deadline_at=None,
+                )
+                return
             retryable_not_submitted = (
                 known_not_submitted and error_code == "IMAGE_GENERATION_NOT_SUBMITTED"
             )
