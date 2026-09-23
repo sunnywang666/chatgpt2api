@@ -1,0 +1,28 @@
+name: Image thread continuity engineering
+on:
+  push:
+    branches: [fix/image-thread-continuity-20260923]
+permissions:
+  contents: read
+jobs:
+  source:
+    if: startsWith(github.event.head_commit.message, 'chore(images): prepare')
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Export exact allowlisted source, no runtime credentials or data
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/thread-source
+          git rev-parse HEAD > /tmp/thread-source/source-sha.txt
+          git archive --format=tar.gz -o /tmp/thread-source/provider-source.tar.gz HEAD api services utils test docs pyproject.toml uv.lock .python-version
+          sha256sum /tmp/thread-source/provider-source.tar.gz > /tmp/thread-source/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-thread-pinned-source
+          path: /tmp/thread-source/
+          retention-days: 14
