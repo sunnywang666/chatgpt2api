@@ -684,8 +684,8 @@ class ImageTaskService:
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
 
-    def archive_thread(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
-        """Archive only the owner's latest, fully recovered image conversation."""
+    def set_thread_archived(self, identity: dict[str, object], task_id: str, archived: bool) -> dict[str, Any]:
+        """Change only the owner's latest, fully recovered image conversation."""
         from services.account_service import account_service
         from services.openai_backend_api import OpenAIBackendAPI
 
@@ -725,10 +725,16 @@ class ImageTaskService:
                 actual_parent = finished_parent(backend._get_conversation(conversation_id), conversation_id, request_id)
                 if actual_parent != parent_id:
                     raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
-                backend.archive_conversation(conversation_id, parent_id)
+                backend.set_conversation_archived(conversation_id, parent_id, archived)
             finally:
                 backend.close()
-        return {"image_thread": public_thread(task), "archived": True, "task_id": task_id}
+        return {"image_thread": public_thread(task), "archived": archived, "task_id": task_id}
+
+    def archive_thread(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        return self.set_thread_archived(identity, task_id, True)
+
+    def restore_thread(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        return self.set_thread_archived(identity, task_id, False)
 
     def _submit(
         self,

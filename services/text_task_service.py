@@ -624,8 +624,8 @@ class TextTaskService:
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(current), owner, request_id))
             return current
 
-    def archive_public_session(self, owner: str, request_id: str) -> dict[str, object]:
-        """Archive one completed owner session by its original final request ID."""
+    def set_public_session_archived(self, owner: str, request_id: str, archived: bool) -> dict[str, object]:
+        """Change one completed owner session by its original final request ID."""
         with self._db() as db:
             receipt = self.store.read_receipt(db, "text", owner, request_id)
             if not receipt or receipt.get("route") != "chat" or not receipt.get("_public_session_ref"):
@@ -639,9 +639,15 @@ class TextTaskService:
                         "conversation_id", "parent_message_id")
             if any(not isinstance(receipt.get(key), str) or not receipt[key] for key in required):
                 raise ConversationBindingError("original conversation cursor unavailable", code="CHAT_SESSION_UNCONFIRMED")
-        conversation_binding_service.archive(receipt)
-        return {"request_id": request_id, "archived": True,
+        conversation_binding_service.set_archived(receipt, archived)
+        return {"request_id": request_id, "archived": archived,
                 "conversation": {"client_conversation_id": receipt["_public_session_ref"], "protocol": "sequential-v1"}}
+
+    def archive_public_session(self, owner: str, request_id: str) -> dict[str, object]:
+        return self.set_public_session_archived(owner, request_id, True)
+
+    def restore_public_session(self, owner: str, request_id: str) -> dict[str, object]:
+        return self.set_public_session_archived(owner, request_id, False)
 
     def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False):
         from services.pool_admission import unknown_text_result

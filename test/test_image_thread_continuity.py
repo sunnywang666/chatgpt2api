@@ -235,8 +235,11 @@ def test_image_archive_route_uses_original_owner_task_and_no_upstream_cursor(run
         assert response.status_code == 200, response.text
         assert response.json() == {"image_thread": {"protocol": PROTOCOL, "id": "product-a",
             "previous_task_id": None, "edit_source_task_id": None}, "archived": True, "task_id": "main-v1"}
+        assert client.post("/api/image-tasks/main-v1/restore-thread", json={"conversation_id":"forged"}).status_code == 422
+        restored = client.post("/api/image-tasks/main-v1/restore-thread", json={})
+        assert restored.status_code == 200 and restored.json()["archived"] is False
         assert client.post("/api/image-tasks/unknown/archive-thread", json={}).status_code == 404
-    assert len(r.state.archive_actions) == 1
+    assert [archived for _,archived in r.state.archive_actions] == [True, False]
 
 
 def test_same_thread_waits_but_another_product_keeps_its_independent_capacity(runtime):

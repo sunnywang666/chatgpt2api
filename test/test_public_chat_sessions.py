@@ -61,15 +61,18 @@ def test_archive_route_uses_only_the_latest_original_owner_request(public_chat):
     post(h,turn('r1'));h.queue.run()
     post(h,turn('r2','r1'));h.queue.run()
     from services.text_task_service import conversation_binding_service
-    with patch.object(conversation_binding_service,'archive',return_value={'archived':True}) as archive:
+    with patch.object(conversation_binding_service,'set_archived',return_value={'archived':True}) as archive:
         early=h.client.post('/api/chat-requests/r1/archive-conversation',headers=h.headers(),json={})
         assert early.status_code==409,early.text
         assert h.client.post('/api/chat-requests/r2/archive-conversation',headers=h.headers(),json={'conversation_id':'forged'}).status_code==422
         assert h.client.post('/api/chat-requests/r2/archive-conversation',headers=h.headers(h.secret_b),json={}).status_code==404
         response=h.client.post('/api/chat-requests/r2/archive-conversation',headers=h.headers(),json={})
+        restored=h.client.post('/api/chat-requests/r2/restore-conversation',headers=h.headers(),json={})
     assert response.status_code==200,response.text
     assert response.json()=={'request_id':'r2','archived':True,'conversation':{'client_conversation_id':'dsh-session','protocol':'sequential-v1'}}
-    assert archive.call_args.args[0]['parent_message_id']=='parent-secret'
+    assert restored.status_code==200 and restored.json()['archived'] is False
+    assert archive.call_args_list[0].args[0]['parent_message_id']=='parent-secret'
+    assert [call.args[1] for call in archive.call_args_list]==[True,False]
 
 
 def test_archived_sequential_text_chat_is_restored_before_continuation():

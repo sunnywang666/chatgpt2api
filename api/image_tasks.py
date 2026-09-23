@@ -209,6 +209,17 @@ def create_router() -> APIRouter:
         except Exception as exc:
             raise HTTPException(503, detail={"code": "IMAGE_THREAD_ARCHIVE_UNCONFIRMED"}) from exc
 
+    @router.post("/api/image-tasks/{task_id}/restore-thread")
+    async def restore_image_thread(task_id: str, body: ArchiveImageThreadRequest, request: Request,
+                                   authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization, request=request)
+        try:
+            return await run_in_threadpool(image_task_service.restore_thread, identity, task_id)
+        except ImageThreadError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except Exception as exc:
+            raise HTTPException(503, detail={"code": "IMAGE_THREAD_RESTORE_UNCONFIRMED"}) from exc
+
     @router.post("/api/image-tasks/{task_id}/adopt-latest-conversation-image")
     async def adopt_latest_conversation_image(
         task_id: str,

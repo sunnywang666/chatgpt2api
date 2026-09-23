@@ -336,7 +336,7 @@ class ConversationBindingService:
     RECOVERY_DISPATCH_CLOCK_SKEW_SECONDS = 30.0
     RECOVERY_COVERAGE_VERSION = 1
 
-    def archive(self, body: dict[str, Any]) -> dict[str, Any]:
+    def set_archived(self, body: dict[str, Any], archived: bool) -> dict[str, Any]:
         binding = body["provider_binding_id"]
         if account_service.get_bound_account_identity(binding) != body["provider_account_identity"]:
             raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
@@ -346,10 +346,13 @@ class ConversationBindingService:
             try:
                 if body.get("_public_session_ref") and backend._get_conversation(body["conversation_id"]).get("current_node") != body["parent_message_id"]:
                     raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH")
-                result = backend.archive_conversation(body["conversation_id"], body["parent_message_id"])
+                result = backend.set_conversation_archived(body["conversation_id"], body["parent_message_id"], archived)
                 return {**body, **result}
             finally:
                 backend.close()
+
+    def archive(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self.set_archived(body, True)
 
     def read_text_request(self, receipt: dict[str, Any]) -> dict[str, Any]:
         """Recover only the answer descending from this request's own user turn."""

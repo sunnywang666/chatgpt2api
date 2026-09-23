@@ -81,9 +81,15 @@ async def external_image_boundary(request: Request, call_next):
     elif request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/archive-conversation", path):
         chat_body_limit = 1024
         chat_body_error = "CHAT_ARCHIVE_BODY_TOO_LARGE"
+    elif request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/restore-conversation", path):
+        chat_body_limit = 1024
+        chat_body_error = "CHAT_RESTORE_BODY_TOO_LARGE"
     elif request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/archive-thread", path):
         chat_body_limit = 1024
         chat_body_error = "IMAGE_ARCHIVE_BODY_TOO_LARGE"
+    elif request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/restore-thread", path):
+        chat_body_limit = 1024
+        chat_body_error = "IMAGE_RESTORE_BODY_TOO_LARGE"
     if chat_body_limit is not None:
         # Authenticate before inspecting Content-Length or consuming one byte.
         # This also protects direct Provider calls where the proxy marker is
@@ -125,8 +131,10 @@ async def external_image_boundary(request: Request, call_next):
         or request.method == "GET" and re.fullmatch(r"/api/chat-requests/[^/]+", path)
         or request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/recover", path)
         or request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/archive-conversation", path)
+        or request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/restore-conversation", path)
         or request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/resume-poll", path)
         or request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/archive-thread", path)
+        or request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/restore-thread", path)
         or request.method == "POST" and re.fullmatch(
             r"/api/image-tasks/[^/]+/adopt-latest-conversation-image", path
         )
