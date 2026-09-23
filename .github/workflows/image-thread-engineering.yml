@@ -6,7 +6,6 @@ permissions:
   contents: read
 jobs:
   source:
-    if: startsWith(github.event.head_commit.message, 'chore(images): prepare')
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
