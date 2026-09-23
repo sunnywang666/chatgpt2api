@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from services.image_thread import (PROTOCOL as IMAGE_THREAD_PROTOCOL, ImageThreadError, input_fields, accept_thread, public_thread, finished_parent, saved_image_bytes, source_fingerprint)
+
 import json
 import hashlib
 import threading
@@ -356,6 +358,7 @@ def _request_hash(mode: str, payload: dict[str, Any]) -> str:
     # Keep old task fingerprints unchanged when the caller has no override.
     if _clean(payload.get("upstream_model")):
         contract["upstream_model"] = _clean(payload.get("upstream_model"))
+    contract.update(input_fields(payload))
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -427,6 +430,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
+    if public_thread(task):
+        item["image_thread"] = public_thread(task)
     if task.get("conversation_id"):
         item["image_session_id"] = task.get("conversation_id")
     if task.get("parent_message_id"):
@@ -586,6 +591,9 @@ class ImageTaskService:
         parent_message_id: str = "",
         retain_conversation: bool = False,
         upstream_model: str = "",
+        image_thread_id: str = "",
+        edit_source_task_id: str = "",
+        edit_source_index: int = 0,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -602,6 +610,8 @@ class ImageTaskService:
             "parent_message_id": parent_message_id,
             "retain_conversation": retain_conversation,
             "upstream_model": upstream_model,
+            **({"image_thread_id": image_thread_id, "edit_source_task_id": edit_source_task_id,
+                "edit_source_index": edit_source_index} if image_thread_id or edit_source_task_id or edit_source_index else {}),
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
 
@@ -624,6 +634,9 @@ class ImageTaskService:
         parent_message_id: str = "",
         retain_conversation: bool = False,
         upstream_model: str = "",
+        image_thread_id: str = "",
+        edit_source_task_id: str = "",
+        edit_source_index: int = 0,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
@@ -642,6 +655,8 @@ class ImageTaskService:
             "parent_message_id": parent_message_id,
             "retain_conversation": retain_conversation,
             "upstream_model": upstream_model,
+            **({"image_thread_id": image_thread_id, "edit_source_task_id": edit_source_task_id,
+                "edit_source_index": edit_source_index} if image_thread_id or edit_source_task_id or edit_source_index else {}),
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
 
@@ -684,6 +699,25 @@ class ImageTaskService:
         key = _task_key(owner, task_id)
         now = _now_iso()
         should_start = False
+        thread_fields = input_fields(payload)
+        if thread_fields and self.admission is None:
+            raise ImageThreadError("IMAGE_THREAD_SCHEDULER_UNAVAILABLE", status=503)
+        source_snapshot = None
+        source_bytes = None
+        if thread_fields.get("edit_source_task_id"):
+            # Existing IDs recover without rereading a potentially offline source.
+            # Any remote-backed stored-image read is outside the SQLite write lock.
+            with self.store.connect() as db:
+                duplicate = self.store.read_receipt(db, "image", owner, task_id)
+                source_snapshot = self.store.read_receipt(db, "image", owner, thread_fields["edit_source_task_id"])
+            if duplicate is None:
+                if source_snapshot is None:
+                    raise ImageThreadError("IMAGE_THREAD_SOURCE_UNAVAILABLE")
+                source_bytes = saved_image_bytes(source_snapshot)
+        def read_source(source):
+            if source_bytes is None or source_fingerprint(source) != source_fingerprint(source_snapshot):
+                raise ImageThreadError("IMAGE_THREAD_SOURCE_CHANGED")
+            return source_bytes
         with self._transaction():
             cleaned = self._cleanup_locked()
             task = self._tasks.get(key)
@@ -716,7 +750,7 @@ class ImageTaskService:
                 "request_hash": _request_hash(mode, payload),
                 "upstream_unfinished": False,
                 "admission_recorded": True,
-                "_input_ref": self.store.save_input({"payload": payload, "identity": {k: identity[k] for k in ("id", "name", "role", "external_image_client", "_trusted_source") if k in identity}, "mode": mode}),
+                "_input_ref": None,
                 "_sequence": self.store.next_sequence(self._transaction_local.db),
                 "_source": str(identity.get("_trusted_source") or "key:" + owner),
                 "_input_bytes": __import__("services.text_task_service", fromlist=["_retained_size"])._retained_size(payload),
@@ -724,6 +758,8 @@ class ImageTaskService:
                 "_turn_reserved": False,
                 "_execution_timeline": [{"stage": "accepted", "at": time.time()}],
             }
+            accept_thread(task, self._tasks.values(), payload, mode, output_reader=read_source)
+            task["_input_ref"] = self.store.save_input({"payload": payload, "identity": {k: identity[k] for k in ("id", "name", "role", "external_image_client", "_trusted_source") if k in identity}, "mode": mode})
             self._tasks[key] = task
             self._save_locked()
             should_start = True
@@ -900,6 +936,8 @@ class ImageTaskService:
                 upstream_unfinished=False,
             )
         progress_callback.record_result_ids = record_result_ids
+        progress_callback.image_thread = payload.get("_image_thread")
+        progress_callback.image_thread_predecessor_message = payload.get("_image_thread_predecessor_message")
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
@@ -931,6 +969,8 @@ class ImageTaskService:
                 raise RuntimeError("bound image result changed provider binding identity")
             if expected_account_identity and provider_account_identity != expected_account_identity:
                 raise RuntimeError("bound image result changed provider account identity")
+            if payload.get("_image_thread") and (len(data) != 1 or not result.get("_image_thread_terminal") or (payload.get("conversation_id") and payload["conversation_id"] != conversation_id)):
+                raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED", submitted=True)
             if (
                 bool(provider_binding_id) != bool(provider_account_identity)
                 or bool(provider_binding_id) != bool(conversation_id)
@@ -949,6 +989,7 @@ class ImageTaskService:
                 conversation_id=conversation_id,
                 parent_message_id=parent_message_id,
                 binding_status="bound" if provider_binding_id else "unbound",
+                **({"_image_thread_terminal": True} if payload.get("_image_thread") else {}),
                 upstream_unfinished=False,
                 upstream_outcome="generated",
                 recovery_error_code="",
@@ -1683,6 +1724,12 @@ class ImageTaskService:
                 request_message_id = _clean(task.get("request_message_id")) if task else ""
                 persisted_file_ids = list(task.get("result_file_ids") or []) if task else []
                 persisted_sediment_ids = list(task.get("result_sediment_ids") or []) if task else []
+                image_thread = (task or {}).get("_image_thread")
+                expected_parent = (task or {}).get("_image_thread_request_parent")
+            def recovered_parent(backend):
+                if image_thread:
+                    return finished_parent(backend._get_conversation(conversation_id), conversation_id, request_message_id, expected_parent=expected_parent)
+                return backend.get_conversation_parent_message_id(conversation_id)
             if not binding_id or not account_identity or not client_conversation_id:
                 error = RuntimeError("conversation binding unavailable: task authority missing")
                 error.status_code = 403
@@ -1714,7 +1761,7 @@ class ImageTaskService:
                         {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
                         for image_data in downloaded
                     ]
-                    parent_message_id = backend.get_conversation_parent_message_id(conversation_id)
+                    parent_message_id = recovered_parent(backend)
                     data = format_image_result(
                         image_items,
                         "",
@@ -1730,6 +1777,7 @@ class ImageTaskService:
                         error_code="",
                         binding_status="bound",
                         parent_message_id=parent_message_id,
+                        **({"_image_thread_terminal": True} if image_thread else {}),
                         upstream_unfinished=False,
                         upstream_outcome="generated",
                         next_poll_at=0,
@@ -1880,7 +1928,7 @@ class ImageTaskService:
                     {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
                     for image_data in backend.download_image_bytes(image_urls)
                 ]
-                parent_message_id = backend.get_conversation_parent_message_id(conversation_id)
+                parent_message_id = recovered_parent(backend)
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
@@ -1896,6 +1944,7 @@ class ImageTaskService:
                 error_code="",
                 binding_status="bound",
                 parent_message_id=parent_message_id,
+                **({"_image_thread_terminal": True} if image_thread else {}),
                 upstream_unfinished=False,
                 next_poll_at=0,
                 poll_failures=0,

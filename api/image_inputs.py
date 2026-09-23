@@ -145,6 +145,18 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     ):
         if field in fields:
             payload[field] = _clean(fields.get(field))
+    for field in ("image_thread_id", "edit_source_task_id"):
+        if field in fields:
+            if not isinstance(fields[field], str):
+                raise HTTPException(400, detail={"code": "IMAGE_THREAD_INPUT_INVALID"})
+            payload[field] = fields[field]
+    if "edit_source_index" in fields:
+        value = fields["edit_source_index"]
+        if isinstance(value, str) and value.isdigit():
+            value = int(value)
+        if type(value) is not int or not 0 <= value < 16:
+            raise HTTPException(400, detail={"code": "IMAGE_THREAD_INPUT_INVALID"})
+        payload["edit_source_index"] = value
     if "retain_conversation" in fields:
         payload["retain_conversation"] = bool(_parse_bool(fields.get("retain_conversation")))
     return payload
@@ -259,7 +271,10 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
 
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream"):
+    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream",
+                "image_thread_id", "edit_source_task_id", "edit_source_index", "provider_binding_id",
+                "provider_account_identity", "client_conversation_id", "conversation_id", "parent_message_id",
+                "retain_conversation", "upstream_model"):
         value = form.get(key)
         if isinstance(value, str):
             fields[key] = value

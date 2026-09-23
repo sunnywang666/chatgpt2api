@@ -18,6 +18,7 @@ from fastapi.concurrency import run_in_threadpool
 
 from api.support import require_identity
 from services.image_storage_service import image_storage_service
+from services.image_thread import input_fields, ImageThreadError
 
 MAX_PUBLIC_CHAT_BODY_BYTES = 140 * 1024 * 1024
 MAX_CONCURRENT_PUBLIC_CHAT_BODY_READERS = 2
@@ -137,6 +138,12 @@ async def external_image_boundary(request: Request, call_next):
 
 
 def validate_external_input(request: Request, payload: dict, *, synchronous: bool = False) -> None:
+    try:
+        thread = input_fields(payload)
+    except ImageThreadError as exc:
+        raise HTTPException(exc.status, detail={"code": exc.code}) from None
+    if synchronous and thread:
+        raise HTTPException(400, detail={"code": "IMAGE_THREAD_DURABLE_ENDPOINT_REQUIRED"})
     if not is_external(request):
         return
     if str(payload.get("model") or "gpt-image-2") != "gpt-image-2":
@@ -153,6 +160,8 @@ def validate_external_input(request: Request, payload: dict, *, synchronous: boo
         "conversation_id", "parent_message_id", "retain_conversation", "upstream_model",
     )):
         raise HTTPException(400, detail={"error": "use the original task ID to resume a task"})
+    if synchronous and any(payload.get(k) for k in ("image_thread_id", "edit_source_task_id", "edit_source_index")):
+        raise HTTPException(400, detail={"code": "IMAGE_THREAD_DURABLE_ENDPOINT_REQUIRED"})
     if synchronous and (payload.get("response_format", "b64_json") != "b64_json" or payload.get("stream")):
         raise HTTPException(400, detail={"error": "synchronous image service uses b64_json; use image-tasks for downloadable results"})
 

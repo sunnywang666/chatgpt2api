@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from services.request_context import trusted_source
+from services.image_thread import ImageThreadError
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -31,6 +32,9 @@ class ImageGenerationTaskRequest(BaseModel):
     parent_message_id: str = ""
     retain_conversation: bool = False
     upstream_model: str = ""
+    image_thread_id: str = ""
+    edit_source_task_id: str = ""
+    edit_source_index: int = Field(default=0, ge=0, le=15)
 
 
 class ResumePollRequest(BaseModel):
@@ -104,8 +108,13 @@ def create_router() -> APIRouter:
                 parent_message_id=body.parent_message_id,
                 retain_conversation=body.retain_conversation,
                 upstream_model=body.upstream_model,
+                image_thread_id=body.image_thread_id,
+                edit_source_task_id=body.edit_source_task_id,
+                edit_source_index=body.edit_source_index,
             )
             return client_task(result, request)
+        except ImageThreadError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except ValueError as exc:
             status = 409 if "different immutable request" in str(exc) else 400
             raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
@@ -146,8 +155,13 @@ def create_router() -> APIRouter:
                 parent_message_id=str(payload.get("parent_message_id") or ""),
                 retain_conversation=bool(payload.get("retain_conversation")),
                 upstream_model=str(payload.get("upstream_model") or ""),
+                image_thread_id=payload.get("image_thread_id", ""),
+                edit_source_task_id=payload.get("edit_source_task_id", ""),
+                edit_source_index=payload.get("edit_source_index", 0),
             )
             return client_task(result, request)
+        except ImageThreadError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except ValueError as exc:
             status = 409 if "different immutable request" in str(exc) else 400
             raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
@@ -172,6 +186,8 @@ def create_router() -> APIRouter:
                 body.allow_unrecoverable_retry,
             )
             return client_task(result, request)
+        except ImageThreadError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except ValueError as exc:
             if getattr(request.state, "company_identity", None) and str(exc) == "task not found":
                 raise HTTPException(404, detail={"code": "IMAGE_TASK_NOT_FOUND"}) from None
@@ -200,6 +216,8 @@ def create_router() -> APIRouter:
                 base_url=resolve_image_base_url(request),
             )
             return client_task(result, request)
+        except ImageThreadError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
 
