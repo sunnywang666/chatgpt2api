@@ -35,6 +35,28 @@ NON_TEXT_RESULT_FIELD = "_non_text_result"
 TURN_END_EVIDENCE_FIELD = "_turn_end_evidence"
 
 
+def _request_parent_matches_receipt(
+    receipt: dict[str, Any], observed_parent: str, mapping: dict[str, Any],
+) -> bool:
+    expected_parent = str(receipt.get(
+        "request_parent_message_id", receipt.get("parent_message_id"),
+    ) or "").strip()
+    if not expected_parent or observed_parent == expected_parent:
+        return True
+
+    # A batched model POST can omit an intermediate context node from the GET
+    # mapping. Accept only the exact outbound root saved before that POST,
+    # and only when the predicted intermediate node was not persisted at all.
+    # If it exists, a different parent is a real branch mismatch.
+    submission_root = str(receipt.get("_submission_parent_message_id") or "").strip()
+    return bool(
+        submission_root
+        and observed_parent == submission_root
+        and submission_root in mapping
+        and expected_parent not in mapping
+    )
+
+
 def _completed_request_turn(mapping, children, request_message_id, conversation_id):
     """Positive terminal evidence for the exact original branch, even without a usable answer."""
     node_id, visited = request_message_id, {request_message_id}
@@ -639,15 +661,8 @@ class ConversationBindingService:
                 recovery_reason=TextRecoveryReason.REQUEST_PARENT_MISMATCH.value,
                 recovery_scan={},
             )
-        expected_parent_message_id = str(
-            receipt.get(
-                "request_parent_message_id",
-                receipt.get("parent_message_id"),
-            ) or ""
-        ).strip()
-        if (
-            expected_parent_message_id
-            and request_parent_message_id != expected_parent_message_id
+        if not _request_parent_matches_receipt(
+            receipt, request_parent_message_id, document["mapping"],
         ):
             raise ConversationBindingError(
                 "original request parent changed",
@@ -982,9 +997,8 @@ class ConversationBindingService:
                 recovery_reason=TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
             )
 
-        expected_parent = str(receipt.get("request_parent_message_id", receipt.get("parent_message_id")) or "").strip()
         request_parent = str(request_node.get("parent") or "").strip()
-        if expected_parent and request_parent != expected_parent:
+        if not _request_parent_matches_receipt(receipt, request_parent, mapping):
             raise ConversationBindingError(
                 "original request parent changed",
                 code="CONVERSATION_BINDING_MISMATCH",

@@ -741,6 +741,44 @@ class TextResultRecoveryTests(unittest.TestCase):
         self.assertEqual(result["content"], "original answer")
         self.assertEqual(receipt["parent_message_id"], "later-answer")
 
+    def test_request_recovery_accepts_proven_submission_root_when_batched_parent_was_omitted(self):
+        document = self.request_document()
+        document["mapping"]["submission-root"] = {"parent": None, "message": None}
+        document["mapping"]["request-user"]["parent"] = "submission-root"
+        receipt = self.request_receipt(
+            request_parent_message_id="intermediate-context",
+            _submission_parent_message_id="submission-root",
+        )
+        backend = mock.Mock()
+        result = ConversationBindingService._read_text_request_result(
+            backend, receipt, document=document,
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["content"], "original answer")
+        self.assertEqual(result["parent_message_id"], "original-answer")
+
+    def test_request_recovery_rejects_submission_root_without_omitted_batch_parent(self):
+        document = self.request_document()
+        document["mapping"]["submission-root"] = {"parent": None, "message": None}
+        document["mapping"]["request-user"]["parent"] = "submission-root"
+        receipt = self.request_receipt(
+            request_parent_message_id="intermediate-context",
+            _submission_parent_message_id="submission-root",
+        )
+        backend = mock.Mock()
+        for candidate in ("intermediate-context", "submission-root"):
+            altered = self.request_document()
+            altered["mapping"].update(document["mapping"])
+            if candidate == "intermediate-context":
+                altered["mapping"][candidate] = {"parent": "submission-root", "message": None}
+            else:
+                altered["mapping"].pop(candidate)
+            with self.subTest(candidate=candidate), self.assertRaises(ConversationBindingError) as mismatch:
+                ConversationBindingService._read_text_request_result(
+                    backend, receipt, document=altered,
+                )
+            self.assertEqual(mismatch.exception.recovery_reason, TextRecoveryReason.REQUEST_PARENT_MISMATCH.value)
+
     def test_request_recovery_keeps_divergent_sibling_finals_unknown(self):
         document = self.request_document()
         for node_id in ("later-user", "later-answer"):
@@ -1099,6 +1137,30 @@ class TextResultRecoveryTests(unittest.TestCase):
             TextRecoveryReason.REQUEST_PARENT_MISMATCH.value,
         )
         self.assertEqual(mismatch.exception.conversation_id, "conversation-one")
+
+    def test_missing_conversation_lookup_accepts_proven_submission_root(self):
+        receipt = self.request_receipt(
+            conversation_id="", parent_message_id="",
+            request_parent_message_id="intermediate-context",
+            _submission_parent_message_id="submission-root",
+        )
+        document = self.request_document()
+        document["mapping"]["submission-root"] = {"parent": None, "message": None}
+        document["mapping"]["request-user"]["parent"] = "submission-root"
+        backend = mock.Mock()
+        backend._list_recent_conversations.return_value = [{"id": "conversation-one"}]
+        backend._get_conversation.return_value = document
+        with self.assertRaises(ConversationBindingError) as incomplete:
+            ConversationBindingService._locate_text_request_conversation(backend, receipt)
+        receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = incomplete.exception.recovery_scan
+        located, located_document = ConversationBindingService._locate_text_request_conversation(
+            backend, receipt,
+        )
+        result = ConversationBindingService._read_text_request_result(
+            backend, located, document=located_document,
+        )
+        self.assertEqual(located["request_parent_message_id"], "submission-root")
+        self.assertEqual(result["content"], "original answer")
 
     def test_missing_conversation_root_request_keeps_an_explicit_empty_parent(self):
         receipt = self.request_receipt()
