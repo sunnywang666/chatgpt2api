@@ -73,7 +73,7 @@ def runtime(tmp_path, monkeypatch):
     admission.register("image", lambda ctx, body: service._run_task(ctx.owner+":"+ctx.request_id,
         body["mode"], {**body["payload"], "retain_conversation": True}, body["identity"], body["payload"]["model"]))
     state = SimpleNamespace(sends=[], documents={}, fail_after_send=False, fail_after_result=False,
-        tool_leaf=False, drift=False, final_pending=False, reads=[], naive_reads=0, archive_actions=[])
+        tool_leaf=False, drift=False, final_pending=False, reads=[], polls=[], naive_reads=0, archive_actions=[])
     account_stub = SimpleNamespace(get_bound_account_identity=lambda _b: "account-0",
         acquire_bound_image_access_token=lambda *a, **k: "fixture-token", get_account=lambda _t: rows[0],
         conversation_binding_lock=lambda *a: nullcontext(), mark_image_result=lambda *a: None,
@@ -107,6 +107,11 @@ def runtime(tmp_path, monkeypatch):
         def resolve_conversation_image_urls(self, cid, files, sediment, **kwargs):
             assert kwargs["request_message_id"] in state.documents[cid]["mapping"]
             return ["https://fixture.invalid/original.png"]
+        def _poll_image_results(self, cid, timeout, *, request_message_id):
+            assert request_message_id in state.documents[cid]["mapping"]
+            state.polls.append((cid, request_message_id))
+            _, result_id = tool_document(cid, request_message_id)
+            return [result_id], [result_id]
         def download_image_bytes(self, urls):
             assert urls == ["https://fixture.invalid/original.png"]
             return [OUTPUT]
@@ -160,6 +165,7 @@ def runtime(tmp_path, monkeypatch):
         with store.connect() as db:
             return store.read_receipt(db, "image", who["id"], tid)
     return SimpleNamespace(service=service, store=store, admission=admission, state=state,
+                           account_stub=account_stub,
                            submit=submit, read=read, root=tmp_path)
 
 
@@ -486,6 +492,47 @@ def test_generated_tool_leaf_recovery_downloads_original_and_releases_successor(
     assert len(r.state.sends) == 2
     assert r.state.sends[1]["conversation"] == original["conversation_id"]
     assert r.state.sends[1]["parent"] == recovered["parent_message_id"]
+
+
+def test_first_recovery_read_discovers_result_ids_and_finishes_without_second_poll(runtime):
+    r = runtime
+    r.state.tool_leaf = True
+    r.state.fail_after_send = True
+    r.submit("a1"); r.submit("a2")
+    r.admission.execute(r.admission.claim_next())
+    original = r.read("a1")
+    assert original["status"] == "error" and not original.get("result_file_ids")
+    assert r.admission.claim_next() is None
+    r.state.fail_after_send = False
+    restarted = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
+    restarted._run_resume_poll("happy:a1", original["conversation_id"], 5, "", WHO,
+        "edit", "gpt-image-2", False, False)
+    recovered = r.read("a1")
+    assert recovered["status"] == "success", (recovered.get("recovery_error_code"), recovered.get("error"))
+    assert recovered["result_file_ids"] and recovered["_image_thread_terminal"] is True
+    assert recovered["request_hash"] == original["request_hash"]
+    assert r.state.polls == [(original["conversation_id"], original["request_message_id"])]
+    assert len(r.state.sends) == 1, "original result read/download cannot send another generation"
+    run_next(r, "a2")
+    assert r.state.sends[1]["parent"] == recovered["parent_message_id"]
+
+
+def test_first_recovery_read_rejects_changed_bound_account_before_poll(runtime):
+    r = runtime
+    r.state.tool_leaf = True
+    r.state.fail_after_send = True
+    r.submit("a1"); r.submit("a2")
+    r.admission.execute(r.admission.claim_next())
+    original = r.read("a1")
+    r.account_stub.get_bound_account_identity = lambda _binding: "another-account"
+    restarted = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
+    restarted._run_resume_poll("happy:a1", original["conversation_id"], 5, "", WHO,
+        "edit", "gpt-image-2", False, False)
+    after = r.read("a1")
+    assert after["status"] == "error" and after["recovery_error_code"] == "RECOVERY_AUTH_REQUIRED"
+    assert after["request_hash"] == original["request_hash"]
+    assert not after.get("result_file_ids") and not r.state.polls
+    assert len(r.state.sends) == 1 and r.admission.claim_next() is None
 
 
 def test_completed_tool_leaf_continues_and_archives_same_image_thread(runtime):

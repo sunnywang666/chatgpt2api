@@ -1809,11 +1809,11 @@ class ImageTaskService:
                 persisted_sediment_ids = list(task.get("result_sediment_ids") or []) if task else []
                 image_thread = (task or {}).get("_image_thread")
                 expected_parent = (task or {}).get("_image_thread_request_parent")
-            def recovered_parent(backend):
+            def recovered_parent(backend, result_file_ids, result_sediment_ids):
                 if image_thread:
                     return finished_parent(backend._get_conversation(conversation_id), conversation_id,
                         request_message_id, expected_parent=expected_parent,
-                        expected_result_ids=persisted_file_ids + persisted_sediment_ids)
+                        expected_result_ids=result_file_ids + result_sediment_ids)
                 return backend.get_conversation_parent_message_id(conversation_id)
             if not binding_id or not account_identity or not client_conversation_id:
                 error = RuntimeError("conversation binding unavailable: task authority missing")
@@ -1846,7 +1846,7 @@ class ImageTaskService:
                         {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
                         for image_data in downloaded
                     ]
-                    parent_message_id = recovered_parent(backend)
+                    parent_message_id = recovered_parent(backend, persisted_file_ids, persisted_sediment_ids)
                     data = format_image_result(
                         image_items,
                         "",
@@ -2013,7 +2013,7 @@ class ImageTaskService:
                     {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
                     for image_data in backend.download_image_bytes(image_urls)
                 ]
-                parent_message_id = recovered_parent(backend)
+                parent_message_id = recovered_parent(backend, file_ids, sediment_ids)
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
