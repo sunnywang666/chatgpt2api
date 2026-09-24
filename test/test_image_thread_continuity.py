@@ -21,6 +21,7 @@ from services.account_service import AccountService
 from services.storage.json_storage import JSONStorageBackend
 from services.request_context import current_request
 from services.protocol import conversation, openai_v1_image_edit, openai_v1_image_generations
+from services.openai_backend_api import OpenAIBackendAPI as RealOpenAIBackendAPI
 
 
 def png(color):
@@ -211,6 +212,35 @@ def test_unarchive_timeout_requeues_original_image_request_before_any_new_send(r
     assert len(r.state.sends) == 2
     assert r.state.sends[-1]["conversation"] == first["conversation_id"]
     assert r.state.archive_actions == [(first["conversation_id"], True), (first["conversation_id"], False)]
+
+
+def test_cursor_drift_during_unarchive_never_submits_new_image(runtime, monkeypatch):
+    r = runtime
+    r.submit("main-v1"); first = run_next(r, "main-v1")
+    r.service.archive_thread(WHO, "main-v1")
+    original_get = conversation.OpenAIBackendAPI._get_conversation
+    reads = 0
+    def drift_after_first_read(self, cid):
+        nonlocal reads
+        reads += 1
+        document = original_get(self, cid)
+        if reads >= 2:
+            document["mapping"]["newer"] = node("newer", "user", document["current_node"])
+            document["current_node"] = "newer"
+        return document
+    monkeypatch.setattr(conversation.OpenAIBackendAPI, "_get_conversation", drift_after_first_read)
+    monkeypatch.setattr(conversation.OpenAIBackendAPI, "set_conversation_archived",
+                        RealOpenAIBackendAPI.set_conversation_archived)
+    r.submit("main-v2", source="main-v1")
+    before = r.read("main-v2")
+    claim = r.admission.claim_next(); assert claim and claim.request_id == "main-v2"
+    r.admission.execute(claim)
+    waiting = r.read("main-v2")
+    assert reads >= 2
+    assert waiting["status"] == "queued" and waiting["upstream_outcome"] == "not_submitted"
+    assert waiting["request_hash"] == before["request_hash"]
+    assert len(r.state.sends) == 1
+    assert r.state.archive_actions == [(first["conversation_id"], True)]
 
 
 def test_old_or_unfinished_image_task_cannot_archive_newer_work(runtime):

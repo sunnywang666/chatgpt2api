@@ -1243,6 +1243,8 @@ class OpenAIBackendAPI:
         document = self._get_conversation(conversation_id)
         if parent_message_id not in (document.get("mapping") or {}):
             raise RuntimeError("original product turn is missing")
+        if str(document.get("current_node") or "").strip() != parent_message_id:
+            raise RuntimeError("original conversation cursor changed")
         if document.get("is_archived") is archived:
             return {"archived": archived}
         path = f"/backend-api/conversation/{conversation_id}"
@@ -1251,7 +1253,10 @@ class OpenAIBackendAPI:
             json={"is_archived": archived}, timeout=60)
         ensure_ok(response, path)
         # A timeout on PATCH is safe to recover by reading this exact chat first.
-        if self._get_conversation(conversation_id).get("is_archived") is not archived:
+        readback = self._get_conversation(conversation_id)
+        if str(readback.get("current_node") or "").strip() != parent_message_id:
+            raise RuntimeError("original conversation cursor changed during archive update")
+        if readback.get("is_archived") is not archived:
             raise RuntimeError("conversation archive readback is not confirmed")
         return {"archived": archived}
 

@@ -1527,19 +1527,19 @@ class ProductConversationArchiveTests(unittest.TestCase):
         return backend
 
     def test_archive_preserves_chat_and_checks_authoritative_readback(self):
-        backend = self.backend([{"mapping": {"original": {}}, "is_archived": False}, {"is_archived": True}])
+        backend = self.backend([{"mapping": {"original": {}}, "current_node": "original", "is_archived": False}, {"current_node": "original", "is_archived": True}])
         result = backend.archive_conversation("chat-a", "original")
         self.assertTrue(result["archived"])
         self.assertEqual(backend.session.patch.call_args.kwargs["json"], {"is_archived": True})
         self.assertEqual(backend._get_conversation.call_count, 2)
 
     def test_recovery_reads_already_archived_chat_without_repeating_patch(self):
-        backend = self.backend([{"mapping": {"original": {}}, "is_archived": True}])
+        backend = self.backend([{"mapping": {"original": {}}, "current_node": "original", "is_archived": True}])
         self.assertTrue(backend.archive_conversation("chat-a", "original")["archived"])
         backend.session.patch.assert_not_called()
 
     def test_review_reversal_restores_same_archived_chat_with_readback(self):
-        backend = self.backend([{"mapping": {"original": {}}, "is_archived": True}, {"is_archived": False}])
+        backend = self.backend([{"mapping": {"original": {}}, "current_node": "original", "is_archived": True}, {"current_node": "original", "is_archived": False}])
         result = backend.set_conversation_archived("chat-a", "original", False)
         self.assertFalse(result["archived"])
         self.assertEqual(backend.session.patch.call_args.kwargs["json"], {"is_archived": False})
@@ -1549,3 +1549,19 @@ class ProductConversationArchiveTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             backend.archive_conversation("chat-a", "original")
         backend.session.patch.assert_not_called()
+
+    def test_current_node_drift_blocks_patch_and_already_archived_shortcut(self):
+        for archived in (False, True):
+            with self.subTest(archived=archived):
+                backend = self.backend([{"mapping": {"original": {}, "newer": {}},
+                    "current_node": "newer", "is_archived": archived}])
+                with self.assertRaisesRegex(RuntimeError, "cursor changed"):
+                    backend.set_conversation_archived("chat-a", "original", archived)
+                backend.session.patch.assert_not_called()
+
+    def test_current_node_drift_after_patch_refuses_success(self):
+        backend = self.backend([{"mapping": {"original": {}}, "current_node": "original", "is_archived": True},
+            {"mapping": {"original": {}, "newer": {}}, "current_node": "newer", "is_archived": False}])
+        with self.assertRaisesRegex(RuntimeError, "cursor changed"):
+            backend.set_conversation_archived("chat-a", "original", False)
+        backend.session.patch.assert_called_once()
