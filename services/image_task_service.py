@@ -122,6 +122,8 @@ def _recovery_failure_code(exc: BaseException, phase: str) -> str:
         return "RECOVERY_RATE_LIMITED"
     if status in {401, 403}:
         return "RECOVERY_AUTH_REQUIRED"
+    if isinstance(exc, ImageThreadError):
+        return "RECOVERY_THREAD_UNCONFIRMED"
     if phase == "download_image_result":
         return "RECOVERY_DOWNLOAD_FAILED"
     exc_type = type(exc)
@@ -143,6 +145,7 @@ def _safe_recovery_error(code: str, phase: str) -> str:
             "RECOVERY_AUTH_REQUIRED": "the bound account connection must be restored",
             "RECOVERY_TRANSPORT_FAILED": "the provider could not be reached",
             "RECOVERY_READ_FAILED": "the provider response could not be read",
+            "RECOVERY_THREAD_UNCONFIRMED": "the original image turn could not be confirmed",
         }.get(code, "the result download did not complete")
         return (
             f"Generated image is preserved; {reason}. "
@@ -722,7 +725,9 @@ class ImageTaskService:
                     raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED")
             backend = OpenAIBackendAPI(access_token=token)
             try:
-                actual_parent = finished_parent(backend._get_conversation(conversation_id), conversation_id, request_id)
+                result_ids = (task.get("result_file_ids") or []) + (task.get("result_sediment_ids") or [])
+                actual_parent = finished_parent(backend._get_conversation(conversation_id), conversation_id,
+                    request_id, expected_result_ids=result_ids)
                 if actual_parent != parent_id:
                     raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
                 backend.set_conversation_archived(conversation_id, parent_id, archived)
@@ -979,6 +984,7 @@ class ImageTaskService:
         progress_callback.record_submission_started = record_submission_started
 
         def record_result_ids(file_ids: list[str], sediment_ids: list[str]) -> None:
+            result_ids = list(dict.fromkeys(str(item) for item in file_ids + sediment_ids if item))
             self._update_task(
                 key,
                 result_file_ids=list(dict.fromkeys(str(item) for item in file_ids if item)),
@@ -987,9 +993,11 @@ class ImageTaskService:
                 upstream_outcome="generated",
                 upstream_unfinished=False,
             )
+            progress_callback.image_thread_result_ids = result_ids
         progress_callback.record_result_ids = record_result_ids
         progress_callback.image_thread = payload.get("_image_thread")
         progress_callback.image_thread_predecessor_message = payload.get("_image_thread_predecessor_message")
+        progress_callback.image_thread_predecessor_result_ids = payload.get("_image_thread_predecessor_result_ids")
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         try:
@@ -1803,7 +1811,9 @@ class ImageTaskService:
                 expected_parent = (task or {}).get("_image_thread_request_parent")
             def recovered_parent(backend):
                 if image_thread:
-                    return finished_parent(backend._get_conversation(conversation_id), conversation_id, request_message_id, expected_parent=expected_parent)
+                    return finished_parent(backend._get_conversation(conversation_id), conversation_id,
+                        request_message_id, expected_parent=expected_parent,
+                        expected_result_ids=persisted_file_ids + persisted_sediment_ids)
                 return backend.get_conversation_parent_message_id(conversation_id)
             if not binding_id or not account_identity or not client_conversation_id:
                 error = RuntimeError("conversation binding unavailable: task authority missing")

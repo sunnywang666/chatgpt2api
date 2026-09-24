@@ -721,7 +721,8 @@ class PoolAdmission:
             payload = body["payload"] if context.kind == "image" else body
             payload.update({k: r[k] for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id") if r.get(k)})
             if context.kind == "image" and r.get("_image_thread"):
-                payload.update({k: r[k] for k in ("_image_thread", "_image_thread_predecessor_message", "conversation_id", "parent_message_id") if r.get(k)})
+                payload.update({k: r[k] for k in ("_image_thread", "_image_thread_predecessor_message",
+                    "_image_thread_predecessor_result_ids", "conversation_id", "parent_message_id") if r.get(k)})
                 self.update_claim(context, _image_thread_request_parent=r.get("parent_message_id") or None)
             payload["_admission_claim"] = context.claim
             payload["_request_message_id"] = r.get("request_message_id")
