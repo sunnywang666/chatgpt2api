@@ -1441,9 +1441,15 @@ def _generate_bound_single_image(
                 if thread and request.conversation_id:
                     try:
                         prior_message = getattr(request.progress_callback, "image_thread_predecessor_message", None)
-                        parent = finished_parent(backend._get_conversation(request.conversation_id), request.conversation_id, prior_message)
+                        document = backend._get_conversation(request.conversation_id)
+                        parent = finished_parent(document, request.conversation_id, prior_message)
                         if parent != request.parent_message_id:
                             raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                        # A later review reversal continues this exact conversation.
+                        # Restore it before any image POST; failure leaves the original
+                        # request unsubmitted and available for exact-ID recovery.
+                        if document.get("is_archived") is True:
+                            backend.set_conversation_archived(request.conversation_id, parent, False)
                     except Exception as exc:
                         raise ImageGenerationError("Original image conversation cannot yet be continued",
                             code=getattr(exc, "code", "IMAGE_THREAD_PREVIOUS_UNCONFIRMED"), upstream_submitted=False) from exc

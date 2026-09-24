@@ -74,6 +74,10 @@ class OriginalRecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ArchivePublicSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
 def _ordinary_identity(authorization: str | None, request: Request) -> dict[str, object]:
     identity = require_identity(authorization, request=request)
     if identity.get("role") != "user":
@@ -225,6 +229,34 @@ def create_router() -> APIRouter:
             response.status_code = 200 if result["status"] in {"succeeded", "failed"} else 202
         response.headers["Cache-Control"] = "private, no-store"
         return result
+
+    @router.post("/api/chat-requests/{request_id}/archive-conversation")
+    async def archive_chat_conversation(request_id: str, body: ArchivePublicSessionRequest,
+                                        request: Request, authorization: str | None = Header(default=None)):
+        del body
+        identity = _ordinary_identity(authorization, request)
+        request_id = _validated_request_id(request_id)
+        try:
+            return await run_in_threadpool(text_task_service.archive_public_session, _owner(identity), request_id)
+        except ConversationBindingError as exc:
+            status = 404 if exc.code == "CHAT_REQUEST_NOT_FOUND" else 409
+            raise HTTPException(status, detail={"code": exc.code}) from None
+        except Exception as exc:
+            raise HTTPException(503, detail={"code": "CHAT_SESSION_ARCHIVE_UNCONFIRMED"}) from exc
+
+    @router.post("/api/chat-requests/{request_id}/restore-conversation")
+    async def restore_chat_conversation(request_id: str, body: ArchivePublicSessionRequest,
+                                        request: Request, authorization: str | None = Header(default=None)):
+        del body
+        identity = _ordinary_identity(authorization, request)
+        request_id = _validated_request_id(request_id)
+        try:
+            return await run_in_threadpool(text_task_service.restore_public_session, _owner(identity), request_id)
+        except ConversationBindingError as exc:
+            status = 404 if exc.code == "CHAT_REQUEST_NOT_FOUND" else 409
+            raise HTTPException(status, detail={"code": exc.code}) from None
+        except Exception as exc:
+            raise HTTPException(503, detail={"code": "CHAT_SESSION_RESTORE_UNCONFIRMED"}) from exc
 
     @router.get("/api/chat-requests/{request_id}")
     async def read_chat_request(

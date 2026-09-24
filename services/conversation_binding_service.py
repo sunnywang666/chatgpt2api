@@ -336,7 +336,7 @@ class ConversationBindingService:
     RECOVERY_DISPATCH_CLOCK_SKEW_SECONDS = 30.0
     RECOVERY_COVERAGE_VERSION = 1
 
-    def archive(self, body: dict[str, Any]) -> dict[str, Any]:
+    def set_archived(self, body: dict[str, Any], archived: bool) -> dict[str, Any]:
         binding = body["provider_binding_id"]
         if account_service.get_bound_account_identity(binding) != body["provider_account_identity"]:
             raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
@@ -344,10 +344,15 @@ class ConversationBindingService:
         with account_service.conversation_binding_lock(binding, body["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:
-                result = backend.archive_conversation(body["conversation_id"], body["parent_message_id"])
+                if body.get("_public_session_ref") and backend._get_conversation(body["conversation_id"]).get("current_node") != body["parent_message_id"]:
+                    raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH")
+                result = backend.set_conversation_archived(body["conversation_id"], body["parent_message_id"], archived)
                 return {**body, **result}
             finally:
                 backend.close()
+
+    def archive(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self.set_archived(body, True)
 
     def read_text_request(self, receipt: dict[str, Any]) -> dict[str, Any]:
         """Recover only the answer descending from this request's own user turn."""
@@ -1184,6 +1189,20 @@ class ConversationBindingService:
                 backend.text_cursor_callback = on_cursor
             failure_phase = "stream_open"
             try:
+                if body.get("_public_session_ref") and conversation_id:
+                    try:
+                        document = backend._get_conversation(conversation_id)
+                    except Exception as exc:
+                        raise ConversationBindingError("original conversation read is temporarily unavailable",
+                                                       code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED") from exc
+                    if document.get("current_node") != parent_message_id:
+                        raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH")
+                    if document.get("is_archived") is True:
+                        try:
+                            backend.set_conversation_archived(conversation_id, parent_message_id, False)
+                        except Exception as exc:
+                            raise ConversationBindingError("original conversation restore is temporarily unavailable",
+                                                           code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED") from exc
                 parts: list[str] = []
                 returned_conversation_id = ""
                 for event in conversation_events(

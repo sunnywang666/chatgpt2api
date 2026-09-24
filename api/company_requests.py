@@ -31,7 +31,11 @@ def allowed_route(method: str, path: str) -> bool:
     return method == "POST" and (
         path in {"/api/chat-requests", "/api/image-tasks/generations", "/api/image-tasks/edits"}
         or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/recover", path))
+        or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/archive-conversation", path))
+        or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/restore-conversation", path))
         or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/resume-poll", path))
+        or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/archive-thread", path))
+        or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/restore-thread", path))
     )
 
 

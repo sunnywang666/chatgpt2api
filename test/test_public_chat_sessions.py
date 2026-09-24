@@ -56,6 +56,71 @@ def test_three_turns_keep_one_upstream_account_and_conversation(public_chat):
     assert post(h, {**turn('r1'), 'messages':[{'role':'user','content':'drift'}]}).status_code == 409
 
 
+def test_archive_route_uses_only_the_latest_original_owner_request(public_chat):
+    h=public_chat
+    post(h,turn('r1'));h.queue.run()
+    post(h,turn('r2','r1'));h.queue.run()
+    from services.text_task_service import conversation_binding_service
+    with patch.object(conversation_binding_service,'set_archived',return_value={'archived':True}) as archive:
+        early=h.client.post('/api/chat-requests/r1/archive-conversation',headers=h.headers(),json={})
+        assert early.status_code==409,early.text
+        assert h.client.post('/api/chat-requests/r2/archive-conversation',headers=h.headers(),json={'conversation_id':'forged'}).status_code==422
+        assert h.client.post('/api/chat-requests/r2/archive-conversation',headers=h.headers(h.secret_b),json={}).status_code==404
+        response=h.client.post('/api/chat-requests/r2/archive-conversation',headers=h.headers(),json={})
+        restored=h.client.post('/api/chat-requests/r2/restore-conversation',headers=h.headers(),json={})
+    assert response.status_code==200,response.text
+    assert response.json()=={'request_id':'r2','archived':True,'conversation':{'client_conversation_id':'dsh-session','protocol':'sequential-v1'}}
+    assert restored.status_code==200 and restored.json()['archived'] is False
+    assert archive.call_args_list[0].args[0]['parent_message_id']=='parent-secret'
+    assert [call.args[1] for call in archive.call_args_list]==[True,False]
+
+
+def test_archived_sequential_text_chat_is_restored_before_continuation():
+    service=ConversationBindingService();backend=Mock()
+    backend._get_conversation.return_value={'current_node':'previous-answer','is_archived':True}
+    body={'provider_binding_id':'binding','provider_account_identity':'account',
+          'client_conversation_id':'work','conversation_id':'chat','parent_message_id':'previous-answer',
+          '_public_session_ref':'s','_request_message_id':'our-user','model':'auto',
+          'messages':[{'role':'user','content':'do work'}]}
+    from contextlib import nullcontext
+    with patch('services.conversation_binding_service.account_service') as accounts, \
+         patch('services.conversation_binding_service.OpenAIBackendAPI',return_value=backend), \
+         patch('services.conversation_binding_service.conversation_events',return_value=iter([
+             {'type':'conversation.delta','conversation_id':'chat','delta':'original answer'}])), \
+         patch.object(service,'_read_text_request_result',return_value={'status':'succeeded','content':'original answer','conversation_id':'chat','parent_message_id':'new-final'}):
+        accounts.get_bound_account_identity.return_value='account'
+        accounts.get_bound_text_access_token.return_value='token'
+        accounts.conversation_binding_lock.return_value=nullcontext()
+        service.complete_text(body,on_cursor=Mock())
+    backend.set_conversation_archived.assert_called_once_with('chat','previous-answer',False)
+
+
+def test_uncertain_archive_restore_never_sends_a_new_text_turn(public_chat):
+    service=ConversationBindingService();backend=Mock()
+    backend._get_conversation.return_value={'current_node':'previous-answer','is_archived':True}
+    backend.set_conversation_archived.side_effect=TimeoutError('fixture timeout')
+    body={'provider_binding_id':'binding','provider_account_identity':'account',
+          'client_conversation_id':'work','conversation_id':'chat','parent_message_id':'previous-answer',
+          '_public_session_ref':'s','_request_message_id':'our-user','model':'auto',
+          'messages':[{'role':'user','content':'do work'}]}
+    from contextlib import nullcontext
+    with patch('services.conversation_binding_service.account_service') as accounts, \
+         patch('services.conversation_binding_service.OpenAIBackendAPI',return_value=backend), \
+         patch('services.conversation_binding_service.conversation_events') as send:
+        accounts.get_bound_account_identity.return_value='account'
+        accounts.get_bound_text_access_token.return_value='token'
+        accounts.conversation_binding_lock.return_value=nullcontext()
+        with pytest.raises(ConversationBindingError) as failure:
+            service.complete_text(body,on_cursor=Mock())
+    assert failure.value.code=='CHAT_ARCHIVE_RESTORE_UNCONFIRMED'
+    send.assert_not_called()
+    h=public_chat
+    h.tasks.runner=Mock(side_effect=ConversationBindingError('restore unavailable',code='CHAT_ARCHIVE_RESTORE_UNCONFIRMED'))
+    post(h,turn('same-request'));h.queue.run()
+    receipt=h.tasks.read(h.key_a['id'],'same-request')
+    assert receipt['status']=='failed' and receipt['upstream_outcome']=='not_sent'
+
+
 @pytest.mark.parametrize('status', ['queued','running','unknown','not_started','failed'])
 def test_previous_not_completed_never_advances_or_creates_a_request(public_chat, status):
     h=public_chat
@@ -162,6 +227,7 @@ def test_strict_session_uses_exact_original_final_not_latest_chat_answer():
     service=ConversationBindingService()
     backend=Mock()
     backend.text_request_parent_message_id='batch-user-parent'
+    backend._get_conversation.return_value={'current_node':'previous-answer','is_archived':False}
     backend.get_conversation_parent_message_id.return_value='unrelated-latest'
     body={'provider_binding_id':'binding','provider_account_identity':'account',
           'client_conversation_id':'work','conversation_id':'chat','parent_message_id':'previous-answer',
@@ -200,6 +266,7 @@ def test_sequential_partial_stream_never_becomes_success(state):
     service=ConversationBindingService()
     backend=Mock()
     backend.text_request_parent_message_id='batch-parent'
+    backend._get_conversation.return_value={'current_node':'previous-answer','is_archived':False}
     body={'provider_binding_id':'binding','provider_account_identity':'account',
           'client_conversation_id':'work','conversation_id':'chat','parent_message_id':'previous-answer',
           '_public_session_ref':'s','_request_message_id':'our-user','model':'auto',
