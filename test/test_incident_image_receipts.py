@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -18,6 +19,8 @@ def receipt(task_id: str, *, status: str = "success", owner: str = "owner-1") ->
         "status": status, "mode": "generate", "model": "gpt-image-2",
         "created_at": now, "updated_at": now, "created_ts": 1, "updated_ts": 2,
         "binding_status": "bound", "conversation_id": "original-conversation",
+        "provider_binding_id": "original-binding", "provider_account_identity": "original-account",
+        "client_conversation_id": "original-client", "parent_message_id": "original-parent",
         "error_code": "CONTENT_POLICY_VIOLATION" if status == "error" else "",
         "data": [] if status == "error" else [{"url": "https://example.test/images/original.png"}],
     }
@@ -35,7 +38,7 @@ class IncidentImageReceiptsTests(unittest.TestCase):
                       for task_id in self.ids]
         self.items.append(receipt("existing"))
         self._write_json()
-        with sqlite3.connect(self.db_path) as db:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
             db.execute("CREATE TABLE task_runtime(name TEXT PRIMARY KEY,value TEXT NOT NULL)")
             db.execute("INSERT INTO task_runtime VALUES('image_json_imported','true')")
             db.execute("CREATE TABLE image_requests(task_key TEXT PRIMARY KEY,receipt TEXT NOT NULL)")
@@ -53,7 +56,7 @@ class IncidentImageReceiptsTests(unittest.TestCase):
         self.json_path.write_text(json.dumps({"tasks": self.items}), encoding="utf-8")
 
     def _rows(self) -> dict[str, dict]:
-        with sqlite3.connect(self.db_path) as db:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
             return {key: json.loads(raw) for key, raw in db.execute("SELECT task_key,receipt FROM image_requests")}
 
     def test_dry_run_then_atomic_original_id_insert_preserves_existing_ledgers(self) -> None:
@@ -76,7 +79,7 @@ class IncidentImageReceiptsTests(unittest.TestCase):
         self.assertEqual(rows["owner-1:original-error"]["error_code"],
                          "CONTENT_POLICY_VIOLATION")
         self.assertNotIn("_recovery_suppressed", rows["owner-1:original-error"])
-        with sqlite3.connect(self.db_path) as db:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
             self.assertEqual(db.execute("SELECT count(*) FROM requests").fetchone()[0], 1)
         repeated = reconcile(self.root, self.ids, apply=True,
                              expected_json_sha256=preview["json_sha256"])
@@ -104,6 +107,21 @@ class IncidentImageReceiptsTests(unittest.TestCase):
         self._write_json()
         with self.assertRaisesRegex(ReconciliationError, "differs between ledgers"):
             reconcile(self.root, self.ids)
+
+    def test_changed_existing_original_identity_refuses(self) -> None:
+        existing = self.items[-1]
+        for field in (
+            "request_hash", "provider_binding_id", "provider_account_identity",
+            "client_conversation_id", "conversation_id", "parent_message_id",
+        ):
+            with self.subTest(field=field):
+                original = existing[field]
+                existing[field] = "different-original-identity"
+                self._write_json()
+                with self.assertRaisesRegex(ReconciliationError, "differs between ledgers"):
+                    reconcile(self.root, self.ids)
+                existing[field] = original
+        self._write_json()
 
     def test_nonterminal_or_resultless_success_refuses(self) -> None:
         for status, data, message in (("running", [], "not terminal"),
@@ -142,7 +160,8 @@ class IncidentImageReceiptsTests(unittest.TestCase):
                                    retention_days_getter=lambda: 30)
         with mock.patch("services.image_task_service.threading.Thread",
                         side_effect=AssertionError("recovery thread must not start")):
-            result = service.resume_poll({"id": "owner-1"}, "original-error")
+            result = service.resume_poll({"id": "owner-1"}, "original-error",
+                                         allow_unrecoverable_retry=True)
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
         self.assertTrue(self._rows()["owner-1:original-error"]["_recovery_suppressed"])
@@ -158,14 +177,14 @@ class IncidentImageReceiptsTests(unittest.TestCase):
             reconcile(self.root, self.ids, quarantine_unknown_ids={"another-id"})
 
     def test_missing_import_marker_refuses(self) -> None:
-        with sqlite3.connect(self.db_path) as db:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
             db.execute("DELETE FROM task_runtime")
         with self.assertRaisesRegex(ReconciliationError, "not confirmed"):
             reconcile(self.root, self.ids)
 
     def test_selected_id_under_another_owner_refuses(self) -> None:
         other = receipt("original-a", owner="owner-2")
-        with sqlite3.connect(self.db_path) as db:
+        with closing(sqlite3.connect(self.db_path)) as db, db:
             db.execute("INSERT INTO image_requests VALUES(?,?)",
                        ("owner-2:original-a", json.dumps(other)))
         with self.assertRaisesRegex(ReconciliationError, "another SQLite owner"):

@@ -37,13 +37,15 @@ def _identity(item: dict) -> tuple[str, str]:
     return owner, task_id
 
 
-def _projection(item: dict) -> tuple[str, str, str]:
+def _projection(item: dict) -> tuple[object, ...]:
     data = item.get("data")
-    return (
-        str(item.get("status") or ""),
-        str(item.get("binding_status") or ""),
-        hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+    identity_fields = (
+        "status", "binding_status", "request_hash", "provider_binding_id",
+        "provider_account_identity", "client_conversation_id", "conversation_id",
+        "parent_message_id",
     )
+    return (*(item.get(field) for field in identity_fields),
+            hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest())
 
 
 def _plan(db: sqlite3.Connection, items: list[dict], task_ids: list[str],
