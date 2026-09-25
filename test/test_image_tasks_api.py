@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.image_tasks as image_tasks_module
+from services.image_thread import ImageThreadError
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -21,6 +22,7 @@ class FakeImageTaskService:
         self.edit_calls = []
         self.resume_calls = []
         self.adoption_calls = []
+        self.manual_recovery_calls = []
 
     def submit_generation(self, identity, **kwargs):
         self.generation_calls.append((identity, kwargs))
@@ -80,6 +82,17 @@ class FakeImageTaskService:
             "updated_at": "2026-01-01 00:00:00",
             "adopted_source_request_message_id": kwargs.get("source_request_message_id"),
             "adopted_source_image_message_id": kwargs.get("source_image_message_id"),
+        }
+
+    def recover_manual(self, identity, task_id, **kwargs):
+        self.manual_recovery_calls.append((identity, task_id, kwargs))
+        return {
+            "id": task_id,
+            "status": "success",
+            "mode": "generate",
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00",
+            "data": [{"url": "http://testserver/images/manual.png"}],
         }
 
 
@@ -207,6 +220,65 @@ class ImageTasksApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 422, response.text)
         self.assertEqual(self.fake_service.adoption_calls, [])
+
+    def test_manual_recover_accepts_exact_workbench_authority_without_a_conversation_override(self):
+        response = self.client.post(
+            "/api/image-tasks/policy-task/manual-recover",
+            headers=AUTH_HEADERS,
+            json={
+                "provider_binding_id": "binding-1",
+                "provider_account_identity": "account-1",
+                "client_conversation_id": "client-chat-1",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["id"], "policy-task")
+        self.assertEqual(self.fake_service.manual_recovery_calls, [(
+            {"id": "test-key", "name": "Test", "role": "admin"},
+            "policy-task",
+            {
+                "provider_binding_id": "binding-1",
+                "provider_account_identity": "account-1",
+                "client_conversation_id": "client-chat-1",
+                "base_url": "http://testserver",
+            },
+        )])
+
+    def test_manual_recover_rejects_missing_or_extra_authority(self):
+        for body in (
+            {"provider_binding_id": "binding-1"},
+            {
+                "provider_binding_id": "binding-1",
+                "provider_account_identity": "account-1",
+                "client_conversation_id": "client-chat-1",
+                "conversation_id": "caller-chosen-conversation",
+            },
+        ):
+            with self.subTest(body=body):
+                response = self.client.post(
+                    "/api/image-tasks/policy-task/manual-recover",
+                    headers=AUTH_HEADERS,
+                    json=body,
+                )
+                self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.fake_service.manual_recovery_calls, [])
+
+    def test_manual_recover_returns_upstream_read_429_with_retry_after(self):
+        error = ImageThreadError("RECOVERY_RATE_LIMITED", status=429)
+        error.retry_after = 12
+        with mock.patch.object(self.fake_service, "recover_manual", side_effect=error):
+            response = self.client.post(
+                "/api/image-tasks/policy-task/manual-recover",
+                headers=AUTH_HEADERS,
+                json={
+                    "provider_binding_id": "binding-1",
+                    "provider_account_identity": "account-1",
+                    "client_conversation_id": "client-chat-1",
+                },
+            )
+        self.assertEqual(response.status_code, 429, response.text)
+        self.assertEqual(response.headers["Retry-After"], "12")
+        self.assertEqual(response.json()["detail"]["rate_limit"]["layer"], "chatgpt_upstream")
 
     def test_create_edit_task_accepts_image_url(self):
         """测试图片编辑任务接口支持表单 image_url 引用。"""

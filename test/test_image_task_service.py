@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from services.image_task_service import ImageTaskService, _authoritative_image_failure
+from services.image_thread import ImageThreadError
 from services.openai_backend_api import (
     ChatRequirements,
     ImageActiveDeadlineExceeded,
@@ -2151,6 +2152,131 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(AdoptionBackend.downloads, 1)
             self.assertEqual(generation_calls, [])
             self.assertEqual(AdoptionBackend.resolved[0][3]["request_message_id"], "manual-latest")
+
+    def test_workbench_manual_recovery_uses_the_original_task_and_latest_verified_image(self):
+        for error_code in ("content_policy_violation", "NO_IMAGE_GENERATED"):
+            with self.subTest(error_code=error_code), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                write_policy_task(path, error_code=error_code)
+                generation_calls = []
+                service = self.make_service(path, lambda payload: generation_calls.append(payload))
+                AdoptionBackend.document = manual_image_document()
+                AdoptionBackend.downloads = 0
+                AdoptionBackend.resolved = []
+                with (
+                    mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                    mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+                    mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "http://content/images/manual.png"}]}),
+                ):
+                    first = service.recover_manual(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        base_url="http://content",
+                    )
+                    second = service.recover_manual(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        base_url="http://content",
+                    )
+                persisted = self.make_service(path).list_tasks(OWNER, ["policy-task"])["items"][0]
+                self.assertEqual(first, second)
+                self.assertEqual(first["id"], "policy-task")
+                self.assertEqual(first["status"], "success")
+                self.assertEqual(first["data"], [{"url": "http://content/images/manual.png"}])
+                self.assertEqual(persisted["adopted_from_error_code"], error_code)
+                self.assertEqual(persisted["adopted_source_request_message_id"], "manual-latest")
+                self.assertEqual(persisted["adopted_source_image_message_id"], "latest-image")
+                self.assertEqual(AdoptionBackend.downloads, 1)
+                self.assertEqual(generation_calls, [])
+
+    def test_workbench_manual_recovery_rejects_unproven_or_stopped_originals_before_upstream_read(self):
+        cases = (
+            (OTHER_OWNER, {}, "task not found"),
+            (OWNER, {"request_message_id": ""}, "original request identity is unavailable"),
+            (OWNER, {"conversation_id": ""}, "original conversation identity is unavailable"),
+            (OWNER, {"error_code": "CONVERSATION_OUTCOME_UNKNOWN"}, "not eligible"),
+            (OWNER, {"_recovery_suppressed": True}, "recovery is stopped"),
+        )
+        for identity, overrides, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                write_policy_task(path, **overrides)
+                service = self.make_service(path)
+                if overrides.get("_recovery_suppressed") is True:
+                    # The production stop marker lives in the SQLite receipt;
+                    # the legacy JSON import intentionally selects old fields.
+                    with service._transaction():
+                        service._tasks["owner-1:policy-task"]["_recovery_suppressed"] = True
+                        service._save_locked()
+                with mock.patch("services.openai_backend_api.OpenAIBackendAPI") as backend:
+                    with self.assertRaisesRegex(ValueError, message):
+                        service.recover_manual(
+                            identity, "policy-task", provider_binding_id="binding-1",
+                            provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                        )
+                    backend.assert_not_called()
+                original = service.list_tasks(OWNER, ["policy-task"])["items"][0]
+                self.assertEqual(original["status"], "error")
+                self.assertEqual(original.get("error_code"), overrides.get("error_code", "content_policy_violation"))
+
+    def test_workbench_manual_recovery_rejects_foreign_authority_and_active_latest_turn(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            with mock.patch("services.openai_backend_api.OpenAIBackendAPI") as backend:
+                with self.assertRaisesRegex(ValueError, "authority does not match"):
+                    service.recover_manual(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="other-product",
+                    )
+                backend.assert_not_called()
+            AdoptionBackend.document = manual_image_document(latest_active=True)
+            AdoptionBackend.downloads = 0
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+            ):
+                with self.assertRaisesRegex(ValueError, "latest manual request is still active"):
+                    service.recover_manual(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                    )
+            self.assertEqual(AdoptionBackend.downloads, 0)
+            self.assertEqual(service.list_tasks(OWNER, ["policy-task"])["items"][0]["status"], "error")
+
+    def test_workbench_manual_recovery_preserves_upstream_read_rate_limit(self):
+        class ReadRateLimited(Exception):
+            status_code = 429
+            retry_after = 12
+
+        class LimitedBackend(AdoptionBackend):
+            def _get_conversation(self, _conversation_id):
+                raise ReadRateLimited("upstream read limited")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", LimitedBackend),
+            ):
+                with self.assertRaises(ImageThreadError) as raised:
+                    service.recover_manual(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                    )
+            self.assertEqual(raised.exception.code, "RECOVERY_RATE_LIMITED")
+            self.assertEqual(raised.exception.status, 429)
+            self.assertEqual(raised.exception.retry_after, 12)
+            self.assertEqual(service.list_tasks(OWNER, ["policy-task"])["items"][0]["status"], "error")
 
     def test_adoption_never_falls_back_when_latest_manual_turn_is_active(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
