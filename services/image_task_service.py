@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import hashlib
 import threading
@@ -60,6 +61,22 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
             if isinstance(url, str) and url:
                 urls.append(url)
     return urls
+
+
+def _record_after_task(record: dict[str, Any], task_created_ts: float) -> bool:
+    """Keep only image records created after this task was submitted.
+
+    ChatGPT conversation records expose ``create_time`` as Unix seconds.  A
+    missing/zero timestamp is deliberately rejected: accepting an old image
+    would attach a different product turn to the current task.
+    """
+    if task_created_ts <= 0:
+        return False
+    try:
+        created = float(record.get("create_time") or 0)
+    except (TypeError, ValueError):
+        return False
+    return created > task_created_ts
 
 
 def _request_hash(mode: str, payload: dict[str, Any]) -> str:
@@ -661,6 +678,127 @@ class ImageTaskService:
         )
         thread.start()
         return _public_task(task)
+
+    def recover_manual(
+        self,
+        identity: dict[str, object],
+        task_id: str,
+        *,
+        provider_binding_id: str,
+        provider_account_identity: str,
+        client_conversation_id: str,
+        base_url: str = "",
+    ) -> dict[str, Any]:
+        """Read a manually-created image from the task's bound conversation.
+
+        This never submits a new prompt.  It only accepts an image that was
+        added after the original task was created, on the exact persisted
+        account/binding/client conversation.  The existing task id is updated
+        to success so the Workbench's normal asset writer performs the same
+        download, watermark, checksum, and public readback path.
+        """
+        owner = _owner_id(identity)
+        key = _task_key(owner, _clean(task_id))
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("task not found")
+            if task.get("status") == TASK_STATUS_SUCCESS:
+                return _public_task(task)
+            if task.get("status") != TASK_STATUS_ERROR:
+                return _public_task(task)
+            if _clean(task.get("error_code")) not in {
+                "CONTENT_POLICY_VIOLATION", "NO_IMAGE_GENERATED", "CONVERSATION_OUTCOME_UNKNOWN",
+            }:
+                return _public_task(task)
+            expected = {
+                "provider_binding_id": _clean(provider_binding_id),
+                "provider_account_identity": _clean(provider_account_identity),
+                "client_conversation_id": _clean(client_conversation_id),
+            }
+            if any(not value for value in expected.values()) or any(
+                _clean(task.get(field)) != value for field, value in expected.items()
+            ):
+                raise ValueError("manual image recovery authority mismatch")
+            conversation_id = _clean(task.get("conversation_id"))
+            if not conversation_id:
+                return _public_task(task)
+            model = _clean(task.get("model"), "gpt-image-2")
+            task_created_ts = float(task.get("created_ts") or 0)
+            task_base_url = _clean(task.get("base_url")) or _clean(base_url)
+
+        from services.account_service import account_service
+        from services.openai_backend_api import OpenAIBackendAPI
+        from services.protocol.conversation import format_image_result
+
+        started = time.time()
+        access_token = ""
+        backend = None
+        try:
+            authoritative_identity = account_service.get_bound_account_identity(
+                expected["provider_binding_id"]
+            )
+            if authoritative_identity != expected["provider_account_identity"]:
+                raise ValueError("manual image recovery account identity changed")
+            access_token = account_service.acquire_bound_image_access_token(
+                expected["provider_binding_id"], image_model=model,
+            )
+            with account_service.conversation_binding_lock(
+                expected["provider_binding_id"], expected["client_conversation_id"]
+            ):
+                backend = OpenAIBackendAPI(access_token=access_token)
+                document = backend._get_conversation(conversation_id)
+                records = backend._extract_image_tool_records(document)
+                fresh = [record for record in records if _record_after_task(record, task_created_ts)]
+                if not fresh:
+                    return self._public_task_by_key(key)
+                file_ids: list[str] = []
+                sediment_ids: list[str] = []
+                for record in fresh:
+                    for file_id in record["file_ids"]:
+                        if file_id not in file_ids:
+                            file_ids.append(file_id)
+                    for sediment_id in record["sediment_ids"]:
+                        if sediment_id not in sediment_ids:
+                            sediment_ids.append(sediment_id)
+                urls = backend.resolve_conversation_image_urls(
+                    conversation_id, file_ids, sediment_ids, poll=False,
+                )
+                if not urls:
+                    return self._public_task_by_key(key)
+                image_items = [
+                    {"b64_json": base64.b64encode(image_data).decode("ascii")}
+                    for image_data in backend.download_image_bytes(urls)
+                ]
+                data = format_image_result(
+                    image_items, "", "url", task_base_url, int(time.time()),
+                )["data"]
+                if not data:
+                    return self._public_task_by_key(key)
+                parent_message_id = backend.get_conversation_parent_message_id(conversation_id)
+            self._update_task(
+                key,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                error="",
+                error_code="",
+                binding_status="bound",
+                parent_message_id=parent_message_id,
+                duration_ms=int((time.time() - started) * 1000),
+            )
+            return self._public_task_by_key(key)
+        finally:
+            if backend is not None:
+                backend.close()
+            if access_token:
+                account_service.release_image_slot(access_token)
+
+    def _public_task_by_key(self, key: str) -> dict[str, Any]:
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("task not found")
+            return _public_task(task)
 
     def _run_resume_poll(
         self,

@@ -206,6 +206,113 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["image_session_parent_id"], "message-2")
             self.assertEqual(task["data"], [{"url": "http://content-provider/images/result.png"}])
 
+    def test_manual_recovery_reads_a_new_image_from_the_same_bound_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            error = RuntimeError("blocked")
+            error.code = "CONTENT_POLICY_VIOLATION"
+            error.provider_binding_id = "cb_account_a"
+            error.provider_account_identity = "account_opaque_a"
+            error.conversation_id = "conversation-1"
+
+            def handler(_payload):
+                raise error
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="manual-task",
+                prompt="original",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://content-provider",
+                provider_binding_id="cb_account_a",
+                provider_account_identity="account_opaque_a",
+                client_conversation_id="product-conversation-1",
+                retain_conversation=True,
+            )
+            failed = wait_for_task(service, OWNER, "manual-task", "error")
+            self.assertEqual(failed["error_code"], "CONTENT_POLICY_VIOLATION")
+
+            class FakeBackend:
+                def __init__(self, access_token=None, proxy_url=None):
+                    self.access_token = access_token
+
+                def _get_conversation(self, _conversation_id):
+                    return {
+                        "current_node": "assistant-manual",
+                        "mapping": {
+                            "assistant-manual": {
+                                "message": {
+                                    "author": {"role": "assistant"},
+                                    "metadata": {"async_task_type": "image_gen"},
+                                    "content": {"content_type": "multimodal_text", "parts": []},
+                                    "create_time": time.time() + 1,
+                                },
+                            },
+                        },
+                    }
+
+                def _extract_image_tool_records(self, _document):
+                    return [{"create_time": time.time() + 1, "file_ids": ["file-manual"], "sediment_ids": []}]
+
+                def resolve_conversation_image_urls(self, conversation_id, file_ids, sediment_ids, poll=False):
+                    self.resolution = (conversation_id, file_ids, sediment_ids, poll)
+                    return ["https://provider.example/manual.png"]
+
+                def download_image_bytes(self, _urls):
+                    return [b"manual-image"]
+
+                def get_conversation_parent_message_id(self, _conversation_id):
+                    return "assistant-manual"
+
+                def close(self):
+                    return None
+
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account_opaque_a"),
+                mock.patch("services.account_service.account_service.acquire_bound_image_access_token", return_value="bound-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.account_service.account_service.release_image_slot") as release,
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", FakeBackend),
+                mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "http://content-provider/images/manual.png"}]}),
+            ):
+                recovered = service.recover_manual(
+                    OWNER,
+                    "manual-task",
+                    provider_binding_id="cb_account_a",
+                    provider_account_identity="account_opaque_a",
+                    client_conversation_id="product-conversation-1",
+                    base_url="http://content-provider",
+                )
+
+            self.assertEqual(recovered["status"], "success")
+            self.assertEqual(recovered["data"], [{"url": "http://content-provider/images/manual.png"}])
+            self.assertEqual(recovered["image_session_id"], "conversation-1")
+            self.assertEqual(recovered["image_session_parent_id"], "assistant-manual")
+            release.assert_called_once_with("bound-token")
+
+    def test_manual_recovery_rejects_a_foreign_binding(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+            with service._lock:
+                service._tasks["owner-1:manual-task"] = {
+                    "id": "manual-task", "owner_id": "owner-1", "status": "error",
+                    "mode": "edit", "model": "gpt-image-2", "created_at": "2026-01-01 00:00:00",
+                    "updated_at": "2026-01-01 00:00:00", "created_ts": time.time(),
+                    "provider_binding_id": "binding-a", "provider_account_identity": "account-a",
+                    "client_conversation_id": "product-a", "conversation_id": "conversation-a",
+                    "parent_message_id": "", "binding_status": "bound",
+                    "error_code": "CONTENT_POLICY_VIOLATION", "request_hash": "hash",
+                }
+            with self.assertRaisesRegex(ValueError, "authority mismatch"):
+                service.recover_manual(
+                    OWNER,
+                    "manual-task",
+                    provider_binding_id="binding-b",
+                    provider_account_identity="account-b",
+                    client_conversation_id="product-b",
+                )
+
     def test_authoritative_finished_image_failure_is_terminal(self):
         document = {
             "current_node": "assistant-1",

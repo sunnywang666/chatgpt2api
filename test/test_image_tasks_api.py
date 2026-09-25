@@ -20,6 +20,7 @@ class FakeImageTaskService:
         self.generation_calls = []
         self.edit_calls = []
         self.resume_calls = []
+        self.manual_recovery_calls = []
 
     def submit_generation(self, identity, **kwargs):
         self.generation_calls.append((identity, kwargs))
@@ -67,6 +68,17 @@ class FakeImageTaskService:
             "mode": "generate",
             "created_at": "2026-01-01 00:00:00",
             "updated_at": "2026-01-01 00:00:00",
+        }
+
+    def recover_manual(self, identity, task_id, **kwargs):
+        self.manual_recovery_calls.append((identity, task_id, kwargs))
+        return {
+            "id": task_id,
+            "status": "success",
+            "mode": "edit",
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00",
+            "data": [{"url": "http://testserver/images/manual.png"}],
         }
 
 
@@ -139,6 +151,22 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["status"], "running")
         self.assertEqual(self.fake_service.resume_calls[0][1:], ("task-1", 45.0, "http://testserver"))
+
+    def test_manual_recovery_is_scoped_to_the_exact_binding_and_conversation(self):
+        response = self.client.post(
+            "/api/image-tasks/task-1/manual-recover",
+            headers=AUTH_HEADERS,
+            json={
+                "provider_binding_id": "binding-1",
+                "provider_account_identity": "account-1",
+                "client_conversation_id": "product-1",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "success")
+        self.assertEqual(self.fake_service.manual_recovery_calls[0][1], "task-1")
+        self.assertEqual(self.fake_service.manual_recovery_calls[0][2]["base_url"], "http://testserver")
 
     def test_create_edit_task_accepts_image_url(self):
         """测试图片编辑任务接口支持表单 image_url 引用。"""
