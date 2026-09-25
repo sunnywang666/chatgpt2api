@@ -226,6 +226,8 @@ def _latest_completed_manual_image_turn(
     original_request_message_id: str,
     original_task_created_ts: float,
     extract_records: Callable[[dict[str, Any], str], list[dict[str, Any]]],
+    *,
+    require_original_on_current_branch: bool = False,
 ) -> tuple[str, dict[str, Any], str]:
     """Select the latest completed manual image turn on the authoritative branch.
 
@@ -264,6 +266,8 @@ def _latest_completed_manual_image_turn(
     )
     if not original_request_verified:
         raise ConversationImageAdoptionError("original request is not a verified user message")
+    if require_original_on_current_branch and original_request_message_id not in path:
+        raise ConversationImageAdoptionError("original request is not on the current conversation branch")
     if original_request_message_id in path:
         original_index = path.index(original_request_message_id)
     else:
@@ -1609,6 +1613,7 @@ class ImageTaskService:
                 conversation_id=conversation_id,
                 base_url=base_url,
                 allow_no_image_generated=True,
+                require_original_on_current_branch=True,
             )
         except ConversationImageAdoptionError as exc:
             # A read-only upstream 429 is not a task outcome or an invalid
@@ -1633,6 +1638,7 @@ class ImageTaskService:
         source_image_message_id: str = "",
         base_url: str = "",
         allow_no_image_generated: bool = False,
+        require_original_on_current_branch: bool = False,
     ) -> dict[str, Any]:
         """Adopt the latest completed manual image turn without generating again."""
         owner = _owner_id(identity)
@@ -1718,6 +1724,7 @@ class ImageTaskService:
                     original_request_message_id,
                     float(original_task_created_ts or 0),
                     backend._extract_image_tool_records,
+                    require_original_on_current_branch=require_original_on_current_branch,
                 )
                 if expected_source_request and source_request_id != expected_source_request:
                     raise ConversationImageAdoptionError("specified manual request is not the latest completed image turn")
@@ -1755,6 +1762,7 @@ class ImageTaskService:
                         original_request_message_id,
                         float(original_task_created_ts or 0),
                         backend._extract_image_tool_records,
+                        require_original_on_current_branch=require_original_on_current_branch,
                     )
                 )
                 latest_tasks = backend._query_backend_tasks(

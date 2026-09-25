@@ -8,6 +8,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.image_tasks as image_tasks_module
+from api.company_requests import company_request_boundary
+from api.external_images import external_image_boundary
 from services.image_thread import ImageThreadError
 
 
@@ -279,6 +281,33 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 429, response.text)
         self.assertEqual(response.headers["Retry-After"], "12")
         self.assertEqual(response.json()["detail"]["rate_limit"]["layer"], "chatgpt_upstream")
+
+    def test_manual_recover_uses_workbench_direct_bearer_route_without_opening_other_ingress(self):
+        app = FastAPI()
+        app.middleware("http")(external_image_boundary)
+        app.middleware("http")(company_request_boundary)
+        app.include_router(image_tasks_module.create_router())
+        client = TestClient(app)
+        body = {
+            "provider_binding_id": "binding-1",
+            "provider_account_identity": "account-1",
+            "client_conversation_id": "client-chat-1",
+        }
+        response = client.post(
+            "/api/image-tasks/policy-task/manual-recover",
+            headers={**AUTH_HEADERS, "x-workbench-consumer": "listing"},
+            json=body,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["id"], "policy-task")
+        self.assertEqual(len(self.fake_service.manual_recovery_calls), 1)
+        blocked = client.post(
+            "/api/image-tasks/policy-task/manual-recover",
+            headers={**AUTH_HEADERS, "x-workbench-image-client": "1"},
+            json=body,
+        )
+        self.assertEqual(blocked.status_code, 404)
+        self.assertEqual(len(self.fake_service.manual_recovery_calls), 1)
 
     def test_create_edit_task_accepts_image_url(self):
         """测试图片编辑任务接口支持表单 image_url 引用。"""

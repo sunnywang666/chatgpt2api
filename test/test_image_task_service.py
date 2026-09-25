@@ -2249,6 +2249,34 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(AdoptionBackend.downloads, 0)
             self.assertEqual(service.list_tasks(OWNER, ["policy-task"])["items"][0]["status"], "error")
 
+    def test_workbench_manual_recovery_never_adopts_a_later_sibling_branch_image(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path, error_code="NO_IMAGE_GENERATED")
+            service = self.make_service(path)
+            # The image is newer and shares an ancestor, but the original sent
+            # request is not on the current branch. Time alone is insufficient.
+            AdoptionBackend.document = manual_image_document(divergent=True)
+            AdoptionBackend.downloads = 0
+            AdoptionBackend.resolved = []
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", AdoptionBackend),
+            ):
+                with self.assertRaisesRegex(ValueError, "original request is not on the current conversation branch"):
+                    service.recover_manual(
+                        OWNER, "policy-task", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-chat-1",
+                    )
+            self.assertEqual(AdoptionBackend.downloads, 0)
+            self.assertEqual(AdoptionBackend.resolved, [])
+            result = service.list_tasks(OWNER, ["policy-task"])["items"][0]
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["error_code"], "NO_IMAGE_GENERATED")
+            self.assertNotIn("adopted_source_request_message_id", result)
+
     def test_workbench_manual_recovery_preserves_upstream_read_rate_limit(self):
         class ReadRateLimited(Exception):
             status_code = 429
