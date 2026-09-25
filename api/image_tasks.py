@@ -55,6 +55,16 @@ class AdoptLatestConversationImageRequest(BaseModel):
     source_image_message_id: str = Field(default="", max_length=300)
 
 
+class ManualRecoveryRequest(BaseModel):
+    """Workbench's original-task authority; the Provider owns the conversation ID."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_binding_id: str = Field(..., min_length=1, max_length=300)
+    provider_account_identity: str = Field(..., min_length=1, max_length=300)
+    client_conversation_id: str = Field(..., min_length=1, max_length=300)
+
+
 def _parse_task_ids(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -243,6 +253,44 @@ def create_router() -> APIRouter:
             )
             return client_task(result, request)
         except ImageThreadError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-tasks/{task_id}/manual-recover")
+    async def recover_manual_image(
+        task_id: str,
+        body: ManualRecoveryRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization, request=request)
+        try:
+            result = await run_in_threadpool(
+                image_task_service.recover_manual,
+                identity,
+                task_id,
+                provider_binding_id=body.provider_binding_id,
+                provider_account_identity=body.provider_account_identity,
+                client_conversation_id=body.client_conversation_id,
+                base_url=resolve_image_base_url(request),
+            )
+            return client_task(result, request)
+        except ImageThreadError as exc:
+            if exc.code == "RECOVERY_RATE_LIMITED":
+                retry_after = getattr(exc, "retry_after", None)
+                raise HTTPException(
+                    429,
+                    detail={
+                        "code": exc.code,
+                        "rate_limit": {
+                            "layer": "chatgpt_upstream",
+                            "phase": "manual_recovery_read",
+                            "retry_after_seconds": retry_after,
+                        },
+                    },
+                    headers={"Retry-After": str(retry_after)} if retry_after is not None else None,
+                ) from None
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc

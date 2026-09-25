@@ -226,6 +226,8 @@ def _latest_completed_manual_image_turn(
     original_request_message_id: str,
     original_task_created_ts: float,
     extract_records: Callable[[dict[str, Any], str], list[dict[str, Any]]],
+    *,
+    require_original_on_current_branch: bool = False,
 ) -> tuple[str, dict[str, Any], str]:
     """Select the latest completed manual image turn on the authoritative branch.
 
@@ -264,6 +266,8 @@ def _latest_completed_manual_image_turn(
     )
     if not original_request_verified:
         raise ConversationImageAdoptionError("original request is not a verified user message")
+    if require_original_on_current_branch and original_request_message_id not in path:
+        raise ConversationImageAdoptionError("original request is not on the current conversation branch")
     if original_request_message_id in path:
         original_index = path.index(original_request_message_id)
     else:
@@ -1554,6 +1558,73 @@ class ImageTaskService:
         thread.start()
         return _public_task(task)
 
+    def recover_manual(
+        self,
+        identity: dict[str, object],
+        task_id: str,
+        *,
+        provider_binding_id: str,
+        provider_account_identity: str,
+        client_conversation_id: str,
+        base_url: str = "",
+    ) -> dict[str, Any]:
+        """Resolve a later manual image on the original task's bound branch.
+
+        The caller cannot choose a Provider conversation or an image node.  The
+        existing adoption path verifies the original sent message and the
+        latest completed manual turn before atomically saving the result.
+        """
+        owner = _owner_id(identity)
+        key = _task_key(owner, _clean(task_id))
+        supplied_identity = tuple(map(_clean, (
+            provider_binding_id, provider_account_identity, client_conversation_id,
+        )))
+        if not all(supplied_identity):
+            raise ConversationImageAdoptionError("complete conversation authority is required")
+        with self._transaction():
+            task = self._tasks.get(key)
+            if task is None:
+                raise ConversationImageAdoptionError("task not found")
+            if tuple(_clean(task.get(field)) for field in (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id",
+            )) != supplied_identity:
+                raise ConversationImageAdoptionError("conversation authority does not match the original task")
+            if task.get("_recovery_suppressed") is True:
+                raise ConversationImageAdoptionError("original task recovery is stopped")
+            if task.get("status") == TASK_STATUS_SUCCESS:
+                return _public_task(task)
+            if task.get("status") != TASK_STATUS_ERROR or _clean(task.get("error_code")).lower() not in {
+                "content_policy_violation", "no_image_generated",
+            }:
+                raise ConversationImageAdoptionError("task is not eligible for manual image adoption")
+            if not _clean(task.get("request_message_id")):
+                raise ConversationImageAdoptionError("original request identity is unavailable")
+            conversation_id = _clean(task.get("conversation_id"))
+            if not conversation_id:
+                raise ConversationImageAdoptionError("original conversation identity is unavailable")
+
+        try:
+            return self.adopt_latest_conversation_image(
+                identity,
+                task_id,
+                provider_binding_id=provider_binding_id,
+                provider_account_identity=provider_account_identity,
+                client_conversation_id=client_conversation_id,
+                conversation_id=conversation_id,
+                base_url=base_url,
+                allow_no_image_generated=True,
+                require_original_on_current_branch=True,
+            )
+        except ConversationImageAdoptionError as exc:
+            # A read-only upstream 429 is not a task outcome or an invalid
+            # manual image. Preserve its layer and Retry-After for the caller.
+            upstream = exc.__cause__
+            if upstream is not None and _upstream_status_code(upstream) == 429:
+                error = ImageThreadError("RECOVERY_RATE_LIMITED", status=429)
+                error.retry_after = _retry_after_seconds(upstream)
+                raise error from exc
+            raise
+
     def adopt_latest_conversation_image(
         self,
         identity: dict[str, object],
@@ -1566,6 +1637,8 @@ class ImageTaskService:
         source_request_message_id: str = "",
         source_image_message_id: str = "",
         base_url: str = "",
+        allow_no_image_generated: bool = False,
+        require_original_on_current_branch: bool = False,
     ) -> dict[str, Any]:
         """Adopt the latest completed manual image turn without generating again."""
         owner = _owner_id(identity)
@@ -1580,6 +1653,9 @@ class ImageTaskService:
             raise ConversationImageAdoptionError("complete conversation authority is required")
         expected_source_request = _clean(source_request_message_id)
         expected_source_image = _clean(source_image_message_id)
+        eligible_errors = {"content_policy_violation"}
+        if allow_no_image_generated:
+            eligible_errors.add("no_image_generated")
 
         with self._transaction():
             task = self._tasks.get(key)
@@ -1593,6 +1669,8 @@ class ImageTaskService:
             ))
             if stored_identity != supplied_identity:
                 raise ConversationImageAdoptionError("conversation authority does not match the original task")
+            if task.get("_recovery_suppressed") is True:
+                raise ConversationImageAdoptionError("original task recovery is stopped")
             if task.get("status") == TASK_STATUS_SUCCESS:
                 if task.get("adopted_source_request_message_id"):
                     if (
@@ -1615,7 +1693,7 @@ class ImageTaskService:
                 raise ConversationImageAdoptionError("task already completed without manual image adoption")
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ConversationImageAdoptionError("task is not in a terminal error state")
-            if _clean(task.get("error_code")).lower() != "content_policy_violation":
+            if _clean(task.get("error_code")).lower() not in eligible_errors:
                 raise ConversationImageAdoptionError("task is not eligible for manual image adoption")
             original_request_message_id = _clean(task.get("request_message_id"))
             if not original_request_message_id:
@@ -1646,6 +1724,7 @@ class ImageTaskService:
                     original_request_message_id,
                     float(original_task_created_ts or 0),
                     backend._extract_image_tool_records,
+                    require_original_on_current_branch=require_original_on_current_branch,
                 )
                 if expected_source_request and source_request_id != expected_source_request:
                     raise ConversationImageAdoptionError("specified manual request is not the latest completed image turn")
@@ -1683,6 +1762,7 @@ class ImageTaskService:
                         original_request_message_id,
                         float(original_task_created_ts or 0),
                         backend._extract_image_tool_records,
+                        require_original_on_current_branch=require_original_on_current_branch,
                     )
                 )
                 latest_tasks = backend._query_backend_tasks(
@@ -1735,7 +1815,8 @@ class ImageTaskService:
                 ))
                 if (
                     current.get("status") != TASK_STATUS_ERROR
-                    or _clean(current.get("error_code")).lower() != "content_policy_violation"
+                    or _clean(current.get("error_code")).lower() not in eligible_errors
+                    or current.get("_recovery_suppressed") is True
                     or _clean(current.get("request_message_id")) != original_request_message_id
                     or current_identity != supplied_identity
                 ):
