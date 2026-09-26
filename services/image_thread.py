@@ -196,18 +196,12 @@ def bind_waiting_threads(store, db, receipts):
                 store.write_receipt(db, kind, owner, task_id, task)
 
 
-def _matching_image_tool_result(message, expected_result_ids):
-    expected = {item for item in (expected_result_ids or ()) if isinstance(item, str) and item}
-    if not expected:
-        return False
-    # The image tool can be the committed leaf without a later assistant final.
-    # Its asset pointers must be the exact result IDs already saved on this
-    # original receipt; a nearby image or an arbitrary tool reply is not proof.
+def _image_result_ids(message):
     payload = {"content": message.get("content"), "metadata": message.get("metadata")}
     if not OpenAIBackendAPI._has_image_asset_pointer(payload):
-        return False
+        return set()
     file_ids, sediment_ids = OpenAIBackendAPI._extract_image_reference_ids(payload)
-    return set(file_ids) | set(sediment_ids) == expected
+    return set(file_ids) | set(sediment_ids)
 
 
 def finished_parent(document, conversation_id, request_message_id, *, expected_parent=None,
@@ -235,7 +229,9 @@ def finished_parent(document, conversation_id, request_message_id, *, expected_p
     if expected_parent is not None and children.get(expected_parent) != [request_message_id]:
         raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
     seen, current = {request_message_id}, request_message_id
-    previous_role = "user"
+    saw_assistant = False
+    expected = {item for item in (expected_result_ids or ()) if isinstance(item, str) and item}
+    observed = set()
     for _ in range(len(mapping)):
         next_ids = children.get(current, [])
         if len(next_ids) != 1:
@@ -251,13 +247,17 @@ def finished_parent(document, conversation_id, request_message_id, *, expected_p
                 or msg.get("status") != "finished_successfully"):
             raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED")
         role = (msg.get("author") or {}).get("role")
+        if role == "assistant":
+            saw_assistant = True
+        observed.update(_image_result_ids(msg))
+        if expected and not observed <= expected:
+            raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
         if role == "assistant" and msg.get("end_turn") is True:
             if msg.get("channel") not in {None, "final"} or document.get("current_node") != current or children.get(current):
                 raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
             return current
-        if (role == "tool" and previous_role == "assistant"
+        if (role == "tool" and saw_assistant and expected
                 and document.get("current_node") == current and not children.get(current)
-                and _matching_image_tool_result(msg, expected_result_ids)):
+                and _image_result_ids(msg) and observed == expected):
             return current
-        previous_role = role
     raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED")

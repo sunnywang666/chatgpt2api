@@ -588,6 +588,30 @@ def test_tool_leaf_accepts_exact_saved_asset():
         expected_result_ids=[result_id, result_id]) == "request-a-image"
 
 
+@pytest.mark.parametrize("change", [None, "missing-asset", "extra-asset", "unfinished", "sibling", "drift"])
+def test_consecutive_image_tool_results_require_exact_original_branch_and_all_saved_assets(change):
+    doc, first_id = tool_document()
+    second_id = "file_00000000" + "b" * 24
+    second = node("request-a-image-2", "tool", "request-a-image")
+    second["message"]["content"] = {"content_type": "multimodal_text", "parts": [
+        {"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + second_id}]}
+    doc["mapping"]["request-a-image-2"] = second
+    doc["current_node"] = "request-a-image-2"
+    expected = [first_id, first_id, second_id, second_id]
+    if change == "missing-asset": expected = [first_id]
+    elif change == "extra-asset": expected.append("file_00000000" + "c" * 24)
+    elif change == "unfinished": second["message"]["status"] = "in_progress"
+    elif change == "sibling": doc["mapping"]["other"] = node("other", "tool", "request-a-image")
+    elif change == "drift": doc["current_node"] = "request-a-image"
+    if change is None:
+        assert finished_parent(doc, "conversation-a", "request-a", expected_parent="root",
+            expected_result_ids=expected) == "request-a-image-2"
+    else:
+        with pytest.raises(ImageThreadError):
+            finished_parent(doc, "conversation-a", "request-a", expected_parent="root",
+                expected_result_ids=expected)
+
+
 def test_accepted_edit_does_not_dispatch_if_source_record_is_later_replaced(runtime):
     r=runtime;r.submit("a1");run_next(r,"a1");r.submit("edit",source="a1")
     with r.store.transaction() as db:
