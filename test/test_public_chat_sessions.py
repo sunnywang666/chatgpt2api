@@ -133,6 +133,159 @@ def test_previous_not_completed_never_advances_or_creates_a_request(public_chat,
     assert len(h.queue.calls)==1
 
 
+def terminal_empty_original(h):
+    """An exact-account, sent original with an empty final upstream turn."""
+    assert post(h, turn('r1')).status_code == 202
+    owner = h.key_a['id']
+    with h.tasks._db() as db:
+        original = h.tasks.store.read_receipt(db, 'text', owner, 'r1')
+    evidence = {'conversation_id': 'original-conversation',
+                'request_message_id': original['request_message_id'],
+                'final_message_id': 'empty-final', 'observed_at': 100.0}
+    h.tasks._update(owner, 'r1', status='unknown', error_code='CONVERSATION_OUTCOME_UNKNOWN',
+                    recovery_reason='REQUEST_RESULT_TERMINAL_EMPTY', _upstream_terminal=True,
+                    provider_binding_id='original-binding', provider_account_identity='original-account',
+                    conversation_id='original-conversation', _turn_end_evidence=evidence)
+    h.queue.calls.clear()  # The original sent turn is represented by its durable receipt.
+    h.tasks.recovery_reader = lambda receipt: {
+        'status': 'unknown', 'recovery_reason': 'REQUEST_RESULT_TERMINAL_EMPTY',
+        'provider_binding_id': receipt['provider_binding_id'],
+        'provider_account_identity': receipt['provider_account_identity'],
+        'client_conversation_id': receipt['client_conversation_id'],
+        'conversation_id': receipt['conversation_id'], '_turn_end_evidence': evidence,
+    }
+    return evidence
+
+
+def test_verified_terminal_empty_allows_one_new_same_conversation_correction(public_chat):
+    h = public_chat
+    evidence = terminal_empty_original(h)
+    owner = h.key_a['id']
+    original = h.client.get('/api/chat-requests/r1', headers=h.headers()).json()
+    assert original['status'] == 'unknown'
+    assert original['terminal_empty'] == {'verified': True, 'original_request_id': 'r1',
+                                          'observed_at': 100.0, 'same_conversation_continuation': True}
+    assert 'original-binding' not in json.dumps(original)
+    with h.tasks._db() as db:
+        before = db.execute('SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?',
+                            (owner, 'r1')).fetchone()
+    assert post(h, turn('plain','r1')).json()['detail']['code'] == 'CHAT_PREVIOUS_REQUEST_PENDING'
+    correction = {**turn('r2','r1'), 'continue_after_terminal_empty': True}
+    accepted = post(h, correction)
+    assert accepted.status_code == 202, accepted.text
+    assert accepted.json()['correction_of_request_id'] == 'r1'
+    assert post(h, {**turn('r3','r1'), 'continue_after_terminal_empty': True}).json()['detail']['code'] == 'CHAT_CONVERSATION_CONFLICT'
+    h.queue.run()
+    sent = h.upstream.call_args.args[0]
+    assert sent['provider_binding_id'] == 'original-binding'
+    assert sent['provider_account_identity'] == 'original-account'
+    assert sent['conversation_id'] == evidence['conversation_id']
+    assert sent['parent_message_id'] == evidence['final_message_id']
+    assert sent['_request_message_id'] != evidence['request_message_id']
+    with h.tasks._db() as db:
+        after = db.execute('SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?',
+                           (owner, 'r1')).fetchone()
+    assert before == after, 'the original UNKNOWN and input identity must remain unchanged'
+    assert post(h, correction).status_code == 200
+    assert h.upstream.call_count == 1
+
+
+def test_terminal_empty_correction_requires_exact_proof_and_fresh_read(public_chat):
+    h = public_chat
+    evidence = terminal_empty_original(h)
+    owner = h.key_a['id']
+    correction = {**turn('r2','r1'), 'continue_after_terminal_empty': True}
+    assert post(h, {**correction, 'model': 'gpt-text-2'}).json()['detail']['code'] == 'CHAT_TERMINAL_EMPTY_UNVERIFIED'
+    foreign = h.client.post('/api/chat-requests', headers=h.headers(h.secret_b), json=correction)
+    assert foreign.status_code == 409
+    h.tasks.recovery_reader = lambda receipt: {
+        'status': 'unknown', 'recovery_reason': 'REQUEST_RESULT_TERMINAL_EMPTY',
+        'provider_binding_id': receipt['provider_binding_id'],
+        'provider_account_identity': receipt['provider_account_identity'],
+        'client_conversation_id': receipt['client_conversation_id'],
+        'conversation_id': receipt['conversation_id'],
+        '_turn_end_evidence': {**evidence, 'final_message_id': 'different-final'},
+    }
+    assert post(h, correction).status_code == 202
+    h.queue.run()
+    result = h.client.get('/api/chat-requests/r2', headers=h.headers()).json()
+    assert result['status'] == 'failed' and result['error_code'] == 'CHAT_TERMINAL_EMPTY_UNVERIFIED'
+    assert result['recovery']['upstream_outcome'] == 'not_sent'
+    h.upstream.assert_not_called()
+    assert h.tasks.read(owner, 'r1')['status'] == 'unknown'
+
+
+def test_terminal_empty_correction_has_one_successor_across_workers_and_restart(public_chat):
+    h = public_chat
+    terminal_empty_original(h)
+    from api.chat_requests import PublicChatRequest, _payload
+    owner = h.key_a['id']
+    queues = [QueuedExecutor(), QueuedExecutor()]
+    services = [TextTaskService(h.tasks.path, runner=h.upstream, executor=q,
+                                recovery_reader=h.tasks.recovery_reader) for q in queues]
+    def submit(n):
+        item = {**turn(f'correction-{n}', 'r1'), 'continue_after_terminal_empty': True}
+        payload = _payload(owner, PublicChatRequest(**item), item['messages'])
+        try:
+            return services[n].submit(owner, payload)
+        except ConversationBindingError as exc:
+            return {'error': exc.code}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(submit, range(2)))
+    assert sum(row.get('status') == 'queued' for row in results) == 1
+    assert sum(row.get('error') == 'CHAT_CONVERSATION_CONFLICT' for row in results) == 1
+    winner = next(row for row in results if row.get('status') == 'queued')
+    restarted = TextTaskService(h.tasks.path, runner=h.upstream, executor=QueuedExecutor(),
+                                recovery_reader=h.tasks.recovery_reader)
+    with restarted._db() as db:
+        receipt = restarted.store.read_receipt(db, 'text', owner, winner['request_id'])
+        body = restarted.store.load_input(receipt['_input_ref'])
+        assert 'provider_binding_id' not in body
+        receipt.update(status='queued', boot=restarted.boot)
+        restarted.store.write_receipt(db, 'text', owner, winner['request_id'], receipt)
+    restarted._run(owner, winner['request_id'], {**body, '_request_message_id': receipt['request_message_id']})
+    assert h.upstream.call_count == 1
+    assert h.upstream.call_args.args[0]['parent_message_id'] == 'empty-final'
+    assert restarted.read(owner, winner['request_id'])['status'] == 'succeeded'
+
+
+def test_terminal_empty_read_outage_keeps_correction_unsent_and_waiting(public_chat):
+    h = public_chat
+    terminal_empty_original(h)
+    h.tasks.admission = SimpleNamespace(wake=lambda: None)
+    h.tasks.recovery_reader = Mock(side_effect=TimeoutError('synthetic read outage'))
+    accepted = post(h, {**turn('r2','r1'), 'continue_after_terminal_empty': True})
+    assert accepted.status_code == 202
+    with h.tasks._db() as db:
+        receipt = h.tasks.store.read_receipt(db, 'text', h.key_a['id'], 'r2')
+        body = h.tasks.store.load_input(receipt['_input_ref'])
+    h.tasks._run(h.key_a['id'], 'r2', {**body, '_request_message_id': receipt['request_message_id']})
+    with h.tasks._db() as db:
+        waiting = h.tasks.store.read_receipt(db, 'text', h.key_a['id'], 'r2')
+    assert waiting['status'] == 'queued'
+    assert waiting['upstream_outcome'] == 'not_sent'
+    assert waiting['waiting']['reason'] == 'previous_result_unverified'
+    assert waiting['_input_ref'] == receipt['_input_ref']
+    h.upstream.assert_not_called()
+
+
+@pytest.mark.parametrize('change', [
+    {'_upstream_terminal': False},
+    {'recovery_reason': 'REQUEST_RESULT_INCOMPLETE'},
+    {'_turn_end_evidence': {'conversation_id':'wrong', 'request_message_id':'x',
+                            'final_message_id':'y', 'observed_at':100.0}},
+])
+def test_unverified_terminal_empty_never_opens_a_new_turn(public_chat, change):
+    h = public_chat
+    terminal_empty_original(h)
+    h.tasks._update(h.key_a['id'], 'r1', **change)
+    response = post(h, {**turn('r2','r1'), 'continue_after_terminal_empty': True})
+    assert response.status_code == 409
+    assert response.json()['detail']['code'] == 'CHAT_TERMINAL_EMPTY_UNVERIFIED'
+    assert h.tasks.read(h.key_a['id'], 'r2')['status'] == 'not_found'
+    h.upstream.assert_not_called()
+
+
 def test_missing_predecessor_stale_predecessor_and_foreign_owner_fail_closed(public_chat):
     h=public_chat
     post(h,turn('r1')); h.queue.run()
@@ -201,6 +354,8 @@ def test_two_store_instances_cannot_fork_one_predecessor_and_restart_keeps_curso
     {'client_conversation_id':'x','previous_request_id':'r1'},
     {'client_conversation_id':'x','conversation_id':'foreign-upstream'},
     {'client_conversation_id':'x','provider_binding_id':'admin'},
+    {'continue_after_terminal_empty':True},
+    {'client_conversation_id':'x','previous_request_id':'r0','continue_after_terminal_empty':'yes'},
 ])
 def test_session_reference_validation_does_not_open_arbitrary_cursors(public_chat,extra):
     assert post(public_chat,{**request_body('r1'),**extra}).status_code==422

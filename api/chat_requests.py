@@ -39,6 +39,8 @@ class PublicChatRequest(BaseModel):
     # An application-owned work session, NOT an upstream conversation cursor.
     client_conversation_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
     previous_request_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
+    # A new corrective turn, never a retry of the original sent request.
+    continue_after_terminal_empty: bool = Field(default=False, strict=True)
 
     @field_validator("client_conversation_id", "previous_request_id", mode="before")
     @classmethod
@@ -51,6 +53,8 @@ class PublicChatRequest(BaseModel):
     def continuation_contract(self):
         if self.previous_request_id and (not self.client_conversation_id or self.previous_request_id == self.client_request_id):
             raise ValueError("a different predecessor and a work session are required")
+        if self.continue_after_terminal_empty and not self.previous_request_id:
+            raise ValueError("terminal-empty correction requires the original previous_request_id")
         if self.client_conversation_id and self.messages[-1].get("role") != "user":
             raise ValueError("a sequential turn must end with its new user input")
         return self
@@ -112,6 +116,8 @@ def _payload(owner: str, body: PublicChatRequest, messages: list[dict]) -> dict:
         payload["_public_session_ref"] = body.client_conversation_id
         if body.previous_request_id is not None:
             payload["_previous_request_id"] = body.previous_request_id
+        if body.continue_after_terminal_empty:
+            payload["_continue_after_terminal_empty"] = True
     # Absence retains the exact legacy identity; explicit high is persisted
     # through the existing internal field and participates in conflict checks.
     if body.reasoning_effort is not None:

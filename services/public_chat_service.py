@@ -1,6 +1,7 @@
 """Safe projections and admission checks for the ordinary-key Chat API."""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from services.model_service import model_catalog_service
@@ -126,6 +127,20 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
     for field in ("waiting", "rate_limit"):
         if isinstance(receipt.get(field), dict):
             result[field] = receipt[field]
+    terminal_empty = receipt.get("terminal_empty")
+    if (result["status"] == "unknown" and isinstance(terminal_empty, dict)
+            and terminal_empty.get("verified") is True
+            and terminal_empty.get("original_request_id") == result["request_id"]
+            and terminal_empty.get("same_conversation_continuation") is True
+            and type(terminal_empty.get("observed_at")) in {int, float}
+            and math.isfinite(terminal_empty["observed_at"]) and terminal_empty["observed_at"] > 0):
+        result["terminal_empty"] = {
+            "verified": True, "original_request_id": result["request_id"],
+            "observed_at": terminal_empty["observed_at"],
+            "same_conversation_continuation": True,
+        }
+    if isinstance(receipt.get("correction_of_request_id"), str):
+        result["correction_of_request_id"] = receipt["correction_of_request_id"]
     non_text_result = receipt.get("result")
     if (result["status"] == "failed" and error_code == "CHAT_RESPONSE_NOT_TEXT"
             and isinstance(non_text_result, dict) and non_text_result.get("type") == "non_text"
