@@ -175,6 +175,8 @@ Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `
 
 唯一例外是原请求已发送且原账号读回确认最终轮次 `end_turn=true`、文字为空：原回执继续为 `unknown`，并显示 `terminal_empty={verified:true,original_request_id,observed_at,same_conversation_continuation:true}`。应用若确需纠正协议，可用**新的** `client_request_id`、相同 `client_conversation_id`、指向该原请求的 `previous_request_id`、新的纠正说明作为末尾 user 消息，并显式传 `continue_after_terminal_empty:true`。服务原子限制该前序只有一个后继，绑定原账号、原上游会话与空回答的最终节点，发送前重新读取原结果；证据不符、读取失败或会话位置已变时不发送纠正轮次。此字段不表示原业务请求失败或可重发，也不允许绕过其他 `unknown`。普通 CLI 仍只接受成功前序，不会自动创建纠正轮次。
 
+若这条**纠正请求本身**已受理，却在发送前以 `failed`／`CHAT_TERMINAL_EMPTY_UNVERIFIED`／`recovery.upstream_outcome=not_sent` 结束，升级或普通状态读取不会自动重发。核实原 ID、未发送时间线和持久输入后，可显式 `POST /api/chat-requests/{纠正请求ID}/recover`，请求体为 `{"resume_unsent_correction":true}`。服务仅在同一调用身份、原输入哈希、原账号/会话/消息位置和新鲜空终态证明都通过时，将**同一请求 ID** 原子放回原等待队列；派发前仍再次读取原结果。证据变化、输入缺失或曾开始发送均拒绝，不创建新 ID，也不修改原 `unknown`。默认 `{}` 的 recover 仅查询原结果，不重新发送模型请求；客户端不得自动给所有 failed/UNKNOWN 请求加此标志。
+
 公共客户端现支持 `--session-id` 和 `--previous-request-id`，用于从新会话开始的连续工作，不自动承接缺少sequential-v1回执的旧请求。每轮使用独立的 `--state` 文件，先把上一轮查到 `succeeded` 再提交下一轮；客户端还会在新POST前读取前序并核对协议、会话和成功状态，服务端最终原子核对唯一后继。下面三轮不依赖Happy或DSH；示例ID须替换为实际工作持久保存的ID，模型须从实时目录选择。先运行第一轮：
 
 ```sh

@@ -294,6 +294,35 @@ class TextTaskService:
         return evidence
 
     @classmethod
+    def _fresh_terminal_empty_continuation(cls, previous, correction, recovered):
+        """Verify the same ended branch without equating two observation clocks."""
+        if (previous or {}).get("_recovery_suppressed") is True or correction.get("_recovery_suppressed") is True:
+            return False
+        saved = cls._verified_terminal_empty(previous or {})
+        if not saved or not isinstance(recovered, dict):
+            return False
+        validated, error_code, _, reason = cls._safe_recovery_result(recovered, previous)
+        fresh = (validated or {}).get(TURN_END_EVIDENCE_FIELD)
+        return bool(
+            error_code == "UPSTREAM_OUTCOME_UNKNOWN"
+            and reason == TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
+            and isinstance(fresh, dict)
+            and all(fresh[key] == saved[key] for key in (
+                "conversation_id", "request_message_id", "final_message_id"))
+            and fresh["observed_at"] >= saved["observed_at"]
+            and correction.get("_terminal_empty_correction_of") == previous.get("request_id")
+            and correction.get("_previous_request_id") == previous.get("request_id")
+            and correction.get("route") == "chat"
+            and correction.get("model") == previous.get("model")
+            and correction.get("_public_session_ref") == previous.get("_public_session_ref")
+            and correction.get("client_conversation_id") == previous.get("client_conversation_id")
+            and correction.get("parent_message_id") == saved["final_message_id"]
+            and correction.get("request_message_id") != previous.get("request_message_id")
+            and all(previous.get(key) == correction.get(key) for key in (
+                "provider_binding_id", "provider_account_identity", "conversation_id"))
+        )
+
+    @classmethod
     def _recovery_due(cls, receipt, now):
         if receipt.get("_forward_protocol"):
             from services.durable_forward import chat_recovery_supported
@@ -1062,6 +1091,101 @@ class TextTaskService:
                 self._update(owner, request_id, status="failed", error_code="CONVERSATION_SCHEDULING_FAILED")
         return self.read(owner, request_id)
 
+    @staticmethod
+    def _known_unsent_terminal_empty_correction(receipt, now):
+        timeline = receipt.get("_execution_timeline") or []
+        claim_until = receipt.get("_claim_until")
+        sent_stages = {"send_guard_passed", "send_call_started", "response_headers_received", "first_output"}
+        if (not isinstance(timeline, list)
+                or any(not isinstance(item, dict) for item in timeline)
+                or (claim_until is not None and (type(claim_until) not in {int, float}
+                                                 or not math.isfinite(claim_until)))):
+            return False
+        return bool(
+            receipt.get("route") == "chat"
+            and receipt.get("_route", "chat") == "chat"
+            and receipt.get("_operation", "text") == "text"
+            and receipt.get("status") == "failed"
+            and receipt.get("error_code") == "CHAT_TERMINAL_EMPTY_UNVERIFIED"
+            and receipt.get("upstream_outcome") == "not_sent"
+            and receipt.get("_submission_started") is False
+            and receipt.get("_turn_reserved") is False
+            and receipt.get("_executing") is False
+            and not any(item.get("stage") in sent_stages for item in timeline)
+            and bool(receipt.get("_input_ref"))
+            and bool(receipt.get("_terminal_empty_correction_of"))
+            and (claim_until or 0) <= now
+        )
+
+    def resume_unsent_terminal_empty(self, owner: str, request_id: str):
+        """Explicitly requeue one proved-unsent correction using only its saved input.
+
+        This is never called on startup or by ordinary result reads. A fresh
+        original-result GET precedes the atomic state transition; execution
+        repeats that GET before any model send.
+        """
+        now = self._now()
+        with self._db() as db:
+            row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                             (owner, request_id)).fetchone()
+            if not row:
+                raise ConversationBindingError("request not found", code="CHAT_REQUEST_NOT_FOUND")
+            request_hash, raw = row
+            receipt = json.loads(raw)
+            if receipt.get("_terminal_empty_correction_of") and receipt.get("status") in {
+                "queued", "running", "succeeded", "unknown",
+            }:
+                return self._public(receipt)
+            if not self._known_unsent_terminal_empty_correction(receipt, now):
+                raise ConversationBindingError("correction is not known unsent", code="CHAT_UNSENT_CORRECTION_NOT_RESUMABLE")
+            previous = self.store.read_receipt(db, "text", owner, receipt["_terminal_empty_correction_of"])
+        if (previous or {}).get("_recovery_suppressed") is True or not self._verified_terminal_empty(previous or {}):
+            raise ConversationBindingError("original terminal proof changed", code="CHAT_TERMINAL_EMPTY_UNVERIFIED")
+        try:
+            body = self.store.load_input(receipt["_input_ref"])
+            if self._submission_identity(owner, body) != (request_id, request_hash):
+                raise ValueError("original input identity changed")
+        except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
+            raise ConversationBindingError("original input unavailable", code="CHAT_ORIGINAL_INPUT_UNAVAILABLE") from None
+        try:
+            proven = self.recovery_reader(previous)
+        except Exception:
+            raise ConversationBindingError("original result read unavailable", code="CHAT_TERMINAL_EMPTY_READ_UNAVAILABLE") from None
+        if not self._fresh_terminal_empty_continuation(previous, receipt, proven):
+            raise ConversationBindingError("original terminal proof changed", code="CHAT_TERMINAL_EMPTY_UNVERIFIED")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                     (owner, request_id)).fetchone()
+            if not current_row or current_row[0] != request_hash:
+                raise ConversationBindingError("original request changed", code="CHAT_REQUEST_CONFLICT")
+            current = json.loads(current_row[1])
+            if current.get("_terminal_empty_correction_of") == receipt["_terminal_empty_correction_of"] and current.get("status") in {
+                "queued", "running", "succeeded", "unknown",
+            }:
+                return self._public(current)
+            latest_previous = self.store.read_receipt(db, "text", owner, receipt["_terminal_empty_correction_of"])
+            if (current_row[1] != raw
+                    or not self._known_unsent_terminal_empty_correction(current, self._now())
+                    or not self._fresh_terminal_empty_continuation(latest_previous, current, proven)):
+                raise ConversationBindingError("original terminal proof changed", code="CHAT_TERMINAL_EMPTY_UNVERIFIED")
+            updated = dict(current)
+            for key in ("error_code", "upstream_outcome", "finished_at", "waiting", "_ready_at",
+                        "_claim_id", "_claim_until"):
+                updated.pop(key, None)
+            updated.update(status="queued", boot=self.boot, updated_at=self._now(),
+                           _executing=False, _turn_reserved=False, _submission_started=False)
+            timeline = list(updated.get("_execution_timeline") or [])
+            timeline.append({"stage": "known_unsent_resumed", "at": self._now()})
+            updated["_execution_timeline"] = timeline[-32:]
+            self.store.write_receipt(db, "text", owner, request_id, updated)
+        if self.admission is not None:
+            self.admission.wake()
+        else:
+            self.executor.submit(self._run, owner, request_id,
+                                 {**body, "_request_message_id": updated["request_message_id"]})
+        return self._public(updated)
+
     def _run(self, owner, request_id, body):
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1107,13 +1231,7 @@ class TextTaskService:
                         changes.update(status="failed", finished_at=self._now())
                     self._update(owner, request_id, **changes)
                     return
-                validated, error_code, _, reason = self._safe_recovery_result(proven, previous) if proven else (None, None, None, None)
-                if (error_code != "UPSTREAM_OUTCOME_UNKNOWN"
-                        or reason != TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
-                        or not validated or validated.get(TURN_END_EVIDENCE_FIELD) != original_evidence
-                        or receipt.get("parent_message_id") != original_evidence["final_message_id"]
-                        or any(previous.get(k) != receipt.get(k) for k in (
-                            "provider_binding_id", "provider_account_identity", "conversation_id"))):
+                if not self._fresh_terminal_empty_continuation(previous, receipt, proven):
                     self._update(owner, request_id, status="failed", error_code="CHAT_TERMINAL_EMPTY_UNVERIFIED",
                                  upstream_outcome="not_sent", _turn_reserved=False, finished_at=self._now())
                     return

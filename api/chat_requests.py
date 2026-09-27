@@ -76,6 +76,9 @@ class PublicChatRequest(BaseModel):
 
 class OriginalRecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    # Explicit same-ID resume only for a verified pre-send correction failure.
+    # The default endpoint remains an original-result read.
+    resume_unsent_correction: bool = Field(default=False, strict=True)
 
 
 class ArchivePublicSessionRequest(BaseModel):
@@ -285,12 +288,28 @@ def create_router() -> APIRouter:
         body: OriginalRecoveryRequest | None = None,
         authorization: str | None = Header(default=None),
     ):
-        del body
         identity = _ordinary_identity(authorization, request)
         request_id = _validated_request_id(request_id)
+        owner = _owner(identity)
+        if body is not None and body.resume_unsent_correction:
+            existing = await run_in_threadpool(text_task_service.read, owner, request_id)
+            if existing.get("status") == "not_found":
+                raise _not_found(request_id)
+            require_chat_text_policy(identity, endpoint="/api/chat-requests", model=existing.get("model"))
+            try:
+                receipt = await run_in_threadpool(text_task_service.resume_unsent_terminal_empty,
+                                                  owner, request_id)
+            except ConversationBindingError as exc:
+                status = (404 if exc.code == "CHAT_REQUEST_NOT_FOUND" else
+                          503 if exc.code == "CHAT_TERMINAL_EMPTY_READ_UNAVAILABLE" else 409)
+                raise HTTPException(status, detail={"code": exc.code, "request_id": request_id}) from None
+            result = _projection(receipt, request_id)
+            response.status_code = 202 if result["status"] in {"queued", "running"} else 200
+            response.headers["Cache-Control"] = "private, no-store"
+            return result
         receipt = await run_in_threadpool(
             text_task_service.recover,
-            _owner(identity),
+            owner,
             request_id,
             False,
         )
