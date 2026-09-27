@@ -9,6 +9,7 @@ from pathlib import Path
 import time
 import threading
 import fcntl
+from contextlib import contextmanager
 
 from services.storage.base import StorageBackend
 
@@ -506,6 +507,17 @@ class ConfigStore:
             if "temporary_chat_second_slot" in snapshot:
                 result["temporary_chat_second_slot"] = dict(snapshot["temporary_chat_second_slot"])
             return result
+
+    @contextmanager
+    def resource_settings_guard(self):
+        """Keep a claim/send check ordered with a settings revision change."""
+        self._resource_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._update_lock, self._resource_path.with_suffix(".lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def update_resource_settings(self, expected_revision: int, image_account_concurrency: int,
                                  codex_max_concurrency: int, chat_account_concurrency: int | None = None,

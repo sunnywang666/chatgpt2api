@@ -319,6 +319,15 @@ class PoolAdmission:
         from services.config import config
         return config.resource_settings()
 
+    def _settings_guard(self):
+        if self.settings:
+            provider = getattr(self.settings, "__self__", None)
+        else:
+            from services.config import config
+            provider = config
+        guard = getattr(provider, "resource_settings_guard", None)
+        return guard() if guard else nullcontext()
+
     def _types(self, model):
         if self.model_types:
             return self.model_types(model)
@@ -716,8 +725,8 @@ class PoolAdmission:
                     probes += 1
                     if probes >= 3:
                         break
-        now = float(self.clock())
-        with self.store.transaction() as db, self._account_guard():
+        with self._settings_guard(), self.store.transaction() as db, self._account_guard():
+            now = float(self.clock())
             receipts = list(self.store.receipts(db))
             self._recover_claims(db, receipts, now)
             bind_waiting_threads(self.store, db, receipts)
@@ -740,7 +749,8 @@ class PoolAdmission:
                     elif bound:
                         r["provider_account_identity"] = bound[0]["provider_account_identity"]
                     self.store.write_receipt(db, kind, owner, request_id, r)
-            snapshot = self._snapshot(self._rows(), receipts, self._settings(), types, now, self.store.runtime(db, "fairness", {}))
+            settings = self._settings()
+            snapshot = self._snapshot(self._rows(), receipts, settings, types, now, self.store.runtime(db, "fairness", {}))
             selection = choose_next(snapshot, now)
             for deferred in selection.deferred:
                 r = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id)
@@ -765,9 +775,14 @@ class PoolAdmission:
             claim = uuid.uuid4().hex
             timeline = list(r.get("_execution_timeline") or [])
             timeline.append({"stage": "execution_claimed", "at": now})
+            trial_marker = None
+            if snapshot.scoped_extra_turn and ref == snapshot.scoped_extra_turn[0]:
+                trial_marker = {**settings["temporary_chat_second_slot"],
+                                "revision": settings.get("revision", 0)}
             r.update(status="running", _claim_id=claim, _claim_until=now + self.CLAIM_SECONDS,
                      _turn_reserved=True, _submission_started=False, _executing=True,
                      _account_resource=account_clock_key(rows[pick.account]),
+                     _temporary_chat_second_slot=trial_marker,
                      _execution_timeline=timeline[-32:],
                      provider_binding_id=binding, provider_account_identity=pick.account)
             if r.get("_route") == "codex" and self.codex is not None and r.get("_forward_protocol") == "codex":
@@ -798,12 +813,25 @@ class PoolAdmission:
         self.wake()
 
     def before_send(self, context):
-        now = float(self.clock())
-        with self.store.transaction() as db, self._account_guard():
+        with self._settings_guard(), self.store.transaction() as db, self._account_guard():
+            now = float(self.clock())
             r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
             if (r is None or r.get("_claim_id") != context.claim or r.get("status") != "running"
                     or float(r.get("_claim_until") or 0) <= now):
                 raise AdmissionLost("original task claim expired")
+            marker = r.get("_temporary_chat_second_slot")
+            if marker is not None:
+                settings = self._settings()
+                trial = settings.get("temporary_chat_second_slot")
+                if (not isinstance(marker, dict) or not isinstance(trial, dict)
+                        or type(marker.get("expires_at")) is not int
+                        or settings.get("revision", 0) != marker.get("revision")
+                        or any(trial.get(key) != marker.get(key)
+                               for key in ("account_identity", "request_id", "expires_at"))
+                        or r.get("provider_account_identity") != marker.get("account_identity")
+                        or context.request_id != marker.get("request_id")
+                        or now >= marker.get("expires_at", 0)):
+                    raise AdmissionLost("temporary second Chat turn was stopped or expired before send")
             if context.kind == "image" and r.get("_image_thread"):
                 owned = {task_id: task for kind, owner, task_id, task in self.store.receipts(db) if kind == "image" and owner == context.owner}
                 binding, blocked = predecessor_state(r, owned)

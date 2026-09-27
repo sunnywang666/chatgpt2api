@@ -3,6 +3,7 @@ import json
 import multiprocessing
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 from services.account_service import AccountService
@@ -439,6 +440,103 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(child.exitcode, 0)
         self.assertEqual([value[0] for value in claimed if value is not None], ["chosen"])
         self.assertEqual(self.read("text", "happy", "other")["status"], "queued")
+
+    def test_stopped_scoped_slot_cannot_claim_or_send_original(self):
+        from services.config import ConfigStore
+        (self.root / "config.json").write_text(json.dumps({"auth-key": "fixture-admin"}))
+        config = ConfigStore(self.root / "config.json")
+        self.admission.settings = config.resource_settings
+        self.submit("active", provider_account_identity="account-0", provider_binding_id="binding-0")
+        self.admission.claim_next().before_send()
+        self.submit("chosen", owner="wb", provider_account_identity="account-0", provider_binding_id="binding-0")
+        config.update_temporary_chat_second_slot(0, {
+            "account_identity": "account-0", "request_id": "chosen", "expires_at": 1100})
+        config.update_temporary_chat_second_slot(1, None)
+        self.assertIsNone(self.admission.claim_next())
+        self.assertEqual(self.read("text", "wb", "chosen")["status"], "queued")
+
+        config.update_temporary_chat_second_slot(2, {
+            "account_identity": "account-0", "request_id": "chosen", "expires_at": 1100})
+        chosen = self.admission.claim_next()
+        self.assertEqual(chosen.request_id, "chosen")
+        config.update_temporary_chat_second_slot(3, None)
+        with self.assertRaises(AdmissionLost):
+            chosen.before_send()
+        self.assertFalse(self.read("text", "wb", "chosen")["_submission_started"])
+        self.admission.execute(chosen)
+        self.assertEqual(self.read("text", "wb", "chosen")["status"], "queued")
+        self.assertEqual(self.calls, [])
+
+    def test_stop_interleaved_with_scoped_claim_cannot_send_after_stop(self):
+        from services.config import ConfigStore
+        (self.root / "config.json").write_text(json.dumps({"auth-key": "fixture-admin"}))
+        config = ConfigStore(self.root / "config.json")
+        self.admission.settings = config.resource_settings
+        self.submit("active", provider_account_identity="account-0", provider_binding_id="binding-0")
+        self.admission.claim_next().before_send()
+        self.submit("chosen", owner="wb", provider_account_identity="account-0", provider_binding_id="binding-0")
+        config.update_temporary_chat_second_slot(0, {
+            "account_identity": "account-0", "request_id": "chosen", "expires_at": 1100})
+
+        snapshot_ready, release_claim = threading.Event(), threading.Event()
+        original_snapshot = self.admission._snapshot
+        def paused_snapshot(*args, **kwargs):
+            result = original_snapshot(*args, **kwargs)
+            snapshot_ready.set()
+            if not release_claim.wait(5):
+                raise AssertionError("claim was not released")
+            return result
+        self.admission._snapshot = paused_snapshot
+        claim_result, stop_result = {}, {}
+        def claim():
+            try:
+                claim_result["context"] = self.admission.claim_next()
+            except Exception as error:
+                claim_result["error"] = error
+        def stop():
+            try:
+                stop_result["settings"] = config.update_temporary_chat_second_slot(1, None)
+            except Exception as error:
+                stop_result["error"] = error
+        claimant = threading.Thread(target=claim)
+        stopper = threading.Thread(target=stop)
+        claimant.start()
+        try:
+            self.assertTrue(snapshot_ready.wait(5))
+            stopper.start()
+        finally:
+            release_claim.set()
+        claimant.join(10)
+        stopper.join(10)
+        self.assertFalse(claimant.is_alive())
+        self.assertFalse(stopper.is_alive())
+        self.assertNotIn("error", claim_result)
+        self.assertNotIn("error", stop_result)
+        self.assertEqual(stop_result["settings"]["revision"], 2)
+        chosen = claim_result["context"]
+        self.assertEqual(chosen.request_id, "chosen")
+        with self.assertRaises(AdmissionLost):
+            chosen.before_send()
+        receipt = self.read("text", "wb", "chosen")
+        self.assertFalse(receipt["_submission_started"])
+        self.assertNotIn("send_guard_passed", [item["stage"] for item in receipt["_execution_timeline"]])
+
+    def test_scoped_claim_expired_before_send_does_not_submit(self):
+        from services.config import ConfigStore
+        (self.root / "config.json").write_text(json.dumps({"auth-key": "fixture-admin"}))
+        config = ConfigStore(self.root / "config.json")
+        self.admission.settings = config.resource_settings
+        self.submit("active", provider_account_identity="account-0", provider_binding_id="binding-0")
+        self.admission.claim_next().before_send()
+        self.submit("chosen", owner="wb", provider_account_identity="account-0", provider_binding_id="binding-0")
+        config.update_temporary_chat_second_slot(0, {
+            "account_identity": "account-0", "request_id": "chosen", "expires_at": 1001})
+        chosen = self.admission.claim_next()
+        self.assertEqual(chosen.request_id, "chosen")
+        self.clock.now = 1002
+        with self.assertRaises(AdmissionLost):
+            chosen.before_send()
+        self.assertFalse(self.read("text", "wb", "chosen")["_submission_started"])
 
     def test_duplicate_upstream_account_does_not_double_turn_capacity(self):
         self.write_accounts(2)
