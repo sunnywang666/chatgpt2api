@@ -380,7 +380,6 @@ class PoolAdmission:
                         or correction.get("_previous_request_id") != key[1]
                         or correction.get("_public_session_ref") != previous.get("_public_session_ref")
                         or correction.get("client_conversation_id") != previous.get("client_conversation_id")
-                        or correction.get("_public_session_ref") != correction.get("client_conversation_id")
                         or correction.get("model") != previous.get("model")
                         or correction.get("parent_message_id") != evidence["final_message_id"]
                         or correction.get("request_message_id") == previous.get("request_message_id")
