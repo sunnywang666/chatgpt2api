@@ -1,4 +1,6 @@
 """Internal Workbench management bridge; never exposed by public AI ingress."""
+import time
+
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
@@ -46,6 +48,15 @@ class ResourceSettings(BaseModel):
     # Optional for old Workbench clients. Omitted means keep the current value,
     # so an older client cannot silently reset the new account activity limit.
     chat_account_concurrency: int | None = Field(default=None, ge=1, le=16)
+
+
+class TemporaryChatSecondSlot(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_revision: int = Field(ge=0)
+    action: Literal["start", "stop"]
+    account_ref: str | None = Field(default=None, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+    request_id: str | None = Field(default=None, min_length=1, max_length=300)
+    ttl_seconds: int | None = Field(default=None, ge=1, le=600)
 
 
 class CodexAuthorization(BaseModel):
@@ -160,6 +171,44 @@ def create_router() -> APIRouter:
         return await account_operation(config.update_resource_settings, body.expected_revision,
                                        body.image_account_concurrency, body.codex_max_concurrency,
                                        body.chat_account_concurrency)
+
+    @router.post("/pool/chat-second-slot")
+    async def temporary_chat_second_slot(body: TemporaryChatSecondSlot,
+                                         authorization: str | None = Header(default=None),
+                                         x_workbench_account_owner: str | None = Header(default=None)):
+        owner_scope(authorization, x_workbench_account_owner)
+        from services.config import config
+        if body.action == "stop":
+            if any(value is not None for value in (body.account_ref, body.request_id, body.ttl_seconds)):
+                raise HTTPException(400, detail={"error": "stop must not name a request"})
+            return await account_operation(config.update_temporary_chat_second_slot, body.expected_revision, None)
+        if not body.account_ref or not body.request_id or body.ttl_seconds is None:
+            raise HTTPException(400, detail={"error": "exact account, original request and TTL are required"})
+        all_accounts = await run_in_threadpool(account_service.list_accounts)
+        accounts = [row for row in all_accounts if account_service.pool_account_ref(row) == body.account_ref]
+        if len(accounts) != 1 or not accounts[0].get("provider_account_identity"):
+            raise HTTPException(409, detail={"error": "target account identity is not exact"})
+        account = accounts[0]
+        if sum(row.get("provider_account_identity") == account["provider_account_identity"]
+               for row in all_accounts) != 1:
+            raise HTTPException(409, detail={"error": "target physical account is not unique"})
+        if account.get("managed_disabled") or account.get("status") in {"禁用", "异常", "限流"}:
+            raise HTTPException(409, detail={"error": "target account is unavailable"})
+        from services.image_task_service import image_task_service
+        admission = image_task_service.admission
+        with admission.store.connect() as db:
+            candidates = [receipt for kind, _owner, request_id, receipt in admission.store.receipts(db)
+                          if kind == "text" and request_id == body.request_id]
+        if (len(candidates) != 1 or candidates[0].get("status") != "queued"
+                or candidates[0].get("_route", "chat") != "chat"
+                or candidates[0].get("_operation", "text") != "text"
+                or not candidates[0].get("_input_ref")
+                or candidates[0].get("provider_account_identity") != account["provider_account_identity"]):
+            raise HTTPException(409, detail={"error": "one durable queued Chat request bound to this account is required"})
+        trial = {"account_identity": account["provider_account_identity"],
+                 "request_id": body.request_id,
+                 "expires_at": int(time.time()) + body.ttl_seconds}
+        return await account_operation(config.update_temporary_chat_second_slot, body.expected_revision, trial)
 
     @router.post("/accounts")
     async def import_account(body: ImportAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):

@@ -151,6 +151,9 @@ class Snapshot:
     last_source: str | None = None
     last_account: str | None = None
     last_owner_by_source: tuple[tuple[str, str], ...] = ()
+    # One already accepted request may use a temporary second Chat turn. The
+    # extra place is never offered to another request or another account.
+    scoped_extra_turn: tuple[RequestRef, str] | None = None
 
     def __post_init__(self) -> None:
         _name(self.revision)
@@ -164,6 +167,11 @@ class Snapshot:
         for source, owner in self.last_owner_by_source:
             _name(source)
             _name(owner)
+        if self.scoped_extra_turn is not None:
+            ref, resource = self.scoped_extra_turn
+            if not isinstance(ref, RequestRef):
+                raise InvalidSnapshot('invalid scoped extra turn request')
+            _name(resource)
 
 
 @dataclass(frozen=True)
@@ -301,6 +309,11 @@ def choose_next(snapshot: Snapshot, now: float) -> Selection:
                     if resource.occupied is None:
                         blockers.add('occupancy_unknown')
                     elif resource.occupied + need.units > resource.capacity:
+                        blockers.add('resource_full')
+                    elif (snapshot.scoped_extra_turn is not None
+                          and need.resource == snapshot.scoped_extra_turn[1]
+                          and resource.occupied >= 1
+                          and request.ref != snapshot.scoped_extra_turn[0]):
                         blockers.add('resource_full')
                     if resource.next_at is None:
                         blockers.add('availability_time_unknown')
