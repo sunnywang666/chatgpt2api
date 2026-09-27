@@ -190,6 +190,221 @@ def test_verified_terminal_empty_allows_one_new_same_conversation_correction(pub
     assert h.upstream.call_count == 1
 
 
+def test_fresh_terminal_empty_read_may_have_a_new_observation_time(public_chat):
+    h = public_chat
+    evidence = terminal_empty_original(h)
+    h.tasks.recovery_reader = lambda receipt: {
+        'status': 'unknown', 'recovery_reason': 'REQUEST_RESULT_TERMINAL_EMPTY',
+        'provider_binding_id': receipt['provider_binding_id'],
+        'provider_account_identity': receipt['provider_account_identity'],
+        'client_conversation_id': receipt['client_conversation_id'],
+        'conversation_id': receipt['conversation_id'],
+        '_turn_end_evidence': {**evidence, 'observed_at': 101.0},
+    }
+    assert post(h, {**turn('r2', 'r1'), 'continue_after_terminal_empty': True}).status_code == 202
+    h.queue.run()
+    assert h.tasks.read(h.key_a['id'], 'r2')['status'] == 'succeeded'
+    assert h.upstream.call_count == 1
+
+
+def fresh_empty_result(receipt, evidence, **changes):
+    return {
+        'status': 'unknown', 'recovery_reason': 'REQUEST_RESULT_TERMINAL_EMPTY',
+        'provider_binding_id': receipt['provider_binding_id'],
+        'provider_account_identity': receipt['provider_account_identity'],
+        'client_conversation_id': receipt['client_conversation_id'],
+        'conversation_id': receipt['conversation_id'],
+        '_turn_end_evidence': {**evidence, 'observed_at': evidence['observed_at'] + 1, **changes},
+    }
+
+
+def failed_unsent_correction(h):
+    evidence = terminal_empty_original(h)
+    body = {**turn('r2', 'r1'), 'continue_after_terminal_empty': True}
+    assert post(h, body).status_code == 202
+    h.queue.calls.clear()  # The existing claim already ended before sending.
+    h.tasks._update(h.key_a['id'], 'r2', status='failed',
+                    error_code='CHAT_TERMINAL_EMPTY_UNVERIFIED',
+                    upstream_outcome='not_sent', _submission_started=False,
+                    _turn_reserved=False, _executing=False, _claim_until=0,
+                    _ready_at=1_000_000_000_000.0)
+    return evidence, body
+
+
+def test_explicit_unsent_correction_resume_keeps_id_input_and_original(public_chat):
+    h = public_chat
+    evidence, body = failed_unsent_correction(h)
+    owner = h.key_a['id']
+    with h.tasks._db() as db:
+        old_before = db.execute('SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?',
+                                (owner, 'r1')).fetchone()
+        new_before = db.execute('SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?',
+                                (owner, 'r2')).fetchone()
+    h.tasks.recovery_reader = lambda receipt: fresh_empty_result(receipt, evidence)
+    response = h.client.post('/api/chat-requests/r2/recover', headers=h.headers(),
+                             json={'resume_unsent_correction': True})
+    assert response.status_code == 202, response.text
+    assert response.json()['request_id'] == 'r2' and response.json()['status'] == 'queued'
+    with h.tasks._db() as db:
+        old_after = db.execute('SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?',
+                               (owner, 'r1')).fetchone()
+        new_after = db.execute('SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?',
+                               (owner, 'r2')).fetchone()
+    before, after = json.loads(new_before[1]), json.loads(new_after[1])
+    assert old_before == old_after and new_before[0] == new_after[0]
+    assert all(before[key] == after[key] for key in (
+        '_input_ref', '_sequence', 'request_message_id', 'provider_account_identity',
+        'provider_binding_id', 'conversation_id', 'parent_message_id', '_terminal_empty_correction_of'))
+    assert '_ready_at' not in after
+    assert len(h.queue.calls) == 1
+    h.queue.run()
+    assert h.tasks.read(owner, 'r2')['status'] == 'succeeded'
+    assert h.upstream.call_count == 1 and post(h, body).status_code == 200
+    assert h.client.post('/api/chat-requests/r2/recover', headers=h.headers(),
+                         json={'resume_unsent_correction': True}).status_code == 200
+    assert h.upstream.call_count == 1
+
+
+@pytest.mark.parametrize('changed', ['final_message', 'now_has_text', 'stale_observation'])
+def test_unsent_correction_resume_refuses_changed_original(public_chat, changed):
+    h = public_chat
+    evidence, _ = failed_unsent_correction(h)
+    owner = h.key_a['id']
+    with h.tasks._db() as db:
+        before = db.execute('SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?',
+                            (owner, 'r2')).fetchone()
+    def changed_result(receipt):
+        if changed == 'final_message':
+            return fresh_empty_result(receipt, evidence, final_message_id='other-final')
+        if changed == 'stale_observation':
+            return fresh_empty_result(receipt, evidence, observed_at=99.0)
+        return {**fresh_empty_result(receipt, evidence), 'status': 'succeeded',
+                'binding_status': 'bound', 'content': 'actual answer',
+                'parent_message_id': evidence['final_message_id']}
+    h.tasks.recovery_reader = changed_result
+    response = h.client.post('/api/chat-requests/r2/recover', headers=h.headers(),
+                             json={'resume_unsent_correction': True})
+    assert response.status_code == 409
+    assert response.json()['detail']['code'] == 'CHAT_TERMINAL_EMPTY_UNVERIFIED'
+    with h.tasks._db() as db:
+        after = db.execute('SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?',
+                           (owner, 'r2')).fetchone()
+    assert before == after and not h.queue.calls and h.upstream.call_count == 0
+
+
+def test_unsent_resume_rechecks_original_inside_atomic_transition(public_chat):
+    h = public_chat
+    evidence, _ = failed_unsent_correction(h)
+    owner = h.key_a['id']
+    with h.tasks._db() as db:
+        before = db.execute('SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?',
+                            (owner, 'r2')).fetchone()
+    def changed_during_read(receipt):
+        h.tasks._update(owner, 'r1', _turn_end_evidence={**evidence, 'final_message_id': 'later-branch'})
+        return fresh_empty_result(receipt, evidence)
+    h.tasks.recovery_reader = changed_during_read
+    response = h.client.post('/api/chat-requests/r2/recover', headers=h.headers(),
+                             json={'resume_unsent_correction': True})
+    assert response.status_code == 409
+    with h.tasks._db() as db:
+        after = db.execute('SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?',
+                           (owner, 'r2')).fetchone()
+    assert before == after and not h.queue.calls and h.upstream.call_count == 0
+
+
+def test_unsent_correction_resume_competing_workers_schedule_once(public_chat):
+    h = public_chat
+    evidence, _ = failed_unsent_correction(h)
+    queues = [QueuedExecutor(), QueuedExecutor()]
+    reader = lambda receipt: fresh_empty_result(receipt, evidence)
+    services = [TextTaskService(h.tasks.path, runner=h.upstream, executor=queue,
+                                recovery_reader=reader) for queue in queues]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda service: service.resume_unsent_terminal_empty(h.key_a['id'], 'r2'), services))
+    assert all(result['request_id'] == 'r2' for result in results)
+    assert sum(len(queue.calls) for queue in queues) == 1
+    next(queue for queue in queues if queue.calls).run()
+    assert services[0].read(h.key_a['id'], 'r2')['status'] == 'succeeded'
+    assert h.upstream.call_count == 1
+
+
+def test_unsent_correction_resume_checks_original_again_before_send(public_chat):
+    h = public_chat
+    evidence, _ = failed_unsent_correction(h)
+    h.tasks.recovery_reader = lambda receipt: fresh_empty_result(receipt, evidence)
+    assert h.client.post('/api/chat-requests/r2/recover', headers=h.headers(),
+                         json={'resume_unsent_correction': True}).status_code == 202
+    h.tasks.recovery_reader = lambda receipt: fresh_empty_result(receipt, evidence,
+                                                                  final_message_id='changed-after-resume')
+    h.queue.run()
+    result = h.tasks.read(h.key_a['id'], 'r2')
+    assert result['status'] == 'failed' and result['upstream_outcome'] == 'not_sent'
+    h.upstream.assert_not_called()
+
+
+@pytest.mark.parametrize('change', [
+    {'_submission_started': True},
+    {'_input_ref': None},
+    {'_execution_timeline': [{'stage': 'send_call_started', 'at': 100.0}]},
+])
+def test_unsent_correction_resume_requires_positive_never_sent_evidence(public_chat, change):
+    h = public_chat
+    evidence, _ = failed_unsent_correction(h)
+    h.tasks._update(h.key_a['id'], 'r2', **change)
+    h.tasks.recovery_reader = Mock(return_value=fresh_empty_result(
+        h.tasks.read(h.key_a['id'], 'r1'), evidence))
+    response = h.client.post('/api/chat-requests/r2/recover', headers=h.headers(),
+                             json={'resume_unsent_correction': True})
+    assert response.status_code == 409
+    assert response.json()['detail']['code'] == 'CHAT_UNSENT_CORRECTION_NOT_RESUMABLE'
+    h.tasks.recovery_reader.assert_not_called()
+    assert h.tasks.read(h.key_a['id'], 'r2')['status'] == 'failed'
+    h.upstream.assert_not_called()
+
+
+def test_unsent_correction_resume_needs_original_input_hash_and_owner(public_chat):
+    h = public_chat
+    evidence, _ = failed_unsent_correction(h)
+    h.tasks.recovery_reader = Mock(return_value=fresh_empty_result(
+        h.tasks.read(h.key_a['id'], 'r1'), evidence))
+    foreign = h.client.post('/api/chat-requests/r2/recover', headers=h.headers(h.secret_b),
+                            json={'resume_unsent_correction': True})
+    assert foreign.status_code == 404
+    with h.tasks._db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('UPDATE requests SET request_hash=? WHERE owner=? AND id=?',
+                   ('0' * 64, h.key_a['id'], 'r2'))
+    response = h.client.post('/api/chat-requests/r2/recover', headers=h.headers(),
+                             json={'resume_unsent_correction': True})
+    assert response.status_code == 409
+    assert response.json()['detail']['code'] == 'CHAT_ORIGINAL_INPUT_UNAVAILABLE'
+    h.tasks.recovery_reader.assert_not_called()
+    assert h.tasks.read(h.key_a['id'], 'r2')['status'] == 'failed'
+    assert not h.queue.calls and h.upstream.call_count == 0
+
+
+def test_ordinary_recover_does_not_resume_failed_unsent_correction(public_chat):
+    h = public_chat
+    failed_unsent_correction(h)
+    response = h.client.post('/api/chat-requests/r2/recover', headers=h.headers(), json={})
+    assert response.status_code == 200 and response.json()['status'] == 'failed'
+    assert not h.queue.calls and h.upstream.call_count == 0
+
+
+def test_stopped_original_does_not_resume_known_unsent_correction(public_chat):
+    h = public_chat
+    evidence, _ = failed_unsent_correction(h)
+    h.tasks._update(h.key_a['id'], 'r1', _recovery_suppressed=True)
+    h.tasks.recovery_reader = Mock(return_value=fresh_empty_result(
+        h.tasks.read(h.key_a['id'], 'r1'), evidence))
+    response = h.client.post('/api/chat-requests/r2/recover', headers=h.headers(),
+                             json={'resume_unsent_correction': True})
+    assert response.status_code == 409
+    h.tasks.recovery_reader.assert_not_called()
+    assert h.tasks.read(h.key_a['id'], 'r2')['status'] == 'failed'
+    h.upstream.assert_not_called()
+
+
 def test_terminal_empty_correction_requires_exact_proof_and_fresh_read(public_chat):
     h = public_chat
     evidence = terminal_empty_original(h)

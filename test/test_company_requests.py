@@ -149,6 +149,58 @@ def test_company_unknown_submission_is_not_reexecuted_after_restart(company, mon
     company.runner.assert_not_called()
 
 
+def test_company_explicitly_resumes_only_the_same_known_unsent_correction(company):
+    owner = company_identity("company", "employee", CONNECTOR)["id"]
+    original_body = {**body(), "client_conversation_id": "work"}
+    original = company.client.post(PREFIX + "/api/chat-requests", headers=company.headers(), json=original_body)
+    assert original.status_code == 202, original.text
+    with company.text_tasks._db() as db:
+        original_receipt = company.text_tasks.store.read_receipt(db, "text", owner, "original-chat")
+    evidence = {"conversation_id": "original-conversation",
+                "request_message_id": original_receipt["request_message_id"],
+                "final_message_id": "empty-final", "observed_at": 100.0}
+    company.text_tasks._update(owner, "original-chat", status="unknown",
+                               error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                               recovery_reason="REQUEST_RESULT_TERMINAL_EMPTY", _upstream_terminal=True,
+                               provider_binding_id="private-binding",
+                               provider_account_identity="private-account",
+                               conversation_id="original-conversation", _turn_end_evidence=evidence)
+    company.queue.calls.clear()
+
+    def read_original(receipt):
+        return {"status": "unknown", "recovery_reason": "REQUEST_RESULT_TERMINAL_EMPTY",
+                "provider_binding_id": receipt["provider_binding_id"],
+                "provider_account_identity": receipt["provider_account_identity"],
+                "client_conversation_id": receipt["client_conversation_id"],
+                "conversation_id": receipt["conversation_id"],
+                "_turn_end_evidence": {**evidence, "observed_at": 101.0}}
+
+    company.text_tasks.recovery_reader = read_original
+    correction_body = {**body("correction"), "client_request_id": "correction-chat",
+                       "client_conversation_id": "work", "previous_request_id": "original-chat",
+                       "continue_after_terminal_empty": True}
+    accepted = company.client.post(PREFIX + "/api/chat-requests", headers=company.headers(), json=correction_body)
+    assert accepted.status_code == 202, accepted.text
+    company.queue.calls.clear()
+    company.text_tasks._update(owner, "correction-chat", status="failed",
+                               error_code="CHAT_TERMINAL_EMPTY_UNVERIFIED", upstream_outcome="not_sent",
+                               _submission_started=False, _turn_reserved=False, _executing=False,
+                               _claim_until=0)
+    wrong_owner = company.client.post(PREFIX + "/api/chat-requests/correction-chat/recover",
+                                      headers=company.headers(connector=OTHER_CONNECTOR),
+                                      json={"resume_unsent_correction": True})
+    assert wrong_owner.status_code == 404
+    resumed = company.client.post(PREFIX + "/api/chat-requests/correction-chat/recover",
+                                  headers=company.headers(), json={"resume_unsent_correction": True})
+    assert resumed.status_code == 202, resumed.text
+    assert resumed.json()["request_id"] == "correction-chat"
+    assert len(company.queue.calls) == 1
+    company.queue.run()
+    result = company.client.get(PREFIX + "/api/chat-requests/correction-chat", headers=company.headers())
+    assert result.status_code == 200 and result.json()["content"] == "answer"
+    assert company.runner.call_count == 1
+
+
 def test_company_multipart_images_query_download_and_recovery(company, monkeypatch):
     response = company.client.post(PREFIX + "/api/image-tasks/edits", headers=company.headers(),
         data={"client_task_id": "original-image", "prompt": "edit", "model": "gpt-image-2"},
