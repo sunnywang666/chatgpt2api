@@ -372,6 +372,12 @@ class PoolAdmission:
                 previous = text_receipts.get(key)
                 evidence = TextTaskService._verified_terminal_empty(previous or {})
                 request_id, correction = candidates[0]
+                # Success advances the live cursor to the correction's result.
+                # Its persisted submission root still proves which empty turn
+                # it continued; do not put that original UNKNOWN back at head.
+                correction_parent = (correction.get("_submission_parent_message_id")
+                                     if correction.get("status") == "succeeded"
+                                     else correction.get("parent_message_id"))
                 if (not evidence or not previous or request_id == key[1]
                         or correction.get("status") not in {"queued", "running", "unknown", "succeeded"}
                         or not correction.get("_input_ref")
@@ -381,7 +387,7 @@ class PoolAdmission:
                         or correction.get("_public_session_ref") != previous.get("_public_session_ref")
                         or correction.get("client_conversation_id") != previous.get("client_conversation_id")
                         or correction.get("model") != previous.get("model")
-                        or correction.get("parent_message_id") != evidence["final_message_id"]
+                        or correction_parent != evidence["final_message_id"]
                         or correction.get("request_message_id") == previous.get("request_message_id")
                         or type(correction.get("_sequence")) is not int
                         or type(previous.get("_sequence")) is not int
