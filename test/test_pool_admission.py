@@ -1,6 +1,7 @@
 """Independent data and fake time; these are not production capacity samples."""
 import json
 import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
 import threading
@@ -356,6 +357,104 @@ class AdmissionTests(unittest.TestCase):
         self.submit("other", owner="wb")
         self.assertEqual(self.admission.claim_next().request_id, "other")
         self.assertIsNone(self.admission.claim_next())
+
+    def terminal_empty_correction_pair(self):
+        session = "same-public-session"
+        self.submit("original", client_conversation_id=session,
+                    _public_route="chat", _public_session_ref=session)
+        original = self.read("text", "happy", "original")
+        evidence = {"conversation_id": "original-conversation",
+                    "request_message_id": original["request_message_id"],
+                    "final_message_id": "empty-final", "observed_at": 100.0}
+        with self.store.transaction() as db:
+            original.update(status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                            recovery_reason="REQUEST_RESULT_TERMINAL_EMPTY",
+                            _upstream_terminal=True, _turn_reserved=False,
+                            provider_binding_id="binding-0",
+                            provider_account_identity="account-0",
+                            conversation_id="original-conversation",
+                            _turn_end_evidence=evidence)
+            self.store.write_receipt(db, "text", "happy", "original", original)
+        self.submit("correction", client_conversation_id=session,
+                    _public_route="chat", _public_session_ref=session,
+                    _previous_request_id="original", _continue_after_terminal_empty=True)
+        return evidence
+
+    def test_verified_terminal_empty_correction_claims_once_without_changing_original(self):
+        evidence = self.terminal_empty_correction_pair()
+        original = self.read("text", "happy", "original")
+        correction = self.read("text", "happy", "correction")
+        self.assertEqual(correction["_terminal_empty_correction_of"], "original")
+        self.assertTrue(self.store.load_input(correction["_input_ref"]))
+        self.text.recovery_reader = lambda receipt: {
+            "status": "unknown", "recovery_reason": "REQUEST_RESULT_TERMINAL_EMPTY",
+            "provider_binding_id": receipt["provider_binding_id"],
+            "provider_account_identity": receipt["provider_account_identity"],
+            "client_conversation_id": receipt["client_conversation_id"],
+            "conversation_id": receipt["conversation_id"],
+            "_turn_end_evidence": evidence,
+        }
+        claim = self.admission.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.request_id, "correction")
+        self.assertIsNone(self.admission.claim_next())
+        self.admission.execute(claim)
+        self.assertEqual([(owner, request_id) for owner, request_id, _ in self.calls],
+                         [("happy", "correction")])
+        self.assertEqual(self.read("text", "happy", "original"), original)
+        self.assertEqual(self.read("text", "happy", "correction")["status"], "succeeded")
+
+    def test_invalid_terminal_empty_link_never_clears_original_order_barrier(self):
+        self.terminal_empty_correction_pair()
+        original = self.read("text", "happy", "original")
+        correction = self.read("text", "happy", "correction")
+        cases = (
+            ("correction", "_terminal_empty_correction_of", "other-request"),
+            ("correction", "_previous_request_id", "other-request"),
+            ("correction", "parent_message_id", "wrong-final"),
+            ("correction", "provider_binding_id", "wrong-binding"),
+            ("correction", "provider_account_identity", "wrong-account"),
+            ("correction", "_input_ref", None),
+            ("original", "_upstream_terminal", False),
+            ("original", "recovery_reason", "REQUEST_RESULT_INCOMPLETE"),
+        )
+        for name, field, value in cases:
+            with self.subTest(name=name, field=field):
+                with self.store.transaction() as db:
+                    row = dict(original if name == "original" else correction)
+                    row[field] = value
+                    self.store.write_receipt(db, "text", "happy", name, row)
+                self.assertIsNone(self.admission.claim_next())
+                waiting = self.read("text", "happy", "correction")["waiting"]
+                self.assertIn("earlier_group_request_unfinished", waiting["reasons"])
+                with self.store.transaction() as db:
+                    self.store.write_receipt(db, "text", "happy", name,
+                                             original if name == "original" else correction)
+
+    def test_terminal_empty_correction_competing_workers_claim_only_once(self):
+        self.terminal_empty_correction_pair()
+        workers = [build(self.root, self.clock)[2] for _ in range(2)]
+        start = threading.Barrier(3)
+        def claim(worker):
+            start.wait()
+            return worker.claim_next()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(claim, worker) for worker in workers]
+            start.wait()
+            claims = [future.result() for future in futures]
+        self.assertEqual([ctx.request_id for ctx in claims if ctx is not None], ["correction"])
+        self.assertIsNone(self.admission.claim_next())
+
+    def test_ordinary_unknown_still_blocks_same_session_successor(self):
+        self.submit("original", client_conversation_id="same")
+        self.submit("successor", client_conversation_id="same")
+        with self.store.transaction() as db:
+            original = self.store.read_receipt(db, "text", "happy", "original")
+            original.update(status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN")
+            self.store.write_receipt(db, "text", "happy", "original", original)
+        self.assertIsNone(self.admission.claim_next())
+        self.assertIn("earlier_group_request_unfinished",
+                      self.read("text", "happy", "successor")["waiting"]["reasons"])
 
     def test_restart_loads_actual_multimodal_input_and_claims_once(self):
         self.submit("original", messages=[{"role": "user", "content": [(b"original image", "image.png", "image/png")]}])

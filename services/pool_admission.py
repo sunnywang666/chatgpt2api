@@ -352,6 +352,45 @@ class PoolAdmission:
         return read() if read else self.accounts.list_accounts()
 
     def _snapshot(self, rows, receipts, settings, types, now, cursor):
+        # A verified empty upstream turn may have one explicitly accepted
+        # correction in the same public Chat session. Its UNKNOWN receipt must
+        # remain intact for recovery, but it cannot remain the session's order
+        # head forever. This is a planner-only projection, never a status edit.
+        text_receipts = {(owner, request_id): r for kind, owner, request_id, r in receipts
+                         if kind == "text"}
+        corrections = {}
+        for kind, owner, request_id, r in receipts:
+            previous_id = r.get("_terminal_empty_correction_of")
+            if kind == "text" and isinstance(previous_id, str) and previous_id:
+                corrections.setdefault((owner, previous_id), []).append((request_id, r))
+        released_order_heads = set()
+        if corrections:
+            from services.text_task_service import TextTaskService
+            for key, candidates in corrections.items():
+                if len(candidates) != 1:
+                    continue
+                previous = text_receipts.get(key)
+                evidence = TextTaskService._verified_terminal_empty(previous or {})
+                request_id, correction = candidates[0]
+                if (not evidence or not previous or request_id == key[1]
+                        or correction.get("status") not in {"queued", "running", "unknown", "succeeded"}
+                        or not correction.get("_input_ref")
+                        or correction.get("route") != "chat"
+                        or correction.get("_route", "chat") != "chat"
+                        or correction.get("_previous_request_id") != key[1]
+                        or correction.get("_public_session_ref") != previous.get("_public_session_ref")
+                        or correction.get("client_conversation_id") != previous.get("client_conversation_id")
+                        or correction.get("_public_session_ref") != correction.get("client_conversation_id")
+                        or correction.get("model") != previous.get("model")
+                        or correction.get("parent_message_id") != evidence["final_message_id"]
+                        or correction.get("request_message_id") == previous.get("request_message_id")
+                        or type(correction.get("_sequence")) is not int
+                        or type(previous.get("_sequence")) is not int
+                        or correction["_sequence"] <= previous["_sequence"]
+                        or any(correction.get(field) != previous.get(field) for field in (
+                            "provider_binding_id", "provider_account_identity", "conversation_id"))):
+                    continue
+                released_order_heads.add(key)
         by_identity = {str(a.get("provider_account_identity") or ""): a for a in rows}
         identity_counts = {}
         for row in rows:
@@ -416,7 +455,8 @@ class PoolAdmission:
                 "image" if kind == "image" else r.get("_operation", "text"),
                 bool(r.get("_input_ref")), state=state,
                 bound_account=str(r.get("provider_account_identity") or "") or None,
-                order_group=str(r.get("client_conversation_id") or "") or None,
+                order_group=(None if (owner, request_id) in released_order_heads
+                             else str(r.get("client_conversation_id") or "") or None),
                 ready_at=float(r.get("_ready_at") or 0),
                 needs=thread_needs + (Need("execution_input_bytes", max(1, int(r.get("_input_bytes") or 1))),)
                       + ((Need("chat_executor"),) if kind == "text" and route == "chat" and r.get("_operation") != "image" else ())
