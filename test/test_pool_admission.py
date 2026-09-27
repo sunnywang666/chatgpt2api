@@ -1,5 +1,6 @@
 """Independent data and fake time; these are not production capacity samples."""
 import json
+import hashlib
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -360,7 +361,11 @@ class AdmissionTests(unittest.TestCase):
 
     def terminal_empty_correction_pair(self):
         session = "same-public-session"
-        self.submit("original", client_conversation_id=session,
+        # Public Chat stores the caller's session reference separately from
+        # its owner-scoped hashed group used by the admission planner.
+        group = "public-session-" + hashlib.sha256(("happy\0session\0" + session).encode()).hexdigest()
+        self.assertNotEqual(group, session)
+        self.submit("original", client_conversation_id=group,
                     _public_route="chat", _public_session_ref=session)
         original = self.read("text", "happy", "original")
         evidence = {"conversation_id": "original-conversation",
@@ -375,7 +380,7 @@ class AdmissionTests(unittest.TestCase):
                             conversation_id="original-conversation",
                             _turn_end_evidence=evidence)
             self.store.write_receipt(db, "text", "happy", "original", original)
-        self.submit("correction", client_conversation_id=session,
+        self.submit("correction", client_conversation_id=group,
                     _public_route="chat", _public_session_ref=session,
                     _previous_request_id="original", _continue_after_terminal_empty=True)
         return evidence
@@ -411,6 +416,7 @@ class AdmissionTests(unittest.TestCase):
         cases = (
             ("correction", "_terminal_empty_correction_of", "other-request"),
             ("correction", "_previous_request_id", "other-request"),
+            ("correction", "_public_session_ref", "other-session"),
             ("correction", "parent_message_id", "wrong-final"),
             ("correction", "provider_binding_id", "wrong-binding"),
             ("correction", "provider_account_identity", "wrong-account"),
