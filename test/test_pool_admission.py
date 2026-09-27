@@ -437,6 +437,64 @@ class AdmissionTests(unittest.TestCase):
                     self.store.write_receipt(db, "text", "happy", name,
                                              original if name == "original" else correction)
 
+    def completed_terminal_empty_correction(self):
+        evidence = self.terminal_empty_correction_pair()
+        self.text.recovery_reader = lambda receipt: {
+            "status": "unknown", "recovery_reason": "REQUEST_RESULT_TERMINAL_EMPTY",
+            **{key: receipt[key] for key in (
+                "provider_binding_id", "provider_account_identity",
+                "client_conversation_id", "conversation_id")},
+            "_turn_end_evidence": evidence,
+        }
+        runner = self.text.runner
+        def completed_runner(body, on_cursor):
+            result = runner(body, on_cursor)
+            on_cursor({"parent_message_id": "correction-final"})
+            return {**result, "parent_message_id": "correction-final"}
+        self.text.runner = completed_runner
+        self.admission.execute(self.admission.claim_next())
+        correction = self.read("text", "happy", "correction")
+        self.assertEqual(correction["status"], "succeeded")
+        self.assertEqual(correction["_submission_parent_message_id"], evidence["final_message_id"])
+        self.assertEqual(correction["parent_message_id"], "correction-final")
+        self.submit("successor", client_conversation_id=correction["client_conversation_id"],
+                    _public_route="chat", _public_session_ref=correction["_public_session_ref"],
+                    _previous_request_id="correction")
+
+    def test_completed_correction_allows_successor_after_cursor_advance_and_restart(self):
+        self.completed_terminal_empty_correction()
+        original = self.read("text", "happy", "original")
+        self.assertEqual(original["status"], "unknown")
+        self.assertEqual(self.read("text", "happy", "successor")["parent_message_id"], "correction-final")
+        _, _, restarted = build(self.root, self.clock)
+        claim = restarted.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.request_id, "successor")
+        self.assertIsNone(self.admission.claim_next())
+        self.assertEqual(self.read("text", "happy", "original"), original)
+
+    def test_completed_correction_still_requires_original_submission_anchor_and_identity(self):
+        self.completed_terminal_empty_correction()
+        correction = self.read("text", "happy", "correction")
+        original = self.read("text", "happy", "original")
+        for field, value in (
+            ("_submission_parent_message_id", None),
+            ("_submission_parent_message_id", "wrong-final"),
+            ("provider_account_identity", "wrong-account"),
+            ("_previous_request_id", "wrong-request"),
+            ("_public_session_ref", "wrong-session"),
+            ("status", "unknown"),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.store.transaction() as db:
+                    self.store.write_receipt(db, "text", "happy", "correction", {**correction, field: value})
+                self.assertIsNone(self.admission.claim_next())
+                self.assertIn("earlier_group_request_unfinished",
+                              self.read("text", "happy", "successor")["waiting"]["reasons"])
+                self.assertEqual(self.read("text", "happy", "original"), original)
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "text", "happy", "correction", correction)
+
     def test_terminal_empty_correction_competing_workers_claim_only_once(self):
         self.terminal_empty_correction_pair()
         workers = [build(self.root, self.clock)[2] for _ in range(2)]
