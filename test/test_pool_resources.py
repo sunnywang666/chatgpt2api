@@ -137,6 +137,18 @@ class PoolResourceTests(unittest.TestCase):
         result = self.config.update_resource_settings(1, 4, 3)
         self.assertEqual(result["chat_account_concurrency"], 2)
 
+    def test_one_request_second_slot_persists_and_requires_global_one(self):
+        trial = {"account_identity": "account_fixture", "request_id": "original-request", "expires_at": 1100}
+        result = self.config.update_temporary_chat_second_slot(0, trial)
+        self.assertEqual(result["revision"], 1)
+        self.assertEqual(ConfigStore(self.path).resource_settings()["temporary_chat_second_slot"], trial)
+        with self.assertRaisesRegex(ValueError, "global_one"):
+            self.config.update_resource_settings(1, 4, 4, 2)
+        self.assertEqual(self.config.resource_settings()["revision"], 1)
+        self.assertEqual(self.config.update_temporary_chat_second_slot(1, None)["revision"], 2)
+        self.assertNotIn("temporary_chat_second_slot", ConfigStore(self.path).resource_settings())
+        self.assertEqual(self.config.update_resource_settings(2, 4, 4, 2)["chat_account_concurrency"], 2)
+
     def test_codex_unobserved_capacity_is_unknown_not_zero(self):
         record = account(source_type="codex")
         record["codex_observation"] = observation(state="unknown")

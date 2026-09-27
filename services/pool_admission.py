@@ -344,11 +344,17 @@ class PoolAdmission:
 
     def _snapshot(self, rows, receipts, settings, types, now, cursor):
         by_identity = {str(a.get("provider_account_identity") or ""): a for a in rows}
+        identity_counts = {}
+        for row in rows:
+            identity = str(row.get("provider_account_identity") or "")
+            if identity:
+                identity_counts[identity] = identity_counts.get(identity, 0) + 1
         occupied = {}
         unknown_unbound = False
         active_bytes = 0
         active_text = 0
         active_images = 0
+        live_turns = {}
         requests = []
         thread_resources = []
         image_receipts = {}
@@ -378,6 +384,11 @@ class PoolAdmission:
             if resource and turn_active and (unknown or r.get("_turn_reserved", True)):
                 key = route + "_turn:" + resource
                 occupied[key] = occupied.get(key, 0) + 1
+                if (kind == "text" and route == "chat" and r.get("_operation") != "image"
+                        and status == "running" and r.get("_executing")
+                        and r.get("_submission_started")
+                        and float(r.get("_claim_until") or 0) > now):
+                    live_turns[key] = live_turns.get(key, 0) + 1
             if resource and image_generation_active(kind, r, active):
                 key = "image:" + resource
                 occupied[key] = occupied.get(key, 0) + 1
@@ -408,6 +419,12 @@ class PoolAdmission:
                      "codex_server": Resource("codex_server", int(settings.get("codex_max_concurrency", 4)), codex_used, now)}
         resources.update({resource.key: resource for resource in thread_resources})
         offers = []
+        scoped_extra_turn = None
+        trial = settings.get("temporary_chat_second_slot")
+        trial_active = (isinstance(trial, dict)
+                        and int(settings.get("chat_account_concurrency", 1)) == 1
+                        and type(trial.get("expires_at")) is int
+                        and now < trial["expires_at"])
         for account in rows:
             identity = str(account.get("provider_account_identity") or "")
             if not identity:
@@ -424,6 +441,18 @@ class PoolAdmission:
             # default remains one active Chat turn per account; a validated
             # setting may raise it without changing the 10/60s pacing clocks.
             chat_capacity = max(1, int(settings.get("chat_account_concurrency", 1)))
+            if (trial_active and identity == trial.get("account_identity")
+                    and identity_counts.get(identity) == 1
+                    and not disabled and chat_saved and paid
+                    and occupied.get(turn_key, 0) == 1 and live_turns.get(turn_key, 0) == 1):
+                candidates = [request for request in requests
+                              if request.ref.kind == "text" and request.ref.request_id == trial.get("request_id")
+                              and request.state == "queued" and request.route == "chat"
+                              and request.operation == "text" and request.payload_saved
+                              and request.bound_account == identity]
+                if len(candidates) == 1:
+                    chat_capacity = 2
+                    scoped_extra_turn = (candidates[0].ref, turn_key)
             new = Resource(turn_key, chat_capacity, None if unknown_unbound else occupied.get(turn_key, 0), pace.get("next_at"))
             resources[turn_key] = new
             previous = resources.get(image_key)
@@ -498,7 +527,8 @@ class PoolAdmission:
         unique = {offer.key: offer for offer in offers}
         return Snapshot(uuid.uuid4().hex, now, now + 1, tuple(resources.values()), tuple(unique.values()), tuple(requests),
                         last_source=cursor.get("source"), last_account=cursor.get("account"),
-                        last_owner_by_source=tuple((cursor.get("owners") or {}).items()))
+                        last_owner_by_source=tuple((cursor.get("owners") or {}).items()),
+                        scoped_extra_turn=scoped_extra_turn)
 
     def _recover_claims(self, db, receipts, now):
         for kind, owner, request_id, r in receipts:

@@ -77,6 +77,19 @@ DEFAULT_PROXY_RUNTIME = {
     },
 }
 
+_KEEP_CHAT_TRIAL = object()
+
+
+def _valid_temporary_chat_second_slot(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"account_identity", "request_id", "expires_at"}:
+        return False
+    for key in ("account_identity", "request_id"):
+        item = value[key]
+        if (not isinstance(item, str) or not item or len(item) > 300
+                or any(ord(char) < 32 for char in item)):
+            return False
+    return type(value["expires_at"]) is int and value["expires_at"] > 0
+
 DEFAULT_THIRD_PARTY_APPS = {
     "infinite_canvas": {
         "enabled": False,
@@ -458,14 +471,18 @@ class ConfigStore:
         values = JSONStorageBackend._load_json_list(self._resource_path)
         if not values:
             return {}
-        allowed = {"revision", "image_account_concurrency", "codex_max_concurrency", "chat_account_concurrency"}
+        allowed = {"revision", "image_account_concurrency", "codex_max_concurrency",
+                   "chat_account_concurrency", "temporary_chat_second_slot"}
         if (len(values) != 1 or not set(values[0]).issubset(allowed)
                 or not {"revision", "image_account_concurrency", "codex_max_concurrency"}.issubset(values[0])
-                or any(type(value) is not int for value in values[0].values())
+                or any(type(value) is not int for key, value in values[0].items()
+                       if key != "temporary_chat_second_slot")
                 or values[0]["revision"] < 1 or not 1 <= values[0]["image_account_concurrency"] <= 16
                 or not 1 <= values[0]["codex_max_concurrency"] <= 32
                 or ("chat_account_concurrency" in values[0]
-                    and not 1 <= values[0]["chat_account_concurrency"] <= 16)):
+                    and not 1 <= values[0]["chat_account_concurrency"] <= 16)
+                or ("temporary_chat_second_slot" in values[0]
+                    and not _valid_temporary_chat_second_slot(values[0]["temporary_chat_second_slot"]))):
             raise RuntimeError("resource settings are invalid")
         return values[0]
 
@@ -482,19 +499,25 @@ class ConfigStore:
             chat_limit = snapshot.get("chat_account_concurrency", self.data.get("chat_account_concurrency", 1))
             if type(chat_limit) is not int or not 1 <= chat_limit <= 16:
                 chat_limit = 1
-            return {"revision": snapshot.get("revision", 0),
+            result = {"revision": snapshot.get("revision", 0),
                     "image_account_concurrency": image_limit,
                     "codex_max_concurrency": codex_limit,
                     "chat_account_concurrency": chat_limit}
+            if "temporary_chat_second_slot" in snapshot:
+                result["temporary_chat_second_slot"] = dict(snapshot["temporary_chat_second_slot"])
+            return result
 
     def update_resource_settings(self, expected_revision: int, image_account_concurrency: int,
-                                 codex_max_concurrency: int, chat_account_concurrency: int | None = None) -> dict:
+                                 codex_max_concurrency: int, chat_account_concurrency: int | None = None,
+                                 *, trial_update: object = _KEEP_CHAT_TRIAL) -> dict:
         from services.storage.json_storage import JSONStorageBackend
         from services.storage.base import AccountCommitUncertain
         if (type(image_account_concurrency) is not int or not 1 <= image_account_concurrency <= 16
                 or type(codex_max_concurrency) is not int or not 1 <= codex_max_concurrency <= 32
                 or (chat_account_concurrency is not None
-                    and (type(chat_account_concurrency) is not int or not 1 <= chat_account_concurrency <= 16))):
+                    and (type(chat_account_concurrency) is not int or not 1 <= chat_account_concurrency <= 16))
+                or (trial_update is not _KEEP_CHAT_TRIAL and trial_update is not None
+                    and not _valid_temporary_chat_second_slot(trial_update))):
             raise ValueError("resource_settings_invalid")
         self._resource_path.parent.mkdir(parents=True, exist_ok=True)
         with self._update_lock, self._resource_path.with_suffix(".lock").open("a+b") as lock:
@@ -504,11 +527,18 @@ class ConfigStore:
                 if current["revision"] != expected_revision:
                     raise ValueError("resource_settings_conflict")
                 chat_limit = current["chat_account_concurrency"] if chat_account_concurrency is None else chat_account_concurrency
+                trial = (current.get("temporary_chat_second_slot")
+                         if trial_update is _KEEP_CHAT_TRIAL else trial_update)
+                if trial is not None and chat_limit != 1:
+                    raise ValueError("temporary_chat_second_slot_requires_global_one")
                 result = {"revision": expected_revision + 1,
                           "image_account_concurrency": image_account_concurrency,
                           "codex_max_concurrency": codex_max_concurrency,
                           "chat_account_concurrency": chat_limit}
-                if all(result[key] == current[key] for key in result if key != "revision"):
+                if trial is not None:
+                    result["temporary_chat_second_slot"] = dict(trial)
+                if (len(result) == len(current)
+                        and all(result[key] == current[key] for key in result if key != "revision")):
                     return current
                 # Reuse the pool's atomic JSON persistence; only technical
                 # settings live here. The bind-mounted credential/config file
@@ -522,6 +552,14 @@ class ConfigStore:
                 return result
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def update_temporary_chat_second_slot(self, expected_revision: int, trial: dict | None) -> dict:
+        current = self.resource_settings()
+        return self.update_resource_settings(
+            expected_revision, current["image_account_concurrency"],
+            current["codex_max_concurrency"], current["chat_account_concurrency"],
+            trial_update=trial,
+        )
 
     @property
     def image_parallel_generation(self) -> bool:
