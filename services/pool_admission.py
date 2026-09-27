@@ -605,7 +605,9 @@ class PoolAdmission:
         Session counts are intentionally absent from execution capacity.
         """
         now = float(self.clock())
-        with self.store.connect() as db, self._account_guard():
+        # Match claim/send lock order: a read holding the account lock must
+        # never wait for settings while admission holds settings for accounts.
+        with self._settings_guard(), self.store.connect() as db, self._account_guard():
             rows = self._rows()
             receipts = list(self.store.receipts(db))
             settings = self._settings()
@@ -692,7 +694,7 @@ class PoolAdmission:
         """Exact-model readback of original physical turns, no additional pool."""
         from services.owned_accounts import public_pool_account
         now = float(self.clock())
-        with self.store.connect() as db, self._account_guard():
+        with self._settings_guard(), self.store.connect() as db, self._account_guard():
             rows = self._rows()
             snapshot = self._snapshot(rows, list(self.store.receipts(db)), self._settings(), {}, now, {})
         resources = {resource.key: resource for resource in snapshot.resources}
