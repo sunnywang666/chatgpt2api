@@ -281,6 +281,65 @@ class AccountCenterTests(unittest.TestCase):
         self.assertEqual(saved[0]["codex_credentials"], codex)
         self.assertEqual(saved[0]["task_receipts"], {"original": "keep"})
 
+    def test_chat_refresh_restores_verified_abnormal_account(self) -> None:
+        chat = credentials("chat-recovered")
+        self.accounts.add_account_items([{
+            **chat, "source_type": "oauth_login", "user_id": "chat-user-id",
+            "managed_owner": "workbench:org:boss", "managed_account_id": "original-row",
+            "status": "异常", "quota": 0, "invalid_count": 2,
+            "last_invalid_at": "2026-09-20T07:46:00+00:00",
+            "last_refresh_error": "invalid access token",
+            "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+            "task_receipts": {"original": "keep"},
+        }])
+        ref = self.accounts.list_pool_accounts()[0]["account_ref"]
+        info = {"user_id": "chat-user-id", "account_id": ACCOUNT_ID,
+                "status": "正常", "quota": 1000,
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 1000}]}
+        with patch.object(self.accounts, "_verified_chat_info", return_value=(("chat-user-id", ACCOUNT_ID), info)):
+            result = self.accounts.refresh_pool_account(ref, ["chat"], True)
+        saved = self.accounts.list_accounts()[0]
+        self.assertEqual(result["account_ref"], ref)
+        self.assertEqual(saved["status"], "正常")
+        self.assertEqual(saved["quota"], 1000)
+        self.assertEqual(saved["invalid_count"], 0)
+        self.assertIsNone(saved["last_invalid_at"])
+        self.assertEqual(saved["task_receipts"], {"original": "keep"})
+
+    def test_chat_refresh_does_not_restore_abnormal_account_on_identity_mismatch(self) -> None:
+        chat = credentials("chat-not-recovered")
+        self.accounts.add_account_items([{
+            **chat, "source_type": "oauth_login", "user_id": "original-chat-user",
+            "status": "异常", "quota": 0, "invalid_count": 2,
+            "last_invalid_at": "2026-09-20T07:46:00+00:00",
+        }])
+        ref = self.accounts.list_pool_accounts()[0]["account_ref"]
+        info = {"user_id": "different-chat-user", "account_id": ACCOUNT_ID,
+                "status": "正常", "quota": 1000}
+        with patch.object(self.accounts, "_verified_chat_info", return_value=(("different-chat-user", ACCOUNT_ID), info)):
+            self.accounts.refresh_pool_account(ref, ["chat"], False)
+        saved = self.accounts.list_accounts()[0]
+        self.assertEqual(saved["status"], "异常")
+        self.assertEqual(saved["quota"], 0)
+        self.assertEqual(saved["invalid_count"], 2)
+
+    def test_chat_refresh_does_not_enable_manually_disabled_account(self) -> None:
+        chat = credentials("chat-disabled")
+        self.accounts.add_account_items([{
+            **chat, "source_type": "oauth_login", "user_id": "chat-user-id",
+            "managed_owner": "workbench:org:boss", "managed_account_id": "original-row",
+            "managed_disabled": True, "status": "禁用", "quota": 0,
+        }])
+        ref = self.accounts.list_pool_accounts()[0]["account_ref"]
+        info = {"user_id": "chat-user-id", "account_id": ACCOUNT_ID,
+                "status": "正常", "quota": 1000,
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 1000}]}
+        with patch.object(self.accounts, "_verified_chat_info", return_value=(("chat-user-id", ACCOUNT_ID), info)):
+            self.accounts.refresh_pool_account(ref, ["chat"], False)
+        saved = self.accounts.list_accounts()[0]
+        self.assertTrue(saved["managed_disabled"])
+        self.assertEqual(saved["status"], "禁用")
+
     def test_chat_refresh_rejects_real_user_or_workspace_mismatch(self) -> None:
         chat = credentials("chat-mismatch", subject="oauth-principal")
         self.accounts.add_account_items([{

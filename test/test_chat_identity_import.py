@@ -113,6 +113,58 @@ def test_unseen_authenticated_account_is_created_once(tmp_path):
     assert len(restored.storage.load_accounts()) == 5
 
 
+@pytest.mark.parametrize(("remaining", "status"), [(19, "正常"), (0, "限流")])
+def test_verified_chat_reauthorization_restores_existing_abnormal_account(tmp_path, remaining, status):
+    accounts = pool(tmp_path)
+    previous = next(row for row in accounts.list_accounts() if row["managed_account_id"] == "original-row-2")
+    ref = accounts.pool_account_ref(previous)
+    accounts.update_account(previous["access_token"], {
+        "status": "异常", "quota": 0, "invalid_count": 2,
+        "last_invalid_at": "2026-09-20T07:46:00+00:00",
+    }, quiet=True)
+    incoming = material(2, marker="fresh")
+    identity, info = observation(2)
+    info["status"] = status
+    info["quota"] = remaining
+    info["limits_progress"][0]["remaining"] = remaining
+    with patch.object(accounts, "_verified_chat_info", return_value=(identity, info)):
+        receipt = accounts.import_owned_account(
+            OWNER, {**incoming, "source_type": "oauth_login"}, verified_oauth=True,
+        )
+    saved = accounts.get_account(incoming["access_token"])
+    assert receipt["import_status"] == "updated"
+    assert receipt["authorization_ref"] == ref
+    assert saved["status"] == status
+    assert saved["quota"] == remaining
+    assert saved["invalid_count"] == 0
+    assert saved["last_invalid_at"] is None
+    assert saved["task_receipts"] == {"original": "succeeded"}
+    assert saved["conversation_binding_ids"] == ["original-binding-2"]
+
+
+def test_same_material_oauth_reauthorization_still_verifies_abnormal_account(tmp_path):
+    accounts = pool(tmp_path)
+    previous = next(row for row in accounts.list_accounts() if row["managed_account_id"] == "original-row-2")
+    accounts.update_account(previous["access_token"], {
+        "status": "异常", "quota": 0, "invalid_count": 2,
+        "last_invalid_at": "2026-09-20T07:46:00+00:00",
+    }, quiet=True)
+    incoming = material(2)
+    assert accounts.chat_login_committed_receipt(incoming) is None
+    identity, info = observation(2)
+    info["status"] = "正常"
+    with patch.object(accounts, "_verified_chat_info", return_value=(identity, info)) as verify:
+        receipt = accounts.import_owned_account(
+            OWNER, {**incoming, "source_type": "oauth_login"}, verified_oauth=True,
+        )
+    verify.assert_called_once_with(incoming["access_token"])
+    saved = accounts.get_account(incoming["access_token"])
+    assert receipt["import_status"] == "updated"
+    assert saved["status"] == "正常"
+    assert saved["task_receipts"] == {"original": "succeeded"}
+    assert len(accounts.list_accounts()) == 4
+
+
 @pytest.mark.parametrize("conflict", ["chat-user", "workspace", "id-subject"])
 def test_real_identity_conflicts_do_not_overwrite_or_create(tmp_path, conflict):
     accounts = pool(tmp_path)
