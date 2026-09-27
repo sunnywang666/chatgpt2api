@@ -3,6 +3,7 @@ import json
 import hashlib
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 import tempfile
 import threading
@@ -335,6 +336,86 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(snapshot["accounts"][0]["chat_turn"]["occupied"], 0)
         self.assertEqual(before, self.store.path.read_bytes())
         self.assertEqual(self.admission.claim_next().request_id, "queued")
+
+    def assert_capacity_read_does_not_deadlock_claim(self, read):
+        from services.config import ConfigStore
+        path = self.root / "config.json"
+        path.write_text(json.dumps({"auth-key": "fixture-only"}))
+        config = ConfigStore(path)
+        config.update_resource_settings(0, 4, 4, 2)
+        # Bound the same reentrant-lock wait so a regression fails instead of
+        # hanging the test process. The account and SQLite locks remain real.
+        settings_lock = threading.RLock()
+        class BoundedSettingsLock:
+            def __enter__(self):
+                if not settings_lock.acquire(timeout=2):
+                    raise TimeoutError("settings/account lock inversion")
+            def __exit__(self, *args):
+                settings_lock.release()
+        config._update_lock = BoundedSettingsLock()
+        self.admission.settings = config.resource_settings
+        self.submit("original")
+        before = self.read("text", "happy", "original")
+        settings_held, reader_at_lock = threading.Event(), threading.Event()
+        settings_guard = self.admission._settings_guard
+        account_guard = self.admission._account_guard
+        errors, claims, snapshots = [], [], []
+
+        @contextmanager
+        def observed_settings_guard():
+            if threading.current_thread().name == "capacity-reader":
+                reader_at_lock.set()
+            with settings_guard():
+                yield
+
+        @contextmanager
+        def observed_account_guard():
+            with account_guard():
+                if threading.current_thread().name == "capacity-reader":
+                    reader_at_lock.set()
+                yield
+
+        self.admission._settings_guard = observed_settings_guard
+        self.admission._account_guard = observed_account_guard
+
+        def claim():
+            try:
+                with config.resource_settings_guard():
+                    settings_held.set()
+                    if not reader_at_lock.wait(3):
+                        raise TimeoutError("reader did not reach a lock")
+                    claims.append(self.admission.claim_next())
+            except Exception as error:
+                errors.append(error)
+
+        def observe():
+            try:
+                if not settings_held.wait(3):
+                    raise TimeoutError("claim did not hold settings")
+                snapshots.append(read())
+            except Exception as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=claim),
+                   threading.Thread(target=observe, name="capacity-reader")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(6)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual([context.request_id for context in claims], ["original"])
+        after = self.read("text", "happy", "original")
+        self.assertEqual(after["request_message_id"], before["request_message_id"])
+        self.assertFalse(after["_submission_started"])
+        self.assertEqual(self.calls, [])
+
+    def test_resource_read_and_original_claim_do_not_deadlock(self):
+        self.assert_capacity_read_does_not_deadlock_claim(self.admission.resource_snapshot)
+
+    def test_model_resource_read_and_original_claim_do_not_deadlock(self):
+        self.assert_capacity_read_does_not_deadlock_claim(lambda: self.admission.model_resources([]))
 
     def test_ordinary_company_and_internal_take_turns_on_one_occupancy(self):
         for i in range(5):
