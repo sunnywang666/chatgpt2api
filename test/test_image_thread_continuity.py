@@ -664,3 +664,21 @@ def test_thread_capability_matches_ingress_without_changing_private_catalog(runt
     else:
         assert response.json()["service_capabilities"] == {"image_thread": PROTOCOL if enabled else None}
     assert catalog == {"object": "list", "data": []}, "discovery may not mutate cached catalog"
+
+
+@pytest.mark.parametrize("previous,reason", [
+    (None, "IMAGE_THREAD_PREVIOUS_MISSING"),
+    ({"status": "error", "upstream_outcome": "rejected"}, "IMAGE_THREAD_PREVIOUS_FAILED"),
+    ({"status": "unknown"}, "IMAGE_THREAD_PREVIOUS_UNKNOWN"),
+    ({"status": "error", "upstream_unfinished": True}, "IMAGE_THREAD_PREVIOUS_UNKNOWN"),
+    ({"status": "success", "_recovery_suppressed": True}, "IMAGE_THREAD_PREVIOUS_RECOVERY_STOPPED"),
+    ({"status": "queued"}, "IMAGE_THREAD_PREVIOUS_PENDING"),
+    ({"status": "success"}, "IMAGE_THREAD_PREVIOUS_UNCONFIRMED"),
+])
+def test_predecessor_diagnostics_are_specific_and_read_only(previous, reason):
+    from services.image_thread import predecessor_state
+    task = {"_image_thread": {"protocol": PROTOCOL, "id": "same-product", "previous_task_id": "original"}}
+    owned = {} if previous is None else {"original": previous}
+    before = copy.deepcopy(owned)
+    assert predecessor_state(task, owned) == ({}, reason)
+    assert owned == before

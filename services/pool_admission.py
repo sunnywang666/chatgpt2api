@@ -44,6 +44,13 @@ def unknown_text_result(receipt):
             and receipt.get("upstream_outcome") == "unknown"))
 
 
+def unresolved_result(kind, receipt):
+    if kind == "text":
+        return unknown_text_result(receipt)
+    return not recovery_suppressed(receipt) and (receipt.get("status") == "unknown"
+           or receipt.get("status") == "error" and receipt.get("upstream_unfinished") is True)
+
+
 def unfinished(kind, receipt):
     if recovery_suppressed(receipt):
         return False
@@ -76,6 +83,23 @@ def image_capacity(account, settings):
     return capacity
 
 
+def image_generation_active(kind, receipt, active):
+    """Count generation only; confirmed output download/save has its own work.
+
+    An EOF, old request or suppressed recovery is not proof of generated output.
+    Native image receipts persist original result IDs before downloading; wire
+    image receipts persist the original turn's explicit terminal evidence.
+    """
+    if kind != "image" and receipt.get("_operation") != "image":
+        return False
+    single = int(receipt.get("_expected_sends") or 1) <= 1
+    generated = (single and kind == "image" and receipt.get("upstream_unfinished") is False
+                 and bool(receipt.get("result_file_ids") or receipt.get("result_sediment_ids"))
+                 and bool(receipt.get("request_message_id")))
+    ended = original_turn_ended(kind, receipt) and single
+    return not (generated or ended) and (receipt.get("upstream_unfinished") is True or active)
+
+
 class ExecutionContext:
     def __init__(self, admission, kind, owner, request_id, claim):
         self.admission, self.kind, self.owner = admission, kind, owner
@@ -105,6 +129,10 @@ class ExecutionContext:
         """Persist and log a safe stage in the original request timeline."""
         receipt = self.receipt()
         settings = self.admission._settings()
+        accepted = next((item.get("at") for item in receipt.get("_execution_timeline", [])
+                         if item.get("stage") == "accepted"), receipt.get("created_ts") or receipt.get("created_at"))
+        claimed = next((item.get("at") for item in receipt.get("_execution_timeline", [])
+                        if item.get("stage") == "execution_claimed"), None)
         entry = {
             "stage": str(stage),
             "at": time.time(),
@@ -114,9 +142,10 @@ class ExecutionContext:
             "operation": receipt.get("_operation", "image" if self.kind == "image" else "text"),
             "source": receipt.get("_source"),
             "input_bytes": receipt.get("_input_bytes"),
+            "queue_wait_seconds": max(0, claimed - accepted) if type(accepted) in (int, float) and type(claimed) in (int, float) else None,
             "config_revision": settings.get("revision") if isinstance(settings, dict) else None,
             **{key: value for key, value in extra.items()
-               if key in {"status_code", "upstream_request_id", "output_ref", "known"}},
+               if key in {"status_code", "upstream_request_id", "output_ref", "known", "task_status", "image_count"}},
         }
         timeline = list(receipt.get("_execution_timeline") or [])
         timeline.append(entry)
@@ -127,6 +156,23 @@ class ExecutionContext:
             pass
         logger.info({"event": "pool_execution_stage", **entry})
         return entry
+
+    def record_outcome(self):
+        receipt = self.receipt()
+        status = receipt.get("status")
+        if status not in {"success", "succeeded", "failed", "error", "unknown", "cancelled"}:
+            return
+        if (receipt.get("upstream_outcome") == "generated" and status == "error"
+                and (receipt.get("result_file_ids") or receipt.get("result_sediment_ids"))):
+            return  # Output download is unfinished, not a failed generation.
+        outcome = "succeeded" if status in {"success", "succeeded"} else "unknown" if status == "unknown" or receipt.get("upstream_unfinished") is True or receipt.get("upstream_outcome") == "unknown" else "failed"
+        if any(item.get("stage") == "task_finished" and item.get("task_status") == outcome
+               for item in receipt.get("_execution_timeline", [])):
+            return
+        images = len(receipt["data"]) if outcome == "succeeded" and self.kind == "image" and isinstance(receipt.get("data"), list) else None
+        if outcome == "succeeded" and receipt.get("_operation") == "image" and type(receipt.get("_completed_slot")) is int:
+            images = receipt["_completed_slot"] + 1
+        self.record_stage("task_finished", task_status=outcome, image_count=images)
 
     def log_fields(self):
         r = self.receipt()
@@ -157,7 +203,7 @@ class PoolAdmission:
     MAX_ACTIVE_INPUT_BYTES = 256 * 1024 * 1024
 
     def __init__(self, store: TaskStore, accounts, *, clock=time.time,
-                 settings=None, model_types=None, pacing=None, codex=None, text_workers=4):
+                 settings=None, model_types=None, pacing=None, codex=None, text_workers=None):
         self.store, self.accounts, self.clock = store, accounts, clock
         self.settings = settings
         self.model_types = model_types
@@ -258,6 +304,10 @@ class PoolAdmission:
         finally:
             done.set()
             try:
+                context.record_outcome()
+            except Exception:
+                logger.warning({"event": "pool_outcome_unavailable", "layer": "provider"})
+            try:
                 self.update_claim(context, _executing=False)
             except AdmissionLost:
                 pass
@@ -298,6 +348,7 @@ class PoolAdmission:
         unknown_unbound = False
         active_bytes = 0
         active_text = 0
+        active_images = 0
         requests = []
         thread_resources = []
         image_receipts = {}
@@ -307,9 +358,7 @@ class PoolAdmission:
         for kind, owner, request_id, r in receipts:
             status = r.get("status")
             pending = unfinished(kind, r)
-            unknown = (unknown_text_result(r) if kind == "text" else
-                       (not recovery_suppressed(r) and
-                        (status == "unknown" or status == "error" and r.get("upstream_unfinished"))))
+            unknown = unresolved_result(kind, r)
             account = by_identity.get(str(r.get("provider_account_identity") or ""))
             resource = account_clock_key(account) if account else r.get("_account_resource")
             active = status == "running" or unknown
@@ -319,7 +368,9 @@ class PoolAdmission:
             turn_active = active and not original_turn_ended(kind, r)
             if status == "running" and r.get("_executing") and float(r.get("_claim_until") or 0) > now:
                 active_bytes += int(r.get("_input_bytes") or 0)
-                if kind == "text" and r.get("_route", "chat") == "chat":
+                if kind == "image" or r.get("_operation") == "image":
+                    active_images += 1
+                if kind == "text" and r.get("_route", "chat") == "chat" and r.get("_operation") != "image":
                     active_text += 1
             if turn_active and not resource:
                 unknown_unbound = True
@@ -327,7 +378,7 @@ class PoolAdmission:
             if resource and turn_active and (unknown or r.get("_turn_reserved", True)):
                 key = route + "_turn:" + resource
                 occupied[key] = occupied.get(key, 0) + 1
-            if resource and (kind == "image" or r.get("_operation") == "image") and (r.get("upstream_unfinished") or active):
+            if resource and image_generation_active(kind, r, active):
                 key = "image:" + resource
                 occupied[key] = occupied.get(key, 0) + 1
             state = "unknown" if unknown else "queued" if status in {"queued", "not_started"} else "active" if active else "succeeded"
@@ -348,11 +399,12 @@ class PoolAdmission:
                 order_group=str(r.get("client_conversation_id") or "") or None,
                 ready_at=float(r.get("_ready_at") or 0),
                 needs=thread_needs + (Need("execution_input_bytes", max(1, int(r.get("_input_bytes") or 1))),)
-                      + ((Need("chat_executor"),) if kind == "text" and route == "chat" else ()),
+                      + ((Need("chat_executor"),) if kind == "text" and route == "chat" and r.get("_operation") != "image" else ())
+                      + ((Need("image_executor"),) if kind == "image" or r.get("_operation") == "image" else ()),
             ))
         codex_used = sum(value for key, value in occupied.items() if key.startswith("codex_turn:"))
         resources = {"execution_input_bytes": Resource("execution_input_bytes", self.MAX_ACTIVE_INPUT_BYTES, active_bytes, now),
-                     "chat_executor": Resource("chat_executor", self.text_workers, active_text, now),
+                     "chat_executor": Resource("chat_executor", self.text_workers or 0, active_text, now),
                      "codex_server": Resource("codex_server", int(settings.get("codex_max_concurrency", 4)), codex_used, now)}
         resources.update({resource.key: resource for resource in thread_resources})
         offers = []
@@ -411,10 +463,42 @@ class PoolAdmission:
                     if isinstance(limit, dict) and limit.get("feature_name") == model and limit.get("remaining") == 0:
                         enabled = False
                 offers.append(Offer(identity, "chat", model, request.operation, needs, enabled=bool(enabled)))
-        # All sources are server-authenticated; cursor moves only on a claim.
+        if self.text_workers is None:
+            # Execution threads follow the same usable physical account turns.
+            # The retained-input memory ceiling still bounds all work; image
+            # executions use their image budget rather than the text budget.
+            enabled_turns = {need.resource for offer in offers if offer.enabled and offer.route == "chat"
+                             for need in offer.needs if need.resource.startswith("chat_turn:")}
+            # Offers exist only for queued models. Account eligibility must also
+            # be visible when idle, without triggering catalog or model calls.
+            for account in rows:
+                if (not account.get("managed_disabled") and account.get("status") not in {"禁用", "异常", "限流"}
+                        and str(account.get("source_type") or "web") in {"web", "oauth_login", "password"}
+                        and account.get("access_token") and account.get("provider_account_identity")
+                        and self.accounts._normalize_account_type(account.get("type")) in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}):
+                    enabled_turns.add("chat_turn:" + account_clock_key(account))
+            resources["chat_executor"] = Resource("chat_executor", sum(resources[key].capacity for key in enabled_turns), active_text, now)
+        # Leave room for confirmed images to save while new generation runs,
+        # but never allow slow downloads to create an unbounded thread backlog.
+        # This is a local retained-work ceiling, separate from upstream slots.
+        image_keys = {need.resource for offer in offers if offer.enabled
+                      for need in offer.needs if need.resource.startswith("image:") or (offer.operation == "image" and need.resource.startswith("codex_turn:"))}
+        usable_chat_keys = {"image:" + account_clock_key(account) for account in rows
+                            if account.get("provider_account_identity") and account.get("access_token")
+                            and not account.get("managed_disabled") and account.get("status") not in {"禁用", "异常", "限流"}
+                            and str(account.get("source_type") or "web") in {"web", "oauth_login", "password"}
+                            and self.accounts._normalize_account_type(account.get("type")) in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}}
+        image_keys.update(usable_chat_keys)
+        if self.codex is not None:
+            image_keys.update("codex_turn:" + account_clock_key(account) for account in rows
+                              if account.get("provider_account_identity") and account.get("source_type") == "codex"
+                              and self.codex._eligible_account(account, allow_probe=False) is not None)
+        resources["image_executor"] = Resource("image_executor", 2 * sum(resources[key].capacity for key in image_keys), active_images, now)
+        # Sources and owners are server-authenticated; cursors move only on a claim.
         unique = {offer.key: offer for offer in offers}
         return Snapshot(uuid.uuid4().hex, now, now + 1, tuple(resources.values()), tuple(unique.values()), tuple(requests),
-                        last_source=cursor.get("source"), last_account=cursor.get("account"))
+                        last_source=cursor.get("source"), last_account=cursor.get("account"),
+                        last_owner_by_source=tuple((cursor.get("owners") or {}).items()))
 
     def _recover_claims(self, db, receipts, now):
         for kind, owner, request_id, r in receipts:
@@ -454,7 +538,9 @@ class PoolAdmission:
             enabled = not account.get("managed_disabled") and account.get("status") not in {"禁用", "异常", "限流"}
             chat_ok = enabled and str(account.get("source_type") or "web") in {"web", "oauth_login", "password"} and bool(account.get("access_token")) and self.accounts._normalize_account_type(account.get("type")) in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
             native_ok = self.codex is not None and self.codex._eligible_account(account, allow_probe=False) is not None
-            item = {"provider_account_identity": identity, "enabled": bool(enabled)}
+            item = {"provider_account_identity": identity, "account_ref": self.accounts.pool_account_ref(account),
+                    "enabled": bool(enabled), "status": str(account.get("status") or ""),
+                    "chat_eligible": bool(chat_ok)}
             for name, prefix, usable in (("chat_turn", "chat_turn:", chat_ok), ("image", "image:", chat_ok), ("codex", "codex_turn:", native_ok)):
                 resource = resources.get(prefix + key)
                 if resource is None:
@@ -475,6 +561,15 @@ class PoolAdmission:
                     "inflight": None if any(v["occupied"] is None for v in values) else sum(v["occupied"] for v in values),
                     "slots_free": None if any(v["free"] is None for v in values) else sum(v["free"] for v in values),
                     "dispatchable_now": None if any(v["dispatchable_now"] is None for v in values) else sum(v["dispatchable_now"] for v in values)}
+        image_summary = aggregate("image")
+        image_workers_free = max(0, resources["image_executor"].capacity - resources["image_executor"].occupied)
+        if resources["execution_input_bytes"].occupied >= self.MAX_ACTIVE_INPUT_BYTES:
+            image_workers_free = 0
+        if image_summary["dispatchable_now"] is not None:
+            image_summary["dispatchable_now"] = min(image_summary["dispatchable_now"], image_workers_free)
+        for item in result:
+            if item["image"]["dispatchable_now"] is not None:
+                item["image"]["dispatchable_now"] = min(item["image"]["dispatchable_now"], image_workers_free)
         native = aggregate("codex")
         native["server_limit"] = settings["codex_max_concurrency"]
         native["slots_total"] = min(native["slots_total"], native["server_limit"])
@@ -482,14 +577,32 @@ class PoolAdmission:
             native["slots_free"] = min(native["slots_free"], max(0, native["server_limit"] - native["inflight"]))
             native["dispatchable_now"] = min(native["dispatchable_now"], native["slots_free"])
         queued = [(kind, owner, r) for kind, owner, _, r in receipts if r.get("status") == "queued"]
-        sources = {}
+        sources, reasons = {}, {}
+        oldest = 0.0
         for _, owner, r in queued:
             source = r.get("_source") or "key:" + owner
             sources[source] = sources.get(source, 0) + 1
-        return {"accounts": result, "settings": settings, "chat_turn": aggregate("chat_turn"), "image": aggregate("image"), "codex": native,
-                "queue": {"mode": "durable_original_receipts", "queued": len(queued), "by_source": sources},
+            accepted = next((stage.get("at") for stage in r.get("_execution_timeline", [])
+                             if stage.get("stage") == "accepted"), r.get("created_ts") or r.get("created_at"))
+            if type(accepted) in (int, float):
+                oldest = max(oldest, max(0, now - accepted))
+            for reason in (r.get("waiting") or {}).get("reasons", ["awaiting_dispatch"]):
+                reasons[reason] = reasons.get(reason, 0) + 1
+        recovery = sum(1 for kind, _, _, r in receipts if not recovery_suppressed(r) and
+                       (unknown_text_result(r) if kind == "text" else r.get("upstream_unfinished") is True
+                        and r.get("status") in {"error", "unknown"}))
+        saving = sum(1 for kind, _, _, r in receipts if r.get("status") == "running"
+                     and (kind == "image" or r.get("_operation") == "image")
+                     and not image_generation_active(kind, r, True))
+        return {"accounts": result, "settings": settings, "chat_turn": aggregate("chat_turn"), "image": image_summary, "codex": native,
+                "queue": {"mode": "durable_original_receipts", "queued": len(queued), "by_source": sources,
+                          "by_reason": reasons, "oldest_wait_seconds": oldest,
+                          "recovering_original": recovery, "saving_images": saving},
                 "execution": {"active_input_bytes": resources["execution_input_bytes"].occupied, "max_input_bytes": self.MAX_ACTIVE_INPUT_BYTES,
-                              "chat_workers_active": resources["chat_executor"].occupied, "chat_workers_limit": self.text_workers}}
+                              "chat_workers_active": resources["chat_executor"].occupied,
+                              "chat_workers_limit": resources["chat_executor"].capacity,
+                              "image_workers_active": resources["image_executor"].occupied,
+                              "image_workers_limit": resources["image_executor"].capacity}}
 
     def model_resources(self, model_ids):
         """Exact-model readback of original physical turns, no additional pool."""
@@ -602,6 +715,11 @@ class PoolAdmission:
             for deferred in selection.deferred:
                 r = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id)
                 r["waiting"] = {"reasons": ([r["_image_thread_waiting_reason"]] if r.get("_image_thread_waiting_reason") else list(deferred.reasons)), "next_check_at": deferred.next_at}
+                previous_id = (r.get("_image_thread") or {}).get("previous_task_id")
+                if previous_id and r.get("_image_thread_waiting_reason"):
+                    # Same-owner original receipt is the recovery entry. This is
+                    # diagnostic only: never replace or resend its failed turn.
+                    r["waiting"].update(previous_task_id=previous_id, action="read_original_predecessor")
                 self.store.write_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id, r)
             if selection.dispatch is None:
                 return None
@@ -634,7 +752,10 @@ class PoolAdmission:
                 r["client_conversation_id"] = r.get("client_conversation_id") or "image-task-" + uuid.uuid4().hex
                 r["binding_status"] = "bound"
             self.store.write_receipt(db, ref.kind, ref.owner, ref.request_id, r)
-            self.store.set_runtime(db, "fairness", {"source": pick.source, "account": pick.account})
+            owners = {source: owner for source, owner in snapshot.last_owner_by_source
+                      if any(request.source == source and request.state == "queued" for request in snapshot.requests)}
+            owners[pick.source] = ref.owner
+            self.store.set_runtime(db, "fairness", {"source": pick.source, "account": pick.account, "owners": owners})
             return ExecutionContext(self, ref.kind, ref.owner, ref.request_id, claim)
 
     def update_claim(self, context, **changes):
@@ -676,7 +797,7 @@ class PoolAdmission:
                     occupied = sum(1 for kind, _, _, other in self.store.receipts(db)
                                    if (kind == "image" or other.get("_operation") == "image")
                                    and other.get("_account_resource") == r.get("_account_resource")
-                                   and (other.get("upstream_unfinished") or other.get("status") in {"running", "unknown"}))
+                                   and image_generation_active(kind, other, other.get("status") == "running" or unresolved_result(kind, other)))
                     if capacity < occupied:
                         raise AdmissionLost("original image capacity decreased before send")
                 if any(isinstance(limit, dict) and limit.get("feature_name") == r.get("model") and limit.get("remaining") == 0
@@ -748,6 +869,10 @@ class PoolAdmission:
                         r.update(status="queued", _claim_id=None, _turn_reserved=False, upstream_unfinished=False,
                                  _ready_at=float(self.clock()) + 1)
                     self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
+            try:
+                context.record_outcome()
+            except Exception:
+                logger.warning({"event": "pool_outcome_unavailable", "layer": "provider"})
             self.wake()
 
 
@@ -756,7 +881,7 @@ def configure_original_task_admission():
     from services.text_task_service import text_task_service
     from services.image_task_service import image_task_service
     from services.codex_service import codex_service
-    admission = PoolAdmission(text_task_service.store, account_service, codex=codex_service, text_workers=text_task_service.executor.limit)
+    admission = PoolAdmission(text_task_service.store, account_service, codex=codex_service)
     admission.register("text", lambda context, body: text_task_service._run(context.owner, context.request_id, body))
     def image(context, body):
         payload = body["payload"]

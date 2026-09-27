@@ -122,3 +122,28 @@ class AuditTests(unittest.TestCase):
         self.assertFalse(json.loads(p.stdout)['coverage']['input_complete'])
 
 if __name__=='__main__': unittest.main(verbosity=2)
+
+
+class OutcomeMetricsTests(unittest.TestCase):
+    def test_hourly_receipts_deduplicate_recovery_and_keep_unknown_separate(self):
+        def outcome(ref, status, at, count=None):
+            return line('pool_execution_stage', account_ref='b'*24, request_ref=ref*24,
+                        operation='image', stage='task_finished', task_status=status,
+                        at=at, image_count=count, queue_wait_seconds=120)
+        report = analyze([outcome('a', 'unknown', 1800000010), outcome('a', 'succeeded', 1800000020, 1),
+                          outcome('a', 'succeeded', 1800000020, 1), outcome('c', 'failed', 1800000030),
+                          outcome('d', 'unknown', 1800000040), outcome('e', 'succeeded', 1800000050)])
+        row = report['hourly_outcomes'][0]
+        self.assertEqual(row['succeeded_requests'], 2)
+        self.assertEqual(row['failed_requests'], 1)
+        self.assertEqual(row['unknown_requests'], 1)
+        self.assertEqual(row['known_saved_images'], 1)
+        self.assertEqual(row['image_count_unknown_requests'], 1)
+        self.assertAlmostEqual(row['failure_rate_known_outcomes'], 1/3)
+        self.assertEqual(row['queue_wait_seconds']['p95'], 120)
+        self.assertTrue(report['real_24h_acceptance'].startswith('unverified'))
+
+    def test_old_logs_and_missing_results_are_not_zero_failure_or_24h_evidence(self):
+        report = analyze([line(request_ref='a'*24)])
+        self.assertEqual(report['hourly_outcomes'], [])
+        self.assertTrue(report['real_24h_acceptance'].startswith('unverified'))

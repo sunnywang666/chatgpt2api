@@ -30,17 +30,33 @@
 
 | 资源 | 实际计算与含义 |
 | --- | --- |
-| Chat 活跃轮次 | 每个可用 Chat 账号最多1轮，正在读取的响应流占用该轮；保存的会话不计为轮次 |
-| 图片生命周期 | 每号上限为 `min(image_account_concurrency, 该号可用图片额度)`；显式 `image_gen.remaining` 更低时采用更低值。尚未终结的原图片及 UNKNOWN 占位，原模型响应流结束后可释放轮次而继续占图片位 |
+| Chat 活跃轮次 | 每账号按 `chat_account_concurrency`（默认仍1）计活动轮次；正在读取的响应流占位，保存的会话不计位。配置入口已支持先验证2路，不在代码升级时自动提额 |
+| 图片生成 | 每号上限为 `min(image_account_concurrency, 该号可用图片额度)`；显式 `image_gen.remaining` 更低时采用更低值。UNKNOWN保留占位；原任务已持久化结果ID和生成结束证明后，下载/保存不继续占生成位。多次模型发送的原多图请求在整个已知序列结束前保留占位 |
 | 原生 Codex | 每个具备新鲜有效模型/额度观察的账号最多1轮，同时受原 `codex_max_concurrency` 约束；原会话绑定和待定响应同样限制领取 |
 | 节拍与冷却 | 账号请求间隔、模型轮次发送间隔、上游冷却分别取下一可发时间；有空位不等于现在可发送 |
-| Provider 技术保护 | 原 Chat 文本执行器4个、同时执行输入256MiB与传输 body-reader 独立约束；磁盘等待不占执行线程，不等于账号配额 |
+| Provider 技术保护 | 共用调度的文字执行数随可用物理账号轮次计算，移除原全局4限制；图片执行器允许生成和保存重叠，但总在途工作不超过可用图片容量的2倍，防止慢下载无限累积线程。同时执行输入256MiB和原传输 body-reader 限制保留；磁盘排队不占执行线程 |
 
 账号停用、异常、授权或模型额度不可用会停止相应新派发；提交前再次核对。已提交/UNKNOWN 原任务不改号、不释放为“可重发”，恢复只读原结果。模型特定限制只影响其模型；Codex额度不能代替 Chat图片额度。缺失占用用 `null`，已知没有占用用 `0`；未知额度使该路线不准入，但不会伪造一条额度为0的观察。
 
-原 `/api/workbench/ai/pool/resources` 投影增加 `accounts[]`：每行 `provider_account_identity`、`enabled`，以及 `chat_turn` / `image` / `codex` 的 `capacity, occupied, free, dispatchable_now, next_at`。汇总保留 `slots_total/inflight/slots_free`，增加 `dispatchable_now`、`queue.mode=durable_original_receipts`、`queue.queued/by_source`、`execution.active_input_bytes/max_input_bytes/chat_workers_active/chat_workers_limit`。这是调度器同一存储的只读投影；没有改 UI 或账号身份展示作者负责的 `owned_accounts.py`。
+原 `/api/workbench/ai/pool/resources` 投影增加 `accounts[]`：每行 `provider_account_identity`、`enabled`，以及 `chat_turn` / `image` / `codex` 的 `capacity, occupied, free, dispatchable_now, next_at`。汇总保留 `slots_total/inflight/slots_free`，增加 `dispatchable_now`、`queue.mode=durable_original_receipts`、`queue.queued/by_source`、`execution.active_input_bytes/max_input_bytes/chat_workers_active/chat_workers_limit`。2026-09-27候选同时投影原账号安全引用、可派发状态、队列等待原因/最长等待、核查原结果/图片保存数和图片执行器占用。Workbench配套显示真正可启动数、异常账号和前驱阻塞；旧服务缺字段显示未知，不能据余量推定可派发。未另建账号或任务数据库。
 
-基础公平以认证后的来源轮转，再在合格账号间轮转，同来源保留先到顺序和同会话前序。普通 Key 的来源取真实 Key ID，公司来源取已验证公司身份；私网管理员调用仅接受服务端允许的消费者名。Workbench 配套给两方向上新的共同 Worker 标记 `internal:listing`，给 Content 标记 `internal:content`；Happy 沿原公司身份，未修改其本机传输。普通客户端自报来源/优先级不改变调度，不新增预算或权限。
+基础公平以认证后的来源轮转，再按来源内owner轮转并在合格账号间轮转；同owner按接受顺序，同会话前序保留。游标保存在原SQLite runtime行，重启不归零。普通Key的来源取真实Key ID，公司来源按已验证公司+用户归组，多连接器保留各自原回执owner而不会增加这个用户的派发份额；私网管理员调用仅接受服务端允许的消费者名。Workbench 配套给两方向上新的共同 Worker 标记 `internal:listing`，给 Content 标记 `internal:content`；Happy 沿原公司身份，未修改其本机传输。普通客户端自报来源/优先级不改变调度，不新增预算或权限。
+
+### 2026-09-27接续：占位、公平与真实验收
+
+对应用户对五项补齐计划的“补吧”。本候选基于已含认证异常恢复PR64的main b0e878e，保留原Provider PR63终结空响应后继方案的独立范围；未修改线上并发值、10/60秒发送节拍、116 HOLD或55条停止恢复标记。Workbench配套取消整款四位预算，只保留同商品互斥和旧回执恢复；各入口仍调用原Provider持久调度。
+
+前驱结果区分缺失、正在执行、失败、UNKNOWN、图片保存待完成、未确认和人工停止恢复；公开等待信息包含同owner的 `previous_task_id` 与 `read_original_predecessor` 操作提示。这里只查原记录，不因明确失败或UNKNOWN自动新建会话、换账号、重发生成。新任务只在前驱确已保存且原绑定确认后继续。
+
+真实验收仍是 `waiting-external`，依赖唯一发布协调部署准确Provider/Node/Web工件。离线多进程、重启、断线、账号停用恢复、满队列、公平、2/4路容量和UI证据只证明工程行为，不能替代以下步骤：
+
+1. **准确上线与原负载：** 读取运行digest、资源设置revision和健康账号；选择原已授权、未HOLD且没有UNKNOWN重发风险的商品队列。记录原owner/request/account/conversation身份、初始排队和已保存结果；不为压测新增无业务用途图片。
+2. **每账号两路：** 通过原带revision的设置入口把活动对话设为2，沿原队列至少观察每个健康账号一对真实重叠且最终保存成功的请求。保留当前image上限和发送间隔。按小时报告已成功图片、仍未知结果、失败率与等待p95；样本不足或上游限流增加时维持/退回原设置，不推定4路稳定。
+3. **四路只作后续实测选择：** 两路稳定且有足够原业务样本后才用同一入口做有界四路试验，比较吞吐和等待、429与UNKNOWN；若无实质收益或错误升高，恢复试验前revision对应数值。配置变更不终止原任务，不释放UNKNOWN。
+4. **恢复验证：** 先用隔离回归覆盖无发送领取过期、已发送进程消失、下载失败和前驱失败。线上仅在发布协调的安全窗口验证单服务重启及单账号停用/恢复；保留原请求读回，不断开全公司网络或清库。真实故障事件按实际是否发生单列，不能把测试注入写成真实上游事故。
+5. **连续24小时：** 从上述准确部署和原负载就绪时起保留完整UTC起止窗口、各小时日志与资源读回，核对接收数=排队+执行/恢复+已完成/明确失败，抽查原身份和成果无丢失、无重复。没有业务输入时记录空闲原因，不计成24小时持续成功生图。服务重启/账号恢复后仍原ID接续才关闭相应项。
+
+复用 `scripts/audit_pacing_log.py`：对有界完整日志导出运行 `python scripts/audit_pacing_log.py < provider-window.log > pool-window-report.json`。新增 `task_finished` 来自原回执终态，按请求去重并以最新恢复结果统计 `hourly_outcomes`，成功、失败、UNKNOWN分别列出；图片数量证据缺失单列，失败率分母只含已知终态。采样上限只截取样本列表，小时统计遍历全部导入事件。脚本保留 `real_24h_acceptance=unverified`，日志片段/假时钟/短测不能自动关闭验收。无需新定时器或第二套监控服务。
 
 ### 原任务持久化、领取与恢复
 
