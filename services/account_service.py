@@ -767,6 +767,12 @@ class AccountService:
                 quota = chat_info.get("quota")
                 next_item["limits_progress"] = limits if isinstance(limits, list) else []
                 next_item["quota"] = quota if type(quota) is int and quota >= 0 else None
+                # A verified replacement for the same Chat principal resolves
+                # a retained invalid-authorization state. A token refresh
+                # without a protected Chat read must not do so.
+                if (next_item.get("status") == "异常" and not next_item.get("managed_disabled")
+                        and chat_info.get("status") in {"正常", "限流"}):
+                    next_item["status"] = chat_info["status"]
                 next_item["capacity_observed_at"] = now
                 next_item["capacity_used_since_observation"] = False
                 next_item["capacity_read_failed_at"] = None
@@ -1971,6 +1977,12 @@ class AccountService:
             "capacity_read_failed_at": None,
             "managed_updated_at": utc_now(),
         }
+        if (account.get("status") == "异常" and not account.get("managed_disabled")
+                and info.get("status") in {"正常", "限流"}):
+            updates.update(
+                status=info["status"], invalid_count=0, last_invalid_at=None,
+                last_refresh_error=None, last_refresh_error_at=None,
+            )
         if isinstance(info.get("email"), str):
             updates["email"] = info["email"]
         self.update_account(token, updates, quiet=True, expected_credentials=expected)
@@ -1986,7 +1998,8 @@ class AccountService:
             snapshot = self._copy_account(account)
         if "chat" in routes and self._chat_authorization_saved(snapshot):
             chat = chat_projection(snapshot)
-            if not stale_only or not observation_is_fresh(chat.get("observed_at")):
+            if (not stale_only or snapshot.get("status") == "异常"
+                    or not observation_is_fresh(chat.get("observed_at"))):
                 self._refresh_pool_chat(account_ref)
         with self._lock:
             token, account = self._pool_account_locked(account_ref)
@@ -2632,7 +2645,8 @@ class AccountService:
                     and str(payload[key]).strip() != str(current.get(key) or "").strip()
                     for key in ("refresh_token", "id_token", "account_id")
                 )
-                if not changed_material and current.get("source_type") != "codex":
+                if (not changed_material and current.get("source_type") != "codex"
+                        and current.get("status") != "异常"):
                     if current.get("managed_owner") == owner:
                         return public_owned_account(current)
                     return self._chat_import_receipt(current, "unchanged")
@@ -2785,6 +2799,10 @@ class AccountService:
                 return None
             if account_ref and self.pool_account_ref(account) != account_ref:
                 raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
+            # An identical OAuth exchange still needs a protected Chat read
+            # before a previously abnormal row can become dispatchable again.
+            if account.get("status") == "异常":
+                return None
             return self._chat_import_receipt(account, "unchanged")
 
     def import_owned_account(self, owner: str, payload: dict, *, verified_oauth: bool = False) -> dict:
