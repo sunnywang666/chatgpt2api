@@ -11,6 +11,7 @@ arbitrary exception text are never printed.
 from __future__ import annotations
 import argparse
 from collections import defaultdict
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -80,6 +81,10 @@ def decode_event(line):
     # of copying a potentially sensitive header value into the shared report.
     upstream = obj.get('upstream_request_id')
     clean['upstream_request_ref'] = hashlib.sha256(upstream.encode()).hexdigest()[:24] if isinstance(upstream, str) and 0 < len(upstream) <= 160 else None
+    clean['at'] = numeric(obj.get('at'))
+    clean['queue_wait_seconds'] = numeric(obj.get('queue_wait_seconds'))
+    clean['image_count'] = numeric(obj.get('image_count'))
+    clean['task_status'] = obj.get('task_status') if obj.get('task_status') in {'succeeded', 'failed', 'unknown'} else None
     clean['account_ref'] = account
     clean['stage'] = obj.get('stage') if obj['event'] == 'pool_execution_stage' and isinstance(obj.get('stage'), str) else None
     source = obj.get('source')
@@ -97,6 +102,7 @@ def analyze(lines, *, input_complete=True):
     rows = defaultdict(lambda: {'starts': 0, 'limits': 0, 'stages': 0, 'interval': [], 'local_minimum': [], 'retry_after': [], 'cooldown': [], 'times': []})
     ignored = total = recognized = attributed = 0
     samples = []
+    outcomes = {}
     for line in lines:
         total += 1
         event = decode_event(line)
@@ -104,6 +110,10 @@ def analyze(lines, *, input_complete=True):
             ignored += 1
             continue
         recognized += 1
+        if (event['stage'] == 'task_finished' and event['request_ref'] and event['task_status'] and event['at'] is not None):
+            key = event['request_ref']
+            if key not in outcomes or event['at'] > outcomes[key]['at']:
+                outcomes[key] = event
         if event['request_ref'] is not None:
             attributed += 1
         if len(samples) < MAX_SAMPLES:
@@ -134,15 +144,40 @@ def analyze(lines, *, input_complete=True):
             'timestamped_events': len(row['times']),
             'model': None, 'operation': None, 'safe_concurrency': None, 'recommended_interval_seconds': None,
         })
+    hours = {}
+    for event in outcomes.values():
+        try:
+            hour = datetime.fromtimestamp(event['at'], timezone.utc).strftime('%Y-%m-%dT%H:00:00Z')
+        except (ValueError, OverflowError, OSError):
+            continue
+        row = hours.setdefault(hour, {'succeeded_requests': 0, 'failed_requests': 0, 'unknown_requests': 0,
+                                      'succeeded_image_requests': 0, 'known_saved_images': 0, 'image_count_unknown_requests': 0, 'wait_seconds': []})
+        row[event['task_status'] + '_requests'] += 1
+        if event['queue_wait_seconds'] is not None:
+            row['wait_seconds'].append(event['queue_wait_seconds'])
+        if event['operation'] == 'image' and event['task_status'] == 'succeeded':
+            row['succeeded_image_requests'] += 1
+            if event['image_count'] is None:
+                row['image_count_unknown_requests'] += 1
+            else:
+                row['known_saved_images'] += event['image_count']
+    hourly = []
+    for hour, row in sorted(hours.items()):
+        waits = sorted(row.pop('wait_seconds'))
+        completed = row['succeeded_requests'] + row['failed_requests']
+        hourly.append({'hour_utc': hour, **row, 'failure_rate_known_outcomes': row['failed_requests'] / completed if completed else None,
+                       'queue_wait_seconds': {**_range(waits), 'p95': waits[max(0, math.ceil(len(waits) * .95) - 1)] if waits else None}})
     return {
         'schema': 1, 'mode': 'read_only_clock_and_execution_events',
         'coverage': {'input_complete': input_complete, 'lines_read': total, 'recognized_events': recognized, 'ignored_lines': ignored,
                      'request_attributed_events': attributed, 'sampled_events': len(samples),
                      'omitted_samples': recognized - len(samples)},
         'accounts': accounts,
+        'hourly_outcomes': hourly,
+        'real_24h_acceptance': 'unverified_requires_complete_window_runtime_and_original_receipt_readback',
         'samples': samples,
         'limitations': [
-            'Counts are observed log events, not all requests, success rates, model usage or billable generations.',
+            'Clock counts are observed events. Hourly outcomes use the latest original task_finished event per request, not all accepted requests or billable generations; UNKNOWN remains separate and image counts may be missing.',
             'Old clock events lack per-event attribution; current clock and execution-stage events may include model, operation, persisted input bytes and the owner/request hash.',
             'Execution-stage events provide send/result boundaries; they still require the original receipt and an observed pool snapshot to establish occupancy.',
             'A message-start event precedes final send guards and is not proof that the model received the request. Confirm the original receipt/result.',

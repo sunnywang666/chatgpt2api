@@ -29,7 +29,7 @@ def trusted_source(identity, request=None):
     # a JSON body participates in scheduling. Private internal callers already
     # holding the service credential may name their existing consumer lane.
     if request is not None and getattr(request.state, "company_identity", None):
-        return "company:" + str(identity["id"])
+        return str(identity.get("_fair_source") or "company:" + str(identity["id"]))
     if identity.get("role") == "admin" and request is not None:
         lane = request.headers.get("x-workbench-consumer", "")
         if lane in {"happy", "wb-to-ozon", "ozon-to-wb", "listing", "content"}:

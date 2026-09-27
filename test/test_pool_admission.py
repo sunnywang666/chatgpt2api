@@ -350,6 +350,121 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.text.read("happy", "original")["error_code"], "TASK_INPUT_UNAVAILABLE")
 
+    def test_workers_scale_with_usable_physical_accounts_beyond_four(self):
+        self.write_accounts(3)
+        self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 4, "codex_max_concurrency": 4}
+        for i in range(7):
+            self.submit("many-" + str(i))
+        claims = [self.admission.claim_next() for _ in range(6)]
+        self.assertTrue(all(claims))
+        self.assertIsNone(self.admission.claim_next())
+        self.assertEqual(self.admission.resource_snapshot()["execution"]["chat_workers_limit"], 6)
+        self.assertEqual(len({c.receipt()["provider_account_identity"] for c in claims}), 3)
+        self.write_accounts(4)
+        self.assertEqual(self.admission.claim_next().request_id, "many-6")
+
+    def test_generated_image_save_releases_image_capacity_but_preserves_receipt_and_memory(self):
+        self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 1, "codex_max_concurrency": 4}
+        self.image("saving")
+        first = self.admission.claim_next()
+        first.before_send()
+        self.image("next")
+        self.assertIsNone(self.admission.claim_next())
+        self.admission.update_claim(first, upstream_unfinished=False, result_file_ids=["original-file"], request_message_id="original-message")
+        before = first.receipt()
+        snapshot = self.admission.resource_snapshot()
+        self.assertEqual(snapshot["image"]["inflight"], 0)
+        self.assertEqual(snapshot["queue"]["saving_images"], 1)
+        self.assertGreater(snapshot["execution"]["active_input_bytes"], 0)
+        self.assertEqual(self.admission.claim_next().request_id, "next")
+        self.assertEqual(first.receipt(), before)
+
+    def test_unknown_or_multi_send_image_keeps_generation_capacity(self):
+        from services.pool_admission import image_generation_active
+        self.assertTrue(image_generation_active("image", {"status": "error", "upstream_unfinished": True}, True))
+        self.assertTrue(image_generation_active("image", {"upstream_unfinished": False}, True))
+        self.assertTrue(image_generation_active("text", {"_operation": "image", "_upstream_terminal": True, "_expected_sends": 2}, True))
+        self.assertFalse(image_generation_active("text", {"_operation": "image", "_upstream_terminal": True, "_expected_sends": 1}, True))
+
+    def test_same_source_people_rotate_and_cursor_survives_restart(self):
+        for i in range(8):
+            self.submit("bulk-" + str(i), owner="person-a", source="internal:happy")
+        self.submit("small", owner="person-b", source="internal:happy")
+        first = self.admission.claim_next()
+        self.assertEqual(first.owner, "person-a")
+        self.admission.execute(first)
+        _, _, restarted = build(self.root, self.clock)
+        self.assertEqual(restarted.claim_next().owner, "person-b")
+
+    def test_image_wire_request_does_not_consume_text_worker_budget(self):
+        self.admission.text_workers = 1
+        self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 4, "codex_max_concurrency": 4}
+        self.submit("image-wire")
+        with self.store.transaction() as db:
+            r = self.store.read_receipt(db, "text", "happy", "image-wire")
+            r.update(_operation="image", model="gpt-image-2")
+            self.store.write_receipt(db, "text", "happy", "image-wire", r)
+        first = self.admission.claim_next()
+        self.assertEqual(first.request_id, "image-wire")
+        self.submit("recognition")
+        self.assertEqual(self.admission.claim_next().request_id, "recognition")
+        self.assertEqual(self.admission.resource_snapshot()["execution"]["chat_workers_active"], 1)
+
+    def test_bad_identity_row_cannot_break_dynamic_capacity_or_leak_input(self):
+        self.rows.append({"access_token": "unverified", "type": "Plus", "status": "正常", "quota": 999})
+        (self.root / "accounts.json").write_text(json.dumps(self.rows))
+        self.submit("blocked", provider_binding_id="binding-missing", provider_account_identity="missing")
+        self.assertIsNone(self.admission.claim_next())
+        snapshot = self.admission.resource_snapshot()
+        self.assertEqual(snapshot["queue"]["by_reason"], {"bound_account_unavailable": 1})
+        self.assertNotIn("private original input", json.dumps(snapshot))
+        self.assertNotIn("fixture-token", json.dumps(snapshot))
+
+    def test_slow_image_saves_have_bounded_local_workers_without_holding_generation(self):
+        self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 1, "codex_max_concurrency": 4}
+        for name in ("save-a", "save-b"):
+            self.image(name)
+            context = self.admission.claim_next()
+            context.before_send()
+            self.admission.update_claim(context, upstream_unfinished=False, result_file_ids=[name],
+                                        request_message_id=name, _upstream_terminal=True)
+        self.image("third")
+        self.assertIsNone(self.admission.claim_next())
+        self.submit("text-still-runs")
+        self.assertEqual(self.admission.claim_next().request_id, "text-still-runs")
+        resource = self.admission.resource_snapshot()
+        self.assertEqual(resource["image"]["inflight"], 0)
+        self.assertEqual(resource["image"]["dispatchable_now"], 0)
+        self.assertEqual(resource["execution"]["image_workers_active"], 2)
+        self.assertEqual(resource["execution"]["image_workers_limit"], 2)
+        with self.store.transaction() as db:
+            saved = self.store.read_receipt(db, "image", "happy", "save-a")
+            saved.update(status="success", _executing=False)
+            self.store.write_receipt(db, "image", "happy", "save-a", saved)
+        self.assertEqual(self.admission.claim_next().request_id, "third")
+
+    def test_finished_outcome_records_original_once_without_replay(self):
+        self.submit("metrics")
+        context = self.admission.claim_next()
+        self.admission.execute(context)
+        context.record_outcome()
+        finished = [item for item in context.receipt()["_execution_timeline"] if item["stage"] == "task_finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0]["task_status"], "succeeded")
+        self.assertEqual(finished[0]["queue_wait_seconds"], 0)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_unsent_capacity_wait_is_not_logged_as_terminal_failure(self):
+        self.image("unsent")
+        context = self.admission.claim_next()
+        def unavailable(ctx, body):
+            self.admission.update_claim(ctx, status="error", error_code="IMAGE_RESOURCE_UNAVAILABLE", upstream_unfinished=False)
+        self.admission.register("image", unavailable)
+        self.admission.execute(context)
+        receipt = self.read("image", "happy", "unsent")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(any(item["stage"] == "task_finished" for item in receipt["_execution_timeline"]))
+
 
 if __name__ == "__main__":
     unittest.main()

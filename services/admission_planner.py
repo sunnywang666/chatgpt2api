@@ -150,6 +150,7 @@ class Snapshot:
     requests: tuple[WaitingRequest, ...]
     last_source: str | None = None
     last_account: str | None = None
+    last_owner_by_source: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         _name(self.revision)
@@ -160,6 +161,9 @@ class Snapshot:
         for value in (self.last_source, self.last_account):
             if value is not None:
                 _name(value)
+        for source, owner in self.last_owner_by_source:
+            _name(source)
+            _name(owner)
 
 
 @dataclass(frozen=True)
@@ -254,8 +258,11 @@ def choose_next(snapshot: Snapshot, now: float) -> Selection:
     wakeups: list[float] = []
     sources = _rotate([r.source for r in pending], snapshot.last_source)
     for source in sources:
+        owners = _rotate([r.ref.owner for r in pending if r.source == source],
+                         dict(snapshot.last_owner_by_source).get(source))
+        owner_position = {owner: index for index, owner in enumerate(owners)}
         source_requests = sorted((r for r in pending if r.source == source),
-                                 key=lambda r: (r.sequence, r.ref))
+                                 key=lambda r: (owner_position[r.ref.owner], r.sequence, r.ref))
         for request in source_requests:
             reasons: set[str] = set()
             if not request.payload_saved:

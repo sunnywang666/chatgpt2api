@@ -191,3 +191,17 @@ def test_company_identity_is_stable_and_not_key_ownership():
     assert a == company_identity("org", "user", CONNECTOR)
     assert a["id"] != company_identity("other", "user", CONNECTOR)["id"]
     assert a["role"] == "user" and a["policy"]["routes"] == ["chat"]
+
+
+def test_multiple_company_connectors_share_user_fairness_without_sharing_receipts():
+    from services.request_context import trusted_source
+    one = company_identity("org", "person", CONNECTOR)
+    two = company_identity("org", "person", OTHER_CONNECTOR)
+    other = company_identity("org", "colleague", CONNECTOR)
+    request = SimpleNamespace(state=SimpleNamespace(company_identity=True), headers={"x-workbench-consumer": "happy"})
+    assert one["id"] != two["id"]
+    assert trusted_source(one, request) == trusted_source(two, request)
+    assert trusted_source(one, request) != trusted_source(other, request)
+    # The same field on a normal external credential grants no scheduling lane.
+    request.state.company_identity = None
+    assert trusted_source(one, request) == "key:" + one["id"]

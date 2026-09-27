@@ -51,7 +51,10 @@ def company_identity(org: str, user: str, connector: str) -> dict:
         raise HTTPException(400, detail={"code": "CONNECTOR_ID_INVALID"})
     subject = json.dumps([org, user, connector], separators=(",", ":"), ensure_ascii=True)
     owner = "company_" + hashlib.sha256(subject.encode()).hexdigest()
-    return {"id": owner, "name": "Company application", "role": "user", "enabled": True,
+    # Multiple connectors retain isolated receipts but share one person's fair
+    # scheduling lane. Connector count must not multiply that person's turns.
+    fair_source = "company:" + hashlib.sha256(json.dumps([org, user], separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+    return {"id": owner, "_fair_source": fair_source, "name": "Company application", "role": "user", "enabled": True,
             "policy": make_policy(["chat"], revision=1).to_record()}
 
 

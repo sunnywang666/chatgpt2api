@@ -162,8 +162,21 @@ def predecessor_state(task, owned):
     if previous_id is None:
         return {}, None
     previous = owned.get(previous_id)
+    if previous is None:
+        return {}, "IMAGE_THREAD_PREVIOUS_MISSING"
+    if previous.get("_recovery_suppressed"):
+        return {}, "IMAGE_THREAD_PREVIOUS_RECOVERY_STOPPED"
+    if (previous.get("status") == "error" and previous.get("upstream_outcome") == "generated"
+            and (previous.get("result_file_ids") or previous.get("result_sediment_ids"))):
+        return {}, "IMAGE_THREAD_PREVIOUS_ASSET_PENDING"
+    if previous.get("status") in {"error", "failed", "cancelled", "unknown"}:
+        unresolved = (previous.get("status") == "unknown" or previous.get("upstream_unfinished") is True
+                      or previous.get("upstream_outcome") == "unknown"
+                      or previous.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN")
+        return {}, "IMAGE_THREAD_PREVIOUS_UNKNOWN" if unresolved else "IMAGE_THREAD_PREVIOUS_FAILED"
     if not _source_usable(previous):
-        return {}, "IMAGE_THREAD_PREVIOUS_PENDING"
+        return {}, ("IMAGE_THREAD_PREVIOUS_UNCONFIRMED" if previous.get("status") == "success"
+                    else "IMAGE_THREAD_PREVIOUS_PENDING")
     if (previous.get("_image_thread") or {}).get("id") != thread["id"] and previous_id != thread.get("origin_task_id"):
         return {}, "IMAGE_THREAD_HISTORY_INVALID"
     if previous.get("_image_thread") and not previous.get("_image_thread_terminal"):
