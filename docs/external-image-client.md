@@ -173,6 +173,8 @@ Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `
 
 回执增加 `conversation={protocol:"sequential-v1",client_conversation_id,previous_request_id}`，不暴露池账号/上游ID。前序待定返回409 `CHAT_PREVIOUS_REQUEST_PENDING`；漏前序、跨会话或已有后继返回明确409；这些拒绝不代表新请求已受理。查询原前序，不换新ID绕过。客户端确认原前序 succeeded 后才提交后轮。重复同ID同输入仍返回原回执，即使会话已推进到更后面；旧不带此字段的请求保持原哈希及单次调用方式。
 
+唯一例外是原请求已发送且原账号读回确认最终轮次 `end_turn=true`、文字为空：原回执继续为 `unknown`，并显示 `terminal_empty={verified:true,original_request_id,observed_at,same_conversation_continuation:true}`。应用若确需纠正协议，可用**新的** `client_request_id`、相同 `client_conversation_id`、指向该原请求的 `previous_request_id`、新的纠正说明作为末尾 user 消息，并显式传 `continue_after_terminal_empty:true`。服务原子限制该前序只有一个后继，绑定原账号、原上游会话与空回答的最终节点，发送前重新读取原结果；证据不符、读取失败或会话位置已变时不发送纠正轮次。此字段不表示原业务请求失败或可重发，也不允许绕过其他 `unknown`。普通 CLI 仍只接受成功前序，不会自动创建纠正轮次。
+
 公共客户端现支持 `--session-id` 和 `--previous-request-id`，用于从新会话开始的连续工作，不自动承接缺少sequential-v1回执的旧请求。每轮使用独立的 `--state` 文件，先把上一轮查到 `succeeded` 再提交下一轮；客户端还会在新POST前读取前序并核对协议、会话和成功状态，服务端最终原子核对唯一后继。下面三轮不依赖Happy或DSH；示例ID须替换为实际工作持久保存的ID，模型须从实时目录选择。先运行第一轮：
 
 ```sh

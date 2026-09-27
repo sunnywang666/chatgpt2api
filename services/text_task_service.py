@@ -261,7 +261,37 @@ class TextTaskService:
             result["conversation"] = {"client_conversation_id": receipt["_public_session_ref"],
                                       "previous_request_id": receipt.get("_previous_request_id"),
                                       "protocol": "sequential-v1"}
+        evidence = TextTaskService._verified_terminal_empty(receipt)
+        if evidence:
+            result["terminal_empty"] = {"verified": True, "original_request_id": receipt["request_id"],
+                                        "observed_at": evidence["observed_at"],
+                                        "same_conversation_continuation": True}
+        if receipt.get("_terminal_empty_correction_of"):
+            result["correction_of_request_id"] = receipt["_terminal_empty_correction_of"]
         return result
+
+    @staticmethod
+    def _verified_terminal_empty(receipt):
+        """Only an exact, persisted original-turn proof can open correction."""
+        evidence = receipt.get(TURN_END_EVIDENCE_FIELD)
+        if (receipt.get("route") != "chat" or not receipt.get("_public_session_ref")
+                or receipt.get("status") != "unknown"
+                or receipt.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
+                or receipt.get("_upstream_terminal") is not True
+                or receipt.get("recovery_requires_new_conversation") is True
+                or not isinstance(evidence, dict)
+                or set(evidence) != {"conversation_id", "request_message_id", "final_message_id", "observed_at"}
+                or any(not isinstance(evidence.get(k), str) or not evidence[k].strip()
+                       for k in ("conversation_id", "request_message_id", "final_message_id"))
+                or evidence["request_message_id"] != receipt.get("request_message_id")
+                or evidence["final_message_id"] == evidence["request_message_id"]
+                or evidence["conversation_id"] != receipt.get("conversation_id")
+                or type(evidence["observed_at"]) not in {int, float}
+                or not math.isfinite(evidence["observed_at"]) or evidence["observed_at"] <= 0
+                or any(not isinstance(receipt.get(k), str) or not receipt[k]
+                       for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id", "model"))):
+            return None
+        return evidence
 
     @classmethod
     def _recovery_due(cls, receipt, now):
@@ -918,18 +948,28 @@ class TextTaskService:
             if db.execute("SELECT 1 FROM requests WHERE owner=? AND json_extract(receipt,'$._previous_request_id')=? LIMIT 1",
                           (owner, previous_id)).fetchone():
                 reject("CHAT_CONVERSATION_CONFLICT")
-            if previous.get("status") != "succeeded":
+            terminal_empty = bool(body.get("_continue_after_terminal_empty"))
+            evidence = self._verified_terminal_empty(previous) if terminal_empty else None
+            if terminal_empty and (not evidence or previous.get("model") != receipt.get("model")):
+                reject("CHAT_TERMINAL_EMPTY_UNVERIFIED")
+            if previous.get("status") != "succeeded" and not evidence:
                 reject("CHAT_PREVIOUS_REQUEST_PENDING")
-            anchors = ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id")
+            anchors = ("provider_binding_id", "provider_account_identity", "conversation_id")
             if not all(isinstance(previous.get(key), str) and previous[key] for key in anchors):
                 reject("CHAT_CONTINUATION_UNAVAILABLE")
             receipt.update({key: previous[key] for key in anchors})
+            parent = evidence["final_message_id"] if evidence else previous.get("parent_message_id")
+            if not isinstance(parent, str) or not parent:
+                reject("CHAT_CONTINUATION_UNAVAILABLE")
+            receipt["parent_message_id"] = parent
             # The actual last-user parent is filled by the final upstream payload;
             # it differs from the submission parent for multi-message input.
             receipt["_previous_request_id"] = previous_id
             if not previous.get("_public_session_ref"):
                 receipt["_legacy_session_anchor"] = previous_id
-            receipt["_submission_parent_message_id"] = previous["parent_message_id"]
+            receipt["_submission_parent_message_id"] = parent
+            if evidence:
+                receipt["_terminal_empty_correction_of"] = previous_id
         receipt["_public_session_ref"] = body["_public_session_ref"]
 
     def submit(self, owner: str, body: dict, *, source: str | None = None):
@@ -1047,6 +1087,36 @@ class TextTaskService:
             from services.durable_forward import run
             return run(self, owner, request_id, body)
         try:
+            if receipt.get("_terminal_empty_correction_of"):
+                with self._db() as db:
+                    previous = self.store.read_receipt(db, "text", owner, receipt["_terminal_empty_correction_of"])
+                original_evidence = self._verified_terminal_empty(previous or {})
+                try:
+                    proven = self.recovery_reader(previous) if original_evidence else None
+                except Exception:
+                    # A failed exact-account read proves nothing about the
+                    # original result. Keep the new turn unsent and retry its
+                    # existing durable queue entry when the reader returns.
+                    changes = {"error_code": "CHAT_TERMINAL_EMPTY_READ_UNAVAILABLE", "upstream_outcome": "not_sent",
+                               "_turn_reserved": False, "_executing": False,
+                               "waiting": {"reason": "previous_result_unverified"}}
+                    if self.admission is not None:
+                        changes.update(status="queued", _ready_at=self._now() + self.RECOVERY_BASE_BACKOFF_SECONDS,
+                                       _claim_id=None, _claim_until=None)
+                    else:
+                        changes.update(status="failed", finished_at=self._now())
+                    self._update(owner, request_id, **changes)
+                    return
+                validated, error_code, _, reason = self._safe_recovery_result(proven, previous) if proven else (None, None, None, None)
+                if (error_code != "UPSTREAM_OUTCOME_UNKNOWN"
+                        or reason != TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
+                        or not validated or validated.get(TURN_END_EVIDENCE_FIELD) != original_evidence
+                        or receipt.get("parent_message_id") != original_evidence["final_message_id"]
+                        or any(previous.get(k) != receipt.get(k) for k in (
+                            "provider_binding_id", "provider_account_identity", "conversation_id"))):
+                    self._update(owner, request_id, status="failed", error_code="CHAT_TERMINAL_EMPTY_UNVERIFIED",
+                                 upstream_outcome="not_sent", _turn_reserved=False, finished_at=self._now())
+                    return
             if receipt.get("_legacy_session_anchor"):
                 with self._db() as db:
                     previous = self.store.read_receipt(db, "text", owner, receipt["_legacy_session_anchor"])
