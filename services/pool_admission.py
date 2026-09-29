@@ -261,7 +261,7 @@ class PoolAdmission:
     def recover_one(self):
         now = float(self.clock())
         with self.store.connect() as db:
-            rows = list(self.store.receipts(db))
+            rows = list(self.store.scheduling_receipts(db))
         # Use the existing persisted retry timestamps. A short-backoff legacy
         # scan must not monopolize recovery ahead of other overdue originals.
         # Missing/zero retry times are immediately due. Image created_at is a
@@ -351,7 +351,7 @@ class PoolAdmission:
         read = getattr(self.accounts, "admission_accounts", None)
         return read() if read else self.accounts.list_accounts()
 
-    def _snapshot(self, rows, receipts, settings, types, now, cursor):
+    def _snapshot(self, rows, receipts, settings, types, now, cursor, *, source_reader=None):
         # A verified empty upstream turn may have one explicitly accepted
         # correction in the same public Chat session. Its UNKNOWN receipt must
         # remain intact for recovery, but it cannot remain the session's order
@@ -448,7 +448,8 @@ class PoolAdmission:
             state = "unknown" if unknown else "queued" if status in {"queued", "not_started"} else "active" if active else "succeeded"
             thread_needs = ()
             if kind == "image" and r.get("_image_thread"):
-                _, blocked = predecessor_state(r, image_receipts.get(owner, {}))
+                _, blocked = predecessor_state(r, image_receipts.get(owner, {}),
+                    source_reader=(lambda source_id: source_reader(owner, source_id)) if source_reader else None)
                 dependency = "image_thread:" + hashlib.sha256((owner + "\0" + request_id).encode()).hexdigest()
                 thread_resources.append(Resource(dependency, 0 if blocked else 1, 0, now))
                 thread_needs = (Need(dependency),)
@@ -588,6 +589,8 @@ class PoolAdmission:
         for kind, owner, request_id, r in receipts:
             if not r.get("_claim_id") or r.get("status") != "running" or float(r.get("_claim_until") or 0) > now:
                 continue
+            projected = r
+            r = self.store.read_receipt(db, kind, owner, request_id)
             if r.get("_submission_started"):
                 r.update(status="unknown" if kind == "text" else "error", error_code="CONVERSATION_OUTCOME_UNKNOWN")
                 if kind == "image":
@@ -597,6 +600,8 @@ class PoolAdmission:
             else:
                 r.update(status="queued", _turn_reserved=False, _claim_id=None, upstream_unfinished=False)
             self.store.write_receipt(db, kind, owner, request_id, r)
+            projected.update({key: r[key] for key in ("status", "error_code", "upstream_unfinished",
+                "upstream_outcome", "recovery_error_code", "next_poll_at", "_turn_reserved", "_claim_id") if key in r})
 
     def resource_snapshot(self):
         """Read-only projection of the same persisted occupancy used to claim.
@@ -609,9 +614,10 @@ class PoolAdmission:
         # never wait for settings while admission holds settings for accounts.
         with self._settings_guard(), self.store.connect() as db, self._account_guard():
             rows = self._rows()
-            receipts = list(self.store.receipts(db))
+            receipts = list(self.store.scheduling_receipts(db))
             settings = self._settings()
-            snapshot = self._snapshot(rows, receipts, settings, {}, now, {})
+            snapshot = self._snapshot(rows, receipts, settings, {}, now, {},
+                source_reader=lambda owner, task_id: self.store.read_receipt(db, "image", owner, task_id))
         resources = {r.key: r for r in snapshot.resources}
         result = []
         seen = set()
@@ -696,7 +702,8 @@ class PoolAdmission:
         now = float(self.clock())
         with self._settings_guard(), self.store.connect() as db, self._account_guard():
             rows = self._rows()
-            snapshot = self._snapshot(rows, list(self.store.receipts(db)), self._settings(), {}, now, {})
+            snapshot = self._snapshot(rows, list(self.store.scheduling_receipts(db)), self._settings(), {}, now, {},
+                source_reader=lambda owner, task_id: self.store.read_receipt(db, "image", owner, task_id))
         resources = {resource.key: resource for resource in snapshot.resources}
         server = resources["codex_server"]
         server_free = None if server.occupied is None else max(0, server.capacity - server.occupied)
@@ -743,7 +750,7 @@ class PoolAdmission:
         # Catalog lookup may perform a metadata read; never do that under the
         # database/account transaction or occupy an execution worker waiting.
         with self.store.connect() as db:
-            models = {str(r.get("model") or "auto") for kind, _, _, r in self.store.receipts(db)
+            models = {str(r.get("model") or "auto") for kind, _, _, r in self.store.scheduling_receipts(db)
                       if kind == "text" and unfinished(kind, r) and r.get("_route", "chat") == "chat"}
         types = {}
         for model in models:
@@ -753,7 +760,7 @@ class PoolAdmission:
                 types[model] = set()
         if self.codex is not None:
             with self.store.connect() as db:
-                native_models = {r.get("model") for _, _, _, r in self.store.receipts(db)
+                native_models = {r.get("model") for _, _, _, r in self.store.scheduling_receipts(db)
                                  if r.get("status") == "queued" and r.get("_route") == "codex"}
             # Reuse the existing bounded metadata refresh, outside the claim
             # transaction. This never sends a model request.
@@ -774,7 +781,7 @@ class PoolAdmission:
                         break
         with self._settings_guard(), self.store.transaction() as db, self._account_guard():
             now = float(self.clock())
-            receipts = list(self.store.receipts(db))
+            receipts = list(self.store.scheduling_receipts(db))
             self._recover_claims(db, receipts, now)
             bind_waiting_threads(self.store, db, receipts)
             if self.codex is not None:
@@ -782,6 +789,8 @@ class PoolAdmission:
                 for kind, owner, request_id, r in receipts:
                     if r.get("_route") != "codex" or r.get("status") != "queued":
                         continue
+                    projected = r
+                    r = self.store.read_receipt(db, kind, owner, request_id)
                     bound = [a for a in rows if r.get("client_conversation_id") in (a.get("codex_affinities") or {})]
                     previous = r.get("_previous_response_id")
                     if previous:
@@ -796,8 +805,10 @@ class PoolAdmission:
                     elif bound:
                         r["provider_account_identity"] = bound[0]["provider_account_identity"]
                     self.store.write_receipt(db, kind, owner, request_id, r)
+                    projected.update({key: r[key] for key in ("status", "error_code", "provider_account_identity") if key in r})
             settings = self._settings()
-            snapshot = self._snapshot(self._rows(), receipts, settings, types, now, self.store.runtime(db, "fairness", {}))
+            snapshot = self._snapshot(self._rows(), receipts, settings, types, now, self.store.runtime(db, "fairness", {}),
+                source_reader=lambda owner, task_id: self.store.read_receipt(db, "image", owner, task_id))
             selection = choose_next(snapshot, now)
             for deferred in selection.deferred:
                 r = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id)
@@ -880,8 +891,9 @@ class PoolAdmission:
                         or now >= marker.get("expires_at", 0)):
                     raise AdmissionLost("temporary second Chat turn was stopped or expired before send")
             if context.kind == "image" and r.get("_image_thread"):
-                owned = {task_id: task for kind, owner, task_id, task in self.store.receipts(db) if kind == "image" and owner == context.owner}
-                binding, blocked = predecessor_state(r, owned)
+                owned = {task_id: task for kind, owner, task_id, task in self.store.scheduling_receipts(db) if kind == "image" and owner == context.owner}
+                binding, blocked = predecessor_state(r, owned,
+                    source_reader=lambda source_id: self.store.read_receipt(db, "image", context.owner, source_id))
                 if blocked or any(r.get(k) != v for k, v in binding.items()):
                     raise AdmissionLost("original image thread predecessor changed before send")
             sequence = int(r.get("_send_sequence") or 0)
@@ -899,7 +911,7 @@ class PoolAdmission:
             else:
                 if context.kind == "image" or r.get("_operation") == "image":
                     capacity = image_capacity(selected, self._settings())
-                    occupied = sum(1 for kind, _, _, other in self.store.receipts(db)
+                    occupied = sum(1 for kind, _, _, other in self.store.scheduling_receipts(db)
                                    if (kind == "image" or other.get("_operation") == "image")
                                    and other.get("_account_resource") == r.get("_account_resource")
                                    and image_generation_active(kind, other, other.get("status") == "running" or unresolved_result(kind, other)))

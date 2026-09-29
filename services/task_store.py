@@ -43,6 +43,35 @@ def _unpack(value):
     raise ValueError("invalid durable input")
 
 
+# Scheduling and retention metadata only. Keep absent keys absent and preserve
+# JSON types: e.g. upstream_unfinished=False differs from 0 and from no key.
+# Output bodies (data/content/result/etc.) must never cross into Python on scans.
+_SCHEDULING_FIELDS = (
+    "id", "owner_id", "status", "model", "route", "error_code",
+    "upstream_outcome", "upstream_unfinished", "provider_account_identity",
+    "provider_binding_id", "client_conversation_id", "conversation_id",
+    "parent_message_id", "request_message_id", "adopted_source_request_message_id",
+    "result_file_ids", "result_sediment_ids", "created_at", "created_ts", "updated_at",
+    "retain_receipt", "waiting", "next_poll_at", "recovery_next_at", "recovery_reason",
+    "recovery_requires_new_conversation", "original_failure_phase",
+    "original_exception_category", "original_upstream_request_stage", "original_http_status",
+    "_recovery_suppressed", "_upstream_terminal", "_turn_end_evidence",
+    "_route", "_operation", "_forward_protocol", "_chat_recovery", "_image_recovery",
+    "_expected_sends", "_input_ref", "_input_bytes", "_sequence", "_source", "_ready_at",
+    "_account_resource", "_claim_id", "_claim_until", "_executing",
+    "_submission_started", "_turn_reserved", "_execution_timeline",
+    "_terminal_empty_correction_of", "_submission_parent_message_id",
+    "_previous_request_id", "_public_session_ref", "_previous_response_id",
+    "_image_thread", "_image_thread_terminal", "_image_thread_waiting_reason",
+)
+# json_each exposes true/false as 1/0; re-encode by type, not by SQL value.
+_SCHEDULING_JSON = """(SELECT json_group_object(key, json(CASE
+    WHEN type = 'text' THEN json_quote(value)
+    WHEN type IN ('true', 'false', 'null') THEN type ELSE value END))
+    FROM json_each(receipt) WHERE key IN (%s))""" % ",".join(
+        "'" + field + "'" for field in _SCHEDULING_FIELDS)
+
+
 class TaskStore:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -170,6 +199,18 @@ class TaskStore:
         for key, raw in db.execute("SELECT task_key,receipt FROM image_requests"):
             receipt = json.loads(raw)
             yield "image", receipt["owner_id"], receipt["id"], receipt
+
+    @staticmethod
+    def scheduling_receipts(db, *, kind=None):
+        """Read-only metadata; callers must re-read the full target before writes."""
+        if kind in (None, "text"):
+            for owner, request_id, raw in db.execute(
+                    "SELECT owner,id," + _SCHEDULING_JSON + " FROM requests"):
+                yield "text", owner, request_id, json.loads(raw)
+        if kind in (None, "image"):
+            for raw, in db.execute("SELECT " + _SCHEDULING_JSON + " FROM image_requests"):
+                receipt = json.loads(raw)
+                yield "image", receipt["owner_id"], receipt["id"], receipt
 
     @staticmethod
     def read_receipt(db, kind, owner, request_id):

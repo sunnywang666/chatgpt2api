@@ -568,10 +568,10 @@ class ImageTaskService:
 
     def resource_occupancy(self) -> dict:
         """Internal aggregate only: keep unfinished original receipts after restart."""
-        with self._transaction():
+        with self.store.connect() as db:
             held = {}
             unattributed = 0
-            for task in self._tasks.values():
+            for _, _, _, task in self.store.scheduling_receipts(db, kind="image"):
                 if not _holds_upstream_slot(task):
                     continue
                 identity = str(task.get("provider_account_identity") or "")
@@ -670,23 +670,24 @@ class ImageTaskService:
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
-        with self._transaction():
-            if self._cleanup_locked():
-                self._save_locked()
-            items = []
-            missing_ids = []
-            for task_id in requested_ids:
-                task = self._tasks.get(_task_key(owner, task_id))
-                if task is None:
-                    missing_ids.append(task_id)
-                else:
-                    items.append(_public_task(task))
-            if not requested_ids:
-                items = [
-                    _public_task(task)
-                    for task in self._tasks.values()
-                    if task.get("owner_id") == owner
-                ]
+        with self._lock, self.store.transaction() as db:
+            # Retention needs metadata only, including legacy missing-key slot
+            # semantics. Do not populate/save the mutation cache on status reads.
+            metadata = {_task_key(task_owner, task_id): task for _, task_owner, task_id, task
+                        in self.store.scheduling_receipts(db, kind="image")}
+            for key in self._expired_task_keys(metadata):
+                db.execute("DELETE FROM image_requests WHERE task_key=?", (key,))
+                self._tasks.pop(key, None)
+            if requested_ids:
+                tasks = {task_id: self.store.read_receipt(db, "image", owner, task_id)
+                         for task_id in dict.fromkeys(requested_ids)}
+                items = [_public_task(tasks[task_id]) for task_id in requested_ids
+                         if tasks[task_id] is not None]
+                missing_ids = [task_id for task_id in requested_ids if tasks[task_id] is None]
+            else:
+                # Preserve full-list compatibility without loading other owners.
+                items = [_public_task(json.loads(raw)) for raw, in db.execute(
+                    "SELECT receipt FROM image_requests WHERE json_extract(receipt, '$.owner_id')=?", (owner,))]
                 items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
@@ -1445,20 +1446,23 @@ class ImageTaskService:
                 changed = True
         return changed
 
-    def _cleanup_locked(self) -> bool:
+    def _expired_task_keys(self, tasks):
         try:
             retention_days = max(1, int(self.retention_days_getter()))
         except Exception:
             retention_days = 30
         cutoff = time.time() - retention_days * 86400
-        removed_keys = [
+        return [
             key
-            for key, task in self._tasks.items()
+            for key, task in tasks.items()
             if task.get("status") in TERMINAL_STATUSES and not _holds_upstream_slot(task)
             and not task.get("retain_receipt")
             and task.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
             and _timestamp(task.get("updated_at")) < cutoff
         ]
+
+    def _cleanup_locked(self) -> bool:
+        removed_keys = self._expired_task_keys(self._tasks)
         for key in removed_keys:
             self._tasks.pop(key, None)
             self._transaction_local.db.execute("DELETE FROM image_requests WHERE task_key=?", (key,))
