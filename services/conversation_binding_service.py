@@ -172,7 +172,7 @@ _TEXT_HTTP_ERROR_FORMS = frozenset({
     "detail_text", "validation", "message_text", "object", "list", "text",
     "empty", "opaque",
 })
-_TEXT_HTTP_FIELDS = frozenset({
+_TEXT_422_FIELDS = frozenset({
     "action", "messages", "model", "parent_message_id", "conversation_id",
     "conversation_mode", "thinking_effort", "history_and_training_disabled",
     "force_use_sse", "supported_encodings", "system_hints", "timezone",
@@ -180,15 +180,15 @@ _TEXT_HTTP_FIELDS = frozenset({
 })
 
 
-def _text_http_field(value: object) -> str:
+def _text_422_field(value: object) -> str:
     if not isinstance(value, str) or len(value) > 96:
         return ""
     top_level = value.split(".", 1)[0].split("[", 1)[0]
-    return top_level if top_level in _TEXT_HTTP_FIELDS else ""
+    return top_level if top_level in _TEXT_422_FIELDS else ""
 
 
 def _text_http_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
-    """Keep only the shape and allowlisted top-level field, never upstream text."""
+    """Keep response shape; only 422 may name a validated field. Never keep text."""
     body = exc.body
     candidates: list[object] = []
     form = "opaque"
@@ -229,7 +229,7 @@ def _text_http_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
         form = "text" if body else "empty"
     elif body is None:
         form = "empty"
-    fields = {_text_http_field(value) for value in candidates} - {""}
+    fields = {_text_422_field(value) for value in candidates} - {""} if exc.status_code == 422 else set()
     return {
         "original_upstream_error_form": form,
         **({"original_upstream_rejected_field": next(iter(fields))} if len(fields) == 1 else {}),
@@ -350,7 +350,7 @@ class ConversationBindingError(RuntimeError):
         self.original_upstream_rejected_field = (
             original_upstream_rejected_field
             if is_stream_open_http and self.original_http_status == 422
-            and original_upstream_rejected_field in _TEXT_HTTP_FIELDS else ""
+            and original_upstream_rejected_field in _TEXT_422_FIELDS else ""
         )
 
 
