@@ -167,7 +167,7 @@ _TEXT_HTTP_REQUEST_STAGES = {
     "/backend-anon/conversation": "conversation",
 }
 _TEXT_HTTP_REQUEST_STAGE_VALUES = frozenset({*_TEXT_HTTP_REQUEST_STAGES.values(), "unknown"})
-_TEXT_422_ERROR_FORMS = frozenset({
+_TEXT_HTTP_ERROR_FORMS = frozenset({
     "error", "error_text", "detail_error", "detail_error_text", "detail",
     "detail_text", "validation", "message_text", "object", "list", "text",
     "empty", "opaque",
@@ -187,8 +187,8 @@ def _text_422_field(value: object) -> str:
     return top_level if top_level in _TEXT_422_FIELDS else ""
 
 
-def _text_422_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
-    """Keep only the shape and allowlisted top-level field, never upstream text."""
+def _text_http_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
+    """Keep response shape; only 422 may name a validated field. Never keep text."""
     body = exc.body
     candidates: list[object] = []
     form = "opaque"
@@ -229,7 +229,7 @@ def _text_422_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
         form = "text" if body else "empty"
     elif body is None:
         form = "empty"
-    fields = {_text_422_field(value) for value in candidates} - {""}
+    fields = {_text_422_field(value) for value in candidates} - {""} if exc.status_code == 422 else set()
     return {
         "original_upstream_error_form": form,
         **({"original_upstream_rejected_field": next(iter(fields))} if len(fields) == 1 else {}),
@@ -338,14 +338,19 @@ class ConversationBindingError(RuntimeError):
             if self.original_http_status is not None
             and original_upstream_request_stage in _TEXT_HTTP_REQUEST_STAGE_VALUES else ""
         )
-        is_stream_open_422 = self.original_failure_phase == "stream_open" and self.original_http_status == 422
+        is_stream_open_http = (
+            self.original_failure_phase == "stream_open"
+            and self.original_exception_category == "http"
+            and self.original_http_status is not None
+        )
         self.original_upstream_error_form = (
             original_upstream_error_form
-            if is_stream_open_422 and original_upstream_error_form in _TEXT_422_ERROR_FORMS else ""
+            if is_stream_open_http and original_upstream_error_form in _TEXT_HTTP_ERROR_FORMS else ""
         )
         self.original_upstream_rejected_field = (
             original_upstream_rejected_field
-            if is_stream_open_422 and original_upstream_rejected_field in _TEXT_422_FIELDS else ""
+            if is_stream_open_http and self.original_http_status == 422
+            and original_upstream_rejected_field in _TEXT_422_FIELDS else ""
         )
 
 
@@ -1353,9 +1358,8 @@ class ConversationBindingService:
                         _TEXT_HTTP_REQUEST_STAGES.get(exc.context, "unknown")
                         if isinstance(exc, UpstreamHTTPError) else ""
                     ),
-                    **(_text_422_diagnostic(exc)
-                       if isinstance(exc, UpstreamHTTPError) and exc.status_code == 422
-                       and failure_phase == "stream_open" else {}),
+                    **(_text_http_diagnostic(exc)
+                       if isinstance(exc, UpstreamHTTPError) and failure_phase == "stream_open" else {}),
                 ) from exc
             finally:
                 backend.close()
