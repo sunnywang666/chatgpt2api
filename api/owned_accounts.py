@@ -1,7 +1,7 @@
 """Internal Workbench management bridge; never exposed by public AI ingress."""
 import time
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from typing import Literal
@@ -143,8 +143,76 @@ async def chat_login_operation(handler, *args):
         raise HTTPException(status, detail={"code": exc.code}) from None
 
 
+def _private_no_store(response: Response) -> None:
+    # Includes one-time Key material and login URLs on successful responses.
+    # The public Workbench bridge already applies the same response policy.
+    response.headers["Cache-Control"] = "private, no-store"
+
+
+def _owned_target_locked(owner: str, account_id: str) -> tuple[str, dict]:
+    """Resolve this caller's one existing row under the account authority lock.
+
+    A managed row ID is not a pool reference. Never accept another caller's
+    public pool reference in place of an owned row, or silently pick the first
+    duplicate. Only the verified row supplies the internal operation target.
+    """
+    matches = [row for row in account_service.admission_accounts()
+               if row.get("managed_owner") == owner
+               and row.get("managed_account_id") == account_id]
+    if not matches:
+        raise KeyError("account not found")
+    if len(matches) != 1:
+        raise ValueError("owned account is ambiguous")
+    account_ref = account_service.pool_account_ref(matches[0])
+    _token, target = account_service._pool_account_locked(account_ref)
+    if (target.get("managed_owner") != owner
+            or target.get("managed_account_id") != account_id):
+        raise KeyError("account not found")
+    return account_ref, target
+
+
+def _refresh_owned_account(owner: str, account_id: str) -> dict:
+    """Keep the owned HTTP contract; reuse the existing protected pool refresh.
+
+    Refresh only saved authorizations via the canonical Chat/Codex route
+    handlers, with their credential CAS and same-target request coalescing.
+    No account lock is retained during upstream I/O. A successful HTTP receipt
+    is not an assertion that both route observations succeeded.
+    """
+    from services.owned_accounts import public_owned_account
+
+    with account_service.admission_transaction():
+        expected_ref, _target = _owned_target_locked(owner, account_id)
+    account_service.refresh_pool_account(expected_ref, ["chat", "codex"], False)
+    with account_service.admission_transaction():
+        actual_ref, target = _owned_target_locked(owner, account_id)
+        if actual_ref != expected_ref:
+            raise KeyError("account not found")
+        return public_owned_account(target)
+
+
+def _set_owned_account_enabled(owner: str, account_id: str, enabled: bool) -> dict:
+    """Use the same idempotent enable writer without widening caller scope.
+
+    The shared account lock is reentrant. Ownership resolution, the existing
+    pool mutation and the owned projection share one critical section. Repeated
+    enable does not erase quota; re-enabling still needs a successful refresh.
+    """
+    from services.owned_accounts import public_owned_account
+
+    with account_service.admission_transaction():
+        expected_ref, _target = _owned_target_locked(owner, account_id)
+        account_service.set_pool_account_enabled(expected_ref, enabled)
+        actual_ref, target = _owned_target_locked(owner, account_id)
+        if actual_ref != expected_ref:
+            raise KeyError("account not found")
+        return public_owned_account(target)
+
+
 def create_router() -> APIRouter:
-    router = APIRouter(prefix="/api/workbench/ai")
+    router = APIRouter(
+        prefix="/api/workbench/ai", dependencies=[Depends(_private_no_store)],
+    )
 
     @router.get("/accounts")
     async def accounts(authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
@@ -363,12 +431,12 @@ def create_router() -> APIRouter:
     @router.post("/accounts/{account_id}/refresh")
     async def refresh_account(account_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)
-        return {"item": await account_operation(account_service.refresh_owned_account, owner, account_id)}
+        return {"item": await account_operation(_refresh_owned_account, owner, account_id)}
 
     @router.post("/accounts/{account_id}/enabled")
     async def enable_account(account_id: str, body: EnabledAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)
-        return {"item": await account_operation(account_service.set_owned_account_enabled, owner, account_id, body.enabled)}
+        return {"item": await account_operation(_set_owned_account_enabled, owner, account_id, body.enabled)}
 
     @router.get("/models")
     async def models(authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
