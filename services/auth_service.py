@@ -134,7 +134,10 @@ class AuthService:
             raise ValueError("这个专用密钥已经存在，请换一个新的密钥")
         return key_hash
 
-    def _has_name_locked(self, name: str, *, role: AuthRole | None = None, exclude_id: str = "") -> bool:
+    def _has_name_locked(
+        self, name: str, *, role: AuthRole | None = None,
+        exclude_id: str = "", owner_subject: str | None = None,
+    ) -> bool:
         candidate = self._clean(name)
         if not candidate:
             return False
@@ -144,33 +147,49 @@ class AuthService:
                 continue
             if role is not None and item.get("role") != role:
                 continue
+            if owner_subject is not None and self._clean(item.get("owner_subject")) != owner_subject:
+                continue
             if self._clean(item.get("name")) == candidate:
                 return True
         return False
 
-    def _build_default_name_locked(self, role: AuthRole, *, exclude_id: str = "") -> str:
+    def _build_default_name_locked(
+        self, role: AuthRole, *, exclude_id: str = "",
+        owner_subject: str | None = None,
+    ) -> str:
         base_name = self._default_name(role)
-        if not self._has_name_locked(base_name, role=role, exclude_id=exclude_id):
+        if not self._has_name_locked(base_name, role=role, exclude_id=exclude_id,
+                                     owner_subject=owner_subject):
             return base_name
         suffix = 2
         while True:
             candidate = f"{base_name} {suffix}"
-            if not self._has_name_locked(candidate, role=role, exclude_id=exclude_id):
+            if not self._has_name_locked(candidate, role=role, exclude_id=exclude_id,
+                                         owner_subject=owner_subject):
                 return candidate
             suffix += 1
 
-    def _build_name_locked(self, name: str, *, role: AuthRole, exclude_id: str = "") -> str:
+    def _build_name_locked(
+        self, name: str, *, role: AuthRole, exclude_id: str = "",
+        owner_subject: str | None = None,
+    ) -> str:
+        # A display name belongs to its user's key list; it is not a global
+        # credential identity. Hash uniqueness and ID-based ownership checks
+        # remain global and unchanged. None retains the legacy helper lookup.
         candidate = self._clean(name)
         if not candidate:
-            return self._build_default_name_locked(role, exclude_id=exclude_id)
-        if self._has_name_locked(candidate, role=role, exclude_id=exclude_id):
+            return self._build_default_name_locked(role, exclude_id=exclude_id,
+                                                   owner_subject=owner_subject)
+        if self._has_name_locked(candidate, role=role, exclude_id=exclude_id,
+                                 owner_subject=owner_subject):
             raise ValueError("这个名称已经在使用中了，换一个更容易区分的名称吧")
         return candidate
 
     def create_key(self, *, role: AuthRole, name: str = "", owner_subject: str = "", routes: list[str] | None = None) -> tuple[dict[str, object], str]:
         policy = make_policy(routes if routes is not None else ["chat"], revision=1) if role == "user" else None
+        owner_subject = self._clean(owner_subject)
         with self._transaction():
-            normalized_name = self._build_name_locked(name, role=role)
+            normalized_name = self._build_name_locked(name, role=role, owner_subject=owner_subject)
             while True:
                 raw_key = f"sk-{secrets.token_urlsafe(24)}"
                 try:
@@ -229,6 +248,7 @@ class AuthService:
                         str(updates.get("name") or ""),
                         role=next_role,
                         exclude_id=normalized_id,
+                        owner_subject=self._clean(next_item.get("owner_subject")),
                     )
                 if "enabled" in updates and updates.get("enabled") is not None:
                     next_item["enabled"] = bool(updates.get("enabled"))

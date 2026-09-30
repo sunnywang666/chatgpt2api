@@ -14,19 +14,20 @@ def _parse_observed_at(value: object) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def observation_is_fresh(value: object) -> bool:
     observed_at = _parse_observed_at(value)
-    return bool(
-        observed_at
-        and (datetime.now(timezone.utc) - observed_at).total_seconds() <= OBSERVATION_MAX_AGE_SECONDS
-    )
+    if observed_at is None:
+        return False
+    age = (datetime.now(timezone.utc) - observed_at).total_seconds()
+    # Future timestamps are not proof of a current successful observation.
+    return 0 <= age <= OBSERVATION_MAX_AGE_SECONDS
 
 
 def _mask_email(value: object) -> str | None:
@@ -155,11 +156,22 @@ def observed_capacity(account: dict) -> dict:
         isinstance(remaining, float) and math.isfinite(remaining)
         and remaining >= 0 and remaining.is_integer()
     )
+    if account.get("capacity_read_failed_at"):
+        state = "read_failed"
+    elif not valid:
+        state = "unknown"
+    elif (account.get("capacity_used_since_observation")
+          or not observation_is_fresh(account.get("capacity_observed_at"))):
+        state = "stale"
+    else:
+        state = "observed"
+    # Retain the last observed value (including zero) as historical evidence.
+    # Staleness is not zero quota, a new failure, or permission to resend work.
     return {
         "route": "chatgpt_image_gen",
         "source": "limits_progress.image_gen.remaining",
         "unit": "upstream_image_gen",
-        "state": "read_failed" if account.get("capacity_read_failed_at") else "stale" if valid and account.get("capacity_used_since_observation") else "observed" if valid else "unknown",
+        "state": state,
         "remaining": int(remaining) if valid else None,
         "observed_at": account.get("capacity_observed_at"),
         "failed_at": account.get("capacity_read_failed_at"),
