@@ -1208,12 +1208,21 @@ class ConversationBindingService:
                 backend.text_cursor_callback = on_cursor
             failure_phase = "stream_open"
             try:
-                if body.get("_public_session_ref") and conversation_id:
+                # All bound text consumers can resume an archived Chat. The
+                # public-session flag describes a client protocol, not whether
+                # the original upstream conversation needs restoring.
+                if conversation_id:
                     try:
                         document = backend._get_conversation(conversation_id)
                     except Exception as exc:
                         raise ConversationBindingError("original conversation read is temporarily unavailable",
                                                        code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED") from exc
+                    if not isinstance(document, dict) or type(document.get("is_archived")) is not bool:
+                        raise ConversationBindingError("original conversation visibility is unconfirmed",
+                                                       code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED")
+                    if str(document.get("conversation_id") or conversation_id) != conversation_id:
+                        raise ConversationBindingError("original conversation identity changed",
+                                                       code="CONVERSATION_BINDING_MISMATCH")
                     if document.get("current_node") != parent_message_id:
                         raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH")
                     if document.get("is_archived") is True:
