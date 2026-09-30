@@ -1,4 +1,4 @@
-"""Owned HTTP operations must reuse the existing protected account authority.
+"""Company account operations and retired legacy endpoints share one authority.
 
 Regression definitions for the C01/C02 implementation batch. All upstream reads
 are controlled; these tests must run with the owning suite in an isolated data
@@ -83,8 +83,9 @@ def assert_owned_receipt(response):
     assert response.status_code == 200
     assert response.headers["cache-control"] == "private, no-store"
     item = response.json()["item"]
-    assert item["id"] == ROW_ID
-    assert "account_ref" not in item and "managed_owner" not in item
+    assert item["id"] == item["account_ref"] == item["authorization_ref"]
+    assert item["id"] != ROW_ID
+    assert "managed_owner" not in item
     assert TOKEN not in response.text and "access_token" not in response.text
     return item
 
@@ -92,7 +93,7 @@ def assert_owned_receipt(response):
 def test_refresh_reuses_verified_routes_and_owned_envelope(harness):
     h = harness
     before = h.accounts.get_account(TOKEN)
-    item = assert_owned_receipt(post(h, f"/accounts/{ROW_ID}/refresh"))
+    item = assert_owned_receipt(post(h, f"/pool/accounts/{h.accounts.list_pool_accounts()[0]['account_ref']}/refresh", {}))
     h.read.assert_called_once_with(TOKEN)
     h.codex_read.assert_not_called()
     assert item["capacity"]["remaining"] == 5
@@ -105,19 +106,19 @@ def test_refresh_reuses_verified_routes_and_owned_envelope(harness):
 def test_repeat_enable_is_read_only_and_reenable_preserves_quota(harness):
     h = harness
     original = h.storage.file_path.read_bytes()
-    assert_owned_receipt(post(h, f"/accounts/{ROW_ID}/enabled", {"enabled": True}))
+    assert_owned_receipt(post(h, f"/pool/accounts/{h.accounts.list_pool_accounts()[0]['account_ref']}/enabled", {"enabled": True}))
     assert h.storage.file_path.read_bytes() == original
-    assert not assert_owned_receipt(post(h, f"/accounts/{ROW_ID}/enabled", {"enabled": False}))["enabled"]
+    assert not assert_owned_receipt(post(h, f"/pool/accounts/{h.accounts.list_pool_accounts()[0]['account_ref']}/enabled", {"enabled": False}))["enabled"]
     disabled = h.storage.file_path.read_bytes()
-    post(h, f"/accounts/{ROW_ID}/enabled", {"enabled": False})
+    post(h, f"/pool/accounts/{h.accounts.list_pool_accounts()[0]['account_ref']}/enabled", {"enabled": False})
     assert h.storage.file_path.read_bytes() == disabled
-    item = assert_owned_receipt(post(h, f"/accounts/{ROW_ID}/enabled", {"enabled": True}))
+    item = assert_owned_receipt(post(h, f"/pool/accounts/{h.accounts.list_pool_accounts()[0]['account_ref']}/enabled", {"enabled": True}))
     assert item["enabled"] and item["connection_status"] == "unavailable"
     assert item["capacity"]["remaining"] == 7
     assert h.accounts.get_account(TOKEN)["quota"] == 7
     assert h.accounts.get_account(TOKEN)["status"] == "禁用"
     h.read.assert_not_called()
-    item = assert_owned_receipt(post(h, f"/accounts/{ROW_ID}/refresh"))
+    item = assert_owned_receipt(post(h, f"/pool/accounts/{h.accounts.list_pool_accounts()[0]['account_ref']}/refresh", {}))
     assert item["connection_status"] == "connected"
     assert h.accounts.get_account(TOKEN)["status"] == "正常"
 
@@ -126,24 +127,26 @@ def test_repeat_enable_is_read_only_and_reenable_preserves_quota(harness):
 def test_wrong_owner_and_pool_reference_cannot_select_owned_row(harness, operation, body):
     h = harness
     original = h.storage.file_path.read_bytes()
-    headers = {**h.headers, "X-Workbench-Account-Owner": OTHER}
-    assert post(h, f"/accounts/{ROW_ID}/{operation}", body, headers=headers).status_code == 404
     ref = h.accounts.list_pool_accounts()[0]["account_ref"]
-    assert post(h, f"/accounts/{ref}/{operation}", body).status_code == 404
+    for actor in (OWNER, OTHER):
+        headers = {**h.headers, "X-Workbench-Account-Owner": actor}
+        for identifier in (ROW_ID, ref):
+            response = post(h, f"/accounts/{identifier}/{operation}", body, headers=headers)
+            assert response.status_code == 410
+            assert response.json()["detail"]["code"] == "COMPANY_ACCOUNT_ENTRY_REQUIRED"
+            assert response.json()["detail"]["automatic_retry"] is False
     assert h.storage.file_path.read_bytes() == original
     h.read.assert_not_called()
 
 
 def test_duplicate_owned_id_does_not_pick_first_row(harness):
     h = harness
-    h.accounts.add_account_items([{
-        "access_token": "second-synthetic-access", "source_type": "web",
-        "managed_owner": OWNER, "managed_account_id": ROW_ID,
-        "user_id": "other-chat-user", "quota": 3,
-    }])
     original = h.storage.file_path.read_bytes()
-    assert post(h, f"/accounts/{ROW_ID}/refresh").status_code == 409
-    assert post(h, f"/accounts/{ROW_ID}/enabled", {"enabled": False}).status_code == 409
+    for identifier in (ROW_ID, "unknown-row"):
+        assert post(h, f"/accounts/{identifier}/refresh").status_code == 410
+        assert post(h, f"/accounts/{identifier}/enabled", {"enabled": False}).status_code == 410
+    listing = h.client.get("/api/workbench/ai/accounts", headers=h.headers)
+    assert listing.status_code == 410
     assert h.storage.file_path.read_bytes() == original
     h.read.assert_not_called()
 
@@ -151,7 +154,7 @@ def test_duplicate_owned_id_does_not_pick_first_row(harness):
 def test_failed_metadata_read_keeps_previous_value_and_specific_state(harness):
     h = harness
     h.read.side_effect = RuntimeError("synthetic private upstream error")
-    item = assert_owned_receipt(post(h, f"/accounts/{ROW_ID}/refresh"))
+    item = assert_owned_receipt(post(h, f"/pool/accounts/{h.accounts.list_pool_accounts()[0]['account_ref']}/refresh", {}))
     assert item["capacity"]["state"] == "read_failed"
     assert item["capacity"]["remaining"] == 7
     assert item["chat"]["state"] == "read_failed"
@@ -161,12 +164,12 @@ def test_failed_metadata_read_keeps_previous_value_and_specific_state(harness):
 
 def test_owner_is_rechecked_after_refresh_without_leaking_new_owner(harness, monkeypatch):
     h = harness
-    def changed_owner(*_args):
-        h.accounts.update_account(TOKEN, {"managed_owner": OTHER}, quiet=True)
-        return {}
-    monkeypatch.setattr(h.accounts, "refresh_pool_account", changed_owner)
-    response = post(h, f"/accounts/{ROW_ID}/refresh")
-    assert response.status_code == 404
+    ref = h.accounts.list_pool_accounts()[0]["account_ref"]
+    headers = {**h.headers, "X-Workbench-Account-Owner": OTHER}
+    response = post(h, f"/pool/accounts/{ref}/refresh", {}, headers=headers)
+    item = assert_owned_receipt(response)
+    assert item["id"] == ref
+    assert h.accounts.get_account(TOKEN)["managed_owner"] == OWNER
     assert OTHER not in response.text and TOKEN not in response.text
 
 
@@ -177,7 +180,7 @@ def test_upstream_read_does_not_hold_global_account_lock(harness):
         assert not h.accounts.admission_transaction()._is_owned()
         return original_read
     h.read.side_effect = observe
-    assert_owned_receipt(post(h, f"/accounts/{ROW_ID}/refresh"))
+    assert_owned_receipt(post(h, f"/pool/accounts/{h.accounts.list_pool_accounts()[0]['account_ref']}/refresh", {}))
 
 
 def test_keys_have_no_store_and_revoke_only_the_requested_owners_key(harness):

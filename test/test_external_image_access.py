@@ -1,4 +1,5 @@
 import tempfile
+from datetime import datetime, timezone
 import io
 import time
 import threading
@@ -342,7 +343,7 @@ class ExternalImageAccessTests(unittest.TestCase):
     def test_capacity_zero_missing_invalid_and_stale_are_distinct(self):
         for remaining in (None, "", "unknown", True, -1, float("inf")):
             self.assertIsNone(observed_capacity({"limits_progress": [{"feature_name": "image_gen", "remaining": remaining}]})["remaining"])
-        observed = {"limits_progress": [{"feature_name": "image_gen", "remaining": 0, "reset_after": 3600}], "capacity_observed_at": "2026-09-16T00:00:00Z"}
+        observed = {"limits_progress": [{"feature_name": "image_gen", "remaining": 0, "reset_after": 3600}], "capacity_observed_at": datetime.now(timezone.utc).isoformat()}
         self.assertEqual(observed_capacity(observed)["remaining"], 0)
         self.assertEqual(observed_capacity(observed)["state"], "observed")
         self.assertEqual(observed_capacity({**observed, "capacity_used_since_observation": True})["state"], "stale")

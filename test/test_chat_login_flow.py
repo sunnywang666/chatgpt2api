@@ -119,21 +119,21 @@ def test_success_is_manual_callback_durable_redacted_and_idempotent(root, includ
     service = make_service(root, accounts, http)
     request_id = str(uuid.uuid4())
 
-    started = service.start(OWNER, "owned", "import", request_id)
+    started = service.start(OWNER, "pool", "import", request_id)
     assert started["state"] == "pending_callback"
     assert started["return_mode"] == "manual_callback"
     assert started["authorize_url"].startswith(ChatLoginService.AUTHORIZE_URL + "?")
     callback = callback_for(started)
     if not include_scope:
         callback = callback.split("&scope=", 1)[0]
-    result = service.submit_callback(OWNER, "owned", started["id"], callback)
+    result = service.submit_callback(OWNER, "pool", started["id"], callback)
 
     assert result["state"] == "succeeded"
     assert result["account_ref"] == ACCOUNT_REF
     assert result["import_status"] == "created"
     assert result["route"] == "chat"
     assert "authorize_url" not in result
-    assert service.start(OWNER, "owned", "import", request_id) == result
+    assert service.start(OWNER, "pool", "import", request_id) == result
     assert len(http.calls) == 1
     assert http.calls[0][0] == ChatLoginService.TOKEN_URL
     assert http.calls[0][1]["allow_redirects"] is False
@@ -151,7 +151,7 @@ def test_callback_requires_exact_url_and_state_before_any_exchange(root):
     accounts = FakeAccounts()
     http = FakeHttp([])
     service = make_service(root, accounts, http)
-    started = service.start(OWNER, "owned", "import", str(uuid.uuid4()))
+    started = service.start(OWNER, "pool", "import", str(uuid.uuid4()))
 
     invalid = [
         "raw-code",
@@ -167,11 +167,11 @@ def test_callback_requires_exact_url_and_state_before_any_exchange(root):
     ]
     for value in invalid:
         with pytest.raises(ChatLoginError, match="invalid_callback"):
-            service.submit_callback(OWNER, "owned", started["id"], value)
+            service.submit_callback(OWNER, "pool", started["id"], value)
     wrong_state = "https://platform.openai.com/auth/callback?code=x&state=wrong&scope=openid+profile"
     with pytest.raises(ChatLoginError, match="state_mismatch"):
-        service.submit_callback(OWNER, "owned", started["id"], wrong_state)
-    assert service.get(OWNER, "owned", started["id"])["state"] == "pending_callback"
+        service.submit_callback(OWNER, "pool", started["id"], wrong_state)
+    assert service.get(OWNER, "pool", started["id"])["state"] == "pending_callback"
     assert http.calls == []
 
 
@@ -179,11 +179,11 @@ def test_unknown_exchange_and_duplicate_callback_never_exchange_twice(root):
     accounts = FakeAccounts()
     http = FakeHttp([RuntimeError("private upstream failure")])
     service = make_service(root, accounts, http)
-    started = service.start(OWNER, "owned", "import", str(uuid.uuid4()))
+    started = service.start(OWNER, "pool", "import", str(uuid.uuid4()))
     callback = callback_for(started)
 
-    first = service.submit_callback(OWNER, "owned", started["id"], callback)
-    second = service.submit_callback(OWNER, "owned", started["id"], callback)
+    first = service.submit_callback(OWNER, "pool", started["id"], callback)
+    second = service.submit_callback(OWNER, "pool", started["id"], callback)
 
     assert first == second
     assert first["state"] == "interrupted"
@@ -198,15 +198,15 @@ def test_tokens_persist_before_import_and_restart_resumes_without_exchange(root)
     tokens = {"access_token": "access-save", "refresh_token": "refresh-save", "id_token": "id-save"}
     http = FakeHttp([FakeResponse(200, tokens)])
     service = make_service(root, accounts, http)
-    started = service.start(OWNER, "owned", "attach", str(uuid.uuid4()), ACCOUNT_REF)
+    started = service.start(OWNER, "pool", "attach", str(uuid.uuid4()), ACCOUNT_REF)
 
-    saving = service.submit_callback(OWNER, "owned", started["id"], callback_for(started))
+    saving = service.submit_callback(OWNER, "pool", started["id"], callback_for(started))
     assert saving["state"] == "saving"
     stored = (root / "chat_login_sessions.json").read_text()
     assert "access-save" in stored and "refresh-save" in stored
 
     restarted = make_service(root, accounts, FakeHttp([]))
-    recovered = restarted.get(OWNER, "owned", started["id"])
+    recovered = restarted.get(OWNER, "pool", started["id"])
     assert recovered["state"] == "succeeded"
     assert recovered["account_ref"] == ACCOUNT_REF
     assert len(http.calls) == 1
@@ -217,7 +217,7 @@ def test_tokens_persist_before_import_and_restart_resumes_without_exchange(root)
 def test_restart_during_exchange_is_unknown_and_cannot_reuse_code(root):
     accounts = FakeAccounts()
     service = make_service(root, accounts, FakeHttp([]))
-    started = service.start(OWNER, "owned", "import", str(uuid.uuid4()))
+    started = service.start(OWNER, "pool", "import", str(uuid.uuid4()))
     with service._lock:
         session = service._sessions[started["id"]]
         session["state"] = "exchanging"
@@ -226,7 +226,7 @@ def test_restart_during_exchange_is_unknown_and_cannot_reuse_code(root):
         service._save_locked()
 
     restarted = make_service(root, accounts, FakeHttp([]))
-    result = restarted.get(OWNER, "owned", started["id"])
+    result = restarted.get(OWNER, "pool", started["id"])
     assert result["state"] == "interrupted"
     assert result["error_code"] == "chat_login_exchange_outcome_unknown"
     persisted = (root / "chat_login_sessions.json").read_text()
@@ -260,28 +260,28 @@ def test_concurrent_duplicate_callback_has_one_exchange(root):
 
     http = BlockingHttp([])
     service = make_service(root, accounts, http)
-    started = service.start(OWNER, "owned", "import", str(uuid.uuid4()))
+    started = service.start(OWNER, "pool", "import", str(uuid.uuid4()))
     callback = callback_for(started)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(service.submit_callback, OWNER, "owned", started["id"], callback)
+        first = executor.submit(service.submit_callback, OWNER, "pool", started["id"], callback)
         assert entered.wait(1)
-        second = executor.submit(service.submit_callback, OWNER, "owned", started["id"], callback)
+        second = executor.submit(service.submit_callback, OWNER, "pool", started["id"], callback)
         assert second.result(timeout=1)["state"] == "exchanging"
         release.set()
         assert first.result(timeout=2)["state"] == "succeeded"
     assert len(http.calls) == 1
 
 
-def test_cancel_only_pending_and_pool_requires_attach(root):
+def test_cancel_only_pending_and_legacy_start_is_rejected(root):
     accounts = FakeAccounts()
     service = make_service(root, accounts, FakeHttp([]))
-    with pytest.raises(ChatLoginError, match="invalid_mode"):
-        service.start(OWNER, "pool", "import", str(uuid.uuid4()))
-    started = service.start(OWNER, "owned", "import", str(uuid.uuid4()))
-    assert service.cancel(OWNER, "owned", started["id"])["state"] == "cancelled"
-    assert service.cancel(OWNER, "owned", started["id"])["state"] == "cancelled"
+    with pytest.raises(ChatLoginError, match="COMPANY_ACCOUNT_ENTRY_REQUIRED"):
+        service.start(OWNER, "owned", "import", str(uuid.uuid4()))
+    started = service.start(OWNER, "pool", "import", str(uuid.uuid4()))
+    assert service.cancel(OWNER, "pool", started["id"])["state"] == "cancelled"
+    assert service.cancel(OWNER, "pool", started["id"])["state"] == "cancelled"
     with pytest.raises(ChatLoginError, match="not_found"):
-        service.get("workbench:org:other", "owned", started["id"])
+        service.get("workbench:org:other", "pool", started["id"])
 
 
 def test_http_factory_forces_verified_tls(root):
@@ -307,10 +307,10 @@ def test_unknown_save_reads_committed_result_after_restart_without_exchange(root
     accounts = CommitThenLoseReceipt()
     http = FakeHttp([FakeResponse(200, {"access_token": "save-once", "refresh_token": "refresh-once"})])
     service = make_service(root, accounts, http)
-    started = service.start(OWNER, "owned", "import", str(uuid.uuid4()))
-    assert service.submit_callback(OWNER, "owned", started["id"], callback_for(started))["state"] == "saving"
+    started = service.start(OWNER, "pool", "import", str(uuid.uuid4()))
+    assert service.submit_callback(OWNER, "pool", started["id"], callback_for(started))["state"] == "saving"
     restored = make_service(root, accounts, FakeHttp([]))
-    assert restored.get(OWNER, "owned", started["id"])["state"] == "succeeded"
+    assert restored.get(OWNER, "pool", started["id"])["state"] == "succeeded"
     assert len(http.calls) == len(accounts.imports) == 1
     assert "save-once" not in (root / "chat_login_sessions.json").read_text()
 
@@ -333,3 +333,30 @@ def test_verified_oauth_import_does_not_refresh_again_and_readback_checks_target
     assert restored.chat_login_committed_receipt({**material, "refresh_token": "wrong"}) is None
     with pytest.raises(CodexAuthorizationAttachError, match="account_conflict"):
         restored.chat_login_committed_receipt(material, ACCOUNT_REF)
+
+
+@pytest.mark.parametrize("mode", ["import", "attach"])
+def test_persisted_legacy_callback_recovers_same_owner_scope_and_save(root, mode):
+    accounts = FakeAccounts()
+    http = FakeHttp([FakeResponse(200, {"access_token": "legacy-access", "refresh_token": "legacy-refresh"})])
+    service = make_service(root, accounts, http)
+    ref = ACCOUNT_REF if mode == "attach" else None
+    request_id = str(uuid.uuid4())
+    started = service.start(OWNER, "pool", mode, request_id, ref)
+    record = service._sessions[started["id"]]
+    record["scope"] = "owned"
+    record["request_hash"] = service._request_hash("owned", mode, ref or "")
+    service._save_locked()
+    restored = make_service(root, accounts, http)
+    assert restored.start(OWNER, "owned", mode, request_id, ref)["id"] == started["id"]
+    with pytest.raises(ChatLoginError, match="not_found"):
+        restored.submit_callback("other-owner", "owned", started["id"], callback_for(started))
+    with pytest.raises(ChatLoginError, match="not_found"):
+        restored.get(OWNER, "pool", started["id"])
+    completed = restored.submit_callback(OWNER, "owned", started["id"], callback_for(started))
+    assert completed["state"] == "succeeded"
+    assert completed["id"] == started["id"]
+    assert len(http.calls) == len(accounts.imports) == 1
+    assert accounts.imports[0][0] == OWNER
+    assert restored.submit_callback(OWNER, "owned", started["id"], callback_for(started)) == completed
+    assert len(http.calls) == 1

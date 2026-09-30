@@ -94,10 +94,9 @@ class CodexAuthorizationApiTests(unittest.TestCase):
             headers=self.trusted,
             json=self.body,
         )
-        self.assertEqual(owned.status_code, 200)
-        self.accounts.attach_owned_codex_authorization.assert_called_once_with(
-            "workbench:org:boss", "owned-account", self.body
-        )
+        self.assertEqual(owned.status_code, 410)
+        self.assertEqual(owned.json()["detail"]["code"], "COMPANY_ACCOUNT_ENTRY_REQUIRED")
+        self.accounts.attach_owned_codex_authorization.assert_not_called()
 
     def test_login_routes_preserve_owner_scope_and_never_add_internal_material(self):
         request_id = "12345678-1234-5678-9234-567812345678"

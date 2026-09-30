@@ -66,10 +66,10 @@ def test_official_callback_matches_each_existing_row_and_preserves_other_route(t
     incoming = material(index, marker="fresh")
     http = FakeHttp([FakeResponse(200, incoming)])
     service = ChatLoginService(tmp_path / "sessions.json", accounts, http.factory)
-    started = service.start(OWNER, "owned", "import", str(uuid.uuid4()))
+    started = service.start(OWNER, "pool", "import", str(uuid.uuid4()))
     with patch.object(accounts, "_verified_chat_info", return_value=observation(index)) as protected_read, \
             patch.object(accounts, "_request_access_token_refresh", side_effect=AssertionError("no second exchange")):
-        result = service.submit_callback(OWNER, "owned", started["id"], callback_for(started))
+        result = service.submit_callback(OWNER, "pool", started["id"], callback_for(started))
     assert result["state"] == "succeeded"
     assert result["import_status"] == "updated"
     assert result["account_ref"] == refs[index]
@@ -92,7 +92,7 @@ def test_official_callback_matches_each_existing_row_and_preserves_other_route(t
     restarted = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
     receipt = restarted.chat_login_committed_receipt(incoming)
     assert receipt["authorization_ref"] == refs[index]
-    assert service.get(OWNER, "owned", started["id"])["state"] == "succeeded"
+    assert service.get(OWNER, "pool", started["id"])["state"] == "succeeded"
     assert len(http.calls) == 1
     assert "pending_credentials" not in (tmp_path / "sessions.json").read_text()
 

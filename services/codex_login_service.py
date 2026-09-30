@@ -232,7 +232,7 @@ class CodexLoginService:
             raise CodexLoginError(422, "codex_login_invalid_request_id") from None
         if scope not in {"owned", "pool"}:
             raise CodexLoginError(404, "codex_login_not_found")
-        if mode not in {"import", "attach"} or (scope == "pool" and mode != "attach"):
+        if mode not in {"import", "attach"}:
             raise CodexLoginError(422, "codex_login_invalid_mode")
         if (mode == "attach") != bool(account_ref):
             raise CodexLoginError(422, "codex_login_account_ref_required" if mode == "attach" else "codex_login_account_ref_not_allowed")
@@ -244,6 +244,10 @@ class CodexLoginService:
                     if item.get("request_hash") != request_hash:
                         raise CodexLoginError(409, "codex_login_idempotency_conflict")
                     return self._public(item)
+            # Original scope/ID/hash lookup above is retained for old sessions.
+            # Only a new legacy start is rejected, before any upstream I/O.
+            if scope == "owned":
+                raise CodexLoginError(409, "COMPANY_ACCOUNT_ENTRY_REQUIRED")
             target_revision = None
             if mode == "attach":
                 target = self.accounts.codex_login_target(owner, account_ref, pool=scope == "pool")
