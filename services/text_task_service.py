@@ -268,6 +268,8 @@ class TextTaskService:
                                         "same_conversation_continuation": True}
         if receipt.get("_terminal_empty_correction_of"):
             result["correction_of_request_id"] = receipt["_terminal_empty_correction_of"]
+        if receipt.get("_supersedes_request_id"):
+            result["supersedes_request_id"] = receipt["_supersedes_request_id"]
         return result
 
     @staticmethod
@@ -991,14 +993,158 @@ class TextTaskService:
         ).hexdigest()
         return request_id, request_hash
 
+    SUPERSEDE_FIELDS = frozenset({"supersedes_request_id", "client_request_id", "provider_binding_id",
+        "provider_account_identity", "client_conversation_id", "conversation_id", "parent_message_id"})
+
+    def submission_input(self, owner, body):
+        """Resolve an explicit internal reference; callers cannot replace original content."""
+        if "supersedes_request_id" not in body:
+            return body
+        request_id = body.get("client_request_id")
+        with self._db() as db:
+            existing = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+            conflict = "CONVERSATION_REQUEST_CONFLICT" if existing else "CHAT_SUPERSEDE_INVALID"
+            def reject():
+                raise ConversationBindingError("original successor input cannot be changed", code=conflict)
+            if (set(body) != self.SUPERSEDE_FIELDS or not owner
+                    or any(not isinstance(v, str) or not v.strip() or v != v.strip() for v in body.values())
+                    or len(request_id) > 200 or len(body["supersedes_request_id"]) > 200
+                    or request_id == body["supersedes_request_id"]):
+                reject()
+            row = existing or db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                         (owner, body["supersedes_request_id"])).fetchone()
+            if not row:
+                reject()
+            receipt = json.loads(row[1])
+            try:
+                retained = self.store.load_input(receipt["_input_ref"])
+                if self._submission_identity(owner, retained) != (receipt["request_id"], row[0]):
+                    reject()
+            except (OSError, ValueError, TypeError, KeyError):
+                reject()
+            expected = {**retained, "client_request_id": request_id, "supersedes_request_id": body["supersedes_request_id"]}
+            if existing and retained.get("supersedes_request_id") != body["supersedes_request_id"]:
+                reject()
+            if any(expected.get(k) != v for k, v in body.items()):
+                reject()
+            return expected
+
+    @staticmethod
+    def _supersede_order_link(previous, successor):
+        """A server-registered successor releases only its own predecessor's order head."""
+        return bool(previous and successor.get("_supersedes_request_id") == previous.get("request_id")
+            and successor.get("request_id") != previous.get("request_id")
+            and successor.get("_supersedes_request_message_id") == previous.get("request_message_id")
+            and successor.get("_supersedes_input_hash") and successor.get("_input_ref")
+            and not previous.get("_public_session_ref") and not successor.get("_public_session_ref")
+            and successor.get("_route", "chat") == previous.get("_route", "chat") == "chat"
+            and successor.get("_operation", "text") == previous.get("_operation", "text") == "text"
+            and not successor.get("_forward_protocol") and not previous.get("_forward_protocol")
+            and all(successor.get(k) == previous.get(k) and previous.get(k) for k in (
+                "provider_binding_id", "provider_account_identity", "conversation_id", "client_conversation_id", "model"))
+            and successor.get("_submission_parent_message_id") == (
+                previous.get("_submission_parent_message_id") or previous.get("parent_message_id")))
+
+    @staticmethod
+    def _validate_supersede(store, db, owner, successor, now):
+        """Recheck the immutable original and live claims in the existing transaction."""
+        def reject(code):
+            raise ConversationBindingError("explicit original-request successor cannot advance", code=code)
+        previous_id = successor.get("_supersedes_request_id")
+        row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                         (owner, previous_id)).fetchone()
+        if not row:
+            reject("CHAT_SUPERSEDE_INVALID")
+        previous = json.loads(row[1])
+        if previous.get("status") == "succeeded" or previous.get("_upstream_terminal"):
+            reject("CHAT_SUPERSEDE_ORIGINAL_FOUND")
+        if (not isinstance(previous.get("request_message_id"), str) or not previous["request_message_id"]
+                or not TextTaskService._supersede_order_link(previous, successor)):
+            reject("CHAT_SUPERSEDE_INVALID")
+        for claim_key, until_key in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until")):
+            until = previous.get(until_key)
+            if previous.get(claim_key) and (type(until) not in (int, float) or not math.isfinite(until) or until > now):
+                reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
+        if previous.get("_executing") or previous.get("_turn_reserved"):
+            reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
+        if (previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
+                or previous.get("upstream_outcome") != "unknown"
+                or previous.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND"
+                or previous.get("_recovery_suppressed") or previous.get("_supersedes_request_id")
+                or type(previous.get("_execution_wait_ended_at")) not in (int, float)
+                or not math.isfinite(previous["_execution_wait_ended_at"])):
+            reject("CHAT_SUPERSEDE_INVALID")
+        if row[0] != successor.get("_supersedes_input_hash"):
+            reject("CHAT_SUPERSEDE_INVALID")
+        try:
+            original_body = store.load_input(previous["_input_ref"])
+            identity = TextTaskService._submission_identity(owner, original_body)
+        except (OSError, ValueError, TypeError, KeyError):
+            reject("CHAT_SUPERSEDE_INVALID")
+        if identity != (previous_id, row[0]):
+            reject("CHAT_SUPERSEDE_INVALID")
+        # The submission root is stable even when a result advances the live cursor.
+        if any(original_body.get(k) != successor.get(k) for k in (
+                "provider_binding_id", "provider_account_identity", "conversation_id", "client_conversation_id")):
+            reject("CHAT_SUPERSEDE_INVALID")
+        if original_body.get("parent_message_id") != successor.get("_submission_parent_message_id"):
+            reject("CHAT_SUPERSEDE_INVALID")
+        other = db.execute("SELECT id FROM requests WHERE owner=? AND json_extract(receipt,'$._supersedes_request_id')=? AND id<>? LIMIT 1",
+                           (owner, previous_id, successor["request_id"])).fetchone()
+        if other:
+            reject("CHAT_SUPERSEDE_CONFLICT")
+        return previous
+
+    def _prepare_supersede(self, db, owner, body, receipt):
+        if "supersedes_request_id" not in body:
+            return
+        previous_id = body["supersedes_request_id"]
+        def reject(code):
+            raise ConversationBindingError("explicit original-request successor cannot advance", code=code)
+        if (not isinstance(previous_id, str) or not previous_id.strip() or len(previous_id) > 200
+                or previous_id != previous_id.strip() or previous_id == body.get("client_request_id")
+                or body.get("_public_session_ref") or body.get("_public_route") or body.get("_forward")
+                or body.get("_editable") or body.get("_route", "chat") != "chat"
+                or body.get("_operation", "text") != "text"):
+            reject("CHAT_SUPERSEDE_INVALID")
+        row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, previous_id)).fetchone()
+        if not row:
+            reject("CHAT_SUPERSEDE_INVALID")
+        original = json.loads(row[1])
+        comparison = {k: v for k, v in body.items() if k != "supersedes_request_id"}
+        comparison["client_request_id"] = previous_id
+        if self._submission_identity(owner, comparison) != (previous_id, row[0]):
+            reject("CHAT_SUPERSEDE_INVALID")
+        receipt.update({k: body.get(k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id")})
+        receipt.update(_supersedes_request_id=previous_id, _supersedes_input_hash=row[0],
+                       _supersedes_request_message_id=original.get("request_message_id"),
+                       _submission_parent_message_id=body.get("parent_message_id"))
+        # This placeholder is used only for validation, never saved or exposed.
+        candidate = {**receipt, "_input_ref": True}
+        self._validate_supersede(self.store, db, owner, candidate, self._now())
+        from services.pool_admission import unfinished
+        # Do not move an intervening queued/unknown turn ahead of this explicit successor.
+        for kind, other_owner, other_id, other in self.store.receipts(db):
+            if other_owner != owner or (kind == "text" and other_id == previous_id):
+                continue
+            same_chat = (other.get("provider_account_identity") == receipt.get("provider_account_identity")
+                         and other.get("conversation_id") == receipt.get("conversation_id"))
+            if unfinished(kind, other) and (same_chat or other.get("client_conversation_id") == body.get("client_conversation_id")):
+                reject("CHAT_SUPERSEDE_CONFLICT")
+
     def validate_submission(self, owner: str, body: dict):
         """Read-only conflict check before any optional external review call."""
+        body = self.submission_input(owner, body)
         request_id, request_hash = self._submission_identity(owner, body)
         with self._db() as db:
             previous = db.execute(
                 "SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
                 (owner, request_id),
             ).fetchone()
+            if not previous and "supersedes_request_id" in body:
+                from services.durable_forward import dispatch_model
+                self._prepare_supersede(db, owner, body, {"request_id": request_id,
+                    "client_conversation_id": body["client_conversation_id"], "model": dispatch_model(body)})
         if previous and previous[0] != request_hash:
             raise ConversationBindingError(
                 "request identity already has different input",
@@ -1064,6 +1210,7 @@ class TextTaskService:
 
     def submit(self, owner: str, body: dict, *, source: str | None = None):
         from services.durable_forward import dispatch_model
+        body = self.submission_input(owner, body)
         request_id, request_hash = self._submission_identity(owner, body)
         receipt = {"request_id": request_id, "client_conversation_id": body["client_conversation_id"],
                    "_route": body.get("_route", "chat"), "_operation": body.get("_operation", "text"),
@@ -1120,6 +1267,7 @@ class TextTaskService:
                 db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
                 schedule = True
             elif not previous:
+                self._prepare_supersede(db, owner, body, receipt)
                 self._continue_public_session(db, owner, body, receipt)
                 receipt.update({"_input_ref": self.store.save_input(body),
                                 "_sequence": self.store.next_sequence(db),
@@ -1272,6 +1420,10 @@ class TextTaskService:
             from services.durable_forward import run
             return run(self, owner, request_id, body)
         try:
+            if receipt.get("_supersedes_request_id"):
+                with self.store.transaction() as db:
+                    previous = self._validate_supersede(self.store, db, owner, receipt, self._now())
+                body = {**body, "_supersedes_request_message_id": previous["request_message_id"]}
             if receipt.get("_terminal_empty_correction_of"):
                 with self._db() as db:
                     previous = self.store.read_receipt(db, "text", owner, receipt["_terminal_empty_correction_of"])
@@ -1325,12 +1477,25 @@ class TextTaskService:
                 result = editable_file_task_service.run_admitted(body)
             else:
                 result = self.runner(body, on_cursor=progress)
+            if receipt.get("_supersedes_request_id"):
+                result = {**result, "upstream_outcome": "completed", "error_code": None, "waiting": None}
             self._update(owner, request_id, **{**result, "status": "succeeded", "finished_at": self._now()})
             context = current_request.get()
             if context is not None and hasattr(context, "record_stage"):
                 context.record_stage("artifact_saved")
         except ConversationBindingError as exc:
             cursor = {k: getattr(exc, k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id") if getattr(exc, k, "")}
+            if exc.code.startswith("CHAT_SUPERSEDE_"):
+                transient = exc.code in {"CHAT_SUPERSEDE_READ_UNAVAILABLE", "CHAT_SUPERSEDE_PREDECESSOR_BUSY"}
+                changes = {"error_code": exc.code, "upstream_outcome": "not_sent", "_turn_reserved": False,
+                           "_executing": False, "_claim_id": None, "_claim_until": None}
+                if transient and self.admission is not None:
+                    changes.update(status="queued", _ready_at=self._now()+self.RECOVERY_BASE_BACKOFF_SECONDS,
+                                   waiting={"reason": "superseded_original_unverified"})
+                else:
+                    changes.update(status="failed", finished_at=self._now())
+                self._update(owner, request_id, **changes)
+                return
             if exc.code == "CHAT_ARCHIVE_RESTORE_UNCONFIRMED":
                 changes = {"error_code": exc.code, "upstream_outcome": "not_sent", "_turn_reserved": False,
                            "_executing": False, "waiting": {"reason": "archive_restore"}}

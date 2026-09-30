@@ -5,7 +5,7 @@ from services.request_context import trusted_source
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from api.external_images import client_sync_result, validate_external_input, is_external, synchronous_external_task
 from api.image_inputs import parse_image_edit_request, read_image_sources
@@ -18,7 +18,7 @@ from services.conversation_binding_service import (
     conversation_binding_service,
 )
 from services.editable_file_task_service import editable_file_task_service
-from services.text_task_service import text_task_service
+from services.text_task_service import TextTaskService, text_task_service
 from services.log_service import LoggedCall
 from services.public_chat_service import PublicChatContractError, project_public_models
 from services.protocol import (
@@ -67,14 +67,25 @@ class ConversationBindingTextRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model: str = "auto"
     image_model: str = "gpt-image-2"
-    messages: list[dict[str, object]]
+    messages: list[dict[str, object]] | None = None
     thinking_effort: str = "standard"
     provider_binding_id: str | None = None
     provider_account_identity: str | None = None
     client_conversation_id: str
     client_request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    supersedes_request_id: str | None = Field(default=None, min_length=1, max_length=200)
     conversation_id: str | None = None
     parent_message_id: str | None = None
+
+
+    @model_validator(mode="after")
+    def original_or_successor(self):
+        if self.supersedes_request_id is None:
+            if self.messages is None:
+                raise ValueError("messages are required")
+        elif self.model_fields_set != TextTaskService.SUPERSEDE_FIELDS:
+            raise ValueError("explicit successor requires only original binding and request identities")
+        return self
 
 
 class TextRequestRecoveryRequest(BaseModel):
@@ -304,8 +315,14 @@ def create_router() -> APIRouter:
                 "error": "ordinary-client bound conversation submission is not supported; use the supported Chat API"})
         require_chat_text_policy(identity)
         owner = str(identity.get("id") or "anonymous")
-        payload = body.model_dump(mode="python")
+        payload = body.model_dump(mode="python", exclude_unset=body.supersedes_request_id is not None)
+        # Preserve hashes of every pre-existing ordinary submission.
+        if body.supersedes_request_id is None:
+            payload.pop("supersedes_request_id", None)
         try:
+            if body.supersedes_request_id is not None and not body.client_request_id:
+                raise ConversationBindingError("explicit successor request identity is required",
+                                               code="CHAT_SUPERSEDE_INVALID")
             if body.client_request_id:
                 # Reject a durable id/body conflict before the optional AI
                 # review can make an external request. submit repeats the same
@@ -319,12 +336,14 @@ def create_router() -> APIRouter:
                             text_task_service.submit, owner, payload, source=trusted_source(identity, request),
                         )
                     return existing
-            request_preview = request_text(payload.get("messages"))
+            review_payload = (await run_in_threadpool(text_task_service.submission_input, owner, payload)
+                              if body.supersedes_request_id is not None else payload)
+            request_preview = request_text(review_payload.get("messages"))
             await filter_or_log(
                 LoggedCall(
                     identity,
                     "/api/conversation-bindings/text",
-                    body.model,
+                    str(review_payload.get("model") or "auto"),
                     "绑定会话文本",
                     request_text=request_preview,
                 ),
