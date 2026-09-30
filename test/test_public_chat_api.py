@@ -670,3 +670,44 @@ def test_public_model_discovery_describes_text_image_input_and_generation(public
 
     internal = public_chat.client.get("/v1/models", headers=public_chat.headers(public=False))
     assert internal.json() == catalogue
+
+
+def test_public_model_discovery_exposes_only_safe_observed_account_capability(public_chat, monkeypatch):
+    from services.model_service import ModelRoute
+
+    account_ref = "car_" + "a" * 43
+    catalog = Mock()
+    catalog.route_for_model.side_effect = lambda model: ModelRoute(
+        account_types=frozenset({"Plus"}) if model == "gpt-text" else frozenset(),
+        allow_anonymous=False,
+        account_identities=frozenset({"account-safe"}) if model == "gpt-text" else frozenset(),
+    )
+    catalog.public_accounts_for_model.return_value = [{
+        "account_ref": account_ref, "state": "unknown", "reason": "model_catalog_observed",
+        "capabilities": ["text", "image_input"],
+    }]
+    monkeypatch.setattr("services.public_chat_service.model_catalog_service", catalog)
+    monkeypatch.setattr(ai.openai_v1_models, "list_models", lambda: {
+        "object": "list", "data": [{
+            "id": "gpt-text", "access_token": "must-not-leak", "label": "private",
+            "permission": [{"account_id": "must-not-leak"}],
+            "owned_by": {"account_id": "must-not-leak"},
+            "root": {"private": "must-not-leak"},
+            "parent": ["must-not-leak"],
+        }],
+    })
+
+    response = public_chat.client.get("/v1/models", headers=public_chat.headers())
+
+    assert response.status_code == 200, response.text
+    item = response.json()["data"][0]
+    assert item["accounts"] == [{
+        "account_ref": account_ref, "state": "unknown", "reason": "model_catalog_observed",
+        "capabilities": ["text", "image_input"],
+    }]
+    assert "must-not-leak" not in response.text
+    assert "account-safe" not in response.text
+    assert "permission" not in item
+    assert "owned_by" not in item
+    assert "root" not in item
+    assert "parent" not in item

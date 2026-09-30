@@ -10,6 +10,7 @@ import threading
 import unittest
 
 from services.account_service import AccountService
+from services.model_service import ModelRoute
 from services.storage.json_storage import JSONStorageBackend
 from services.task_store import TaskStore
 from services.pool_admission import PoolAdmission
@@ -439,6 +440,23 @@ class AdmissionTests(unittest.TestCase):
         self.submit("other", owner="wb")
         self.assertEqual(self.admission.claim_next().request_id, "other")
         self.assertIsNone(self.admission.claim_next())
+
+    def test_durable_model_route_never_claims_same_plan_unobserved_account(self):
+        self.accounts.add_account_items([{
+            "access_token": "fixture-token-observed", "account_id": "upstream-observed",
+            "provider_account_identity": "account-observed", "type": "Plus", "status": "正常",
+            "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-observed"],
+        }])
+        self.admission.model_types = lambda _model: ModelRoute(
+            account_types=frozenset({"Plus"}), account_identities=frozenset({"account-observed"}),
+        )
+        self.submit("observed-only")
+
+        context = self.admission.claim_next()
+
+        self.assertIsNotNone(context)
+        receipt = self.read("text", "happy", "observed-only")
+        self.assertEqual(receipt["provider_account_identity"], "account-observed")
 
     def terminal_empty_correction_pair(self):
         session = "same-public-session"

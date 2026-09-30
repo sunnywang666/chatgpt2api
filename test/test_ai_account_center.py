@@ -421,7 +421,7 @@ class _CatalogBackend:
 
 
 class ManagementModelTests(unittest.TestCase):
-    def test_type_catalog_keeps_account_observation_pending(self) -> None:
+    def test_account_catalog_keeps_capability_bound_to_the_observed_account(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             accounts = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
             accounts.add_account_items([{"access_token": "chat-token", "source_type": "web", "type": "Plus", "status": "正常"}])
@@ -432,7 +432,8 @@ class ManagementModelTests(unittest.TestCase):
             self.assertIsNone(item["available_accounts"])
             self.assertEqual(item["pending_accounts"], 1)
             self.assertEqual(item["accounts"][0]["state"], "unknown")
-            self.assertEqual(item["accounts"][0]["reason"], "account_type_catalog_only")
+            self.assertEqual(item["accounts"][0]["reason"], "model_catalog_observed")
+            self.assertEqual(item["accounts"][0]["capabilities"], ["text", "image_input"])
 
     def test_chat_catalog_never_uses_codex_only_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

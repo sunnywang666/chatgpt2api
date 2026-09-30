@@ -61,7 +61,7 @@ The synchronous-compatible routes use the same persistent receipt machinery as `
 
 The client reads the env file only when `--env-file` is supplied. Global options precede the command.
 
-Read the service model catalog before submitting. For image output select `gpt-image-2`; text-capable entries have `capabilities` including `text` and `image_input`:
+Read the service model catalog before submitting. For image output select `gpt-image-2`; text-capable entries have `capabilities` including `text` and `image_input`. A row may also include `accounts` capability observations with opaque `account_ref` values plus state, reason, and capabilities. Those observations do not promise an immediately available slot or upstream quota; admission is decided when a request is submitted:
 
 ```sh
 python3 examples/image_client.py --env-file .image-client.env models

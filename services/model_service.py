@@ -16,6 +16,11 @@ from utils.log import logger
 class ModelRoute:
     account_types: frozenset[str]
     allow_anonymous: bool = False
+    # `None` preserves the narrow type-only compatibility seam used by older
+    # in-process callers.  Catalog-produced routes always contain an explicit
+    # set, including an empty one, and must therefore select only observed
+    # physical accounts.
+    account_identities: frozenset[str] | None = None
 
 
 class ModelUnavailableError(RuntimeError):
@@ -23,7 +28,12 @@ class ModelUnavailableError(RuntimeError):
 
 
 class ModelCatalogService:
-    """Caches the model catalogs advertised to each active account type."""
+    """Caches independently observed Chat model catalogs for active accounts."""
+
+    # A cold read probes one endpoint per physical account.  Keep that burst
+    # bounded while allowing the ordinary pool size to be observed in parallel
+    # instead of serial account-timeouts.
+    MAX_DISCOVERY_WORKERS = 8
 
     def __init__(
         self,
@@ -39,9 +49,10 @@ class ModelCatalogService:
         self._clock = clock
         self._lock = RLock()
         self._expires_at = 0.0
-        self._account_signature: tuple[tuple[str, int], ...] = ()
+        self._account_signature: tuple[tuple[str, str], ...] = ()
         self._anonymous_models: dict[str, dict[str, Any]] = {}
-        self._models_by_account_type: dict[str, dict[str, dict[str, Any]]] = {}
+        self._models_by_account: dict[str, dict[str, dict[str, Any]]] = {}
+        self._account_types: dict[str, str] = {}
 
     @staticmethod
     def _model_map(result: object) -> dict[str, dict[str, Any]]:
@@ -56,10 +67,17 @@ class ModelCatalogService:
                 models[model_id] = dict(item)
         return models
 
-    def _active_accounts_by_type(self) -> dict[str, list[str]]:
-        groups: dict[str, list[str]] = {}
+    def _active_accounts(self) -> dict[str, tuple[str, str]]:
+        """Return exactly one usable token for each stable physical account.
+
+        Model access belongs to a concrete account, not its subscription type.
+        Duplicate stable identities are excluded because choosing either record
+        would lose the original-account authority used by durable receipts.
+        """
+        candidates: dict[str, list[tuple[str, str]]] = {}
         for account in self._accounts.list_accounts():
-            if not isinstance(account, dict) or account.get("status") in {"禁用", "异常"}:
+            if (not isinstance(account, dict) or account.get("managed_disabled")
+                    or account.get("status") in {"禁用", "异常", "限流"}):
                 continue
             if str(account.get("source_type") or "").strip().lower() not in {"web", "oauth_login", "password"}:
                 # Codex authorization is a separate bearer and must never be
@@ -67,16 +85,20 @@ class ModelCatalogService:
                 continue
             access_token = str(account.get("access_token") or "").strip()
             account_type = self._accounts._normalize_account_type(account.get("type"))
-            if access_token and account_type:
-                groups.setdefault(account_type, []).append(access_token)
-        return groups
+            identity = self._accounts._stable_account_identity(account)
+            if access_token and account_type and identity:
+                candidates.setdefault(identity, []).append((access_token, account_type))
+        active: dict[str, tuple[str, str]] = {}
+        for identity, rows in candidates.items():
+            if len(rows) == 1:
+                active[identity] = rows[0]
+            else:
+                logger.warning({"event": "model_catalog_account_identity_ambiguous"})
+        return active
 
     @staticmethod
-    def _signature(groups: dict[str, list[str]]) -> tuple[tuple[str, int], ...]:
-        return tuple(
-            (account_type, len(tokens))
-            for account_type, tokens in sorted(groups.items())
-        )
+    def _signature(accounts: dict[str, tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted((identity, account_type) for identity, (_token, account_type) in accounts.items()))
 
     def _fetch_models(self, access_token: str = "") -> dict[str, dict[str, Any]]:
         backend = self._backend_factory(access_token=access_token)
@@ -85,44 +107,17 @@ class ModelCatalogService:
         finally:
             backend.close()
 
-    def _fetch_account_type_models(
-        self,
-        account_type: str,
-        access_tokens: list[str],
-    ) -> dict[str, dict[str, Any]] | None:
-        attempted_tokens: set[str] = set()
-        last_error: Exception | None = None
-        for access_token in access_tokens:
-            try:
-                resolved_token = self._accounts.refresh_access_token(
-                    access_token,
-                    event="list_models",
-                ) or access_token
-                if resolved_token in attempted_tokens:
-                    continue
-                attempted_tokens.add(resolved_token)
-                return self._fetch_models(resolved_token)
-            except Exception as exc:  # noqa: BLE001 - try the next account for any upstream failure
-                last_error = exc
-        if last_error is not None:
-            logger.warning({
-                "event": "model_catalog_account_type_failed",
-                "account_type": account_type,
-                "error_type": type(last_error).__name__,
-            })
-        return None
+    def _fetch_account_models(self, access_token: str) -> dict[str, dict[str, Any]]:
+        resolved_token = self._accounts.refresh_access_token(access_token, event="list_models") or access_token
+        return self._fetch_models(resolved_token)
 
-    def _refresh(self, groups: dict[str, list[str]], signature: tuple[tuple[str, int], ...]) -> None:
-        models_by_account_type: dict[str, dict[str, dict[str, Any]]] = {}
-        with ThreadPoolExecutor(max_workers=min(4, len(groups) + 1)) as executor:
+    def _refresh(self, accounts: dict[str, tuple[str, str]], signature: tuple[tuple[str, str], ...]) -> None:
+        models_by_account: dict[str, dict[str, dict[str, Any]]] = {}
+        with ThreadPoolExecutor(max_workers=min(self.MAX_DISCOVERY_WORKERS, len(accounts) + 1)) as executor:
             anonymous_future = executor.submit(self._fetch_models)
             account_futures = {
-                account_type: executor.submit(
-                    self._fetch_account_type_models,
-                    account_type,
-                    access_tokens,
-                )
-                for account_type, access_tokens in groups.items()
+                identity: executor.submit(self._fetch_account_models, access_token)
+                for identity, (access_token, _account_type) in accounts.items()
             }
             try:
                 anonymous_models = anonymous_future.result()
@@ -133,25 +128,28 @@ class ModelCatalogService:
                 })
                 anonymous_models = self._anonymous_models
 
-            for account_type, future in account_futures.items():
-                models = future.result()
-                if models is not None:
-                    models_by_account_type[account_type] = models
-                elif account_type in self._models_by_account_type:
-                    models_by_account_type[account_type] = self._models_by_account_type[account_type]
+            for identity, future in account_futures.items():
+                try:
+                    models_by_account[identity] = future.result()
+                except Exception as exc:  # noqa: BLE001 - failed observations must not route work
+                    logger.warning({
+                        "event": "model_catalog_account_failed",
+                        "error_type": type(exc).__name__,
+                    })
 
         self._anonymous_models = anonymous_models
-        self._models_by_account_type = models_by_account_type
+        self._models_by_account = models_by_account
+        self._account_types = {identity: account_type for identity, (_token, account_type) in accounts.items()}
         self._account_signature = signature
         self._expires_at = self._clock() + self._cache_ttl_seconds
 
     def _ensure_catalog(self) -> None:
-        groups = self._active_accounts_by_type()
-        signature = self._signature(groups)
+        accounts = self._active_accounts()
+        signature = self._signature(accounts)
         with self._lock:
             if signature == self._account_signature and self._clock() < self._expires_at:
                 return
-            self._refresh(groups, signature)
+            self._refresh(accounts, signature)
 
     def list_models(self) -> dict[str, Any]:
         self._ensure_catalog()
@@ -160,8 +158,8 @@ class ModelCatalogService:
                 model_id: dict(item)
                 for model_id, item in self._anonymous_models.items()
             }
-            for account_type in sorted(self._models_by_account_type):
-                for model_id, item in self._models_by_account_type[account_type].items():
+            for identity in sorted(self._models_by_account):
+                for model_id, item in self._models_by_account[identity].items():
                     union.setdefault(model_id, dict(item))
         return {
             "object": "list",
@@ -169,20 +167,18 @@ class ModelCatalogService:
         }
 
     def management_models(self) -> list[dict[str, Any]]:
-        """Project the real Chat catalog without inventing per-account probes."""
+        """Project observed account-level Chat capability for management reads."""
         self._ensure_catalog()
         accounts = self._accounts.list_accounts()
         with self._lock:
             anonymous = {key: dict(value) for key, value in self._anonymous_models.items()}
-            by_type = {
-                account_type: {key: dict(value) for key, value in models.items()}
-                for account_type, models in self._models_by_account_type.items()
+            by_account = {
+                identity: {key: dict(value) for key, value in models.items()}
+                for identity, models in self._models_by_account.items()
             }
-        model_types: dict[str, set[str]] = {}
         model_payloads: dict[str, dict[str, Any]] = dict(anonymous)
-        for account_type, models in by_type.items():
+        for models in by_account.values():
             for model_id, payload in models.items():
-                model_types.setdefault(model_id, set()).add(account_type)
                 model_payloads.setdefault(model_id, payload)
 
         from services.owned_accounts import public_pool_account
@@ -190,67 +186,87 @@ class ModelCatalogService:
 
         result: list[dict[str, Any]] = []
         for model_id in sorted(model_payloads):
-            supported_types = model_types.get(model_id, set())
+            capabilities = (
+                ["image_generation", "image_edit"]
+                if model_id == "gpt-image-2" else ["text", "image_input"]
+            )
             projected_accounts = []
-            unavailable = 0
-            pending = 0
             for account in accounts:
                 if str(account.get("source_type") or "").strip().lower() not in {"web", "oauth_login", "password"}:
                     continue
-                account_type = self._accounts._normalize_account_type(account.get("type"))
-                if account_type not in supported_types:
+                identity = self._accounts._stable_account_identity(account)
+                if model_id not in by_account.get(identity, {}):
                     continue
                 safe = public_pool_account(account)
-                if account.get("managed_disabled") or account.get("status") == "禁用":
-                    state, reason = "unavailable", "disabled"
-                    unavailable += 1
-                elif account.get("status") == "异常":
-                    state, reason = "unavailable", "account_unavailable"
-                    unavailable += 1
-                else:
-                    # The cache proves support for this account type only. It
-                    # does not prove that every peer account was observed.
-                    state, reason = "unknown", "account_type_catalog_only"
-                    pending += 1
+                # A model-catalog read proves capability, not free capacity.
+                state, reason = "unknown", "model_catalog_observed"
                 projected_accounts.append({
                     "account_ref": safe["account_ref"],
                     "label": safe["label"],
                     "state": state,
                     "reason": reason,
+                    "capabilities": capabilities,
                 })
-            capabilities = (
-                ["image_generation", "image_edit"]
-                if model_id == "gpt-image-2" else ["text", "image_input"]
-            )
             supported = len(projected_accounts)
-            state = "unavailable" if supported and unavailable == supported else "unknown"
             result.append({
                 "id": model_id,
                 "label": str(model_payloads[model_id].get("label") or model_id)[:160],
                 "route": "chat",
                 "capabilities": capabilities,
-                "state": state,
+                "state": "unknown",
                 "supported_accounts": supported,
-                "available_accounts": 0 if state == "unavailable" else None,
-                "pending_accounts": pending,
-                "unavailable_accounts": unavailable,
+                "available_accounts": None,
+                "pending_accounts": supported,
+                "unavailable_accounts": 0,
                 "accounts": projected_accounts,
                 "reasoning_efforts": public_reasoning_efforts(model_id),
             })
         return result
+
+    def public_accounts_for_model(self, model: str, capabilities: list[str]) -> list[dict[str, Any]]:
+        """Return capability-only account rows for the ordinary model directory.
+
+        The opaque pool reference is sufficient for a caller to distinguish
+        compatible company accounts.  Labels, identities, ownership and all
+        credentials remain management-only.
+        """
+        self._ensure_catalog()
+        with self._lock:
+            observed = {
+                identity for identity, models in self._models_by_account.items()
+                if model in models
+            }
+        rows = []
+        for account in self._accounts.list_accounts():
+            if self._accounts._stable_account_identity(account) not in observed:
+                continue
+            rows.append({
+                "account_ref": self._accounts.pool_account_ref(account),
+                # Catalog capability is known; dispatch capacity remains a
+                # separate admission decision and is deliberately not claimed.
+                "state": "unknown",
+                "reason": "model_catalog_observed",
+                "capabilities": list(capabilities),
+            })
+        return sorted(rows, key=lambda item: item["account_ref"])
 
     def route_for_model(self, model: str) -> ModelRoute:
         model = str(model or "").strip()
         self._ensure_catalog()
         with self._lock:
             account_types = frozenset(
-                account_type
-                for account_type, models in self._models_by_account_type.items()
+                self._account_types[identity]
+                for identity, models in self._models_by_account.items()
+                if model in models
+            )
+            identities = frozenset(
+                identity for identity, models in self._models_by_account.items()
                 if model in models
             )
             return ModelRoute(
                 account_types=account_types,
                 allow_anonymous=model in self._anonymous_models,
+                account_identities=identities,
             )
 
 

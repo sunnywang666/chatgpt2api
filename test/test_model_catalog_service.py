@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -173,6 +173,40 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(self.calls.count("pro"), 1)
         self.assertEqual(self.calls.count(""), 1)
 
+    def test_cold_discovery_starts_pool_accounts_in_parallel_with_a_bounded_worker_count(self) -> None:
+        started = Event()
+        release = Event()
+        entered: list[str] = []
+        entered_lock = Lock()
+        original_factory = self.catalog._backend_factory
+
+        def factory(access_token=""):
+            backend = original_factory(access_token=access_token)
+            original_list = backend.list_models
+
+            def read_models():
+                with entered_lock:
+                    entered.append(access_token)
+                    if len(entered) == 5:  # anonymous plus the four active accounts
+                        started.set()
+                if not release.wait(2):
+                    raise RuntimeError("test catalog was not released")
+                return original_list()
+
+            backend.list_models = read_models
+            return backend
+
+        self.catalog._backend_factory = factory
+        reader = Thread(target=self.catalog.list_models, daemon=True)
+        try:
+            reader.start()
+            self.assertTrue(started.wait(1), "cold discovery queued an active account behind another timeout")
+        finally:
+            release.set()
+            reader.join(2)
+        self.assertFalse(reader.is_alive())
+        self.assertLessEqual(self.catalog.MAX_DISCOVERY_WORKERS, 8)
+
     def test_concurrent_readers_share_one_catalog_refresh(self) -> None:
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(lambda _index: self.catalog.list_models(), range(8)))
@@ -183,17 +217,17 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(self.calls.count("plus"), 1)
         self.assertEqual(self.calls.count("pro"), 1)
 
-    def test_failed_refresh_keeps_last_successful_models_for_that_type(self) -> None:
+    def test_failed_refresh_drops_stale_account_capability(self) -> None:
         self.catalog.list_models()
         self.outcomes["pro"] = RuntimeError("temporary upstream failure")
         self.now += 301
 
         result = self.catalog.list_models()
 
-        self.assertIn("pro-only", {item["id"] for item in result["data"]})
+        self.assertNotIn("pro-only", {item["id"] for item in result["data"]})
         self.assertEqual(
             self.catalog.route_for_model("pro-only").account_types,
-            frozenset({"Pro"}),
+            frozenset(),
         )
         self.assertEqual(self.calls.count("pro"), 2)
 
@@ -208,6 +242,55 @@ class ModelCatalogServiceTests(unittest.TestCase):
             self.catalog.route_for_model("pro-only").account_types,
             frozenset(),
         )
+
+    def test_same_plan_accounts_keep_disjoint_model_observations(self) -> None:
+        self.accounts.add_account_items([
+            {"access_token": "plus-second", "type": "Plus", "status": "正常"},
+        ])
+        self.outcomes["plus-second"] = model_list("second-plus-only")
+
+        self.catalog.list_models()
+
+        identities = {
+            str(account["access_token"]): self.accounts._stable_account_identity(account)
+            for account in self.accounts.list_accounts()
+        }
+        plus_only = self.catalog.route_for_model("plus-only")
+        second_only = self.catalog.route_for_model("second-plus-only")
+        self.assertEqual(plus_only.account_types, frozenset({"Plus"}))
+        self.assertEqual(plus_only.account_identities, frozenset({identities["plus"]}))
+        self.assertEqual(second_only.account_identities, frozenset({identities["plus-second"]}))
+
+    def test_bound_same_plan_account_fails_closed_when_only_a_peer_observed_the_model(self) -> None:
+        self.accounts.add_account_items([
+            {"access_token": "plus-second", "type": "Plus", "status": "正常"},
+        ])
+        self.outcomes["plus-second"] = model_list("second-plus-only")
+        with self.accounts._lock:
+            binding = self.accounts._conversation_binding_for_token_locked("plus")
+
+        self.catalog.list_models()
+
+        with mock.patch("services.model_service.model_catalog_service", self.catalog):
+            self.assertEqual(
+                self.accounts.get_bound_text_access_token(binding, model="plus-only"),
+                "plus",
+            )
+            with self.assertRaisesRegex(RuntimeError, "bound account cannot serve model"):
+                self.accounts.get_bound_text_access_token(binding, model="second-plus-only")
+
+    def test_bound_text_rechecks_managed_disable_and_rate_limit(self) -> None:
+        with self.accounts._lock:
+            binding = self.accounts._conversation_binding_for_token_locked("plus")
+        self.catalog.list_models()
+
+        with mock.patch("services.model_service.model_catalog_service", self.catalog):
+            self.accounts.update_account("plus", {"managed_disabled": True})
+            with self.assertRaisesRegex(RuntimeError, "bound account cannot serve text"):
+                self.accounts.get_bound_text_access_token(binding, model="plus-only")
+            self.accounts.update_account("plus", {"managed_disabled": False, "status": "限流"})
+            with self.assertRaisesRegex(RuntimeError, "bound account cannot serve text"):
+                self.accounts.get_bound_text_access_token(binding, model="plus-only")
 
 
 if __name__ == "__main__":

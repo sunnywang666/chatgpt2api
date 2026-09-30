@@ -81,21 +81,47 @@ def project_public_models(result: object) -> dict[str, Any]:
     if not isinstance(result, dict) or not isinstance(result.get("data"), list):
         raise PublicChatContractError("MODEL_DISCOVERY_UNAVAILABLE", "model discovery unavailable")
     data: list[dict[str, Any]] = []
+
+    def public_model_fields(raw: dict[str, Any]) -> dict[str, Any]:
+        # Upstream catalog extensions are not a public-account contract.
+        # Keep OpenAI model metadata only; provider/account material must not
+        # cross ordinary ingress merely because it appeared in a model row.
+        return {
+            field: raw[field]
+            for field in ("id", "object", "created", "owned_by", "root", "parent")
+            if field in raw and (type(raw[field]) in {str, int, float} or raw[field] is None)
+        }
+
+    def safe_accounts(model_id: str, capabilities: list[str]) -> list[dict[str, Any]]:
+        route = model_catalog_service.route_for_model(model_id)
+        # Older in-process compatibility doubles expose type support only. Do
+        # not manufacture individual-account visibility from that weaker fact.
+        if getattr(route, "account_identities", None) is None:
+            return []
+        return model_catalog_service.public_accounts_for_model(model_id, capabilities)
+
     for raw in result["data"]:
         if not isinstance(raw, dict):
             continue
-        model_id = str(raw.get("id") or "").strip()
+        raw_model_id = raw.get("id")
+        if not isinstance(raw_model_id, str):
+            continue
+        model_id = raw_model_id.strip()
         if model_id == "gpt-image-2":
+            capabilities = ["image_generation", "image_edit"]
             data.append({
-                **raw,
-                "capabilities": ["image_generation", "image_edit"],
+                **public_model_fields(raw),
+                "capabilities": capabilities,
                 "input_limits": dict(IMAGE_OUTPUT_LIMITS),
+                "accounts": safe_accounts(model_id, capabilities),
             })
         elif is_public_text_model(model_id):
+            capabilities = ["text", "image_input"]
             item = {
-                **raw,
-                "capabilities": ["text", "image_input"],
+                **public_model_fields(raw),
+                "capabilities": capabilities,
                 "input_limits": dict(CHAT_INPUT_LIMITS),
+                "accounts": safe_accounts(model_id, capabilities),
             }
             efforts = public_reasoning_efforts(model_id)
             if efforts:

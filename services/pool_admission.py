@@ -335,7 +335,20 @@ class PoolAdmission:
         if model == "auto":
             return {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
         from services.model_service import model_catalog_service
-        return model_catalog_service.route_for_model(model).account_types
+        return model_catalog_service.route_for_model(model)
+
+    @staticmethod
+    def _model_account_matches(account, route) -> bool:
+        """Keep legacy injected type sets while catalog routes stay account-exact."""
+        if isinstance(route, set):
+            return route and account is not None
+        account_types = getattr(route, "account_types", route)
+        if account_types is None:
+            return False
+        identities = getattr(route, "account_identities", None)
+        if identities is None:
+            return True
+        return str(account.get("provider_account_identity") or "") in identities
 
     def _pacing(self, account, now):
         if self.pacing:
@@ -546,7 +559,8 @@ class PoolAdmission:
                         enabled = enabled and plan == self.accounts._normalize_account_type(required_plan)
                     needs = (Need(turn_key), Need(image_key))
                 else:
-                    enabled = enabled and plan in types.get(model, set())
+                    route = types.get(model, set())
+                    enabled = enabled and plan in getattr(route, "account_types", route) and self._model_account_matches(account, route)
                     needs = (Need(turn_key),)
                 # Explicit per-model exhausted observations apply only to that
                 # model. Unknown limits are not invented as an extra balance.

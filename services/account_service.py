@@ -1634,9 +1634,10 @@ class AccountService:
             raise RuntimeError("conversation binding unavailable: explicit text model required")
         from services.model_service import model_catalog_service
 
+        route = model_catalog_service.route_for_model(requested_model)
         supported_types = {
             self._normalize_account_type(value)
-            for value in model_catalog_service.route_for_model(requested_model).account_types
+            for value in route.account_types
         }
         paid_types = {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
         allowed_types = supported_types & paid_types
@@ -1647,9 +1648,11 @@ class AccountService:
             candidates = [
                 str(account.get("access_token") or "")
                 for account in self._accounts.values()
-                if account.get("status") not in {"禁用", "异常"}
+                if account.get("status") not in {"禁用", "异常", "限流"}
                 and not account.get("managed_disabled")
                 and self._normalize_account_type(account.get("type")) in allowed_types
+                and (getattr(route, "account_identities", None) is None
+                     or self._stable_account_identity(account) in route.account_identities)
                 and str(account.get("access_token") or "")
             ]
             if not candidates:
@@ -1664,9 +1667,11 @@ class AccountService:
             resolved = self._resolve_access_token_locked(refreshed)
             account = self._accounts.get(resolved) or {}
             if (
-                account.get("status") in {"禁用", "异常"}
+                account.get("status") in {"禁用", "异常", "限流"}
                 or account.get("managed_disabled")
                 or self._normalize_account_type(account.get("type")) not in allowed_types
+                or (getattr(route, "account_identities", None) is not None
+                    and self._stable_account_identity(account) not in route.account_identities)
             ):
                 raise RuntimeError("conversation binding unavailable: selected account changed")
             binding_id = self._conversation_binding_for_token_locked(resolved)
@@ -1716,10 +1721,14 @@ class AccountService:
             account = self._accounts.get(access_token) or {}
             if for_message and self._normalize_account_type(account.get("type")) not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}:
                 raise RuntimeError("conversation binding unavailable: paid account required")
-            if account.get("status") in {"禁用", "异常"}:
+            if account.get("managed_disabled") or account.get("status") in {"禁用", "异常", "限流"}:
                 raise RuntimeError("conversation binding unavailable: bound account cannot serve text")
             if route is not None:
-                if self._normalize_account_type(account.get("type")) not in route.account_types:
+                if (
+                    self._normalize_account_type(account.get("type")) not in route.account_types
+                    or (getattr(route, "account_identities", None) is not None
+                        and self._stable_account_identity(account) not in route.account_identities)
+                ):
                     raise RuntimeError("conversation binding unavailable: bound account cannot serve model")
         refreshed = self.refresh_access_token(access_token, event="conversation_binding_text")
         if not refreshed:
@@ -1732,28 +1741,44 @@ class AccountService:
             model: str = "auto",
     ) -> str:
         from services.request_context import current_request, AdmissionLost
-        context = current_request.get()
-        if context is not None:
-            selected = context.selected_account()
-            if not selected or selected.get("access_token") in (excluded_tokens or ()):
-                raise AdmissionLost("original text account cannot be replaced")
-            token = str(selected["access_token"])
-            return self.refresh_access_token(token, event="admitted_text_request") or token
-        excluded = set(excluded_tokens or set())
         requested_model = str(model or "auto").strip() or "auto"
         route = None
         if requested_model != "auto":
             from services.model_service import model_catalog_service
 
             route = model_catalog_service.route_for_model(requested_model)
+        context = current_request.get()
+        if context is not None:
+            selected = context.selected_account()
+            if not selected or selected.get("access_token") in (excluded_tokens or ()):
+                raise AdmissionLost("original text account cannot be replaced")
+            token = str(selected["access_token"])
+            with self._lock:
+                resolved = self._resolve_access_token_locked(token)
+                account = self._accounts.get(resolved) or {}
+                if account.get("managed_disabled") or account.get("status") in {"禁用", "异常", "限流"}:
+                    raise AdmissionLost("original text account is unavailable")
+                if route is not None and (
+                    self._normalize_account_type(account.get("type")) not in route.account_types
+                    or (getattr(route, "account_identities", None) is not None
+                        and self._stable_account_identity(account) not in route.account_identities)
+                ):
+                    raise AdmissionLost("original text account cannot serve model")
+            return self.refresh_access_token(token, event="admitted_text_request") or token
+        excluded = set(excluded_tokens or set())
         with self._lock:
             candidates = [
                 token
                 for account in self._accounts.values()
-                if account.get("status") not in {"禁用", "异常"}
+                if not account.get("managed_disabled")
+                   and account.get("status") not in {"禁用", "异常", "限流"}
                    and (
                        route is None
-                       or self._normalize_account_type(account.get("type")) in route.account_types
+                       or (
+                           self._normalize_account_type(account.get("type")) in route.account_types
+                           and (getattr(route, "account_identities", None) is None
+                                or self._stable_account_identity(account) in route.account_identities)
+                       )
                    )
                    and (token := account.get("access_token") or "")
                    and token not in excluded
