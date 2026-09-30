@@ -10,6 +10,7 @@ from services.image_thread import bind_waiting_threads, predecessor_state
 
 from contextlib import nullcontext
 import hashlib
+import math
 import threading
 import time
 import uuid
@@ -421,10 +422,17 @@ class PoolAdmission:
             account = by_identity.get(str(r.get("provider_account_identity") or ""))
             resource = account_clock_key(account) if account else r.get("_account_resource")
             active = status == "running" or unknown
-            # An unresolved result and an executing model turn are distinct.
-            # Only positive original-turn terminal evidence can clear UNKNOWN
-            # occupancy; age, a closed socket or a missing result cannot.
-            turn_active = active and not original_turn_ended(kind, r)
+            # Keep an unresolved result as its conversation's order head even
+            # after the existing qualified-read policy ends local waiting.
+            # This is not proof that the upstream turn ended or permission to
+            # send the original request again.
+            wait_ended = (kind == "text" and r.get("_route", "chat") == "chat"
+                          and r.get("_operation", "text") == "text" and not r.get("_forward_protocol")
+                          and status == "failed" and r.get("error_code") == "RESULT_UNRECOVERABLE"
+                          and r.get("upstream_outcome") == "unknown"
+                          and type(r.get("_execution_wait_ended_at")) in (int, float)
+                          and math.isfinite(r["_execution_wait_ended_at"]))
+            turn_active = active and not original_turn_ended(kind, r) and not wait_ended
             if status == "running" and r.get("_executing") and float(r.get("_claim_until") or 0) > now:
                 active_bytes += int(r.get("_input_bytes") or 0)
                 if kind == "image" or r.get("_operation") == "image":
@@ -585,7 +593,10 @@ class PoolAdmission:
                         scoped_extra_turn=scoped_extra_turn)
 
     def _recover_claims(self, db, receipts, now):
+        from services.text_task_service import TextTaskService
         for kind, owner, request_id, r in receipts:
+            if kind == "text" and TextTaskService._end_execution_wait(r, now):
+                self.store.write_receipt(db, kind, owner, request_id, r)
             if not r.get("_claim_id") or r.get("status") != "running" or float(r.get("_claim_until") or 0) > now:
                 continue
             if r.get("_submission_started"):

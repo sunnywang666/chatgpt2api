@@ -1239,10 +1239,10 @@ class TextTaskTests(unittest.TestCase):
             conversation_id="chat",
         )
         clock.advance(TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS + 1)
-        for delay in (31, 61, 121):
+        for attempt, delay in enumerate((31, 61, 121), 1):
             result = service.recover("owner", "attempt-1")
-            self.assertEqual(result["status"], "unknown")
-            self.assertEqual(result.get("recovery_no_result_reads", 0), 0)
+            self.assertEqual(result["status"], "failed" if attempt == 3 else "unknown")
+            self.assertEqual(result.get("recovery_no_result_reads", 0), attempt)
             clock.advance(delay)
 
     def test_late_runner_updates_cannot_regress_recovered_success(self):
