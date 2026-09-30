@@ -471,6 +471,9 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
             def __init__(self, access_token: str) -> None:
                 self.access_token = access_token
 
+            def _get_conversation(self, conversation_id: str) -> dict:
+                return {"conversation_id": conversation_id, "current_node": "message-2", "is_archived": False}
+
             def get_conversation_parent_message_id(self, conversation_id: str) -> str:
                 return "message-2" if conversation_id == "conversation-1" else ""
 
