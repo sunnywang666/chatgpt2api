@@ -1721,7 +1721,9 @@ class AccountService:
             account = self._accounts.get(access_token) or {}
             if for_message and self._normalize_account_type(account.get("type")) not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}:
                 raise RuntimeError("conversation binding unavailable: paid account required")
-            if account.get("managed_disabled") or account.get("status") in {"禁用", "异常", "限流"}:
+            if account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
+                raise RuntimeError("conversation binding unavailable: bound account cannot serve text")
+            if for_message and account.get("status") == "限流":
                 raise RuntimeError("conversation binding unavailable: bound account cannot serve text")
             if route is not None:
                 if (

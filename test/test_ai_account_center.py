@@ -432,8 +432,12 @@ class ManagementModelTests(unittest.TestCase):
             self.assertIsNone(item["available_accounts"])
             self.assertEqual(item["pending_accounts"], 1)
             self.assertEqual(item["accounts"][0]["state"], "unknown")
-            self.assertEqual(item["accounts"][0]["reason"], "model_catalog_observed")
-            self.assertEqual(item["accounts"][0]["capabilities"], ["text", "image_input"])
+            row = item["accounts"][0]
+            self.assertEqual(row["account_ref"], accounts.list_pool_accounts()[0]["account_ref"])
+            self.assertEqual(row["reason"], "model_catalog_observed")
+            self.assertEqual(row["capabilities"], ["text", "image_input"])
+            self.assertEqual(row["observation_state"], "observed")
+            self.assertIsInstance(row["observed_at"], float)
 
     def test_chat_catalog_never_uses_codex_only_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from threading import Event, Lock, Thread
 from unittest import mock
@@ -42,6 +43,8 @@ class FakeBackend:
         outcome = self._outcomes[self.access_token]
         if isinstance(outcome, Exception):
             raise outcome
+        if callable(outcome):
+            return outcome()
         return outcome
 
     def close(self) -> None:
@@ -82,6 +85,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
             ),
             cache_ttl_seconds=300,
             clock=lambda: self.now,
+            observed_clock=lambda: self.now,
         )
 
     def test_catalog_unions_anonymous_and_each_active_account_type(self) -> None:
@@ -207,6 +211,44 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertFalse(reader.is_alive())
         self.assertLessEqual(self.catalog.MAX_DISCOVERY_WORKERS, 8)
 
+    def test_slow_account_isolated_by_catalog_refresh_budget_and_retried_after_late_completion(self) -> None:
+        entered, release, completed = Event(), Event(), Event()
+        self.catalog.DISCOVERY_BUDGET_SECONDS = 0.05
+        reads = 0
+
+        def slow_models():
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                entered.set()
+                release.wait(2)
+                completed.set()
+            return model_list("plus-only")
+
+        self.outcomes["plus"] = slow_models
+        started = time.monotonic()
+        try:
+            self.catalog.list_models()
+            self.assertTrue(entered.is_set())
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(self.catalog.route_for_model("plus-only").account_types, frozenset())
+
+            # The retained first future is intentionally not republished.  It
+            # must nevertheless keep the cache on its short retry window.
+            self.now += 2
+            self.catalog.list_models()
+            self.assertEqual(reads, 1)
+            self.assertLessEqual(self.catalog._expires_at - self.now, 1.0)
+
+            release.set()
+            self.assertTrue(completed.wait(1))
+            self.now += 2
+            self.catalog.list_models()
+            self.assertEqual(reads, 2)
+            self.assertEqual(self.catalog.route_for_model("plus-only").account_types, frozenset({"Plus"}))
+        finally:
+            release.set()
+
     def test_concurrent_readers_share_one_catalog_refresh(self) -> None:
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(lambda _index: self.catalog.list_models(), range(8)))
@@ -217,19 +259,68 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(self.calls.count("plus"), 1)
         self.assertEqual(self.calls.count("pro"), 1)
 
-    def test_failed_refresh_drops_stale_account_capability(self) -> None:
+    def test_failed_refresh_retains_stale_capability_but_drops_execution_route(self) -> None:
         self.catalog.list_models()
         self.outcomes["pro"] = RuntimeError("temporary upstream failure")
         self.now += 301
 
         result = self.catalog.list_models()
 
-        self.assertNotIn("pro-only", {item["id"] for item in result["data"]})
+        self.assertIn("pro-only", {item["id"] for item in result["data"]})
         self.assertEqual(
             self.catalog.route_for_model("pro-only").account_types,
             frozenset(),
         )
-        self.assertEqual(self.calls.count("pro"), 2)
+        identity = next(self.accounts._stable_account_identity(account) for account in self.accounts.list_accounts()
+                        if account["access_token"] == "pro")
+        observation = self.catalog._model_observations[identity]
+        self.assertIn(observation["observation_state"], {"read_failed", "stale"})
+        self.assertIn(observation["reason"], {"read_failed", "stale"})
+        # Old success makes pro-only queueable, but cannot prove that a new
+        # request is permanently unsupported while this paid read failed.
+        self.assertTrue(self.catalog.catalog_is_unknown())
+
+        self.outcomes["pro"] = model_list("pro-only")
+        self.now += 301
+        self.catalog.list_models()
+        self.assertEqual(self.catalog.route_for_model("pro-only").account_types, frozenset({"Pro"}))
+        self.assertEqual(self.calls.count("pro"), 3)
+
+    def test_limited_account_keeps_capability_evidence_but_never_routes(self) -> None:
+        self.catalog.list_models()
+        self.accounts.update_account("pro", {"status": "限流"})
+
+        self.assertIn("pro-only", {item["id"] for item in self.catalog.list_models()["data"]})
+        self.assertEqual(self.catalog.route_for_model("pro-only").account_types, frozenset())
+        row = self.catalog.public_accounts_for_model("pro-only", ["text"])[0]
+        self.assertEqual(row["reason"], "limited")
+        self.assertEqual(row["observation_state"], "observed")
+        # A rate-limited account retains its known model but cannot prove that
+        # a newly requested model is permanently unsupported.
+        self.assertTrue(self.catalog.catalog_is_unknown())
+
+    def test_successful_catalog_removal_is_permanent_not_stale(self) -> None:
+        self.catalog.list_models()
+        self.outcomes["pro"] = model_list("replacement")
+        self.now += 301
+
+        self.catalog.list_models()
+
+        self.assertNotIn("pro-only", {item["id"] for item in self.catalog.list_models()["data"]})
+        self.assertEqual(self.catalog.known_account_types_for_model("pro-only"), frozenset())
+
+    def test_initial_paid_catalog_failure_is_unknown_not_unsupported(self) -> None:
+        self.outcomes.update({
+            "": RuntimeError("anonymous unavailable"),
+            "free-bad": RuntimeError("unavailable"),
+            "free-good": RuntimeError("unavailable"),
+            "plus": RuntimeError("unavailable"),
+            "pro": RuntimeError("unavailable"),
+        })
+
+        self.catalog.list_models()
+
+        self.assertTrue(self.catalog.catalog_is_unknown())
 
     def test_removed_account_type_drops_its_stale_capabilities(self) -> None:
         self.catalog.list_models()
@@ -289,8 +380,9 @@ class ModelCatalogServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "bound account cannot serve text"):
                 self.accounts.get_bound_text_access_token(binding, model="plus-only")
             self.accounts.update_account("plus", {"managed_disabled": False, "status": "限流"})
+            self.assertEqual(self.accounts.get_bound_text_access_token(binding, model="auto"), "plus")
             with self.assertRaisesRegex(RuntimeError, "bound account cannot serve text"):
-                self.accounts.get_bound_text_access_token(binding, model="plus-only")
+                self.accounts.get_bound_text_access_token(binding, model="plus-only", for_message=True)
 
 
 if __name__ == "__main__":

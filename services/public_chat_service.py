@@ -41,6 +41,13 @@ def is_public_text_model(model: object) -> bool:
     model_id = str(model or "").strip()
     if not model_id or model_id == "auto" or is_supported_image_model(model_id):
         return False
+    known_types = getattr(model_catalog_service, "known_account_types_for_model", None)
+    if callable(known_types):
+        result = known_types(model_id)
+        if isinstance(result, frozenset) and result & PAID_ACCOUNT_TYPES:
+            return True
+    # Compatibility doubles used by local callers before observation history
+    # existed still model only the current executable route.
     route = model_catalog_service.route_for_model(model_id)
     return bool(route.account_types & PAID_ACCOUNT_TYPES)
 
@@ -70,17 +77,30 @@ def require_public_text_model(model: object) -> str:
             "image generation models are not supported by chat-requests",
         )
     if not is_public_text_model(model_id):
+        unknown = getattr(model_catalog_service, "catalog_is_unknown", None)
+        if callable(unknown) and unknown() is True:
+            raise PublicChatContractError(
+                "MODEL_DISCOVERY_UNAVAILABLE",
+                "model capability discovery is temporarily unavailable",
+            )
         raise PublicChatContractError(
             "CHAT_MODEL_UNSUPPORTED",
             "model is not available to the ordinary Chat service",
         )
+    # A known capability with no fresh executable account is accepted into the
+    # existing durable admission path.  It stays queued under its original
+    # request ID until a compatible account is observed again; do not relabel
+    # this temporary condition as permanent unsupported.
     return model_id
 
 
 def project_public_models(result: object) -> dict[str, Any]:
     if not isinstance(result, dict) or not isinstance(result.get("data"), list):
         raise PublicChatContractError("MODEL_DISCOVERY_UNAVAILABLE", "model discovery unavailable")
+    unknown = getattr(model_catalog_service, "catalog_is_unknown", None)
+    catalog_unknown = callable(unknown) and unknown() is True
     data: list[dict[str, Any]] = []
+    has_text_model = False
 
     def public_model_fields(raw: dict[str, Any]) -> dict[str, Any]:
         # Upstream catalog extensions are not a public-account contract.
@@ -116,6 +136,7 @@ def project_public_models(result: object) -> dict[str, Any]:
                 "accounts": safe_accounts(model_id, capabilities),
             })
         elif is_public_text_model(model_id):
+            has_text_model = True
             capabilities = ["text", "image_input"]
             item = {
                 **public_model_fields(raw),
@@ -127,7 +148,18 @@ def project_public_models(result: object) -> dict[str, Any]:
             if efforts:
                 item["reasoning_efforts"] = efforts
             data.append(item)
-    return {"object": "list", "data": data}
+    # A partial paid catalog still has useful, per-account historical and
+    # healthy-model rows.  Do not turn those models into an empty directory;
+    # only fail when no known text model can be truthfully advertised.
+    if catalog_unknown and not has_text_model:
+        raise PublicChatContractError(
+            "MODEL_DISCOVERY_UNAVAILABLE",
+            "model capability discovery is temporarily unavailable",
+        )
+    result: dict[str, Any] = {"object": "list", "data": data}
+    if catalog_unknown:
+        result["model_catalog"] = {"state": "partial"}
+    return result
 
 
 def project_public_chat_receipt(receipt: object) -> dict[str, Any]:

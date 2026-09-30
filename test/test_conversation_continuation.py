@@ -724,6 +724,73 @@ class TextResultRecoveryTests(unittest.TestCase):
             },
         }
 
+    def test_limited_bound_account_reads_and_archives_without_sending_a_new_turn(self):
+        from services.account_service import AccountService
+        from services.storage.json_storage import JSONStorageBackend
+
+        with tempfile.TemporaryDirectory() as directory:
+            accounts = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
+            accounts.add_account_items([{
+                "access_token": "limited-token", "source_type": "web", "type": "Plus", "status": "限流",
+            }])
+            accounts.refresh_access_token = lambda token, **_kwargs: token
+            with accounts._lock:
+                binding = accounts._conversation_binding_for_token_locked("limited-token")
+                identity = accounts._provider_account_identity_for_token_locked("limited-token")
+
+            calls = []
+
+            class FakeBackend:
+                def __init__(self, *, access_token):
+                    self.access_token = access_token
+                    calls.append(("open", access_token))
+
+                def _get_conversation(self, _conversation_id):
+                    calls.append(("read", self.access_token))
+                    return TextResultRecoveryTests().request_document()
+
+                def set_conversation_archived(self, conversation_id, parent_message_id, archived):
+                    calls.append(("archive", conversation_id, parent_message_id, archived))
+                    return {"archived": archived}
+
+                def close(self):
+                    calls.append(("close", self.access_token))
+
+            receipt = self.request_receipt(
+                provider_binding_id=binding,
+                provider_account_identity=identity,
+            )
+            service = ConversationBindingService()
+            with (
+                mock.patch("services.conversation_binding_service.account_service", accounts),
+                mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FakeBackend),
+            ):
+                result = service.read_text_request(receipt)
+                archived = service.set_archived({
+                    "provider_binding_id": binding,
+                    "provider_account_identity": identity,
+                    "client_conversation_id": "client-one",
+                    "conversation_id": "conversation-one",
+                    "parent_message_id": "prior-answer",
+                }, True)
+                with self.assertRaises(ConversationBindingError):
+                    service.complete_text({
+                        "provider_binding_id": binding,
+                        "provider_account_identity": identity,
+                        "client_conversation_id": "client-one",
+                        "model": "auto",
+                        "messages": [{"role": "user", "content": "must not send"}],
+                    })
+
+            self.assertEqual(result["status"], "succeeded")
+            self.assertTrue(archived["archived"])
+            self.assertIn(("read", "limited-token"), calls)
+            self.assertIn(("archive", "conversation-one", "prior-answer", True), calls)
+            # The explicit message path was rejected before it opened another
+            # upstream client or emitted a replacement request.
+            self.assertEqual(calls.count(("open", "limited-token")), 2)
+            self.assertEqual(accounts.get_account("limited-token")["status"], "限流")
+
     def test_request_recovery_reads_completed_original_after_later_user_turn(self):
         backend = mock.Mock()
         backend._get_conversation.return_value = self.request_document()

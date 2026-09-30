@@ -195,9 +195,10 @@ def create_router() -> APIRouter:
 
         require_chat_text_policy(identity, endpoint="/api/chat-requests", model=body.model)
         try:
-            require_public_text_model(body.model)
+            await run_in_threadpool(require_public_text_model, body.model)
         except PublicChatContractError as exc:
-            raise HTTPException(400, detail={"code": exc.code, "error": str(exc)}) from None
+            raise HTTPException(503 if exc.code == "MODEL_DISCOVERY_UNAVAILABLE" else 400,
+                                detail={"code": exc.code, "error": str(exc)}) from None
         except Exception:
             raise HTTPException(503, detail={"code": "MODEL_DISCOVERY_UNAVAILABLE"}) from None
 

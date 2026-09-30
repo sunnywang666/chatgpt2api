@@ -63,6 +63,8 @@ The client reads the env file only when `--env-file` is supplied. Global options
 
 Read the service model catalog before submitting. For image output select `gpt-image-2`; text-capable entries have `capabilities` including `text` and `image_input`. A row may also include `accounts` capability observations with opaque `account_ref` values plus state, reason, and capabilities. Those observations do not promise an immediately available slot or upstream quota; admission is decided when a request is submitted:
 
+A successful account observation remains capability evidence if a later refresh fails or the account becomes limited. Its account row then reports `observed_at` and `observation_state` (`observed`, `read_failed`, `stale`, or `unknown`) with the existing reason such as `read_failed`, `stale`, or `limited`; it is not selected for a new send until refreshed successfully. When other known text models remain, the directory returns them with `model_catalog: {"state":"partial"}`. A request for a model absent from an incomplete paid catalog returns retryable `503 MODEL_DISCOVERY_UNAVAILABLE`, rather than claiming permanent unsupported. Catalog reads use a bounded shared worker set and timeout budget, so a slow account is retained as non-routable evidence and retried without serially blocking the directory.
+
 ```sh
 python3 examples/image_client.py --env-file .image-client.env models
 ```
