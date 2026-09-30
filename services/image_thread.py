@@ -148,7 +148,7 @@ def accept_thread(task, tasks, payload, mode, *, output_reader=saved_image_bytes
         "image-thread-" + hashlib.sha256((owner + "\0" + thread_id).encode()).hexdigest())
 
 
-def predecessor_state(task, owned):
+def predecessor_state(task, owned, *, source_reader=None):
     """Read-only prerequisite result; used by preview, claim, and send guard."""
     thread = task.get("_image_thread")
     if not thread:
@@ -156,7 +156,9 @@ def predecessor_state(task, owned):
     if thread.get("protocol") != PROTOCOL or not _id(thread.get("id")):
         return {}, "IMAGE_THREAD_HISTORY_INVALID"
     source_id = thread.get("edit_source_task_id")
-    if source_id and source_fingerprint(owned.get(source_id)) != thread.get("edit_source_fingerprint"):
+    if source_id and source_fingerprint(
+            source_reader(source_id) if source_reader else owned.get(source_id)
+    ) != thread.get("edit_source_fingerprint"):
         return {}, "IMAGE_THREAD_SOURCE_CHANGED"
     previous_id = thread.get("previous_task_id")
     if previous_id is None:
@@ -200,13 +202,16 @@ def bind_waiting_threads(store, db, receipts):
             by_owner.setdefault(owner, {})[task_id] = task
     for kind, owner, task_id, task in receipts:
         if kind == "image" and task.get("_image_thread") and task.get("status") == "queued":
-            binding, reason = predecessor_state(task, by_owner[owner])
+            binding, reason = predecessor_state(task, by_owner[owner],
+                source_reader=lambda source_id: store.read_receipt(db, "image", owner, source_id))
             changes = {} if reason else {k: v for k, v in binding.items() if task.get(k) != v}
             if task.get("_image_thread_waiting_reason") != reason:
                 changes["_image_thread_waiting_reason"] = reason
             if changes:
+                original = store.read_receipt(db, kind, owner, task_id)
+                original.update(changes)
+                store.write_receipt(db, kind, owner, task_id, original)
                 task.update(changes)
-                store.write_receipt(db, kind, owner, task_id, task)
 
 
 def _image_result_ids(message):
