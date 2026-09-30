@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,12 +14,66 @@ from services.account_service import AccountService
 from services.auth_service import AuthService
 from services.config import config
 from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-from services.owned_accounts import observed_capacity
+from services.owned_accounts import image_capability_projection, observed_capacity
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
+    def test_image_capability_projection_retains_evidence_without_claiming_dispatch(self) -> None:
+        now = datetime.now(timezone.utc)
+        account = {
+            "limits_progress": [{"feature_name": "image_gen", "remaining": 2}],
+            "capacity_observed_at": now.isoformat(),
+            "status": "正常",
+        }
+        observed = image_capability_projection(account)
+        self.assertEqual(
+            (observed["capable"], observed["state"], observed["reason"], observed["observation_state"]),
+            (True, "unknown", "image_capability_observed", "observed"),
+        )
+        self.assertAlmostEqual(observed["observed_at"], now.timestamp(), places=3)
+
+        account["limits_progress"] = [{"feature_name": "image_gen", "remaining": 0}]
+        limited = image_capability_projection(account)
+        self.assertEqual((limited["capable"], limited["state"], limited["reason"]), (True, "unavailable", "limited"))
+
+        zero_read_failed = image_capability_projection({
+            "limits_progress": [{"feature_name": "image_gen", "remaining": 0}],
+            "capacity_observed_at": now.isoformat(),
+            "capacity_read_failed_at": now.isoformat(),
+            "status": "正常",
+        })
+        self.assertEqual(
+            (zero_read_failed["state"], zero_read_failed["reason"], zero_read_failed["observation_state"]),
+            ("unavailable", "read_failed", "read_failed"),
+        )
+
+        zero_stale = image_capability_projection({
+            "limits_progress": [{"feature_name": "image_gen", "remaining": 0}],
+            "capacity_observed_at": (now - timedelta(minutes=6)).isoformat(),
+            "status": "正常",
+        })
+        self.assertEqual(
+            (zero_stale["state"], zero_stale["reason"], zero_stale["observation_state"]),
+            ("unknown", "stale", "stale"),
+        )
+
+        account.update({"limits_progress": [{"feature_name": "image_gen", "remaining": 2}],
+                        "capacity_observed_at": (now - timedelta(minutes=6)).isoformat()})
+        stale = image_capability_projection(account)
+        self.assertEqual((stale["capable"], stale["state"], stale["reason"], stale["observation_state"]),
+                         (True, "unknown", "stale", "stale"))
+
+        account["capacity_read_failed_at"] = now.isoformat()
+        failed = image_capability_projection(account)
+        self.assertEqual((failed["capable"], failed["state"], failed["reason"], failed["observation_state"]),
+                         (True, "unavailable", "read_failed", "read_failed"))
+
+        unknown = image_capability_projection({"status": "正常", "limits_progress": []})
+        self.assertEqual((unknown["capable"], unknown["state"], unknown["reason"], unknown["observation_state"]),
+                         (False, "unknown", None, "unknown"))
+
     def test_image_quota_projection_distinguishes_unknown_zero_and_positive(self) -> None:
         unknown_limits = (
             [],

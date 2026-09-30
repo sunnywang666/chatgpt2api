@@ -23,7 +23,7 @@ from curl_cffi import requests
 from PIL import Image
 
 from services.account_service import account_service
-from services.account_request_pacing import pace_account_session
+from services.account_request_pacing import pace_account_session, retry_after_seconds
 from services.config import config
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
@@ -3153,7 +3153,19 @@ class OpenAIBackendAPI:
             headers=self._headers(route),
             timeout=30,
         )
-        ensure_ok(response, context)
+        try:
+            ensure_ok(response, context)
+        except UpstreamHTTPError as exc:
+            # ensure_ok intentionally has a small generic parser.  Catalog
+            # reads also accept the HTTP-date form of Retry-After, including
+            # anonymous reads that have no account pacing wrapper.
+            if exc.status_code == 429:
+                retry_after = retry_after_seconds(
+                    str((getattr(response, "headers", {}) or {}).get("Retry-After") or "")
+                )
+                if math.isfinite(retry_after) and retry_after > 0:
+                    exc.retry_after = retry_after
+            raise
         data = []
         seen = set()
         for item in response.json().get("models", []):

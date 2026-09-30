@@ -1135,6 +1135,11 @@ class ConversationBindingService:
         client_conversation_id = str(body.get("client_conversation_id") or "").strip()
         conversation_id = str(body.get("conversation_id") or "").strip()
         parent_message_id = str(body.get("parent_message_id") or "").strip()
+        requested_identity = body.get("_requested_account_identity")
+        if body.get("_requested_account_ref") and not requested_identity:
+            raise ConversationBindingError("account selection has no durable identity", code="CHAT_ACCOUNT_SELECTION_CONFLICT")
+        if requested_identity and account_identity and requested_identity != account_identity:
+            raise ConversationBindingError("account selection conflicts with binding", code="CHAT_ACCOUNT_SELECTION_CONFLICT")
         model = str(body.get("model") or "auto").strip() or "auto"
         image_model = str(body.get("image_model") or "gpt-image-2").strip() or "gpt-image-2"
         messages = body.get("messages")
@@ -1178,8 +1183,11 @@ class ConversationBindingService:
                 if body.get("_text_only_binding") is True:
                     binding_id, account_identity = account_service.create_text_conversation_binding(
                         text_model=model,
+                        **({"requested_account_identity": requested_identity} if requested_identity else {}),
                     )
                 else:
+                    if requested_identity:
+                        raise ConversationBindingError("account selection requires ordinary text binding", code="CHAT_ACCOUNT_SELECTION_CONFLICT")
                     binding_id, account_identity, image_token = account_service.create_conversation_binding(
                         image_model=image_model, text_model=model
                     )
@@ -1187,6 +1195,8 @@ class ConversationBindingService:
             except RuntimeError as exc:
                 raise ConversationBindingError(str(exc)) from exc
 
+        if requested_identity and account_identity != requested_identity:
+            raise ConversationBindingError("selected account changed", code="CHAT_ACCOUNT_SELECTION_CONFLICT")
         if on_cursor:
             on_cursor({"provider_binding_id": binding_id, "provider_account_identity": account_identity,
                        "client_conversation_id": client_conversation_id,
@@ -1196,6 +1206,7 @@ class ConversationBindingService:
                 binding_id,
                 model=model,
                 for_message=True,
+                **({"requested_account_identity": requested_identity} if requested_identity else {}),
             )
         except RuntimeError as exc:
             raise ConversationBindingError(str(exc)) from exc

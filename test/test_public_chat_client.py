@@ -51,7 +51,7 @@ def session_client(directory):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    def run(request_id, previous=None, session="work", command="chat-submit"):
+    def run(request_id, previous=None, session="work", command="chat-submit", account_ref=None):
         args = [sys.executable, str(CLIENT), "--server-root", f"http://127.0.0.1:{server.server_port}/ai",
                 "--timeout", "1", command, "--state", str(Path(directory) / f"{request_id}.json")]
         if command == "chat-submit":
@@ -59,6 +59,8 @@ def session_client(directory):
                      "--session-id", session]
             if previous:
                 args += ["--previous-request-id", previous]
+            if account_ref is not None:
+                args += ["--account-ref", account_ref]
         return subprocess.run(args, env={**os.environ, "CHATGPT2API_BEARER_TOKEN": "fixture-only"},
                               capture_output=True, text=True)
 
@@ -70,6 +72,36 @@ def session_client(directory):
 
 
 class ChatClientTest(unittest.TestCase):
+    def test_advanced_account_selection_is_immutable_and_restart_reads_original(self):
+        selected = "car_" + "a" * 43
+        other = "car_" + "b" * 43
+        with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, _, disconnect):
+            disconnect.add("selected")
+            first = run("selected", account_ref=selected)
+            self.assertEqual(first.returncode, 1)
+            self.assertEqual(calls[0][1]["account_ref"], selected)
+            self.assertEqual(calls[0][2]["account_ref"], selected)
+            self.assertEqual(calls[0][2]["phase"], "prepared")
+            for ref in (other, None):
+                changed = run("selected", account_ref=ref)
+                self.assertEqual(changed.returncode, 1)
+                self.assertIn("immutable input", changed.stderr)
+            repeat = run("selected", account_ref=selected)
+            self.assertEqual(repeat.returncode, 0, repeat.stderr)
+            status = run("selected", command="chat-status")
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertEqual([call[0] for call in calls], ["POST", "GET", "GET"])
+
+    def test_invalid_account_reference_never_writes_or_sends(self):
+        with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, _, _):
+            for ref in ("", "token", "car_short", "car_" + "a" * 42, "car_" + "a" * 44):
+                with self.subTest(ref=ref):
+                    result = run("invalid", account_ref=ref)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("opaque car_ reference", result.stderr)
+                    self.assertFalse((Path(directory) / "invalid.json").exists())
+            self.assertEqual(calls, [])
+
     def test_invalid_session_references_cannot_silently_become_a_new_conversation(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "invalid.json"

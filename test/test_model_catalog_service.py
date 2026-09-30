@@ -3,6 +3,8 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from threading import Event, Lock, Thread
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
@@ -10,7 +12,9 @@ from pathlib import Path
 
 from services.account_service import AccountService
 from services.model_service import ModelCatalogService
+from services.openai_backend_api import OpenAIBackendAPI
 from services.storage.json_storage import JSONStorageBackend
+from utils.helper import UpstreamHTTPError
 
 
 def model_list(*model_ids: str) -> dict:
@@ -49,6 +53,30 @@ class FakeBackend:
 
     def close(self) -> None:
         self._closed.append(self.access_token)
+
+
+class _RateLimitedModelResponse:
+    status_code = 429
+    text = "rate limited"
+
+    def __init__(self, retry_after: str) -> None:
+        self.headers = {"Retry-After": retry_after}
+
+    def json(self) -> dict:
+        return {"error": "rate limited"}
+
+
+def http_rate_limited_model_backend(retry_after: str) -> OpenAIBackendAPI:
+    backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+    backend.access_token = ""
+    backend.base_url = "https://chatgpt.com"
+    backend._bootstrap = lambda: None
+    backend._headers = lambda _route: {}
+    backend.session = type("Session", (), {
+        "get": lambda _self, *_args, **_kwargs: _RateLimitedModelResponse(retry_after),
+        "close": lambda _self: None,
+    })()
+    return backend
 
 
 class ModelCatalogServiceTests(unittest.TestCase):
@@ -248,6 +276,134 @@ class ModelCatalogServiceTests(unittest.TestCase):
             self.assertEqual(self.catalog.route_for_model("plus-only").account_types, frozenset({"Plus"}))
         finally:
             release.set()
+
+    def test_failed_account_retries_without_reprobing_fresh_peer(self) -> None:
+        self.outcomes["pro"] = RuntimeError("temporary upstream failure")
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count("plus"), 1)
+        self.assertEqual(self.calls.count("pro"), 1)
+
+        # The failed Pro row is due again, but the healthy Plus row retains
+        # its own execution TTL and must not be dragged into B's retry loop.
+        for seconds, expected_pro_calls in ((2, 2), (4, 3), (6, 4)):
+            self.now += seconds
+            self.catalog.list_models()
+            self.catalog.route_for_model("plus-only")
+            self.assertEqual(self.calls.count("plus"), 1)
+            self.assertEqual(self.calls.count("pro"), expected_pro_calls)
+        self.assertEqual(self.catalog.route_for_model("plus-only").account_types, frozenset({"Plus"}))
+
+        self.outcomes["pro"] = model_list("pro-only")
+        self.now += 2
+        self.catalog.list_models()
+        self.assertEqual(self.catalog.route_for_model("pro-only").account_types, frozenset({"Pro"}))
+
+    def test_anonymous_failure_does_not_shorten_healthy_account_ttl(self) -> None:
+        self.outcomes[""] = RuntimeError("anonymous unavailable")
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count("plus"), 1)
+        self.assertEqual(self.calls.count(""), 1)
+
+        for seconds, expected_anonymous_calls in ((2, 2), (4, 3), (6, 4)):
+            self.now += seconds
+            self.catalog.list_models()
+            self.catalog.route_for_model("plus-only")
+            self.assertEqual(self.calls.count("plus"), 1)
+            self.assertEqual(self.calls.count(""), expected_anonymous_calls)
+        self.assertEqual(self.catalog.route_for_model("plus-only").account_types, frozenset({"Plus"}))
+
+    def test_anonymous_429_keeps_retry_after_without_shortening_account_ttl(self) -> None:
+        self.outcomes[""] = UpstreamHTTPError("anon models", 429, {}, retry_after=47)
+
+        self.catalog.list_models()
+        self.assertEqual(self.catalog._anonymous_observation["retry_after"], self.now + 47)
+        self.assertEqual(self.calls.count("plus"), 1)
+
+        self.now += 46
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count(""), 1)
+        self.assertEqual(self.calls.count("plus"), 1)
+
+        self.now += 1
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count(""), 2)
+        self.assertEqual(self.calls.count("plus"), 1)
+
+    def test_actual_anonymous_model_http_date_429_reaches_catalog_retry_window(self) -> None:
+        retry_after = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=50), usegmt=True)
+        original_factory = self.catalog._backend_factory
+
+        def factory(access_token=""):
+            if not access_token:
+                return http_rate_limited_model_backend(retry_after)
+            return original_factory(access_token=access_token)
+
+        self.catalog._backend_factory = factory
+        self.catalog.list_models()
+
+        self.assertGreaterEqual(self.catalog._anonymous_observation["retry_after"] - self.now, 45)
+        self.now += 2
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count("plus"), 1)
+
+    def test_actual_model_read_preserves_numeric_and_http_date_retry_after(self) -> None:
+        with self.assertRaises(UpstreamHTTPError) as numeric:
+            http_rate_limited_model_backend("47").list_models()
+        self.assertEqual(numeric.exception.retry_after, 47)
+
+        retry_after = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=50), usegmt=True)
+        with self.assertRaises(UpstreamHTTPError) as http_date:
+            http_rate_limited_model_backend(retry_after).list_models()
+        self.assertGreaterEqual(http_date.exception.retry_after, 45)
+
+    def test_refresh_completion_expires_peer_observation_before_routing(self) -> None:
+        self.catalog.list_models()
+        plus_identity = next(
+            self.accounts._stable_account_identity(account)
+            for account in self.accounts.list_accounts()
+            if account["access_token"] == "plus"
+        )
+        pro_identity = next(
+            self.accounts._stable_account_identity(account)
+            for account in self.accounts.list_accounts()
+            if account["access_token"] == "pro"
+        )
+        self.catalog._model_observations[plus_identity]["refresh_after"] = self.now + 1
+        self.catalog._model_observations[pro_identity]["refresh_after"] = self.now
+        self.catalog._expires_at = self.now
+
+        def delayed_pro_result() -> dict:
+            self.now += 2
+            return model_list("pro-only")
+
+        self.outcomes["pro"] = delayed_pro_result
+        self.catalog.list_models()
+
+        self.assertNotIn(plus_identity, self.catalog._models_by_account)
+        self.assertEqual(self.calls.count("plus"), 1)
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count("plus"), 2)
+
+    def test_successful_account_rechecks_on_expiry_state_and_credential_change(self) -> None:
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count("plus"), 1)
+
+        self.now += self.catalog._cache_ttl_seconds + 1
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count("plus"), 2)
+
+        self.accounts.update_account("plus", {"managed_disabled": True})
+        self.catalog.list_models()
+        self.assertEqual(self.catalog.route_for_model("plus-only").account_types, frozenset())
+        self.accounts.update_account("plus", {"managed_disabled": False, "status": "正常"})
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count("plus"), 3)
+
+        self.outcomes["plus-rotated"] = model_list("plus-only")
+        self.accounts._apply_refreshed_tokens("plus", {"access_token": "plus-rotated"}, "test")
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count("plus-rotated"), 1)
+        self.assertEqual(self.catalog.route_for_model("plus-only").account_types, frozenset({"Plus"}))
 
     def test_concurrent_readers_share_one_catalog_refresh(self) -> None:
         with ThreadPoolExecutor(max_workers=8) as executor:

@@ -34,6 +34,7 @@ class PublicChatRequest(BaseModel):
         pattern=r"^[A-Za-z0-9_.:-]+$",
     )
     model: str = Field(min_length=1, max_length=200)
+    account_ref: str | None = Field(default=None, strict=True, pattern=r"^car_[A-Za-z0-9_-]{43}$")
     messages: list[dict[str, object]] = Field(min_length=1, max_length=100)
     reasoning_effort: Literal["high"] | None = None
     # An application-owned work session, NOT an upstream conversation cursor.
@@ -58,6 +59,13 @@ class PublicChatRequest(BaseModel):
         if self.client_conversation_id and self.messages[-1].get("role") != "user":
             raise ValueError("a sequential turn must end with its new user input")
         return self
+
+    @field_validator("account_ref", mode="before")
+    @classmethod
+    def reject_null_account_ref(cls, value):
+        if value is None:
+            raise ValueError("account_ref must be omitted or an advertised account reference")
+        return value
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
@@ -113,6 +121,8 @@ def _payload(owner: str, body: PublicChatRequest, messages: list[dict]) -> dict:
         "_text_only_binding": True,
         "_public_route": "chat",
     }
+    if body.account_ref is not None:
+        payload["_requested_account_ref"] = body.account_ref
     if body.client_conversation_id is not None:
         digest = hashlib.sha256(f"{owner}\0session\0{body.client_conversation_id}".encode()).hexdigest()
         payload["client_conversation_id"] = f"public-session-{digest}"

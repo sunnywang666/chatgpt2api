@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -9,6 +10,7 @@ from typing import Any
 
 from services.account_service import AccountService, account_service
 from services.openai_backend_api import OpenAIBackendAPI
+from utils.helper import UpstreamHTTPError
 from utils.log import logger
 
 
@@ -35,6 +37,7 @@ class ModelCatalogService:
     # instead of serial account-timeouts.
     MAX_DISCOVERY_WORKERS = 8
     DISCOVERY_BUDGET_SECONDS = 10.0
+    DISCOVERY_RETRY_SECONDS = 1.0
 
     def __init__(
         self,
@@ -52,8 +55,9 @@ class ModelCatalogService:
         self._observed_clock = observed_clock
         self._lock = RLock()
         self._expires_at = 0.0
-        self._account_signature: tuple[tuple[str, str, str], ...] = ()
+        self._account_signature: tuple[tuple[str, str, str, str], ...] = ()
         self._anonymous_models: dict[str, dict[str, Any]] = {}
+        self._anonymous_observation: dict[str, Any] = {}
         # A successful catalog read remains capability evidence after a later
         # read failure or rate limit.  It is deliberately separate from the
         # executable map below, which is rebuilt only from this refresh.
@@ -78,20 +82,20 @@ class ModelCatalogService:
                 models[model_id] = dict(item)
         return models
 
-    def _active_accounts(self) -> dict[str, tuple[str, str, str]]:
-        """Return exactly one stable physical account and its dispatch state.
+    @staticmethod
+    def _credential_fingerprint(access_token: str) -> str:
+        # Private cache coherence only; never project a credential or its raw
+        # identifier into a model row.
+        import hashlib
+        return hashlib.sha256(access_token.encode()).hexdigest()
 
-        Model access belongs to a concrete account, not its subscription type.
-        Duplicate stable identities are excluded because choosing either record
-        would lose the original-account authority used by durable receipts.
-        """
-        candidates: dict[str, list[tuple[str, str, str]]] = {}
+    def _active_accounts(self) -> dict[str, tuple[str, str, str, str]]:
+        """Return exactly one stable physical account and its dispatch state."""
+        candidates: dict[str, list[tuple[str, str, str, str]]] = {}
         for account in self._accounts.list_accounts():
             if not isinstance(account, dict):
                 continue
             if str(account.get("source_type") or "").strip().lower() not in {"web", "oauth_login", "password"}:
-                # Codex authorization is a separate bearer and must never be
-                # sent to Chat's model-catalog endpoint.
                 continue
             access_token = str(account.get("access_token") or "").strip()
             account_type = self._accounts._normalize_account_type(account.get("type"))
@@ -104,8 +108,10 @@ class ModelCatalogService:
                     else "limited" if status == "限流"
                     else "active"
                 )
-                candidates.setdefault(identity, []).append((access_token, account_type, state))
-        active: dict[str, tuple[str, str, str]] = {}
+                candidates.setdefault(identity, []).append((
+                    access_token, account_type, state, self._credential_fingerprint(access_token),
+                ))
+        active: dict[str, tuple[str, str, str, str]] = {}
         for identity, rows in candidates.items():
             if len(rows) == 1:
                 active[identity] = rows[0]
@@ -114,10 +120,10 @@ class ModelCatalogService:
         return active
 
     @staticmethod
-    def _signature(accounts: dict[str, tuple[str, str, str]]) -> tuple[tuple[str, str, str], ...]:
+    def _signature(accounts: dict[str, tuple[str, str, str, str]]) -> tuple[tuple[str, str, str, str], ...]:
         return tuple(sorted(
-            (identity, account_type, state)
-            for identity, (_token, account_type, state) in accounts.items()
+            (identity, account_type, state, fingerprint)
+            for identity, (_token, account_type, state, fingerprint) in accounts.items()
         ))
 
     def _fetch_models(self, access_token: str = "") -> dict[str, dict[str, Any]]:
@@ -148,161 +154,262 @@ class ModelCatalogService:
             return "read_failed"
         return "stale"
 
-    def _refresh(self, accounts: dict[str, tuple[str, str, str]], signature: tuple[tuple[str, str, str], ...]) -> None:
-        models_by_account: dict[str, dict[str, dict[str, Any]]] = {}
-        now = self._observed_clock()
+    @staticmethod
+    def _at(value: object) -> float:
+        return float(value) if type(value) in {int, float} else 0.0
+
+    def _failure_retry_at(self, exc: BaseException | None, now: float) -> float:
+        """Keep an anonymous upstream 429's requested retry window intact."""
+        retry_after = getattr(exc, "retry_after", None)
+        if (
+            isinstance(exc, UpstreamHTTPError)
+            and exc.status_code == 429
+            and type(retry_after) in {int, float}
+            and math.isfinite(float(retry_after))
+            and retry_after >= 0
+        ):
+            return now + max(self.DISCOVERY_RETRY_SECONDS, float(retry_after))
+        return now + self.DISCOVERY_RETRY_SECONDS
+
+    def _reusable_observation(
+        self,
+        observation: dict[str, Any] | None,
+        account_type: str,
+        state: str,
+        credential_fingerprint: str,
+        now: float,
+    ) -> bool:
+        return bool(
+            state == "active"
+            and isinstance(observation, dict)
+            and isinstance(observation.get("models"), dict)
+            and observation.get("state") == "unknown"
+            and observation.get("observation_state") == "observed"
+            and observation.get("account_type") == account_type
+            and observation.get("credential_fingerprint") == credential_fingerprint
+            and observation.get("observed_account_state") == "active"
+            and observation.get("last_seen_account_state") == "active"
+            and self._at(observation.get("refresh_after")) > now
+        )
+
+    def _account_due(
+        self,
+        identity: str,
+        account_type: str,
+        state: str,
+        credential_fingerprint: str,
+        observation: dict[str, Any] | None,
+        now: float,
+    ) -> bool:
+        if state != "active":
+            return False
+        future = self._inflight_accounts.get(identity)
+        if future is not None and not future.done():
+            return True
+        if self._reusable_observation(observation, account_type, state, credential_fingerprint, now):
+            return False
+        return self._at((observation or {}).get("retry_after")) <= now
+
+    def _account_next_refresh(
+        self,
+        identity: str,
+        account_type: str,
+        state: str,
+        credential_fingerprint: str,
+        observation: dict[str, Any] | None,
+        now: float,
+    ) -> float | None:
+        if state != "active":
+            return None
+        future = self._inflight_accounts.get(identity)
+        if future is not None and not future.done():
+            return now + self.DISCOVERY_RETRY_SECONDS
+        if self._reusable_observation(observation, account_type, state, credential_fingerprint, now):
+            return self._at(observation.get("refresh_after"))
+        retry_after = self._at((observation or {}).get("retry_after"))
+        return retry_after if retry_after > now else now
+
+    def _anonymous_due(self, now: float) -> bool:
+        observation = self._anonymous_observation
+        if self._anonymous_inflight is not None and not self._anonymous_inflight.done():
+            return True
+        return self._at(observation.get("refresh_after")) <= now and self._at(observation.get("retry_after")) <= now
+
+    def _anonymous_next_refresh(self, now: float) -> float:
+        if self._anonymous_inflight is not None and not self._anonymous_inflight.done():
+            return now + self.DISCOVERY_RETRY_SECONDS
+        observation = self._anonymous_observation
+        refresh_after = self._at(observation.get("refresh_after"))
+        retry_after = self._at(observation.get("retry_after"))
+        if refresh_after > now:
+            return refresh_after
+        if retry_after > now:
+            return retry_after
+        return now
+
+    def _set_failed_observation(
+        self,
+        observation: dict[str, Any] | None,
+        *,
+        account_type: str,
+        credential_fingerprint: str,
+        now: float,
+        observed_now: float,
+    ) -> dict[str, Any]:
+        if observation is None:
+            observation = {"models": {}, "credential_fingerprint": credential_fingerprint,
+                           "observed_account_state": "active"}
+        observation_state = self._observation_state_after_failure(observation, observed_now)
+        observation.update(
+            account_type=account_type,
+            state="unavailable",
+            reason="read_failed" if observation_state == "read_failed" else "stale",
+            observation_state=observation_state,
+            last_seen_account_state="active",
+            last_read_failed_at=observed_now,
+            retry_after=now + self.DISCOVERY_RETRY_SECONDS,
+        )
+        return observation
+
+    def _refresh(self, accounts: dict[str, tuple[str, str, str, str]], signature: tuple[tuple[str, str, str, str], ...]) -> None:
+        now, observed_now = self._clock(), self._observed_clock()
         observations = {
-            identity: {
-                **observation,
-                "models": {key: dict(value) for key, value in observation.get("models", {}).items()},
-            }
+            identity: {**observation, "models": {key: dict(value) for key, value in observation.get("models", {}).items()}}
             for identity, observation in self._model_observations.items()
             if identity in accounts
         }
-        anonymous_models = self._anonymous_models
-        # A timed-out or failed observation is never executable.  It also
-        # shortens the cache so a completed slow read is followed by a fresh
-        # observation rather than freezing failure evidence for the full TTL.
-        retry_soon = False
-        # One executor is retained for this catalog instance.  Slow requests
-        # therefore occupy at most this bounded worker set across refreshes;
-        # late futures are discarded rather than republished into a newer view.
-        previous_anonymous = self._anonymous_inflight
-        if previous_anonymous is not None and previous_anonymous.done():
-            self._anonymous_inflight = None
-        anonymous_future = self._anonymous_inflight
-        anonymous_is_current = False
-        if anonymous_future is None:
-            anonymous_future = self._executor.submit(self._fetch_models)
-            self._anonymous_inflight = anonymous_future
-            anonymous_is_current = True
-        # Removed or newly non-dispatchable accounts must not retain an
-        # in-flight slot indefinitely.  A running call cannot be forcefully
-        # stopped, but the shared bounded executor prevents it from spawning
-        # another worker and any queued call is cancelled.
+        anonymous_models = dict(self._anonymous_models)
+
         for identity, future in list(self._inflight_accounts.items()):
             if identity not in accounts or accounts[identity][2] != "active":
                 future.cancel()
                 self._inflight_accounts.pop(identity, None)
+        if self._anonymous_inflight is not None and self._anonymous_inflight.done():
+            self._anonymous_inflight = None
 
-        account_futures = {}
-        current_futures = []
-        for identity, (access_token, _account_type, state) in accounts.items():
-            if state != "active":
+        anonymous_future = None
+        anonymous_is_new = False
+        if self._anonymous_due(now):
+            if self._anonymous_inflight is None:
+                self._anonymous_inflight = self._executor.submit(self._fetch_models)
+                anonymous_is_new = True
+            anonymous_future = self._anonymous_inflight
+
+        account_futures: dict[str, tuple[object, bool]] = {}
+        new_futures = [anonymous_future] if anonymous_is_new and anonymous_future is not None else []
+        for identity, (access_token, account_type, state, fingerprint) in accounts.items():
+            observation = observations.get(identity)
+            if not self._account_due(identity, account_type, state, fingerprint, observation, now):
                 continue
-            previous = self._inflight_accounts.get(identity)
-            if previous is not None and previous.done():
-                self._inflight_accounts.pop(identity, None)
-                previous = None
-            if previous is None:
+            future = self._inflight_accounts.get(identity)
+            is_new = False
+            if future is None or future.done():
                 future = self._executor.submit(self._fetch_account_models, access_token)
                 self._inflight_accounts[identity] = future
-                account_futures[identity] = (future, True)
-                current_futures.append(future)
-            else:
-                account_futures[identity] = (previous, False)
-        done, _pending = wait(
-            [anonymous_future, *current_futures],
-            timeout=self.DISCOVERY_BUDGET_SECONDS,
-        )
-        if anonymous_is_current and anonymous_future in done:
-            try:
-                anonymous_models = anonymous_future.result()
-            except Exception as exc:  # noqa: BLE001 - retain cached models on upstream failure
-                logger.warning({
-                    "event": "model_catalog_anonymous_failed",
-                    "error_type": type(exc).__name__,
-                })
-                retry_soon = True
-        else:
-            logger.warning({"event": "model_catalog_anonymous_timeout"})
-            retry_soon = True
+                is_new = True
+                new_futures.append(future)
+            account_futures[identity] = (future, is_new)
 
-        for identity, (_access_token, account_type, state) in accounts.items():
+        done, _pending = wait(new_futures, timeout=self.DISCOVERY_BUDGET_SECONDS) if new_futures else (set(), set())
+        # Waiting is bounded, but it can still take long enough for a peer's
+        # cache record to expire.  Snapshot eligibility using the completion
+        # time rather than the time the refresh began.
+        now, observed_now = self._clock(), self._observed_clock()
+        if anonymous_future is not None:
+            if anonymous_is_new and anonymous_future in done:
+                try:
+                    anonymous_models = anonymous_future.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning({"event": "model_catalog_anonymous_failed", "error_type": type(exc).__name__})
+                    self._anonymous_observation["retry_after"] = self._failure_retry_at(exc, now)
+                else:
+                    self._anonymous_observation = {
+                        "refresh_after": now + self._cache_ttl_seconds,
+                        "observed_at": observed_now,
+                    }
+            elif anonymous_is_new:
+                logger.warning({"event": "model_catalog_anonymous_timeout"})
+                self._anonymous_observation["retry_after"] = now + self.DISCOVERY_RETRY_SECONDS
+
+        models_by_account: dict[str, dict[str, dict[str, Any]]] = {}
+        for identity, (_access_token, account_type, state, fingerprint) in accounts.items():
+            observation = observations.get(identity)
             if state != "active":
-                previous = observations.get(identity)
-                if previous is not None:
-                    observation_state = previous.get("observation_state", "unknown")
+                if observation is not None:
+                    observation_state = observation.get("observation_state", "unknown")
                     if state == "limited":
-                        observation_state = ("observed" if self._observation_state_after_failure(previous, now) == "read_failed"
-                                             else "stale")
-                    previous.update(
+                        observation_state = "observed" if self._observation_state_after_failure(observation, observed_now) == "read_failed" else "stale"
+                    observation.update(
                         account_type=account_type,
                         state=state,
                         reason=self._observation_reason(state),
                         observation_state=observation_state,
-                        last_attempt_at=now,
+                        last_seen_account_state=state,
+                        last_attempt_at=observed_now,
                     )
                 continue
-            future, is_current = account_futures[identity]
-            if not is_current or future not in done:
-                previous = observations.get(identity)
-                if previous is not None:
-                    observation_state = self._observation_state_after_failure(previous, now)
-                    previous.update(
-                        account_type=account_type,
-                        state="unavailable",
-                        reason="read_failed" if observation_state == "read_failed" else "stale",
-                        observation_state=observation_state,
-                        last_read_failed_at=now,
+            future_info = account_futures.get(identity)
+            if future_info is not None:
+                future, is_new = future_info
+                if is_new and future in done:
+                    try:
+                        models = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        observations[identity] = observation = self._set_failed_observation(
+                            observation, account_type=account_type, credential_fingerprint=fingerprint,
+                            now=now, observed_now=observed_now,
+                        )
+                        logger.warning({"event": "model_catalog_account_failed", "error_type": type(exc).__name__})
+                    else:
+                        observations[identity] = observation = {
+                            "models": models,
+                            "account_type": account_type,
+                            "state": "unknown",
+                            "reason": self._observation_reason("observed"),
+                            "observation_state": "observed",
+                            "observed_at": observed_now,
+                            "last_attempt_at": observed_now,
+                            "refresh_after": now + self._cache_ttl_seconds,
+                            "credential_fingerprint": fingerprint,
+                            "observed_account_state": "active",
+                            "last_seen_account_state": "active",
+                        }
+                elif is_new:
+                    observations[identity] = observation = self._set_failed_observation(
+                        observation, account_type=account_type, credential_fingerprint=fingerprint,
+                        now=now, observed_now=observed_now,
                     )
-                logger.warning({"event": "model_catalog_account_timeout"})
-                retry_soon = True
-                continue
-            try:
-                models = future.result()
-            except Exception as exc:  # noqa: BLE001 - failed observations must not route work
-                previous = observations.get(identity)
-                if previous is not None:
-                    observation_state = self._observation_state_after_failure(previous, now)
-                    previous.update(
-                        account_type=account_type,
-                        state="unavailable",
-                        reason="read_failed" if observation_state == "read_failed" else "stale",
-                        observation_state=observation_state,
-                        last_read_failed_at=now,
+                    logger.warning({"event": "model_catalog_account_timeout"})
+                elif observation is not None:
+                    # A retained late future is intentionally not published
+                    # into this snapshot; retry this account alone when due.
+                    observations[identity] = observation = self._set_failed_observation(
+                        observation, account_type=account_type, credential_fingerprint=fingerprint,
+                        now=now, observed_now=observed_now,
                     )
-                logger.warning({"event": "model_catalog_account_failed", "error_type": type(exc).__name__})
-                retry_soon = True
-                continue
-            models_by_account[identity] = models
-            previous = observations.get(identity, {})
-            observations[identity] = {
-                "models": models,
-                "account_type": account_type,
-                "state": "unknown",
-                "reason": self._observation_reason("observed"),
-                "observation_state": "observed",
-                "observed_at": now,
-                "last_attempt_at": now,
-            }
+            if self._reusable_observation(observations.get(identity), account_type, state, fingerprint, now):
+                models_by_account[identity] = observations[identity]["models"]
+
         self._anonymous_models = anonymous_models
         self._model_observations = observations
-        # Historical capability proves that a known model may be queued, but
-        # it cannot prove that an arbitrary newly requested model is absent.
-        # Any paid account without a fresh observation therefore makes the
-        # directory incomplete and unknown-model admission retryable.
-        self._catalog_unknown = bool(
-            any(account_type in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
-                and state in {"active", "limited"} and identity not in models_by_account
-                for identity, (_token, account_type, state) in accounts.items())
-        )
         self._models_by_account = models_by_account
         self._account_types = {
             identity: account_type
-            for identity, (_token, account_type, state) in accounts.items()
+            for identity, (_token, account_type, state, _fingerprint) in accounts.items()
             if state == "active" and identity in models_by_account
         }
+        self._catalog_unknown = bool(
+            any(account_type in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
+                and state in {"active", "limited"} and identity not in models_by_account
+                for identity, (_token, account_type, state, _fingerprint) in accounts.items())
+        )
+        next_refreshes = [self._anonymous_next_refresh(now)]
+        next_refreshes.extend(
+            next_at for identity, (_token, account_type, state, fingerprint) in accounts.items()
+            if (next_at := self._account_next_refresh(identity, account_type, state, fingerprint, observations.get(identity), now)) is not None
+        )
+        self._expires_at = min(next_refreshes, default=now + self._cache_ttl_seconds)
         self._account_signature = signature
-        # `wait()` does not include a retained prior future.  Treat both it
-        # and any transient failure as a short retry, otherwise a late result
-        # discarded for snapshot safety could leave recovery stalled for five
-        # minutes.
-        retry_soon = retry_soon or any(
-            not is_current or future not in done
-            for future, is_current in account_futures.values()
-        ) or (not anonymous_is_current or anonymous_future not in done)
-        self._expires_at = self._clock() + (1.0 if retry_soon else self._cache_ttl_seconds)
 
     def _ensure_catalog(self) -> None:
         accounts = self._active_accounts()
@@ -341,6 +448,9 @@ class ModelCatalogService:
         for observation in observations.values():
             for model_id, payload in observation["models"].items():
                 model_payloads.setdefault(model_id, payload)
+        # gpt-image-2 is a provider alias.  Its evidence comes from the
+        # persisted Chat image_gen counter, never from an upstream model row.
+        model_payloads.pop("gpt-image-2", None)
 
         from services.owned_accounts import public_pool_account
         from services.public_chat_service import public_reasoning_efforts
@@ -385,7 +495,53 @@ class ModelCatalogService:
                 "accounts": projected_accounts,
                 "reasoning_efforts": public_reasoning_efforts(model_id),
             })
+        image_accounts = self.image_capability_rows(management=True)
+        if image_accounts:
+            pending = sum(row["state"] == "unknown" for row in image_accounts)
+            unavailable = sum(row["state"] == "unavailable" for row in image_accounts)
+            result.append({
+                "id": "gpt-image-2",
+                "label": "gpt-image-2",
+                "route": "chat",
+                "capabilities": ["image_generation", "image_edit"],
+                "state": "unknown" if pending else "unavailable",
+                # Capability observation is deliberately separate from a
+                # dispatchable slot, so no aggregate free-capacity claim.
+                "supported_accounts": len(image_accounts),
+                "available_accounts": None,
+                "pending_accounts": pending,
+                "unavailable_accounts": unavailable,
+                "accounts": image_accounts,
+                "reasoning_efforts": [],
+            })
         return result
+
+    def image_capability_rows(self, *, management: bool = False) -> list[dict[str, Any]]:
+        """Expose stored image_gen capability evidence for the provider alias."""
+        from services.owned_accounts import image_capability_projection, public_pool_account
+
+        rows: list[dict[str, Any]] = []
+        for account in self._accounts.list_accounts():
+            if str(account.get("source_type") or "").strip().lower() not in {"web", "oauth_login", "password"}:
+                continue
+            evidence = image_capability_projection(account)
+            # With no valid upstream image_gen observation there is no model
+            # capability to advertise. A failed later read retains its last
+            # valid evidence and is included as read_failed/stale instead.
+            if not evidence["capable"]:
+                continue
+            row = {
+                "account_ref": self._accounts.pool_account_ref(account),
+                "state": evidence["state"],
+                "reason": evidence["reason"],
+                "capabilities": ["image_generation", "image_edit"],
+                "observed_at": evidence["observed_at"],
+                "observation_state": evidence["observation_state"],
+            }
+            if management:
+                row["label"] = public_pool_account(account)["label"]
+            rows.append(row)
+        return sorted(rows, key=lambda item: item["account_ref"])
 
     def public_accounts_for_model(self, model: str, capabilities: list[str]) -> list[dict[str, Any]]:
         """Return capability-only account rows for the ordinary model directory.
@@ -394,6 +550,8 @@ class ModelCatalogService:
         compatible company accounts.  Labels, identities, ownership and all
         credentials remain management-only.
         """
+        if str(model or "").strip() == "gpt-image-2":
+            return self.image_capability_rows()
         self._ensure_catalog()
         with self._lock:
             observed = {

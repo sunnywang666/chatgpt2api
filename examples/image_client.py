@@ -593,6 +593,11 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
         parts.append({"type": "image_url", "image_url": {"url":
             f"data:{item['content_type']};base64," + base64.b64encode(item["data"]).decode("ascii")}})
     body = {"model": args.model, "messages": [{"role": "user", "content": parts}]}
+    account_ref = getattr(args, "account_ref", None)
+    if account_ref is not None:
+        if not re.fullmatch(r"car_[A-Za-z0-9_-]{43}", account_ref):
+            raise ClientError("--account-ref must be an opaque car_ reference from the model directory")
+        body["account_ref"] = account_ref
     conversation = None
     if args.previous_request_id is not None and args.session_id is None:
         raise ClientError("--previous-request-id requires --session-id")
@@ -624,6 +629,8 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
                 raise ClientError("previous Chat request is not succeeded; query its original ID before submitting this turn")
         state = {"schema": "chatgpt2api.chat-request.v1", "request_id": request_id,
                  "input_fingerprint": fingerprint, "phase": "prepared", "created_at": _utc_now()}
+        if account_ref is not None:
+            state["account_ref"] = account_ref
         if conversation is not None:
             state["conversation"] = conversation
         _atomic_write_state(state_path, state)
@@ -685,6 +692,7 @@ def _parser() -> argparse.ArgumentParser:
     chat.add_argument("--request-id")
     chat.add_argument("--session-id", help="application work session; requires Provider sequential-v1")
     chat.add_argument("--previous-request-id", help="previous succeeded request in the same session; checked before a new submit")
+    chat.add_argument("--account-ref", help="advanced: require this opaque company account; omission keeps automatic allocation")
     chat.add_argument("--model", required=True)
     chat.add_argument("--prompt", required=True)
     chat.add_argument("--image", action="append", default=[])

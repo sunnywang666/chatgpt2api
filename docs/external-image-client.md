@@ -63,7 +63,9 @@ The client reads the env file only when `--env-file` is supplied. Global options
 
 Read the service model catalog before submitting. For image output select `gpt-image-2`; text-capable entries have `capabilities` including `text` and `image_input`. A row may also include `accounts` capability observations with opaque `account_ref` values plus state, reason, and capabilities. Those observations do not promise an immediately available slot or upstream quota; admission is decided when a request is submitted:
 
-A successful account observation remains capability evidence if a later refresh fails or the account becomes limited. Its account row then reports `observed_at` and `observation_state` (`observed`, `read_failed`, `stale`, or `unknown`) with the existing reason such as `read_failed`, `stale`, or `limited`; it is not selected for a new send until refreshed successfully. When other known text models remain, the directory returns them with `model_catalog: {"state":"partial"}`. A request for a model absent from an incomplete paid catalog returns retryable `503 MODEL_DISCOVERY_UNAVAILABLE`, rather than claiming permanent unsupported. Catalog reads use a bounded shared worker set and timeout budget, so a slow account is retained as non-routable evidence and retried without serially blocking the directory.
+A successful account observation remains capability evidence if a later refresh fails or the account becomes limited. Its account row then reports `observed_at` and `observation_state` (`observed`, `read_failed`, `stale`, or `unknown`) with the existing reason such as `read_failed`, `stale`, or `limited`; it is not selected for a new send until refreshed successfully. When other known text models remain, the directory returns them with `model_catalog: {"state":"partial"}`. A request for a model absent from an incomplete paid catalog returns retryable `503 MODEL_DISCOVERY_UNAVAILABLE`, rather than claiming permanent unsupported. Catalog reads use a bounded shared worker set and timeout budget, so a slow account is retained as non-routable evidence and retried without serially blocking the directory. Successful accounts retain their own 300-second cache while failed accounts and anonymous discovery retry independently; credential or account-state changes invalidate executable reuse. Anonymous model discovery preserves numeric and HTTP-date Retry-After on 429, and authenticated reads retain the existing account pacing cooldown.
+
+`gpt-image-2` is the Provider image-generation alias, not proof that upstream `/models` returned that exact name. Its account rows come from saved `limits_progress.image_gen` observations. Zero remaining quota, a later read failure, or staleness retains capability history but does not claim current dispatch capacity; absent or invalid observations are not inferred from subscription type or account presence. Image generation admission and send-time quota checks remain separate from this directory projection.
 
 ```sh
 python3 examples/image_client.py --env-file .image-client.env models
@@ -217,3 +219,25 @@ python3 examples/image_client.py --env-file .image-client.env chat-status --stat
 服务端在模型发送前持久保存本轮最后一个 user 的实际父消息和整次上传的根父消息，二者在多段上下文时不同。新连续会话必须取得本请求唯一终态分支，不能用流断开或聊天的“最新回答”推进下一轮。显式承接旧已成功的原请求时，先重新读取证明原结果及游标；缺证明则保留等待（旧非准入执行模式明确失败），不重新建聊、不改旧收据。原 UNKNOWN 不自动迁移。新客户端需与本协议的 Provider 成对部署；无此协议的服务会拒绝字段，不能静默退回每轮新聊。
 
 Happy 主循环依据原生 DSH 消息 `source.replayState.response.requestId` 承接，并保留收到的消息指纹和系统/工具版本指纹。截图内多个连续 user 气泡可能是一次请求中的上下文数组，不应据此判断有几次上游发送。图片工具仍有独立持久图片任务；主推理的会话连续不等于把独立图片任务合并成一条图片请求。本增量不改变额度、并发设置、员工权限或原生 Codex 路线。
+
+
+### Advanced ordinary Chat account selection
+
+Automatic account routing remains the default. For an advanced ordinary Chat text or image-input request, an application may copy an opaque `account_ref` from a text model's public `accounts` directory and include it in `POST /api/chat-requests`:
+
+```json
+{
+  "client_request_id": "selected-chat-1",
+  "model": "gpt-5-6-thinking",
+  "account_ref": "car_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "messages": [{"role": "user", "content": "Explain the supplied product."}]
+}
+```
+
+The example reference is a placeholder; use an actual advertised `car_` reference (43 URL-safe characters after the prefix). Never send an upstream token, email, or raw account identity. The companion client supports `chat-submit --account-ref <reference>` and saves this choice with its original request envelope. The default copyable instructions continue to use automatic routing.
+
+A selection means **only that account**. The durable admission path queues a known account under the same request ID while it is unavailable, rate limited, or not currently observed to support the model; it never substitutes another account. It becomes executable only when that exact account and model are eligible. Deployments using the legacy executor without admission safely fail an unavailable selection instead of falling back. Invalid references fail schema validation (422); nonexistent or ambiguous references are rejected with `CHAT_ACCOUNT_NOT_FOUND` or `CHAT_ACCOUNT_AMBIGUOUS` (409).
+
+Changing or removing an explicit selection on the same request ID is `CHAT_REQUEST_CONFLICT`. Retrying an identical ID reads the original receipt before account/model rediscovery, including after a restart or directory outage. Do not create a replacement ID to bypass an unknown original outcome. A sequential continuation inherits its predecessor's bound account when the selector is omitted; an explicit different account returns `CHAT_ACCOUNT_SELECTION_CONFLICT`. Original owner, session, recovery and archive rules continue to apply.
+
+This selector is implemented for ordinary `/api/chat-requests` text and image-input only. It does not add account selection to image generation, Codex, or other protocol routes. Public receipt projections do not expose internal account identities, bindings, or credentials.

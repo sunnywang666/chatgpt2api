@@ -1047,6 +1047,9 @@ class TextTaskService:
             anchors = ("provider_binding_id", "provider_account_identity", "conversation_id")
             if not all(isinstance(previous.get(key), str) and previous[key] for key in anchors):
                 reject("CHAT_CONTINUATION_UNAVAILABLE")
+            if (receipt.get("_requested_account_identity")
+                    and receipt["_requested_account_identity"] != previous["provider_account_identity"]):
+                reject("CHAT_ACCOUNT_SELECTION_CONFLICT")
             receipt.update({key: previous[key] for key in anchors})
             parent = evidence["final_message_id"] if evidence else previous.get("parent_message_id")
             if not isinstance(parent, str) or not parent:
@@ -1120,6 +1123,15 @@ class TextTaskService:
                 db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
                 schedule = True
             elif not previous:
+                if body.get("_requested_account_ref") is not None:
+                    from services.account_service import account_service
+                    accounts = self.admission.accounts if self.admission is not None else account_service
+                    receipt["_requested_account_ref"] = body["_requested_account_ref"]
+                    receipt["_requested_account_identity"] = accounts.resolve_public_chat_account(body["_requested_account_ref"])
+                    if (body.get("provider_account_identity")
+                            and body["provider_account_identity"] != receipt["_requested_account_identity"]):
+                        raise ConversationBindingError("account selection conflicts with binding",
+                                                       code="CHAT_ACCOUNT_SELECTION_CONFLICT")
                 self._continue_public_session(db, owner, body, receipt)
                 receipt.update({"_input_ref": self.store.save_input(body),
                                 "_sequence": self.store.next_sequence(db),
@@ -1260,6 +1272,8 @@ class TextTaskService:
                 return
             receipt = {**receipt, "status": "running", "started_at": self._now()}
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
+            if receipt.get("_requested_account_identity"):
+                body = {**body, "_requested_account_identity": receipt["_requested_account_identity"]}
             if receipt.get("_public_session_ref"):
                 # Keep the immutable submitted envelope unchanged in storage.
                 # Only the execution copy receives server-owned account/cursors.

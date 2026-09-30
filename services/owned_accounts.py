@@ -180,6 +180,44 @@ def observed_capacity(account: dict) -> dict:
     }
 
 
+def image_capability_projection(account: dict) -> dict:
+    """Project persisted upstream image_gen evidence without claiming a slot."""
+    capacity = observed_capacity(account)
+    observed_at = _parse_observed_at(capacity.get("observed_at"))
+    remaining = capacity.get("remaining")
+    observed = remaining is not None
+    observation_state = str(capacity.get("state") or "unknown")
+    status = str(account.get("status") or "")
+
+    if account.get("managed_disabled") or status == "禁用":
+        state, reason = "unavailable", "disabled"
+    elif status == "异常":
+        state, reason = "unavailable", "auth_required"
+    elif status == "限流":
+        state, reason = "unavailable", "limited"
+    # The retained counter is historical evidence after a metadata failure or
+    # expiry. Do not present a previous zero as current rate limiting.
+    elif observation_state == "read_failed":
+        state, reason = "unavailable", "read_failed"
+    elif observation_state == "stale":
+        state, reason = "unknown", "stale"
+    elif observed and remaining == 0:
+        state, reason = "unavailable", "limited"
+    elif observation_state == "observed":
+        # A positive image_gen counter is capability evidence, not an offer
+        # for immediate dispatch; pool admission still owns that decision.
+        state, reason = "unknown", "image_capability_observed"
+    else:
+        state, reason = "unknown", None
+    return {
+        "capable": observed,
+        "state": state,
+        "reason": reason,
+        "observation_state": observation_state,
+        "observed_at": observed_at.timestamp() if observed_at is not None else None,
+    }
+
+
 def public_owned_account(account: dict) -> dict:
     from services.codex_service import codex_service
     capacity = observed_capacity(account)

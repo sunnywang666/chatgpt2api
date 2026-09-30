@@ -480,7 +480,7 @@ class PoolAdmission:
                 int(r.get("_sequence") or 0), route, str(r.get("model") or "auto"),
                 "image" if kind == "image" else r.get("_operation", "text"),
                 bool(r.get("_input_ref")), state=state,
-                bound_account=str(r.get("provider_account_identity") or "") or None,
+                bound_account=str(r.get("_requested_account_identity") or r.get("provider_account_identity") or "") or None,
                 order_group=(None if (owner, request_id) in released_order_heads
                              else str(r.get("client_conversation_id") or "") or None),
                 ready_at=float(r.get("_ready_at") or 0),
@@ -550,7 +550,7 @@ class PoolAdmission:
                                         (Need(codex_key), Need("codex_server")), enabled=bool(eligible),
                                         preference=0 if decision.get("quota_bucket") == "gpt-reserve" else 1))
                     continue
-                enabled = not disabled and chat_saved and paid
+                enabled = not disabled and chat_saved and paid and identity_counts.get(identity) == 1
                 if request.operation == "image":
                     from utils.helper import is_codex_image_model, split_image_model
                     required_plan, _ = split_image_model(model)
@@ -840,6 +840,11 @@ class PoolAdmission:
             r = self.store.read_receipt(db, ref.kind, ref.owner, ref.request_id)
             if r.get("status") != "queued" or not r.get("_input_ref"):
                 return None
+            requested = r.get("_requested_account_identity")
+            if (r.get("_requested_account_ref") and not requested
+                    or requested and (pick.account != requested
+                                      or r.get("provider_account_identity") not in (None, "", requested))):
+                raise AdmissionLost("requested Chat account changed before claim")
             # This only records a local account binding. It never probes or
             # refreshes an upstream credential in the claiming transaction.
             binding = r.get("provider_binding_id") or (self.accounts.admission_binding(pick.account) if r.get("_route", "chat") == "chat" else None)
@@ -885,12 +890,26 @@ class PoolAdmission:
         self.wake()
 
     def before_send(self, context):
+        # Resolve capability outside account/store locks, then recheck the exact
+        # selected row under the send guard. Discovery failure must fail closed.
+        with self.store.connect() as db:
+            observed = self.store.read_receipt(db, context.kind, context.owner, context.request_id) or {}
+        selected_route = None
+        if observed.get("_requested_account_identity"):
+            try:
+                selected_route = self._types(observed.get("model", ""))
+            except Exception:
+                raise AdmissionLost("selected Chat model discovery unavailable before send") from None
         with self._settings_guard(), self.store.transaction() as db, self._account_guard():
             now = float(self.clock())
             r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
             if (r is None or r.get("_claim_id") != context.claim or r.get("status") != "running"
                     or float(r.get("_claim_until") or 0) <= now):
                 raise AdmissionLost("original task claim expired")
+            requested = r.get("_requested_account_identity")
+            if (r.get("_requested_account_ref") and not requested
+                    or requested and r.get("provider_account_identity") != requested):
+                raise AdmissionLost("requested Chat account changed before send")
             marker = r.get("_temporary_chat_second_slot")
             if marker is not None:
                 settings = self._settings()
@@ -912,7 +931,14 @@ class PoolAdmission:
             sequence = int(r.get("_send_sequence") or 0)
             if r.get("_submission_started") and sequence <= int(r.get("_last_sent_sequence") or 0):
                 raise AdmissionLost("original model request was already submitted")
-            selected = next((a for a in self._rows() if a.get("provider_account_identity") == r.get("provider_account_identity")), None)
+            selected_rows = [a for a in self._rows() if a.get("provider_account_identity") == r.get("provider_account_identity")]
+            selected = selected_rows[0] if len(selected_rows) == 1 else None
+            if requested and selected is not None:
+                if (selected_route is None
+                        or self.accounts._normalize_account_type(selected.get("type")) not in getattr(selected_route, "account_types", selected_route)
+                        or not self._model_account_matches(selected, selected_route)
+                        or self.accounts.get_bound_account_identity(r.get("provider_binding_id")) != requested):
+                    raise AdmissionLost("selected Chat model or binding changed before send")
             if selected is None or selected.get("managed_disabled") or selected.get("status") in {"禁用", "异常", "限流"}:
                 raise AdmissionLost("original account is unavailable before send")
             if r.get("_route") == "codex":

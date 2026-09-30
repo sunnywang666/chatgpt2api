@@ -100,7 +100,7 @@ def project_public_models(result: object) -> dict[str, Any]:
     unknown = getattr(model_catalog_service, "catalog_is_unknown", None)
     catalog_unknown = callable(unknown) and unknown() is True
     data: list[dict[str, Any]] = []
-    has_text_model = False
+    has_known_model = False
 
     def public_model_fields(raw: dict[str, Any]) -> dict[str, Any]:
         # Upstream catalog extensions are not a public-account contract.
@@ -129,14 +129,16 @@ def project_public_models(result: object) -> dict[str, Any]:
         model_id = raw_model_id.strip()
         if model_id == "gpt-image-2":
             capabilities = ["image_generation", "image_edit"]
+            accounts = safe_accounts(model_id, capabilities)
+            has_known_model = has_known_model or bool(accounts)
             data.append({
                 **public_model_fields(raw),
                 "capabilities": capabilities,
                 "input_limits": dict(IMAGE_OUTPUT_LIMITS),
-                "accounts": safe_accounts(model_id, capabilities),
+                "accounts": accounts,
             })
         elif is_public_text_model(model_id):
-            has_text_model = True
+            has_known_model = True
             capabilities = ["text", "image_input"]
             item = {
                 **public_model_fields(raw),
@@ -150,8 +152,8 @@ def project_public_models(result: object) -> dict[str, Any]:
             data.append(item)
     # A partial paid catalog still has useful, per-account historical and
     # healthy-model rows.  Do not turn those models into an empty directory;
-    # only fail when no known text model can be truthfully advertised.
-    if catalog_unknown and not has_text_model:
+    # only fail when no observed image or known text model can be advertised.
+    if catalog_unknown and not has_known_model:
         raise PublicChatContractError(
             "MODEL_DISCOVERY_UNAVAILABLE",
             "model capability discovery is temporarily unavailable",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import secrets
 import time
 import uuid
@@ -86,6 +87,22 @@ class AccountService:
         # derive the same opaque identity from the existing, rotation-stable
         # pool ref. Reading resources must not mutate the account authority.
         return str(account.get("provider_account_identity") or "").strip() or "account_" + cls.pool_account_ref(account)[4:]
+
+    def resolve_public_chat_account(self, account_ref: str) -> str:
+        """Resolve only the canonical pool ref, without probing or selecting a fallback."""
+        from services.conversation_binding_service import ConversationBindingError
+        if not isinstance(account_ref, str) or not re.fullmatch(r"car_[A-Za-z0-9_-]{43}", account_ref):
+            raise ConversationBindingError("invalid account reference", code="CHAT_ACCOUNT_REF_INVALID")
+        with self._lock:
+            matches = [account for account in self._accounts.values()
+                       if self.pool_account_ref(account) == account_ref]
+            if not matches:
+                raise ConversationBindingError("account reference not found", code="CHAT_ACCOUNT_NOT_FOUND")
+            identity = self._stable_account_identity(matches[0])
+            if len(matches) != 1 or sum(self._stable_account_identity(a) == identity
+                                        for a in self._accounts.values()) != 1:
+                raise ConversationBindingError("account reference is ambiguous", code="CHAT_ACCOUNT_AMBIGUOUS")
+            return identity
 
     def admission_binding(self, account_identity: str) -> str:
         """Bind the selected original account without selecting/probing again."""
@@ -1621,7 +1638,7 @@ class AccountService:
             account_identity = self._provider_account_identity_for_token_locked(access_token)
         return binding_id, account_identity, access_token
 
-    def create_text_conversation_binding(self, *, text_model: str) -> tuple[str, str]:
+    def create_text_conversation_binding(self, *, text_model: str, requested_account_identity: str | None = None) -> tuple[str, str]:
         """Bind an ordinary text conversation to the existing paid account pool.
 
         Text-only callers must not consume or depend on image quota. Model
@@ -1648,15 +1665,19 @@ class AccountService:
             candidates = [
                 str(account.get("access_token") or "")
                 for account in self._accounts.values()
-                if account.get("status") not in {"禁用", "异常", "限流"}
+                if (not requested_account_identity or self._stable_account_identity(account) == requested_account_identity)
+                and account.get("status") not in {"禁用", "异常", "限流"}
                 and not account.get("managed_disabled")
                 and self._normalize_account_type(account.get("type")) in allowed_types
                 and (getattr(route, "account_identities", None) is None
                      or self._stable_account_identity(account) in route.account_identities)
                 and str(account.get("access_token") or "")
+                and (not requested_account_identity or not any(
+                    isinstance(limit, dict) and limit.get("feature_name") == requested_model and limit.get("remaining") == 0
+                    for limit in account.get("limits_progress") or []))
             ]
-            if not candidates:
-                raise RuntimeError("conversation binding unavailable: no paid account supports text model")
+            if not candidates or (requested_account_identity and len(candidates) != 1):
+                raise RuntimeError("conversation binding unavailable: no unique paid account supports text model")
             access_token = candidates[self._index % len(candidates)]
             self._index += 1
 
@@ -1667,7 +1688,8 @@ class AccountService:
             resolved = self._resolve_access_token_locked(refreshed)
             account = self._accounts.get(resolved) or {}
             if (
-                account.get("status") in {"禁用", "异常", "限流"}
+                (requested_account_identity and self._stable_account_identity(account) != requested_account_identity)
+                or account.get("status") in {"禁用", "异常", "限流"}
                 or account.get("managed_disabled")
                 or self._normalize_account_type(account.get("type")) not in allowed_types
                 or (getattr(route, "account_identities", None) is not None
@@ -1708,7 +1730,7 @@ class AccountService:
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
 
-    def get_bound_text_access_token(self, binding_id: str, *, model: str, for_message: bool = False) -> str:
+    def get_bound_text_access_token(self, binding_id: str, *, model: str, for_message: bool = False, requested_account_identity: str | None = None) -> str:
         # Model lookup reads this account pool and may refresh its catalog in
         # other threads. Never hold the pool lock across that lookup.
         route = None
@@ -1725,6 +1747,12 @@ class AccountService:
                 raise RuntimeError("conversation binding unavailable: bound account cannot serve text")
             if for_message and account.get("status") == "限流":
                 raise RuntimeError("conversation binding unavailable: bound account cannot serve text")
+            if requested_account_identity and (self._stable_account_identity(account) != requested_account_identity
+                    or sum(self._stable_account_identity(a) == requested_account_identity for a in self._accounts.values()) != 1):
+                raise RuntimeError("conversation binding unavailable: selected account changed")
+            if requested_account_identity and any(isinstance(limit, dict) and limit.get("feature_name") == model
+                                   and limit.get("remaining") == 0 for limit in account.get("limits_progress") or []):
+                raise RuntimeError("conversation binding unavailable: bound model quota exhausted")
             if route is not None:
                 if (
                     self._normalize_account_type(account.get("type")) not in route.account_types
@@ -1735,6 +1763,19 @@ class AccountService:
         refreshed = self.refresh_access_token(access_token, event="conversation_binding_text")
         if not refreshed:
             raise RuntimeError("conversation binding unavailable: bound account token refresh failed")
+        if requested_account_identity:
+            with self._lock:
+                selected = self._accounts.get(self._resolve_access_token_locked(refreshed)) or {}
+                if (self._stable_account_identity(selected) != requested_account_identity
+                        or sum(self._stable_account_identity(a) == requested_account_identity for a in self._accounts.values()) != 1
+                        or selected.get("managed_disabled") or selected.get("status") in {"禁用", "异常", "限流"}
+                        or self._normalize_account_type(selected.get("type")) not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
+                        or (route is not None and (self._normalize_account_type(selected.get("type")) not in route.account_types
+                            or (getattr(route, "account_identities", None) is not None
+                                and requested_account_identity not in route.account_identities)))
+                        or any(isinstance(limit, dict) and limit.get("feature_name") == model and limit.get("remaining") == 0
+                               for limit in selected.get("limits_progress") or [])):
+                    raise RuntimeError("conversation binding unavailable: selected account changed during refresh")
         return refreshed
 
     def get_text_access_token(

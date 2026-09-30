@@ -1,5 +1,6 @@
 import threading
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -46,6 +47,23 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_metadata_429_keeps_account_cooldown_and_retry_after(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+
+            class RateLimitedResponse(Response):
+                status_code = 429
+                headers = {"Retry-After": "123"}
+
+            response = clock.request(
+                lambda *_args, **_kwargs: RateLimitedResponse(),
+                "GET",
+                "https://chatgpt.com/backend-api/models",
+            )
+
+            self.assertEqual(response.status_code, 429)
+            self.assertGreaterEqual(clock.cooldown_until - time.monotonic(), 122)
+
     def test_stream_lock_is_released_at_headers_not_stream_terminal(self):
         with tempfile.TemporaryDirectory() as tmp:
             clock = AccountRequestClock("account", Path(tmp) / "clock.json")
