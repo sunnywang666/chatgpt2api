@@ -144,6 +144,7 @@ class AccountRequestClock:
     def request(self, send, method, url, **kwargs):
         deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
         before_send = kwargs.pop("_account_request_before_send", None)
+        preflight = kwargs.pop("_account_request_preflight", None)
         if not isinstance(deadline_at, (int, float)) or isinstance(deadline_at, bool):
             deadline_at = None
 
@@ -214,6 +215,35 @@ class AccountRequestClock:
                     if remaining is not None and delay >= remaining:
                         raise AccountRequestDeadlineExceeded("account request deadline elapsed during cooldown wait")
                     time.sleep(delay)
+                if preflight is not None:
+                    # A superseded original may arrive during the cooldown.
+                    # This GET shares the held pacing lock and raw transport;
+                    # recursively calling the paced session would deadlock.
+                    def read_original(read_method, read_url, **read_kwargs):
+                        if str(read_method).upper() != "GET":
+                            raise ValueError("submission preflight must be read-only")
+                        remaining = remaining_budget()
+                        if remaining is not None:
+                            if remaining <= 0:
+                                raise AccountRequestDeadlineExceeded("preflight deadline elapsed")
+                            read_kwargs["timeout"] = min(float(read_kwargs.get("timeout", 60)), remaining)
+                        self.next_request = time.monotonic() + min(60.0, config.account_request_interval_secs * 2 ** min(self.rate_failures, 4))
+                        self._save()
+                        response = send(read_method, read_url, **read_kwargs)
+                        if response.status_code == 429:
+                            request_id = (response.headers.get("x-request-id") or response.headers.get("openai-request-id"))
+                            safe_id = request_id if isinstance(request_id, str) and len(request_id) <= 160 and request_id.isascii() and not any(c.isspace() for c in request_id) else None
+                            self.limited(retry_after_seconds(response.headers.get("Retry-After")),
+                                         evidence={"phase": "conversation_preflight", "model": model, "origin": "http_429", "upstream_request_id": safe_id})
+                        return response
+                    preflight(read_original)
+                    # The metadata GET does not bypass the account request pace.
+                    delay = max(self.next_request, self.cooldown_until, self.next_turn if is_turn else 0.0) - time.monotonic()
+                    if delay > 0:
+                        remaining = remaining_budget()
+                        if remaining is not None and delay >= remaining:
+                            raise AccountRequestDeadlineExceeded("deadline elapsed after preflight")
+                        time.sleep(delay)
                 now = time.monotonic()
                 cap_timeout_before_send()
                 factor = 2 ** min(self.rate_failures, 4)

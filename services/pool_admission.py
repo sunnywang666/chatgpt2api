@@ -410,6 +410,22 @@ class PoolAdmission:
                             "provider_binding_id", "provider_account_identity", "conversation_id"))):
                     continue
                 released_order_heads.add(key)
+        successors = {}
+        for (owner, request_id), r in text_receipts.items():
+            if r.get("_supersedes_request_id"):
+                successors.setdefault((owner, r["_supersedes_request_id"]), []).append((request_id, r))
+        if successors:
+            from services.text_task_service import TextTaskService
+            for key, candidates in successors.items():
+                if len(candidates) != 1:
+                    continue
+                request_id, successor = candidates[0]
+                previous = text_receipts.get(key)
+                # Failed known-unsent successors keep the old order block. A
+                # submitted/unknown successor remains the new blocking head.
+                if (successor.get("status") in {"queued", "running", "unknown", "succeeded"}
+                        or unknown_text_result(successor)) and TextTaskService._supersede_order_link(previous, successor):
+                    released_order_heads.add(key)
         by_identity = {str(a.get("provider_account_identity") or ""): a for a in rows}
         identity_counts = {}
         for row in rows:
@@ -928,6 +944,9 @@ class PoolAdmission:
                 binding, blocked = predecessor_state(r, owned)
                 if blocked or any(r.get(k) != v for k, v in binding.items()):
                     raise AdmissionLost("original image thread predecessor changed before send")
+            if context.kind == "text" and r.get("_supersedes_request_id"):
+                from services.text_task_service import TextTaskService
+                TextTaskService._validate_supersede(self.store, db, context.owner, r, now)
             sequence = int(r.get("_send_sequence") or 0)
             if r.get("_submission_started") and sequence <= int(r.get("_last_sent_sequence") or 0):
                 raise AdmissionLost("original model request was already submitted")
@@ -959,6 +978,8 @@ class PoolAdmission:
                 if any(isinstance(limit, dict) and limit.get("feature_name") == r.get("model") and limit.get("remaining") == 0
                        for limit in selected.get("limits_progress") or []):
                     raise AdmissionLost("original model quota is unavailable before send")
+            if r.get("_supersedes_request_id"):
+                r.update(upstream_outcome="unknown", error_code=None, waiting=None)
             timeline = list(r.get("_execution_timeline") or [])
             timeline.append({"stage": "send_guard_passed", "at": now})
             r.update(_submission_started=True, _last_sent_sequence=sequence, _turn_reserved=True,

@@ -37,6 +37,17 @@ def original(runtime):
 def upstream(runtime, monkeypatch, *, done=False, transport_error=False, text="original prefix", text_chunks=None):
     sent = []
     from services.protocol import conversation, openai_v1_chat_complete, openai_v1_response, anthropic_v1_messages
+    from services.model_service import ModelRoute
+    identity = runtime.accounts._stable_account_identity(runtime.accounts.list_accounts()[0])
+    # Anthropic's production adapter resolves its selected account through the
+    # model catalog at send time. This synthetic upstream must supply the same
+    # per-identity capability evidence as the admission fixture.
+    monkeypatch.setattr(
+        "services.model_service.model_catalog_service",
+        Mock(route_for_model=lambda _model: ModelRoute(
+            frozenset({"Plus"}), False, frozenset({identity}),
+        )),
+    )
     class Backend(OpenAIBackendAPI):
         def __init__(self, access_token="fixture-only-token"):
             self.access_token = access_token

@@ -1129,6 +1129,30 @@ class ConversationBindingService:
             **({"_search_result": search_result} if search_result is not None else {}),
         }
 
+    @staticmethod
+    def _check_superseded_original(document, conversation_id, parent_message_id, original_user):
+        def reject(code):
+            raise ConversationBindingError("original request cannot be superseded before send", code=code)
+        if (not isinstance(document, dict) or document.get("conversation_id") != conversation_id
+                or not isinstance(document.get("mapping"), dict) or not document["mapping"]
+                or type(document.get("is_archived")) is not bool):
+            reject("CHAT_SUPERSEDE_READ_UNAVAILABLE")
+        mapping = document["mapping"]
+        if any(not isinstance(node, dict) for node in mapping.values()):
+            reject("CHAT_SUPERSEDE_READ_UNAVAILABLE")
+        if original_user in mapping or any(isinstance(node.get("message"), dict)
+                and node["message"].get("id") == original_user for node in mapping.values()):
+            reject("CHAT_SUPERSEDE_ORIGINAL_FOUND")
+        parent = mapping.get(parent_message_id) or {}
+        message = parent.get("message") or {}
+        if (not isinstance(message, dict) or not isinstance(message.get("author"), dict)):
+            reject("CHAT_SUPERSEDE_READ_UNAVAILABLE")
+        if (document.get("current_node") != parent_message_id or not isinstance(message, dict)
+                or message.get("id") != parent_message_id or (message.get("author") or {}).get("role") != "assistant"
+                or message.get("status") != "finished_successfully" or message.get("end_turn") is not True
+                or parent.get("children") or any(node.get("parent") == parent_message_id for node in mapping.values())):
+            reject("CHAT_SUPERSEDE_CURSOR_CHANGED")
+
     def complete_text(self, body: dict[str, Any], *, on_cursor=None) -> dict[str, Any]:
         binding_id = str(body.get("provider_binding_id") or "").strip()
         account_identity = str(body.get("provider_account_identity") or "").strip()
@@ -1215,16 +1239,42 @@ class ConversationBindingService:
             backend = OpenAIBackendAPI(access_token=access_token)
             backend.retain_bound_conversation = True
             backend.text_request_message_id = str(body.get("_request_message_id") or "")
-            if body.get("_public_session_ref"):
+            if body.get("_public_session_ref") or body.get("_supersedes_request_message_id"):
                 backend.text_cursor_callback = on_cursor
+            if body.get("_supersedes_request_message_id"):
+                def check_original(send):
+                    try:
+                        fresh = backend._get_conversation(conversation_id, _send=send)
+                    except Exception as exc:
+                        raise ConversationBindingError("original conversation read is temporarily unavailable",
+                                                       code="CHAT_SUPERSEDE_READ_UNAVAILABLE") from exc
+                    self._check_superseded_original(fresh, conversation_id, parent_message_id,
+                                                    body["_supersedes_request_message_id"])
+                    if fresh["is_archived"]:
+                        raise ConversationBindingError("original conversation restore is unconfirmed",
+                                                       code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
+                backend.text_pre_send_check = check_original
             failure_phase = "stream_open"
             try:
-                if body.get("_public_session_ref") and conversation_id:
+                # All bound text consumers can resume an archived Chat. The
+                # public-session flag describes a client protocol, not whether
+                # the original upstream conversation needs restoring.
+                if conversation_id:
                     try:
                         document = backend._get_conversation(conversation_id)
                     except Exception as exc:
                         raise ConversationBindingError("original conversation read is temporarily unavailable",
-                                                       code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED") from exc
+                                                       code=("CHAT_SUPERSEDE_READ_UNAVAILABLE" if body.get("_supersedes_request_message_id")
+                                                             else "CHAT_ARCHIVE_RESTORE_UNCONFIRMED")) from exc
+                    if body.get("_supersedes_request_message_id"):
+                        self._check_superseded_original(document, conversation_id, parent_message_id,
+                                                        body["_supersedes_request_message_id"])
+                    if not isinstance(document, dict) or type(document.get("is_archived")) is not bool:
+                        raise ConversationBindingError("original conversation visibility is unconfirmed",
+                                                       code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED")
+                    if str(document.get("conversation_id") or conversation_id) != conversation_id:
+                        raise ConversationBindingError("original conversation identity changed",
+                                                       code="CONVERSATION_BINDING_MISMATCH")
                     if document.get("current_node") != parent_message_id:
                         raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH")
                     if document.get("is_archived") is True:
@@ -1272,7 +1322,7 @@ class ConversationBindingService:
                         provider_account_identity=account_identity,
                         conversation_id=returned_conversation_id,
                     )
-                if body.get("_public_session_ref"):
+                if body.get("_public_session_ref") or body.get("_supersedes_request_message_id"):
                     # Neither a socket EOF nor the conversation's latest answer
                     # proves our turn finished. Use this request's unique branch.
                     failure_phase = "cursor_read"
@@ -1333,6 +1383,12 @@ class ConversationBindingService:
                     exc.original_exception_category = "provider_error"
                 raise
             except Exception as exc:
+                if body.get("_supersedes_request_message_id"):
+                    from services.request_context import current_request
+                    context = current_request.get()
+                    if context is not None and not context.receipt().get("_submission_started"):
+                        raise ConversationBindingError("successor pre-send check did not complete",
+                                                       code="CHAT_SUPERSEDE_READ_UNAVAILABLE") from exc
                 original_category = _text_failure_category(exc)
                 original_status = exc.status_code if isinstance(exc, UpstreamHTTPError) else None
                 recovered_parent = ""

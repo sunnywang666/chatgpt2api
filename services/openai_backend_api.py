@@ -1223,13 +1223,19 @@ class OpenAIBackendAPI:
         self,
         conversation_id: str,
         timeout_secs: float = 60.0,
+        *, _send=None,
     ) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=self._image_active_timeout(timeout_secs))
-        ensure_ok(response, path)
-        return response.json()
+        request = self.session.get if _send is None else lambda url, **kw: _send("GET", url, **kw)
+        response = request(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
+                           timeout=self._image_active_timeout(timeout_secs))
+        try:
+            ensure_ok(response, path)
+            return response.json()
+        finally:
+            if _send is not None:
+                response.close()
 
     def get_conversation_parent_message_id(self, conversation_id: str) -> str:
         document = self._get_conversation(conversation_id)
@@ -2942,6 +2948,8 @@ class OpenAIBackendAPI:
             conversation_id=conversation_id,
             parent_message_id=parent_message_id,
         )
+        # The paced transport checks after any cooldown, before marking a send.
+        pre_send_check = getattr(self, "text_pre_send_check", None)
         request_deadline = time.monotonic() + TEXT_STREAM_HARD_CAP_SECS
         response = self.session.post(
             self.base_url + path,
@@ -2950,6 +2958,7 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
             _account_request_deadline_monotonic=request_deadline,
+            **({"_account_request_preflight": pre_send_check} if pre_send_check is not None else {}),
         )
         ensure_ok(response, path)
         try:

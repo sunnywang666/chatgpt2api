@@ -98,6 +98,46 @@
 
 部署时须由协调者按 Workbench 当前 runbook 和不可变 digest，先完成候选制品预检与可恢复备份，停止旧 Provider 写入者后再导入/启动，不能让仍写 `image_tasks.json` 的旧版本和新版本混跑。现有备份的 `image_tasks` 选项包含一致的 SQLite 副本和所有引用的私密输入、已提交输出前缀；它们应与原账号、节拍、图片存储整体保护。回退保留切换后新增/修改的 SQLite 记录与输入，不得直接用旧 JSON 覆盖回退或删 UNKNOWN 后重画；旧版本不理解新等待记录，故必须先停止新写入者，逐项核对待处理记录和恢复路径。此次没有执行迁移、部署或生产参数调整。结束本地等待的新字段保存在原SQLite收据内；回退到不识别该字段的旧版会重新保守计入这些未确认轮次。回退预检必须核对这一容量变化，不能删除原收据或把上游结果改为未发送。
 
+内部 bound-text 与公共顺序会话共用原 Chat 的发送前检查：以原账号读取原 Chat，核对会话身份、当前父消息和明确的归档状态；已归档时复用既有取消归档及游标读回，确认后才发送模型请求。读取/恢复不确定时沿原任务保存 `CHAT_ARCHIVE_RESTORE_UNCONFIRMED`、`upstream_outcome=not_sent`；接入准入调度的任务继续等待，不新建 Chat 或切换账号。该检查只作用于获准执行的新轮次，不重排旧 `UNKNOWN` 或 `failed/RESULT_UNRECOVERABLE`，也不把前一轮父消息结束当作本轮结果。此修复不授权部署时批量取消归档或重发历史请求。
+
+### 内部缺失原消息的显式后继
+
+此能力只属于现有 admin/Content `POST /api/conversation-bindings/text`；普通 Key、公共 Chat 和 Happy 合同不变。默认 UNKNOWN 仍只查原结果。只有业务明确决定承担潜在重复风险后，才可提交以下七个字段（示例是虚构身份）：
+
+```json
+{
+  "supersedes_request_id": "old-request",
+  "client_request_id": "one-persisted-successor",
+  "provider_binding_id": "original-binding",
+  "provider_account_identity": "original-account",
+  "client_conversation_id": "original-client-session",
+  "conversation_id": "original-chat",
+  "parent_message_id": "original-submission-parent"
+}
+```
+
+此分支禁止携带 `messages`、`model`、`image_model`、`thinking_effort` 或其他字段；包括传入默认值也会拒绝。服务在同 owner 下读取原 `_input_ref` 并核对原请求 hash、绑定和提交父消息，复用完整原输入，仅替换新请求 ID、附旧引用，并在受理前持久保存新请求的完整输入。不会向客户端返回提示词或私密文件引用。普通请求省略新字段时，原默认值及 request hash 语义不变。
+
+前提是原请求为内部 Chat 文本、`failed/RESULT_UNRECOVERABLE`、`upstream_outcome=unknown`、本地执行等待已结束、原消息缺失，且无有效执行/恢复领取或停止标记。原 SQLite `BEGIN IMMEDIATE` 中复核，一个原请求最多一个后继；原记录、消息 ID 和发送次数不修改。不允许借此跳过同会话的其他未完成请求，也不支持递归替换后继 UNKNOWN。
+
+| 情形 | 返回及调用方动作 |
+| --- | --- |
+| 同新 ID、相同七字段 | 返回原新回执，继续查此 ID，不再次生成 |
+| 同新 ID 改字段 | HTTP 409 `CONVERSATION_REQUEST_CONFLICT` |
+| 不同新 ID 争同一旧 ID，或存在其他未完成轮次 | HTTP 409 `CHAT_SUPERSEDE_CONFLICT` |
+| 原输入缺失/损坏、身份不同或旧状态不符合 | HTTP 409 `CHAT_SUPERSEDE_INVALID`，未受理 |
+| 原执行/恢复仍有有效领取 | HTTP 409 `CHAT_SUPERSEDE_PREDECESSOR_BUSY`，未受理；等待后沿同新 ID 核验 |
+| 已受理后查到旧 user 或旧终态 | 新回执 `failed/not_sent`、`CHAT_SUPERSEDE_ORIGINAL_FOUND`；查 `supersedes_request_id` 的原结果，不换新 ID 再发 |
+| 原 parent/分支漂移 | 新回执 `failed/not_sent`、`CHAT_SUPERSEDE_CURSOR_CHANGED`，停下处理原会话 |
+| 原 Chat 读失败/限流，或原领取暂忙 | 新回执 `queued/not_sent`、`CHAT_SUPERSEDE_READ_UNAVAILABLE` 或 `CHAT_SUPERSEDE_PREDECESSOR_BUSY`；保存同一新 ID 等待 |
+
+响应新增 `supersedes_request_id`，结果只按新请求自己的 user/assistant 分支核验。领取及发送前都会重核原记录；原 Chat GET 在账号冷却后执行，早于模型提交标记，GET 同样计入发送间隔并遵守真实 429 冷却。原账号、Chat、提交父消息、客户端会话固定；已归档 Chat 复用原取消归档及读回检查。
+
+**这仍然是新执行，不是取回旧结果。** 最后一次 GET 后仍须遵守账号请求间隔，上游也没有原子“确认旧请求不存在并提交新请求”的接口；GET 与 POST 之间仍可能出现旧结果。工程只能阻止已观察到的迟到结果和本地重复派发，不能承诺上游 exactly-once。本候选测试不授权历史请求生产重发；业务执行必须另核对应旧对象及重复风险决策。
+
+无数据库迁移、新服务或配置变化。发布需先 Provider、后使用此字段的内部消费者。接受后继之前可回退旧镜像；一旦已受理后继，**不得直接降级为不识别此合同的版本**：应保留识别此合同的运行版本处理在途/等待及原 ID 读回，或由发布负责人核定只暂停新提交的回退方案，保留原数据库和输入。不能删除后继或清空 UNKNOWN 来回退。
+
+
 ### 429 分层
 
 | 来源 | 证据与处理 |

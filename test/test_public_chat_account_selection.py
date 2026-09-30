@@ -268,3 +268,13 @@ def test_independent_selected_accounts_can_claim_in_parallel(tmp_path, accounts)
     assert first.request_id != second.request_id
     admission.execute(first); admission.execute(second)
     assert {body['provider_account_identity'] for body in calls}=={'account-A','account-B'}
+
+
+def test_selected_binding_ambiguity_keeps_distinct_error(accounts, monkeypatch):
+    monkeypatch.setattr('services.model_service.model_catalog_service.route_for_model', lambda _:SimpleNamespace(
+        account_types=frozenset({'Plus'}), account_identities=frozenset({'account-B'})))
+    with accounts._lock:
+        accounts._accounts['duplicate']={**accounts._accounts['fixture-B'],'access_token':'duplicate'}
+        accounts._save_accounts()
+    with pytest.raises(RuntimeError, match='no unique paid account supports text model'):
+        accounts.create_text_conversation_binding(text_model='gpt-text', requested_account_identity='account-B')

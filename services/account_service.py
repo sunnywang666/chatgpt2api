@@ -1676,7 +1676,9 @@ class AccountService:
                     isinstance(limit, dict) and limit.get("feature_name") == requested_model and limit.get("remaining") == 0
                     for limit in account.get("limits_progress") or []))
             ]
-            if not candidates or (requested_account_identity and len(candidates) != 1):
+            if not candidates:
+                raise RuntimeError("conversation binding unavailable: no paid account supports text model")
+            if requested_account_identity and len(candidates) != 1:
                 raise RuntimeError("conversation binding unavailable: no unique paid account supports text model")
             access_token = candidates[self._index % len(candidates)]
             self._index += 1
