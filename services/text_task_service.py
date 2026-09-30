@@ -546,6 +546,55 @@ class TextTaskService:
             **({"failed_reads": failures} if failures else {}),
         }
 
+    @staticmethod
+    def _bounded_chat_wait(receipt):
+        return (receipt.get("_route", "chat") == "chat"
+                and receipt.get("_operation", "text") == "text"
+                and not receipt.get("_forward_protocol")
+                and receipt.get("_recovery_suppressed") is not True)
+
+    @classmethod
+    def _end_execution_wait(cls, receipt, now):
+        """End local waiting, not the upstream turn or its original-ID recovery.
+
+        The existing age and qualified-read policy bounds Chat execution
+        occupancy. A timeout, failed GET or arbitrary failed receipt alone
+        cannot do so. Persist this decision so later failed reads and restart
+        cannot reopen a released slot.
+        """
+        if not cls._bounded_chat_wait(receipt) or receipt.get("_execution_wait_ended_at") is not None:
+            return False
+        if not (receipt.get("status") == "unknown"
+                or receipt.get("status") == "failed" and receipt.get("error_code") == "RESULT_UNRECOVERABLE"
+                and receipt.get("upstream_outcome") == "unknown"):
+            return False
+        if receipt.get("recovery_claim_id") or receipt.get("_upstream_terminal") is True:
+            # Proven empty terminal results already release execution capacity
+            # and retain their separate explicit continuation contract.
+            return False
+        if not all(receipt.get(key) for key in (
+                "request_message_id", "provider_binding_id", "provider_account_identity",
+                "client_conversation_id")):
+            return False
+        claim_until = receipt.get("_claim_until")
+        if receipt.get("_claim_id") and (type(claim_until) not in (int, float)
+                or not math.isfinite(claim_until) or claim_until > now):
+            return False
+        if receipt.get("_executing") is True and not receipt.get("_claim_id"):
+            return False  # A legacy executor without a lease cannot be fenced.
+        created = receipt.get("created_at")
+        reads = receipt.get("recovery_no_result_reads")
+        if (type(created) not in (int, float) or not math.isfinite(created)
+                or now - created < cls.UNRECOVERABLE_MIN_AGE_SECONDS
+                or type(reads) is not int or reads < cls.UNRECOVERABLE_QUALIFIED_READS
+                or receipt.get("recovery_reason") not in cls._UNRECOVERABLE_REASONS):
+            return False
+        receipt.update(status="failed", error_code="RESULT_UNRECOVERABLE", upstream_outcome="unknown",
+                       recovery_retryable=True, finished_at=receipt.get("finished_at") or now,
+                       _execution_wait_ended_at=now, _turn_reserved=False, updated_at=now,
+                       _claim_id=None, _claim_until=None, _executing=False)
+        return True
+
     def _finish_recovery(
         self, owner, request_id, claim_id, recovered=None, error_code=None,
         phase=None, recovery_reason=None, retry_after_seconds=None, *, count_unrecoverable=False,
@@ -577,7 +626,7 @@ class TextTaskService:
                     qualified_reads = 0
                 created_at = float(current.get("created_at") or now)
                 qualified_read_recorded = (
-                    count_unrecoverable
+                    (count_unrecoverable or self._bounded_chat_wait(current))
                     and recovery_reason in self._UNRECOVERABLE_REASONS
                     and now - created_at >= self.UNRECOVERABLE_MIN_AGE_SECONDS
                 )
@@ -665,6 +714,7 @@ class TextTaskService:
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}
+            self._end_execution_wait(updated, now)
             if updated.get(RECOVERY_CONVERSATION_SCAN_FIELD) == {} or not error_code:
                 updated.pop(RECOVERY_CONVERSATION_SCAN_FIELD, None)
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
@@ -717,6 +767,10 @@ class TextTaskService:
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
             if row:
                 previous = json.loads(row[0])
+                if self._end_execution_wait(previous, now):
+                    db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
+                               (json.dumps(previous), owner, request_id))
+                    row = (json.dumps(previous),)
                 if previous.get("_recovery_suppressed") is True:
                     # An explicit operator stop preserves the original
                     # receipt and makes reads observational until the marker is
@@ -853,7 +907,8 @@ class TextTaskService:
             if not row:
                 return {"request_id": request_id, "status": "not_found"}
             current = json.loads(row[0])
-            if current.get("status") == "succeeded" or current.get("error_code") == "RESULT_UNRECOVERABLE":
+            if (current.get("status") == "succeeded" or current.get("error_code") == "RESULT_UNRECOVERABLE"
+                    or current.get("recovery_claim_id") or current.get("_executing") is True):
                 return self._public(current)
             created_at = float(current.get("created_at") or now)
             if (
@@ -878,6 +933,7 @@ class TextTaskService:
                 "updated_at": now,
                 "finished_at": now,
             }
+            self._end_execution_wait(updated, now)
             db.execute(
                 "UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
                 (json.dumps(updated), owner, request_id, row[0]),
@@ -897,6 +953,11 @@ class TextTaskService:
             ):
                 # A late runner callback must not reopen a recovered terminal
                 # result or replace its original result/cursor evidence.
+                return
+            if receipt.get("_execution_wait_ended_at") is not None:
+                # A late runner cannot reopen local execution or overwrite the
+                # original evidence. Only the exact-ID recovery path may adopt
+                # its subsequently verified upstream result.
                 return
             receipt = {**receipt, **changes, "updated_at": self._now()}
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))

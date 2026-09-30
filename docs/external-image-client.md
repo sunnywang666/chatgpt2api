@@ -164,6 +164,8 @@ python3 examples/image_client.py --env-file .image-client.env chat-recover --sta
 
 完整受理后的原请求及实际输入由服务器持久保存。满载时返回202并以原ID等待；新增符合条件的账号、账号恢复或原占用释放后自动派发，不要求客户端换Key、重启或重提。服务重启后尚未发送的请求沿持久输入继续，已发送/UNKNOWN仍绑定原账号查结果。等待不再受旧32个内存任务上限拒绝。请求体读取仍有2个并行读取及执行输入256MiB等技术保护，和账号额度、会话数量分开；429 `CHAT_BODY_READER_CAPACITY_EXCEEDED` 属于受理前读取繁忙。旧版 `failed` / `TEXT_TASK_CAPACITY_EXCEEDED` / `recovery.upstream_outcome=not_sent` 回执才允许退避后原ID原输入再次POST。示例客户端保持查询优先，不自动执行这个重试，也不能删除状态文件换ID绕过保护。`waiting.next_check_at`、`recovery.next_at`是退避证据，不是客户端重新提交指令。
 
+原生持久 Chat 文字请求的本地执行等待有界：受理至少15分钟、此后至少3次符合条件的原结果查询仍无法取得结果，且没有活跃执行或恢复领取时，可返回 `failed` / `RESULT_UNRECOVERABLE`，释放给其他独立会话的执行位置。`recovery.upstream_outcome=unknown` 仍表示上游结果尚未确认，不能按“未发送”处理；`recovery.retryable` 仅用于原ID结果查询，不授权再提交模型。保留原请求编号与输入，迟到的准确结果可更新为成功；同会话下一轮仍需原结果确认。网络超时、授权失败、429或查询次数不足不会单独触发此处置。此规则不代表图片/兼容转发/Codex具有相同超时策略。
+
 Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `success`，不要混用。只有实际取得的上游usage才可报告，当前未返回usage时应显示未知。现有公共Chat不提供工具执行或结构化输出保证；应用自行校验模型文本，不把JSON解析失败包装为成功。
 
 
