@@ -164,6 +164,107 @@ def project_public_models(result: object) -> dict[str, Any]:
     return result
 
 
+EXECUTION_ENUMS = {
+    "phase": {"queued", "preparing", "sending", "receiving", "recovering", "stalled", "completed", "failed", "unknown"},
+    "send_state": {"not_sent", "attempted", "response_received", "unknown"},
+    "local_state": {"not_started", "active", "ended", "unknown"},
+    "wait_state": {"waiting", "ended", "completed", "unknown"},
+    "upstream_outcome": {"not_sent", "unknown", "completed", "rejected"},
+    "upstream_status": {"in_progress", "running", "pending", "queued", "finished_successfully"},
+}
+EXECUTION_TIMES = ("accepted_at", "sent_at", "response_received_at", "first_stream_event_at",
+                   "local_finished_at", "observation_started_at", "last_checked_at", "last_progress_at", "wait_ended_at", "upstream_updated_at")
+EXECUTION_RESOURCES = {
+    "local_worker": {"active", "idle", "unknown"},
+    "account_turn": {"held", "released", "unattributed", "unknown"},
+    "conversation": {"protected", "ready", "unknown"},
+}
+
+
+def safe_public_execution(value: object) -> dict[str, Any]:
+    """No raw timelines, private account/message IDs or upstream payloads."""
+    if not isinstance(value, dict):
+        return {}
+    result = {key: value[key] for key, allowed in EXECUTION_ENUMS.items()
+              if isinstance(value.get(key), str) and value[key] in allowed}
+    for key in EXECUTION_TIMES:
+        number = value.get(key)
+        if type(number) in (int, float) and math.isfinite(number) and number > 0:
+            result[key] = number
+    count = value.get("unchanged_reads")
+    if type(count) is int and 0 <= count <= 2147483647:
+        result["unchanged_reads"] = count
+    resources = value.get("resources")
+    if isinstance(resources, dict):
+        result["resources"] = {key: resources[key] for key, allowed in EXECUTION_RESOURCES.items()
+                               if isinstance(resources.get(key), str) and resources[key] in allowed}
+    return result
+
+
+def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
+    from services.pool_admission import original_turn_ended, unknown_text_result
+
+    status = receipt.get("status")
+    stages = {}
+    timeline = receipt.get("_execution_timeline")
+    for item in timeline if isinstance(timeline, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("stage"), str):
+            at = item.get("at")
+            if type(at) in (int, float) and math.isfinite(at) and at > 0:
+                stages[item["stage"]] = at
+    sent, response = stages.get("send_call_started"), stages.get("response_headers_received")
+    send_state = ("response_received" if response else "attempted" if sent or receipt.get("_submission_started") is True
+                  else "not_sent" if receipt.get("upstream_outcome") == "not_sent"
+                  or receipt.get("_submission_started") is False and (
+                      status in {"queued", "not_started"} or status == "running" and receipt.get("_claim_id"))
+                  else "unknown")
+    local_end = stages.get("task_finished") or receipt.get("finished_at")
+    local = ("active" if receipt.get("_executing") is True and status == "running"
+             else "ended" if local_end else "not_started" if status in {"queued", "not_started"} else "unknown")
+    unresolved = status == "unknown" or (status == "failed" and receipt.get("upstream_outcome") == "unknown")
+    released_wait = (status == "failed" and receipt.get("error_code") == "RESULT_UNRECOVERABLE"
+                     and receipt.get("upstream_outcome") == "unknown"
+                     and type(receipt.get("_execution_wait_ended_at")) in (int, float)
+                     and math.isfinite(receipt["_execution_wait_ended_at"]))
+    wait_end = receipt.get("_result_wait_ended_at") or receipt.get("_execution_wait_ended_at")
+    progress = receipt.get("_result_last_progress_at")
+    stalled = (type(wait_end) in (int, float) and math.isfinite(wait_end)
+               and (type(progress) not in (int, float) or progress <= wait_end))
+    outcome = ("completed" if status == "succeeded" or receipt.get("upstream_outcome") == "completed"
+               else "rejected" if original_turn_ended("text", receipt) and not receipt.get("_upstream_terminal")
+               else "not_sent" if send_state == "not_sent" and not unresolved else "unknown")
+    phase = ("completed" if status == "succeeded" else "stalled" if unresolved and stalled
+             else "recovering" if unresolved else "failed" if status == "failed"
+             else "queued" if status in {"queued", "not_started"}
+             else "receiving" if response else "sending" if send_state == "attempted"
+             else "preparing" if status == "running" else "unknown")
+    turn_active = (status == "running" or unknown_text_result(receipt)) and not original_turn_ended("text", receipt) and not released_wait
+    accounted = turn_active and (unknown_text_result(receipt) or receipt.get("_turn_reserved", True))
+    resources = {
+        "local_worker": "active" if local == "active" else "idle" if local in {"ended", "not_started"} else "unknown",
+        "account_turn": ("held" if receipt.get("provider_account_identity") or receipt.get("_account_resource")
+                         else "unattributed") if accounted else "released",
+        "conversation": "protected" if unresolved or status == "running" else "ready" if status == "succeeded" else "unknown",
+    }
+    observation = receipt.get("_original_result_observation")
+    observation = observation if isinstance(observation, dict) else {}
+    nodes = observation.get("nodes")
+    latest = nodes[-1] if isinstance(nodes, list) and nodes and isinstance(nodes[-1], dict) else {}
+    return safe_public_execution({
+        "phase": phase, "send_state": send_state, "local_state": local,
+        "wait_state": "completed" if status == "succeeded" else "ended" if wait_end or status == "failed"
+                      else "waiting" if status in {"queued", "running", "unknown"} else "unknown",
+        "upstream_outcome": outcome, "upstream_status": latest.get("status"),
+        "accepted_at": receipt.get("created_at"), "sent_at": sent, "response_received_at": response,
+        # The first SSE line is transport evidence, never a reasoning/token signal.
+        "first_stream_event_at": stages.get("first_output"), "local_finished_at": local_end,
+        "observation_started_at": receipt.get("_result_observation_started_at"),
+        "last_checked_at": receipt.get("_result_last_checked_at"), "last_progress_at": progress,
+        "wait_ended_at": wait_end, "upstream_updated_at": observation.get("upstream_updated_at"),
+        "unchanged_reads": receipt.get("_result_no_progress_reads"), "resources": resources,
+    })
+
+
 def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
     if not isinstance(receipt, dict):
         raise PublicChatContractError("CHAT_RECEIPT_INVALID", "chat request receipt is invalid")
@@ -243,4 +344,7 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
     }
     if recovery:
         result["recovery"] = recovery
+    execution = safe_public_execution(receipt.get("execution"))
+    if execution:
+        result["execution"] = execution
     return result

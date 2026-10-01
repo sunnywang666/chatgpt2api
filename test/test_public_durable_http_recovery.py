@@ -351,6 +351,45 @@ def test_queued_public_successors_survive_restart_and_unknown_predecessor(tmp_pa
 _FIXTURE_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 
 
+def test_http_stalled_original_cli_restart_and_late_save_without_another_send(tmp_path):
+    from examples import image_client
+    body = {**_input(tmp_path, "stalled-original"), "client_conversation_id": "stalled-session"}
+    (tmp_path / "read-state.json").write_text(json.dumps({
+        "schema": "chatgpt2api.chat-request.v1", "request_id": body["client_request_id"], "request": body,
+    }))
+    def cli(port, key, *args):
+        result = subprocess.run([sys.executable, str(Path(image_client.__file__)), *map(str, args)],
+                                env={**os.environ, "SERVER_ROOT": f"http://127.0.0.1:{port}", "CHATGPT2API_BEARER_TOKEN": key},
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+    with _server(tmp_path, "stalled") as (port, key, _):
+        assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
+        def ended():
+            receipt = _http(port, key, "GET", "/api/chat-requests/stalled-original")[1]
+            return receipt if receipt.get("execution", {}).get("phase") == "stalled" else None
+        receipt = _wait(ended)
+        execution = receipt["execution"]
+        assert receipt["status"] == "unknown" and execution["wait_state"] == "ended"
+        assert execution["send_state"] == "response_received"
+        assert execution["resources"]["account_turn"] == "held"
+        assert receipt["recovery"]["reason"] == "REQUEST_RESULT_INCOMPLETE"
+        assert _http(port, key, "POST", "/api/chat-requests", body)[1]["status"] == "unknown"
+    with _server(tmp_path, "stalled") as (port, key, _):
+        observed = cli(port, key, "chat-status", "--request-id", body["client_request_id"], "--state", tmp_path / "read-state.json")
+        assert observed["execution"]["wait_ended_at"] == execution["wait_ended_at"]
+        assert observed["execution"]["resources"]["conversation"] == "protected"
+        assert observed["execution"]["send_state"] == "response_received"
+        (tmp_path / "original-completed").touch()
+        _success(port, key, body["client_request_id"])
+        cli(port, key, "chat-save", "--state", tmp_path / "read-state.json",
+            "--output", tmp_path / "original-result.json")
+        saved = json.loads((tmp_path / "original-result.json").read_text())
+        assert saved["content"] == "late original HTTP result"
+        assert saved["request_id"] == body["client_request_id"]
+    assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"stalled-original"']
+
+
 def _serve_images(root):
     import pytest
     import uvicorn
@@ -470,6 +509,12 @@ def _serve(root, mode):
             log.write(json.dumps(body["client_request_id"]) + "\n")
             log.flush()
             os.fsync(log.fileno())
+        if mode == "stalled":
+            from services.conversation_binding_service import ConversationBindingError
+            current_request.get().record_stage("send_call_started")
+            current_request.get().record_stage("response_headers_received", status_code=200)
+            on_cursor({"conversation_id": "controlled-original-conversation"})
+            raise ConversationBindingError("controlled interrupted stream", code="CONVERSATION_OUTCOME_UNKNOWN")
         if mode == "blocked-send":
             _wait(lambda: (root / "release-send").exists(), timeout=10)
         if mode == "parallel":
@@ -486,6 +531,25 @@ def _serve(root, mode):
         return result
 
     tasks = TextTaskService(store.path, runner=synthetic_model, admission=admission)
+    if mode == "stalled":
+        # Accelerate only this isolated child fixture. Production's 900-second
+        # boundary is exercised with a manual clock in the service regressions.
+        TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS = .05
+        TextTaskService.RECOVERY_BASE_BACKOFF_SECONDS = .03
+        TextTaskService.RECOVERY_MAX_BACKOFF_SECONDS = .1
+        admission.CLAIM_SECONDS = .1
+        from services.conversation_binding_service import ConversationBindingService
+        from test.test_unknown_turn_recovery import document
+        def original_read(row):
+            doc = document(row)
+            message = doc["mapping"]["final-" + row["request_message_id"]]["message"]
+            if (root / "original-completed").exists():
+                message["content"]["parts"] = ["late original HTTP result"]
+            else:
+                message.update(status="in_progress", end_turn=None)
+                message["content"]["parts"] = [""]
+            return ConversationBindingService._read_text_request_result(None, row, document=doc)
+        tasks.recovery_reader = original_read
     admission.register("text", lambda context, body: tasks._run(context.owner, context.request_id, body))
     chat_requests.text_task_service = tasks
     if mode == "lifecycle":

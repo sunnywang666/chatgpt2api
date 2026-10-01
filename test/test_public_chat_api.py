@@ -231,7 +231,7 @@ def test_durable_public_chat_submit_query_reuse_conflict_and_owner_isolation(pub
     assert first.json()["status"] == "queued"
     assert set(first.json()) <= {
         "request_id", "route", "model", "status", "content", "error_code",
-        "created_at", "updated_at", "started_at", "finished_at", "recovery",
+        "created_at", "updated_at", "started_at", "finished_at", "recovery", "execution",
     }
     assert "secret" not in first.text
     assert len(public_chat.queue.calls) == 1

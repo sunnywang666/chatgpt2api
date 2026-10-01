@@ -33,6 +33,49 @@ class TextRecoveryReason(str, Enum):
 _ACTIVE_TEXT_RESULT_STATUSES = frozenset({"in_progress", "running", "pending", "queued"})
 NON_TEXT_RESULT_FIELD = "_non_text_result"
 TURN_END_EVIDENCE_FIELD = "_turn_end_evidence"
+RESULT_OBSERVATION_FIELD = "_original_result_observation"
+
+
+def _result_observation(mapping, children, request_message_id, conversation_id):
+    """Observe only this request's unambiguous branch, never message contents.
+
+    An upstream heartbeat timestamp alone is not generation progress. Keep a
+    bounded structural/text-length observation to distinguish a changing turn
+    from a stale in_progress label. Missing or branching nodes cannot qualify.
+    """
+    node_id, visited, nodes, updated_at = request_message_id, {request_message_id}, [], None
+    while children.get(node_id):
+        successors = children[node_id]
+        if len(successors) != 1 or len(nodes) >= 128:
+            return None
+        node_id = successors[0]
+        if node_id in visited:
+            return None
+        visited.add(node_id)
+        message = (mapping.get(node_id) or {}).get("message")
+        if not isinstance(message, dict) or message.get("id") != node_id:
+            return None
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        if role == "user":
+            return None  # A later user turn cannot establish our progress.
+        status = message.get("status")
+        if role not in {"assistant", "tool"} or status not in _ACTIVE_TEXT_RESULT_STATUSES | {"finished_successfully"}:
+            return None
+        content = message.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list) or any(not isinstance(part, str) for part in parts):
+            return None  # Unsupported tool/media bodies are not empty text.
+        nodes.append({"id": node_id, "role": role, "status": status,
+                      "end_turn": message.get("end_turn") is True,
+                      "text_chars": sum(len(part) for part in parts)})
+        value = message.get("update_time")
+        if type(value) in (int, float) and math.isfinite(value) and value > 0:
+            updated_at = max(updated_at or value, value)
+    if not nodes:
+        return None
+    return {"conversation_id": conversation_id, "request_message_id": request_message_id,
+            "nodes": nodes, "upstream_updated_at": updated_at}
 
 
 def _request_parent_matches_receipt(
@@ -1101,6 +1144,8 @@ class ConversationBindingService:
                 "binding_status": "unknown",
                 "status": "running" if active_result_seen else "unknown",
                 "recovery_reason": recovery_reason,
+                **({RESULT_OBSERVATION_FIELD: observation} if active_result_seen
+                   and (observation := _result_observation(mapping, children, request_message_id, conversation_id)) else {}),
                 **({TURN_END_EVIDENCE_FIELD: ended} if not active_result_seen and terminal_empty_seen
                    and (ended := _completed_request_turn(mapping, children, request_message_id, conversation_id)) else {}),
             }

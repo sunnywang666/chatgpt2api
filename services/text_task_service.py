@@ -267,7 +267,12 @@ class TextTaskService:
 
     @staticmethod
     def _public(receipt):
+        from services.public_chat_service import project_text_execution
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
+        result.pop("execution", None)
+        if (receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
+                and not receipt.get("_forward_protocol")):
+            result["execution"] = project_text_execution(receipt)
         # Derive diagnostics only from validated private records. Never trust a
         # stored projection or arbitrary exception content at the public edge.
         if receipt.get("_scheduling") is not None:
@@ -483,6 +488,9 @@ class TextTaskService:
                     if key != "request_parent_message_id" and not value.strip():
                         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
                     anchor[key] = value
+            observation = cls._safe_result_observation(recovered.get("_original_result_observation"), receipt or {})
+            if observation is not None and recovered.get("recovery_reason") == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value:
+                anchor["_original_result_observation"] = observation
             scan = cls._safe_recovery_scan(recovered.get(RECOVERY_CONVERSATION_SCAN_FIELD))
             if scan is not None:
                 anchor[RECOVERY_CONVERSATION_SCAN_FIELD] = scan
@@ -507,6 +515,34 @@ class TextTaskService:
                 anchor.update({TURN_END_EVIDENCE_FIELD: dict(ended), "_upstream_terminal": True, "_turn_reserved": False})
             return anchor or None, "UPSTREAM_OUTCOME_UNKNOWN", "read_text_result", cls._safe_recovery_reason(recovered.get("recovery_reason"))
         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+
+    @staticmethod
+    def _safe_result_observation(value, receipt):
+        if (not isinstance(value, dict)
+                or set(value) != {"conversation_id", "request_message_id", "nodes", "upstream_updated_at"}
+                or not value.get("conversation_id")
+                or value["conversation_id"] != receipt.get("conversation_id")
+                or not value.get("request_message_id")
+                or value["request_message_id"] != receipt.get("request_message_id")):
+            return None
+        nodes = value["nodes"]
+        if not isinstance(nodes, list) or not 1 <= len(nodes) <= 128:
+            return None
+        ids = set()
+        for node in nodes:
+            if (not isinstance(node, dict) or set(node) != {"id", "role", "status", "end_turn", "text_chars"}
+                    or not isinstance(node["id"], str) or not 1 <= len(node["id"]) <= 200
+                    or node["id"] in ids or node["id"] == value["request_message_id"]
+                    or node["role"] not in {"assistant", "tool"}
+                    or node["status"] not in {"in_progress", "running", "pending", "queued", "finished_successfully"}
+                    or type(node["end_turn"]) is not bool
+                    or type(node["text_chars"]) is not int or not 0 <= node["text_chars"] <= 100_000_000):
+                return None
+            ids.add(node["id"])
+        updated = value["upstream_updated_at"]
+        if updated is not None and (type(updated) not in (int, float) or not math.isfinite(updated) or updated <= 0):
+            return None
+        return {**value, "nodes": [dict(node) for node in nodes]}
 
     @staticmethod
     def _safe_recovery_scan(value):
@@ -587,7 +623,7 @@ class TextTaskService:
                 and receipt.get("_recovery_suppressed") is not True)
 
     @classmethod
-    def _end_execution_wait(cls, receipt, now):
+    def _end_execution_wait(cls, receipt, now, *, observed=False):
         """End local waiting, not the upstream turn or its original-ID recovery.
 
         The existing age and qualified-read policy bounds Chat execution
@@ -615,6 +651,20 @@ class TextTaskService:
             return False
         if receipt.get("_executing") is True and not receipt.get("_claim_id"):
             return False  # A legacy executor without a lease cannot be fenced.
+        if receipt.get("recovery_reason") == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value:
+            # A stale upstream label can end the foreground result wait, but
+            # is never evidence to release the account turn. Only a fresh,
+            # validated original GET may make this decision, not a timer/read
+            # of old stored observations. Keep UNKNOWN and the original lease.
+            progress = receipt.get("_result_last_progress_at") or receipt.get("_result_observation_started_at")
+            reads = receipt.get("_result_no_progress_reads")
+            if (not observed or receipt.get("_result_wait_ended_at") is not None
+                    or type(progress) not in (int, float) or not math.isfinite(progress)
+                    or now - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS
+                    or type(reads) is not int or reads < cls.UNRECOVERABLE_QUALIFIED_READS):
+                return False
+            receipt.update(_result_wait_ended_at=now, updated_at=now)
+            return True
         created = receipt.get("created_at")
         reads = receipt.get("recovery_no_result_reads")
         if (type(created) not in (int, float) or not math.isfinite(created)
@@ -744,10 +794,25 @@ class TextTaskService:
                 }
             if not error_code:
                 changes["recovery_last_read_error"] = None
+            observation = self._safe_result_observation((recovered or {}).get("_original_result_observation"), current)
+            observed = bool(error_code == "UPSTREAM_OUTCOME_UNKNOWN"
+                            and recovery_reason == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
+                            and observation is not None)
+            if observed:
+                previous = self._safe_result_observation(current.get("_original_result_observation"), current)
+                started = current.get("_result_observation_started_at")
+                progress = current.get("_result_last_progress_at")
+                initial = previous is None or type(started) not in (int, float) or not math.isfinite(started)
+                changed = previous is not None and previous["nodes"] != observation["nodes"]
+                count = current.get("_result_no_progress_reads")
+                changes.update(_original_result_observation=observation, _result_last_checked_at=now,
+                               _result_observation_started_at=now if initial else started,
+                               _result_last_progress_at=now if changed else None if initial else progress,
+                               _result_no_progress_reads=0 if initial or changed else (count if type(count) is int and count >= 0 else 0) + 1)
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}
-            self._end_execution_wait(updated, now)
+            self._end_execution_wait(updated, now, observed=observed)
             if updated.get(RECOVERY_CONVERSATION_SCAN_FIELD) == {} or not error_code:
                 updated.pop(RECOVERY_CONVERSATION_SCAN_FIELD, None)
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
