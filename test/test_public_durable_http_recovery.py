@@ -1,7 +1,10 @@
-"""Real loopback HTTP/process restarts; only model execution is synthetic.
+"""Real loopback HTTP/process restarts with isolated dependency fixtures.
 
-No upstream account, model HTTP, or production data is used. This does not
-simulate killing a process after a real upstream send with an UNKNOWN result.
+Auth, admission, durable storage and lifecycle handlers are real. Model and
+archive execution, catalog observations and credential refresh are synthetic;
+AI content review is disabled. No upstream account or production data is used.
+This does not simulate killing a process after a real upstream send with an
+UNKNOWN result, or verify the deployed company's ingress/authentication.
 """
 from contextlib import contextmanager
 import http.client
@@ -127,6 +130,243 @@ def test_real_socket_disconnect_keeps_original_execution_and_result(tmp_path):
     assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"disconnected-original"']
 
 
+def test_independent_client_saves_multiturn_work_reuses_slot_and_restores_original(tmp_path):
+    """Exercise the shipped CLI over sockets, not a replacement client/receipt."""
+    from examples import image_client
+
+    def cli(port, key, *args):
+        env = {**os.environ, "SERVER_ROOT": f"http://127.0.0.1:{port}", "CHATGPT2API_BEARER_TOKEN": key}
+        result = subprocess.run([sys.executable, str(Path(image_client.__file__)), *map(str, args)],
+                                env=env, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    def submit(port, key, name, session, previous=None):
+        args = ["chat-submit", "--state", tmp_path / (name + ".json"), "--request-id", name,
+                "--session-id", session, "--model", "fixture-text", "--prompt", "controlled input",
+                "--workflow-id", "batch", "--workflow-concurrency", "1"]
+        if previous:
+            args += ["--previous-request-id", previous]
+        return cli(port, key, *args)
+
+    with _server(tmp_path, "lifecycle") as (port, key, _):
+        submit(port, key, "A-1", "A")
+        _success(port, key, "A-1")
+        first = cli(port, key, "chat-work-status", "--state", tmp_path / "A-1.json")
+        assert first["state"] == "active" and first["slot_held"] is True
+        assert first["archive"]["status"] == "not_requested"
+        submit(port, key, "B-1", "B")
+        waiting = _http(port, key, "GET", "/api/chat-requests/B-1")[1]
+        assert waiting["status"] == "queued"
+        assert "workflow_concurrency" in waiting["waiting"]["reasons"]
+        submit(port, key, "A-2", "A", "A-1")
+        _success(port, key, "A-2")
+        cli(port, key, "chat-save", "--state", tmp_path / "A-2.json", "--output", tmp_path / "answer.json")
+        saved = json.loads((tmp_path / "answer.json").read_text())
+        assert saved["request_id"] == "A-2" and saved["content"] == "synthetic saved answer"
+        assert not (tmp_path / "archives.jsonl").exists()
+        cli(port, key, "chat-complete", "--state", tmp_path / "A-2.json")
+        _success(port, key, "B-1")
+        work = cli(port, key, "chat-work-status", "--state", tmp_path / "A-2.json")
+        assert work["state"] == "completed" and not work["slot_held"]
+        assert work["archive"]["archived"] is True
+        assert _http(port, key, "POST", "/api/chat-requests/A-1/work",
+                     {"state": "completed", "results_saved": True})[0] == 409
+        cli(port, key, "chat-save", "--state", tmp_path / "B-1.json", "--output", tmp_path / "B-answer.json")
+        cli(port, key, "chat-complete", "--state", tmp_path / "B-1.json")
+    with _server(tmp_path, "lifecycle") as (port, key, _):
+        assert cli(port, key, "chat-status", "--state", tmp_path / "A-2.json") == saved
+        cli(port, key, "chat-rework", "--state", tmp_path / "A-2.json")
+        submit(port, key, "A-3", "A", "A-2")
+        _success(port, key, "A-3")
+        current = cli(port, key, "chat-work-status", "--state", tmp_path / "A-3.json")
+        assert current["work_ref"] == "A" and current["state"] == "active"
+    assert [json.loads(x) for x in (tmp_path / "sends.jsonl").read_text().splitlines()] == ["A-1", "A-2", "B-1", "A-3"]
+    archives = [json.loads(x) for x in (tmp_path / "archives.jsonl").read_text().splitlines()]
+    assert [(x["request_id"], x["archived"]) for x in archives] == [("A-2", True), ("B-1", True), ("A-2", False)]
+    assert archives[0]["conversation_id"] == archives[2]["conversation_id"]
+    assert archives[1]["conversation_id"] != archives[0]["conversation_id"]
+
+
+def test_archive_failure_http_restart_never_changes_successor_work(tmp_path):
+    body = {**_input(tmp_path, "A-1"), "client_conversation_id": "A",
+            "scheduling": {"workflow_id": "batch", "workflow_concurrency": 1}}
+    with _server(tmp_path, "lifecycle") as (port, key, _):
+        assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
+        _success(port, key, "A-1")
+        (tmp_path / "fail-archive").touch()
+        assert _http(port, key, "POST", "/api/chat-requests/A-1/work",
+                     {"state": "completed", "results_saved": True})[0] == 200
+        _wait(lambda: _http(port, key, "GET", "/api/chat-requests/A-1/work")[1]["archive"]["status"] == "unknown")
+        assert _http(port, key, "POST", "/api/chat-requests/A-1/work", {"state": "active"})[0] == 409
+        assert _http(port, key, "POST", "/api/chat-requests", {
+            **body, "client_request_id": "B-1", "client_conversation_id": "B"})[0] == 202
+        _success(port, key, "B-1")
+    (tmp_path / "fail-archive").unlink()
+    with _server(tmp_path, "lifecycle") as (port, key, _):
+        _wait(lambda: _http(port, key, "GET", "/api/chat-requests/A-1/work")[1]["archive"]["status"] == "confirmed")
+        b = _http(port, key, "GET", "/api/chat-requests/B-1/work")[1]
+        assert b["state"] == "active" and b["slot_held"] is True
+        assert b["archive"]["status"] == "not_requested"
+    actions = [json.loads(x) for x in (tmp_path / "archives.jsonl").read_text().splitlines()]
+    assert len(actions) >= 2 and {x["request_id"] for x in actions} == {"A-1"}
+    assert [json.loads(x) for x in (tmp_path / "sends.jsonl").read_text().splitlines()] == ["A-1", "B-1"]
+
+
+def test_image_http_selected_zero_quota_refresh_executes_original_and_saves_bytes(tmp_path):
+    from examples import image_client
+    body = {"client_task_id": "selected-original", "model": "gpt-image-2", "prompt": "controlled image",
+            "account_ref": "car_" + "B" * 43}
+    with _server(tmp_path, "image-recovery") as (port, key, _):
+        response = _http(port, key, "POST", "/api/image-tasks/generations", body)
+        assert response[0] == 200 and response[1]["id"] == "selected-original"
+        def item():
+            return _http(port, key, "GET", "/api/image-tasks?ids=selected-original")[1]["items"][0]
+        _wait(lambda: item()["status"] == "queued" and (tmp_path / "metadata-reads.jsonl").exists())
+        assert not (tmp_path / "image-sends.jsonl").exists()
+        assert _http(port, key, "POST", "/api/image-tasks/generations", {**body, "account_ref": "car_" + "A" * 43})[0] == 409
+        # Change only the controlled upstream observation, not the stored
+        # account, managed flag, caller identity, original request or queue.
+        (tmp_path / "quota-recovered").touch()
+        # Keep the real 30-second metadata probe interval: a shorter test
+        # timeout would mistake normal cooldown for a stalled durable queue.
+        _wait(lambda: item()["status"] == "success", timeout=40)
+        result = subprocess.run([sys.executable, str(Path(image_client.__file__)), "download",
+                                 "--task-id", "selected-original", "--output", str(tmp_path / "actual.png")],
+                                env={**os.environ, "SERVER_ROOT": f"http://127.0.0.1:{port}", "CHATGPT2API_BEARER_TOKEN": key},
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        import base64
+        assert (tmp_path / "actual.png").read_bytes() == base64.b64decode(_FIXTURE_PNG)
+    sends = [json.loads(x) for x in (tmp_path / "image-sends.jsonl").read_text().splitlines()]
+    assert sends == [{"request_id": "selected-original", "account": "account-B",
+                      "model": body["model"], "prompt": body["prompt"]}]
+    probes = [json.loads(x) for x in (tmp_path / "metadata-reads.jsonl").read_text().splitlines()]
+    assert len(probes) >= 2 and probes[0]["recovered"] is False and probes[1]["recovered"] is True
+    assert probes[1]["at"] - probes[0]["at"] >= 29.5
+
+
+def test_http_scheduling_survives_restart_and_deadline_never_sends(tmp_path):
+    from datetime import datetime, timezone
+    def at(seconds):
+        return datetime.fromtimestamp(seconds, timezone.utc).isoformat()
+    options = {"not_before": at(time.time() + 4), "wait_deadline": at(time.time() + 20)}
+    body = {**_input(tmp_path, "scheduled-original"), "scheduling": options}
+    with _server(tmp_path, "execute") as (port, key, _):
+        assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
+        def waiting():
+            receipt = _http(port, key, "GET", "/api/chat-requests/scheduled-original")[1]
+            return receipt if "not_before" in receipt.get("waiting", {}).get("reasons", []) else None
+        receipt = _wait(waiting)
+        assert receipt["scheduling"] == options
+        assert not (tmp_path / "sends.jsonl").exists()
+    with _server(tmp_path, "execute") as (port, key, _):
+        assert _http(port, key, "POST", "/api/chat-requests", {**body, "scheduling": {}})[0] == 409
+        receipt = _success(port, key, "scheduled-original")
+        assert receipt["scheduling"] == options
+        assert receipt["started_at"] >= datetime.fromisoformat(options["not_before"]).timestamp()
+    # Capacity remains unavailable until after this request's waiting budget.
+    with _server(tmp_path, "queued") as (port, key, _):
+        expired = {**_input(tmp_path, "deadline-original"), "scheduling": {"wait_deadline": at(time.time() + 1)}}
+        assert _http(port, key, "POST", "/api/chat-requests", expired)[0] == 202
+        _wait(lambda: _http(port, key, "GET", "/api/chat-requests/deadline-original")[1].get("error_code") == "WAIT_DEADLINE_EXCEEDED")
+    with _server(tmp_path, "execute") as (port, key, _):
+        receipt = _http(port, key, "GET", "/api/chat-requests/deadline-original")[1]
+        assert receipt["status"] == "failed" and receipt["error_code"] == "WAIT_DEADLINE_EXCEEDED"
+    assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"scheduled-original"']
+
+
+def test_http_one_account_parallel_sessions_never_overlap_turns(tmp_path):
+    def turn(name, session, previous=None):
+        return {**_input(tmp_path, name), "client_conversation_id": session,
+                **({"previous_request_id": previous} if previous else {})}
+    with _server(tmp_path, "parallel") as (port, key, _):
+        for name in ("A-1", "B-1"):
+            assert _http(port, key, "POST", "/api/chat-requests", turn(name, name[0]))[0] == 202
+        def sent():
+            path = tmp_path / "sends.jsonl"
+            return path.exists() and len(path.read_text().splitlines()) == 2
+        _wait(sent)
+        for name in ("A-1", "B-1"):
+            assert _http(port, key, "GET", "/api/chat-requests/" + name)[1]["status"] == "running"
+        rejected = _http(port, key, "POST", "/api/chat-requests", turn("A-2", "A", "A-1"))
+        assert rejected[0] == 409 and rejected[1]["detail"]["code"] == "CHAT_PREVIOUS_REQUEST_PENDING"
+        (tmp_path / "release-A-1").touch()
+        _success(port, key, "A-1")
+        assert _http(port, key, "POST", "/api/chat-requests", turn("A-2", "A", "A-1"))[0] == 202
+        _wait(lambda: len((tmp_path / "sends.jsonl").read_text().splitlines()) == 3)
+        assert _http(port, key, "GET", "/api/chat-requests/B-1")[1]["status"] == "running"
+        for name in ("B-1", "A-2"):
+            (tmp_path / ("release-" + name)).touch()
+            _success(port, key, name)
+    sends = [json.loads(x) for x in (tmp_path / "sends.jsonl").read_text().splitlines()]
+    assert sorted(sends[:2]) == ["A-1", "B-1"] and sends[2:] == ["A-2"]
+
+
+_FIXTURE_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+
+
+def _serve_images(root):
+    import pytest
+    import uvicorn
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI
+    from api import image_tasks, support
+    from services.auth_service import AuthService
+    from services.storage.json_storage import JSONStorageBackend
+    from services.request_context import current_request
+    from test.test_image_account_selection import runtime, fresh
+
+    patches = pytest.MonkeyPatch()
+    rt = runtime.__wrapped__(root, patches)
+    rt.admission.clock = time.time
+    rt.update("B", status="限流", **fresh(0))
+    def metadata(token):
+        with (root / "metadata-reads.jsonl").open("a") as log:
+            log.write(json.dumps({"account": "B", "at": time.monotonic(),
+                                  "recovered": (root / "quota-recovered").exists()}) + "\n")
+        amount = 3 if (root / "quota-recovered").exists() else 0
+        return ("fixture-user", ""), {**fresh(amount), "quota": amount, "status": "正常" if amount else "限流"}
+    rt.accounts._verified_chat_info = metadata
+    rt.accounts.refresh_image_capability = rt.accounts._refresh_pool_chat
+    def render(body):
+        ctx = current_request.get()
+        ctx.before_send()
+        with (root / "image-sends.jsonl").open("a") as log:
+            log.write(json.dumps({"request_id": ctx.request_id, "model": body["model"], "prompt": body["prompt"],
+                                  "account": ctx.selected_account()["provider_account_identity"]}) + "\n")
+        return {"created": 1, "data": [{"b64_json": _FIXTURE_PNG}],
+                "_provider_binding_id": body["provider_binding_id"],
+                "_provider_account_identity": body["provider_account_identity"],
+                "_conversation_id": "controlled-image-conversation", "_parent_message_id": "controlled-image-result"}
+    rt.tasks.generation_handler = render
+    rt.tasks.edit_handler = render
+    auth = AuthService(JSONStorageBackend(root / "accounts.json", root / "auth_keys.json"))
+    _, secret = auth.create_key(role="user", owner_subject="fixture-person", routes=["chat"])
+    (root / "fixture-key").write_text(secret)
+    (root / "fixture-key").chmod(0o600)
+    support.auth_service = auth
+    image_tasks.image_task_service = rt.tasks
+    @asynccontextmanager
+    async def lifespan(_app):
+        rt.admission.start()
+        try:
+            yield
+        finally:
+            rt.admission.stop()
+    app = FastAPI(lifespan=lifespan)
+    app.include_router(image_tasks.create_router())
+    @app.get("/fixture-ready")
+    def ready():
+        return {"ready": True}
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(64)
+        listener.setblocking(False)
+        (root / "ready.json").write_text(json.dumps({"port": listener.getsockname()[1]}))
+        uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False)).run(sockets=[listener])
+
+
 def _serve(root, mode):
     # Independent of the caller's optional sitecustomize offline guard: this
     # process must never initiate any outbound socket, including model probes.
@@ -139,6 +379,8 @@ def _serve(root, mode):
     import requests.sessions
     curl_cffi.requests.Session.request = forbidden
     requests.sessions.Session.request = forbidden
+    if mode == "image-recovery":
+        return _serve_images(root)
 
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
@@ -170,10 +412,11 @@ def _serve(root, mode):
     public_chat_service.model_catalog_service = SimpleNamespace(
         known_account_types_for_model=lambda _model: frozenset({"Plus"}),
         catalog_is_unknown=lambda: False)
-    chat_requests.check_request = lambda *_args: None
+    from services.config import config
+    config.data["ai_review"] = {"enabled": False}
     store = TaskStore(root / "tasks.sqlite3")
     admission = PoolAdmission(store, accounts, settings=lambda: {
-        "chat_account_concurrency": 1, "image_account_concurrency": 1, "codex_max_concurrency": 1},
+        "chat_account_concurrency": 2 if mode == "parallel" else 1, "image_account_concurrency": 1, "codex_max_concurrency": 1},
         model_types=lambda _model: {"Plus"}, pacing=lambda _account, now: {"next_at": now})
 
     def synthetic_model(body, on_cursor):
@@ -184,11 +427,35 @@ def _serve(root, mode):
             os.fsync(log.fileno())
         if mode == "blocked-send":
             _wait(lambda: (root / "release-send").exists(), timeout=10)
-        return {"content": "synthetic saved answer"}
+        if mode == "parallel":
+            _wait(lambda: (root / ("release-" + body["client_request_id"])).exists(), timeout=10)
+        result = {"content": "synthetic saved answer"}
+        if mode in {"lifecycle", "parallel"}:
+            conversation = body.get("conversation_id") or "upstream-" + body["client_conversation_id"]
+            if body.get("_previous_request_id"):
+                assert body["parent_message_id"] == "answer-" + body["_previous_request_id"]
+            result.update(provider_binding_id=body.get("provider_binding_id") or "fixture-binding",
+                          provider_account_identity=body.get("provider_account_identity") or "fixture-account",
+                          conversation_id=conversation, parent_message_id="answer-" + body["client_request_id"],
+                          binding_status="bound")
+        return result
 
     tasks = TextTaskService(store.path, runner=synthetic_model, admission=admission)
     admission.register("text", lambda context, body: tasks._run(context.owner, context.request_id, body))
     chat_requests.text_task_service = tasks
+    if mode == "lifecycle":
+        from services import text_task_service as text_module
+        from services.work_lifecycle import WorkLifecycleService
+        text_module.text_task_service = tasks
+        admission.work_lifecycle = WorkLifecycleService(tasks, SimpleNamespace())
+        def synthetic_archive(receipt, archived):
+            with (root / "archives.jsonl").open("a") as log:
+                log.write(json.dumps({"request_id": receipt["request_id"],
+                                      "conversation_id": receipt["conversation_id"], "archived": archived}) + "\n")
+            if (root / "fail-archive").exists():
+                raise TimeoutError("controlled lost archive response")
+            return {"archived": archived}
+        text_module.conversation_binding_service.set_archived = synthetic_archive
 
     @asynccontextmanager
     async def lifespan(_app):
