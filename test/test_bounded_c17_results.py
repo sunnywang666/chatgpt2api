@@ -8,6 +8,21 @@ from PIL import Image
 
 spec=importlib.util.spec_from_file_location('bounded_c17_round',Path(__file__).parents[1]/'scripts/acceptance/bounded_c17_round.py')
 client=importlib.util.module_from_spec(spec);spec.loader.exec_module(client)
+driver_spec=importlib.util.spec_from_file_location('real_candidate_client',Path(__file__).parents[1]/'scripts/acceptance/real_candidate_client.py')
+real_client=importlib.util.module_from_spec(driver_spec);driver_spec.loader.exec_module(real_client)
+
+
+def test_text_recovery_reads_existing_result_without_overwriting(tmp_path):
+    receipt={'status':'succeeded','content':'original result'}
+    record={'id':'original'}
+    real_client._save_text_content(record,receipt,tmp_path)
+    target=tmp_path/'original.txt';before=target.stat().st_mtime_ns
+    recovered={'id':'original'}
+    real_client._save_text_content(recovered,receipt,tmp_path)
+    assert recovered==record and target.stat().st_mtime_ns==before
+    with pytest.raises(SystemExit):
+        real_client._save_text_content({'id':'original'},{'status':'succeeded','content':'changed'},tmp_path)
+    assert target.read_text()=='original result'
 
 def png(color):
     out=BytesIO();Image.new('RGB',(2,3),color).save(out,format='PNG');return out.getvalue()

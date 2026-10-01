@@ -86,6 +86,7 @@ class AccountRequestClock:
         self.cooldown_until = 0.0
         self.rate_failures = 0
         self.last_rate_limit = 0.0
+        self.last_rate_limit_evidence = None
         self.last_turn_started = None
         self._load()
 
@@ -100,6 +101,7 @@ class AccountRequestClock:
                 raise ValueError("Invalid saved account request clock")
             setattr(self, field, value - offset)
         self.rate_failures = max(0, int(saved["rate_failures"]))
+        self.last_rate_limit_evidence = saved.get("last_rate_limit_evidence")
         started = saved.get("last_turn_started")
         if started is not None:
             self.last_turn_started = float(started) - offset
@@ -111,6 +113,7 @@ class AccountRequestClock:
         saved = {field: getattr(self, field) + offset for field in
                  ("next_request", "next_turn", "cooldown_until", "last_rate_limit")}
         saved["rate_failures"] = self.rate_failures
+        saved["last_rate_limit_evidence"] = self.last_rate_limit_evidence
         saved["last_turn_started"] = None if self.last_turn_started is None else self.last_turn_started + offset
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_suffix(".tmp")
@@ -127,7 +130,6 @@ class AccountRequestClock:
         self.last_rate_limit = time.monotonic()
         fallback = min(900.0, 60.0 * (2 ** min(self.rate_failures - 1, 4)))
         self.cooldown_until = self.last_rate_limit + max(fallback, retry_after)
-        self._save()
         context = current_request.get()
         observed = {"layer": "upstream_chatgpt", "phase": "unknown", "origin": "http_429",
                     **(evidence or {}), "retry_after_seconds": retry_after,
@@ -136,6 +138,11 @@ class AccountRequestClock:
                     "observed_at": time.time(), "account": self.account_key}
         if context is not None:
             observed["request_ref"] = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24]
+        # Metadata/archiving calls have no generation context. Keep their
+        # bounded, sanitized evidence with the cooldown across restarts too.
+        self.last_rate_limit_evidence = observed
+        self._save()
+        if context is not None:
             context.record_limit(observed)
         logger.warning({"event": "account_rate_limited", "account": self.account_key,
                         "consecutive_limits": self.rate_failures,
@@ -175,6 +182,13 @@ class AccountRequestClock:
         is_turn = str(method).upper() == "POST" and (path.endswith("/conversation") or path.endswith("/responses"))
         context = current_request.get()
         phase = "conversation" if is_turn else "prepare" if path.endswith("/conversation/prepare") else "account_read"
+        if "/conversation/" in path and str(method).upper() == "PATCH":
+            phase = "conversation_update"
+            body = kwargs.get("json")
+            if isinstance(body, dict) and isinstance(body.get("is_archived"), bool):
+                phase = "conversation_archive" if body["is_archived"] else "conversation_restore"
+        elif "/conversation/" in path and str(method).upper() == "GET":
+            phase = "conversation_read"
         raw_model = (kwargs.get("json") or {}).get("model") if isinstance(kwargs.get("json"), dict) else None
         model = raw_model if isinstance(raw_model, str) and len(raw_model) <= 160 else None
         request_ref = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24] if context else None

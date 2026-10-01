@@ -301,14 +301,36 @@ def test_before_send_rechecks_not_before_after_claim_and_returns_original_to_que
     rt=runtime
     submit(rt,'one',scheduling={'not_before':at(990)})
     ctx=rt.admission.claim_next();assert ctx
+    rt.admission.update_claim(ctx, active_attempt_started_at=1000,
+                              active_attempt_deadline_at=1300, started_ts=1000)
     # A backwards-moving clock must not let the acquired claim bypass not_before.
     rt.admission.clock=lambda:980
     with pytest.raises(AdmissionLost,match='SCHEDULING_NOT_BEFORE'):ctx.before_send()
     saved=row(rt,'one')
     assert saved['status']=='queued' and saved['upstream_outcome']=='not_sent'
     assert saved['waiting']['reasons']==['not_before'] and not work(rt,saved)['slot_held']
+    assert all(saved[k] is None for k in ('active_attempt_started_at','active_attempt_deadline_at','started_ts'))
     rt.admission.clock=lambda:1001
     assert rt.admission.claim_next().request_id=='one'
+
+
+@pytest.mark.parametrize('explicit_error', [False, True])
+def test_unsent_handler_requeue_releases_active_budget(runtime, explicit_error):
+    rt=runtime
+    submit(rt,'one')
+    def interrupted(ctx, body):
+        rt.admission.update_claim(ctx, active_attempt_started_at=1000,
+                                  active_attempt_deadline_at=1300, started_ts=1000)
+        if explicit_error:
+            rt.admission.update_claim(ctx, status='error', error_code='IMAGE_RESOURCE_UNAVAILABLE')
+        else:
+            raise RuntimeError('before model submission')
+    rt.admission.handlers['image']=interrupted
+    rt.admission.execute(rt.admission.claim_next())
+    saved=row(rt,'one')
+    assert saved['status']=='queued' and not saved['_submission_started']
+    assert not saved['_executing'] and not saved['_claim_id']
+    assert all(saved[k] is None for k in ('active_attempt_started_at','active_attempt_deadline_at','started_ts'))
 
 
 @pytest.mark.parametrize('unknown',[False,True])

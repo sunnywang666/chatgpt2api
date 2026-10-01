@@ -151,14 +151,19 @@ def _save_text_content(record: dict[str, Any], receipt: dict[str, Any], result_d
     result_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(result_dir, 0o700)
     target = result_dir / f"{record['id']}.txt"
-    if target.exists():
-        _die("client_error=refuse_overwrite_result")
     raw = content.encode("utf-8")
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(raw)
-        handle.flush()
-        os.fsync(handle.fileno())
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # A process can stop after fsync but before saving its journal or
+        # confirming archive. Reuse only the exact original public result.
+        if target.is_symlink() or not target.is_file() or target.read_bytes() != raw:
+            _die("client_error=refuse_overwrite_result")
+    else:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
     # Readback proves the saved text is exactly the public terminal result.
     saved = target.read_bytes()
     if saved != raw:

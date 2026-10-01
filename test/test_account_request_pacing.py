@@ -63,6 +63,21 @@ class AccountRequestPacingTests(unittest.TestCase):
 
             self.assertEqual(response.status_code, 429)
             self.assertGreaterEqual(clock.cooldown_until - time.monotonic(), 122)
+            restarted = AccountRequestClock("account", Path(tmp) / "clock.json")
+            self.assertEqual(restarted.last_rate_limit_evidence["phase"], "account_read")
+            self.assertEqual(restarted.last_rate_limit_evidence["retry_after_seconds"], 123)
+
+    def test_archive_429_retains_phase_without_generation_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            response = Response();response.status_code = 429
+            clock.request(lambda *a, **kw: response, "PATCH",
+                          "https://chatgpt.com/backend-api/conversation/private-conversation-id",
+                          json={"is_archived": True})
+            saved = AccountRequestClock("account", Path(tmp) / "clock.json").last_rate_limit_evidence
+            self.assertEqual(saved["phase"], "conversation_archive")
+            self.assertEqual(saved["upstream_request_id"], "fixture-request")
+            self.assertNotIn("private-conversation-id", str(saved))
 
     def test_stream_lock_is_released_at_headers_not_stream_terminal(self):
         with tempfile.TemporaryDirectory() as tmp:

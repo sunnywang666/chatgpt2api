@@ -22,6 +22,13 @@ from services import workflow_scheduling
 from utils.log import logger
 
 
+def reset_unsent_image_attempt(kind, receipt):
+    if not receipt.get("_submission_started") and (kind == "image" or receipt.get("_operation") == "image"):
+        # Queue/cooldown time is outside a not-yet-sent active attempt.
+        receipt.update(active_attempt_started_at=None,
+                       active_attempt_deadline_at=None, started_ts=None)
+
+
 def account_clock_key(account):
     # Use the identity already owned by AccountRequestClock. Duplicate imports
     # of that upstream identity share both its turn and image constraints.
@@ -1106,6 +1113,7 @@ class PoolAdmission:
                         r.update(status="queued", upstream_outcome="not_sent", upstream_unfinished=False,
                                  _claim_id=None, _claim_until=0, _turn_reserved=False, _executing=False,
                                  _ready_at=now + 1, waiting={"reasons": [reason], "next_check_at": now + 1})
+                        reset_unsent_image_attempt(context.kind, r)
                         if cancelled:
                             r.update(status="failed" if context.kind == "text" else "error",
                                      error_code="COMPLETION_ORIGINAL_RECOVERED", waiting=None)
@@ -1274,8 +1282,10 @@ class PoolAdmission:
                     if r.get("_submission_started"):
                         r.update(status="unknown" if context.kind == "text" else "error", error_code="CONVERSATION_OUTCOME_UNKNOWN")
                     else:
-                        r.update(status="queued", _claim_id=None, _turn_reserved=False, upstream_unfinished=False,
+                        r.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
+                                 _turn_reserved=False, upstream_unfinished=False,
                                  _ready_at=float(self.clock()) + 1)
+                        reset_unsent_image_attempt(context.kind, r)
                     self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
         finally:
             done.set()
@@ -1284,8 +1294,10 @@ class PoolAdmission:
                 if r and r.get("_claim_id") == context.claim:
                     r["_executing"] = False
                     if not r.get("_submission_started") and r.get("error_code") in {"CONVERSATION_OUTCOME_UNKNOWN", "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}:
-                        r.update(status="queued", _claim_id=None, _turn_reserved=False, upstream_unfinished=False,
+                        r.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
+                                 _turn_reserved=False, upstream_unfinished=False,
                                  _ready_at=float(self.clock()) + 1)
+                        reset_unsent_image_attempt(context.kind, r)
                     self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
             try:
                 context.record_outcome()
