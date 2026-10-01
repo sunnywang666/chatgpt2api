@@ -72,7 +72,7 @@ def _provider_account_identity(record: dict[str, Any]) -> str:
 _ACCOUNT_COPY_FIELDS = frozenset({
     # No refresh/password/Codex material: this acceptance process can use only
     # a still-valid access token and therefore cannot rotate a live credential.
-    "access_token",
+    "access_token", "proxy",
     "account_id", "provider_account_identity", "managed_pool_account_ref",
     "user_id", "source_type", "type", "status", "quota", "limits_progress",
     "models", "capabilities", "image_capabilities", "image_models",
@@ -168,6 +168,7 @@ def _temporary_config(source: dict[str, Any], bootstrap_key: str) -> dict[str, A
     """Explicit allowlist. All writing/cleanup/relogin integrations stay off."""
     return {
         "auth-key": bootstrap_key,
+        "proxy": str(source.get("proxy") or ""),
         "proxy_runtime": _safe_proxy_runtime(source.get("proxy_runtime")),
         "default_upstream_model_name": str(source.get("default_upstream_model_name") or "gpt-5-5"),
         "default_thinking_effort": str(source.get("default_thinking_effort") or "auto"),
