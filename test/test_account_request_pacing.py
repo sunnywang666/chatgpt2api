@@ -47,6 +47,78 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_actual_send_gap_includes_slow_fence_and_durable_clock_write(self):
+        for method, message_interval, fail_first in (("GET", 0, False), ("POST", 5, False), ("GET", 0, True), ("POST", 5, True)):
+            with self.subTest(method=method, fail_first=fail_first), tempfile.TemporaryDirectory() as tmp:
+                now = [10000.0]
+                def advance(seconds):
+                    now[0] += seconds
+
+                with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+                     patch("services.account_request_pacing.time.sleep", side_effect=advance), \
+                     patch.object(type(config), "account_request_interval_secs", property(lambda _: 2)), \
+                     patch.object(type(config), "account_message_interval_secs", property(lambda _: message_interval)):
+                    clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+                    save = clock._save
+                    saves = []
+                    def slow_first_save():
+                        if not saves:
+                            advance(0.25)
+                        saves.append(now[0])
+                        save()
+                    clock._save = slow_first_save
+                    sent = []
+                    def send(*args, **kwargs):
+                        sent.append(now[0])
+                        if fail_first and len(sent) == 1:
+                            raise OSError("transport outcome unknown")
+                        return Response()
+                    class SlowFence(Context):
+                        def before_send(self):
+                            super().before_send()
+                            if not sent:
+                                advance(0.25)
+                    context = SlowFence("slow-durable-fence")
+                    kwargs = {"_account_request_before_send": lambda: advance(0.25)}
+                    with executing(context):
+                        if fail_first:
+                            with self.assertRaises(OSError):
+                                clock.request(send, method, "https://provider/backend-api/conversation", **kwargs)
+                            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+                        else:
+                            clock.request(send, method, "https://provider/backend-api/conversation", **kwargs)
+                        clock.request(send, method, "https://provider/backend-api/conversation")
+                    self.assertGreaterEqual(sent[1] - sent[0], max(2, message_interval))
+                    restarted = AccountRequestClock("account", Path(tmp) / "clock.json")
+                    self.assertGreaterEqual(restarted.next_request, sent[-1] + 2 - 0.001)
+                    if method == "POST":
+                        self.assertGreaterEqual(restarted.next_turn, sent[-1] + message_interval - 0.001)
+
+    def test_preflight_get_obeys_actual_send_gap_after_slow_clock_write(self):
+        now = [10000.0]
+        def advance(seconds):
+            now[0] += seconds
+        with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=advance), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 2)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account")
+            writes = []
+            def slow_first_save():
+                if not writes:
+                    advance(0.25)
+                writes.append(now[0])
+            clock._save = slow_first_save
+            sent = []
+            def send(method, url, **kwargs):
+                sent.append((method, now[0]))
+                return Response()
+            clock.request(send, "POST", "https://provider/backend-api/conversation",
+                          _account_request_preflight=lambda read: read("GET", "https://provider/backend-api/conversation/original"))
+            self.assertEqual([x[0] for x in sent], ["GET", "POST"])
+            self.assertGreaterEqual(sent[1][1] - sent[0][1], 2)
+
     def test_metadata_429_keeps_account_cooldown_and_retry_after(self):
         with tempfile.TemporaryDirectory() as tmp:
             clock = AccountRequestClock("account", Path(tmp) / "clock.json")

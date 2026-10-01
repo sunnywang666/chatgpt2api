@@ -243,7 +243,15 @@ class AccountRequestClock:
                             read_kwargs["timeout"] = min(float(read_kwargs.get("timeout", 60)), remaining)
                         self.next_request = time.monotonic() + min(60.0, config.account_request_interval_secs * 2 ** min(self.rate_failures, 4))
                         self._save()
-                        response = send(read_method, read_url, **read_kwargs)
+                        sent_at = time.monotonic()
+                        try:
+                            response = send(read_method, read_url, **read_kwargs)
+                        finally:
+                            # Persisting the reservation can itself take time.
+                            # Correct its floor from the actual transport edge
+                            # before another caller can acquire this clock.
+                            self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * 2 ** min(self.rate_failures, 4)))
+                            self._save()
                         if response.status_code == 429:
                             request_id = (response.headers.get("x-request-id") or response.headers.get("openai-request-id"))
                             safe_id = request_id if isinstance(request_id, str) and len(request_id) <= 160 and request_id.isascii() and not any(c.isspace() for c in request_id) else None
@@ -258,6 +266,14 @@ class AccountRequestClock:
                         if remaining is not None and delay >= remaining:
                             raise AccountRequestDeadlineExceeded("deadline elapsed after preflight")
                         time.sleep(delay)
+                if context is not None and is_turn:
+                    context.before_send()
+                    if hasattr(context, "record_stage"):
+                        context.record_stage("send_call_started")
+                if callable(before_send):
+                    before_send()
+                # Receipt persistence and final fences must not consume the
+                # interval reserved for the following upstream request.
                 now = time.monotonic()
                 cap_timeout_before_send()
                 factor = 2 ** min(self.rate_failures, 4)
@@ -276,16 +292,20 @@ class AccountRequestClock:
                 remaining = remaining_budget()
                 if remaining is not None and remaining <= 0:
                     raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
-                if context is not None and is_turn:
-                    context.before_send()
-                    if hasattr(context, "record_stage"):
-                        context.record_stage("send_call_started")
-                if callable(before_send):
-                    before_send()
                 # Saving pacing state and the submission receipt can consume
                 # part of the declared budget; cap once more at the send edge.
                 cap_timeout_before_send()
-                response = send(method, url, **kwargs)
+                sent_at = time.monotonic()
+                try:
+                    response = send(method, url, **kwargs)
+                finally:
+                    # Keep the pre-send durable reservation for crash safety,
+                    # then account for its I/O delay even if transport fails.
+                    self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
+                    if is_turn:
+                        self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
+                        self.last_turn_started = sent_at
+                    self._save()
                 release_pacing()
                 response_headers = getattr(response, "headers", {}) or {}
                 upstream_id = response_headers.get("x-request-id") or response_headers.get("openai-request-id")
