@@ -392,7 +392,92 @@ def test_http_stalled_original_cli_restart_and_late_save_without_another_send(tm
     assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"stalled-original"']
 
 
-def _serve_images(root, completion=False):
+def test_http_stalled_completion_late_original_closes_full_workflow_after_restart(tmp_path):
+    from examples import image_client
+    state, output = tmp_path / "stalled-state.json", tmp_path / "late-result.json"
+    request_id = "stalled-completion-original"
+    endpoint = "/api/chat-requests/" + request_id + "/completion"
+    def cli(port, key, command, *extra):
+        result = subprocess.run([sys.executable, str(Path(image_client.__file__)), command,
+                                 "--state", str(state), *map(str, extra)],
+            env={**os.environ, "SERVER_ROOT": f"http://127.0.0.1:{port}", "CHATGPT2API_BEARER_TOKEN": key},
+            capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+    with _server(tmp_path, "stalled-completion") as (port, key, _):
+        cli(port, key, "chat-submit", "--request-id", request_id, "--session-id", "stalled-work",
+            "--model", "fixture-text", "--prompt", "controlled retained objective")
+        _wait(lambda: _http(port, key, "GET", "/api/chat-requests/" + request_id)[1].get(
+            "execution", {}).get("phase") == "stalled")
+        stopped = cli(port, key, "chat-completion-recover")
+        assert stopped["state"] == "needs_attention" and stopped["reason"] == "COMPLETION_ORIGINAL_END_UNCONFIRMED"
+        assert not stopped.get("replacement_id")
+    with _server(tmp_path, "stalled-completion") as (port, key, _):
+        (tmp_path / "original-completed").touch()
+        _success(port, key, request_id)
+        chosen = cli(port, key, "chat-completion-status")
+        assert chosen["selected_id"] == request_id and not chosen.get("replacement_id")
+        cli(port, key, "chat-completion-save", "--output", output)
+        saved = json.loads(output.read_text())
+        assert saved["request_id"] == request_id and saved["content"] == "late original HTTP result"
+        assert cli(port, key, "chat-completion-complete", "--reviewed")["state"] == "completed"
+        _wait(lambda: _http(port, key, "GET", endpoint)[1].get("work", {}).get("archive", {}).get("status") == "confirmed")
+        cli(port, key, "chat-completion-rework")
+        _wait(lambda: _http(port, key, "GET", endpoint)[1].get("work", {}).get("state") == "active")
+    assert (tmp_path / "sends.jsonl").read_text().splitlines() == [json.dumps(request_id)]
+
+
+def test_http_same_step_messages_preserve_order_and_reject_middle_input_drift(tmp_path):
+    messages = [{"role": role, "content": value} for role, value in (
+        ("system", "fixture rule"), ("user", "first question"),
+        ("assistant", "prior answer"), ("user", "current question"))]
+    body = {**_input(tmp_path, "ordered-input"), "messages": messages}
+    with _server(tmp_path, "ordered-input") as (port, key, _):
+        assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
+        _success(port, key, body["client_request_id"])
+        changed = json.loads(json.dumps(body))
+        changed["messages"][1]["content"] = "changed earlier input"
+        assert _http(port, key, "POST", "/api/chat-requests", changed)[0] == 409
+    assert json.loads((tmp_path / "received-messages.json").read_text()) == messages
+    assert len((tmp_path / "sends.jsonl").read_text().splitlines()) == 1
+
+
+def test_http_restored_account_wakes_original_id_without_starving_other_owner_workflows(tmp_path):
+    from services.task_store import TaskStore
+    def body(task_id, workflow, selected=False):
+        return {"client_task_id": task_id, "model": "gpt-image-2", "prompt": "controlled image",
+                "scheduling": {"workflow_id": workflow, "workflow_concurrency": 1},
+                **({"account_ref": "car_" + "B" * 43} if selected else {})}
+    with _server(tmp_path, "image-fair-recovery") as (port, _, _):
+        keys = json.loads((tmp_path / "fixture-fair-keys.json").read_text())
+        jobs = [("same_one", "bound-recovery", "recovery", True),
+                ("same_two", "same-owner-healthy", "healthy-a", False),
+                ("other", "other-owner-healthy", "healthy-b", False)]
+        for key, task_id, workflow, selected in jobs:
+            assert _http(port, keys[key], "POST", "/api/image-tasks/generations", body(task_id, workflow, selected))[0] == 200
+        _wait(lambda: (tmp_path / "metadata-reads.jsonl").exists())
+        assert not (tmp_path / "image-sends.jsonl").exists()
+        def success(key, task_id):
+            return _http(port, keys[key], "GET", "/api/image-tasks?ids=" + task_id)[1]["items"][0]["status"] == "success"
+        (tmp_path / "healthy-recovered").touch()
+        _wait(lambda: success("same_two", "same-owner-healthy") and success("other", "other-owner-healthy"), timeout=45)
+        assert not success("same_one", "bound-recovery")
+        (tmp_path / "quota-recovered").touch()
+        _wait(lambda: success("same_one", "bound-recovery"), timeout=45)
+    sends = [json.loads(line) for line in (tmp_path / "image-sends.jsonl").read_text().splitlines()]
+    assert {row["request_id"] for row in sends[:2]} == {"same-owner-healthy", "other-owner-healthy"}
+    assert len(sends) == 3 and sends[-1]["request_id"] == "bound-recovery"
+    assert sends[-1]["account"] == "account-B"
+    store = TaskStore(tmp_path / "text_tasks.sqlite3")
+    with store.connect() as db:
+        rows = {request_id: store.read_receipt(db, kind, owner, request_id)
+                for kind, owner, request_id, _ in store.receipts(db)}
+    assert rows["bound-recovery"]["_source"] == rows["same-owner-healthy"]["_source"]
+    assert rows["bound-recovery"]["_source"] != rows["other-owner-healthy"]["_source"]
+    assert rows["bound-recovery"]["_requested_account_identity"] == "account-B"
+
+
+def _serve_images(root, completion=False, fair_recovery=False):
     import pytest
     import uvicorn
     from contextlib import asynccontextmanager
@@ -407,11 +492,14 @@ def _serve_images(root, completion=False):
     rt = runtime.__wrapped__(root, patches)
     rt.admission.clock = time.time
     rt.update("B", status="限流", **fresh(0))
+    if fair_recovery:
+        rt.update("A", status="限流", **fresh(0))
     def metadata(token):
+        letter = str(token).rsplit("-", 1)[-1]
+        recovered = (root / ("healthy-recovered" if letter == "A" and fair_recovery else "quota-recovered")).exists()
         with (root / "metadata-reads.jsonl").open("a") as log:
-            log.write(json.dumps({"account": "B", "at": time.monotonic(),
-                                  "recovered": (root / "quota-recovered").exists()}) + "\n")
-        amount = 3 if (root / "quota-recovered").exists() else 0
+            log.write(json.dumps({"account": letter, "at": time.monotonic(), "recovered": recovered}) + "\n")
+        amount = 3 if recovered else 0
         return ("fixture-user", ""), {**fresh(amount), "quota": amount, "status": "正常" if amount else "限流"}
     rt.accounts._verified_chat_info = metadata
     rt.accounts.refresh_image_capability = rt.accounts._refresh_pool_chat
@@ -436,6 +524,12 @@ def _serve_images(root, completion=False):
     _, secret = auth.create_key(role="user", owner_subject="fixture-person", routes=["chat"])
     (root / "fixture-key").write_text(secret)
     (root / "fixture-key").chmod(0o600)
+    if fair_recovery:
+        keys = {}
+        for name, person in (("same_one", "same"), ("same_two", "same"), ("other", "other")):
+            _, keys[name] = auth.create_key(role="user", routes=["chat"], owner_subject="fixture-person-" + person)
+        (root / "fixture-fair-keys.json").write_text(json.dumps(keys))
+        (root / "fixture-fair-keys.json").chmod(0o600)
     support.auth_service = auth
     image_tasks.image_task_service = rt.tasks
     if completion:
@@ -558,8 +652,8 @@ def _serve(root, mode):
     import requests.sessions
     curl_cffi.requests.Session.request = forbidden
     requests.sessions.Session.request = forbidden
-    if mode in {"image-recovery", "image-completion"}:
-        return _serve_images(root, completion=mode == "image-completion")
+    if mode in {"image-recovery", "image-completion", "image-fair-recovery"}:
+        return _serve_images(root, completion=mode == "image-completion", fair_recovery=mode == "image-fair-recovery")
 
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
@@ -603,11 +697,13 @@ def _serve(root, mode):
 
     def synthetic_model(body, on_cursor):
         current_request.get().before_send()
+        if mode == "ordered-input":
+            (root / "received-messages.json").write_text(json.dumps(body["messages"]))
         with (root / "sends.jsonl").open("a") as log:
             log.write(json.dumps(body["client_request_id"]) + "\n")
             log.flush()
             os.fsync(log.fileno())
-        if mode == "stalled" or mode in {"completion", "same-session-completion"} and body["client_request_id"] == "completion-original":
+        if mode in {"stalled", "stalled-completion"} or mode in {"completion", "same-session-completion"} and body["client_request_id"] == "completion-original":
             from services.conversation_binding_service import ConversationBindingError
             current_request.get().record_stage("send_call_started")
             current_request.get().record_stage("response_headers_received", status_code=200)
@@ -633,7 +729,7 @@ def _serve(root, mode):
         return result
 
     tasks = TextTaskService(store.path, runner=synthetic_model, admission=admission)
-    if mode in {"stalled", "completion", "same-session-completion"}:
+    if mode in {"stalled", "stalled-completion", "completion", "same-session-completion"}:
         # Accelerate only this isolated child fixture. Production's 900-second
         # boundary is exercised with a manual clock in the service regressions.
         TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS = .05
@@ -657,7 +753,7 @@ def _serve(root, mode):
         tasks.recovery_reader = original_read
     admission.register("text", lambda context, body: tasks._run(context.owner, context.request_id, body))
     chat_requests.text_task_service = tasks
-    if mode in {"lifecycle", "completion", "same-session-completion"}:
+    if mode in {"lifecycle", "stalled-completion", "completion", "same-session-completion"}:
         from services import text_task_service as text_module
         from services.work_lifecycle import WorkLifecycleService
         text_module.text_task_service = tasks
@@ -670,7 +766,7 @@ def _serve(root, mode):
                 raise TimeoutError("controlled lost archive response")
             return {"archived": archived}
         text_module.conversation_binding_service.set_archived = synthetic_archive
-        if mode in {"completion", "same-session-completion"}:
+        if mode in {"stalled-completion", "completion", "same-session-completion"}:
             from services.generation_completion import GenerationCompletionService
             GenerationCompletionService.STALL_SECONDS = .05
             GenerationCompletionService.INVESTIGATION_SECONDS = .05

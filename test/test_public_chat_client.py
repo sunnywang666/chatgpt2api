@@ -205,9 +205,25 @@ class ChatClientTest(unittest.TestCase):
                 self.assertNotIn("fixture-only", text)
                 self.assertNotIn(f"delta-{request_id}", text)
 
-    def test_incomplete_or_unconfirmed_predecessor_never_submits_next_turn(self):
+    def test_queued_or_running_predecessor_can_accept_a_durable_dependent_turn(self):
         with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, receipts, _):
-            for index, status in enumerate(("queued", "running", "not_started", "unknown", "failed", "missing", "wrong_session", "old_protocol")):
+            for status in ("queued", "running"):
+                receipts["previous"] = {"request_id": "previous", "route": "chat", "status": status,
+                    "conversation": {"protocol": "sequential-v1", "client_conversation_id": "work",
+                                     "previous_request_id": None}}
+                result = run("next-" + status, "previous")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                post = calls[-1]
+                self.assertEqual(post[0], "POST")
+                self.assertEqual(post[1]["previous_request_id"], "previous")
+                self.assertEqual(post[2]["phase"], "prepared")
+                # Restart only reads the child; it never resubmits either turn.
+                self.assertEqual(run("next-" + status, "previous").returncode, 0)
+            self.assertEqual(sum(row[0] == "POST" for row in calls), 2)
+
+    def test_failed_or_unconfirmed_predecessor_never_submits_next_turn(self):
+        with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, receipts, _):
+            for index, status in enumerate(("not_started", "unknown", "failed", "missing", "wrong_session", "old_protocol")):
                 with self.subTest(status=status):
                     receipt = {"request_id": "previous", "route": "chat", "status": status, "conversation": {
                         "protocol": "sequential-v1", "client_conversation_id": "work", "previous_request_id": None}}
@@ -219,7 +235,7 @@ class ChatClientTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 1)
                     self.assertFalse((Path(directory) / f"next-{index}.json").exists())
             self.assertTrue(all(call[0] == "GET" for call in calls))
-            self.assertEqual(len(calls), 8)
+            self.assertEqual(len(calls), 6)
 
     def test_missing_session_confirmation_preserves_original_and_never_falls_back(self):
         with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, receipts, _):

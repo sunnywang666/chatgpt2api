@@ -714,8 +714,10 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
             prior_session = previous.get("conversation")
             if not isinstance(prior_session, dict) or prior_session.get("protocol") != "sequential-v1" or prior_session.get("client_conversation_id") != args.session_id:
                 raise ClientError("previous Chat request does not belong to this sequential-v1 session")
-            if previous.get("status") != "succeeded":
-                raise ClientError("previous Chat request is not succeeded; query its original ID before submitting this turn")
+            if previous.get("status") not in {"succeeded", "queued", "running"}:
+                raise ClientError("previous Chat request cannot accept a dependent turn; recover its original result first")
+            # Admission persists this dependency and sends only after the
+            # previous answer finishes. Client acceptance is not a model send.
         state = {"schema": "chatgpt2api.chat-request.v1", "request_id": request_id,
                  "input_fingerprint": fingerprint, "phase": "prepared", "created_at": _utc_now()}
         if account_ref is not None:

@@ -177,21 +177,21 @@ Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `
 
 ### 连续工作会话（sequential-v1 增量）
 
-原生 Chat 文字的每个公共回执带脱敏 `execution`。`send_state=not_sent` 需要明确未发送证据，`attempted` 只证明进入发送边界，`response_received` 只证明收到 HTTP 响应头；均不能单独证明生成成功。`sent_at`、`response_received_at`、`local_finished_at` 分别记录发送、响应、本地执行结束。`first_stream_event_at` 是首个流事件，不是思考或首个文字 token；旧回执缺发送证据时返回 `unknown`。不要将 `running` 一律展示为“正在生成”。
+原生 Chat 文字的每个公共回执带脱敏 `execution`。`send_state=not_sent` 需要明确未发送证据，`attempted` 只证明进入发送边界，`response_received` 只证明收到 HTTP 响应头；均不能单独证明生成成功。`sent_at`、`response_received_at`、`local_finished_at` 分别记录发送、响应、本地执行结束。`first_stream_event_at` 是首个流事件，不是思考或首个文字 token；旧回执缺发送证据时返回 `unknown`。不要将 `running` 一律展示为“正在生成”。 `stream_end`区分done（收到SSE结束标记）、eof、hard_timeout、transport_error与consumer_closed；`stream_ended_at`、`sse_data_count`、`sse_parse_errors`及`sse_error_event`只保存结构诊断，不包含原始正文或错误内容。done和HTTP 200都不证明生成完成：兼容流也要读回原分支的最终文本。缺尾文本仅从核验的原结果补回，空结果保持UNKNOWN；已发文本与最终结果冲突时保留旧流，原ID恢复读取生成新的完整结果文件，不再发送模型请求。历史回执缺诊断字段不补猜。
 
 `observation_started_at` 是首次有效原结果观察，`last_checked_at` 是最近有效观察，`last_progress_at` 仅在同一原请求的有效消息结构、状态或文本长度发生变化时出现。原分支的已知 `code`、`execution_output`、`thoughts`、`reasoning_recap` 封装也可观测，只保留类型、长度和条目计数，不持久化或公开正文；未知／媒体封装不计为有效空结果。上游 `update_time` 单独变化、无关分支变化、网络／429／授权失败不算进展。对持续 `REQUEST_RESULT_INCOMPLETE`，至少 15 分钟无可验证变化且至少 3 次有效无变化读后，持久化 `phase=stalled / wait_state=ended / wait_ended_at`：本次结果等待异常结束，原 `status=unknown` 和上游结果未知仍保留。此标记**不释放**可能仍在执行的账号 turn，不放行同会话后续，不允许重发；它与已有 `RESULT_UNRECOVERABLE` 合格无结果释放规则分开。迟到结果仍沿原 ID 接回，重启不重置观察或结束记录。
 
 客户端读到 `wait_state=ended` 应停止本次前台等待，保存原 ID、输入和最后回执，显示未确认的原因、`recovery.attempt/reason/next_at`，以后仍沿原 ID 恢复。`resources.local_worker/account_turn/conversation` 分别解释本地执行、账号执行位置、会话保护；工作槽位和归档以 `/work` 回执为准。示例显示：“请求已发送并收到响应；本地执行已结束；原结果连续无可验证进展，本次等待结束；上游结果未知，账号执行位置仍占用，同会话后续受保护。禁止自动重发。” 这是工程状态合同，不是对生产或真实上游已恢复的声明。
 
-持续推进的应用可在现有 `/api/chat-requests` 请求中提供 `client_conversation_id`；这是调用者的工作会话引用，不是上游 ChatGPT conversation ID。每轮使用不同的 `client_request_id`，除首轮外传 `previous_request_id` 指向已成功的原请求。每次只提供新增输入/工具结果与必要附件，不把全部旧历史再次追加。服务在原 owner 范围和原 SQLite 插入事务中核对前序、唯一后继，并沿前轮实际账号、上游会话和已证明最终回答承接；不允许客户端传管理绑定或原始上游游标。
+持续推进的应用可在现有 `/api/chat-requests` 请求中提供 `client_conversation_id`；这是调用者的工作会话引用，不是上游 ChatGPT conversation ID。每轮使用不同的 `client_request_id`，除首轮外传 `previous_request_id` 指向已受理的同会话原请求。每次只提供新增输入/工具结果与必要附件，不把全部旧历史再次追加。服务在原 owner 范围和原 SQLite 插入事务中核对前序、唯一后继，并沿前轮实际账号、上游会话和已证明最终回答承接；不允许客户端传管理绑定或原始上游游标。
 
-回执增加 `conversation={protocol:"sequential-v1",client_conversation_id,previous_request_id}`，不暴露池账号/上游ID。前序待定返回409 `CHAT_PREVIOUS_REQUEST_PENDING`；漏前序、跨会话或已有后继返回明确409；这些拒绝不代表新请求已受理。查询原前序，不换新ID绕过。客户端确认原前序 succeeded 后才提交后轮。重复同ID同输入仍返回原回执，即使会话已推进到更后面；旧不带此字段的请求保持原哈希及单次调用方式。
+回执增加 `conversation={protocol:"sequential-v1",client_conversation_id,previous_request_id}`，不暴露池账号/上游ID。前序为queued/running时可以预受理后轮，后轮持久排队，直到前序succeeded并核验原承接位置才实际发送；前序unknown/failed返回409 `CHAT_PREVIOUS_REQUEST_PENDING`。漏前序、跨会话或已有后继返回明确409；这些拒绝不代表新请求已受理。依赖前轮结果才能构造输入的步骤须先等结果，不能用占位输入提前提交。重复同ID同输入仍返回原回执，即使会话已推进到更后面；旧不带此字段的请求保持原哈希及单次调用方式。
 
-唯一例外是原请求已发送且原账号读回确认最终轮次 `end_turn=true`、文字为空：原回执继续为 `unknown`，并显示 `terminal_empty={verified:true,original_request_id,observed_at,same_conversation_continuation:true}`。应用若确需纠正协议，可用**新的** `client_request_id`、相同 `client_conversation_id`、指向该原请求的 `previous_request_id`、新的纠正说明作为末尾 user 消息，并显式传 `continue_after_terminal_empty:true`。服务原子限制该前序只有一个后继，绑定原账号、原上游会话与空回答的最终节点，发送前重新读取原结果；证据不符、读取失败或会话位置已变时不发送纠正轮次。此字段不表示原业务请求失败或可重发，也不允许绕过其他 `unknown`。普通 CLI 仍只接受成功前序，不会自动创建纠正轮次。
+唯一例外是原请求已发送且原账号读回确认最终轮次 `end_turn=true`、文字为空：原回执继续为 `unknown`，并显示 `terminal_empty={verified:true,original_request_id,observed_at,same_conversation_continuation:true}`。应用若确需纠正协议，可用**新的** `client_request_id`、相同 `client_conversation_id`、指向该原请求的 `previous_request_id`、新的纠正说明作为末尾 user 消息，并显式传 `continue_after_terminal_empty:true`。服务原子限制该前序只有一个后继，绑定原账号、原上游会话与空回答的最终节点，发送前重新读取原结果；证据不符、读取失败或会话位置已变时不发送纠正轮次。此字段不表示原业务请求失败或可重发，也不允许绕过其他 `unknown`。普通 CLI 接受succeeded/queued/running前序，不会自动把UNKNOWN变成纠正轮次。
 
 若这条**纠正请求本身**已受理，却在发送前以 `failed`／`CHAT_TERMINAL_EMPTY_UNVERIFIED`／`recovery.upstream_outcome=not_sent` 结束，升级或普通状态读取不会自动重发。核实原 ID、未发送时间线和持久输入后，可显式 `POST /api/chat-requests/{纠正请求ID}/recover`，请求体为 `{"resume_unsent_correction":true}`。服务仅在同一调用身份、原输入哈希、原账号/会话/消息位置和新鲜空终态证明都通过时，将**同一请求 ID** 原子放回原等待队列；派发前仍再次读取原结果。证据变化、输入缺失或曾开始发送均拒绝，不创建新 ID，也不修改原 `unknown`。默认 `{}` 的 recover 仅查询原结果，不重新发送模型请求；客户端不得自动给所有 failed/UNKNOWN 请求加此标志。
 
-公共客户端现支持 `--session-id` 和 `--previous-request-id`，用于从新会话开始的连续工作，不自动承接缺少sequential-v1回执的旧请求。每轮使用独立的 `--state` 文件，先把上一轮查到 `succeeded` 再提交下一轮；客户端还会在新POST前读取前序并核对协议、会话和成功状态，服务端最终原子核对唯一后继。下面三轮不依赖Happy或DSH；示例ID须替换为实际工作持久保存的ID，模型须从实时目录选择。先运行第一轮：
+公共客户端现支持 `--session-id` 和 `--previous-request-id`，用于从新会话开始的连续工作，不自动承接缺少sequential-v1回执的旧请求。每轮使用独立的 `--state` 文件，输入已知时可在上一轮queued/running期间提交后轮；依赖其输出时先等到succeeded再构造输入。客户端在新POST前读取前序并核对协议、会话和可受理状态，服务端最终原子核对唯一后继。下面三轮不依赖Happy或DSH；示例ID须替换为实际工作持久保存的ID，模型须从实时目录选择。先运行第一轮：
 
 ```sh
 python3 examples/image_client.py --env-file .image-client.env chat-submit \
@@ -220,9 +220,9 @@ python3 examples/image_client.py --env-file .image-client.env chat-submit \
 python3 examples/image_client.py --env-file .image-client.env chat-status --state ./work-3.json
 ```
 
-收到202、断线或进程退出后，以该轮原状态文件运行 `chat-status`；需要有界读取上游时运行 `chat-recover`。相同 `chat-submit` 重入也只查该轮原ID，不重发。`unknown`、前轮不成功、会话或协议不符时不能推进后轮；服务器拒绝字段或回执不确认sequential-v1时也不能去掉会话字段重试。客户端保存会话/前序身份且将其纳入原输入指纹，恢复时核对原回执，不把最新一轮结果当旧轮结果。保存状态文件不是保存全部输入；应用仍应保留原提示词/附件，服务器正式受理后的恢复依赖其持久输入，不能用历史缺输入请求冒充新协议验收。
+收到202、断线或进程退出后，以该轮原状态文件运行 `chat-status`；需要有界读取上游时运行 `chat-recover`。相同 `chat-submit` 重入也只查该轮原ID，不重发。`unknown`、`failed`、会话或协议不符时不能提交后轮；服务器拒绝字段或回执不确认sequential-v1时也不能去掉会话字段重试。客户端保存会话/前序身份且将其纳入原输入指纹，恢复时核对原回执，不把最新一轮结果当旧轮结果。保存状态文件不是保存全部输入；应用仍应保留原提示词/附件，服务器正式受理后的恢复依赖其持久输入，不能用历史缺输入请求冒充新协议验收。
 
-应用工具结果须在实际执行后作为下一轮新增user文本提交；这不是服务端工具调用协议，不发送 `role=tool` 或 `tools`。每轮最后一条消息必须是user。`client_conversation_id`、`previous_request_id`遵循原请求ID字符规则，缺省字段省略而非null。账号、上游会话和父消息位置由服务器保留；客户端不能用这些字段选账号，也不要把保存的会话数当执行占用。
+应用工具结果须在实际执行后作为下一轮新增user文本提交；这不是服务端工具调用协议，不发送 `role=tool` 或 `tools`。同一步的已知输入由调用方在受理前组为有序messages，服务保存完整顺序；不能合并或改写已受理的不同请求。每轮最后一条消息必须是user。`client_conversation_id`、`previous_request_id`遵循原请求ID字符规则，缺省字段省略而非null。账号、上游会话和父消息位置由服务器保留；客户端不能用这些字段选账号，也不要把保存的会话数当执行占用。
 
 服务端在模型发送前持久保存本轮最后一个 user 的实际父消息和整次上传的根父消息，二者在多段上下文时不同。新连续会话必须取得本请求唯一终态分支，不能用流断开或聊天的“最新回答”推进下一轮。显式承接旧已成功的原请求时，先重新读取证明原结果及游标；缺证明则保留等待（旧非准入执行模式明确失败），不重新建聊、不改旧收据。原 UNKNOWN 不自动迁移。新客户端需与本协议的 Provider 成对部署；无此协议的服务会拒绝字段，不能静默退回每轮新聊。
 

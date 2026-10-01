@@ -162,7 +162,8 @@ class ExecutionContext:
             "queue_wait_seconds": max(0, claimed - accepted) if type(accepted) in (int, float) and type(claimed) in (int, float) else None,
             "config_revision": settings.get("revision") if isinstance(settings, dict) else None,
             **{key: value for key, value in extra.items()
-               if key in {"status_code", "upstream_request_id", "output_ref", "known", "task_status", "image_count"}},
+               if key in {"status_code", "upstream_request_id", "output_ref", "known", "task_status", "image_count",
+                          "stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event"}},
         }
         timeline = list(receipt.get("_execution_timeline") or [])
         timeline.append(entry)

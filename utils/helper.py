@@ -226,15 +226,29 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
+def iter_sse_payloads(response: requests.Response, *, observation: dict | None = None) -> Iterator[str]:
     for raw_line in response.iter_lines():
         if not raw_line:
             continue
         line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
+        if observation is not None and line.startswith("event:") and line[6:].strip() == "error":
+            observation["sse_error_event"] = True
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
         if payload:
+            if observation is not None:
+                observation["sse_data_count"] = min(observation.get("sse_data_count", 0) + 1, 2147483647)
+                if payload == "[DONE]":
+                    observation["stream_end"] = "done"
+                else:
+                    try:
+                        event = json.loads(payload)
+                    except (ValueError, TypeError):
+                        observation["sse_parse_errors"] = min(observation.get("sse_parse_errors", 0) + 1, 2147483647)
+                    else:
+                        if isinstance(event, dict) and (event.get("type") == "error" or event.get("error")):
+                            observation["sse_error_event"] = True
             yield payload
 
 

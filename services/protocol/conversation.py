@@ -792,6 +792,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
+    emitted_text = ""
     while True:
         if token and token in attempted_tokens:
             raise RuntimeError("no available text account")
@@ -802,7 +803,6 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             active_backend = OpenAIBackendAPI(access_token=token)
             if recoverable:
                 active_backend.retain_bound_conversation = True
-            done = False
             for event in conversation_events(
                 active_backend,
                 messages=request.messages,
@@ -817,20 +817,43 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                         if receipt.get("conversation_id"):
                             raise RuntimeError("original conversation identity changed")
                         context.admission.update_claim(context, conversation_id=conversation_id)
-                    if event.get("type") == "conversation.done":
-                        done = True
-                        context.terminal(True)
                 if event.get("type") != "conversation.delta":
                     continue
                 delta = str(event.get("delta") or "")
                 if delta:
                     emitted = True
+                    emitted_text += delta
                     yield delta
-            if recoverable and not done:
-                # A transport EOF cannot authorize the formatter's final event.
-                from services.conversation_binding_service import ConversationBindingError
-                raise ConversationBindingError("original stream ended without its terminal event",
-                                               code="CONVERSATION_OUTCOME_UNKNOWN")
+            if recoverable:
+                # [DONE] and EOF describe the transport, not our model turn.
+                # Verify the exact persisted user branch before emitting a
+                # successful wire terminator or releasing its account turn.
+                from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
+                receipt = context.receipt()
+                try:
+                    if not receipt.get("conversation_id") or not receipt.get("request_message_id"):
+                        raise ValueError("original cursor is unavailable")
+                    recovered = ConversationBindingService._read_text_request_result(active_backend, receipt)
+                except Exception as exc:
+                    raise ConversationBindingError("original stream result could not be verified",
+                                                   code="CONVERSATION_OUTCOME_UNKNOWN") from exc
+                if recovered.get("status") != "succeeded":
+                    raise ConversationBindingError("original stream result is not complete",
+                                                   code="CONVERSATION_OUTCOME_UNKNOWN")
+                context.terminal(True)
+                final_text = sanitize_output_text(recovered["content"])
+                # The saved-result reader strips outer whitespace. Preserve
+                # whitespace already delivered without treating it as drift.
+                delivered = emitted_text.lstrip()
+                if final_text == delivered.rstrip():
+                    remaining = ""
+                elif final_text.startswith(delivered):
+                    remaining = final_text[len(delivered):]
+                else:
+                    raise ConversationBindingError("original stream prefix does not match its saved result",
+                                                   code="CONVERSATION_OUTCOME_UNKNOWN")
+                if remaining:
+                    yield remaining
             account_service.mark_text_used(token)
             return
         except Exception as exc:

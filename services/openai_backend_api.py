@@ -2993,6 +2993,7 @@ class OpenAIBackendAPI:
                 timeout_message=(
                     f"conversation stream exceeded hard limit of {int(TEXT_STREAM_HARD_CAP_SECS)} seconds"
                 ),
+                observe_text=True,
             )
         finally:
             response.close()
@@ -3053,6 +3054,7 @@ class OpenAIBackendAPI:
             *,
             timeout_error_type: type[StreamHardTimeoutError] = ImageStreamHardTimeoutError,
             timeout_message: str | None = None,
+            observe_text: bool = False,
     ) -> Iterator[str]:
         """按墙钟硬上限消费图片 SSE 流，避免上游异常时长连接被无限挂起。
 
@@ -3069,19 +3071,33 @@ class OpenAIBackendAPI:
         timeout_message = timeout_message or (
             f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
         )
+        observation = {"sse_data_count": 0, "sse_parse_errors": 0, "sse_error_event": False} if observe_text else None
         try:
-            for payload in iter_sse_payloads(response):
+            payloads = iter_sse_payloads(response, observation=observation) if observe_text else iter_sse_payloads(response)
+            for payload in payloads:
                 yield payload
                 if time.monotonic() >= deadline:
                     raise timeout_error_type(timeout_message)
             if time.monotonic() >= deadline:
                 raise timeout_error_type(timeout_message)
+            if observation is not None:
+                observation.setdefault("stream_end", "eof")
+        except GeneratorExit:
+            if observation is not None:
+                observation.setdefault("stream_end", "consumer_closed")
+            raise
         except StreamHardTimeoutError:
+            if observation is not None:
+                observation["stream_end"] = "hard_timeout"
             raise
         except Exception as exc:
             # 看门狗关闭连接后，底层读取会抛出 curl 错误，这里统一转成明确的硬上限错误
             if time.monotonic() >= deadline:
+                if observation is not None:
+                    observation["stream_end"] = "hard_timeout"
                 raise timeout_error_type(timeout_message) from exc
+            if observation is not None:
+                observation["stream_end"] = "transport_error"
             raise
         finally:
             watchdog.cancel()
@@ -3089,6 +3105,18 @@ class OpenAIBackendAPI:
                 response.close()
             except Exception:
                 pass
+            if observation is not None:
+                # Only fixed enums/counts are retained, never SSE body, error
+                # text, tool/reasoning content, headers or credentials.
+                from services.request_context import current_request
+                context = current_request.get()
+                if context is not None:
+                    try:
+                        context.record_stage("stream_finished", **observation)
+                    except Exception:
+                        # Losing diagnostic storage must not mask the original
+                        # transport outcome or cause another model submission.
+                        pass
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""

@@ -171,9 +171,10 @@ EXECUTION_ENUMS = {
     "wait_state": {"waiting", "ended", "completed", "unknown"},
     "upstream_outcome": {"not_sent", "unknown", "completed", "rejected"},
     "upstream_status": {"in_progress", "running", "pending", "queued", "finished_successfully"},
+    "stream_end": {"done", "eof", "hard_timeout", "transport_error", "consumer_closed"},
 }
 EXECUTION_TIMES = ("accepted_at", "sent_at", "response_received_at", "first_stream_event_at",
-                   "local_finished_at", "observation_started_at", "last_checked_at", "last_progress_at", "wait_ended_at", "upstream_updated_at")
+                   "local_finished_at", "observation_started_at", "last_checked_at", "last_progress_at", "wait_ended_at", "upstream_updated_at", "stream_ended_at")
 EXECUTION_RESOURCES = {
     "local_worker": {"active", "idle", "unknown"},
     "account_turn": {"held", "released", "unattributed", "unknown"},
@@ -191,9 +192,12 @@ def safe_public_execution(value: object) -> dict[str, Any]:
         number = value.get(key)
         if type(number) in (int, float) and math.isfinite(number) and number > 0:
             result[key] = number
-    count = value.get("unchanged_reads")
-    if type(count) is int and 0 <= count <= 2147483647:
-        result["unchanged_reads"] = count
+    for key in ("unchanged_reads", "sse_data_count", "sse_parse_errors"):
+        count = value.get(key)
+        if type(count) is int and 0 <= count <= 2147483647:
+            result[key] = count
+    if type(value.get("sse_error_event")) is bool:
+        result["sse_error_event"] = value["sse_error_event"]
     resources = value.get("resources")
     if isinstance(resources, dict):
         result["resources"] = {key: resources[key] for key, allowed in EXECUTION_RESOURCES.items()
@@ -250,6 +254,8 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
     observation = observation if isinstance(observation, dict) else {}
     nodes = observation.get("nodes")
     latest = nodes[-1] if isinstance(nodes, list) and nodes and isinstance(nodes[-1], dict) else {}
+    stream = next((item for item in reversed(receipt.get("_execution_timeline") or [])
+                   if isinstance(item, dict) and item.get("stage") == "stream_finished"), {})
     return safe_public_execution({
         "phase": phase, "send_state": send_state, "local_state": local,
         "wait_state": "completed" if status == "succeeded" else "ended" if wait_end or status == "failed"
@@ -262,6 +268,8 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
         "last_checked_at": receipt.get("_result_last_checked_at"), "last_progress_at": progress,
         "wait_ended_at": wait_end, "upstream_updated_at": observation.get("upstream_updated_at"),
         "unchanged_reads": receipt.get("_result_no_progress_reads"), "resources": resources,
+        "stream_ended_at": stream.get("at"),
+        **{key: stream[key] for key in ("stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event") if key in stream},
     })
 
 

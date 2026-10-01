@@ -34,7 +34,8 @@ def original(runtime):
     return durable_forward.raw_receipt(runtime.service, WHO["id"], "original-wire")
 
 
-def upstream(runtime, monkeypatch, *, done=False, transport_error=False, text="original prefix", text_chunks=None):
+def upstream(runtime, monkeypatch, *, done=False, transport_error=False, text="original prefix", text_chunks=None,
+             verified_text=None):
     sent = []
     from services.protocol import conversation, openai_v1_chat_complete, openai_v1_response, anthropic_v1_messages
     from services.model_service import ModelRoute
@@ -73,6 +74,13 @@ def upstream(runtime, monkeypatch, *, done=False, transport_error=False, text="o
 
         def close(self):
             pass
+
+        def _get_conversation(self, conversation_id):
+            assert conversation_id == "original-conversation"
+            doc = result_document(original(runtime), text=verified_text or "")
+            if verified_text is None:
+                doc["mapping"]["original-assistant"]["message"].update(status="in_progress", end_turn=None)
+            return doc
     monkeypatch.setattr(conversation, "OpenAIBackendAPI", Backend)
     monkeypatch.setattr(conversation, "account_service", runtime.accounts)
     monkeypatch.setattr(openai_v1_chat_complete, "text_backend", lambda _: Backend())
@@ -185,9 +193,80 @@ def test_two_recovery_workers_claim_once_and_live_subscriber_cannot_splice_files
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
 def test_original_upstream_done_keeps_normal_success(runtime, monkeypatch, protocol):
-    sent = upstream(runtime, monkeypatch, done=True)
+    sent = upstream(runtime, monkeypatch, done=True, verified_text="original prefix")
     execute(runtime, protocol)
     assert original(runtime)["status"] == "succeeded"
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("done", [False, True])
+def test_transport_finish_without_verified_original_stays_unknown(runtime, monkeypatch, protocol, stream, done):
+    sent = upstream(runtime, monkeypatch, done=done, text="")
+    execute(runtime, protocol, stream)
+    row = original(runtime)
+    assert row["status"] == "unknown"
+    assert row["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN"
+    assert runtime.admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    assert len(sent) == 1
+    with runtime.store.output_file(row["_wire_output"]) as handle:
+        wire = handle.read()
+    assert b"[DONE]" not in wire and b"message_stop" not in wire
+
+
+@pytest.mark.parametrize("protocol", PROTOCOLS)
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("done", [False, True])
+def test_verified_original_recovers_missing_stream_tail_without_resend(runtime, monkeypatch, protocol, stream, done):
+    sent = upstream(runtime, monkeypatch, done=done, verified_text="original prefix and saved tail")
+    data = execute(runtime, protocol, stream)
+    assert original(runtime)["status"] == "succeeded"
+    status, wire = asyncio.run(response_bytes(runtime, data, protocol))
+    assert status == 200 and b"and saved tail" in wire
+    assert runtime.admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("verified_text", ["different saved answer", ""])
+def test_incompatible_or_empty_saved_answer_cannot_finish_stream(runtime, monkeypatch, verified_text):
+    sent = upstream(runtime, monkeypatch, done=True, verified_text=verified_text)
+    execute(runtime, "openai_v1_chat_complete")
+    assert original(runtime)["status"] == "unknown"
+    assert runtime.admission.resource_snapshot()["chat_turn"]["inflight"] == (0 if verified_text else 1)
+    assert len(sent) == 1
+
+
+def test_upstream_revision_recovers_verified_wire_without_resending(runtime, monkeypatch):
+    sent = upstream(runtime, monkeypatch, done=True, text_chunks=["old answer", "revised final answer"],
+                    verified_text="revised final answer")
+    data = execute(runtime, "openai_v1_chat_complete")
+    assert original(runtime)["status"] == "unknown"  # The delivered wire cannot be silently rewritten.
+    assert runtime.admission.resource_snapshot()["chat_turn"]["inflight"] == 0  # GET proved the turn ended.
+    runtime.service.recovery_reader = lambda row: ConversationBindingService._read_text_request_result(
+        None, row, document=result_document(row, "revised final answer"))
+    assert runtime.service.read(WHO["id"], "original-wire")["status"] == "succeeded"
+    _, wire = asyncio.run(response_bytes(runtime, data, "openai_v1_chat_complete"))
+    assert b"revised final answer" in wire and b"old answer" not in wire
+    assert len(sent) == 1
+
+
+def test_closing_after_recovered_tail_keeps_verified_terminal(runtime, monkeypatch):
+    from services.protocol.conversation import ConversationRequest, stream_text_deltas
+    from services.protocol import openai_v1_chat_complete
+    sent = upstream(runtime, monkeypatch, done=True, verified_text="original prefix and saved tail")
+    def consume(body):
+        request = ConversationRequest(messages=[{"role": "user", "content": "original input"}], model="fixture-text")
+        iterator = stream_text_deltas(openai_v1_chat_complete.text_backend({}), request)
+        assert next(iterator) == "original prefix"
+        assert next(iterator) == " and saved tail"
+        iterator.close()
+        assert current_request.get().receipt()["_upstream_terminal"] is True
+        raise OSError("synthetic consumer closed after saved tail")
+    monkeypatch.setattr(openai_v1_chat_complete, "handle", consume)
+    execute(runtime, "openai_v1_chat_complete")
+    assert original(runtime)["_upstream_terminal"] is True
+    assert runtime.admission.resource_snapshot()["chat_turn"]["inflight"] == 0
     assert len(sent) == 1
 
 
@@ -244,7 +323,7 @@ def test_native_partial_stream_keeps_real_response_cursor_without_claiming_a_get
 
 def test_anthropic_recovery_preserves_tool_id_already_emitted_before_output_failure(runtime, monkeypatch):
     text = '<tool_calls><tool_call><tool_name>lookup</tool_name><parameters>{"key":"fixture"}</parameters></tool_call></tool_calls>'
-    sent = upstream(runtime, monkeypatch, done=True, text=text)
+    sent = upstream(runtime, monkeypatch, done=True, text=text, verified_text=text)
     protocol = "anthropic_v1_messages"
     data = payload(protocol)
     data["tools"] = [{"name": "lookup", "input_schema": {"type": "object"}}]
@@ -276,7 +355,7 @@ def test_anthropic_whitespace_chunks_preserve_every_emitted_tool_identity(runtim
     text = "<tool_calls>" + "".join(
         '<tool_call><tool_name>' + name + '</tool_name><parameters>{"index":' + str(index) + '}</parameters></tool_call>'
         for index, name in enumerate(names)) + "</tool_calls>"
-    sent = upstream(runtime, monkeypatch, done=True, text_chunks=[" \n", " \n" + text])
+    sent = upstream(runtime, monkeypatch, done=True, text_chunks=[" \n", " \n" + text], verified_text=" \n" + text)
     protocol, data = "anthropic_v1_messages", payload("anthropic_v1_messages")
     data["tools"] = [{"name": name, "input_schema": {"type": "object"}} for name in dict.fromkeys(names)]
     update, failed = runtime.service._update, []
