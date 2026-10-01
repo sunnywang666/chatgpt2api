@@ -253,9 +253,13 @@ def _empty_reply_evidence(mapping, children, request_message_id, conversation_id
             return {"conversation_id": conversation_id, "request_message_id": request_message_id,
                     "final_message_id": node_id, "retry_parent_message_id": current_node,
                     "observed_at": time.time()}
-        # Still-running tools/reasoning or unknown envelopes are not an empty
-        # response. Never duplicate an outstanding tool/image operation.
-        if (message.get("status") != "finished_successfully" or not isinstance(content, dict)
+        # Reasoning snapshots can retain in_progress even after a later final
+        # exists. Only known assistant reasoning envelopes get that allowance;
+        # tools/code must still be complete. The caller also proves local close.
+        stale_reasoning = (role == "assistant" and isinstance(content, dict)
+                           and content.get("content_type") in {"thoughts", "reasoning_recap"}
+                           and message.get("status") == "in_progress")
+        if (message.get("status") != "finished_successfully" and not stale_reasoning or not isinstance(content, dict)
                 or content.get("content_type") not in OBSERVED_CONTENT_TYPES
                 or role == "tool" and content.get("content_type") != "execution_output"):
             return None

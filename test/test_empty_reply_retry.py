@@ -19,6 +19,11 @@ def empty_reader(original, *, external=False, mixed=False):
     doc["mapping"][final]["message"].update(status="in_progress", end_turn=None)
     if mixed:
         mixed_chain(doc)
+        if mixed == "stale_reasoning":
+            for node in doc["mapping"].values():
+                message = node.get("message") or {}
+                if (message.get("content") or {}).get("content_type") == "thoughts":
+                    message["status"] = "in_progress"
     if external:
         external_continuation(doc)
     return ConversationBindingService._read_text_request_result(None, original, document=doc)
@@ -37,7 +42,7 @@ def seed_empty(service, *, external=False, mixed=False, end="done", legacy=False
     service.text.read("owner", "old-0")
 
 
-@pytest.mark.parametrize("external,mixed", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("external,mixed", [(False, False), (True, False), (False, True), (True, "stale_reasoning")])
 def test_empty_stream_automatically_retries_same_conversation_and_transfers_own_slot(setup, external, mixed):
     service, admission, calls = setup
     seed_empty(service, external=external, mixed=mixed)
