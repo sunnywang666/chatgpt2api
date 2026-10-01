@@ -319,23 +319,35 @@ For example, start two independent sessions under `--workflow-id product-copy --
 # Bounded completion of an abnormal pure-generation step
 
 Original `GET`, Chat `/recover` and image `/resume-poll` never authorize another
-model send. For an explicitly approved pure text/image generation or edit, use
-`POST /api/chat-requests/{original-id}/completion` (images: `image-tasks`) with
-`{"action":"recover","allow_unconfirmed_retry":true}`. This reserves **at most
-one** server-generated replacement ID. It keeps the original input, model,
-effective account selection and scheduling, and reconstructs a new conversation
-only when retained context is sufficient. Existing generated image files are
-downloaded through their original receipt, never redrawn. Missing context is an
-explicit error. This API does not retry external business writes or Codex routes.
+model send. For an approved pure generation task, POST to the original
+`/api/chat-requests/{original-id}/completion` (images: `image-tasks`) with
+`{"action":"recover"}`. For native Chat text, a freshly verified ended-empty
+original is retried **in the same account and conversation first**. The server
+loads its exact retained input, creates one linked attempt, keeps the model,
+account_ref and effective scheduling, and inherits the original conversation's
+work slot. `conversation_mode=original` and `original_turn_ended=true` expose
+this choice. The old UNKNOWN/failed receipt remains historical evidence. Empty
+output, a failed label, a timeout, and local disconnect alone cannot establish
+this proof. The existing send path rereads the exact original before sending;
+changed or missing end evidence keeps the retry unsent.
 
-The unknown original remains readable and continues holding its actual capacity.
-`stop.capability=unsupported` and `confirmed=false` mean no verified remote stop
-operation exists. A 15-minute stalled original plus bounded five-minute
-investigation does not prove cancellation; the caller's explicit policy permits
-the one additional generation despite that uncertainty. Valid original reads,
-Retry-After, pauses and ordinary account/workflow capacity still apply. Upgrades
-do not reset original request age. Repeated calls and process restarts use the
-same reserved ID; the replacement itself cannot create another replacement.
+An in-progress/uncertain original with no verified end returns
+`COMPLETION_ORIGINAL_END_UNCONFIRMED`. The current Chat adapter has no verified
+remote stop operation (`stop.capability=unsupported`, `confirmed=false`); this
+is an integration limitation, not a claim that ChatGPT cannot stop generation.
+No guessed cancellation endpoint, archive operation or local disconnect is used
+to pretend the old upstream execution stopped. Resolving that limitation requires
+a verified stop contract and authoritative original-turn readback.
+
+Only as a separately permitted fallback, pass `allow_unconfirmed_retry:true`
+to allow a reconstructed **new conversation** after 15 minutes of stalled
+progress plus the bounded five-minute investigation. This does not override an
+explicit account_ref or known account/workflow capacity. Missing retained
+context blocks reconstruction. Existing image artifacts are downloaded, never
+redrawn. The original UNKNOWN's conservative occupancy remains until supported
+end evidence is obtained; it is not proof that the remote account is busy.
+This API excludes external business writes and Codex routes. Repeated calls and
+restarts reuse the same reserved attempt; no attempt can create another retry.
 
 `GET` the same `/completion` to inspect `state`, `reason`, `waiting`,
 `original_status`, `replacement_status`, `replacement_id` and `selected_id`.
@@ -347,7 +359,7 @@ available; only the selected result enters downstream saving/review.
 The shipped independent CLI preserves its original state file:
 
 ```sh
-python examples/image_client.py chat-completion-recover --state original.json --allow-unconfirmed-retry
+python examples/image_client.py chat-completion-recover --state original.json
 python examples/image_client.py chat-completion-status --state original.json
 python examples/image_client.py chat-completion-save --state original.json --output answer.json
 python examples/image_client.py chat-completion-complete --state original.json --reviewed
@@ -359,7 +371,9 @@ the selected local file still matches the saved bytes, then acknowledges the
 result as saved and reviewed. `result_ready` is not completion. API clients send
 `{"action":"complete","selected_id":"returned-id","results_saved":true,"reviewed":true}`
 only after their actual durable save/readback/review. The selected conversation
-archives at that task-complete boundary. `work.archive` reports pending, failure
+archives at that task-complete boundary. A same-conversation correction closes
+its shared work only after the verified correction has succeeded and its result
+is selected; an ended-empty original alone cannot be marked completed. `work.archive` reports pending, failure
 or confirmation; `original_work.cleanup_pending` separately preserves old
 unknown occupancy and its deferred cleanup. Rework restores the selected
 conversation and never sends a new model request. A reconstructed conversation

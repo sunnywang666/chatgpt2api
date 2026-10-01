@@ -1,6 +1,7 @@
 """Bounded completion of a pure generation step, without rewriting its receipt.
 
-An explicitly authorized replacement is a new conversation. Its one reserved ID,
+An ended original turn is retried in its original conversation first. An
+explicitly authorized unresolved replacement may use a new conversation. Its reserved ID,
 original input and selected result live on the original receipt in the existing
 SQLite transaction. Ordinary result reads never authorize another model send.
 """
@@ -123,6 +124,20 @@ class GenerationCompletionService:
     def _prepare(self, db, kind, owner, request_id, root, replacement_id):
         body = copy.deepcopy(self._load_verified_input(db, kind, owner, request_id, root))
         if kind == "text":
+            if self.text._verified_terminal_empty(root):
+                # Reuse the proven session/physical binding through the existing
+                # continuation validator. Do not reconstruct its prior context
+                # or allocate a second conversation work slot.
+                payload = {k: body[k] for k in ("model", "reasoning_effort", "messages", "_requested_account_ref", "_scheduling") if k in body}
+                for key in ("_requested_account_ref", "_scheduling"):
+                    if root.get(key) is not None:
+                        payload[key] = copy.deepcopy(root[key])
+                payload.update(client_request_id=replacement_id,
+                               client_conversation_id=root["client_conversation_id"],
+                               _public_session_ref=root["_public_session_ref"], _public_route="chat",
+                               _previous_request_id=request_id, _continue_after_terminal_empty=True,
+                               _text_only_binding=True, _completion_of=request_id)
+                return payload
             messages, current, seen = copy.deepcopy(body["messages"]), root, {request_id}
             while current.get("_previous_request_id"):
                 previous_id = current["_previous_request_id"]
@@ -193,13 +208,21 @@ class GenerationCompletionService:
             chosen = request_id if successful(kind, root) else child_id if successful(kind, child) else None
             if chosen:
                 state.update(selected_id=chosen, selected_at=float(self.clock()), state="result_ready", next_at=None)
-        if child and state.get("selected_id") == request_id and child.get("status") in {"queued", "running"} and not child.get("_submission_started"):
+        if (child and state.get("selected_id") == request_id and not child.get("_submission_started")
+                and (child.get("status") in {"queued", "running"}
+                     or child.get("status") == "failed" and child.get("upstream_outcome") == "not_sent")):
             child.update(status="failed" if kind == "text" else "error", error_code="COMPLETION_ORIGINAL_RECOVERED",
                          upstream_outcome="not_sent", upstream_unfinished=False, _turn_reserved=False,
                          _claim_id=None, _claim_until=0, _executing=False)
             self.store.write_receipt(db, kind, owner, child_id, child)
             from services.workflow_scheduling import release_provisional_slot
             release_provisional_slot(self.store, db, child)
+        if kind == "text" and child and self.text._cancelled_completion_child(child, root):
+            if child.get("_work_key") and child.get("_work_key") == root.get("_work_key"):
+                work = self.store.runtime(db, root["_work_key"])
+                if work and work["last_request_id"] == child_id:
+                    work["last_request_id"] = request_id
+                    self.store.set_runtime(db, work["key"], work)
         return child
 
     def advance(self, kind, owner, request_id):
@@ -238,10 +261,13 @@ class GenerationCompletionService:
                     work = self.store.runtime(db, root.get("_work_key")) if root.get("_work_key") else None
                     if work and work.get("state") != "active":
                         raise CompletionError("COMPLETION_WORK_NOT_ACTIVE")
-                    unknown = unresolved(root)
+                    ended = kind == "text" and self.text._verified_terminal_empty(root)
+                    if kind == "text" and root.get("conversation_id") and not ended and not state["allow_unconfirmed_retry"]:
+                        raise CompletionError("COMPLETION_ORIGINAL_END_UNCONFIRMED")
+                    unknown = unresolved(root) and not ended
                     if unknown:
                         if not state["allow_unconfirmed_retry"]:
-                            raise CompletionError("COMPLETION_UNCONFIRMED_RETRY_NOT_AUTHORIZED")
+                            raise CompletionError("COMPLETION_ORIGINAL_END_UNCONFIRMED")
                         anchor = self._age_anchor(root)
                         if anchor is None or now < anchor + self.STALL_SECONDS + self.INVESTIGATION_SECONDS:
                             raise CompletionError("COMPLETION_INVESTIGATING_ORIGINAL")
@@ -254,13 +280,13 @@ class GenerationCompletionService:
                             raise CompletionError("COMPLETION_ORIGINAL_READ_UNAVAILABLE")
                         if kind == "image" and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS:
                             raise CompletionError("COMPLETION_ORIGINAL_READ_UNAVAILABLE")
-                    elif root.get("status") not in {"failed", "error"}:
+                    elif not ended and root.get("status") not in {"failed", "error"}:
                         raise CompletionError("COMPLETION_ORIGINAL_NOT_TERMINAL")
                     if not state.get("replacement_id"):
                         replacement_id = "completion-" + uuid.uuid4().hex
                         prepared = self._prepare(db, kind, owner, request_id, root, replacement_id)
                         state.update(replacement_id=replacement_id, prepared_input=self.store.save_input(prepared),
-                                     conversation_mode="reconstructed", state="replacement_pending")
+                                     conversation_mode="original" if ended else "reconstructed", state="replacement_pending")
                     state.pop("reason", None)
                 except CompletionError as exc:
                     state.update(state="needs_attention" if exc.code not in {
@@ -300,12 +326,14 @@ class GenerationCompletionService:
             child = self._select(db, kind, owner, request_id, root)
             self.store.write_receipt(db, kind, owner, request_id, root)
             selected = root if state.get("selected_id") == request_id else child if state.get("selected_id") else None
+            ended = kind == "text" and bool(self.text._verified_terminal_empty(root))
             result = {"protocol": "generation-completion-v1", "kind": kind, "original_id": request_id,
                       **{k: state[k] for k in ("state", "reason", "started_at", "next_at", "replacement_id", "selected_id",
                                               "selected_at", "max_extra_requests", "conversation_mode", "results_saved", "work") if k in state},
                       "original_status": root.get("status"), "replacement_status": (child or {}).get("status"),
                       "stop": {"capability": "unsupported", "confirmed": False},
-                      "original_cleanup": "pending" if unresolved(root) else "not_required"}
+                      "original_turn_ended": bool(ended or successful(kind, root)),
+                      "original_cleanup": "pending" if unresolved(root) and not ended else "not_required"}
             if child and state.get("selected_id") == request_id:
                 result["replacement_cleanup"] = "pending" if unresolved(child) or child.get("status") == "running" else "not_required"
             if child and child.get("waiting"):
@@ -349,7 +377,8 @@ class GenerationCompletionService:
             root = self._root(db, kind, str(identity["id"]), request_id)
             unused_id = request_id if selected_id != request_id else root["_completion"].get("replacement_id")
             unused = self.store.read_receipt(db, kind, str(identity["id"]), unused_id) if unused_id else None
-            if unused and unused.get("_work_key"):
+            chosen = self.store.read_receipt(db, kind, str(identity["id"]), selected_id)
+            if unused and unused.get("_work_key") and unused.get("_work_key") != (chosen or {}).get("_work_key"):
                 # Business completion is linked to the selected saved result.
                 # Keep the old physical work's slot until its own cleanup is
                 # confirmed; archive processing already refuses UNKNOWN turns.

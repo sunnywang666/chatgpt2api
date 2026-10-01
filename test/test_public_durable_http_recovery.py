@@ -17,6 +17,8 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 
 def _wait(check, timeout=10):
     end = time.monotonic() + timeout
@@ -468,8 +470,10 @@ def _serve_images(root, completion=False):
         uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False)).run(sockets=[listener])
 
 
-def test_http_completion_cli_saves_reviews_archives_and_restores_selected_result_after_restart(tmp_path):
+@pytest.mark.parametrize("same_session", [False, True])
+def test_http_completion_cli_saves_reviews_archives_and_restores_selected_result_after_restart(tmp_path, same_session):
     from examples import image_client
+    mode = "same-session-completion" if same_session else "completion"
     state = tmp_path / "original-state.json"
     output = tmp_path / "selected-answer.json"
     def cli(port, key, command, *extra, expected=0):
@@ -478,26 +482,27 @@ def test_http_completion_cli_saves_reviews_archives_and_restores_selected_result
             capture_output=True, text=True, timeout=10)
         assert result.returncode == expected, result.stderr
         return json.loads(result.stdout) if expected == 0 else None
-    with _server(tmp_path, "completion") as (port, key, _):
+    with _server(tmp_path, mode) as (port, key, _):
         cli(port, key, "chat-submit", "--request-id", "completion-original", "--session-id", "original-work",
             "--model", "fixture-text", "--prompt", "Complete this retained objective")
         _wait(lambda: _http(port, key, "GET", "/api/chat-requests/completion-original")[1]["status"] == "unknown")
-        requested = cli(port, key, "chat-completion-recover", "--allow-unconfirmed-retry")
+        requested = cli(port, key, "chat-completion-recover", *([] if same_session else ["--allow-unconfirmed-retry"]))
         assert requested["original_id"] == "completion-original"
         def selected():
             receipt = _http(port, key, "GET", "/api/chat-requests/completion-original/completion")[1]
             return receipt if receipt.get("selected_id") else None
         chosen = _wait(selected)
         child = chosen["selected_id"]
-        assert child != "completion-original" and chosen["original_cleanup"] == "pending"
+        assert child != "completion-original" and chosen["original_cleanup"] == ("not_required" if same_session else "pending")
+        assert chosen["conversation_mode"] == ("original" if same_session else "reconstructed")
         cli(port, key, "chat-completion-complete", "--reviewed", expected=1)
-    with _server(tmp_path, "completion") as (port, key, _):
+    with _server(tmp_path, mode) as (port, key, _):
         assert cli(port, key, "chat-completion-status")["selected_id"] == child
         cli(port, key, "chat-completion-save", "--output", output)
         saved = json.loads(output.read_text())
         assert saved["request_id"] == child and saved["content"] == "synthetic saved answer"
         done = cli(port, key, "chat-completion-complete", "--reviewed")
-        assert done["state"] == "completed" and done["original_cleanup"] == "pending"
+        assert done["state"] == "completed" and done["original_cleanup"] == ("not_required" if same_session else "pending")
         endpoint = "/api/chat-requests/completion-original/completion"
         _wait(lambda: _http(port, key, "GET", endpoint)[1].get("work", {}).get("archive", {}).get("status") == "confirmed")
         cli(port, key, "chat-completion-rework")
@@ -511,6 +516,8 @@ def test_http_completion_cli_saves_reviews_archives_and_restores_selected_result
     archives = [json.loads(line) for line in (tmp_path / "archives.jsonl").read_text().splitlines()]
     assert any(a["request_id"] == child and a["archived"] for a in archives)
     assert any(a["request_id"] == child and not a["archived"] for a in archives)
+    if same_session:
+        assert all(a["conversation_id"] == "controlled-original-conversation" for a in archives)
 
 
 def test_http_image_completion_cli_downloads_real_bytes_before_acknowledging(tmp_path):
@@ -600,7 +607,7 @@ def _serve(root, mode):
             log.write(json.dumps(body["client_request_id"]) + "\n")
             log.flush()
             os.fsync(log.fileno())
-        if mode == "stalled" or mode == "completion" and body["client_request_id"] == "completion-original":
+        if mode == "stalled" or mode in {"completion", "same-session-completion"} and body["client_request_id"] == "completion-original":
             from services.conversation_binding_service import ConversationBindingError
             current_request.get().record_stage("send_call_started")
             current_request.get().record_stage("response_headers_received", status_code=200)
@@ -611,9 +618,13 @@ def _serve(root, mode):
         if mode == "parallel":
             _wait(lambda: (root / ("release-" + body["client_request_id"])).exists(), timeout=10)
         result = {"content": "synthetic saved answer"}
-        if mode in {"lifecycle", "parallel", "completion"}:
+        if mode in {"lifecycle", "parallel", "completion", "same-session-completion"}:
             conversation = body.get("conversation_id") or "upstream-" + body["client_conversation_id"]
-            if body.get("_previous_request_id"):
+            if body.get("_continue_after_terminal_empty"):
+                with store.connect() as db:
+                    previous = store.read_receipt(db, "text", current_request.get().owner, body["_previous_request_id"])
+                assert body["parent_message_id"] == previous["_turn_end_evidence"]["final_message_id"]
+            elif body.get("_previous_request_id"):
                 assert body["parent_message_id"] == "answer-" + body["_previous_request_id"]
             result.update(provider_binding_id=body.get("provider_binding_id") or "fixture-binding",
                           provider_account_identity=body.get("provider_account_identity") or "fixture-account",
@@ -622,7 +633,7 @@ def _serve(root, mode):
         return result
 
     tasks = TextTaskService(store.path, runner=synthetic_model, admission=admission)
-    if mode in {"stalled", "completion"}:
+    if mode in {"stalled", "completion", "same-session-completion"}:
         # Accelerate only this isolated child fixture. Production's 900-second
         # boundary is exercised with a manual clock in the service regressions.
         TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS = .05
@@ -639,13 +650,14 @@ def _serve(root, mode):
             if (root / "original-completed").exists():
                 message["content"]["parts"] = ["late original HTTP result"]
             else:
-                message.update(status="in_progress", end_turn=None)
+                message.update(status="finished_successfully" if mode == "same-session-completion" else "in_progress",
+                               end_turn=True if mode == "same-session-completion" else None)
                 message["content"]["parts"] = [""]
             return ConversationBindingService._read_text_request_result(None, row, document=doc)
         tasks.recovery_reader = original_read
     admission.register("text", lambda context, body: tasks._run(context.owner, context.request_id, body))
     chat_requests.text_task_service = tasks
-    if mode in {"lifecycle", "completion"}:
+    if mode in {"lifecycle", "completion", "same-session-completion"}:
         from services import text_task_service as text_module
         from services.work_lifecycle import WorkLifecycleService
         text_module.text_task_service = tasks
@@ -658,7 +670,7 @@ def _serve(root, mode):
                 raise TimeoutError("controlled lost archive response")
             return {"archived": archived}
         text_module.conversation_binding_service.set_archived = synthetic_archive
-        if mode == "completion":
+        if mode in {"completion", "same-session-completion"}:
             from services.generation_completion import GenerationCompletionService
             GenerationCompletionService.STALL_SECONDS = .05
             GenerationCompletionService.INVESTIGATION_SECONDS = .05

@@ -310,11 +310,25 @@ class TextTaskService:
         return result
 
     @staticmethod
+    def _cancelled_completion_child(receipt, original):
+        state = (original or {}).get("_completion") or {}
+        return bool(original and original.get("status") == "succeeded"
+                    and state.get("selected_id") == original.get("request_id")
+                    and state.get("replacement_id") == receipt.get("request_id")
+                    and receipt.get("_completion_of") == original.get("request_id")
+                    and receipt.get("status") == "failed"
+                    and receipt.get("error_code") == "COMPLETION_ORIGINAL_RECOVERED"
+                    and receipt.get("upstream_outcome") == "not_sent"
+                    and not receipt.get("_submission_started"))
+
+    @staticmethod
     def _verified_terminal_empty(receipt):
         """Only an exact, persisted original-turn proof can open correction."""
         evidence = receipt.get(TURN_END_EVIDENCE_FIELD)
         if (receipt.get("route") != "chat" or not receipt.get("_public_session_ref")
-                or receipt.get("status") != "unknown"
+                or receipt.get("status") not in {"unknown", "failed"}
+                or (receipt.get("status") == "failed" and (
+                    receipt.get("error_code") != "RESULT_UNRECOVERABLE" or receipt.get("upstream_outcome") != "unknown"))
                 or receipt.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
                 or receipt.get("_upstream_terminal") is not True
                 or receipt.get("recovery_requires_new_conversation") is True
@@ -1289,8 +1303,10 @@ class TextTaskService:
             if ((previous.get("_public_session_ref") and previous.get("client_conversation_id") != group)
                     or (members and previous_id not in members)):
                 reject("CHAT_CONVERSATION_CONFLICT")
-            if db.execute("SELECT 1 FROM requests WHERE owner=? AND json_extract(receipt,'$._previous_request_id')=? LIMIT 1",
-                          (owner, previous_id)).fetchone():
+            successors = [json.loads(raw) for raw, in db.execute(
+                "SELECT receipt FROM requests WHERE owner=? AND json_extract(receipt,'$._previous_request_id')=?",
+                (owner, previous_id))]
+            if any(not self._cancelled_completion_child(candidate, previous) for candidate in successors):
                 reject("CHAT_CONVERSATION_CONFLICT")
             terminal_empty = bool(body.get("_continue_after_terminal_empty"))
             evidence = self._verified_terminal_empty(previous) if terminal_empty else None

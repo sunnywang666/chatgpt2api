@@ -119,12 +119,26 @@ def record_slot(store, db, kind, owner, receipt, held=True):
     return row
 
 
-def _blocked(receipt, *, allow_queued=False):
+def _blocked(receipt, *, allow_queued=False, members=()):
     # Operator suppression or local worker release never proves remote end.
-    if (receipt.get("status") == "unknown" or receipt.get("upstream_outcome") == "unknown"
-            or receipt.get("upstream_unfinished") is True or receipt.get("_executing")
-            or receipt.get("recovery_claim_id")):
+    if receipt.get("_executing") or receipt.get("recovery_claim_id"):
         return True
+    if (receipt.get("status") == "unknown" or receipt.get("upstream_outcome") == "unknown"
+            or receipt.get("upstream_unfinished") is True):
+        from services.text_task_service import TextTaskService
+        evidence = TextTaskService._verified_terminal_empty(receipt)
+        corrections = [r for r in members if evidence and r.get("status") == "succeeded"
+                       and r.get("_terminal_empty_correction_of") == receipt.get("request_id")
+                       and r.get("_previous_request_id") == receipt.get("request_id")
+                       and r.get("_submission_parent_message_id") == evidence["final_message_id"]
+                       and r.get("_work_key") == receipt.get("_work_key")
+                       and r.get("provider_binding_id") == receipt.get("provider_binding_id")
+                       and _same_conversation(r, receipt)]
+        # Only the completed, proven correction can close the original work.
+        # An empty terminal by itself is still not a completed business result.
+        if len(corrections) != 1 or (receipt.get("_completion") and
+                receipt["_completion"].get("selected_id") != corrections[0].get("request_id")):
+            return True
     if receipt.get("status") in {"running", "not_started"}:
         return True
     if receipt.get("status") == "queued":
@@ -171,7 +185,9 @@ class WorkLifecycleService:
             r.get("_work_key") == work["key"] or (
                 not r.get("_work_key") and _reference(k, o, r) == work["work_ref"]))) ]
         own_members = [r for k, o, _, r in rows if k == kind and o == owner and r.get("_work_key") == work["key"]]
-        if any(int(r.get("_sequence") or 0) > int(receipt.get("_sequence") or 0) for r in own_members):
+        from services.text_task_service import TextTaskService
+        if any(int(r.get("_sequence") or 0) > int(receipt.get("_sequence") or 0)
+               and not TextTaskService._cancelled_completion_child(r, receipt) for r in own_members):
             raise WorkLifecycleError("WORK_SUPERSEDED")
         return receipt, work, members
 
@@ -188,7 +204,7 @@ class WorkLifecycleService:
             if state == "completed" and results_saved is not True:
                 raise WorkLifecycleError("WORK_RESULTS_SAVE_REQUIRED", 400)
             allow_queued = state == "paused" or state == "active" and work["state"] == "paused"
-            if any(_blocked(r, allow_queued=allow_queued) for r in members):
+            if any(_blocked(r, allow_queued=allow_queued, members=members) for r in members):
                 raise WorkLifecycleError("WORK_TURN_UNFINISHED")
             legacy_restore = state == work["state"] == "active" and not work.get("archive")
             if state == work["state"] and not legacy_restore:
@@ -278,7 +294,7 @@ class WorkLifecycleService:
                             and float(a.get("claim_until") or 0) <= now):
                         try:
                             _, current, members = self._load(db, candidate["kind"], {"id": candidate["owner"]}, a["request_id"])
-                            if current["version"] != a["version"] or any(_blocked(r) for r in members):
+                            if current["version"] != a["version"] or any(_blocked(r, members=members) for r in members):
                                 raise WorkLifecycleError("WORK_TURN_UNFINISHED")
                         except WorkLifecycleError as exc:
                             a.update(status="unknown", error_code=exc.code, next_at=now + 60)

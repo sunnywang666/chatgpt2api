@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from services.generation_completion import GenerationCompletionService, CompletionError
 from services.image_task_service import ImageTaskService
 from services.request_context import current_request, AdmissionLost, executing
-from services.work_lifecycle import WorkLifecycleService, ensure_work
+from services.work_lifecycle import WorkLifecycleService, WorkLifecycleError, ensure_work
 from test.test_unknown_turn_recovery import migration
 from test.test_stalled_text_diagnostics import incomplete_reader
 
@@ -65,6 +65,139 @@ def setup(tmp_path):
 
 def start(service, kind="text", rid="old-0"):
     return service.start(kind, IDENTITY, rid, allow_unconfirmed_retry=True)
+
+
+def ended_original(service):
+    from services.conversation_binding_service import ConversationBindingService
+    from test.test_unknown_turn_recovery import document
+    service.text.recovery_reader = lambda receipt: ConversationBindingService._read_text_request_result(
+        None, receipt, document=document(receipt))
+    patch_row(service, _sequence=0)
+    service.text.read("owner", "old-0")
+    return row(service)
+
+
+@pytest.mark.parametrize("status", ["unknown", "failed"])
+def test_confirmed_original_turn_retries_same_account_session_work_and_closes(setup, status):
+    service, admission, calls = setup
+    original = ended_original(service)
+    if status == "failed":
+        patch_row(service, status="failed", error_code="RESULT_UNRECOVERABLE")
+    # No permission to create a new conversation and no second workflow slot.
+    result = service.start("text", IDENTITY, "old-0")
+    child_id = result["replacement_id"]
+    assert result["conversation_mode"] == "original" and result["original_turn_ended"]
+    child = row(service, request_id=child_id)
+    for key in ("provider_account_identity", "provider_binding_id", "conversation_id",
+                "client_conversation_id", "_public_session_ref", "_work_key"):
+        assert child[key] == original[key]
+    assert child["parent_message_id"] == original["_turn_end_evidence"]["final_message_id"]
+    assert child["request_message_id"] != original["request_message_id"]
+    assert child["_previous_request_id"] == "old-0"
+    with service.store.connect() as db:
+        assert db.execute("SELECT count(*) FROM task_runtime WHERE name LIKE 'work:%'").fetchone()[0] == 1
+    def run(body, on_cursor):
+        current_request.get().before_send()
+        calls.append(copy.deepcopy(body))
+        return {"content": "Completed original objective", "conversation_id": original["conversation_id"],
+                "parent_message_id": "corrected-final", "_upstream_terminal": True, "upstream_outcome": "completed"}
+    service.text.runner = run
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=admission.clock)
+    assert restarted.start("text", IDENTITY, "old-0")["replacement_id"] == child_id
+    ctx = admission.claim_next()
+    assert ctx and ctx.request_id == child_id
+    admission.execute(ctx)
+    assert len(calls) == 1
+    assert calls[0]["messages"] == service.store.load_input(original["_input_ref"])["messages"]
+    assert restarted.read("text", IDENTITY, "old-0")["selected_id"] == child_id
+    done = restarted.complete("text", IDENTITY, "old-0", child_id)
+    assert done["state"] == "completed" and done["original_cleanup"] == "not_required"
+    assert done["work"]["archive"]["status"] == "pending" and not done["work"]["slot_held"]
+    archive_calls = []
+    def archive(owner, request_id, archived):
+        archive_calls.append((request_id, row(service, request_id=request_id)["conversation_id"], archived))
+        return {"request_id": request_id, "archived": archived,
+                "conversation": {"client_conversation_id": original["_public_session_ref"]}}
+    service.text.set_public_session_archived = archive
+    service.lifecycle.process_one()
+    assert restarted.read("text", IDENTITY, "old-0")["work"]["archive"]["status"] == "confirmed"
+    restarted.rework("text", IDENTITY, "old-0", child_id)
+    service.lifecycle.process_one()
+    assert archive_calls == [(child_id, original["conversation_id"], True), (child_id, original["conversation_id"], False)]
+    assert restarted.read("text", IDENTITY, "old-0")["work"]["state"] == "active"
+    assert row(service)["status"] == status and row(service)["_input_ref"] == original["_input_ref"]
+    assert len(calls) == 1
+
+
+def test_ended_empty_alone_cannot_close_work_and_drift_before_retry_never_sends(setup):
+    service, admission, calls = setup
+    ended_original(service)
+    with pytest.raises(WorkLifecycleError, match="WORK_TURN_UNFINISHED"):
+        service.lifecycle.update("text", IDENTITY, "old-0", "completed", results_saved=True)
+    child_id = service.start("text", IDENTITY, "old-0")["replacement_id"]
+    service.text.recovery_reader = Mock(return_value={"status": "running", "recovery_reason": "REQUEST_RESULT_INCOMPLETE"})
+    ctx = admission.claim_next()
+    assert ctx and ctx.request_id == child_id
+    admission.execute(ctx)
+    assert calls == [] and row(service, request_id=child_id)["upstream_outcome"] == "not_sent"
+    assert row(service)["status"] == "unknown"
+
+
+@pytest.mark.parametrize("after_claim", [False, True])
+def test_original_recovered_before_same_session_send_closes_and_allows_later_continuation(setup, after_claim):
+    service, admission, calls = setup
+    original = ended_original(service)
+    child_id = service.start("text", IDENTITY, "old-0")["replacement_id"]
+    ctx = admission.claim_next() if after_claim else None
+    patch_row(service, status="succeeded", content="late original result", upstream_outcome="completed",
+              parent_message_id="late-final", recovery_next_at=None)
+    if ctx:
+        with executing(ctx), pytest.raises(AdmissionLost):
+            ctx.before_send()
+    result = service.read("text", IDENTITY, "old-0")
+    assert result["selected_id"] == "old-0" and row(service, request_id=child_id)["upstream_outcome"] == "not_sent"
+    assert result["work"]["request_id"] == "old-0"
+    assert admission.claim_next() is None and calls == []
+    assert service.complete("text", IDENTITY, "old-0", "old-0")["state"] == "completed"
+    # Stand in only for confirmed archive/restore; the full chain is tested above.
+    with service.store.transaction() as db:
+        work = service.store.runtime(db, original["_work_key"])
+        work.update(state="active", archive={"status": "confirmed", "desired": False, "archived": False})
+        service.store.set_runtime(db, work["key"], work)
+    body = service.store.load_input(original["_input_ref"])
+    response = service.text.submit("owner", {**body, "client_request_id": "later-user-turn",
+                                            "_previous_request_id": "old-0"})
+    assert response["status"] == "queued"
+    assert row(service, request_id="later-user-turn")["conversation_id"] == original["conversation_id"]
+
+
+def test_failed_label_with_inconsistent_end_metadata_cannot_start_same_session_retry(setup):
+    service, admission, calls = setup
+    ended_original(service)
+    patch_row(service, status="failed", error_code="UNRELATED_FAILURE", upstream_outcome="failed")
+    result = service.start("text", IDENTITY, "old-0")
+    assert result["reason"] == "COMPLETION_ORIGINAL_END_UNCONFIRMED"
+    assert "replacement_id" not in result and not calls
+
+
+def test_same_session_retry_pause_restart_keeps_one_child_and_unknown_occupancy_needs_proof(setup):
+    service, admission, calls = setup
+    original = ended_original(service)
+    child_id = service.start("text", IDENTITY, "old-0")["replacement_id"]
+    with service.store.transaction() as db:
+        work = service.store.runtime(db, original["_work_key"])
+        work["state"] = "paused"
+        service.store.set_runtime(db, work["key"], work)
+    for _ in range(3):
+        assert admission.claim_next() is None
+        admission.clock.now += 31
+        assert service.start("text", IDENTITY, "old-0")["replacement_id"] == child_id
+    with service.store.transaction() as db:
+        work = service.store.runtime(db, original["_work_key"])
+        work["state"] = "active"
+        service.store.set_runtime(db, work["key"], work)
+    assert admission.claim_next().request_id == child_id
+    assert calls == []
 
 
 def test_concurrent_authorization_restart_single_replacement_and_actual_completion(setup):
@@ -198,7 +331,7 @@ def test_crash_after_reservation_reuses_prepared_input_and_rejects_drift(setup, 
 def test_explicit_later_authorization_can_enable_the_one_unused_attempt(setup):
     service, admission, calls = setup
     initial = service.start("text", IDENTITY, "old-0")
-    assert initial["reason"] == "COMPLETION_UNCONFIRMED_RETRY_NOT_AUTHORIZED"
+    assert initial["reason"] == "COMPLETION_ORIGINAL_END_UNCONFIRMED"
     assert "replacement_id" not in initial
     authorized = start(service)
     assert authorized["replacement_id"] and authorized["max_extra_requests"] == 1
