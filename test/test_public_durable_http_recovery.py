@@ -128,7 +128,12 @@ def test_real_socket_disconnect_keeps_original_execution_and_result(tmp_path):
         (tmp_path / "release-send").touch()
         receipt = _success(port, key, body["client_request_id"])
         assert receipt["content"] == "synthetic saved answer"
-        assert _http(port, key, "POST", "/api/chat-requests", body) == (200, receipt)
+        replay_status, replay = _http(port, key, "POST", "/api/chat-requests", body)
+        assert replay_status == 200
+        # Worker cleanup may finish between these reads and update execution
+        # telemetry. Idempotency preserves the result and original identity.
+        for field in ("request_id", "route", "model", "status", "content", "created_at", "conversation"):
+            assert replay.get(field) == receipt.get(field)
     assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"disconnected-original"']
 
 
