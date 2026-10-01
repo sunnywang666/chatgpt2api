@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 
-from services.admission_planner import Need, Resource, Offer, RequestRef, WaitingRequest, Snapshot, choose_next
+from services.admission_planner import Need, Resource, Offer, RequestRef, WaitingRequest, Snapshot, choose_next, fairness_lane
 from services.request_context import AdmissionLost, executing, safe_account_ref
 from services.task_store import TaskStore
 from services import workflow_scheduling
@@ -534,6 +534,8 @@ class PoolAdmission:
                     physical_needs += (Need(order),)
             # Legacy pending rows still protect their conversation order, but
             # cannot execute without a durable input reference.
+            scheduling = r.get("_scheduling") or {}
+            workflow_id = scheduling.get("workflow_id")
             requests.append(WaitingRequest(
                 RequestRef(owner, kind, request_id), r.get("_source") or "key:" + owner,
                 int(r.get("_sequence") or 0), route, str(r.get("model") or "auto"),
@@ -542,6 +544,10 @@ class PoolAdmission:
                 bound_account=str(r.get("_requested_account_identity") or r.get("provider_account_identity") or "") or None,
                 order_group=(None if (owner, request_id) in released_order_heads
                              else str(r.get("client_conversation_id") or "") or None),
+                # `source` is the trusted, stable caller.  The planner scopes
+                # this workflow ID to that source, so workflows cannot gain a
+                # second top-level caller turn by using multiple key owners.
+                fair_group=workflow_id if isinstance(workflow_id, str) and workflow_id else None,
                 ready_at=max(float(r.get("_ready_at") or 0), scheduling_ready),
                 needs=thread_needs + physical_needs + tuple(scheduling_needs) + (Need("execution_input_bytes", max(1, int(r.get("_input_bytes") or 1))),)
                       + ((Need("chat_executor"),) if kind == "text" and route == "chat" and r.get("_operation") != "image" else ())
@@ -661,9 +667,14 @@ class PoolAdmission:
         resources["image_executor"] = Resource("image_executor", 2 * sum(resources[key].capacity for key in image_keys), active_images, now)
         # Sources and owners are server-authenticated; cursors move only on a claim.
         unique = {offer.key: offer for offer in offers}
+        groups = cursor.get("groups") or {}
+        if not isinstance(groups, dict):
+            groups = {}
         return Snapshot(uuid.uuid4().hex, now, now + 1, tuple(resources.values()), tuple(unique.values()), tuple(requests),
                         last_source=cursor.get("source"), last_account=cursor.get("account"),
                         last_owner_by_source=tuple((cursor.get("owners") or {}).items()),
+                        last_group_by_source=tuple((source, group) for source, group in groups.items()
+                                                   if isinstance(source, str) and isinstance(group, str)),
                         scoped_extra_turn=scoped_extra_turn)
 
     def _recover_claims(self, db, receipts, now):
@@ -1005,7 +1016,12 @@ class PoolAdmission:
             owners = {source: owner for source, owner in snapshot.last_owner_by_source
                       if any(request.source == source and request.state == "queued" for request in snapshot.requests)}
             owners[pick.source] = ref.owner
-            self.store.set_runtime(db, "fairness", {"source": pick.source, "account": pick.account, "owners": owners})
+            groups = {source: group for source, group in snapshot.last_group_by_source
+                      if any(request.source == source and request.state == "queued" for request in snapshot.requests)}
+            selected_group = next((request.fair_group for request in snapshot.requests if request.ref == ref), None)
+            groups[pick.source] = fairness_lane(selected_group)
+            self.store.set_runtime(db, "fairness", {"source": pick.source, "account": pick.account,
+                                                      "owners": owners, "groups": groups})
             return ExecutionContext(self, ref.kind, ref.owner, ref.request_id, claim)
 
     def update_claim(self, context, **changes):

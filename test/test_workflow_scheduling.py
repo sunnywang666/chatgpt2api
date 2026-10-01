@@ -80,6 +80,31 @@ def test_two_keys_of_same_user_share_workflow_limit(runtime):
     assert row(rt,'second','key-b')['status']=='queued'
 
 
+def test_claims_rotate_legacy_and_workflows_within_one_authenticated_source(runtime):
+    rt = runtime
+    scheduled_a = {'workflow_id': 'workflow-a', 'workflow_concurrency': 2}
+    scheduled_b = {'workflow_id': 'workflow-b', 'workflow_concurrency': 2}
+    submit(rt, 'legacy')
+    submit(rt, 'a-first', scheduling=scheduled_a)
+    submit(rt, 'a-second', scheduling=scheduled_a)
+    submit(rt, 'b-only', scheduling=scheduled_b)
+
+    legacy = rt.admission.claim_next()
+    first = rt.admission.claim_next()
+    assert legacy and first
+    # The controlled runtime releases the Chat turn after the first durable
+    # image send; its work slot remains held, but workflow-a allows two.
+    rt.admission.execute(legacy)
+    second = rt.admission.claim_next()
+    assert second
+    rt.admission.execute(first)
+    claimed = [legacy, first, second, rt.admission.claim_next()]
+    assert [context.request_id for context in claimed] == ['legacy', 'a-first', 'b-only', 'a-second']
+    with rt.store.connect() as db:
+        cursor = rt.store.runtime(db, 'fairness')
+    assert cursor['groups'] == {'user:one': 'workflow:workflow-a'}
+
+
 def test_authenticated_owner_principal_controls_workflow_fairness(runtime):
     rt = runtime
     auth = AuthService(JSONStorageBackend(rt.root / "self-service-keys.json"))
