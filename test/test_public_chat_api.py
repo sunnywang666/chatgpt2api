@@ -803,3 +803,23 @@ def test_public_model_discovery_exposes_only_safe_observed_account_capability(pu
     assert "owned_by" not in item
     assert "root" not in item
     assert "parent" not in item
+
+
+def test_public_chat_scheduling_persists_normalized_receipt_and_original_input(public_chat):
+    class Admission:
+        def wake(self):
+            pass
+
+    public_chat.tasks.admission = Admission()
+    submitted = public_chat.client.post(
+        "/api/chat-requests", headers=public_chat.headers(),
+        json={**request_body("scheduled-native"), "scheduling": {"workflow_id": "catalog-refresh"}},
+    )
+    assert submitted.status_code == 202, submitted.text
+    assert submitted.json()["scheduling"] == {"workflow_id": "catalog-refresh", "workflow_concurrency": 1}
+    receipt = public_chat.tasks.read(public_chat.key_a["id"], "scheduled-native")
+    assert receipt["scheduling"] == {"workflow_id": "catalog-refresh", "workflow_concurrency": 1}
+    with public_chat.tasks._db() as db:
+        raw = public_chat.tasks.store.read_receipt(db, "text", public_chat.key_a["id"], "scheduled-native")
+    saved = public_chat.tasks.store.load_input(raw["_input_ref"])
+    assert saved["_scheduling"] == {"workflow_id": "catalog-refresh", "workflow_concurrency": 1}

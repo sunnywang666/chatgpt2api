@@ -719,11 +719,16 @@ class OpenAIBackendAPI:
             "Content-Type": "application/json",
         }
 
-    def _ensure_codex_source_account(self) -> None:
+    def _ensure_codex_source_account(self, *, require_image_capacity: bool = False) -> None:
         account = account_service.get_account(self.access_token)
         source_type = str((account or {}).get("source_type") or "web").strip().lower()
         if source_type != "codex":
             raise RuntimeError("codex responses endpoint requires a codex source account")
+        if require_image_capacity:
+            # Shared selection logic includes current capacity, freshness, and
+            # disabled/rate-limited state. Do not infer Codex image support
+            # merely from a Codex source type.
+            account_service.require_image_account(self.access_token, CODEX_IMAGE_MODEL)
 
     @staticmethod
     def _codex_image_input(prompt: str, images: list[str]) -> list[Dict[str, Any]]:
@@ -966,6 +971,18 @@ class OpenAIBackendAPI:
                 if key.lower() != "authorization"
             },
         })
+        # The caller may have spent time composing the upstream payload. The
+        # admission claim must be rechecked at the actual urllib POST edge;
+        # the context also fences a retry after an uncertain original send.
+        from services.request_context import current_request
+        context = current_request.get()
+        if context is not None:
+            context.before_send()
+        else:
+            # Legacy direct callers have no original claim. They still must
+            # not send through a disabled, rate-limited, or zero-capacity
+            # Codex image account.
+            self._ensure_codex_source_account(require_image_capacity=True)
         try:
             with urllib.request.urlopen(request, timeout=1200) as raw:
                 yield from self._iter_codex_response_events(raw)
@@ -1189,6 +1206,11 @@ class OpenAIBackendAPI:
         request_deadline = time.monotonic() + request_timeout
 
         def record_actual_submission() -> None:
+            # Upload, bootstrap, and prepare can take long enough for local
+            # image capability evidence to become stale. Recheck immediately
+            # before the paced generation POST, while it is still known not
+            # submitted. This is deliberately not used by result readers.
+            account_service.require_image_account(self.access_token, model)
             if callable(record_submission_started):
                 # The pacing wrapper invokes this immediately before its
                 # underlying send. A deadline spent on an account lock or
@@ -1215,6 +1237,7 @@ class OpenAIBackendAPI:
                 timeout=self._image_active_timeout(300),
                 stream=True,
                 _account_request_deadline_monotonic=request_deadline,
+                _account_request_before_send=record_actual_submission,
             )
         ensure_ok(response, path)
         return response

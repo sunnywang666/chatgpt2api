@@ -365,6 +365,10 @@ def _request_hash(mode: str, payload: dict[str, Any]) -> str:
     # Keep old task fingerprints unchanged when the caller has no override.
     if _clean(payload.get("upstream_model")):
         contract["upstream_model"] = _clean(payload.get("upstream_model"))
+    if "_requested_account_ref" in payload:
+        contract["_requested_account_ref"] = payload["_requested_account_ref"]
+    if "_scheduling" in payload:
+        contract["_scheduling"] = payload["_scheduling"]
     contract.update(input_fields(payload))
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -437,6 +441,10 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
+    if task.get("_scheduling") is not None:
+        item["scheduling"] = task["_scheduling"]
+    if task.get("_requested_account_ref"):
+        item["account_ref"] = task["_requested_account_ref"]
     if public_thread(task):
         item["image_thread"] = public_thread(task)
     if task.get("conversation_id"):
@@ -601,9 +609,13 @@ class ImageTaskService:
         image_thread_id: str = "",
         edit_source_task_id: str = "",
         edit_source_index: int = 0,
+        account_ref: str | None = None,
+        scheduling: dict | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
+            **({"_requested_account_ref": account_ref} if account_ref is not None else {}),
+            **({"_scheduling": scheduling} if scheduling is not None else {}),
             "model": model,
             "n": 1,
             "size": size,
@@ -644,9 +656,13 @@ class ImageTaskService:
         image_thread_id: str = "",
         edit_source_task_id: str = "",
         edit_source_index: int = 0,
+        account_ref: str | None = None,
+        scheduling: dict | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
+            **({"_requested_account_ref": account_ref} if account_ref is not None else {}),
+            **({"_scheduling": scheduling} if scheduling is not None else {}),
             "images": images or [],
             "mask": masks or [],
             "model": model,
@@ -753,6 +769,11 @@ class ImageTaskService:
         mode: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        from services.workflow_scheduling import normalize_scheduling
+        if "_scheduling" in payload:
+            payload = {**payload, "_scheduling": normalize_scheduling(payload["_scheduling"])}
+        if payload.get("_scheduling") is not None and self.admission is None:
+            raise ValueError("SCHEDULING_UNAVAILABLE")
         task_id = _clean(client_task_id)
         if not task_id:
             raise ValueError("client_task_id is required")
@@ -819,7 +840,31 @@ class ImageTaskService:
                 "_turn_reserved": False,
                 "_execution_timeline": [{"stage": "accepted", "at": time.time()}],
             }
+            if is_codex_image_model(task["model"]):
+                task["_route"] = "codex"
+                if any(payload.get(k) for k in ("provider_binding_id", "conversation_id", "parent_message_id", "retain_conversation")):
+                    raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
+            if "_requested_account_ref" in payload:
+                from services.account_service import account_service
+                accounts = self.admission.accounts if self.admission is not None else account_service
+                requested_identity = accounts.resolve_image_account(payload["_requested_account_ref"])
+                if (task.get("provider_account_identity") and task["provider_account_identity"] != requested_identity):
+                    raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
+                if task.get("provider_binding_id"):
+                    try:
+                        bound_identity = accounts.get_bound_account_identity(task["provider_binding_id"])
+                    except RuntimeError:
+                        raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT") from None
+                    if bound_identity != requested_identity:
+                        raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
+                task.update(_requested_account_ref=payload["_requested_account_ref"],
+                            _requested_account_identity=requested_identity)
             accept_thread(task, self._tasks.values(), payload, mode, output_reader=read_source)
+            from services.workflow_scheduling import prepare_receipt
+            from services.work_lifecycle import ensure_work
+            prepare_receipt(task, payload.get("_scheduling"), task["_source"])
+            ensure_work(self.store, self._transaction_local.db, "image", owner, task_id, task,
+                        source=task["_source"], scheduling=task.get("_scheduling"))
             task["_input_ref"] = self.store.save_input({"payload": payload, "identity": {k: identity[k] for k in ("id", "name", "role", "external_image_client", "_trusted_source") if k in identity}, "mode": mode})
             self._tasks[key] = task
             self._save_locked()
@@ -845,7 +890,10 @@ class ImageTaskService:
         identity: dict[str, object],
         model: str,
     ) -> None:
-        if identity.get("external_image_client") and not payload.get("_admission_claim"):
+        with self._transaction():
+            original = self._tasks.get(key) or {}
+            payload = {**payload, **{k: original[k] for k in ("_requested_account_ref", "_requested_account_identity") if original.get(k)}}
+        if (identity.get("external_image_client") or payload.get("_requested_account_ref")) and not payload.get("_admission_claim"):
             # Allocate once for this newly persisted task, before any generation.
             # Duplicate submissions never enter this thread. Account selection
             # only performs readiness reads; a failure here is NOT submitted.
@@ -853,7 +901,7 @@ class ImageTaskService:
             token = ""
             try:
                 capacities = {str(item.get("provider_account_identity") or ""): min(
-                    max(1, int(config.image_account_concurrency)), max(0, int(item.get("quota") or 0)))
+                    max(1, int(config.image_account_concurrency)), account_service.image_account_capacity(item, model))
                     for item in account_service.list_accounts()}
                 with self._transaction():
                     held = {}
@@ -864,7 +912,8 @@ class ImageTaskService:
                     unavailable = {identity_id for identity_id, count in held.items()
                                    if count >= capacities.get(identity_id, max(1, int(config.image_account_concurrency)))}
                 binding, account_identity, token = account_service.create_conversation_binding(
-                    image_model=model, excluded_account_identities=unavailable)
+                    image_model=model, excluded_account_identities=unavailable,
+                    **({"requested_account_identity": payload["_requested_account_identity"]} if payload.get("_requested_account_identity") else {}))
                 payload = {**payload, "provider_binding_id": binding,
                            "provider_account_identity": account_identity,
                            "client_conversation_id": "image-task-" + uuid.uuid4().hex,
@@ -874,7 +923,7 @@ class ImageTaskService:
                 # durable occupancy before releasing the temporary slot.
                 selected = account_service.get_account(token) or {}
                 capacity = min(max(1, int(config.image_account_concurrency)),
-                               max(0, int(selected.get("quota") or 0)))
+                               account_service.image_account_capacity(selected, model))
                 with self._transaction():
                     occupied = sum(1 for other_key, other in self._tasks.items()
                                    if other_key != key and other.get("provider_account_identity") == account_identity

@@ -524,6 +524,8 @@ class ModelCatalogService:
         for account in self._accounts.list_accounts():
             if str(account.get("source_type") or "").strip().lower() not in {"web", "oauth_login", "password"}:
                 continue
+            if self._accounts._normalize_account_type(account.get("type")) not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}:
+                continue
             evidence = image_capability_projection(account)
             # With no valid upstream image_gen observation there is no model
             # capability to advertise. A failed later read retains its last

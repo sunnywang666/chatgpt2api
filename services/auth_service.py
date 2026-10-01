@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -39,6 +40,25 @@ class AuthService:
     def _clean(value: object) -> str:
         return str(value or "").strip()
 
+    @classmethod
+    def _owner_subject(cls, value: object) -> str:
+        """Canonicalize the server-owned principal without exposing it to callers."""
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            except (TypeError, ValueError):
+                return ""
+        return cls._clean(value)
+
+    @classmethod
+    def _fair_source(cls, item: dict[str, object]) -> str | None:
+        # A legacy key with no owner remains its own lane.  A managed user's
+        # keys share only a hash of the canonical server-side owner principal.
+        if item.get("role") != "user":
+            return None
+        owner_subject = cls._owner_subject(item.get("owner_subject"))
+        return "user:" + _hash_key(owner_subject) if owner_subject else None
+
     @staticmethod
     def _default_name(role: object) -> str:
         return "管理员密钥" if str(role or "").strip().lower() == "admin" else "普通用户"
@@ -58,7 +78,7 @@ class AuthService:
         last_used_at = self._clean(raw.get("last_used_at")) or None
         return {
             "id": item_id,
-            "owner_subject": self._clean(raw.get("owner_subject")),
+            "owner_subject": self._owner_subject(raw.get("owner_subject")),
             "name": name,
             "role": role,
             "key_hash": key_hash,
@@ -185,9 +205,9 @@ class AuthService:
             raise ValueError("这个名称已经在使用中了，换一个更容易区分的名称吧")
         return candidate
 
-    def create_key(self, *, role: AuthRole, name: str = "", owner_subject: str = "", routes: list[str] | None = None) -> tuple[dict[str, object], str]:
+    def create_key(self, *, role: AuthRole, name: str = "", owner_subject: object = "", routes: list[str] | None = None) -> tuple[dict[str, object], str]:
         policy = make_policy(routes if routes is not None else ["chat"], revision=1) if role == "user" else None
-        owner_subject = self._clean(owner_subject)
+        owner_subject = self._owner_subject(owner_subject)
         with self._transaction():
             normalized_name = self._build_name_locked(name, role=role, owner_subject=owner_subject)
             while True:
@@ -338,7 +358,14 @@ class AuthService:
                 if last_flush_at is None or (now - last_flush_at).total_seconds() >= 60:
                     item["last_used_at"] = now.isoformat()
                     self._last_used_flush_at[item_id] = now
-                return self._public_item(item)
+                identity = self._public_item(item)
+                fair_source = self._fair_source(item)
+                if fair_source:
+                    # This marker is internal authentication state. It is not
+                    # part of the public key listing/projection.
+                    identity["_fair_source"] = fair_source
+                    identity["_authenticated_fair_source"] = True
+                return identity
         return None
 
 

@@ -2,8 +2,10 @@
 from contextvars import ContextVar
 from contextlib import contextmanager
 import hashlib
+import re
 
 current_request = ContextVar("provider_original_request", default=None)
+_FAIR_SOURCE = re.compile(r"^(?:user|company):[0-9a-f]{64}$")
 
 
 class AdmissionLost(RuntimeError):
@@ -28,8 +30,14 @@ def trusted_source(identity, request=None):
     # Ownership is supplied by authentication. No priority or source field in
     # a JSON body participates in scheduling. Private internal callers already
     # holding the service credential may name their existing consumer lane.
+    source = identity.get("_fair_source")
     if request is not None and getattr(request.state, "company_identity", None):
-        return str(identity.get("_fair_source") or "company:" + str(identity["id"]))
+        if isinstance(source, str) and _FAIR_SOURCE.fullmatch(source):
+            return source
+        return "company:" + str(identity["id"])
+    if (identity.get("_authenticated_fair_source") is True
+            and isinstance(source, str) and _FAIR_SOURCE.fullmatch(source)):
+        return source
     if identity.get("role") == "admin" and request is not None:
         lane = request.headers.get("x-workbench-consumer", "")
         if lane in {"happy", "wb-to-ozon", "ozon-to-wb", "listing", "content"}:

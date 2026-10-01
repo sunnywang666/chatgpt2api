@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -67,7 +68,13 @@ def company(tmp_path, monkeypatch):
     monkeypatch.setattr("services.account_service.account_service.create_conversation_binding",
                         lambda **_: ("private-binding", "private-account", "private-token"))
     monkeypatch.setattr("services.account_service.account_service.release_image_slot", lambda *_: None)
-    monkeypatch.setattr("services.account_service.account_service.get_account", lambda *_: {"quota": 2})
+    # Image dispatch now requires fresh observed image_gen evidence. This is
+    # the real capacity gate, not a mocked bypass of final dispatch.
+    monkeypatch.setattr("services.account_service.account_service.get_account", lambda *_: {
+        "access_token": "private-token", "quota": 2, "status": "正常", "source_type": "web", "type": "Plus",
+        "limits_progress": [{"feature_name": "image_gen", "remaining": 2}],
+        "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+    })
 
     def headers(user="employee", org="company", connector=CONNECTOR):
         return {"Authorization": "Bearer " + admin, "X-Workbench-Company-Org": org,

@@ -104,6 +104,45 @@ class AccountService:
                 raise ConversationBindingError("account reference is ambiguous", code="CHAT_ACCOUNT_AMBIGUOUS")
             return identity
 
+    def resolve_image_account(self, account_ref: str) -> str:
+        from services.conversation_binding_service import ConversationBindingError
+        from services.image_thread import ImageThreadError
+        try:
+            return self.resolve_public_chat_account(account_ref)
+        except ConversationBindingError as exc:
+            codes = {"CHAT_ACCOUNT_REF_INVALID": ("IMAGE_ACCOUNT_REF_INVALID", 400),
+                     "CHAT_ACCOUNT_NOT_FOUND": ("IMAGE_ACCOUNT_NOT_FOUND", 404),
+                     "CHAT_ACCOUNT_AMBIGUOUS": ("IMAGE_ACCOUNT_AMBIGUOUS", 409)}
+            code, status = codes[exc.code]
+            raise ImageThreadError(code, status=status) from None
+
+    @staticmethod
+    def image_account_capacity(account: dict, model: str = "gpt-image-2") -> int:
+        from services.owned_accounts import image_dispatch_capacity
+        return image_dispatch_capacity(account, model)
+
+    def require_image_account(self, access_token: str, model: str, *, expected_identity: str | None = None) -> dict:
+        """Recheck the exact account before execution; never select another one."""
+        with self._lock:
+            token = self._resolve_access_token_locked(access_token)
+            account = self._accounts.get(token) or {}
+            identity = self._stable_account_identity(account)
+            if (expected_identity and identity != expected_identity
+                    or sum(self._stable_account_identity(a) == identity for a in self._accounts.values()) != 1
+                    or self.image_account_capacity(account, model) <= 0):
+                raise RuntimeError("selected image account capability is unavailable")
+            return dict(account)
+
+    def refresh_image_capability(self, account_ref: str) -> None:
+        # Existing protected metadata readers; no model execution is a probe.
+        with self._lock:
+            _, account = self._pool_account_locked(account_ref)
+            source = account.get("source_type")
+        if source in {None, "web", "oauth_login", "password"}:
+            self._refresh_pool_chat(account_ref)
+        elif source == "codex":
+            self.refresh_pool_account(account_ref, routes=["codex"], stale_only=True)
+
     def admission_binding(self, account_identity: str) -> str:
         """Bind the selected original account without selecting/probing again."""
         with self._lock:
@@ -213,11 +252,7 @@ class AccountService:
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
-        if not isinstance(account, dict):
-            return False
-        if account.get("status") in {"禁用", "限流", "异常"}:
-            return False
-        return int(account.get("quota") or 0) > 0
+        return isinstance(account, dict) and AccountService.image_account_capacity(account) > 0
 
     @classmethod
     def _account_matches_plan_type(cls, account: dict, plan_type: str | None = None) -> bool:
@@ -1454,7 +1489,7 @@ class AccountService:
         return [
             token
             for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
-            if int(self._image_inflight.get(token, 0)) < min(max_concurrency, int(self._accounts[token].get("quota") or 0))
+            if int(self._image_inflight.get(token, 0)) < min(max_concurrency, self.image_account_capacity(self._accounts[token]))
         ]
 
     def _acquire_next_candidate_token(
@@ -1509,6 +1544,13 @@ class AccountService:
             selected = context.selected_account()
             if not selected or selected.get("access_token") in (excluded_tokens or ()):
                 raise AdmissionLost("original image account cannot be replaced")
+            image_model = str(context.receipt().get("model") or "gpt-image-2")
+            self.require_image_account(str(selected["access_token"]), image_model,
+                                       expected_identity=context.receipt().get("provider_account_identity"))
+            if (not self._account_matches_plan_type(selected, plan_type)
+                    or not self._account_matches_any_plan_type(selected, plan_types)
+                    or not self._account_matches_source_type(selected, source_type)):
+                raise AdmissionLost("original image account route changed")
             return str(selected["access_token"])
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set(excluded_tokens or ())
@@ -1610,7 +1652,7 @@ class AccountService:
             ("plus", "team", "pro") if codex_model and not plan_type else None,
         )
 
-    def create_conversation_binding(self, *, image_model: str, text_model: str = "auto", excluded_account_identities: set[str] | None = None) -> tuple[str, str, str]:
+    def create_conversation_binding(self, *, image_model: str, text_model: str = "auto", excluded_account_identities: set[str] | None = None, requested_account_identity: str | None = None) -> tuple[str, str, str]:
         plan_type, source_type, plan_types = self._image_route(image_model)
         # Product conversations must never fall back to a Free account.
         paid_types = {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
@@ -1618,9 +1660,12 @@ class AccountService:
                       if plan_types else paid_types) & paid_types
         if not plan_types or (plan_type and self._normalize_account_type(plan_type) not in plan_types):
             raise RuntimeError("conversation binding unavailable: paid account required")
+        text_identities = None
         if text_model and text_model != "auto":
             from services.model_service import model_catalog_service
-            supported = model_catalog_service.route_for_model(text_model).account_types
+            text_route = model_catalog_service.route_for_model(text_model)
+            supported = text_route.account_types
+            text_identities = getattr(text_route, "account_identities", None)
             allowed = {self._normalize_account_type(value) for value in supported}
             if plan_types:
                 allowed &= {self._normalize_account_type(value) for value in plan_types}
@@ -1628,13 +1673,30 @@ class AccountService:
                 raise RuntimeError("conversation binding unavailable: no account supports both text and images")
             plan_types = allowed
         selection = dict(plan_type=plan_type, source_type=source_type, plan_types=plan_types)
-        if excluded_account_identities:
+        if excluded_account_identities or text_identities is not None:
             with self._lock:
                 selection["excluded_tokens"] = {token for token, item in self._accounts.items()
-                                                if item.get("provider_account_identity") in excluded_account_identities}
-        access_token = self.get_available_access_token(**selection)
+                    if (self._stable_account_identity(item) in (excluded_account_identities or ())
+                        or (text_identities is not None and self._stable_account_identity(item) not in text_identities))}
+        binding_id = ""
+        if requested_account_identity:
+            with self._lock:
+                matches = [token for token, account in self._accounts.items()
+                           if self._stable_account_identity(account) == requested_account_identity]
+                if len(matches) != 1 or requested_account_identity in (excluded_account_identities or ()):
+                    raise RuntimeError("selected image account is unavailable")
+                access_token = matches[0]
+            selected = self.require_image_account(access_token, image_model, expected_identity=requested_account_identity)
+            if (self._normalize_account_type(selected.get("type")) not in plan_types
+                    or (text_identities is not None and requested_account_identity not in text_identities)):
+                raise RuntimeError("selected image account model is unavailable")
+            with self._lock:
+                binding_id = self._conversation_binding_for_token_locked(access_token)
+            access_token = self.acquire_bound_image_access_token(binding_id, image_model=image_model)
+        else:
+            access_token = self.get_available_access_token(**selection)
         with self._lock:
-            binding_id = self._conversation_binding_for_token_locked(access_token)
+            binding_id = binding_id or self._conversation_binding_for_token_locked(access_token)
             account_identity = self._provider_account_identity_for_token_locked(access_token)
         return binding_id, account_identity, access_token
 
@@ -1720,14 +1782,14 @@ class AccountService:
                 access_token = self._bound_token_locked(binding_id)
                 account = self._accounts.get(access_token) or {}
                 if (
-                        not self._is_image_account_available(account)
+                        self.image_account_capacity(account, image_model) <= 0
                         or self._normalize_account_type(account.get("type")) not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
                         or not self._account_matches_plan_type(account, plan_type)
                         or not self._account_matches_any_plan_type(account, plan_types)
                         or not self._account_matches_source_type(account, source_type)
                 ):
                     raise RuntimeError("conversation binding unavailable: bound account cannot generate images")
-                if int(self._image_inflight.get(access_token, 0)) < min(max_concurrency, int(account.get("quota") or 0)):
+                if int(self._image_inflight.get(access_token, 0)) < min(max_concurrency, self.image_account_capacity(account, image_model)):
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
@@ -2047,8 +2109,11 @@ class AccountService:
             "capacity_read_failed_at": None,
             "managed_updated_at": utc_now(),
         }
-        if (account.get("status") == "异常" and not account.get("managed_disabled")
-                and info.get("status") in {"正常", "限流"}):
+        if (account.get("status") in {"异常", "限流"} and not account.get("managed_disabled")
+                and info.get("status") in {"正常", "限流"}
+                and (account.get("status") != "限流" or (
+                    info.get("status") == "正常"
+                    and self.image_account_capacity({**account, **updates, "status": "正常"}) > 0))):
             updates.update(
                 status=info["status"], invalid_count=0, last_invalid_at=None,
                 last_refresh_error=None, last_refresh_error_at=None,

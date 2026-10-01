@@ -81,7 +81,8 @@ class PoolResourceTests(unittest.TestCase):
         ]
         accounts = Mock()
         for row in rows:
-            row.update(source_type="web", access_token="synthetic-chat")
+            row.update(source_type="web", access_token="synthetic-chat", type="Plus", status="正常")
+        rows[0]["capacity_observed_at"] = datetime.now(timezone.utc).isoformat()
         accounts.list_accounts.return_value = rows
         accounts._is_image_account_available.side_effect = lambda row: row["quota"] > 0
         codex = Mock()
@@ -90,7 +91,7 @@ class PoolResourceTests(unittest.TestCase):
             image = resource_snapshot(accounts, tasks, codex)["image"]
         self.assertIsNone(image["remaining"])
         self.assertEqual(image["known_remaining"], 9)
-        self.assertEqual(image["observed_accounts"], 0)
+        self.assertEqual(image["observed_accounts"], 1)
         self.assertEqual(image["total_accounts"], 3)
         self.assertIsNone(image["slots_free"])
         self.assertEqual((image["slots_free_min"], image["slots_free_max"]), (1, 2))
@@ -98,6 +99,23 @@ class PoolResourceTests(unittest.TestCase):
         rows[0]["image_inflight"] = 0
         with patch("services.pool_resources.config", self.config):
             self.assertEqual(resource_snapshot(accounts, tasks, codex)["image"]["slots_free"], 2)
+
+    def test_image_slots_use_fresh_image_evidence_not_generic_quota(self):
+        rows = [{"source_type": "web", "access_token": "synthetic", "type": "Plus",
+                 "status": "正常", "quota": 999, "provider_account_identity": "a",
+                 "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+                 "limits_progress": [{"feature_name": "image_gen", "remaining": 2}]}]
+        accounts = Mock()
+        accounts.list_accounts.return_value = rows
+        accounts._is_image_account_available.return_value = True
+        tasks = ImageTaskService(Path(self.tmp.name) / "tasks.json")
+        with patch("services.pool_resources.config", self.config):
+            image = resource_snapshot(accounts, tasks, Mock())["image"]
+            self.assertEqual(image["slots_total"], 2)
+            rows[0]["capacity_read_failed_at"] = datetime.now(timezone.utc).isoformat()
+            image = resource_snapshot(accounts, tasks, Mock())["image"]
+            self.assertEqual(image["slots_total"], 0)
+            self.assertEqual(image["eligible_accounts"], 0)
 
     def test_mixed_pool_image_totals_exclude_codex_only_and_include_exhausted_chat(self):
         rows = [

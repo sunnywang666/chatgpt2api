@@ -2,6 +2,7 @@
 import base64
 import copy
 import hashlib
+from datetime import datetime, timezone
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -62,9 +63,12 @@ def tool_document(cid="conversation-a", rid="request-a", parent="root"):
 def runtime(tmp_path, monkeypatch):
     rows = [{"access_token": "fixture-token", "account_id": "fixture-upstream",
              "provider_account_identity": "account-0", "type": "Plus", "status": "正常",
-             "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-0"]}]
+             "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-0"],
+             "limits_progress": [{"feature_name": "image_gen", "remaining": 999}],
+             "capacity_observed_at": datetime.now(timezone.utc).isoformat()}]
     (tmp_path / "accounts.json").write_text(json.dumps(rows))
     accounts = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    monkeypatch.setattr(accounts, "refresh_image_capability", lambda _: None)
     store = TaskStore(tmp_path / "text_tasks.sqlite3")
     admission = PoolAdmission(store, accounts, clock=lambda: 1000.0,
         settings=lambda: {"image_account_concurrency": 4, "chat_account_concurrency": 4, "codex_max_concurrency": 4},
@@ -176,6 +180,27 @@ def run_next(r, expected):
     result = r.read(expected)
     assert result["status"] == "success", result
     return result
+
+
+def test_advanced_selector_reaches_actual_bound_protocol_and_thread(runtime):
+    r = runtime
+    selected = r.admission.accounts.list_accounts()[0]
+    ref = r.admission.accounts.pool_account_ref(selected)
+    # Another fully eligible physical account must not change the explicit choice.
+    other = {**selected, "access_token": "other-fixture", "account_id": "other-upstream",
+             "provider_account_identity": "other-account", "conversation_binding_ids": []}
+    other.pop("managed_pool_account_ref", None)
+    with r.admission.accounts._lock:
+        r.admission.accounts._accounts[other["access_token"]] = other
+        r.admission.accounts._save_accounts()
+    r.service.submit_generation(WHO, client_task_id="chosen", prompt="fixture", model="gpt-image-2",
+                                size=None, account_ref=ref, image_thread_id="product-a")
+    first = run_next(r, "chosen")
+    r.submit("inherited")
+    second = run_next(r, "inherited")
+    assert [send["account"] for send in r.state.sends] == ["account-0", "account-0"]
+    assert first["_requested_account_ref"] == second["_requested_account_ref"] == ref
+    assert first["conversation_id"] == second["conversation_id"]
 
 
 def test_same_product_images_and_edit_of_earlier_image_use_original_real_conversation(runtime):

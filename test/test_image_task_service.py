@@ -144,8 +144,10 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
-    def test_generation_post_records_submission_boundary_before_network_call(self):
+    @mock.patch("services.openai_backend_api.account_service.require_image_account", return_value={"provider_account_identity": "fixture"})
+    def test_generation_post_records_submission_boundary_before_network_call(self, _capability):
         backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "synthetic-fixture"
         backend.base_url = "https://chatgpt.example.test"
         backend.image_request_message_id = "request-message-1"
         backend.image_submission_started = False
@@ -243,8 +245,10 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertEqual(len(observed_timeouts), 6)
         self.assertTrue(all(0 < timeout <= 2.0 for timeout in observed_timeouts))
 
-    def test_generation_post_is_not_called_when_submission_boundary_cannot_be_persisted(self):
+    @mock.patch("services.openai_backend_api.account_service.require_image_account", return_value={"provider_account_identity": "fixture"})
+    def test_generation_post_is_not_called_when_submission_boundary_cannot_be_persisted(self, _capability):
         backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "synthetic-fixture"
         backend.base_url = "https://chatgpt.example.test"
         backend.image_request_message_id = "request-message-1"
         backend.image_submission_started = False

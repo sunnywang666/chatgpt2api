@@ -11,7 +11,7 @@
 - 用下面的 `submit` 保存原任务号，再用 `status` 查询、`download` 保存图片。编辑时加 `--image 本地图片`，可传多张参考图。
 - 进程退出、网络超时或结果未知后，继续使用原状态文件和任务号。客户端不会自动换号或重新生成。
 - 可靠共用候选完整受理后先持久保存实际输入；池满返回原 `queued` 回执，新增/恢复账号后服务自动派发，服务重启也不要求重提。`waiting` 描述当前原因。部署前后的行为以实际版本为准，见[部署说明](deployment.md#可靠共用与动态容量候选2026-09-20)。
-- 账号界面只管理自己导入的账号，显示上游观测值与更新时间；未知、真实零、读取失败和调用后待刷新分开。没有内部预算或张数分配。
+- 公司账号界面由有权限的成员管理公司统一账号，普通调用者通过自己的程序 Key 使用，显示上游观测值与更新时间；未知、真实零、读取失败和调用后待刷新分开。没有内部预算或张数分配。
 - 同源工作台界面无需 CORS。跨域浏览器调用默认关闭；管理员需将明确来源写入 `CHATGPT2API_CORS_ORIGINS`（逗号分隔）或配置 `cors_origins`，不开放凭据通配来源。普通后台 HTTP 程序不受 CORS 影响。
 - 本接入包不等于小乐的程序已接通。她的调用位置确定后，才能核对 SDK、DSH 或其它调用方式的最小适配。
 
@@ -221,7 +221,7 @@ python3 examples/image_client.py --env-file .image-client.env chat-status --stat
 Happy 主循环依据原生 DSH 消息 `source.replayState.response.requestId` 承接，并保留收到的消息指纹和系统/工具版本指纹。截图内多个连续 user 气泡可能是一次请求中的上下文数组，不应据此判断有几次上游发送。图片工具仍有独立持久图片任务；主推理的会话连续不等于把独立图片任务合并成一条图片请求。本增量不改变额度、并发设置、员工权限或原生 Codex 路线。
 
 
-### Advanced ordinary Chat account selection
+### Advanced account selection (separate from default setup)
 
 Automatic account routing remains the default. For an advanced ordinary Chat text or image-input request, an application may copy an opaque `account_ref` from a text model's public `accounts` directory and include it in `POST /api/chat-requests`:
 
@@ -240,4 +240,71 @@ A selection means **only that account**. The durable admission path queues a kno
 
 Changing or removing an explicit selection on the same request ID is `CHAT_REQUEST_CONFLICT`. Retrying an identical ID reads the original receipt before account/model rediscovery, including after a restart or directory outage. Do not create a replacement ID to bypass an unknown original outcome. A sequential continuation inherits its predecessor's bound account when the selector is omitted; an explicit different account returns `CHAT_ACCOUNT_SELECTION_CONFLICT`. Original owner, session, recovery and archive rules continue to apply.
 
-This selector is implemented for ordinary `/api/chat-requests` text and image-input only. It does not add account selection to image generation, Codex, or other protocol routes. Public receipt projections do not expose internal account identities, bindings, or credentials.
+The image task JSON and multipart APIs also accept `account_ref`; the same durable choice reaches the original scheduler and final send. `submit --account-ref <reference>` supports both generation and edits. It is included in the local input fingerprint before POST, and changing or omitting it on a saved state is rejected. Keep the original ID during quota/observation waits. Image thread continuations must keep their original account; selecting another is an explicit conflict. Public receipt projections do not expose internal account identities, bindings, or credentials.
+
+| Entrance | Selection and original identity |
+| --- | --- |
+| `/api/chat-requests` | JSON `account_ref`; persist `client_request_id`. |
+| `/api/image-tasks/generations`, `/edits` | JSON or multipart `account_ref`; persist `client_task_id`. |
+| `/v1/chat/completions`, `/responses`, `/messages`, `/search` | Optional safe reference, with pre-saved `X-Client-Request-ID`; preserved in durable admission and stripped before upstream protocol forwarding. |
+| `/v1/images/generations`, `/edits` | Same safe reference; use the required original task identity and stable request header for selected compatibility calls. |
+| `/codex/v1/responses`, `/responses/compact` | Safe reference plus stable request header; original native session/response affinity still wins and conflicting selection is rejected. |
+| Company forwarding | The native Chat/image task entrances above retain the same JSON/multipart bytes. Company ingress does not open arbitrary compatibility or account-management routes. |
+
+Malformed or null selection is rejected. Selected compatibility requests without a stable request header or durable admission fail explicitly, never fall back to an automatic account. Codex image aliases currently lack verified image-specific capacity evidence: they retain an original waiting receipt instead of borrowing text quota or probing by generating an image. This does not imply a working public persistent Codex image API.
+
+For example, after `models` returns a real image account reference:
+
+```sh
+# Replace the placeholder with the opaque reference actually returned by models.
+python3 examples/image_client.py --env-file .image-client.env submit \
+  --state ./selected-image.json --client-task-id selected-image-1 \
+  --model gpt-image-2 --prompt 'Create the requested product illustration.' \
+  --account-ref DISCOVERED_ACCOUNT_REF
+python3 examples/image_client.py --env-file .image-client.env status --state ./selected-image.json
+```
+
+The submit response can remain `queued` with a waiting reason. Exit and run `status` with the same state until the original receipt is successful, then use `download`; this example does not require Happy, DSH, or prior project conversations. Editing adds one or more `--image` arguments to the same flow. The caller never supplies private provider binding/account IDs.
+
+
+## Complete a work task and return to its original conversation
+
+A request result is one turn, not the end of the application's whole work. Keep the application work reference, original session/thread and last successful request ID together. After the application's review is complete and the final results have been saved, its work-complete action should archive by default. Do not archive a pending/unknown turn or clear a failed receipt to claim completion.
+
+The same client supports `chat-complete --state ./work-3.json` for the last successful sequential Chat turn. On rework, run `chat-rework --state ./work-3.json`, confirm `archived:false`, then create a new turn with the same `--session-id` and `--previous-request-id work-example-3`. These commands call the existing `archive-conversation`/`restore-conversation` endpoints and store the original-work lifecycle result before/after the request. Network ambiguity remains `unknown`; explicit recovery uses the same original object, whose server-side method reads the actual state before any PATCH. It does not generate a new answer.
+
+For a continuous image work, start `submit --thread-id product-work` with model `gpt-image-2`. Download the successful original image. An edit uses a new task/state, the same `--thread-id`, `--source-task-id ORIGINAL_SUCCESSFUL_TASK`, and `--image ./downloaded-original.png`; `--source-index` identifies that original among multiple supplied images (default 0). The server checks exact original-result bytes, owner and completed predecessor. Do not replace those with an upstream URL or another task's latest image.
+
+After review and saving, run `complete --state ./last-image.json`; it calls `archive-thread` for that work's latest successful task. To rework, run `rework` on the same state, confirm the original thread is restored, then submit a new edit along that thread. Lifecycle operations reject incomplete, mismatched or superseded work, and keep all original results and immutable input identities.
+
+The `--timeout` option is a network-wait timeout only. It does not cancel durable server work or release an unknown upstream outcome. Set a finite application in-flight count and query according to server backoff; stop local waiting by saving the original state and resume querying later. Do not invent unsupported server cancellation/deadline fields. Same-session turns are serialized, while independent sessions can share eligible account capacity under the existing scheduler and upstream pacing.
+
+### Persisted scheduling and automatic work completion
+
+Pass an optional `scheduling` object on model submission. Multipart edits encode it as JSON text in the `scheduling` form field. The server stores it with immutable input and applies it both in the original queue and immediately before sending:
+
+| Field | Scope and default |
+| --- | --- |
+| `workflow_id` | Nonempty application workflow reference, at most 128 characters; grouped under the authenticated stable caller, not caller-supplied identity. |
+| `workflow_concurrency` | 1–64 simultaneously held work-conversation slots; requires a workflow ID, whose default concurrency is 1. These are interface bounds, not measured safe account concurrency. |
+| `min_send_interval_seconds` | Extra minimum interval between actual sends in this workflow, 0–86400; omitted adds no delay. Existing upstream pacing still applies. |
+| `not_before` | UTC ISO8601 earliest actual send; omitted has no extra earliest time. |
+| `wait_deadline` | UTC ISO8601 cutoff for still-unsent work; omitted has no extra cutoff. Already-sent or UNKNOWN work is never replayed or cancelled by this date. |
+
+The response returns effective `scheduling` and scoped `waiting.reasons`. Same-work continuation inherits workflow/interval choices when omitted; timestamps apply only to their original request. A model turn ending does not free a continuing work's slot. A completed or paused work does. Distinct keys of one known caller do not gain extra scheduling shares; original receipt ownership is unchanged.
+
+The application persists final results first (`chat-save --state ./work-3.json --output ./result.json`, or image `download`), then emits its work-complete event automatically:
+
+```text
+POST /api/chat-requests/ORIGINAL_LAST_ID/work
+{"state":"completed","results_saved":true}
+
+POST /api/image-tasks/ORIGINAL_LAST_ID/work
+{"state":"completed","results_saved":true}
+```
+
+GET the same `/work` path to read `protocol:work-v1`, `kind`, `request_id`, `work_ref`, `state`, `slot_held`, and `archive`. Completion and the archive intent are stored atomically; `state:completed` releases this work's slot, while `archive.status:pending/running/unknown` truthfully retains unconfirmed upstream archive. Background recovery continues the original target after failure/restart; only `confirmed` with `archived:true` proves archive. `chat-work-status`/`work-status` expose this through the same standalone client. Existing `complete`/`rework` commands use compatible archive/restore entrances backed by the same durable work state; a timeout requires original work readback, not a new model submission.
+
+POST `{"state":"paused"}` to suspend an unsent/finished-turn work without archiving. POST `{"state":"active"}` to resume or rework; an archived work remains `restoring` until original restore is confirmed. A late prior completion cannot close a new work or its slot. UNKNOWN/in-flight work rejects release. Legacy single-request protocols and native Codex without a verified upstream archive API explicitly use `archive.scope:provider_work` / `status:not_applicable`; no upstream archive is claimed.
+
+For example, start two independent sessions under `--workflow-id product-copy --workflow-concurrency 2 --min-send-interval-seconds 12`. Each session keeps its own state files and ordered predecessor IDs. Add `--not-before`/`--wait-deadline` with actual UTC times when needed. Leave the same original ID in place while queued; the scheduler resumes it after capacity or timing constraints clear. `WAIT_DEADLINE_EXCEEDED` with `not_sent` ends only unsent waiting. The client's HTTP timeout is still separate from these server controls.

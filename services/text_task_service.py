@@ -241,6 +241,8 @@ class TextTaskService:
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
         # Derive diagnostics only from validated private records. Never trust a
         # stored projection or arbitrary exception content at the public edge.
+        if receipt.get("_scheduling") is not None:
+            result["scheduling"] = receipt["_scheduling"]
         result.pop("recovery_scan_progress", None)
         result.pop("recovery_last_read_error", None)
         read_error = safe_recovery_read_error(receipt.get("recovery_last_read_error"))
@@ -1214,6 +1216,11 @@ class TextTaskService:
     def submit(self, owner: str, body: dict, *, source: str | None = None):
         from services.durable_forward import dispatch_model
         body = self.submission_input(owner, body)
+        from services.workflow_scheduling import normalize_scheduling
+        if "_scheduling" in body:
+            body = {**body, "_scheduling": normalize_scheduling(body["_scheduling"])}
+        if body.get("_scheduling") is not None and self.admission is None:
+            raise ValueError("SCHEDULING_UNAVAILABLE")
         request_id, request_hash = self._submission_identity(owner, body)
         receipt = {"request_id": request_id, "client_conversation_id": body["client_conversation_id"],
                    "_route": body.get("_route", "chat"), "_operation": body.get("_operation", "text"),
@@ -1274,7 +1281,8 @@ class TextTaskService:
                     from services.account_service import account_service
                     accounts = self.admission.accounts if self.admission is not None else account_service
                     receipt["_requested_account_ref"] = body["_requested_account_ref"]
-                    receipt["_requested_account_identity"] = accounts.resolve_public_chat_account(body["_requested_account_ref"])
+                    receipt["_requested_account_identity"] = (accounts.resolve_image_account(body["_requested_account_ref"])
+                        if body.get("_operation") == "image" else accounts.resolve_public_chat_account(body["_requested_account_ref"]))
                     if (body.get("provider_account_identity")
                             and body["provider_account_identity"] != receipt["_requested_account_identity"]):
                         raise ConversationBindingError("account selection conflicts with binding",
@@ -1290,6 +1298,11 @@ class TextTaskService:
                 for field in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id"):
                     if body.get(field):
                         receipt[field] = body[field]
+                from services.workflow_scheduling import prepare_receipt
+                from services.work_lifecycle import ensure_work
+                prepare_receipt(receipt, body.get("_scheduling"), receipt["_source"])
+                ensure_work(self.store, db, "text", owner, request_id, receipt,
+                            source=receipt["_source"], scheduling=receipt.get("_scheduling"))
                 db.execute("INSERT INTO requests VALUES(?,?,?,?)", (owner, request_id, request_hash, json.dumps(receipt)))
         if schedule and self.admission is not None:
             self.admission.wake()

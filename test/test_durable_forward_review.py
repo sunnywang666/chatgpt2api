@@ -162,3 +162,23 @@ def test_failed_stream_keeps_prefix_and_logs_once_without_claiming_upstream_reco
     logs = runtime.logs.list(type="call")
     assert len(logs) == 1 and logs[0]["detail"]["status"] == "failed"
     assert "NEVER_LOG_UPSTREAM_SECRET" not in json.dumps(logs)
+
+
+def test_selected_account_ref_is_durable_but_never_forwarded_upstream():
+    saved = durable_forward.envelope(
+        WHO,
+        {"model": "fixture-text", "messages": [], "account_ref": "car_" + "A" * 43},
+        request(),
+        "openai_v1_chat_complete",
+    )
+    assert saved["_requested_account_ref"] == "car_" + "A" * 43
+    assert "account_ref" not in saved["_forward"]["payload"]
+
+
+def test_codex_image_envelope_keeps_image_alias_for_admission():
+    saved = durable_forward.envelope(
+        WHO, {"model": "codex-gpt-image-2", "prompt": "draw"}, request(),
+        "openai_v1_image_generations", operation="image",
+    )
+    assert saved["_route"] == "codex"
+    assert saved["model"] == "codex-gpt-image-2"

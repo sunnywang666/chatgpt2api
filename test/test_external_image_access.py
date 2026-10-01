@@ -20,6 +20,19 @@ from services.storage.json_storage import JSONStorageBackend
 
 
 class ExternalImageAccessTests(unittest.TestCase):
+    @staticmethod
+    def image_account(remaining=2, *, token="internal-token"):
+        """Fresh upstream image_gen evidence; quota alone is not dispatch proof."""
+        return {
+            "access_token": token,
+            "type": "Pro",
+            "source_type": "web",
+            "status": "正常",
+            "quota": remaining,
+            "limits_progress": [{"feature_name": "image_gen", "remaining": remaining}],
+            "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -36,7 +49,7 @@ class ExternalImageAccessTests(unittest.TestCase):
         for target, value in [
             ("services.account_service.account_service.create_conversation_binding", lambda **_: ("binding", "account", "internal-token")),
             ("services.account_service.account_service.release_image_slot", lambda *_: None),
-            ("services.account_service.account_service.get_account", lambda *_: {"quota": 2}),
+            ("services.account_service.account_service.get_account", lambda *_: self.image_account()),
             ("api.support.auth_service", self.auth),
             ("api.image_tasks.image_task_service", self.tasks),
             ("services.image_task_service.image_task_service", self.tasks),
@@ -291,8 +304,8 @@ class ExternalImageAccessTests(unittest.TestCase):
 
     def test_admission_cannot_use_the_same_last_capacity_twice(self):
         self.account.add_account_items([
-            {"access_token": "last-slot", "type": "Pro", "status": "正常", "quota": 1},
-            {"access_token": "other-slot", "type": "Pro", "status": "正常", "quota": 2},
+            self.image_account(1, token="last-slot"),
+            self.image_account(2, token="other-slot"),
         ])
         from services.config import config
         with patch.object(type(config), "image_account_concurrency", new_callable=lambda: property(lambda _: 4)):
@@ -318,7 +331,7 @@ class ExternalImageAccessTests(unittest.TestCase):
             records = self.tasks.list_tasks(self.key_a, ["held"])["items"]
             released_with_durable_slot.append(bool(records and records[0].get("upstream_unfinished")))
         body = {"client_task_id": "held", "prompt": "sample"}
-        with patch("services.account_service.account_service.get_account", return_value={"quota": 1}), patch("services.account_service.account_service.release_image_slot", side_effect=release):
+        with patch("services.account_service.account_service.get_account", return_value=self.image_account(1)), patch("services.account_service.account_service.release_image_slot", side_effect=release):
             try:
                 self.client.post("/api/image-tasks/generations", headers=self.headers(), json=body)
                 self.assertTrue(entered.wait(2))

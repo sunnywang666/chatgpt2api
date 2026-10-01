@@ -320,15 +320,17 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         backend.base_url = "https://chatgpt.test"
         backend.session = FakeSession()
         backend._image_headers = lambda path, *_args: {"x-test-path": path}
-
-        response = backend._start_image_generation(
-            "make an image",
-            ChatRequirements(token="requirements"),
-            "conduit",
-            "gpt-image-2",
-            conversation_id="conversation-1",
-            parent_message_id="message-1",
-        )
+        backend.access_token = "fixture-capability-token"
+        with mock.patch("services.openai_backend_api.account_service.require_image_account") as capability:
+            response = backend._start_image_generation(
+                "make an image",
+                ChatRequirements(token="requirements"),
+                "conduit",
+                "gpt-image-2",
+                conversation_id="conversation-1",
+                parent_message_id="message-1",
+            )
+        self.assertEqual(capability.call_args_list, [mock.call("fixture-capability-token", "gpt-image-2")] * 2)
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(backend.session.responses[0].closed)

@@ -19,6 +19,11 @@ from services.storage.json_storage import JSONStorageBackend
 from utils.helper import anonymize_token, split_image_model
 
 
+def image_observation(remaining):
+    return {"limits_progress": [{"feature_name": "image_gen", "remaining": remaining}],
+            "capacity_observed_at": datetime.now(timezone.utc).isoformat()}
+
+
 class AccountCapabilityTests(unittest.TestCase):
     def test_image_capability_projection_retains_evidence_without_claiming_dispatch(self) -> None:
         now = datetime.now(timezone.utc)
@@ -157,8 +162,8 @@ class AccountCapabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items([
-                {"access_token": "free", "type": "Free", "status": "正常", "quota": 100},
-                {"access_token": "pro", "type": "Pro", "status": "正常", "quota": 100},
+                {"access_token": "free", "type": "Free", "status": "正常", "quota": 100, **image_observation(100)},
+                {"access_token": "pro", "type": "Pro", "status": "正常", "quota": 100, **image_observation(100)},
             ])
             service.fetch_remote_info = lambda token, event="": service.get_account(token)
             with patch("services.model_service.model_catalog_service.route_for_model", return_value=SimpleNamespace(account_types=frozenset({"Pro"}))):
@@ -174,8 +179,8 @@ class AccountCapabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items([
-                {"access_token": "free", "type": "Free", "status": "正常", "quota": 100},
-                {"access_token": "pro", "type": "Pro", "status": "正常", "quota": 100},
+                {"access_token": "free", "type": "Free", "status": "正常", "quota": 100, **image_observation(100)},
+                {"access_token": "pro", "type": "Pro", "status": "正常", "quota": 100, **image_observation(100)},
             ])
             service.fetch_remote_info = lambda token, event="": service.get_account(token)
             service.refresh_access_token = lambda token, event="": token
@@ -215,8 +220,8 @@ class AccountCapabilityTests(unittest.TestCase):
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items(
                 [
-                    {"access_token": "token-a", "type": "Pro", "status": "正常", "quota": 3},
-                    {"access_token": "token-b", "type": "Pro", "status": "正常", "quota": 3},
+                    {"access_token": "token-a", "type": "Pro", "status": "正常", "quota": 3, **image_observation(3)},
+                    {"access_token": "token-b", "type": "Pro", "status": "正常", "quota": 3, **image_observation(3)},
                 ]
             )
             service.fetch_remote_info = (
@@ -247,7 +252,7 @@ class AccountCapabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items(
-                [{"access_token": "token-a", "type": "Pro", "status": "正常", "quota": 3}]
+                [{"access_token": "token-a", "type": "Pro", "status": "正常", "quota": 3, **image_observation(3)}]
             )
             service.fetch_remote_info = (
                 lambda access_token, event="fetch_remote_info": service.get_account(access_token)
@@ -280,7 +285,8 @@ class AccountCapabilityTests(unittest.TestCase):
                 {"status": "正常", "quota": 0}
             )
         )
-        self.assertTrue(AccountService._is_image_account_available({"status": "正常", "quota": 1}))
+        self.assertTrue(AccountService._is_image_account_available({"access_token": "fixture", "type": "Plus", "status": "正常", "quota": 1, **image_observation(1)}))
+        self.assertFalse(AccountService._is_image_account_available({"access_token": "fixture", "type": "Plus", "status": "正常", "quota": 1}))
 
     def test_prolite_variants_are_normalized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -333,8 +339,8 @@ class AccountCapabilityTests(unittest.TestCase):
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_account_items(
                 [
-                    {"access_token": "token-plus", "type": "Plus", "status": "正常", "quota": 3},
-                    {"access_token": "token-pro", "type": "Pro", "status": "正常", "quota": 3},
+                    {"access_token": "token-plus", "type": "Plus", "status": "正常", "quota": 3, **image_observation(3)},
+                    {"access_token": "token-pro", "type": "Pro", "status": "正常", "quota": 3, **image_observation(3)},
                 ]
             )
 

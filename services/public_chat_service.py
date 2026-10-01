@@ -187,6 +187,13 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
     for field in ("waiting", "rate_limit"):
         if isinstance(receipt.get(field), dict):
             result[field] = receipt[field]
+    if isinstance(receipt.get("scheduling"), dict):
+        try:
+            from services.workflow_scheduling import normalize_scheduling
+            result["scheduling"] = normalize_scheduling(receipt["scheduling"])
+        except ValueError:
+            # Corrupt legacy receipt metadata must not become a public contract.
+            pass
     terminal_empty = receipt.get("terminal_empty")
     if (result["status"] == "unknown" and isinstance(terminal_empty, dict)
             and terminal_empty.get("verified") is True

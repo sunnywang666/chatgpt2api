@@ -185,7 +185,7 @@ def image_capability_projection(account: dict) -> dict:
     capacity = observed_capacity(account)
     observed_at = _parse_observed_at(capacity.get("observed_at"))
     remaining = capacity.get("remaining")
-    observed = remaining is not None
+    observed = remaining is not None and observed_at is not None
     observation_state = str(capacity.get("state") or "unknown")
     status = str(account.get("status") or "")
 
@@ -216,6 +216,31 @@ def image_capability_projection(account: dict) -> dict:
         "observation_state": observation_state,
         "observed_at": observed_at.timestamp() if observed_at is not None else None,
     }
+
+
+
+def image_dispatch_capacity(account: dict, model: str = "gpt-image-2") -> int:
+    """Fresh image-specific evidence, not the generic quota or a text slot.
+
+    Codex models/usage currently prove Responses capacity only. Until that
+    route provides verified image-tool evidence it cannot yield image slots.
+    """
+    from utils.helper import is_codex_image_model, split_image_model
+    plan, base = split_image_model(model)
+    source = str(account.get("source_type") or "web").lower()
+    if base is None or is_codex_image_model(model) or source not in {"web", "oauth_login", "password"}:
+        return 0
+    from services.account_service import AccountService
+    account_type = AccountService._normalize_account_type(account.get("type"))
+    if (account_type not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
+            or (plan and account_type != AccountService._normalize_account_type(plan))
+            or account.get("managed_disabled") or account.get("status") in {"禁用", "异常", "限流"}
+            or not account.get("access_token")):
+        return 0
+    capacity = observed_capacity(account)
+    if capacity["state"] != "observed" or capacity["remaining"] is None:
+        return 0
+    return capacity["remaining"]
 
 
 def public_owned_account(account: dict) -> dict:

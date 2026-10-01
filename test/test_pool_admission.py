@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 
 from services.account_service import AccountService
 from services.model_service import ModelRoute
@@ -29,6 +30,7 @@ class Clock:
 def build(root, clock=None):
     root = Path(root)
     accounts = AccountService(JSONStorageBackend(root / "accounts.json"))
+    accounts.refresh_image_capability = lambda account_ref: None  # metadata is fixture-controlled
     store = TaskStore(root / "text_tasks.sqlite3")
     admission = PoolAdmission(store, accounts, clock=clock or (lambda: 1000.0),
                               settings=lambda: {"image_account_concurrency": 4, "codex_max_concurrency": 4},
@@ -78,7 +80,9 @@ class AdmissionTests(unittest.TestCase):
     def write_accounts(self, count):
         self.rows = [{"access_token": "fixture-token-" + str(i), "account_id": "upstream-" + str(i),
                       "provider_account_identity": "account-" + str(i), "type": "Plus", "status": "正常",
-                      "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-" + str(i)]}
+                      "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-" + str(i)],
+                      "limits_progress": [{"feature_name": "image_gen", "remaining": 999}],
+                      "capacity_observed_at": datetime.now(timezone.utc).isoformat()}
                      for i in range(count)]
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
 
@@ -286,10 +290,11 @@ class AdmissionTests(unittest.TestCase):
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         self.image("image")
         self.assertIsNone(self.admission.claim_next())
-        self.rows[0].update(managed_disabled=False, quota=0)
+        self.rows[0].update(managed_disabled=False, quota=0, limits_progress=[{"feature_name": "image_gen", "remaining": 0}])
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         self.assertIsNone(self.admission.claim_next())
         self.rows[0]["quota"] = 999
+        self.rows[0]["limits_progress"] = [{"feature_name": "image_gen", "remaining": 999}]
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         self.assertEqual(self.admission.claim_next().request_id, "image")
 
@@ -323,6 +328,7 @@ class AdmissionTests(unittest.TestCase):
         self.image("reserved")
         ctx = self.admission.claim_next()
         self.rows[0]["quota"] = 0
+        self.rows[0]["limits_progress"] = [{"feature_name": "image_gen", "remaining": 0}]
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         with self.assertRaises(AdmissionLost):
             ctx.before_send()

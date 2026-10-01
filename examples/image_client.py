@@ -9,6 +9,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import hashlib
+from http.client import HTTPException
 import json
 import mimetypes
 import os
@@ -168,8 +169,11 @@ class ApiClient:
         if payload is not None:
             body = _json_bytes(payload)
             content_type = "application/json"
-        with self.open(method, endpoint, body=body, content_type=content_type) as response:
-            raw = response.read(MAX_JSON_BYTES + 1)
+        try:
+            with self.open(method, endpoint, body=body, content_type=content_type) as response:
+                raw = response.read(MAX_JSON_BYTES + 1)
+        except (OSError, HTTPException) as exc:
+            raise ClientError("response interrupted; query the original durable request") from exc
         if len(raw) > MAX_JSON_BYTES:
             raise ClientError("server JSON response exceeds 4 MiB")
         try:
@@ -222,7 +226,7 @@ def _read_input_image(path_text: str) -> dict[str, Any]:
 
 def _request_contract(args: argparse.Namespace, images: list[dict[str, Any]]) -> dict[str, Any]:
     mode = "edit" if images else "generate"
-    return {
+    contract = {
         "schema": "chatgpt2api.persistent-image-input.v1",
         "mode": mode,
         "prompt_sha256": hashlib.sha256(args.prompt.encode("utf-8")).hexdigest(),
@@ -234,6 +238,64 @@ def _request_contract(args: argparse.Namespace, images: list[dict[str, Any]]) ->
             for item in images
         ],
     }
+    account_ref = _selected_account(args)
+    if account_ref is not None:
+        contract["account_ref"] = account_ref
+    contract.update(_image_work_fields(args, images))
+    scheduling = _scheduling(args)
+    if scheduling is not None:
+        contract["scheduling"] = scheduling
+    return contract
+
+
+def _selected_account(args: argparse.Namespace) -> str | None:
+    account_ref = getattr(args, "account_ref", None)
+    if account_ref is not None and not re.fullmatch(r"car_[A-Za-z0-9_-]{43}", account_ref):
+        raise ClientError("--account-ref must be an opaque car_ reference from the model directory")
+    return account_ref
+
+
+def _scheduling(args: argparse.Namespace) -> dict | None:
+    fields = ("workflow_id", "workflow_concurrency", "min_send_interval_seconds", "not_before", "wait_deadline")
+    result = {key: getattr(args, key) for key in fields if getattr(args, key, None) is not None}
+    if not result:
+        return None
+    if "workflow_concurrency" in result and (not result.get("workflow_id") or not 1 <= result["workflow_concurrency"] <= 64):
+        raise ClientError("--workflow-concurrency requires --workflow-id and a value from 1 to 64")
+    if "min_send_interval_seconds" in result and not 0 <= result["min_send_interval_seconds"] <= 86400:
+        raise ClientError("--min-send-interval-seconds must be from 0 to 86400")
+    dates = {}
+    for key in ("not_before", "wait_deadline"):
+        if key in result:
+            try:
+                dates[key] = dt.datetime.fromisoformat(result[key].replace("Z", "+00:00"))
+                if dates[key].tzinfo is None or dates[key].utcoffset() != dt.timedelta(0):
+                    raise ValueError()
+            except ValueError:
+                raise ClientError(f"--{key.replace('_', '-')} requires UTC ISO8601") from None
+    if len(dates) == 2 and dates["wait_deadline"] <= dates["not_before"]:
+        raise ClientError("wait deadline must follow not-before")
+    return result
+
+
+def _image_work_fields(args: argparse.Namespace, images: list[dict[str, Any]]) -> dict[str, Any]:
+    thread = getattr(args, "thread_id", None)
+    source = getattr(args, "source_task_id", None)
+    index = getattr(args, "source_index", 0)
+    if thread is None:
+        if source is not None or index:
+            raise ClientError("--source-task-id and --source-index require --thread-id")
+        return {}
+    fields: dict[str, Any] = {"image_thread_id": _validate_task_id(thread)}
+    if args.model != "gpt-image-2":
+        raise ClientError("image threads require the advertised gpt-image-2 route")
+    if source is not None:
+        if not images or not 0 <= index < len(images):
+            raise ClientError("--source-index must identify a supplied original result image")
+        fields.update(edit_source_task_id=_validate_task_id(source), edit_source_index=index)
+    elif index:
+        raise ClientError("--source-index requires --source-task-id")
+    return fields
 
 
 def _fingerprint(contract: dict[str, Any]) -> str:
@@ -418,6 +480,13 @@ def _command_submit(api: ApiClient, args: argparse.Namespace) -> int:
                 }
                 if args.size:
                     fields["size"] = args.size
+                if "account_ref" in contract:
+                    fields["account_ref"] = contract["account_ref"]
+                if "scheduling" in contract:
+                    fields["scheduling"] = json.dumps(contract["scheduling"], separators=(",", ":"))
+                for key in ("image_thread_id", "edit_source_task_id", "edit_source_index"):
+                    if key in contract:
+                        fields[key] = str(contract[key])
                 body, content_type = _multipart_body(fields, images)
                 result = api.json(
                     "POST",
@@ -434,6 +503,13 @@ def _command_submit(api: ApiClient, args: argparse.Namespace) -> int:
                 }
                 if args.size:
                     payload["size"] = args.size
+                if "account_ref" in contract:
+                    payload["account_ref"] = contract["account_ref"]
+                if "scheduling" in contract:
+                    payload["scheduling"] = contract["scheduling"]
+                for key in ("image_thread_id", "edit_source_task_id", "edit_source_index"):
+                    if key in contract:
+                        payload[key] = contract[key]
                 result = api.json("POST", "/api/image-tasks/generations", payload=payload)
             if result.get("id") != task_id:
                 raise ClientError("submit response changed the client task identity")
@@ -514,9 +590,11 @@ def _command_download(api: ApiClient, args: argparse.Namespace) -> int:
         if length.isdigit() and int(length) > MAX_DOWNLOAD_BYTES:
             raise ClientError("download exceeds 100 MiB")
         fd = -1
+        created = False
         total = 0
         try:
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
             with os.fdopen(fd, "wb") as handle:
                 fd = -1
                 while True:
@@ -527,13 +605,18 @@ def _command_download(api: ApiClient, args: argparse.Namespace) -> int:
                     if total > MAX_DOWNLOAD_BYTES:
                         raise ClientError("download exceeds 100 MiB")
                     handle.write(chunk)
+                if total == 0 or (length.isdigit() and total != int(length)):
+                    raise ClientError("download incomplete; retry downloading the original result")
                 handle.flush()
                 os.fsync(handle.fileno())
-        except Exception:
+        except BaseException as exc:
             if fd >= 0:
                 os.close(fd)
-            with contextlib.suppress(FileNotFoundError):
-                target.unlink()
+            if created:
+                with contextlib.suppress(FileNotFoundError):
+                    target.unlink()
+            if isinstance(exc, (OSError, HTTPException)):
+                raise ClientError("download or save failed; retry downloading the original result") from exc
             raise
     _emit({"client_task_id": task_id, "index": args.index, "output": str(target), "bytes": total})
     return 0
@@ -593,10 +676,11 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
         parts.append({"type": "image_url", "image_url": {"url":
             f"data:{item['content_type']};base64," + base64.b64encode(item["data"]).decode("ascii")}})
     body = {"model": args.model, "messages": [{"role": "user", "content": parts}]}
-    account_ref = getattr(args, "account_ref", None)
+    scheduling = _scheduling(args)
+    if scheduling is not None:
+        body["scheduling"] = scheduling
+    account_ref = _selected_account(args)
     if account_ref is not None:
-        if not re.fullmatch(r"car_[A-Za-z0-9_-]{43}", account_ref):
-            raise ClientError("--account-ref must be an opaque car_ reference from the model directory")
         body["account_ref"] = account_ref
     conversation = None
     if args.previous_request_id is not None and args.session_id is None:
@@ -655,6 +739,99 @@ def _command_chat_status(api: ApiClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_chat_save(api: ApiClient, args: argparse.Namespace) -> int:
+    state = _load_chat_state(_chat_state_path(args))
+    request_id = _chat_request_id(args, state)
+    result = _chat_receipt(api, request_id, conversation=state.get("conversation") if state else None)
+    if result.get("status") != "succeeded" or not isinstance(result.get("content"), str):
+        raise ClientError("original Chat result is not ready to save")
+    target = _safe_output_path(args.output)
+    created = False
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(_json_bytes(result))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        if created:
+            with contextlib.suppress(FileNotFoundError):
+                target.unlink()
+        raise
+    _emit({"request_id": request_id, "output": str(target), "bytes": target.stat().st_size})
+    return 0
+
+
+def _command_work_status(api: ApiClient, args: argparse.Namespace) -> int:
+    chat = args.command.startswith("chat-")
+    path = _chat_state_path(args) if chat else _state_path(args)
+    with _state_lock(path):
+        state = _load_chat_state(path) if chat else _load_state(path)
+        if not state:
+            raise ClientError("work status requires the original state file")
+        request_id = state["request_id" if chat else "client_task_id"]
+        ref = (state.get("conversation") or {}).get("client_conversation_id") if chat else state.get("input", {}).get("image_thread_id")
+        endpoint = f"/api/{'chat-requests' if chat else 'image-tasks'}/{parse.quote(request_id, safe='')}/work"
+        result = api.json("GET", endpoint)
+        if (result.get("protocol") != "work-v1" or result.get("request_id") != request_id
+                or result.get("kind") != ("text" if chat else "image") or ref and result.get("work_ref") != ref):
+            raise ClientError("work response changed original identity")
+        state["work"] = result
+        _atomic_write_state(path, state)
+    _emit(result)
+    return 0
+
+
+def _command_work_lifecycle(api: ApiClient, args: argparse.Namespace) -> int:
+    """An explicit work-complete event archives; rework restores that same work."""
+    chat = args.command.startswith("chat-")
+    archived = args.command in {"complete", "chat-complete"}
+    path = _chat_state_path(args) if chat else _state_path(args)
+    with _state_lock(path):
+        state = _load_chat_state(path) if chat else _load_state(path)
+        if state is None:
+            raise ClientError("work lifecycle requires the original durable state file")
+        if chat:
+            task_id = _chat_request_id(args, state)
+            expected = state.get("conversation")
+            if not isinstance(expected, dict) or not expected.get("client_conversation_id"):
+                raise ClientError("work lifecycle requires an original sequential-v1 session")
+            current = _chat_receipt(api, task_id, conversation=expected)
+            if current.get("status") != "succeeded":
+                raise ClientError("work is not complete; query the original request before archiving or rework")
+            endpoint = f"/api/chat-requests/{parse.quote(task_id, safe='')}/{'archive' if archived else 'restore'}-conversation"
+        else:
+            task_id = state["client_task_id"]
+            thread_id = state.get("input", {}).get("image_thread_id")
+            current = _lookup_task(api, task_id)
+            expected = current.get("image_thread")
+            if (not thread_id or not isinstance(expected, dict) or expected.get("protocol") != "image-thread-v1"
+                    or expected.get("id") != thread_id):
+                raise ClientError("work lifecycle requires the original image-thread-v1 receipt")
+            if current.get("status") != "success":
+                raise ClientError("work is not complete; query the original image before archiving or rework")
+            endpoint = f"/api/image-tasks/{parse.quote(task_id, safe='')}/{'archive' if archived else 'restore'}-thread"
+        state["lifecycle"] = {"operation": "archive" if archived else "restore", "status": "prepared", "updated_at": _utc_now()}
+        _atomic_write_state(path, state)
+        try:
+            result = api.json("POST", endpoint, payload={})
+            scope = result.get("conversation") if chat else result.get("image_thread")
+            id_key, scope_key = ("request_id", "client_conversation_id") if chat else ("task_id", "id")
+            if (result.get(id_key) != task_id or result.get("archived") is not archived
+                    or not isinstance(scope, dict) or scope.get("protocol") != expected.get("protocol")
+                    or scope.get(scope_key) != expected.get(scope_key)):
+                raise ClientError("lifecycle response did not confirm the original work and archive state")
+        except ClientError:
+            state["lifecycle"].update(status="unknown", updated_at=_utc_now())
+            _atomic_write_state(path, state)
+            raise
+        state["lifecycle"].update(status="confirmed", archived=archived, updated_at=_utc_now())
+        _atomic_write_state(path, state)
+    _emit(result)
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", help="optional KEY=VALUE file; existing environment values win")
@@ -669,6 +846,10 @@ def _parser() -> argparse.ArgumentParser:
     submit.add_argument("--client-task-id", help="stable 1..200 character URL-safe caller ID; generated when omitted")
     submit.add_argument("--prompt", required=True)
     submit.add_argument("--model", required=True, help="choose an ID returned by the models command")
+    submit.add_argument("--account-ref", help="advanced: require this opaque company account; omission keeps automatic allocation")
+    submit.add_argument("--thread-id", help="application work reference for an image-thread-v1 conversation")
+    submit.add_argument("--source-task-id", help="original successful task whose saved image is supplied for rework")
+    submit.add_argument("--source-index", type=int, default=0, help="index of the supplied original result among --image inputs")
     submit.add_argument("--size")
     submit.add_argument("--quality", default="auto")
     submit.add_argument("--image", action="append", default=[], metavar="PATH", help="repeat for an edit task")
@@ -700,6 +881,21 @@ def _parser() -> argparse.ArgumentParser:
         operation = subparsers.add_parser(command, help="read the original Chat receipt; recover only reads the upstream result")
         operation.add_argument("--state")
         operation.add_argument("--request-id")
+    save = subparsers.add_parser("chat-save", help="save the original successful Chat result, never rerun the model")
+    save.add_argument("--state", required=True)
+    save.add_argument("--output", required=True)
+    for command in ("work-status", "chat-work-status"):
+        work = subparsers.add_parser(command, help="read original work and automatic archive/restore progress")
+        work.add_argument("--state", required=True)
+    for operation in (submit, chat):
+        operation.add_argument("--workflow-id")
+        operation.add_argument("--workflow-concurrency", type=int)
+        operation.add_argument("--min-send-interval-seconds", type=float)
+        operation.add_argument("--not-before", help="UTC ISO8601 earliest actual send")
+        operation.add_argument("--wait-deadline", help="UTC ISO8601 deadline for work that has not yet been sent")
+    for command in ("complete", "rework", "chat-complete", "chat-rework"):
+        lifecycle = subparsers.add_parser(command, help="archive completed work or restore its original conversation for rework")
+        lifecycle.add_argument("--state", required=True)
     return parser
 
 
@@ -719,6 +915,13 @@ def main(argv: list[str] | None = None) -> int:
             "chat-submit": _command_chat_submit,
             "chat-status": _command_chat_status,
             "chat-recover": _command_chat_status,
+            "chat-save": _command_chat_save,
+            "work-status": _command_work_status,
+            "chat-work-status": _command_work_status,
+            "chat-complete": _command_work_lifecycle,
+            "chat-rework": _command_work_lifecycle,
+            "complete": _command_work_lifecycle,
+            "rework": _command_work_lifecycle,
             "submit": _command_submit,
             "status": _command_status,
             "resume": _command_resume,

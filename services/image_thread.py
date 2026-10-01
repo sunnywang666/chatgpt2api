@@ -138,6 +138,14 @@ def accept_thread(task, tasks, payload, mode, *, output_reader=saved_image_bytes
         supplied = images[index][0]
         if not isinstance(supplied, bytes) or hashlib.sha256(original).digest() != hashlib.sha256(supplied).digest():
             raise ImageThreadError("IMAGE_THREAD_SOURCE_MISMATCH")
+    if previous:
+        previous_identity = previous.get("provider_account_identity") or previous.get("_requested_account_identity")
+        requested_identity = task.get("_requested_account_identity")
+        if requested_identity and previous_identity and requested_identity != previous_identity:
+            raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
+        if not requested_identity and previous.get("_requested_account_identity"):
+            task["_requested_account_identity"] = previous["_requested_account_identity"]
+            task["_requested_account_ref"] = previous["_requested_account_ref"]
     task["_image_thread"] = {"protocol": PROTOCOL, "id": thread_id,
                              "previous_task_id": previous["id"] if previous else None,
                              "edit_source_task_id": source_id, "origin_task_id": origin,
@@ -184,6 +192,9 @@ def predecessor_state(task, owned):
     if previous.get("client_conversation_id") != task.get("client_conversation_id"):
         return {}, "IMAGE_THREAD_HISTORY_INVALID"
     binding = {k: previous[k] for k in _FIELDS}
+    if (task.get("_requested_account_identity")
+            and task["_requested_account_identity"] != binding["provider_account_identity"]):
+        return {}, "IMAGE_ACCOUNT_SELECTION_CONFLICT"
     for key in ("provider_binding_id", "provider_account_identity"):
         if task.get(key) and task[key] != binding[key]:
             return {}, "IMAGE_THREAD_BINDING_CHANGED"
