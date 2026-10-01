@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any
@@ -66,8 +66,8 @@ class ModelCatalogService:
         self._models_by_account: dict[str, dict[str, dict[str, Any]]] = {}
         self._account_types: dict[str, str] = {}
         self._executor = ThreadPoolExecutor(max_workers=self.MAX_DISCOVERY_WORKERS)
-        self._inflight_accounts: dict[str, object] = {}
-        self._anonymous_inflight: object | None = None
+        self._inflight_accounts: dict[str, tuple[Future, str, str]] = {}
+        self._anonymous_inflight: Future | None = None
 
     @staticmethod
     def _model_map(result: object) -> dict[str, dict[str, Any]]:
@@ -126,14 +126,15 @@ class ModelCatalogService:
             for identity, (_token, account_type, state, fingerprint) in accounts.items()
         ))
 
-    def _fetch_models(self, access_token: str = "") -> dict[str, dict[str, Any]]:
+    def _fetch_models(self, access_token: str = "") -> tuple[dict[str, dict[str, Any]], float, float]:
         backend = self._backend_factory(access_token=access_token)
         try:
-            return self._model_map(backend.list_models())
+            models = self._model_map(backend.list_models())
+            return models, self._clock(), self._observed_clock()
         finally:
             backend.close()
 
-    def _fetch_account_models(self, access_token: str) -> dict[str, dict[str, Any]]:
+    def _fetch_account_models(self, access_token: str) -> tuple[dict[str, dict[str, Any]], float, float]:
         resolved_token = self._accounts.refresh_access_token(access_token, event="list_models") or access_token
         return self._fetch_models(resolved_token)
 
@@ -203,8 +204,8 @@ class ModelCatalogService:
     ) -> bool:
         if state != "active":
             return False
-        future = self._inflight_accounts.get(identity)
-        if future is not None and not future.done():
+        probe = self._inflight_accounts.get(identity)
+        if probe is not None:
             return True
         if self._reusable_observation(observation, account_type, state, credential_fingerprint, now):
             return False
@@ -221,9 +222,9 @@ class ModelCatalogService:
     ) -> float | None:
         if state != "active":
             return None
-        future = self._inflight_accounts.get(identity)
-        if future is not None and not future.done():
-            return now + self.DISCOVERY_RETRY_SECONDS
+        probe = self._inflight_accounts.get(identity)
+        if probe is not None:
+            return now if probe[0].done() else now + self.DISCOVERY_RETRY_SECONDS
         if self._reusable_observation(observation, account_type, state, credential_fingerprint, now):
             return self._at(observation.get("refresh_after"))
         retry_after = self._at((observation or {}).get("retry_after"))
@@ -231,13 +232,13 @@ class ModelCatalogService:
 
     def _anonymous_due(self, now: float) -> bool:
         observation = self._anonymous_observation
-        if self._anonymous_inflight is not None and not self._anonymous_inflight.done():
+        if self._anonymous_inflight is not None:
             return True
         return self._at(observation.get("refresh_after")) <= now and self._at(observation.get("retry_after")) <= now
 
     def _anonymous_next_refresh(self, now: float) -> float:
-        if self._anonymous_inflight is not None and not self._anonymous_inflight.done():
-            return now + self.DISCOVERY_RETRY_SECONDS
+        if self._anonymous_inflight is not None:
+            return now if self._anonymous_inflight.done() else now + self.DISCOVERY_RETRY_SECONDS
         observation = self._anonymous_observation
         refresh_after = self._at(observation.get("refresh_after"))
         retry_after = self._at(observation.get("retry_after"))
@@ -280,12 +281,11 @@ class ModelCatalogService:
         }
         anonymous_models = dict(self._anonymous_models)
 
-        for identity, future in list(self._inflight_accounts.items()):
-            if identity not in accounts or accounts[identity][2] != "active":
+        for identity, (future, probe_type, probe_fingerprint) in list(self._inflight_accounts.items()):
+            if (identity not in accounts or accounts[identity][2] != "active"
+                    or accounts[identity][1] != probe_type or accounts[identity][3] != probe_fingerprint):
                 future.cancel()
                 self._inflight_accounts.pop(identity, None)
-        if self._anonymous_inflight is not None and self._anonymous_inflight.done():
-            self._anonymous_inflight = None
 
         anonymous_future = None
         anonymous_is_new = False
@@ -301,31 +301,48 @@ class ModelCatalogService:
             observation = observations.get(identity)
             if not self._account_due(identity, account_type, state, fingerprint, observation, now):
                 continue
-            future = self._inflight_accounts.get(identity)
+            probe = self._inflight_accounts.get(identity)
+            future = probe[0] if probe is not None else None
             is_new = False
-            if future is None or future.done():
+            if future is None:
                 future = self._executor.submit(self._fetch_account_models, access_token)
-                self._inflight_accounts[identity] = future
+                self._inflight_accounts[identity] = (future, account_type, fingerprint)
                 is_new = True
                 new_futures.append(future)
             account_futures[identity] = (future, is_new)
 
-        done, _pending = wait(new_futures, timeout=self.DISCOVERY_BUDGET_SECONDS) if new_futures else (set(), set())
+        if new_futures:
+            wait(new_futures, timeout=self.DISCOVERY_BUDGET_SECONDS)
+        # Credentials or account state can change during the bounded wait.
+        # A completed read must still belong to the current physical account.
+        accounts = self._active_accounts()
+        signature = self._signature(accounts)
+        observations = {identity: row for identity, row in observations.items() if identity in accounts}
+        for identity, (future, probe_type, probe_fingerprint) in list(self._inflight_accounts.items()):
+            current = accounts.get(identity)
+            if (current is None or current[2] != "active"
+                    or current[1] != probe_type or current[3] != probe_fingerprint):
+                future.cancel()
+                self._inflight_accounts.pop(identity, None)
+                account_futures.pop(identity, None)
         # Waiting is bounded, but it can still take long enough for a peer's
         # cache record to expire.  Snapshot eligibility using the completion
         # time rather than the time the refresh began.
         now, observed_now = self._clock(), self._observed_clock()
         if anonymous_future is not None:
-            if anonymous_is_new and anonymous_future in done:
+            if anonymous_future.done():
+                self._anonymous_inflight = None
                 try:
-                    anonymous_models = anonymous_future.result()
+                    models, read_at, read_observed_at = anonymous_future.result()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning({"event": "model_catalog_anonymous_failed", "error_type": type(exc).__name__})
                     self._anonymous_observation["retry_after"] = self._failure_retry_at(exc, now)
                 else:
+                    if read_at + self._cache_ttl_seconds > now:
+                        anonymous_models = models
                     self._anonymous_observation = {
-                        "refresh_after": now + self._cache_ttl_seconds,
-                        "observed_at": observed_now,
+                        "refresh_after": read_at + self._cache_ttl_seconds,
+                        "observed_at": read_observed_at,
                     }
             elif anonymous_is_new:
                 logger.warning({"event": "model_catalog_anonymous_timeout"})
@@ -351,9 +368,10 @@ class ModelCatalogService:
             future_info = account_futures.get(identity)
             if future_info is not None:
                 future, is_new = future_info
-                if is_new and future in done:
+                if future.done():
+                    self._inflight_accounts.pop(identity, None)
                     try:
-                        models = future.result()
+                        models, read_at, read_observed_at = future.result()
                     except Exception as exc:  # noqa: BLE001
                         observations[identity] = observation = self._set_failed_observation(
                             observation, account_type=account_type, credential_fingerprint=fingerprint,
@@ -365,11 +383,11 @@ class ModelCatalogService:
                             "models": models,
                             "account_type": account_type,
                             "state": "unknown",
-                            "reason": self._observation_reason("observed"),
-                            "observation_state": "observed",
-                            "observed_at": observed_now,
+                            "reason": self._observation_reason("observed") if read_at + self._cache_ttl_seconds > now else "stale",
+                            "observation_state": "observed" if read_at + self._cache_ttl_seconds > now else "stale",
+                            "observed_at": read_observed_at,
                             "last_attempt_at": observed_now,
-                            "refresh_after": now + self._cache_ttl_seconds,
+                            "refresh_after": read_at + self._cache_ttl_seconds,
                             "credential_fingerprint": fingerprint,
                             "observed_account_state": "active",
                             "last_seen_account_state": "active",
@@ -381,8 +399,8 @@ class ModelCatalogService:
                     )
                     logger.warning({"event": "model_catalog_account_timeout"})
                 elif observation is not None:
-                    # A retained late future is intentionally not published
-                    # into this snapshot; retry this account alone when due.
+                    # An unfinished read is not executable evidence. Retain
+                    # that same future so a later caller can collect it.
                     observations[identity] = observation = self._set_failed_observation(
                         observation, account_type=account_type, credential_fingerprint=fingerprint,
                         now=now, observed_now=observed_now,
@@ -594,7 +612,8 @@ class ModelCatalogService:
             )
             return ModelRoute(
                 account_types=account_types,
-                allow_anonymous=model in self._anonymous_models,
+                allow_anonymous=(model in self._anonymous_models
+                                 and self._at(self._anonymous_observation.get("refresh_after")) > self._clock()),
                 account_identities=identities,
             )
 

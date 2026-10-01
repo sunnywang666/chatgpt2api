@@ -239,7 +239,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertFalse(reader.is_alive())
         self.assertLessEqual(self.catalog.MAX_DISCOVERY_WORKERS, 8)
 
-    def test_slow_account_isolated_by_catalog_refresh_budget_and_retried_after_late_completion(self) -> None:
+    def test_slow_account_isolated_by_budget_and_collected_after_late_completion(self) -> None:
         entered, release, completed = Event(), Event(), Event()
         self.catalog.DISCOVERY_BUDGET_SECONDS = 0.05
         reads = 0
@@ -261,8 +261,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 0.5)
             self.assertEqual(self.catalog.route_for_model("plus-only").account_types, frozenset())
 
-            # The retained first future is intentionally not republished.  It
-            # must nevertheless keep the cache on its short retry window.
+            # Keep one pending read, without probing healthy peers again.
             self.now += 2
             self.catalog.list_models()
             self.assertEqual(reads, 1)
@@ -270,10 +269,147 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
             release.set()
             self.assertTrue(completed.wait(1))
+            for future, _kind, _fingerprint in self.catalog._inflight_accounts.values():
+                future.result(timeout=1)
             self.now += 2
             self.catalog.list_models()
-            self.assertEqual(reads, 2)
+            self.assertEqual(reads, 1)
+            self.assertEqual(self.calls.count("pro"), 1)
             self.assertEqual(self.catalog.route_for_model("plus-only").account_types, frozenset({"Plus"}))
+        finally:
+            release.set()
+
+    def _start_late_catalog_read(self, token: str):
+        release = Event()
+        self.addCleanup(release.set)
+        self.catalog.DISCOVERY_BUDGET_SECONDS = 0.01
+
+        def slow_models():
+            if not release.wait(2):
+                raise RuntimeError("test did not release catalog")
+            return model_list("late-model")
+
+        self.outcomes[token] = slow_models
+        self.catalog.list_models()
+        identity = next((self.accounts._stable_account_identity(a) for a in self.accounts.list_accounts()
+                         if a['access_token'] == token), None)
+        future = self.catalog._inflight_accounts[identity][0] if identity else self.catalog._anonymous_inflight
+        return release, future, identity
+
+    def test_late_anonymous_read_is_collected_without_new_probe(self) -> None:
+        release, future, _identity = self._start_late_catalog_read("")
+        release.set()
+        future.result(timeout=1)
+        self.now += 2
+        self.assertIn("late-model", {m['id'] for m in self.catalog.list_models()['data']})
+        self.assertEqual(self.calls.count(""), 1)
+        self.assertTrue(self.catalog.route_for_model("late-model").allow_anonymous)
+
+    def test_late_read_from_replaced_credential_is_not_published(self) -> None:
+        release, future, identity = self._start_late_catalog_read("plus")
+        self.outcomes["plus-rotated"] = model_list("rotated-model")
+        self.accounts._apply_refreshed_tokens("plus", {"access_token": "plus-rotated"}, "test")
+        release.set()
+        future.result(timeout=1)
+        self.now += 2
+        self.catalog.list_models()
+        self.assertNotIn("late-model", self.catalog._model_observations[identity]['models'])
+        self.assertIn("rotated-model", self.catalog._models_by_account[identity])
+        self.assertEqual(self.calls.count("plus"), 1)
+        self.assertEqual(self.calls.count("plus-rotated"), 1)
+
+    def test_late_disabled_account_read_is_not_published(self) -> None:
+        release, future, identity = self._start_late_catalog_read("plus")
+        self.accounts.update_account("plus", {"managed_disabled": True})
+        release.set()
+        future.result(timeout=1)
+        self.now += 2
+        self.catalog.list_models()
+        self.assertNotIn(identity, self.catalog._models_by_account)
+        self.assertNotIn("late-model", self.catalog._model_observations[identity]['models'])
+
+    def test_late_read_uses_completion_time_without_extending_expired_evidence(self) -> None:
+        release, future, identity = self._start_late_catalog_read("plus")
+        release.set()
+        future.result(timeout=1)
+        completed_at = self.now
+        self.now += self.catalog._cache_ttl_seconds + 1
+        self.catalog.list_models()
+        observation = self.catalog._model_observations[identity]
+        self.assertEqual(observation['observed_at'], completed_at)
+        self.assertEqual(observation['refresh_after'], completed_at + self.catalog._cache_ttl_seconds)
+        self.assertEqual(observation['observation_state'], 'stale')
+        self.assertNotIn(identity, self.catalog._models_by_account)
+        self.assertEqual(self.calls.count("plus"), 1)
+        self.catalog.list_models()
+        self.assertEqual(self.calls.count("plus"), 2)
+        self.assertIn(identity, self.catalog._models_by_account)
+
+    def test_account_changes_during_discovery_wait_cannot_publish_old_read(self) -> None:
+        for mutation in ('disable', 'rotate'):
+            with self.subTest(mutation=mutation):
+                self.setUp()
+                entered, release = Event(), Event()
+                self.catalog.DISCOVERY_BUDGET_SECONDS = 1
+
+                def slow_models():
+                    entered.set()
+                    if not release.wait(2):
+                        raise RuntimeError('test did not release read')
+                    return model_list('late-model')
+
+                self.outcomes['plus'] = slow_models
+                reader = Thread(target=self.catalog.list_models)
+                try:
+                    reader.start()
+                    self.assertTrue(entered.wait(1))
+                    identity = self.accounts._stable_account_identity(self.accounts.get_account('plus'))
+                    if mutation == 'disable':
+                        self.accounts.update_account('plus', {'managed_disabled': True})
+                    else:
+                        self.outcomes['plus-rotated'] = model_list('rotated-model')
+                        self.accounts._apply_refreshed_tokens('plus', {'access_token': 'plus-rotated'}, 'test')
+                    release.set()
+                    reader.join(2)
+                    self.assertFalse(reader.is_alive())
+                    self.assertNotIn(identity, self.catalog._models_by_account)
+                    self.assertNotIn('late-model', self.catalog._model_observations.get(identity, {}).get('models', {}))
+                finally:
+                    release.set()
+                    reader.join(2)
+
+    def test_expired_anonymous_capability_is_retained_but_not_routed(self) -> None:
+        self.catalog.list_models()
+        self.now += self.catalog._cache_ttl_seconds + 1
+        self.outcomes[''] = RuntimeError('anonymous read unavailable')
+        self.assertIn('anon', {row['id'] for row in self.catalog.list_models()['data']})
+        self.assertFalse(self.catalog.route_for_model('anon').allow_anonymous)
+
+    def test_failed_late_read_is_consumed_before_a_bounded_retry(self) -> None:
+        release = Event()
+        self.catalog.DISCOVERY_BUDGET_SECONDS = .01
+
+        def late_failure():
+            release.wait(2)
+            raise RuntimeError('controlled late failure')
+
+        self.outcomes['plus'] = late_failure
+        try:
+            self.catalog.list_models()
+            identity = self.accounts._stable_account_identity(self.accounts.get_account('plus'))
+            future = self.catalog._inflight_accounts[identity][0]
+            release.set()
+            with self.assertRaisesRegex(RuntimeError, 'controlled late failure'):
+                future.result(timeout=1)
+            self.now += 2
+            self.catalog.list_models()
+            self.assertEqual(self.calls.count('plus'), 1)
+            self.assertNotIn(identity, self.catalog._models_by_account)
+            self.outcomes['plus'] = model_list('plus-only')
+            self.now += 2
+            self.catalog.list_models()
+            self.assertEqual(self.calls.count('plus'), 2)
+            self.assertIn(identity, self.catalog._models_by_account)
         finally:
             release.set()
 
