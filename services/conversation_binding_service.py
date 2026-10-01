@@ -205,6 +205,63 @@ def _completed_external_successor(mapping, children, request_message_id, current
     return bool(ended and ended["final_message_id"] == current_node)
 
 
+def _empty_reply_evidence(mapping, children, request_message_id, conversation_id, current_node):
+    """Observe an empty original final and a safe current cursor, not remote cancellation.
+
+    Some completed HTTP responses leave an empty final marked in_progress. The
+    task service separately requires durable local response-end evidence before
+    allowing the user's one same-conversation retry of this observation.
+    """
+    node_id, seen = request_message_id, {request_message_id}
+    while len(seen) <= 128:
+        successors = children.get(node_id, [])
+        if len(successors) != 1:
+            return None
+        node_id = successors[0]
+        if node_id in seen:
+            return None
+        seen.add(node_id)
+        node = mapping.get(node_id)
+        message = node.get("message") if isinstance(node, dict) else None
+        if not isinstance(message, dict) or message.get("id") != node_id:
+            return None
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        if role not in {"assistant", "tool"}:
+            return None
+        following = children.get(node_id, [])
+        final = (role == "assistant" and message.get("channel") in {None, "final"}
+                 and (not following or all(
+                     isinstance(mapping.get(child), dict)
+                     and isinstance(mapping[child].get("message"), dict)
+                     and mapping[child]["message"].get("id") == child
+                     and isinstance(mapping[child]["message"].get("author"), dict)
+                     and mapping[child]["message"]["author"].get("role") == "user"
+                     for child in following)))
+        content = message.get("content")
+        if final:
+            parts = content.get("parts") if isinstance(content, dict) else None
+            if (not isinstance(content, dict) or content.get("content_type") != "text"
+                    or not isinstance(parts, list) or not all(isinstance(p, str) for p in parts)
+                    or "".join(parts).strip()):
+                return None
+            if not isinstance(current_node, str):
+                return None
+            if current_node != node_id and not _completed_external_successor(
+                    mapping, children, node_id, current_node, conversation_id):
+                return None
+            return {"conversation_id": conversation_id, "request_message_id": request_message_id,
+                    "final_message_id": node_id, "retry_parent_message_id": current_node,
+                    "observed_at": time.time()}
+        # Still-running tools/reasoning or unknown envelopes are not an empty
+        # response. Never duplicate an outstanding tool/image operation.
+        if (message.get("status") != "finished_successfully" or not isinstance(content, dict)
+                or content.get("content_type") not in OBSERVED_CONTENT_TYPES
+                or role == "tool" and content.get("content_type") != "execution_output"):
+            return None
+    return None
+
+
 def is_recovery_image_pointer(value: object) -> bool:
     # Retain an upstream reference, never a download URL or tool arguments.
     return isinstance(value, str) and bool(re.fullmatch(
@@ -1225,6 +1282,8 @@ class ConversationBindingService:
                    and (observation := _result_observation(mapping, children, request_message_id, conversation_id)) else {}),
                 **({TURN_END_EVIDENCE_FIELD: ended} if not active_result_seen and terminal_empty_seen
                    and (ended := _completed_request_turn(mapping, children, request_message_id, conversation_id)) else {}),
+                **({"_empty_reply_evidence": empty} if (empty := _empty_reply_evidence(
+                    mapping, children, request_message_id, conversation_id, document.get("current_node"))) else {}),
             }
         parent_message_id, text = candidates[0]
         ended = _completed_request_turn(mapping, children, request_message_id, conversation_id)
@@ -1376,6 +1435,21 @@ class ConversationBindingService:
                         raise ConversationBindingError("original conversation restore is unconfirmed",
                                                        code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
                 backend.text_pre_send_check = check_original
+            elif body.get("_empty_retry_original"):
+                def check_empty_retry(send):
+                    from services.text_task_service import TextTaskService
+                    original = body["_empty_retry_original"]
+                    try:
+                        fresh_document = backend._get_conversation(conversation_id, _send=send)
+                        fresh = self._read_text_request_result(backend, original, document=fresh_document)
+                    except Exception as exc:
+                        raise ConversationBindingError("empty-response original read unavailable",
+                                                       code="CHAT_TERMINAL_EMPTY_READ_UNAVAILABLE") from exc
+                    if (fresh_document.get("is_archived") is True or not TextTaskService._fresh_terminal_empty_continuation(
+                            original, body["_empty_retry_receipt"], fresh)):
+                        raise ConversationBindingError("empty-response retry cursor changed",
+                                                       code="CHAT_TERMINAL_EMPTY_UNVERIFIED")
+                backend.text_pre_send_check = check_empty_retry
             failure_phase = "stream_open"
             try:
                 # All bound text consumers can resume an archived Chat. The

@@ -750,6 +750,10 @@ def _command_chat_save(api: ApiClient, args: argparse.Namespace) -> int:
     state = _load_chat_state(_chat_state_path(args))
     request_id = _chat_request_id(args, state)
     result = _chat_receipt(api, request_id, conversation=state.get("conversation") if state else None)
+    if result.get("status") != "succeeded" and state and result.get("completion"):
+        # The original receipt stays UNKNOWN. Save the server-selected linked
+        # result under its real ID and retain both identities in the state file.
+        return _command_completion(api, argparse.Namespace(**{**vars(args), "command": "chat-completion-save"}))
     return _save_chat_result(result, request_id, args.output)
 
 

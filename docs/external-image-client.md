@@ -177,11 +177,11 @@ Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `
 
 ### 连续工作会话（sequential-v1 增量）
 
-原生 Chat 文字的每个公共回执带脱敏 `execution`。`send_state=not_sent` 需要明确未发送证据，`attempted` 只证明进入发送边界，`response_received` 只证明收到 HTTP 响应头；均不能单独证明生成成功。`sent_at`、`response_received_at`、`local_finished_at` 分别记录发送、响应、本地执行结束。`first_stream_event_at` 是首个流事件，不是思考或首个文字 token；旧回执缺发送证据时返回 `unknown`。不要将 `running` 一律展示为“正在生成”。 `stream_end`区分done（收到SSE结束标记）、eof、hard_timeout、transport_error与consumer_closed；`stream_ended_at`、`sse_data_count`、`sse_parse_errors`及`sse_error_event`只保存结构诊断，不包含原始正文或错误内容。done和HTTP 200都不证明生成完成：兼容流也要读回原分支的最终文本。缺尾文本仅从核验的原结果补回，空结果保持UNKNOWN；已发文本与最终结果冲突时保留旧流，原ID恢复读取生成新的完整结果文件，不再发送模型请求。历史回执缺诊断字段不补猜。 原分支仍未确认、但同一明确当前链已存在后续用户轮次及完成回答时，recovery.reason=REQUEST_CONVERSATION_ADVANCED：显示“原请求无最终结果，会话已被外部继续”，结束原请求前台等待。后续回答不归原ID，不覆盖原输入/游标，不证明原请求已取消，不自动放行旧位置重发或释放原UNKNOWN占用。
+原生 Chat 文字的每个公共回执带脱敏 `execution`。`send_state=not_sent` 需要明确未发送证据，`attempted` 只证明进入发送边界，`response_received` 只证明收到 HTTP 响应头；均不能单独证明生成成功。`sent_at`、`response_received_at`、`local_finished_at` 分别记录发送、响应、本地执行结束。`first_stream_event_at` 是首个流事件，不是思考或首个文字 token；旧回执缺发送证据时返回 `unknown`。不要将 `running` 一律展示为“正在生成”。 `stream_end`区分done（收到SSE结束标记）、eof、hard_timeout、transport_error与consumer_closed；`stream_ended_at`、`sse_data_count`、`sse_parse_errors`及`sse_error_event`只保存结构诊断，不包含原始正文或错误内容。done和HTTP 200都不证明生成完成：兼容流也要读回原分支的最终文本。缺尾文本仅从核验的原结果补回，空结果保持UNKNOWN；已发文本与最终结果冲突时保留旧流，原ID恢复读取生成新的完整结果文件，不再发送模型请求。历史回执缺诊断字段不补猜。 原分支仍未确认、但同一明确当前链已存在后续用户轮次及完成回答时，recovery.reason=REQUEST_CONVERSATION_ADVANCED：显示“原请求无最终结果，会话已被外部继续”，结束原请求前台等待。后续回答不归原ID，不覆盖原输入/游标，不证明原请求已取消，不回退到旧位置；若满足下文的空回复自动重试条件，沿最新已完成位置追加原输入，保留人工后继及原UNKNOWN证据。
 
-`observation_started_at` 是首次有效原结果观察，`last_checked_at` 是最近有效观察，`last_progress_at` 仅在同一原请求的有效消息结构、状态或文本长度发生变化时出现。原分支的已知 `code`、`execution_output`、`thoughts`、`reasoning_recap` 封装也可观测，只保留类型、长度和条目计数，不持久化或公开正文；未知／媒体封装不计为有效空结果。上游 `update_time` 单独变化、无关分支变化、网络／429／授权失败不算进展。对持续 `REQUEST_RESULT_INCOMPLETE`，至少 15 分钟无可验证变化且至少 3 次有效无变化读后，持久化 `phase=stalled / wait_state=ended / wait_ended_at`：本次结果等待异常结束，原 `status=unknown` 和上游结果未知仍保留。此标记**不释放**可能仍在执行的账号 turn，不放行同会话后续，不允许重发；它与已有 `RESULT_UNRECOVERABLE` 合格无结果释放规则分开。迟到结果仍沿原 ID 接回，重启不重置观察或结束记录。
+`observation_started_at` 是首次有效原结果观察，`last_checked_at` 是最近有效观察，`last_progress_at` 仅在同一原请求的有效消息结构、状态或文本长度发生变化时出现。原分支的已知 `code`、`execution_output`、`thoughts`、`reasoning_recap` 封装也可观测，只保留类型、长度和条目计数，不持久化或公开正文；未知／媒体封装不计为有效空结果。上游 `update_time` 单独变化、无关分支变化、网络／429／授权失败不算进展。对持续 `REQUEST_RESULT_INCOMPLETE`，至少 15 分钟无可验证变化且至少 3 次有效无变化读后，持久化 `phase=stalled / wait_state=ended / wait_ended_at`：本次结果等待异常结束，原 `status=unknown` 和上游结果未知仍保留。此标记本身**不释放**账号 turn，也不放行任意同会话后续；已确认空回复的唯一关联重试按下文转交原占用，它与已有 `RESULT_UNRECOVERABLE` 合格无结果释放规则分开。迟到结果仍沿原 ID 接回，重启不重置观察或结束记录。
 
-客户端读到 `wait_state=ended` 应停止本次前台等待，保存原 ID、输入和最后回执，显示未确认的原因、`recovery.attempt/reason/next_at`，以后仍沿原 ID 恢复。`resources.local_worker/account_turn/conversation` 分别解释本地执行、账号执行位置、会话保护；工作槽位和归档以 `/work` 回执为准。示例显示：“请求已发送并收到响应；本地执行已结束；原结果连续无可验证进展，本次等待结束；上游结果未知，账号执行位置仍占用，同会话后续受保护。禁止自动重发。” 这是工程状态合同，不是对生产或真实上游已恢复的声明。
+客户端读到 `wait_state=ended` 应停止本次前台等待，保存原 ID、输入和最后回执，显示未确认的原因、`recovery.attempt/reason/next_at`，以后仍沿原 ID 恢复。`resources.local_worker/account_turn/conversation` 分别解释本地执行、账号执行位置、会话保护；工作槽位和归档以 `/work` 回执为准。示例显示：“请求已发送并收到响应；本地执行已结束；原结果连续无可验证进展，本次等待结束；上游结果未知，账号执行位置仍占用，同会话后续受保护。尚未确认空回复时禁止自动重发；确认后显示 completion 的关联重试和结果。” 这是工程状态合同，不是对生产或真实上游已恢复的声明。
 
 持续推进的应用可在现有 `/api/chat-requests` 请求中提供 `client_conversation_id`；这是调用者的工作会话引用，不是上游 ChatGPT conversation ID。每轮使用不同的 `client_request_id`，除首轮外传 `previous_request_id` 指向已受理的同会话原请求。每次只提供新增输入/工具结果与必要附件，不把全部旧历史再次追加。服务在原 owner 范围和原 SQLite 插入事务中核对前序、唯一后继，并沿前轮实际账号、上游会话和已证明最终回答承接；不允许客户端传管理绑定或原始上游游标。
 
@@ -318,26 +318,41 @@ POST `{"state":"paused"}` to suspend an unsent/finished-turn work without archiv
 For example, start two independent sessions under `--workflow-id product-copy --workflow-concurrency 2 --min-send-interval-seconds 12`. Each session keeps its own state files and ordered predecessor IDs. Add `--not-before`/`--wait-deadline` with actual UTC times when needed. Leave the same original ID in place while queued; the scheduler resumes it after capacity or timing constraints clear. `WAIT_DEADLINE_EXCEEDED` with `not_sent` ends only unsent waiting. The client's HTTP timeout is still separate from these server controls.
 # Bounded completion of an abnormal pure-generation step
 
-Original `GET`, Chat `/recover` and image `/resume-poll` never authorize another
-model send. For an approved pure generation task, POST to the original
-`/api/chat-requests/{original-id}/completion` (images: `image-tasks`) with
-`{"action":"recover"}`. For native Chat text, a freshly verified ended-empty
-original is retried **in the same account and conversation first**. The server
-loads its exact retained input, creates one linked attempt, keeps the model,
-account_ref and effective scheduling, and inherits the original conversation's
-work slot. `conversation_mode=original` and `original_turn_ended=true` expose
-this choice. The old UNKNOWN/failed receipt remains historical evidence. Empty
-output, a failed label, a timeout, and local disconnect alone cannot establish
-this proof. The existing send path rereads the exact original before sending;
-changed or missing end evidence keeps the retry unsent.
+Native sequential Chat text automatically retries a confirmed empty reply **once,
+in the same account and conversation, with the retained original input**. No
+caller retry action or root-cause diagnosis is required first. The original
+request must have a matching upstream user message and an empty text final;
+normal SSE completion plus local execution completion establishes the response
+boundary. Legacy receipts without stream diagnostics additionally require the
+persisted bounded unchanged-result observation. A stale `in_progress` final does
+not by itself block this path. A timeout, arbitrary EOF, missing message, media,
+transport error or HTTP 200 alone is not confirmed empty. Known insufficient
+quota still excludes the account before admission and at the send check.
 
-An in-progress/uncertain original with no verified end returns
-`COMPLETION_ORIGINAL_END_UNCONFIRMED`. The current Chat adapter has no verified
-remote stop operation (`stop.capability=unsupported`, `confirmed=false`); this
-is an integration limitation, not a claim that ChatGPT cannot stop generation.
-No guessed cancellation endpoint, archive operation or local disconnect is used
-to pretend the old upstream execution stopped. Resolving that limitation requires
-a verified stop contract and authoritative original-turn readback.
+The service reuses the durable completion record and creates one linked request.
+It keeps the model, account_ref, effective scheduling and work slot, transfers
+only this original's local turn reservation, and rechecks the actual conversation
+head immediately before POST. A completed manual continuation is preserved and
+the retry appends after its latest head; changed or unreadable evidence keeps the
+attempt unsent. This is not a remote cancellation claim: `original_turn_ended`
+may remain false, the original receipt stays UNKNOWN, and `stop.confirmed` stays
+false. `local_reservation=transferred/released` reports local accounting explicitly.
+
+GET of the original request exposes `completion` progress, `replacement_id`,
+`selected_id` and the selected result without rewriting the original receipt.
+The supplied CLI's normal `chat-save` saves that selected result and retains both
+IDs. A second empty reply stops automatic sends (`COMPLETION_ATTEMPT_EXHAUSTED`)
+and preserves evidence for diagnosis; no silent prompt shortening, new account,
+new conversation or unbounded retry is performed. Business output requirements
+must still be checked before work completion and archive.
+
+For other approved pure-generation recovery, POST to the original
+`/api/chat-requests/{original-id}/completion` (images: `image-tasks`) with
+`{"action":"recover"}`. Strict ended-empty evidence continues to support the
+existing same-conversation path. Uncertain results that do not meet the empty
+response rule return `COMPLETION_ORIGINAL_END_UNCONFIRMED`. The current adapter
+has no verified remote stop operation; no local disconnect or archive pretends
+to stop upstream generation. Image `/resume-poll` remains result recovery only.
 
 Only as a separately permitted fallback, pass `allow_unconfirmed_retry:true`
 to allow a reconstructed **new conversation** after 15 minutes of stalled
@@ -352,7 +367,8 @@ restarts reuse the same reserved attempt; no attempt can create another retry.
 `GET` the same `/completion` to inspect `state`, `reason`, `waiting`,
 `original_status`, `replacement_status`, `replacement_id` and `selected_id`.
 Selection is durable and write-once. An original found before the replacement
-send cancels the unsent replacement. GET and upstream POST are not atomic: a
+send cancels the unsent replacement. Once the replacement has been sent, its
+completion retains result ownership; a late original cannot strand it. GET and upstream POST are not atomic: a
 late original can still appear after replacement submission. Both receipts stay
 available; only the selected result enters downstream saving/review.
 

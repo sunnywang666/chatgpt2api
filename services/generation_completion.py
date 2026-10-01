@@ -51,6 +51,15 @@ def replacement_send_allowed(store, db, kind, owner, request_id, receipt):
         return True
     root = store.read_receipt(db, kind, owner, root_id)
     state = (root or {}).get("_completion") or {}
+    if kind == "text" and receipt.get("_terminal_empty_correction_of"):
+        from services.text_task_service import TextTaskService
+        proof = TextTaskService._verified_retryable_empty(root or {})
+        if (not proof or receipt.get("_terminal_empty_correction_of") != root_id
+                or receipt.get("_previous_request_id") != root_id
+                or receipt.get("_submission_parent_message_id") != proof["retry_parent_message_id"]
+                or any(receipt.get(k) != (root or {}).get(k) for k in (
+                    "provider_account_identity", "provider_binding_id", "conversation_id", "_work_key"))):
+            return False
     return bool(root and state.get("replacement_id") == request_id
                 and not state.get("selected_id") and not successful(kind, root)
                 and state.get("state") != "completed")
@@ -124,7 +133,7 @@ class GenerationCompletionService:
     def _prepare(self, db, kind, owner, request_id, root, replacement_id):
         body = copy.deepcopy(self._load_verified_input(db, kind, owner, request_id, root))
         if kind == "text":
-            if self.text._verified_terminal_empty(root):
+            if self.text._verified_retryable_empty(root):
                 # Reuse the proven session/physical binding through the existing
                 # continuation validator. Do not reconstruct its prior context
                 # or allocate a second conversation work slot.
@@ -205,7 +214,11 @@ class GenerationCompletionService:
         if not state.get("selected_id"):
             # Selection is write-once. A late original after this point stays
             # readable at its own ID and cannot cause another downstream save.
-            chosen = request_id if successful(kind, root) else child_id if successful(kind, child) else None
+            # Once the replacement crossed the send boundary it owns this
+            # completion. A late root cannot strand that in-flight request.
+            original_selectable = not child or not child.get("_submission_started")
+            chosen = (request_id if original_selectable and successful(kind, root)
+                      else child_id if successful(kind, child) else None)
             if chosen:
                 state.update(selected_id=chosen, selected_at=float(self.clock()), state="result_ready", next_at=None)
         if (child and state.get("selected_id") == request_id and not child.get("_submission_started")
@@ -261,7 +274,7 @@ class GenerationCompletionService:
                     work = self.store.runtime(db, root.get("_work_key")) if root.get("_work_key") else None
                     if work and work.get("state") != "active":
                         raise CompletionError("COMPLETION_WORK_NOT_ACTIVE")
-                    ended = kind == "text" and self.text._verified_terminal_empty(root)
+                    ended = kind == "text" and self.text._verified_retryable_empty(root)
                     if kind == "text" and root.get("conversation_id") and not ended and not state["allow_unconfirmed_retry"]:
                         raise CompletionError("COMPLETION_ORIGINAL_END_UNCONFIRMED")
                     unknown = unresolved(root) and not ended
@@ -333,7 +346,16 @@ class GenerationCompletionService:
                       "original_status": root.get("status"), "replacement_status": (child or {}).get("status"),
                       "stop": {"capability": "unsupported", "confirmed": False},
                       "original_turn_ended": bool(ended or successful(kind, root)),
+                      "empty_response_confirmed": bool(kind == "text" and self.text._verified_retryable_empty(root)),
                       "original_cleanup": "pending" if unresolved(root) and not ended else "not_required"}
+            same_retry = bool(child and kind == "text" and child.get("_terminal_empty_correction_of") == request_id
+                              and child.get("_work_key") == root.get("_work_key")
+                              and self.text._verified_retryable_empty(root))
+            result["local_reservation"] = ("released" if same_retry and successful(kind, child)
+                                            else "transferred" if same_retry and child.get("status") in {"queued", "running", "unknown"}
+                                            else "held" if unresolved(root) and not ended else "released")
+            if same_retry and not ended and successful(kind, child) and state.get("state") == "completed":
+                result["original_cleanup"] = "completed"
             if child and state.get("selected_id") == request_id:
                 result["replacement_cleanup"] = "pending" if unresolved(child) or child.get("status") == "running" else "not_required"
             if child and child.get("waiting"):

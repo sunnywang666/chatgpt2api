@@ -126,11 +126,11 @@ def _blocked(receipt, *, allow_queued=False, members=()):
     if (receipt.get("status") == "unknown" or receipt.get("upstream_outcome") == "unknown"
             or receipt.get("upstream_unfinished") is True):
         from services.text_task_service import TextTaskService
-        evidence = TextTaskService._verified_terminal_empty(receipt)
+        evidence = TextTaskService._verified_retryable_empty(receipt)
         corrections = [r for r in members if evidence and r.get("status") == "succeeded"
                        and r.get("_terminal_empty_correction_of") == receipt.get("request_id")
                        and r.get("_previous_request_id") == receipt.get("request_id")
-                       and r.get("_submission_parent_message_id") == evidence["final_message_id"]
+                       and r.get("_submission_parent_message_id") == evidence["retry_parent_message_id"]
                        and r.get("_work_key") == receipt.get("_work_key")
                        and r.get("provider_binding_id") == receipt.get("provider_binding_id")
                        and _same_conversation(r, receipt)]

@@ -308,6 +308,11 @@ class TextTaskService:
             result["correction_of_request_id"] = receipt["_terminal_empty_correction_of"]
         if receipt.get("_supersedes_request_id"):
             result["supersedes_request_id"] = receipt["_supersedes_request_id"]
+        completion = receipt.get("_completion")
+        if isinstance(completion, dict):
+            result["completion"] = {key: completion[key] for key in (
+                "state", "reason", "replacement_id", "selected_id", "max_extra_requests", "conversation_mode",
+                "automatic_empty_retry") if key in completion}
         return result
 
     @staticmethod
@@ -348,21 +353,73 @@ class TextTaskService:
         return evidence
 
     @classmethod
+    def _verified_retryable_empty(cls, receipt):
+        """An ended-empty turn OR a verified empty response after local completion.
+
+        The latter is a one-retry policy, not evidence of remote cancellation.
+        Legacy responses without stream diagnostics need the existing bounded
+        unchanged-result observation; arbitrary timeouts are insufficient.
+        """
+        ended = cls._verified_terminal_empty(receipt)
+        if ended:
+            return {**ended, "retry_parent_message_id": ended["final_message_id"]}
+        evidence = receipt.get("_empty_reply_evidence")
+        if (receipt.get("route") != "chat" or not receipt.get("_public_session_ref")
+                or receipt.get("_forward_protocol") or receipt.get("_operation", "text") != "text"
+                or receipt.get("status") != "unknown" or receipt.get("_executing")
+                or receipt.get("content") or receipt.get("recovery_requires_new_conversation")
+                or not cls._safe_empty_reply_evidence(evidence, receipt)
+                or any(not isinstance(receipt.get(k), str) or not receipt[k] for k in (
+                    "provider_binding_id", "provider_account_identity", "client_conversation_id", "model"))):
+            return None
+        timeline = receipt.get("_execution_timeline") or []
+        stages = {item.get("stage") for item in timeline if isinstance(item, dict)}
+        stream = next((item for item in reversed(timeline) if isinstance(item, dict)
+                       and item.get("stage") == "stream_finished"), {})
+        closed = (stream.get("stream_end") == "done" and not stream.get("sse_error_event")
+                  and not stream.get("sse_parse_errors"))
+        legacy_observed = (not stream and type(receipt.get("_result_wait_ended_at")) in {int, float}
+                           and (receipt.get("_result_no_progress_reads") or 0) >= 3)
+        if (not {"send_call_started", "response_headers_received", "task_finished"} <= stages
+                or not (closed or legacy_observed)):
+            return None
+        return evidence
+
+    @staticmethod
+    def _safe_empty_reply_evidence(evidence, receipt):
+        fields = {"conversation_id", "request_message_id", "final_message_id", "retry_parent_message_id", "observed_at"}
+        if (not isinstance(evidence, dict) or set(evidence) != fields
+                or any(not isinstance(evidence.get(k), str) or not 1 <= len(evidence[k]) <= 200
+                       for k in fields - {"observed_at"})
+                or evidence["conversation_id"] != receipt.get("conversation_id")
+                or evidence["request_message_id"] != receipt.get("request_message_id")
+                or evidence["final_message_id"] == evidence["request_message_id"]
+                or evidence["retry_parent_message_id"] == evidence["request_message_id"]
+                or type(evidence["observed_at"]) not in {int, float}
+                or not math.isfinite(evidence["observed_at"]) or evidence["observed_at"] <= 0):
+            return None
+        return dict(evidence)
+
+    @classmethod
     def _fresh_terminal_empty_continuation(cls, previous, correction, recovered):
-        """Verify the same ended branch without equating two observation clocks."""
+        """Revalidate the original empty branch and the chosen retry head."""
         if (previous or {}).get("_recovery_suppressed") is True or correction.get("_recovery_suppressed") is True:
             return False
-        saved = cls._verified_terminal_empty(previous or {})
+        saved = cls._verified_retryable_empty(previous or {})
         if not saved or not isinstance(recovered, dict):
             return False
         validated, error_code, _, reason = cls._safe_recovery_result(recovered, previous)
-        fresh = (validated or {}).get(TURN_END_EVIDENCE_FIELD)
+        fresh_base = {k: v for k, v in previous.items() if k not in {
+            TURN_END_EVIDENCE_FIELD, "_empty_reply_evidence", "_upstream_terminal"}}
+        fresh = cls._verified_retryable_empty({**fresh_base, **(validated or {}), "recovery_reason": reason})
         return bool(
             error_code == "UPSTREAM_OUTCOME_UNKNOWN"
-            and reason == TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
+            and reason in {TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
+                           TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value,
+                           TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value}
             and isinstance(fresh, dict)
             and all(fresh[key] == saved[key] for key in (
-                "conversation_id", "request_message_id", "final_message_id"))
+                "conversation_id", "request_message_id", "final_message_id", "retry_parent_message_id"))
             and fresh["observed_at"] >= saved["observed_at"]
             and correction.get("_terminal_empty_correction_of") == previous.get("request_id")
             and correction.get("_previous_request_id") == previous.get("request_id")
@@ -370,7 +427,7 @@ class TextTaskService:
             and correction.get("model") == previous.get("model")
             and correction.get("_public_session_ref") == previous.get("_public_session_ref")
             and correction.get("client_conversation_id") == previous.get("client_conversation_id")
-            and correction.get("parent_message_id") == saved["final_message_id"]
+            and correction.get("parent_message_id") == saved["retry_parent_message_id"]
             and correction.get("request_message_id") != previous.get("request_message_id")
             and all(previous.get(key) == correction.get(key) for key in (
                 "provider_binding_id", "provider_account_identity", "conversation_id"))
@@ -504,6 +561,13 @@ class TextTaskService:
                     if key != "request_parent_message_id" and not value.strip():
                         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
                     anchor[key] = value
+            empty = recovered.get("_empty_reply_evidence")
+            if empty is not None:
+                valid_empty = cls._safe_empty_reply_evidence(empty, receipt or {})
+                if (not valid_empty or any(not (receipt or {}).get(k) or recovered.get(k) != receipt[k]
+                        for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))):
+                    return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+                anchor["_empty_reply_evidence"] = valid_empty
             observation = cls._safe_result_observation(recovered.get("_original_result_observation"), receipt or {})
             if observation is not None and recovered.get("recovery_reason") == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value:
                 anchor["_original_result_observation"] = observation
@@ -757,6 +821,7 @@ class TextTaskService:
                     key: value for key, value in (recovered or {}).items()
                     if (
                         key in {RECOVERY_CONVERSATION_SCAN_FIELD, TURN_END_EVIDENCE_FIELD, "_upstream_terminal", "_turn_reserved"}
+                        or key == "_empty_reply_evidence" and not current.get("_completion", {}).get("replacement_id")
                         or key == RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD
                         or key in {"conversation_id", "parent_message_id", "request_parent_message_id"}
                         and not current.get(key)
@@ -846,6 +911,14 @@ class TextTaskService:
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}
             self._end_execution_wait(updated, now, observed=observed)
+            # Empty-response recovery is part of the original logical task.
+            # Reserve at most one child, and never auto-retry that child again.
+            if (getattr(self.admission, "generation_completion", None) is not None and not updated.get("_completion_of")
+                    and not updated.get("_completion") and self._verified_retryable_empty(updated)
+                    and not updated.get("_recovery_suppressed")):
+                updated["_completion"] = {"state": "checking_original", "started_at": now,
+                    "allow_unconfirmed_retry": False, "max_extra_requests": 1, "next_at": now,
+                    "automatic_empty_retry": True}
             if updated.get(RECOVERY_CONVERSATION_SCAN_FIELD) == {} or not error_code:
                 updated.pop(RECOVERY_CONVERSATION_SCAN_FIELD, None)
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
@@ -1316,7 +1389,7 @@ class TextTaskService:
             if any(not self._cancelled_completion_child(candidate, previous) for candidate in successors):
                 reject("CHAT_CONVERSATION_CONFLICT")
             terminal_empty = bool(body.get("_continue_after_terminal_empty"))
-            evidence = self._verified_terminal_empty(previous) if terminal_empty else None
+            evidence = self._verified_retryable_empty(previous) if terminal_empty else None
             if terminal_empty and (not evidence or previous.get("model") != receipt.get("model")):
                 reject("CHAT_TERMINAL_EMPTY_UNVERIFIED")
             if previous.get("status") != "succeeded" and not evidence:
@@ -1335,7 +1408,7 @@ class TextTaskService:
                     and receipt["_requested_account_identity"] != previous["provider_account_identity"]):
                 reject("CHAT_ACCOUNT_SELECTION_CONFLICT")
             receipt.update({key: previous[key] for key in anchors})
-            parent = evidence["final_message_id"] if evidence else previous.get("parent_message_id")
+            parent = evidence["retry_parent_message_id"] if evidence else previous.get("parent_message_id")
             if not isinstance(parent, str) or not parent:
                 reject("CHAT_CONTINUATION_UNAVAILABLE")
             receipt["parent_message_id"] = parent
@@ -1511,7 +1584,7 @@ class TextTaskService:
             if not self._known_unsent_terminal_empty_correction(receipt, now):
                 raise ConversationBindingError("correction is not known unsent", code="CHAT_UNSENT_CORRECTION_NOT_RESUMABLE")
             previous = self.store.read_receipt(db, "text", owner, receipt["_terminal_empty_correction_of"])
-        if (previous or {}).get("_recovery_suppressed") is True or not self._verified_terminal_empty(previous or {}):
+        if (previous or {}).get("_recovery_suppressed") is True or not self._verified_retryable_empty(previous or {}):
             raise ConversationBindingError("original terminal proof changed", code="CHAT_TERMINAL_EMPTY_UNVERIFIED")
         try:
             body = self.store.load_input(receipt["_input_ref"])
@@ -1592,7 +1665,7 @@ class TextTaskService:
             if receipt.get("_terminal_empty_correction_of"):
                 with self._db() as db:
                     previous = self.store.read_receipt(db, "text", owner, receipt["_terminal_empty_correction_of"])
-                original_evidence = self._verified_terminal_empty(previous or {})
+                original_evidence = self._verified_retryable_empty(previous or {})
                 try:
                     proven = self.recovery_reader(previous) if original_evidence else None
                 except Exception:
@@ -1613,6 +1686,10 @@ class TextTaskService:
                     self._update(owner, request_id, status="failed", error_code="CHAT_TERMINAL_EMPTY_UNVERIFIED",
                                  upstream_outcome="not_sent", _turn_reserved=False, finished_at=self._now())
                     return
+                # Repeat the exact cursor check inside the binding lock, at
+                # the final upstream send boundary (manual browser turns may
+                # have advanced the original conversation since admission).
+                body = {**body, "_empty_retry_original": previous, "_empty_retry_receipt": receipt}
             if receipt.get("_legacy_session_anchor"):
                 with self._db() as db:
                     previous = self.store.read_receipt(db, "text", owner, receipt["_legacy_session_anchor"])

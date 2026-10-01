@@ -404,13 +404,14 @@ class PoolAdmission:
             if kind == "text" and isinstance(previous_id, str) and previous_id:
                 corrections.setdefault((owner, previous_id), []).append((request_id, r))
         released_order_heads = set()
+        transferred_empty_turns = set()
         if corrections:
             from services.text_task_service import TextTaskService
             for key, candidates in corrections.items():
                 if len(candidates) != 1:
                     continue
                 previous = text_receipts.get(key)
-                evidence = TextTaskService._verified_terminal_empty(previous or {})
+                evidence = TextTaskService._verified_retryable_empty(previous or {})
                 request_id, correction = candidates[0]
                 # Success advances the live cursor to the correction's result.
                 # Its persisted submission root still proves which empty turn
@@ -427,7 +428,7 @@ class PoolAdmission:
                         or correction.get("_public_session_ref") != previous.get("_public_session_ref")
                         or correction.get("client_conversation_id") != previous.get("client_conversation_id")
                         or correction.get("model") != previous.get("model")
-                        or correction_parent != evidence["final_message_id"]
+                        or correction_parent != evidence["retry_parent_message_id"]
                         or correction.get("request_message_id") == previous.get("request_message_id")
                         or type(correction.get("_sequence")) is not int
                         or type(previous.get("_sequence")) is not int
@@ -436,6 +437,8 @@ class PoolAdmission:
                             "provider_binding_id", "provider_account_identity", "conversation_id"))):
                     continue
                 released_order_heads.add(key)
+                if previous.get("_empty_reply_evidence") and correction.get("_completion_of") == key[1]:
+                    transferred_empty_turns.add(key)
         successors = {}
         for (owner, request_id), r in text_receipts.items():
             if r.get("_supersedes_request_id"):
@@ -492,7 +495,8 @@ class PoolAdmission:
                           and r.get("upstream_outcome") == "unknown"
                           and type(r.get("_execution_wait_ended_at")) in (int, float)
                           and math.isfinite(r["_execution_wait_ended_at"]))
-            turn_active = active and not original_turn_ended(kind, r) and not wait_ended
+            turn_active = (active and not original_turn_ended(kind, r) and not wait_ended
+                           and (owner, request_id) not in transferred_empty_turns)
             if status == "running" and r.get("_executing") and float(r.get("_claim_until") or 0) > now:
                 active_bytes += int(r.get("_input_bytes") or 0)
                 if kind == "image" or r.get("_operation") == "image":

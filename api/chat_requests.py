@@ -368,7 +368,13 @@ def create_router() -> APIRouter:
         request_id = _validated_request_id(request_id)
         receipt = await run_in_threadpool(text_task_service.read, _owner(identity), request_id)
         response.headers["Cache-Control"] = "private, no-store"
-        return _projection(receipt, request_id)
+        result = _projection(receipt, request_id)
+        completion = getattr(text_task_service.admission, "generation_completion", None)
+        if receipt.get("completion") and completion is not None:
+            # Preserve the original attempt's status. The original polling URL
+            # also exposes its logical task and the selected retry's real ID.
+            result["completion"] = await run_in_threadpool(completion.read, "text", identity, request_id)
+        return result
 
     @router.get("/api/chat-requests/{request_id}/work")
     async def read_chat_work(

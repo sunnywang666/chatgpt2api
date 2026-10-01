@@ -355,4 +355,13 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
     execution = safe_public_execution(receipt.get("execution"))
     if execution:
         result["execution"] = execution
+    completion = receipt.get("completion")
+    if isinstance(completion, dict):
+        safe = {k: completion[k] for k in ("state", "reason", "replacement_id", "selected_id", "conversation_mode")
+                if isinstance(completion.get(k), str) and len(completion[k]) <= 200}
+        if completion.get("max_extra_requests") == 1:
+            safe["max_extra_requests"] = 1
+        if completion.get("automatic_empty_retry") is True:
+            safe["automatic_empty_retry"] = True
+        result["completion"] = safe
     return result
