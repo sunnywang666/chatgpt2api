@@ -204,8 +204,16 @@ class WorkLifecycleService:
             if state == "completed" and results_saved is not True:
                 raise WorkLifecycleError("WORK_RESULTS_SAVE_REQUIRED", 400)
             allow_queued = state == "paused" or state == "active" and work["state"] == "paused"
-            if any(_blocked(r, allow_queued=allow_queued, members=members) for r in members):
+            from services.text_task_service import TextTaskService
+            pause_empty = lambda r: (state == "paused" and kind == "text"
+                                    and r.get("_work_key") == work["key"]
+                                    and TextTaskService._verified_retryable_empty(r))
+            if any(_blocked(r, allow_queued=allow_queued, members=members) and not pause_empty(r) for r in members):
                 raise WorkLifecycleError("WORK_TURN_UNFINISHED")
+            for member in members:
+                if pause_empty(member):
+                    member["_turn_reserved"] = False
+                    self.store.write_receipt(db, kind, str(identity["id"]), member["request_id"], member)
             legacy_restore = state == work["state"] == "active" and not work.get("archive")
             if state == work["state"] and not legacy_restore:
                 return _projection(work)

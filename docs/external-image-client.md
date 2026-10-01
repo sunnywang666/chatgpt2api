@@ -342,9 +342,13 @@ GET of the original request exposes `completion` progress, `replacement_id`,
 `selected_id` and the selected result without rewriting the original receipt.
 The supplied CLI's normal `chat-save` saves that selected result and retains both
 IDs. A second empty reply stops automatic sends (`COMPLETION_ATTEMPT_EXHAUSTED`)
-and preserves evidence for diagnosis; no silent prompt shortening, new account,
+and releases that verified-empty attempt's local account turn while preserving
+UNKNOWN and conversation ordering for diagnosis; no silent prompt shortening, new account,
 new conversation or unbounded retry is performed. Business output requirements
-must still be checked before work completion and archive.
+must still be checked before work completion and archive. Explicitly pausing a
+verified-empty test work releases its local turn and workflow slot without
+claiming remote cancellation or discarding the failed sample. Unconfirmed
+transport failures and in-flight requests do not get this exception.
 
 For other approved pure-generation recovery, POST to the original
 `/api/chat-requests/{original-id}/completion` (images: `image-tasks`) with

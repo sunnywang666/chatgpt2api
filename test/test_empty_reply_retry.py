@@ -106,6 +106,7 @@ def test_empty_retry_is_not_retried_again_and_preserves_both_records(setup):
     def run(body, on_cursor):
         ctx = current_request.get()
         ctx.before_send()
+        ctx.record_stage("send_call_started")
         ctx.record_stage("response_headers_received", http_status=200)
         ctx.record_stage("stream_finished", stream_end="done", sse_data_count=2, sse_parse_errors=0, sse_error_event=False)
         calls.append(body)
@@ -122,7 +123,37 @@ def test_empty_retry_is_not_retried_again_and_preserves_both_records(setup):
     assert state["reason"] == "COMPLETION_ATTEMPT_EXHAUSTED"
     assert state["replacement_id"] == child_id and not state.get("selected_id")
     assert len(calls) == 1 and admission.claim_next() is None
-    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert state["local_reservation"] == "released"
+    from services.pool_admission import unfinished
+    assert unfinished("text", row(service, request_id=child_id))
+    public = service.text.read("owner", child_id)
+    assert public["execution"]["resources"]["account_turn"] == "released"
+    assert public["execution"]["resources"]["conversation"] == "protected"
+    paused = service.lifecycle.update("text", IDENTITY, child_id, "paused")
+    assert paused["state"] == "paused" and not paused["slot_held"]
+    assert row(service)["status"] == row(service, request_id=child_id)["status"] == "unknown"
+
+
+@pytest.mark.parametrize("verified", [True, False])
+def test_user_can_pause_confirmed_empty_without_clearing_unknown(setup, verified):
+    from services.work_lifecycle import WorkLifecycleError
+    from services.pool_admission import unfinished
+    service, admission, _ = setup
+    seed_empty(service, end="done" if verified else "transport_error")
+    if not verified:
+        patch_row(service, _turn_reserved=False)
+        with pytest.raises(WorkLifecycleError, match="WORK_TURN_UNFINISHED"):
+            service.lifecycle.update("text", IDENTITY, "old-0", "paused")
+        assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+        return
+    paused = service.lifecycle.update("text", IDENTITY, "old-0", "paused")
+    assert paused["state"] == "paused" and not paused["slot_held"]
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert unfinished("text", row(service)) and row(service)["status"] == "unknown"
+    restarted = GenerationCompletionService(service.text,service.images,service.lifecycle,clock=admission.clock)
+    restarted.process_one()
+    assert not restarted.read("text",IDENTITY,"old-0").get("replacement_id")
 
 
 @pytest.mark.parametrize("case", ["head_drift", "late_original", "missing_proof"])

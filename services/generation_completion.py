@@ -307,6 +307,15 @@ class GenerationCompletionService:
             elif child and not state.get("selected_id"):
                 state.update(state="replacement_pending" if child.get("status") in {"queued", "running"} else "needs_attention",
                              reason="COMPLETION_ATTEMPT_PENDING" if child.get("status") in {"queued", "running"} else "COMPLETION_ATTEMPT_EXHAUSTED")
+                if (kind == "text" and child.get("_completion_of") == request_id
+                        and child.get("_terminal_empty_correction_of") == request_id
+                        and all(child.get(k) == root.get(k) for k in (
+                            "provider_account_identity", "provider_binding_id", "conversation_id", "_work_key"))
+                        and self.text._verified_retryable_empty(child)):
+                    # The bounded empty attempt is over locally. Keep UNKNOWN
+                    # and conversation ordering, but release its physical slot.
+                    child["_turn_reserved"] = False
+                    self.store.write_receipt(db, kind, owner, state["replacement_id"], child)
                 original_work = self.store.runtime(db, root.get("_work_key", "")) or {}
                 if root.get("_recovery_suppressed") or original_work.get("state", "active") != "active":
                     state.update(state="needs_attention", reason="COMPLETION_WORK_NOT_ACTIVE")
@@ -351,7 +360,10 @@ class GenerationCompletionService:
             same_retry = bool(child and kind == "text" and child.get("_terminal_empty_correction_of") == request_id
                               and child.get("_work_key") == root.get("_work_key")
                               and self.text._verified_retryable_empty(root))
-            result["local_reservation"] = ("released" if same_retry and successful(kind, child)
+            local_receipt = child or root
+            empty_released = (kind == "text" and local_receipt.get("_turn_reserved") is False
+                              and self.text._verified_retryable_empty(local_receipt))
+            result["local_reservation"] = ("released" if empty_released or same_retry and successful(kind, child)
                                             else "transferred" if same_retry and child.get("status") in {"queued", "running", "unknown"}
                                             else "held" if unresolved(root) and not ended else "released")
             if same_retry and not ended and successful(kind, child) and state.get("state") == "completed":

@@ -243,7 +243,10 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
              else "receiving" if response else "sending" if send_state == "attempted"
              else "preparing" if status == "running" else "unknown")
     turn_active = (status == "running" or unknown_text_result(receipt)) and not original_turn_ended("text", receipt) and not released_wait
-    accounted = turn_active and (unknown_text_result(receipt) or receipt.get("_turn_reserved", True))
+    from services.text_task_service import TextTaskService
+    empty_local_released = (receipt.get("_turn_reserved") is False
+                            and TextTaskService._verified_retryable_empty(receipt))
+    accounted = turn_active and not empty_local_released and (unknown_text_result(receipt) or receipt.get("_turn_reserved", True))
     resources = {
         "local_worker": "active" if local == "active" else "idle" if local in {"ended", "not_started"} else "unknown",
         "account_turn": ("held" if receipt.get("provider_account_identity") or receipt.get("_account_resource")

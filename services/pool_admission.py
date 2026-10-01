@@ -391,6 +391,7 @@ class PoolAdmission:
         return read() if read else self.accounts.list_accounts()
 
     def _snapshot(self, rows, receipts, settings, types, now, cursor, workflow_state=None):
+        from services.text_task_service import TextTaskService
         works, workflow_clocks = workflow_state or ({}, {})
         # A verified empty upstream turn may have one explicitly accepted
         # correction in the same public Chat session. Its UNKNOWN receipt must
@@ -495,7 +496,9 @@ class PoolAdmission:
                           and r.get("upstream_outcome") == "unknown"
                           and type(r.get("_execution_wait_ended_at")) in (int, float)
                           and math.isfinite(r["_execution_wait_ended_at"]))
-            turn_active = (active and not original_turn_ended(kind, r) and not wait_ended
+            empty_local_released = (kind == "text" and r.get("_turn_reserved") is False
+                                    and TextTaskService._verified_retryable_empty(r))
+            turn_active = (active and not original_turn_ended(kind, r) and not wait_ended and not empty_local_released
                            and (owner, request_id) not in transferred_empty_turns)
             if status == "running" and r.get("_executing") and float(r.get("_claim_until") or 0) > now:
                 active_bytes += int(r.get("_input_bytes") or 0)
