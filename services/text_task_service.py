@@ -215,6 +215,7 @@ class TextTaskService:
         TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value,
         TextRecoveryReason.REQUEST_BRANCH_SUPERSEDED.value,
         TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value,
+        TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value,
         TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value,
         TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
     })
@@ -835,6 +836,12 @@ class TextTaskService:
                                _result_observation_started_at=now if initial else started,
                                _result_last_progress_at=now if changed else None if initial else progress,
                                _result_no_progress_reads=0 if initial or changed else (count if type(count) is int and count >= 0 else 0) + 1)
+            if error_code == "UPSTREAM_OUTCOME_UNKNOWN" and recovery_reason == TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value:
+                # A completed external successor ends our foreground wait;
+                # it does not authorize old-cursor continuation, archive,
+                # capacity release, or adoption of that successor's result.
+                changes.update(_result_last_checked_at=now,
+                               _result_wait_ended_at=current.get("_result_wait_ended_at") or now)
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}

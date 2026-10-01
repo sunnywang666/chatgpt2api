@@ -462,12 +462,22 @@ def test_http_restored_account_wakes_original_id_without_starving_other_owner_wo
         (tmp_path / "healthy-recovered").touch()
         _wait(lambda: success("same_two", "same-owner-healthy") and success("other", "other-owner-healthy"), timeout=45)
         assert not success("same_one", "bound-recovery")
+        # Keep both owners waiting when B actually returns. Two keys owned by
+        # the first person must still receive just one top-level source turn.
+        competing = [("same_one", "same-recovery-1", "recovery-a"),
+                     ("same_two", "same-recovery-2", "recovery-b"),
+                     ("other", "other-recovery-1", "other-a"),
+                     ("same_two", "same-recovery-3", "recovery-c"),
+                     ("other", "other-recovery-2", "other-b")]
+        for key, task_id, workflow in competing:
+            assert _http(port, keys[key], "POST", "/api/image-tasks/generations", body(task_id, workflow, True))[0] == 200
+        assert len((tmp_path / "image-sends.jsonl").read_text().splitlines()) == 2
         (tmp_path / "quota-recovered").touch()
-        _wait(lambda: success("same_one", "bound-recovery"), timeout=45)
+        _wait(lambda: success("same_one", "bound-recovery") and all(success(key, task_id) for key, task_id, _ in competing), timeout=45)
     sends = [json.loads(line) for line in (tmp_path / "image-sends.jsonl").read_text().splitlines()]
     assert {row["request_id"] for row in sends[:2]} == {"same-owner-healthy", "other-owner-healthy"}
-    assert len(sends) == 3 and sends[-1]["request_id"] == "bound-recovery"
-    assert sends[-1]["account"] == "account-B"
+    assert len(sends) == len({row["request_id"] for row in sends}) == 8
+    assert all(row["account"] == "account-B" for row in sends[2:])
     store = TaskStore(tmp_path / "text_tasks.sqlite3")
     with store.connect() as db:
         rows = {request_id: store.read_receipt(db, kind, owner, request_id)
@@ -475,6 +485,8 @@ def test_http_restored_account_wakes_original_id_without_starving_other_owner_wo
     assert rows["bound-recovery"]["_source"] == rows["same-owner-healthy"]["_source"]
     assert rows["bound-recovery"]["_source"] != rows["other-owner-healthy"]["_source"]
     assert rows["bound-recovery"]["_requested_account_identity"] == "account-B"
+    sources = [rows[row["request_id"]]["_source"] for row in sends[2:]]
+    assert len(set(sources[:2])) == 2 and len(set(sources[2:4])) == 2
 
 
 def _serve_images(root, completion=False, fair_recovery=False):
@@ -494,6 +506,7 @@ def _serve_images(root, completion=False, fair_recovery=False):
     rt.update("B", status="限流", **fresh(0))
     if fair_recovery:
         rt.update("A", status="限流", **fresh(0))
+        rt.admission.settings = lambda: {"image_account_concurrency": 1, "codex_max_concurrency": 1}
     def metadata(token):
         letter = str(token).rsplit("-", 1)[-1]
         recovered = (root / ("healthy-recovered" if letter == "A" and fair_recovery else "quota-recovered")).exists()

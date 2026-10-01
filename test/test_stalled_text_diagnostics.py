@@ -33,6 +33,62 @@ def mixed_chain(doc):
     doc["mapping"][final]["parent"] = parent
 
 
+def external_continuation(doc):
+    original = doc["current_node"]
+    doc["mapping"][original]["message"].update(status="in_progress", end_turn=None)
+    doc["mapping"][original]["message"]["content"]["parts"] = [""]
+    doc["mapping"]["external-user"] = {"parent": original, "message": {
+        "id": "external-user", "author": {"role": "user"}, "content": {"content_type": "text", "parts": ["PRIVATE_LATER_INPUT"]}}}
+    doc["mapping"]["external-final"] = {"parent": "external-user", "message": {
+        "id": "external-final", "author": {"role": "assistant"}, "status": "finished_successfully",
+        "end_turn": True, "channel": "final", "content": {"content_type": "text", "parts": ["PRIVATE_LATER_ANSWER"]}}}
+    doc["current_node"] = "external-final"
+    return doc
+
+
+def test_completed_external_turn_is_reported_without_adopting_answer_or_releasing_original(tmp_path):
+    service, admission, backend, legacy = migration(tmp_path)
+    def read(row):
+        doc = external_continuation(document(row))
+        result = ConversationBindingService._read_text_request_result(None, row, document=doc)
+        assert result["status"] == "unknown" and result["recovery_reason"] == "REQUEST_CONVERSATION_ADVANCED"
+        assert "content" not in result and "_turn_end_evidence" not in result
+        return result
+    service.recovery_reader = read
+    result = service.read("owner", "old-0")
+    assert result["status"] == "unknown" and result["recovery_reason"] == "REQUEST_CONVERSATION_ADVANCED"
+    assert result["execution"]["wait_state"] == "ended"
+    row = saved(service)
+    assert "PRIVATE_LATER" not in json.dumps(row)
+    assert all(row.get(key) == legacy[0].get(key) for key in (
+        "request_message_id", "parent_message_id", "request_parent_message_id",
+        "conversation_id", "provider_account_identity"))
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    restarted = TextTaskService(service.path, admission=admission, clock=admission.clock, recovery_reader=read)
+    assert restarted.read("owner", "old-0")["recovery_reason"] == "REQUEST_CONVERSATION_ADVANCED"
+    assert backend.mock_calls == []
+
+
+@pytest.mark.parametrize("case", ["later_running", "other_current", "ambiguous", "wrong_id", "malformed_current"])
+def test_external_progress_requires_verified_same_chain_completed_successor(tmp_path, case):
+    service, _, _, _ = migration(tmp_path)
+    row = saved(service)
+    doc = external_continuation(document(row))
+    if case == "later_running":
+        doc["mapping"]["external-final"]["message"].update(status="in_progress", end_turn=None)
+    elif case == "other_current":
+        doc["current_node"] = "missing"
+    elif case == "ambiguous":
+        doc["mapping"]["other"] = {"parent": row["request_message_id"], "message": {"id": "other", "author": {"role": "user"}}}
+    elif case == "malformed_current":
+        doc["current_node"] = ["external-final"]
+    else:
+        doc["mapping"]["external-user"]["message"]["id"] = "wrong"
+    result = ConversationBindingService._read_text_request_result(None, row, document=doc)
+    assert result["recovery_reason"] == "REQUEST_RESULT_INCOMPLETE"
+    assert "content" not in result and "_turn_end_evidence" not in result
+
+
 def incomplete_reader(backend, mutate=None):
     def read(row):
         doc = document(row)

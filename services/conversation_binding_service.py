@@ -22,6 +22,7 @@ class TextRecoveryReason(str, Enum):
     REQUEST_BRANCH_AMBIGUOUS = "REQUEST_BRANCH_AMBIGUOUS"
     REQUEST_BRANCH_SUPERSEDED = "REQUEST_BRANCH_SUPERSEDED"
     REQUEST_RESULT_INCOMPLETE = "REQUEST_RESULT_INCOMPLETE"
+    REQUEST_CONVERSATION_ADVANCED = "REQUEST_CONVERSATION_ADVANCED"
     REQUEST_RESULT_NOT_FOUND = "REQUEST_RESULT_NOT_FOUND"
     REQUEST_RESULT_TERMINAL_EMPTY = "REQUEST_RESULT_TERMINAL_EMPTY"
     REQUEST_RESULT_NON_TEXT = "REQUEST_RESULT_NON_TEXT"
@@ -169,6 +170,39 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
                     return None
             return {"conversation_id": conversation_id, "request_message_id": request_message_id,
                     "final_message_id": node_id, "observed_at": time.time()}
+
+
+def _completed_external_successor(mapping, children, request_message_id, current_node, conversation_id):
+    """A later user turn completed on the same unambiguous current chain.
+
+    This is diagnostic evidence only: it neither ends the original turn nor
+    makes the later answer an answer to the original request.
+    """
+    if not isinstance(current_node, str):
+        return False
+    node_id, seen, later_user = current_node, set(), None
+    while node_id != request_message_id:
+        if not node_id or node_id in seen or len(seen) >= 128:
+            return False
+        seen.add(node_id)
+        node = mapping.get(node_id)
+        message = node.get("message") if isinstance(node, dict) else None
+        if not isinstance(message, dict) or message.get("id") != node_id:
+            return False
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        if role not in {"user", "assistant", "tool"}:
+            return False
+        if role == "user" and later_user is None:
+            later_user = node_id
+        parent = node.get("parent")
+        if not isinstance(parent, str) or children.get(parent) != [node_id]:
+            return False
+        node_id = parent
+    if not later_user:
+        return False
+    ended = _completed_request_turn(mapping, children, later_user, conversation_id)
+    return bool(ended and ended["final_message_id"] == current_node)
 
 
 def is_recovery_image_pointer(value: object) -> bool:
@@ -1170,7 +1204,11 @@ class ConversationBindingService:
                     "parent_message_id": non_text_result["final_message_id"],
                     NON_TEXT_RESULT_FIELD: non_text_result,
                 }
-            if active_result_seen:
+            advanced = active_result_seen and later_user_seen and _completed_external_successor(
+                mapping, children, request_message_id, document.get("current_node"), conversation_id)
+            if advanced:
+                recovery_reason = TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value
+            elif active_result_seen:
                 recovery_reason = TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
             elif terminal_empty_seen:
                 recovery_reason = TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
@@ -1181,7 +1219,7 @@ class ConversationBindingService:
             return {
                 **result,
                 "binding_status": "unknown",
-                "status": "running" if active_result_seen else "unknown",
+                "status": "running" if active_result_seen and not advanced else "unknown",
                 "recovery_reason": recovery_reason,
                 **({RESULT_OBSERVATION_FIELD: observation} if active_result_seen
                    and (observation := _result_observation(mapping, children, request_message_id, conversation_id)) else {}),
