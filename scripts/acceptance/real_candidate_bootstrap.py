@@ -77,7 +77,7 @@ _ACCOUNT_COPY_FIELDS = frozenset({
     "user_id", "source_type", "type", "status", "quota", "limits_progress",
     "models", "capabilities", "image_capabilities", "image_models",
     "model_catalog", "paid_model_catalog", "last_verified_at", "expires_at",
-    "capacity_observed_at", "capacity_observation_status", "capacity_observation_error",
+    "capacity_observed_at", "capacity_read_failed_at", "capacity_used_since_observation",
 })
 
 
