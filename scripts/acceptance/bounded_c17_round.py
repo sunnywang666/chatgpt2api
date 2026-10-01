@@ -110,32 +110,43 @@ def save_image(api: Any, shared: Any, driver: Any, state_path: Path, state: dict
     if not isinstance(receipt.get("data"), list) or not receipt["data"]:
         halt(driver, shared, state_path, state, record, "IMAGE_RESULT_MISSING")
         return False
-    target = results / f"{record['id']}.png"
+    record["observed_image_count"] = len(receipt["data"])
+    record["budget_reserved"]["image"] = max(record["budget_reserved"].get("image", 0), len(receipt["data"]))
+    driver._save(shared, state_path, state)
+    files = []
     try:
-        with api.open("GET", f"/api/image-tasks/{quote(record['id'], safe='')}/images/0") as response:
-            raw = response.read(shared.MAX_DOWNLOAD_BYTES + 1)
-        if not raw or len(raw) > shared.MAX_DOWNLOAD_BYTES:
-            raise ValueError("IMAGE_RESULT_BYTES_INVALID")
         from PIL import Image
-        with Image.open(BytesIO(raw)) as image:
-            image.verify()
-        with Image.open(BytesIO(raw)) as image:
-            width, height = image.size
-        if not target.exists():
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as output:
-                output.write(raw); output.flush(); os.fsync(output.fileno())
-        if target.read_bytes() != raw:
-            raise ValueError("IMAGE_FILE_READBACK_FAILED")
+        for index in range(len(receipt["data"])):
+            target = results / (f"{record['id']}.png" if index == 0 else f"{record['id']}-{index}.png")
+            with api.open("GET", f"/api/image-tasks/{quote(record['id'], safe='')}/images/{index}") as response:
+                raw = response.read(shared.MAX_DOWNLOAD_BYTES + 1)
+            if not raw or len(raw) > shared.MAX_DOWNLOAD_BYTES:
+                raise ValueError("IMAGE_RESULT_BYTES_INVALID")
+            with Image.open(BytesIO(raw)) as image:
+                image.verify()
+            with Image.open(BytesIO(raw)) as image:
+                width, height = image.size
+            if not target.exists():
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as output:
+                    output.write(raw); output.flush(); os.fsync(output.fileno())
+            if target.read_bytes() != raw:
+                raise ValueError("IMAGE_FILE_READBACK_FAILED")
+            files.append({"file": target.name, "bytes": len(raw), "dimensions": [width, height],
+                          "sha256": hashlib.sha256(raw).hexdigest()})
     except Exception:
         halt(driver, shared, state_path, state, record, "IMAGE_RESULT_VALIDATION_FAILED")
         return False
-    record["result_file"] = target.name
-    record["result_bytes"] = len(raw)
-    record["dimensions"] = [width, height]
+    record["result_file"] = files[0]["file"]
+    record["result_bytes"] = files[0]["bytes"]
+    record["dimensions"] = files[0]["dimensions"]
+    record["result_files"] = files
+    record["actual_image_count"] = len(files)
+    record["budget_reserved"]["image"] = max(record["budget_reserved"].get("image", 0), len(files))
     driver._save(shared, state_path, state)
     emit(status="result_saved", id=record["id"], kind="image", account_ref=record.get("account_ref"),
-         result_bytes=len(raw), file=target.name, width=width, height=height)
+         result_bytes=sum(f["bytes"] for f in files), file=files[0]["file"],
+         width=files[0]["dimensions"][0], height=files[0]["dimensions"][1])
     return True
 
 
@@ -303,7 +314,7 @@ def run(args: argparse.Namespace) -> int:
                         emit(status="result_saved", id=request_id, kind="text", account_ref=record.get("account_ref"), result_bytes=size, file=record["result_file"])
                     if not record.get("work") and driver._work(shared, api, state_path, state, request_id, active=False) != 0: break
                 else:
-                    if not record.get("result_file") and not save_image(api, shared, driver, state_path, state, record, results): break
+                    if not record.get("result_files") and not save_image(api, shared, driver, state_path, state, record, results): break
                     if not record.get("work") and not image_complete(api, shared, driver, state_path, state, record): break
                 if record.get("work") and poll_work(api, shared, driver, state_path, state, record):
                     archived_confirmed += 1; pending.remove(request_id); progressed = True
