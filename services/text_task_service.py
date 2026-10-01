@@ -25,6 +25,7 @@ from services.config import DATA_DIR
 from services.conversation_binding_service import (
     ConversationBindingError,
     NON_TEXT_RESULT_FIELD,
+    OBSERVED_CONTENT_TYPES,
     RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
     RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
@@ -528,21 +529,32 @@ class TextTaskService:
         nodes = value["nodes"]
         if not isinstance(nodes, list) or not 1 <= len(nodes) <= 128:
             return None
-        ids = set()
-        for node in nodes:
-            if (not isinstance(node, dict) or set(node) != {"id", "role", "status", "end_turn", "text_chars"}
+        ids, normalized = set(), []
+        legacy_fields = {"id", "role", "status", "end_turn", "text_chars"}
+        for raw in nodes:
+            if not isinstance(raw, dict):
+                return None
+            # The first candidate measured pure text only. Normalize it so a
+            # reader upgrade does not manufacture progress or reset its clock.
+            node = ({**raw, "content_type": "text", "content_items": 0, "finished_items": 0}
+                    if set(raw) == legacy_fields else raw)
+            if (set(node) != legacy_fields | {"content_type", "content_items", "finished_items"}
                     or not isinstance(node["id"], str) or not 1 <= len(node["id"]) <= 200
                     or node["id"] in ids or node["id"] == value["request_message_id"]
                     or node["role"] not in {"assistant", "tool"}
                     or node["status"] not in {"in_progress", "running", "pending", "queued", "finished_successfully"}
                     or type(node["end_turn"]) is not bool
-                    or type(node["text_chars"]) is not int or not 0 <= node["text_chars"] <= 100_000_000):
+                    or type(node["text_chars"]) is not int or not 0 <= node["text_chars"] <= 100_000_000
+                    or not isinstance(node["content_type"], str) or node["content_type"] not in OBSERVED_CONTENT_TYPES
+                    or type(node["content_items"]) is not int or not 0 <= node["content_items"] <= 65_664
+                    or type(node["finished_items"]) is not int or not 0 <= node["finished_items"] <= 128):
                 return None
             ids.add(node["id"])
+            normalized.append(dict(node))
         updated = value["upstream_updated_at"]
         if updated is not None and (type(updated) not in (int, float) or not math.isfinite(updated) or updated <= 0):
             return None
-        return {**value, "nodes": [dict(node) for node in nodes]}
+        return {**value, "nodes": normalized}
 
     @staticmethod
     def _safe_recovery_scan(value):

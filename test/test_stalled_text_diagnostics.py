@@ -13,6 +13,26 @@ from test.test_expired_execution_wait import saved, patch, waiter
 from test.test_unknown_turn_recovery import document, migration
 
 
+def mixed_chain(doc):
+    """Synthetic bodies reproduce only the live GET's verified envelope shapes."""
+    final = doc["current_node"]
+    parent = doc["mapping"][final]["parent"]
+    envelopes = [
+        ("code", "assistant", {"content_type": "code", "text": "PRIVATE_CODE"}),
+        ("output", "tool", {"content_type": "execution_output", "text": "PRIVATE_TOOL"}),
+        ("thought", "assistant", {"content_type": "thoughts", "thoughts": [
+            {"summary": "PRIVATE_SUMMARY", "content": "", "chunks": [], "finished": False}]}),
+        ("recap", "assistant", {"content_type": "reasoning_recap", "content": "PRIVATE_RECAP"}),
+    ]
+    for suffix, role, content in envelopes:
+        node_id = final + "-" + suffix
+        doc["mapping"][node_id] = {"parent": parent, "message": {
+            "id": node_id, "author": {"role": role}, "status": "finished_successfully",
+            "end_turn": False, "content": content}}
+        parent = node_id
+    doc["mapping"][final]["parent"] = parent
+
+
 def incomplete_reader(backend, mutate=None):
     def read(row):
         doc = document(row)
@@ -175,3 +195,75 @@ def test_public_execution_is_allowlisted_and_legacy_send_is_unknown():
         "send_state": "response_received", "sent_at": float("inf"), "last_progress_at": True,
         "secret": "PRIVATE_BODY", "resources": {"account_turn": "held", "secret": "PRIVATE_ACCOUNT"}}})
     assert receipt["execution"] == {"send_state": "response_received", "resources": {"account_turn": "held"}}
+
+
+@pytest.mark.parametrize("part", ["code", "output", "thought", "recap"])
+def test_mixed_original_chain_observes_progress_then_stall_without_exposing_bodies(tmp_path, part):
+    service, admission, backend, _ = migration(tmp_path)
+    def shape(doc, message):
+        mixed_chain(doc)
+        content = doc["mapping"][doc["current_node"] + "-" + part]["message"]["content"]
+        if progressed[0]:
+            if part == "thought":
+                content["thoughts"][0]["finished"] = True
+            else:
+                content["content" if part == "recap" else "text"] += " growth"
+    progressed = [False]
+    service.recovery_reader = incomplete_reader(backend, shape)
+    result = service.read("owner", "old-0")
+    assert result["execution"]["unchanged_reads"] == 0
+    assert "PRIVATE" not in json.dumps(saved(service))
+    progressed[0] = True
+    admission.clock.now += 901
+    service.read("owner", "old-0")
+    assert saved(service)["_result_last_progress_at"] == admission.clock.now
+    for _ in range(3):
+        admission.clock.now += 301
+        result = service.read("owner", "old-0")
+    assert result["execution"]["phase"] == "stalled"
+    assert result["execution"]["resources"]["account_turn"] == "held"
+    assert "PRIVATE" not in json.dumps(result)
+    assert all(key not in json.dumps(result) for key in ("text_chars", "content_items", "finished_items", "nodes"))
+
+
+@pytest.mark.parametrize("malformed", ["media", "object_output", "unknown_thought_chunk", "later_user", "cycle", "kind_change"])
+def test_mixed_observation_rejects_unsupported_or_ambiguous_branch(tmp_path, malformed):
+    service, admission, backend, _ = migration(tmp_path)
+    def mutate(doc, message):
+        mixed_chain(doc)
+        output = doc["mapping"][doc["current_node"] + "-output"]["message"]
+        if malformed == "media":
+            output["content"] = {"content_type": "image", "parts": ["PRIVATE_IMAGE"]}
+        elif malformed == "object_output":
+            output["content"]["text"] = {"PRIVATE": "BODY"}
+        elif malformed == "unknown_thought_chunk":
+            thought = doc["mapping"][doc["current_node"] + "-thought"]["message"]["content"]["thoughts"][0]
+            thought["chunks"] = [{"PRIVATE": "BODY"}]
+        elif malformed == "later_user":
+            output["author"]["role"] = "user"
+        elif malformed == "cycle":
+            doc["mapping"]["user-0"]["parent"] = doc["current_node"]
+        else:
+            output["content"]["content_type"] = []
+    service.recovery_reader = incomplete_reader(backend, mutate)
+    result = service.read("owner", "old-0")
+    assert "observation_started_at" not in result["execution"]
+    assert "_result_wait_ended_at" not in saved(service)
+
+
+def test_pure_text_observation_upgrade_preserves_progress_clock(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    service.recovery_reader = incomplete_reader(backend)
+    service.read("owner", "old-0")
+    original = saved(service)
+    observation = original["_original_result_observation"]
+    for node in observation["nodes"]:
+        for key in ("content_type", "content_items", "finished_items"):
+            node.pop(key)
+    patch(service, _original_result_observation=observation)
+    admission.clock.now += 301
+    service.read("owner", "old-0")
+    row = saved(service)
+    assert row["_result_observation_started_at"] == original["_result_observation_started_at"]
+    assert row["_result_last_progress_at"] is None
+    assert row["_result_no_progress_reads"] == 1

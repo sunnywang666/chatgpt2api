@@ -34,6 +34,47 @@ _ACTIVE_TEXT_RESULT_STATUSES = frozenset({"in_progress", "running", "pending", "
 NON_TEXT_RESULT_FIELD = "_non_text_result"
 TURN_END_EVIDENCE_FIELD = "_turn_end_evidence"
 RESULT_OBSERVATION_FIELD = "_original_result_observation"
+OBSERVED_CONTENT_TYPES = frozenset({"text", "code", "execution_output", "thoughts", "reasoning_recap"})
+
+
+def _content_observation(content):
+    """Measure known text/tool envelopes without retaining their contents."""
+    if not isinstance(content, dict):
+        return None
+    kind = content.get("content_type")
+    if not isinstance(kind, str):
+        return None
+    items = finished = 0
+    if kind == "text":
+        parts = content.get("parts")
+        if not isinstance(parts, list) or any(not isinstance(part, str) for part in parts):
+            return None
+        chars = sum(len(part) for part in parts)
+    elif kind in {"code", "execution_output", "reasoning_recap"}:
+        text = content.get("content" if kind == "reasoning_recap" else "text")
+        if not isinstance(text, str):
+            return None
+        chars = len(text)
+    elif kind == "thoughts":
+        thoughts = content.get("thoughts")
+        if not isinstance(thoughts, list) or len(thoughts) > 128:
+            return None
+        chars, items = 0, len(thoughts)
+        for thought in thoughts:
+            if (not isinstance(thought, dict)
+                    or not isinstance(thought.get("summary"), str)
+                    or not isinstance(thought.get("content"), str)
+                    or type(thought.get("finished")) is not bool
+                    or not isinstance(thought.get("chunks"), list)
+                    or len(thought["chunks"]) > 512
+                    or any(not isinstance(chunk, str) for chunk in thought["chunks"])):
+                return None
+            chars += len(thought["summary"]) + len(thought["content"]) + sum(map(len, thought["chunks"]))
+            items += len(thought["chunks"])
+            finished += int(thought["finished"])
+    else:
+        return None  # Media or unknown envelopes cannot qualify as empty text.
+    return {"content_type": kind, "text_chars": chars, "content_items": items, "finished_items": finished}
 
 
 def _result_observation(mapping, children, request_message_id, conversation_id):
@@ -62,13 +103,11 @@ def _result_observation(mapping, children, request_message_id, conversation_id):
         status = message.get("status")
         if role not in {"assistant", "tool"} or status not in _ACTIVE_TEXT_RESULT_STATUSES | {"finished_successfully"}:
             return None
-        content = message.get("content")
-        parts = content.get("parts") if isinstance(content, dict) else None
-        if not isinstance(parts, list) or any(not isinstance(part, str) for part in parts):
-            return None  # Unsupported tool/media bodies are not empty text.
+        content = _content_observation(message.get("content"))
+        if content is None:
+            return None
         nodes.append({"id": node_id, "role": role, "status": status,
-                      "end_turn": message.get("end_turn") is True,
-                      "text_chars": sum(len(part) for part in parts)})
+                      "end_turn": message.get("end_turn") is True, **content})
         value = message.get("update_time")
         if type(value) in (int, float) and math.isfinite(value) and value > 0:
             updated_at = max(updated_at or value, value)

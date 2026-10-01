@@ -179,7 +179,7 @@ Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `
 
 原生 Chat 文字的每个公共回执带脱敏 `execution`。`send_state=not_sent` 需要明确未发送证据，`attempted` 只证明进入发送边界，`response_received` 只证明收到 HTTP 响应头；均不能单独证明生成成功。`sent_at`、`response_received_at`、`local_finished_at` 分别记录发送、响应、本地执行结束。`first_stream_event_at` 是首个流事件，不是思考或首个文字 token；旧回执缺发送证据时返回 `unknown`。不要将 `running` 一律展示为“正在生成”。
 
-`observation_started_at` 是首次有效原结果观察，`last_checked_at` 是最近有效观察，`last_progress_at` 仅在同一原请求的有效消息结构、状态或文本长度发生变化时出现。上游 `update_time` 单独变化、无关分支变化、网络／429／授权失败不算进展。对持续 `REQUEST_RESULT_INCOMPLETE`，至少 15 分钟无可验证变化且至少 3 次有效无变化读后，持久化 `phase=stalled / wait_state=ended / wait_ended_at`：本次结果等待异常结束，原 `status=unknown` 和上游结果未知仍保留。此标记**不释放**可能仍在执行的账号 turn，不放行同会话后续，不允许重发；它与已有 `RESULT_UNRECOVERABLE` 合格无结果释放规则分开。迟到结果仍沿原 ID 接回，重启不重置观察或结束记录。
+`observation_started_at` 是首次有效原结果观察，`last_checked_at` 是最近有效观察，`last_progress_at` 仅在同一原请求的有效消息结构、状态或文本长度发生变化时出现。原分支的已知 `code`、`execution_output`、`thoughts`、`reasoning_recap` 封装也可观测，只保留类型、长度和条目计数，不持久化或公开正文；未知／媒体封装不计为有效空结果。上游 `update_time` 单独变化、无关分支变化、网络／429／授权失败不算进展。对持续 `REQUEST_RESULT_INCOMPLETE`，至少 15 分钟无可验证变化且至少 3 次有效无变化读后，持久化 `phase=stalled / wait_state=ended / wait_ended_at`：本次结果等待异常结束，原 `status=unknown` 和上游结果未知仍保留。此标记**不释放**可能仍在执行的账号 turn，不放行同会话后续，不允许重发；它与已有 `RESULT_UNRECOVERABLE` 合格无结果释放规则分开。迟到结果仍沿原 ID 接回，重启不重置观察或结束记录。
 
 客户端读到 `wait_state=ended` 应停止本次前台等待，保存原 ID、输入和最后回执，显示未确认的原因、`recovery.attempt/reason/next_at`，以后仍沿原 ID 恢复。`resources.local_worker/account_turn/conversation` 分别解释本地执行、账号执行位置、会话保护；工作槽位和归档以 `/work` 回执为准。示例显示：“请求已发送并收到响应；本地执行已结束；原结果连续无可验证进展，本次等待结束；上游结果未知，账号执行位置仍占用，同会话后续受保护。禁止自动重发。” 这是工程状态合同，不是对生产或真实上游已恢复的声明。
 

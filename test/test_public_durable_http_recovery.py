@@ -540,8 +540,10 @@ def _serve(root, mode):
         admission.CLAIM_SECONDS = .1
         from services.conversation_binding_service import ConversationBindingService
         from test.test_unknown_turn_recovery import document
+        from test.test_stalled_text_diagnostics import mixed_chain
         def original_read(row):
             doc = document(row)
+            mixed_chain(doc)
             message = doc["mapping"]["final-" + row["request_message_id"]]["message"]
             if (root / "original-completed").exists():
                 message["content"]["parts"] = ["late original HTTP result"]
