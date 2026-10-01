@@ -44,6 +44,35 @@ class TextTaskCapacityError(RuntimeError):
     pass
 
 
+def bind_waiting_public_sessions(store, db, receipts):
+    """Resolve accepted successor cursors only from a successful original turn."""
+    owned = {(owner, request_id): receipt for kind, owner, request_id, receipt in receipts if kind == "text"}
+    fields = ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id")
+    for kind, owner, request_id, receipt in receipts:
+        if kind != "text" or receipt.get("status") != "queued" or not receipt.get("_public_previous_waiting"):
+            continue
+        previous = owned.get((owner, receipt.get("_previous_request_id"))) or {}
+        reason = "CHAT_PREVIOUS_REQUEST_PENDING"
+        if previous.get("status") == "succeeded" and previous.get("upstream_outcome") != "unknown":
+            if not all(isinstance(previous.get(key), str) and previous[key] for key in fields):
+                reason = "CHAT_CONTINUATION_UNAVAILABLE"
+            elif (receipt.get("_requested_account_identity")
+                  and receipt["_requested_account_identity"] != previous["provider_account_identity"]):
+                receipt.update(status="failed", error_code="CHAT_ACCOUNT_SELECTION_CONFLICT", upstream_outcome="not_sent")
+                reason = "CHAT_ACCOUNT_SELECTION_CONFLICT"
+            else:
+                receipt.update({key: previous[key] for key in fields})
+                receipt["_submission_parent_message_id"] = previous["parent_message_id"]
+                receipt.pop("_public_previous_waiting", None)
+                receipt.pop("_public_previous_waiting_reason", None)
+                store.write_receipt(db, kind, owner, request_id, receipt)
+                continue
+        elif previous.get("status") in {"unknown", "failed"}:
+            reason = "CHAT_PREVIOUS_REQUEST_UNKNOWN" if previous.get("status") == "unknown" or previous.get("upstream_outcome") == "unknown" else "CHAT_PREVIOUS_REQUEST_FAILED"
+        receipt["_public_previous_waiting_reason"] = reason
+        store.write_receipt(db, kind, owner, request_id, receipt)
+
+
 def _retained_size(value, seen=None):
     """Estimate the Python heap retained by one scheduled request body."""
     seen = seen if seen is not None else set()
@@ -1191,6 +1220,13 @@ class TextTaskService:
             if terminal_empty and (not evidence or previous.get("model") != receipt.get("model")):
                 reject("CHAT_TERMINAL_EMPTY_UNVERIFIED")
             if previous.get("status") != "succeeded" and not evidence:
+                if (self.admission is not None and previous.get("status") in {"queued", "running"}
+                        and previous.get("_public_session_ref") and not terminal_empty
+                        and previous.get("upstream_outcome") != "unknown"):
+                    receipt.update(_public_session_ref=body["_public_session_ref"],
+                                   _previous_request_id=previous_id, _public_previous_waiting=True,
+                                   _public_previous_waiting_reason="CHAT_PREVIOUS_REQUEST_PENDING")
+                    return
                 reject("CHAT_PREVIOUS_REQUEST_PENDING")
             anchors = ("provider_binding_id", "provider_account_identity", "conversation_id")
             if not all(isinstance(previous.get(key), str) and previous[key] for key in anchors):

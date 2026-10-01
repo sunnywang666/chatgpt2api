@@ -516,6 +516,10 @@ class PoolAdmission:
                 dependency = "image_thread:" + hashlib.sha256((owner + "\0" + request_id).encode()).hexdigest()
                 thread_resources.append(Resource(dependency, 0 if blocked else 1, 0, now))
                 thread_needs = (Need(dependency),)
+            if kind == "text" and r.get("_public_previous_waiting"):
+                dependency = "public_chat_previous:" + hashlib.sha256((owner + "\0" + request_id).encode()).hexdigest()
+                thread_resources.append(Resource(dependency, 0, 0, now))
+                thread_needs += (Need(dependency),)
             scheduling_resources, scheduling_needs, scheduling_ready = workflow_scheduling.constraints(
                 r, works, workflow_clocks, [row for row in receipts if (row[1], row[2]) not in released_order_heads], now)
             thread_resources.extend(scheduling_resources)
@@ -920,6 +924,8 @@ class PoolAdmission:
             workflow_scheduling.expire_unsent(self.store, db, receipts, now)
             self._recover_claims(db, receipts, now)
             bind_waiting_threads(self.store, db, receipts)
+            from services.text_task_service import bind_waiting_public_sessions
+            bind_waiting_public_sessions(self.store, db, receipts)
             if self.codex is not None:
                 rows = self._rows()
                 for kind, owner, request_id, r in receipts:
@@ -949,7 +955,8 @@ class PoolAdmission:
             selection = choose_next(snapshot, now)
             for deferred in selection.deferred:
                 r = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id)
-                reasons = ([r["_image_thread_waiting_reason"]] if r.get("_image_thread_waiting_reason") else list(deferred.reasons))
+                dependency_reason = r.get("_image_thread_waiting_reason") or r.get("_public_previous_waiting_reason")
+                reasons = [dependency_reason] if dependency_reason else list(deferred.reasons)
                 works, clocks = workflow_state
                 reasons = workflow_scheduling.waiting_reasons(r, works, clocks, receipts, now, reasons)
                 if ((deferred.ref.kind == "image" or r.get("_operation") == "image")
@@ -969,6 +976,8 @@ class PoolAdmission:
                     # Same-owner original receipt is the recovery entry. This is
                     # diagnostic only: never replace or resend its failed turn.
                     r["waiting"].update(previous_task_id=previous_id, action="read_original_predecessor")
+                if r.get("_public_previous_waiting"):
+                    r["waiting"].update(previous_request_id=r["_previous_request_id"], action="read_original_predecessor")
                 self.store.write_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id, r)
             if selection.dispatch is None:
                 return None
@@ -1118,6 +1127,13 @@ class PoolAdmission:
             if context.kind == "text" and r.get("_supersedes_request_id"):
                 from services.text_task_service import TextTaskService
                 TextTaskService._validate_supersede(self.store, db, context.owner, r, now)
+            if context.kind == "text" and r.get("_public_session_ref") and r.get("_previous_request_id") and not r.get("_terminal_empty_correction_of"):
+                previous = self.store.read_receipt(db, "text", context.owner, r["_previous_request_id"]) or {}
+                if (r.get("_public_previous_waiting") or previous.get("status") != "succeeded"
+                        or previous.get("upstream_outcome") == "unknown"
+                        or any(r.get(key) != previous.get(key) for key in ("provider_binding_id", "provider_account_identity", "conversation_id"))
+                        or r.get("_submission_parent_message_id") != previous.get("parent_message_id")):
+                    raise AdmissionLost("original Chat predecessor is not confirmed before send")
             physical = physical_conversation_key(r)
             if physical:
                 for other_kind, _, _, other in self.store.receipts(db):

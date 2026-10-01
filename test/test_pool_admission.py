@@ -114,6 +114,38 @@ class AdmissionTests(unittest.TestCase):
         with self.store.connect() as db:
             return self.store.read_receipt(db, kind, owner, name)
 
+    def test_pending_public_successor_claims_immediately_and_rechecks_original_before_send(self):
+        session = {"client_conversation_id": "public-chain", "_public_route": "chat", "_public_session_ref": "public-chain"}
+        self.submit("first", **session)
+        self.submit("next", **session, _previous_request_id="first")
+        with self.store.transaction() as db:
+            original = self.store.read_receipt(db, "text", "happy", "first")
+            original.update(status="succeeded", upstream_outcome="completed", provider_binding_id="binding-0",
+                            provider_account_identity="account-0", conversation_id="chat-0", parent_message_id="answer-0")
+            self.store.write_receipt(db, "text", "happy", "first", original)
+        claim = self.admission.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.request_id, "next")
+        self.assertIsNone(self.admission.claim_next())
+        for key, changed in (("status", "unknown"), ("upstream_outcome", "unknown"),
+                             ("parent_message_id", "drift"), ("provider_account_identity", "other")):
+            with self.subTest(key=key):
+                with self.store.transaction() as db:
+                    self.store.write_receipt(db, "text", "happy", "first", {**original, key: changed})
+                with self.assertRaises(AdmissionLost):
+                    claim.before_send()
+                self.assertEqual(self.calls, [])
+                with self.store.transaction() as db:
+                    self.store.write_receipt(db, "text", "happy", "first", original)
+                self.clock.now += 2
+                claim = self.admission.claim_next()
+                self.assertIsNotNone(claim)
+        self.admission.execute(claim)
+        self.assertEqual(len(self.calls), 1)
+        sent = self.calls[0][2]
+        self.assertEqual(sent["parent_message_id"], "answer-0")
+        self.assertEqual(sent["conversation_id"], "chat-0")
+
     def test_completed_image_with_iso_creation_time_cannot_stop_text_recovery(self):
         self.image("saved-image")
         self.submit("original", provider_binding_id="binding-0", provider_account_identity="account-0")

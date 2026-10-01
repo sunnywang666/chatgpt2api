@@ -289,18 +289,63 @@ def test_http_one_account_parallel_sessions_never_overlap_turns(tmp_path):
         _wait(sent)
         for name in ("A-1", "B-1"):
             assert _http(port, key, "GET", "/api/chat-requests/" + name)[1]["status"] == "running"
-        rejected = _http(port, key, "POST", "/api/chat-requests", turn("A-2", "A", "A-1"))
-        assert rejected[0] == 409 and rejected[1]["detail"]["code"] == "CHAT_PREVIOUS_REQUEST_PENDING"
-        (tmp_path / "release-A-1").touch()
-        _success(port, key, "A-1")
-        assert _http(port, key, "POST", "/api/chat-requests", turn("A-2", "A", "A-1"))[0] == 202
-        _wait(lambda: len((tmp_path / "sends.jsonl").read_text().splitlines()) == 3)
-        assert _http(port, key, "GET", "/api/chat-requests/B-1")[1]["status"] == "running"
-        for name in ("B-1", "A-2"):
+        for name, previous in (("A-2", "A-1"), ("A-3", "A-2")):
+            body = turn(name, "A", previous)
+            assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
+            assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
+            assert _http(port, key, "POST", "/api/chat-requests", {**body, "messages": [{"role": "user", "content": "drift"}]})[0] == 409
+        assert _http(port, key, "POST", "/api/chat-requests", turn("A-fork", "A", "A-1"))[0] == 409
+        assert len((tmp_path / "sends.jsonl").read_text().splitlines()) == 2
+        for previous, successor, count in (("A-1", "A-2", 3), ("A-2", "A-3", 4)):
+            (tmp_path / ("release-" + previous)).touch()
+            _success(port, key, previous)
+            _wait(lambda: len((tmp_path / "sends.jsonl").read_text().splitlines()) == count)
+            assert _http(port, key, "GET", "/api/chat-requests/B-1")[1]["status"] == "running"
+            assert _http(port, key, "GET", "/api/chat-requests/" + successor)[1]["status"] == "running"
+        for name in ("B-1", "A-3"):
             (tmp_path / ("release-" + name)).touch()
             _success(port, key, name)
     sends = [json.loads(x) for x in (tmp_path / "sends.jsonl").read_text().splitlines()]
-    assert sorted(sends[:2]) == ["A-1", "B-1"] and sends[2:] == ["A-2"]
+    assert sorted(sends[:2]) == ["A-1", "B-1"] and sends[2:] == ["A-2", "A-3"]
+
+
+def test_queued_public_successors_survive_restart_and_unknown_predecessor(tmp_path):
+    bodies = [{**_input(tmp_path, f"queued-{i}"), "client_conversation_id": "persistent-chain",
+               **({"previous_request_id": f"queued-{i-1}"} if i > 1 else {})} for i in range(1, 4)]
+    with _server(tmp_path, "queued") as (port, key, _):
+        for body in bodies:
+            assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
+        assert not (tmp_path / "sends.jsonl").exists()
+    with _server(tmp_path, "lifecycle") as (port, key, _):
+        receipts = [_success(port, key, body["client_request_id"]) for body in bodies]
+        from services.task_store import TaskStore
+        with TaskStore(tmp_path / "tasks.sqlite3").transaction() as db:
+            private_receipts = [r for _, _, _, r in TaskStore(tmp_path / "tasks.sqlite3").receipts(db)]
+        assert len({r["conversation_id"] for r in private_receipts}) == 1
+        assert len({r["provider_account_identity"] for r in private_receipts}) == 1
+    assert [json.loads(x) for x in (tmp_path / "sends.jsonl").read_text().splitlines()] == [b["client_request_id"] for b in bodies]
+
+    # A controlled retained UNKNOWN is not permission to send its accepted child.
+    root = tmp_path / "unknown"
+    root.mkdir()
+    with _server(root, "queued") as (port, key, _):
+        for body in bodies[:2]:
+            assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
+    from services.task_store import TaskStore
+    store = TaskStore(root / "tasks.sqlite3")
+    with store.transaction() as db:
+        for kind, owner, request_id, receipt in store.receipts(db):
+            if request_id == "queued-1":
+                receipt.update(status="unknown", upstream_outcome="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN")
+                store.write_receipt(db, kind, owner, request_id, receipt)
+    with _server(root, "lifecycle") as (port, key, _):
+        def blocked():
+            receipt = _http(port, key, "GET", "/api/chat-requests/queued-2")[1]
+            return receipt if "CHAT_PREVIOUS_REQUEST_UNKNOWN" in (receipt.get("waiting") or {}).get("reasons", []) else None
+        receipt = _wait(blocked)
+        assert receipt["status"] == "queued"
+        assert _http(port, key, "GET", "/api/chat-requests/queued-1")[1]["status"] == "unknown"
+        assert not (root / "sends.jsonl").exists()
 
 
 _FIXTURE_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
