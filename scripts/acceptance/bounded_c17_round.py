@@ -139,13 +139,14 @@ def save_image(api: Any, shared: Any, driver: Any, state_path: Path, state: dict
     return True
 
 
-def save_text(driver, record, receipt, results):
+def save_text(driver, shared, state_path, state, record, receipt, results):
     target = results / f"{record['id']}.txt"
     if not target.exists():
         return driver._save_text_content(record, receipt, results)
     content = receipt.get("content")
     if receipt.get("status") != "succeeded" or not isinstance(content, str) or target.read_bytes() != content.encode():
-        raise RuntimeError("TEXT_FILE_READBACK_MISMATCH")
+        halt(driver, shared, state_path, state, record, "TEXT_FILE_READBACK_MISMATCH")
+        return None
     raw = target.read_bytes()
     record.update(result_file=target.name, result_bytes=len(raw), result_sha256=hashlib.sha256(raw).hexdigest())
     return len(raw)
@@ -264,7 +265,8 @@ def run(args: argparse.Namespace) -> int:
                     continue
                 if not record.get("result_file"):
                     receipt = driver._chat_receipt(shared, api, request_id)
-                    size = save_text(driver, record, receipt, results); driver._save(shared, state_path, state)
+                    size = save_text(driver, shared, state_path, state, record, receipt, results); driver._save(shared, state_path, state)
+                    if size is None: break
                     emit(status="result_saved", id=request_id, kind="text", account_ref=record.get("account_ref"), result_bytes=size, file=record["result_file"])
                 if not record.get("work"):
                     driver._work(shared, api, state_path, state, request_id, active=False)
@@ -296,7 +298,8 @@ def run(args: argparse.Namespace) -> int:
                 if record["kind"] == "text":
                     if not record.get("result_file"):
                         receipt = driver._chat_receipt(shared, api, request_id)
-                        size = save_text(driver, record, receipt, results); driver._save(shared, state_path, state)
+                        size = save_text(driver, shared, state_path, state, record, receipt, results); driver._save(shared, state_path, state)
+                        if size is None: break
                         emit(status="result_saved", id=request_id, kind="text", account_ref=record.get("account_ref"), result_bytes=size, file=record["result_file"])
                     if not record.get("work") and driver._work(shared, api, state_path, state, request_id, active=False) != 0: break
                 else:
