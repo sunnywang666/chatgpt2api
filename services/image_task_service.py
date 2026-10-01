@@ -860,6 +860,8 @@ class ImageTaskService:
                 task.update(_requested_account_ref=payload["_requested_account_ref"],
                             _requested_account_identity=requested_identity)
             accept_thread(task, self._tasks.values(), payload, mode, output_reader=read_source)
+            from services.generation_completion import attach_replacement
+            attach_replacement(self.store, self._transaction_local.db, "image", owner, task_id, payload, task)
             from services.workflow_scheduling import prepare_receipt
             from services.work_lifecycle import ensure_work
             prepare_receipt(task, payload.get("_scheduling"), task["_source"])
@@ -1520,6 +1522,7 @@ class ImageTaskService:
         extra_timeout_secs: float = 30.0,
         base_url: str = "",
         allow_unrecoverable_retry: bool = False,
+        completion_recheck: bool = False,
     ) -> dict[str, Any]:
         """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
         owner = _owner_id(identity)
@@ -1536,9 +1539,10 @@ class ImageTaskService:
                 return _public_task(task)
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
-            if _clean(task.get("error_code")) == "RESULT_UNRECOVERABLE":
+            recheck = completion_recheck and bool(task.get("_completion")) and task.get("upstream_outcome") == "unknown"
+            if _clean(task.get("error_code")) == "RESULT_UNRECOVERABLE" and not recheck:
                 return _public_task(task)
-            if _clean(task.get("error_code")) != "CONVERSATION_OUTCOME_UNKNOWN":
+            if _clean(task.get("error_code")) != "CONVERSATION_OUTCOME_UNKNOWN" and not recheck:
                 raise ValueError("task outcome is not unknown")
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
@@ -2042,6 +2046,8 @@ class ImageTaskService:
                         requires_new_conversation=False,
                     )
                 branch_state = _branch_read_state(document, request_message_id)
+                if branch_state in {"running", "terminal_without_result", "no_result"}:
+                    self._update_task(key, _completion_read_at=time.time())
                 authoritative_failure = _authoritative_image_failure(document, request_message_id)
                 if authoritative_failure:
                     raise AuthoritativeImageTaskFailure(authoritative_failure)

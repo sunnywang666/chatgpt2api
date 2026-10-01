@@ -573,6 +573,10 @@ def _safe_output_path(value: str) -> Path:
 def _command_download(api: ApiClient, args: argparse.Namespace) -> int:
     state = _load_state(_state_path(args))
     task_id = _task_id(args, state)
+    return _download_task(api, args, task_id)
+
+
+def _download_task(api: ApiClient, args: argparse.Namespace, task_id: str, *, emit=True) -> int:
     task = _lookup_task(api, task_id)
     if task.get("status") != "success":
         raise ClientError(f"task is not successful; current status is {task.get('status')!r}")
@@ -618,7 +622,8 @@ def _command_download(api: ApiClient, args: argparse.Namespace) -> int:
             if isinstance(exc, (OSError, HTTPException)):
                 raise ClientError("download or save failed; retry downloading the original result") from exc
             raise
-    _emit({"client_task_id": task_id, "index": args.index, "output": str(target), "bytes": total})
+    if emit:
+        _emit({"client_task_id": task_id, "index": args.index, "output": str(target), "bytes": total})
     return 0
 
 
@@ -743,9 +748,13 @@ def _command_chat_save(api: ApiClient, args: argparse.Namespace) -> int:
     state = _load_chat_state(_chat_state_path(args))
     request_id = _chat_request_id(args, state)
     result = _chat_receipt(api, request_id, conversation=state.get("conversation") if state else None)
+    return _save_chat_result(result, request_id, args.output)
+
+
+def _save_chat_result(result, request_id, output, *, emit=True):
     if result.get("status") != "succeeded" or not isinstance(result.get("content"), str):
         raise ClientError("original Chat result is not ready to save")
-    target = _safe_output_path(args.output)
+    target = _safe_output_path(output)
     created = False
     try:
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -759,7 +768,67 @@ def _command_chat_save(api: ApiClient, args: argparse.Namespace) -> int:
             with contextlib.suppress(FileNotFoundError):
                 target.unlink()
         raise
-    _emit({"request_id": request_id, "output": str(target), "bytes": target.stat().st_size})
+    if emit:
+        _emit({"request_id": request_id, "output": str(target), "bytes": target.stat().st_size})
+    return 0
+
+
+def _command_completion(api: ApiClient, args: argparse.Namespace) -> int:
+    """Keep the original state and record the one server-created selected result."""
+    chat = args.command.startswith("chat-")
+    path = _chat_state_path(args) if chat else _state_path(args)
+    action = args.command.rsplit("-", 1)[-1]
+    with _state_lock(path):
+        state = _load_chat_state(path) if chat else _load_state(path)
+        if not state:
+            raise ClientError("completion requires the original durable state file")
+        original_id = state["request_id" if chat else "client_task_id"]
+        endpoint = f"/api/{'chat-requests' if chat else 'image-tasks'}/{parse.quote(original_id, safe='')}/completion"
+        payload = None
+        if action == "recover":
+            payload = {"action": "recover", "allow_unconfirmed_retry": args.allow_unconfirmed_retry}
+        current = api.json("POST" if payload else "GET", endpoint, payload=payload)
+        if (current.get("protocol") != "generation-completion-v1" or current.get("original_id") != original_id
+                or current.get("kind") != ("text" if chat else "image")):
+            raise ClientError("completion response changed original identity")
+        prior = state.get("completion") or {}
+        for key in ("replacement_id", "selected_id"):
+            if prior.get(key) and prior[key] != current.get(key):
+                raise ClientError("completion response changed its durable result selection")
+        state["completion"] = current
+        _atomic_write_state(path, state)
+        selected = current.get("selected_id")
+        if action in {"save", "complete", "rework"} and not selected:
+            raise ClientError("no verified result selected; preserve the original task and inspect completion reason")
+        if action == "save":
+            if chat:
+                result = current.get("result") or {}
+                _verify_chat_receipt(result, selected)
+                _save_chat_result(result, selected, args.output, emit=False)
+            else:
+                _download_task(api, argparse.Namespace(output=args.output, index=0), selected, emit=False)
+            output = Path(args.output).expanduser().resolve(strict=True)
+            saved = output.read_bytes()
+            state["completion_output"] = {"selected_id": selected, "path": str(output),
+                                          "bytes": len(saved), "sha256": hashlib.sha256(saved).hexdigest()}
+            _atomic_write_state(path, state)
+        elif action in {"complete", "rework"}:
+            if action == "complete":
+                saved = state.get("completion_output") or {}
+                if saved.get("selected_id") != selected or not args.reviewed:
+                    raise ClientError("save and review the selected actual result before completing the task")
+                data = Path(saved["path"]).read_bytes()
+                if not data or len(data) != saved["bytes"] or hashlib.sha256(data).hexdigest() != saved["sha256"]:
+                    raise ClientError("saved result no longer matches; task remains incomplete")
+            payload = {"action": action, "selected_id": selected}
+            if action == "complete":
+                payload.update(results_saved=True, reviewed=True)
+            current = api.json("POST", endpoint, payload=payload)
+            if current.get("original_id") != original_id or current.get("selected_id") != selected:
+                raise ClientError("completion acknowledgement changed result identity")
+            state["completion"] = current
+            _atomic_write_state(path, state)
+    _emit(current)
     return 0
 
 
@@ -896,6 +965,18 @@ def _parser() -> argparse.ArgumentParser:
     for command in ("complete", "rework", "chat-complete", "chat-rework"):
         lifecycle = subparsers.add_parser(command, help="archive completed work or restore its original conversation for rework")
         lifecycle.add_argument("--state", required=True)
+    for prefix in ("chat-", ""):
+        for action in ("recover", "status", "save", "complete", "rework"):
+            operation = subparsers.add_parser(prefix + "completion-" + action,
+                help="bounded pure-generation recovery with original identity and selected saved result")
+            operation.add_argument("--state", required=True)
+            if action == "recover":
+                operation.add_argument("--allow-unconfirmed-retry", action="store_true",
+                    help="explicitly permit at most one additional generation while original stop/outcome remains unknown")
+            if action == "save":
+                operation.add_argument("--output", required=True)
+            if action == "complete":
+                operation.add_argument("--reviewed", action="store_true")
     return parser
 
 
@@ -927,6 +1008,8 @@ def main(argv: list[str] | None = None) -> int:
             "resume": _command_resume,
             "download": _command_download,
         }
+        commands.update({prefix + "completion-" + action: _command_completion
+                         for prefix in ("chat-", "") for action in ("recover", "status", "save", "complete", "rework")})
         return commands[args.command](api, args)
     except (ClientError, ValueError) as exc:
         _emit({"error": str(exc)}, stream=sys.stderr)

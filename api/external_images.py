@@ -76,6 +76,9 @@ async def external_image_boundary(request: Request, call_next):
     if request.method == "POST" and path == "/api/chat-requests":
         chat_body_limit = MAX_PUBLIC_CHAT_BODY_BYTES
         chat_body_error = "CHAT_REQUEST_TOO_LARGE"
+    elif request.method == "POST" and re.fullmatch(r"/api/(chat-requests|image-tasks)/[^/]+/completion", path):
+        chat_body_limit = 1024
+        chat_body_error = "COMPLETION_BODY_TOO_LARGE"
     elif request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/recover", path):
         chat_body_limit = 1024
         chat_body_error = "CHAT_RECOVERY_BODY_TOO_LARGE"
@@ -136,6 +139,7 @@ async def external_image_boundary(request: Request, call_next):
             "/api/image-tasks/generations", "/api/image-tasks/edits", "/api/chat-requests",
         }
         or request.method == "GET" and re.fullmatch(r"/api/chat-requests/[^/]+", path)
+        or request.method in {"GET", "POST"} and re.fullmatch(r"/api/(chat-requests|image-tasks)/[^/]+/completion", path)
         or request.method == "GET" and re.fullmatch(r"/api/chat-requests/[^/]+/work", path)
         or request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/recover", path)
         or request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/archive-conversation", path)

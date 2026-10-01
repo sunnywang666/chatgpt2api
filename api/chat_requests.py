@@ -205,6 +205,8 @@ def _raw_text_receipt(owner: str, request_id: str) -> dict[str, object] | None:
 
 def create_router() -> APIRouter:
     router = APIRouter()
+    from api.generation_completion import create_router as completion_router
+    router.include_router(completion_router("text"))
 
     @router.post("/api/chat-requests")
     async def create_chat_request(

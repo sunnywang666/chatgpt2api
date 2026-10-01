@@ -1402,6 +1402,8 @@ class TextTaskService:
                                                        code="CHAT_ACCOUNT_SELECTION_CONFLICT")
                 self._prepare_supersede(db, owner, body, receipt)
                 self._continue_public_session(db, owner, body, receipt)
+                from services.generation_completion import attach_replacement
+                attach_replacement(self.store, db, "text", owner, request_id, body, receipt)
                 receipt.update({"_input_ref": self.store.save_input(body),
                                 "_sequence": self.store.next_sequence(db),
                                 "_source": source or "key:" + owner,

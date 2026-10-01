@@ -113,6 +113,8 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
 
 def create_router() -> APIRouter:
     router = APIRouter()
+    from api.generation_completion import create_router as completion_router
+    router.include_router(completion_router("image"))
 
     async def require_work_policy(identity: dict[str, object], task_id: str) -> dict[str, object]:
         result = await run_in_threadpool(image_task_service.list_tasks, identity, [task_id])

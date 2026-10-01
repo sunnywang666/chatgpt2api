@@ -390,7 +390,7 @@ def test_http_stalled_original_cli_restart_and_late_save_without_another_send(tm
     assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"stalled-original"']
 
 
-def _serve_images(root):
+def _serve_images(root, completion=False):
     import pytest
     import uvicorn
     from contextlib import asynccontextmanager
@@ -415,6 +415,10 @@ def _serve_images(root):
     rt.accounts.refresh_image_capability = rt.accounts._refresh_pool_chat
     def render(body):
         ctx = current_request.get()
+        if completion and ctx.request_id == "image-original":
+            exc = RuntimeError("controlled known-unsent failure")
+            exc.code, exc.upstream_submitted = "IMAGE_GENERATION_NOT_SUBMITTED", False
+            raise exc
         ctx.before_send()
         with (root / "image-sends.jsonl").open("a") as log:
             log.write(json.dumps({"request_id": ctx.request_id, "model": body["model"], "prompt": body["prompt"],
@@ -422,7 +426,8 @@ def _serve_images(root):
         return {"created": 1, "data": [{"b64_json": _FIXTURE_PNG}],
                 "_provider_binding_id": body["provider_binding_id"],
                 "_provider_account_identity": body["provider_account_identity"],
-                "_conversation_id": "controlled-image-conversation", "_parent_message_id": "controlled-image-result"}
+                "_conversation_id": "controlled-image-conversation", "_parent_message_id": "controlled-image-result",
+                **({"_image_thread_terminal": True} if completion else {})}
     rt.tasks.generation_handler = render
     rt.tasks.edit_handler = render
     auth = AuthService(JSONStorageBackend(root / "accounts.json", root / "auth_keys.json"))
@@ -431,6 +436,18 @@ def _serve_images(root):
     (root / "fixture-key").chmod(0o600)
     support.auth_service = auth
     image_tasks.image_task_service = rt.tasks
+    if completion:
+        from services import text_task_service as text_module, image_task_service as image_module
+        from services.generation_completion import GenerationCompletionService
+        from services.work_lifecycle import WorkLifecycleService
+        text_module.text_task_service = text_module.TextTaskService(rt.store.path, admission=rt.admission)
+        image_module.image_task_service = rt.tasks
+        rt.admission.work_lifecycle = WorkLifecycleService(text_module.text_task_service, rt.tasks)
+        rt.admission.generation_completion = GenerationCompletionService(text_module.text_task_service, rt.tasks, rt.admission.work_lifecycle)
+        def archive(identity, task_id, archived):
+            task = rt.tasks.list_tasks(identity, [task_id])["items"][0]
+            return {"task_id": task_id, "image_thread": task["image_thread"], "archived": archived}
+        rt.tasks.set_thread_archived = archive
     @asynccontextmanager
     async def lifespan(_app):
         rt.admission.start()
@@ -451,6 +468,77 @@ def _serve_images(root):
         uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False)).run(sockets=[listener])
 
 
+def test_http_completion_cli_saves_reviews_archives_and_restores_selected_result_after_restart(tmp_path):
+    from examples import image_client
+    state = tmp_path / "original-state.json"
+    output = tmp_path / "selected-answer.json"
+    def cli(port, key, command, *extra, expected=0):
+        result = subprocess.run([sys.executable, str(Path(image_client.__file__)), command, "--state", str(state), *map(str, extra)],
+            env={**os.environ, "SERVER_ROOT": f"http://127.0.0.1:{port}", "CHATGPT2API_BEARER_TOKEN": key},
+            capture_output=True, text=True, timeout=10)
+        assert result.returncode == expected, result.stderr
+        return json.loads(result.stdout) if expected == 0 else None
+    with _server(tmp_path, "completion") as (port, key, _):
+        cli(port, key, "chat-submit", "--request-id", "completion-original", "--session-id", "original-work",
+            "--model", "fixture-text", "--prompt", "Complete this retained objective")
+        _wait(lambda: _http(port, key, "GET", "/api/chat-requests/completion-original")[1]["status"] == "unknown")
+        requested = cli(port, key, "chat-completion-recover", "--allow-unconfirmed-retry")
+        assert requested["original_id"] == "completion-original"
+        def selected():
+            receipt = _http(port, key, "GET", "/api/chat-requests/completion-original/completion")[1]
+            return receipt if receipt.get("selected_id") else None
+        chosen = _wait(selected)
+        child = chosen["selected_id"]
+        assert child != "completion-original" and chosen["original_cleanup"] == "pending"
+        cli(port, key, "chat-completion-complete", "--reviewed", expected=1)
+    with _server(tmp_path, "completion") as (port, key, _):
+        assert cli(port, key, "chat-completion-status")["selected_id"] == child
+        cli(port, key, "chat-completion-save", "--output", output)
+        saved = json.loads(output.read_text())
+        assert saved["request_id"] == child and saved["content"] == "synthetic saved answer"
+        done = cli(port, key, "chat-completion-complete", "--reviewed")
+        assert done["state"] == "completed" and done["original_cleanup"] == "pending"
+        endpoint = "/api/chat-requests/completion-original/completion"
+        _wait(lambda: _http(port, key, "GET", endpoint)[1].get("work", {}).get("archive", {}).get("status") == "confirmed")
+        cli(port, key, "chat-completion-rework")
+        _wait(lambda: _http(port, key, "GET", endpoint)[1].get("work", {}).get("state") == "active")
+        (tmp_path / "original-completed").touch()
+        _success(port, key, "completion-original")
+        assert cli(port, key, "chat-completion-status")["selected_id"] == child
+        assert json.loads(state.read_text())["request_id"] == "completion-original"
+        assert json.loads(state.read_text())["completion_output"]["selected_id"] == child
+    assert [json.loads(line) for line in (tmp_path / "sends.jsonl").read_text().splitlines()] == ["completion-original", child]
+    archives = [json.loads(line) for line in (tmp_path / "archives.jsonl").read_text().splitlines()]
+    assert any(a["request_id"] == child and a["archived"] for a in archives)
+    assert any(a["request_id"] == child and not a["archived"] for a in archives)
+
+
+def test_http_image_completion_cli_downloads_real_bytes_before_acknowledging(tmp_path):
+    import base64
+    from examples import image_client
+    state, output = tmp_path / "image-state.json", tmp_path / "selected.png"
+    with _server(tmp_path, "image-completion") as (port, key, _):
+        def cli(command, *extra):
+            result = subprocess.run([sys.executable, str(Path(image_client.__file__)), command, "--state", str(state), *map(str, extra)],
+                env={**os.environ, "SERVER_ROOT": f"http://127.0.0.1:{port}", "CHATGPT2API_BEARER_TOKEN": key},
+                capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0, result.stderr
+            return json.loads(result.stdout)
+        cli("submit", "--client-task-id", "image-original", "--thread-id", "image-work", "--prompt", "controlled image", "--model", "gpt-image-2")
+        _wait(lambda: _http(port, key, "GET", "/api/image-tasks?ids=image-original")[1]["items"][0]["status"] == "error")
+        cli("completion-recover")  # Confirmed unsent failure needs no UNKNOWN opt-in.
+        endpoint = "/api/image-tasks/image-original/completion"
+        chosen = _wait(lambda: (r if (r := _http(port, key, "GET", endpoint)[1]).get("selected_id") else None))
+        assert chosen["selected_id"] != "image-original"
+        cli("completion-save", "--output", output)
+        assert output.read_bytes() == base64.b64decode(_FIXTURE_PNG)
+        assert cli("completion-complete", "--reviewed")["state"] == "completed"
+        _wait(lambda: _http(port, key, "GET", endpoint)[1].get("work", {}).get("archive", {}).get("status") == "confirmed")
+        cli("completion-rework")
+        _wait(lambda: _http(port, key, "GET", endpoint)[1].get("work", {}).get("state") == "active")
+    assert len((tmp_path / "image-sends.jsonl").read_text().splitlines()) == 1
+
+
 def _serve(root, mode):
     # Independent of the caller's optional sitecustomize offline guard: this
     # process must never initiate any outbound socket, including model probes.
@@ -463,8 +551,8 @@ def _serve(root, mode):
     import requests.sessions
     curl_cffi.requests.Session.request = forbidden
     requests.sessions.Session.request = forbidden
-    if mode == "image-recovery":
-        return _serve_images(root)
+    if mode in {"image-recovery", "image-completion"}:
+        return _serve_images(root, completion=mode == "image-completion")
 
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
@@ -485,6 +573,9 @@ def _serve(root, mode):
         accounts.add_account_items([{"access_token": "fixture-upstream-never-sent", "source_type": "web",
                                     "type": "Plus", "status": "正常"}])
     token = accounts.list_accounts()[0]["access_token"]
+    if mode == "completion" and len(accounts.list_accounts()) == 1:
+        accounts.add_account_items([{"access_token": "fixture-second-never-sent", "source_type": "web",
+                                    "type": "Plus", "status": "正常"}])
     accounts.update_account(token, {"managed_disabled": mode == "queued", "status": "正常"})
     auth = AuthService(JSONStorageBackend(root / "accounts.json", root / "auth_keys.json"))
     key_file = root / "fixture-key"
@@ -509,7 +600,7 @@ def _serve(root, mode):
             log.write(json.dumps(body["client_request_id"]) + "\n")
             log.flush()
             os.fsync(log.fileno())
-        if mode == "stalled":
+        if mode == "stalled" or mode == "completion" and body["client_request_id"] == "completion-original":
             from services.conversation_binding_service import ConversationBindingError
             current_request.get().record_stage("send_call_started")
             current_request.get().record_stage("response_headers_received", status_code=200)
@@ -520,7 +611,7 @@ def _serve(root, mode):
         if mode == "parallel":
             _wait(lambda: (root / ("release-" + body["client_request_id"])).exists(), timeout=10)
         result = {"content": "synthetic saved answer"}
-        if mode in {"lifecycle", "parallel"}:
+        if mode in {"lifecycle", "parallel", "completion"}:
             conversation = body.get("conversation_id") or "upstream-" + body["client_conversation_id"]
             if body.get("_previous_request_id"):
                 assert body["parent_message_id"] == "answer-" + body["_previous_request_id"]
@@ -531,7 +622,7 @@ def _serve(root, mode):
         return result
 
     tasks = TextTaskService(store.path, runner=synthetic_model, admission=admission)
-    if mode == "stalled":
+    if mode in {"stalled", "completion"}:
         # Accelerate only this isolated child fixture. Production's 900-second
         # boundary is exercised with a manual clock in the service regressions.
         TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS = .05
@@ -554,7 +645,7 @@ def _serve(root, mode):
         tasks.recovery_reader = original_read
     admission.register("text", lambda context, body: tasks._run(context.owner, context.request_id, body))
     chat_requests.text_task_service = tasks
-    if mode == "lifecycle":
+    if mode in {"lifecycle", "completion"}:
         from services import text_task_service as text_module
         from services.work_lifecycle import WorkLifecycleService
         text_module.text_task_service = tasks
@@ -567,6 +658,12 @@ def _serve(root, mode):
                 raise TimeoutError("controlled lost archive response")
             return {"archived": archived}
         text_module.conversation_binding_service.set_archived = synthetic_archive
+        if mode == "completion":
+            from services.generation_completion import GenerationCompletionService
+            GenerationCompletionService.STALL_SECONDS = .05
+            GenerationCompletionService.INVESTIGATION_SECONDS = .05
+            GenerationCompletionService.RECHECK_SECONDS = .05
+            admission.generation_completion = GenerationCompletionService(tasks, SimpleNamespace(), admission.work_lifecycle)
 
     @asynccontextmanager
     async def lifespan(_app):

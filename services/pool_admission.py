@@ -279,6 +279,9 @@ class PoolAdmission:
 
     def recover_one(self):
         now = float(self.clock())
+        completion = getattr(self, "generation_completion", None)
+        if completion is not None:
+            completion.process_one()
         with self.store.connect() as db:
             rows = list(self.store.receipts(db))
         # Use the existing persisted retry timestamps. A short-backoff legacy
@@ -519,6 +522,16 @@ class PoolAdmission:
             if kind == "text" and r.get("_public_previous_waiting"):
                 dependency = "public_chat_previous:" + hashlib.sha256((owner + "\0" + request_id).encode()).hexdigest()
                 thread_resources.append(Resource(dependency, 0, 0, now))
+                thread_needs += (Need(dependency),)
+            if r.get("_completion_of"):
+                original = (text_receipts.get((owner, r["_completion_of"])) if kind == "text"
+                            else image_receipts.get(owner, {}).get(r["_completion_of"])) or {}
+                original_work = works.get(original.get("_work_key")) or {}
+                enabled = bool(original and not recovery_suppressed(original)
+                               and original_work.get("state", "active") == "active"
+                               and not original.get("_completion", {}).get("selected_id"))
+                dependency = "completion_work:" + hashlib.sha256((kind + "\0" + owner + "\0" + request_id).encode()).hexdigest()
+                thread_resources.append(Resource(dependency, int(enabled), 0, now))
                 thread_needs += (Need(dependency),)
             scheduling_resources, scheduling_needs, scheduling_ready = workflow_scheduling.constraints(
                 r, works, workflow_clocks, [row for row in receipts if (row[1], row[2]) not in released_order_heads], now)
@@ -959,6 +972,11 @@ class PoolAdmission:
                 reasons = [dependency_reason] if dependency_reason else list(deferred.reasons)
                 works, clocks = workflow_state
                 reasons = workflow_scheduling.waiting_reasons(r, works, clocks, receipts, now, reasons)
+                if r.get("_completion_of"):
+                    original = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, r["_completion_of"]) or {}
+                    original_work = works.get(original.get("_work_key")) or {}
+                    if recovery_suppressed(original) or original_work.get("state", "active") != "active":
+                        reasons = list(dict.fromkeys([*reasons, "work_not_active"]))
                 if ((deferred.ref.kind == "image" or r.get("_operation") == "image")
                         and r.get("_requested_account_identity")):
                     selected = [a for a in self._rows() if a.get("provider_account_identity") == r["_requested_account_identity"]]
@@ -1075,9 +1093,14 @@ class PoolAdmission:
                         reasons = {"SCHEDULING_NOT_BEFORE": "not_before", "SCHEDULING_SEND_INTERVAL": "send_interval",
                                    "WORK_NOT_ACTIVE": "work_not_active"}
                         reason = reasons.get(str(exc), "send_constraints_changed")
+                        from services.generation_completion import replacement_send_allowed
+                        cancelled = not replacement_send_allowed(self.store, db, context.kind, context.owner, context.request_id, r)
                         r.update(status="queued", upstream_outcome="not_sent", upstream_unfinished=False,
                                  _claim_id=None, _claim_until=0, _turn_reserved=False, _executing=False,
                                  _ready_at=now + 1, waiting={"reasons": [reason], "next_check_at": now + 1})
+                        if cancelled:
+                            r.update(status="failed" if context.kind == "text" else "error",
+                                     error_code="COMPLETION_ORIGINAL_RECOVERED", waiting=None)
                         self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
                         workflow_scheduling.release_provisional_slot(self.store, db, r)
                 raise
@@ -1102,6 +1125,14 @@ class PoolAdmission:
             if (r is None or r.get("_claim_id") != context.claim or r.get("status") != "running"
                     or float(r.get("_claim_until") or 0) <= now):
                 raise AdmissionLost("original task claim expired")
+            from services.generation_completion import replacement_send_allowed
+            if not replacement_send_allowed(self.store, db, context.kind, context.owner, context.request_id, r):
+                raise AdmissionLost("completion original changed before send")
+            if r.get("_completion_of"):
+                original = self.store.read_receipt(db, context.kind, context.owner, r["_completion_of"]) or {}
+                original_work = self.store.runtime(db, original.get("_work_key", ""))
+                if original_work and original_work.get("state") != "active":
+                    raise AdmissionLost("WORK_NOT_ACTIVE")
             requested = r.get("_requested_account_identity")
             if (r.get("_requested_account_ref") and not requested
                     or requested and r.get("provider_account_identity") != requested):
@@ -1275,4 +1306,6 @@ def configure_original_task_admission():
     image_task_service.admission = admission
     from services.work_lifecycle import WorkLifecycleService
     admission.work_lifecycle = WorkLifecycleService(text_task_service, image_task_service)
+    from services.generation_completion import GenerationCompletionService
+    admission.generation_completion = GenerationCompletionService(text_task_service, image_task_service, admission.work_lifecycle)
     return admission

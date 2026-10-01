@@ -316,3 +316,54 @@ GET the same `/work` path to read `protocol:work-v1`, `kind`, `request_id`, `wor
 POST `{"state":"paused"}` to suspend an unsent/finished-turn work without archiving. POST `{"state":"active"}` to resume or rework; an archived work remains `restoring` until original restore is confirmed. A late prior completion cannot close a new work or its slot. UNKNOWN/in-flight work rejects release. Legacy single-request protocols and native Codex without a verified upstream archive API explicitly use `archive.scope:provider_work` / `status:not_applicable`; no upstream archive is claimed.
 
 For example, start two independent sessions under `--workflow-id product-copy --workflow-concurrency 2 --min-send-interval-seconds 12`. Each session keeps its own state files and ordered predecessor IDs. Add `--not-before`/`--wait-deadline` with actual UTC times when needed. Leave the same original ID in place while queued; the scheduler resumes it after capacity or timing constraints clear. `WAIT_DEADLINE_EXCEEDED` with `not_sent` ends only unsent waiting. The client's HTTP timeout is still separate from these server controls.
+# Bounded completion of an abnormal pure-generation step
+
+Original `GET`, Chat `/recover` and image `/resume-poll` never authorize another
+model send. For an explicitly approved pure text/image generation or edit, use
+`POST /api/chat-requests/{original-id}/completion` (images: `image-tasks`) with
+`{"action":"recover","allow_unconfirmed_retry":true}`. This reserves **at most
+one** server-generated replacement ID. It keeps the original input, model,
+effective account selection and scheduling, and reconstructs a new conversation
+only when retained context is sufficient. Existing generated image files are
+downloaded through their original receipt, never redrawn. Missing context is an
+explicit error. This API does not retry external business writes or Codex routes.
+
+The unknown original remains readable and continues holding its actual capacity.
+`stop.capability=unsupported` and `confirmed=false` mean no verified remote stop
+operation exists. A 15-minute stalled original plus bounded five-minute
+investigation does not prove cancellation; the caller's explicit policy permits
+the one additional generation despite that uncertainty. Valid original reads,
+Retry-After, pauses and ordinary account/workflow capacity still apply. Upgrades
+do not reset original request age. Repeated calls and process restarts use the
+same reserved ID; the replacement itself cannot create another replacement.
+
+`GET` the same `/completion` to inspect `state`, `reason`, `waiting`,
+`original_status`, `replacement_status`, `replacement_id` and `selected_id`.
+Selection is durable and write-once. An original found before the replacement
+send cancels the unsent replacement. GET and upstream POST are not atomic: a
+late original can still appear after replacement submission. Both receipts stay
+available; only the selected result enters downstream saving/review.
+
+The shipped independent CLI preserves its original state file:
+
+```sh
+python examples/image_client.py chat-completion-recover --state original.json --allow-unconfirmed-retry
+python examples/image_client.py chat-completion-status --state original.json
+python examples/image_client.py chat-completion-save --state original.json --output answer.json
+python examples/image_client.py chat-completion-complete --state original.json --reviewed
+python examples/image_client.py chat-completion-rework --state original.json
+```
+
+For images omit the `chat-` prefix and save an image output. `complete` verifies
+the selected local file still matches the saved bytes, then acknowledges the
+result as saved and reviewed. `result_ready` is not completion. API clients send
+`{"action":"complete","selected_id":"returned-id","results_saved":true,"reviewed":true}`
+only after their actual durable save/readback/review. The selected conversation
+archives at that task-complete boundary. `work.archive` reports pending, failure
+or confirmation; `original_work.cleanup_pending` separately preserves old
+unknown occupancy and its deferred cleanup. Rework restores the selected
+conversation and never sends a new model request. A reconstructed conversation
+is explicitly identified; it is never presented as recovery of the old unknown
+conversation. Applications continue using the selected result's public session
+reference and ID after confirmed restore. Existing clients do not opt in merely
+by upgrading, timing out or receiving UNKNOWN.

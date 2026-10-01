@@ -139,7 +139,9 @@ def _projection(work):
     return {"protocol": "work-v1", "kind": work["kind"], "work_ref": work["work_ref"],
             "request_id": work["last_request_id"], "state": work["state"],
             "slot_held": work["slot_held"], "version": work["version"],
-            "results_saved": bool(work.get("results_saved")), "archive": safe_archive}
+            "results_saved": bool(work.get("results_saved")), "archive": safe_archive,
+            **({"completion_result_id": work["completion_result_id"],
+                "cleanup_pending": bool(work.get("cleanup_pending"))} if work.get("completion_result_id") else {})}
 
 
 class WorkLifecycleService:
@@ -318,6 +320,8 @@ class WorkLifecycleService:
                     updated.update(status="unknown", next_at=float(self.clock()) + min(300, 2 ** min(updated["attempts"], 8)))
                 else:
                     updated.update(status="confirmed", archived=updated["desired"], next_at=None)
+                    if current.get("cleanup_pending") and updated["desired"]:
+                        current.update(cleanup_pending=False, slot_held=False)
                     if current["state"] == "restoring":
                         current["state"] = "active"
                         current["results_saved"] = False
