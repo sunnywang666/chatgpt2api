@@ -274,3 +274,66 @@ def test_unreadable_account_clock_defers_archive_without_claim_or_http(runtime, 
     assert result["archive"]["error_code"] == "ACCOUNT_PACING_UNAVAILABLE"
     assert result["archive"]["next_at"] == 1060
     assert result["archive"]["attempts"] == 0 and result["slot_held"] is False
+
+
+@pytest.mark.parametrize("failure", [
+    {"last_refresh_error": "token invalidated (/backend-api/me)"},
+    {"last_token_refresh_error": "oauth_refresh_http_401: refresh_token_invalidated"},
+    {"last_token_refresh_error": "app_session_terminated"},
+])
+@pytest.mark.parametrize("desired", [True, False])
+def test_invalidated_authorization_preserves_intent_until_same_account_restored(runtime, monkeypatch, failure, desired):
+    from services import account_request_pacing as pacing
+    service, store, clock, calls, _, add = runtime
+    rows = [add("A-1"), add("B-2")]
+    for row in rows:
+        service.update("text", {"id": "one"}, row["request_id"], "completed", True)
+    if not desired:
+        assert service.process_one() and service.process_one()
+        calls.clear()
+        for row in rows:
+            service.update("text", {"id": "one"}, row["request_id"], "active")
+    bad, healthy = sorted(rows, key=lambda row: row["_work_key"])
+    accounts = [{"provider_account_identity": "bad", "status": "异常", **failure},
+                {"provider_account_identity": "healthy", "status": "正常"}]
+    with store.transaction() as db:
+        for label, row in [("bad", bad), ("healthy", healthy)]:
+            row["provider_account_identity"] = label
+            store.write_receipt(db, "text", "one", row["request_id"], row)
+    service.text.admission = SimpleNamespace(accounts=SimpleNamespace(admission_accounts=lambda: accounts), wake=lambda: None)
+    monkeypatch.setattr(pacing, "account_pacing_snapshot", lambda account, now, **kwargs: {"next_at": now})
+    assert service.process_one()
+    assert calls == [("one", healthy["request_id"], desired)]
+    deferred = service.get("text", {"id": "one"}, bad["request_id"])
+    assert deferred["archive"]["status"] == "unknown"
+    assert deferred["archive"]["error_code"] == "RECOVERY_AUTH_REQUIRED"
+    assert deferred["archive"]["attempts"] == 0
+    assert deferred["archive"]["desired"] is desired and deferred["archive"]["next_at"] == 1060
+    assert deferred["slot_held"] is False
+    accounts[0] = {"provider_account_identity": "bad", "status": "正常"}
+    clock[0] = 1060
+    restarted = WorkLifecycleService(service.text, service.images, clock=lambda: clock[0])
+    assert restarted.process_one(target_key=bad["_work_key"])
+    assert calls[-1] == ("one", bad["request_id"], desired)
+    result = restarted.get("text", {"id": "one"}, bad["request_id"])
+    assert result["archive"]["status"] == "confirmed" and result["archive"]["error_code"] is None
+
+
+@pytest.mark.parametrize("account", [
+    {"status": "异常", "last_refresh_error": "connection failed"},
+    {"status": "限流", "last_token_refresh_error": "refresh_token_invalidated"},
+    {"status": "正常", "last_refresh_error": "token invalidated"},
+])
+def test_other_account_states_are_not_misclassified_as_expired_authorization(runtime, monkeypatch, account):
+    from services import account_request_pacing as pacing
+    service, store, _, calls, _, add = runtime
+    row = add("A-1")
+    row["provider_account_identity"] = "original"
+    with store.transaction() as db:
+        store.write_receipt(db, "text", "one", row["request_id"], row)
+    service.text.admission = SimpleNamespace(accounts=SimpleNamespace(admission_accounts=lambda: [
+        {"provider_account_identity": "original", **account}]), wake=lambda: None)
+    monkeypatch.setattr(pacing, "account_pacing_snapshot", lambda account, now, **kwargs: {"next_at": now})
+    service.update("text", {"id": "one"}, row["request_id"], "completed", True)
+    assert service.process_one()
+    assert calls == [("one", row["request_id"], True)]

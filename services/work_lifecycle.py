@@ -326,6 +326,17 @@ class WorkLifecycleService:
                             continue
                         account = account_rows.get(receipt.get("provider_account_identity"))
                         if account is not None:
+                            refresh_error = str(account.get("last_token_refresh_error") or "").lower()
+                            if (account.get("status") == "异常" and (
+                                    str(account.get("last_refresh_error") or "").lower().startswith("token invalidated")
+                                    or "refresh_token_invalidated" in refresh_error
+                                    or "app_session_terminated" in refresh_error)):
+                                # The original account needs reauthorization;
+                                # retrying archive cannot repair its credentials.
+                                # Keep the intent and allow other accounts to run.
+                                a.update(status="unknown", error_code="RECOVERY_AUTH_REQUIRED", next_at=now + 60)
+                                save_work(self.store, db, candidate)
+                                continue
                             from services.account_request_pacing import account_pacing_snapshot
                             ready_at = account_pacing_snapshot(account, now, include_turn=False)["next_at"]
                             if ready_at is None or ready_at > now:
