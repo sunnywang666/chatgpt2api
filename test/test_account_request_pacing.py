@@ -47,6 +47,39 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_http_attempt_evidence_counts_preflight_and_send_without_secrets(self):
+        with patch("services.account_request_pacing.logger.info") as log, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account-hash")
+            response = Response()
+            response.headers = {"Set-Cookie": "secret-cookie"}
+            clock.request(lambda *a, **kw: response, "POST", "https://provider/conversation?secret-query",
+                          json={"messages": ["secret-prompt"]}, headers={"Authorization": "secret-token"},
+                          _account_request_preflight=lambda read: read("GET", "https://provider/conversation/secret-id"))
+            attempts = [c.args[0] for c in log.call_args_list if c.args[0].get("event") == "account_http_attempt"]
+            self.assertEqual([(e["method"], e["phase"], e["status_code"]) for e in attempts],
+                             [("GET", "conversation_preflight", 200), ("POST", "conversation", 200)])
+            self.assertNotIn("secret-", repr(attempts))
+            self.assertTrue(all(e["started_at"] > 0 and e["headers_elapsed_secs"] >= 0 for e in attempts))
+
+    def test_http_attempt_evidence_records_transport_failure_but_not_unsent_deadline(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        with patch("services.account_request_pacing.logger.info") as log:
+            clock = AccountRequestClock("account-hash")
+            def fail(*args, **kwargs):
+                raise OSError("secret-transport-detail")
+            with self.assertRaises(OSError):
+                clock.request(fail, "GET", "https://provider/conversation/secret-id")
+            with self.assertRaises(AccountRequestDeadlineExceeded):
+                clock.request(fail, "GET", "https://provider/conversation/secret-id",
+                              _account_request_deadline_monotonic=time.monotonic() - 1)
+            attempts = [c.args[0] for c in log.call_args_list if c.args[0].get("event") == "account_http_attempt"]
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(attempts[0]["outcome"], "transport_error")
+            self.assertIsNone(attempts[0]["status_code"])
+            self.assertNotIn("secret-", repr(attempts))
+
     def test_actual_send_gap_includes_slow_fence_and_durable_clock_write(self):
         for method, message_interval, fail_first in (("GET", 0, False), ("POST", 5, False), ("GET", 0, True), ("POST", 5, True)):
             with self.subTest(method=method, fail_first=fail_first), tempfile.TemporaryDirectory() as tmp:

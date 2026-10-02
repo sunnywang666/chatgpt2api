@@ -192,6 +192,41 @@ class AccountRequestClock:
         raw_model = (kwargs.get("json") or {}).get("model") if isinstance(kwargs.get("json"), dict) else None
         model = raw_model if isinstance(raw_model, str) and len(raw_model) <= 160 else None
         request_ref = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24] if context else None
+
+        def observed_send(send_method, send_url, send_phase, **send_kwargs):
+            # Count actual transport attempts, including metadata/preflight GETs.
+            # Never log URLs, request bodies/headers, response bodies or exception
+            # messages: conversation URLs and signed downloads can contain secrets.
+            started_at, started = time.time(), time.monotonic()
+            endpoint = urlparse(str(send_url)).path.rstrip("/")
+            endpoint_kind = send_phase
+            if "/attachment/" in endpoint:
+                endpoint_kind = "attachment"
+            elif "/files/" in endpoint or endpoint.endswith("/files"):
+                endpoint_kind = "files"
+            elif endpoint.endswith("/tasks"):
+                endpoint_kind = "tasks"
+            elif endpoint.endswith("/models"):
+                endpoint_kind = "models"
+            elif "/sentinel/" in endpoint:
+                endpoint_kind = "requirements"
+            elif endpoint.endswith("/conversations"):
+                endpoint_kind = "conversation_list"
+            response = None
+            try:
+                response = send(send_method, send_url, **send_kwargs)
+                return response
+            finally:
+                verb = str(send_method).upper()
+                status = getattr(response, "status_code", None)
+                logger.info({"event": "account_http_attempt", "account": self.account_key,
+                             "request_ref": request_ref, "layer": "upstream_chatgpt",
+                             "method": verb if verb in {"GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "OPTIONS"} else "OTHER",
+                             "phase": send_phase, "endpoint_kind": endpoint_kind, "started_at": started_at,
+                             "headers_elapsed_secs": round(time.monotonic() - started, 6),
+                             "status_code": status if isinstance(status, int) and not isinstance(status, bool) else None,
+                             "outcome": "response" if response is not None else "transport_error",
+                             "stream": bool(send_kwargs.get("stream"))})
         # Serialize only the send edge. The account activity reservation lives
         # in PoolAdmission until the response stream is terminal; holding this
         # file lock for the whole stream would silently force capacity back to 1.
@@ -245,7 +280,7 @@ class AccountRequestClock:
                         self._save()
                         sent_at = time.monotonic()
                         try:
-                            response = send(read_method, read_url, **read_kwargs)
+                            response = observed_send(read_method, read_url, "conversation_preflight", **read_kwargs)
                         finally:
                             # Persisting the reservation can itself take time.
                             # Correct its floor from the actual transport edge
@@ -297,7 +332,7 @@ class AccountRequestClock:
                 cap_timeout_before_send()
                 sent_at = time.monotonic()
                 try:
-                    response = send(method, url, **kwargs)
+                    response = observed_send(method, url, phase, **kwargs)
                 finally:
                     # Keep the pre-send durable reservation for crash safety,
                     # then account for its I/O delay even if transport fails.
