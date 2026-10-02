@@ -721,7 +721,9 @@ class PoolAdmission:
                 if kind == "image":
                     r["upstream_unfinished"] = not bool(r.get("result_file_ids") or r.get("result_sediment_ids"))
                     if not r["upstream_unfinished"]:
-                        r.update(upstream_outcome="generated", recovery_error_code="RECOVERY_DOWNLOAD_FAILED", next_poll_at=0)
+                        r.update(upstream_outcome="generated",
+                                 recovery_error_code=r.get("recovery_error_code") or "RECOVERY_RESULT_INCOMPLETE",
+                                 recovery_phase="download_image_result", next_poll_at=0)
             else:
                 r.update(status="queued", _turn_reserved=False, _claim_id=None, upstream_unfinished=False)
             self.store.write_receipt(db, kind, owner, request_id, r)

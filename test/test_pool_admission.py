@@ -688,6 +688,27 @@ class AdmissionTests(unittest.TestCase):
         self.write_accounts(2)
         self.assertIsNone(self.admission.claim_next())
 
+    def test_expired_captured_image_claim_preserves_real_failure_or_uses_neutral_state(self):
+        for prior_code in (None, "RECOVERY_TIMED_OUT"):
+            with self.subTest(prior_code=prior_code):
+                rid = "captured-" + str(prior_code)
+                self.image(rid)
+                context = self.admission.claim_next()
+                context.before_send()
+                context.record_stage("send_call_started")
+                detail = {"phase": "collect_image_result", "type": "TimeoutError", "at": 1000}
+                self.admission.update_claim(context, result_file_ids=["original-file"],
+                    recovery_error_code=prior_code, last_recovery_failure=detail)
+                self.clock.now += 31
+                self.assertIsNone(self.admission.claim_next())
+                record = self.read("image", "happy", rid)
+                self.assertEqual(record["recovery_error_code"], prior_code or "RECOVERY_RESULT_INCOMPLETE")
+                self.assertEqual(record["last_recovery_failure"], detail)
+                self.assertEqual(record["recovery_phase"], "download_image_result")
+                self.assertEqual(record["result_file_ids"], ["original-file"])
+                self.assertFalse(record["upstream_unfinished"])
+                self.assertEqual(sum(e["stage"] == "send_call_started" for e in record["_execution_timeline"]), 1)
+
     def test_account_disabled_between_claim_and_send_is_not_sent(self):
         self.submit("original")
         context = self.admission.claim_next()

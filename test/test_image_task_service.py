@@ -16,6 +16,7 @@ from services.openai_backend_api import (
     ImageActiveDeadlineExceeded,
     ImageContentPolicyError,
     ImagePollTimeoutError,
+    ImageStreamHardTimeoutError,
     OpenAIBackendAPI,
 )
 from services.protocol.conversation import (
@@ -797,10 +798,12 @@ class ImageTaskServiceTests(unittest.TestCase):
             )
             failed = wait_for_task(service, OWNER, "download-task", "error")
             self.assertEqual(failed["recovery_phase"], "download_image_result")
-            self.assertEqual(failed["recovery_error_code"], "RECOVERY_DOWNLOAD_FAILED")
+            self.assertEqual(failed["recovery_error_code"], "RECOVERY_TRANSPORT_FAILED")
             self.assertEqual(failed["upstream_outcome"], "generated")
             self.assertFalse(failed["upstream_unfinished"])
             self.assertNotIn("token=secret", failed["error"])
+            service._update_task("owner-1:download-task", active_attempt_deadline_at=time.time() - 1)
+            failed = service.list_tasks(OWNER, ["download-task"])["items"][0]
             active_started_at = failed["active_attempt_started_at"]
             active_deadline_at = failed["active_attempt_deadline_at"]
             service = self.make_service(path)
@@ -853,6 +856,69 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(succeeded["active_attempt_deadline_at"], active_deadline_at)
             self.assertEqual(DownloadBackend.polls, 0)
             self.assertEqual(DownloadBackend.reads, 0)
+
+    def test_captured_result_failure_keeps_cause_without_claiming_download_failed(self):
+        for error_type, expected in (
+            (ImageStreamHardTimeoutError, "RECOVERY_TIMED_OUT"),
+            (ImageActiveDeadlineExceeded, "RECOVERY_TIMED_OUT"),
+            (RuntimeError, "RECOVERY_RESULT_INCOMPLETE"),
+        ):
+            with self.subTest(error_type=error_type), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                def handler(payload):
+                    callback = payload["progress_callback"]
+                    callback.start_active_attempt()
+                    callback.record_submission_started()
+                    callback.record_conversation_id("conversation-1")
+                    callback.record_result_ids(["file-generated"], [])
+                    error = error_type("Authorization: bearer-secret URL=https://private.test/signed")
+                    error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+                    error.conversation_id = "conversation-1"
+                    error.request_message_id = callback.request_message_id
+                    error.upstream_submitted = True
+                    raise error
+                service = self.make_service(path, handler)
+                service.submit_generation(
+                    OWNER, client_task_id="captured-task", prompt="cat", model="gpt-image-2", size=None,
+                    provider_binding_id="binding-1", provider_account_identity="account-1",
+                    client_conversation_id="client-1", retain_conversation=True,
+                )
+                failed = wait_for_task(service, OWNER, "captured-task", "error")
+                self.assertEqual(failed["recovery_error_code"], expected)
+                self.assertEqual(failed["recovery_phase"], "download_image_result")
+                detail = failed["last_recovery_failure"]
+                self.assertEqual(detail["phase"], "collect_image_result")
+                self.assertEqual(detail["type"], error_type.__name__)
+                self.assertNotIn("bearer-secret", json.dumps(failed))
+                self.assertNotIn("private.test", json.dumps(failed))
+                restored = self.make_service(path).list_tasks(OWNER, ["captured-task"])["items"][0]
+                self.assertEqual(restored["last_recovery_failure"], detail)
+
+    def test_restart_captured_result_does_not_invent_a_download_failure(self):
+        for prior_code in (None, "RECOVERY_TIMED_OUT"):
+            with self.subTest(prior_code=prior_code), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                detail = {"phase": "collect_image_result", "type": "TimeoutError", "status_code": None, "at": 1000}
+                write_policy_task(path, status="running", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                    result_file_ids=["original-file"], recovery_error_code=prior_code, last_recovery_failure=detail)
+                restored = self.make_service(path).list_tasks(OWNER, ["policy-task"])["items"][0]
+                self.assertEqual(restored["recovery_error_code"], prior_code or "RECOVERY_RESULT_INCOMPLETE")
+                self.assertEqual(restored["last_recovery_failure"], detail)
+                self.assertEqual(restored["recovery_phase"], "download_image_result")
+
+    def test_public_failure_details_drop_untrusted_persisted_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path, last_recovery_failure={
+                "phase": "https://private.test/token", "type": "token=private",
+                "status_code": "secret", "at": float("nan"),
+                "body": "Authorization: private", "url": "https://private.test",
+            })
+            public = self.make_service(path).list_tasks(OWNER, ["policy-task"])["items"][0]
+            self.assertEqual(public["last_recovery_failure"], {
+                "phase": "unknown", "type": "Error", "status_code": None, "at": None,
+            })
+            self.assertNotIn("private", json.dumps(public))
 
     def test_generated_download_rate_limit_and_auth_keep_phase_and_failure_type(self):
         for status, expected_code, retry_after in (
@@ -1075,7 +1141,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
     def test_expired_deadline_preserves_running_request_and_transport_failures(self):
         for scenario, expected_code in (
-            ("running", "RECOVERY_READ_FAILED"),
+            ("running", "RECOVERY_TIMED_OUT"),
             ("transport", "RECOVERY_TRANSPORT_FAILED"),
         ):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp_dir:

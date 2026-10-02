@@ -3,6 +3,7 @@ from __future__ import annotations
 from services.image_thread import (PROTOCOL as IMAGE_THREAD_PROTOCOL, ImageThreadError, input_fields, accept_thread, public_thread, finished_parent, saved_image_bytes, source_fingerprint)
 
 import json
+import math
 import hashlib
 import threading
 import time
@@ -116,7 +117,7 @@ def _retry_after_seconds(exc: BaseException) -> int | None:
     return None
 
 
-def _recovery_failure_code(exc: BaseException, phase: str) -> str:
+def _recovery_failure_code(exc: BaseException, phase: str, *, result_captured: bool = False) -> str:
     status = _upstream_status_code(exc)
     if status == 429:
         return "RECOVERY_RATE_LIMITED"
@@ -124,8 +125,9 @@ def _recovery_failure_code(exc: BaseException, phase: str) -> str:
         return "RECOVERY_AUTH_REQUIRED"
     if isinstance(exc, ImageThreadError):
         return "RECOVERY_THREAD_UNCONFIRMED"
-    if phase == "download_image_result":
-        return "RECOVERY_DOWNLOAD_FAILED"
+    from services.openai_backend_api import ImageActiveDeadlineExceeded, ImagePollTimeoutError
+    if isinstance(exc, (TimeoutError, ImageActiveDeadlineExceeded, ImagePollTimeoutError)):
+        return "RECOVERY_TIMED_OUT"
     exc_type = type(exc)
     type_name = f"{exc_type.__module__}.{exc_type.__name__}".lower()
     if (
@@ -135,7 +137,40 @@ def _recovery_failure_code(exc: BaseException, phase: str) -> str:
         or any(marker in type_name for marker in ("curl_cffi", "connection", "network"))
     ):
         return "RECOVERY_TRANSPORT_FAILED"
+    if phase == "download_image_result":
+        return "RECOVERY_DOWNLOAD_FAILED"
+    if result_captured:
+        return "RECOVERY_RESULT_INCOMPLETE"
     return "RECOVERY_READ_FAILED"
+
+
+def _failure_details(exc: BaseException, phase: str) -> dict[str, Any]:
+    # Persist diagnosis without exception text, response bodies, URLs or headers.
+    return {
+        "phase": phase,
+        "type": type(exc).__name__[:80],
+        "status_code": _upstream_status_code(exc),
+        "at": time.time(),
+    }
+
+
+def _public_failure_details(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    phases = {
+        "collect_image_result", "validate_image_result", "read_image_request",
+        "resolve_image_result", "download_image_result", "confirm_image_turn", "save_image_result",
+    }
+    phase = value.get("phase")
+    name = value.get("type")
+    status = value.get("status_code")
+    at = value.get("at")
+    return {
+        "phase": phase if isinstance(phase, str) and phase in phases else "unknown",
+        "type": name if isinstance(name, str) and len(name) <= 80 and name.isidentifier() else "Error",
+        "status_code": status if type(status) is int and 100 <= status <= 599 else None,
+        "at": at if type(at) in (int, float) and math.isfinite(at) and at >= 0 else None,
+    }
 
 
 def _safe_recovery_error(code: str, phase: str) -> str:
@@ -146,6 +181,8 @@ def _safe_recovery_error(code: str, phase: str) -> str:
             "RECOVERY_TRANSPORT_FAILED": "the provider could not be reached",
             "RECOVERY_READ_FAILED": "the provider response could not be read",
             "RECOVERY_THREAD_UNCONFIRMED": "the original image turn could not be confirmed",
+            "RECOVERY_TIMED_OUT": "result retrieval or confirmation timed out",
+            "RECOVERY_RESULT_INCOMPLETE": "result retrieval or confirmation did not complete",
         }.get(code, "the result download did not complete")
         return (
             f"Generated image is preserved; {reason}. "
@@ -156,6 +193,7 @@ def _safe_recovery_error(code: str, phase: str) -> str:
         "RECOVERY_AUTH_REQUIRED": "Image result lookup requires the bound account connection to be restored.",
         "RECOVERY_TRANSPORT_FAILED": "Image result lookup could not reach the provider; retry when connectivity returns.",
         "RECOVERY_READ_FAILED": "Image result lookup returned an unreadable response; retry the same request lookup.",
+        "RECOVERY_TIMED_OUT": "Image result lookup timed out; retry the same request lookup.",
     }.get(code, "Image result lookup did not complete; retry the same request lookup.")
 
 
@@ -467,13 +505,15 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "recovery_retryable",
         "recovery_error_code",
         "recovery_phase",
+        "last_recovery_failure",
         "adopted_source_request_message_id",
         "adopted_source_image_message_id",
         "adopted_from_error_code",
         "adopted_at",
     ):
         if task.get(field):
-            item[field] = task.get(field)
+            item[field] = (_public_failure_details(task[field])
+                           if field == "last_recovery_failure" else task.get(field))
     retry_after = task.get("recovery_retry_after_seconds")
     if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and retry_after >= 0:
         item["recovery_retry_after_seconds"] = retry_after
@@ -1055,9 +1095,11 @@ class ImageTaskService:
         progress_callback.image_thread_predecessor_result_ids = payload.get("_image_thread_predecessor_result_ids")
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
+        failure_phase = "collect_image_result"
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
+            failure_phase = "validate_image_result"
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
@@ -1193,12 +1235,13 @@ class ImageTaskService:
             recovery_phase = (
                 "download_image_result" if result_captured else "read_image_request"
             )
-            recovery_error_code = _recovery_failure_code(exc, recovery_phase)
+            recovery_error_code = _recovery_failure_code(exc, failure_phase, result_captured=result_captured)
             retry_after = _retry_after_seconds(exc)
             if error_code == "CONVERSATION_OUTCOME_UNKNOWN":
                 error_message = _safe_recovery_error(recovery_error_code, recovery_phase)
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
+                              last_recovery_failure=_failure_details(exc, failure_phase),
                               duration_ms=duration_ms,
                               upstream_unfinished=bool(account) and not terminal and not result_captured,
                               **(
@@ -1385,6 +1428,7 @@ class ImageTaskService:
                 "recovery_requires_new_conversation": item.get("recovery_requires_new_conversation") is True,
                 "recovery_error_code": _clean(item.get("recovery_error_code")),
                 "recovery_phase": _clean(item.get("recovery_phase")),
+                "last_recovery_failure": _public_failure_details(item.get("last_recovery_failure")),
                 "recovery_retry_after_seconds": item.get("recovery_retry_after_seconds"),
                 "deadline_recovery_started": item.get("deadline_recovery_started") is True,
                 "result_file_ids": [
@@ -1469,7 +1513,7 @@ class ImageTaskService:
                 elif result_captured:
                     task["upstream_unfinished"] = False
                     task["upstream_outcome"] = "generated"
-                    task["recovery_error_code"] = "RECOVERY_DOWNLOAD_FAILED"
+                    task["recovery_error_code"] = task.get("recovery_error_code") or "RECOVERY_RESULT_INCOMPLETE"
                     task["recovery_phase"] = "download_image_result"
                     task["next_poll_at"] = 0
                 elif task["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN":
@@ -1928,6 +1972,7 @@ class ImageTaskService:
         account_service = None
         access_token = ""
         conversation_available = False
+        failure_phase = "read_image_request"
         try:
             from services.account_service import account_service
             from services.openai_backend_api import ImageContentPolicyError, OpenAIBackendAPI
@@ -1964,6 +2009,7 @@ class ImageTaskService:
                 backend = OpenAIBackendAPI(access_token=access_token)
                 if persisted_file_ids or persisted_sediment_ids:
                     self._update_task(key, progress="receiving_image", recovery_phase="download_image_result")
+                    failure_phase = "resolve_image_result"
                     image_urls = backend.resolve_conversation_image_urls(
                         conversation_id,
                         persisted_file_ids,
@@ -1973,6 +2019,7 @@ class ImageTaskService:
                     )
                     if not image_urls:
                         raise RuntimeError("generated image URL could not be resolved")
+                    failure_phase = "download_image_result"
                     downloaded = backend.download_image_bytes(image_urls)
                     if not downloaded:
                         raise RuntimeError("generated image could not be downloaded")
@@ -1980,7 +2027,9 @@ class ImageTaskService:
                         {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
                         for image_data in downloaded
                     ]
+                    failure_phase = "confirm_image_turn"
                     parent_message_id = recovered_parent(backend, persisted_file_ids, persisted_sediment_ids)
+                    failure_phase = "save_image_result"
                     data = format_image_result(
                         image_items,
                         "",
@@ -2138,6 +2187,7 @@ class ImageTaskService:
                     recovery_phase="download_image_result",
                 )
 
+                failure_phase = "resolve_image_result"
                 image_urls = backend.resolve_conversation_image_urls(
                     conversation_id, file_ids, sediment_ids, poll=False,
                     request_message_id=request_message_id,
@@ -2145,11 +2195,14 @@ class ImageTaskService:
                 if not image_urls:
                     raise RuntimeError("图片 URL 解析失败")
 
+                failure_phase = "download_image_result"
                 image_items = [
                     {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
                     for image_data in backend.download_image_bytes(image_urls)
                 ]
+                failure_phase = "confirm_image_turn"
                 parent_message_id = recovered_parent(backend, file_ids, sediment_ids)
+            failure_phase = "save_image_result"
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
@@ -2213,7 +2266,7 @@ class ImageTaskService:
             recovery_phase = (
                 "download_image_result" if result_captured else "read_image_request"
             )
-            recovery_error_code = _recovery_failure_code(exc, recovery_phase)
+            recovery_error_code = _recovery_failure_code(exc, failure_phase, result_captured=result_captured)
             retry_after = _retry_after_seconds(exc)
             final_error_code = (
                 "RESULT_UNRECOVERABLE" if unrecoverable
@@ -2226,6 +2279,7 @@ class ImageTaskService:
                 status=TASK_STATUS_ERROR,
                 error=error_message,
                 error_code=final_error_code,
+                last_recovery_failure=_failure_details(exc, failure_phase),
                 binding_status=("unavailable" if unrecoverable and requires_new_conversation
                                 else "bound" if terminal or unrecoverable else "unknown"),
                 data=[],
