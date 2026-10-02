@@ -192,6 +192,50 @@ def test_same_session_fresh_original_success_clears_active_error_and_preserves_h
     assert calls == []
 
 
+@pytest.mark.parametrize("read_available", [True, False])
+def test_successful_missing_result_read_allows_bounded_automatic_same_session_retry(setup, read_available):
+    from services.conversation_binding_service import ConversationBindingService
+    from test.test_unknown_turn_recovery import document
+    service, admission, calls = setup
+    admission.clock.now = 1000
+    patch_row(service, _sequence=0, _automatic_generation_recovery=True)
+
+    def read(original):
+        doc = document(original)
+        del doc["mapping"][doc["current_node"]]
+        doc.update(current_node=original["request_message_id"], is_archived=False)
+        return ConversationBindingService._read_text_request_result(None, original, document=doc)
+
+    service.text.recovery_reader = read
+    service.process_one()
+    original = row(service)
+    assert original["recovery_reason"] == "REQUEST_RESULT_NOT_FOUND"
+    assert original["_completion"]["reason"] == "COMPLETION_INVESTIGATING_ORIGINAL"
+    admission.clock.now += service.STALL_SECONDS + service.INVESTIGATION_SECONDS
+    if not read_available:
+        service.text.recovery_reader = Mock(side_effect=ConnectionError("unavailable"))
+    service.process_one()
+    state = service.read("text", IDENTITY, "old-0")
+    if not read_available:
+        assert state["reason"] == "COMPLETION_ORIGINAL_READ_UNAVAILABLE"
+        assert not state.get("replacement_id") and not calls
+        assert row(service)["_result_last_checked_at"] == 1000
+        return
+    assert state.get("replacement_id"), state
+    child_id = state["replacement_id"]
+    child = row(service, request_id=child_id)
+    assert row(service)["_result_last_checked_at"] == admission.clock.now
+    assert row(service)["status"] == "unknown"
+    assert row(service).get("upstream_outcome") != "not_sent"
+    for key in ("conversation_id", "provider_account_identity", "provider_binding_id", "_work_key"):
+        assert child[key] == original[key]
+    assert child["parent_message_id"] == original["request_message_id"]
+    admission.execute(admission.claim_next())
+    assert len(calls) == 1
+    assert service.read("text", IDENTITY, "old-0")["selected_id"] == child_id
+    assert sum(e["stage"] == "send_call_started" for e in row(service)["_execution_timeline"]) == 1
+
+
 def test_failed_label_with_inconsistent_end_metadata_cannot_start_same_session_retry(setup):
     service, admission, calls = setup
     ended_original(service)

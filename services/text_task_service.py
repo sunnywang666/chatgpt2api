@@ -919,6 +919,12 @@ class TextTaskService:
                 # capacity release, or adoption of that successor's result.
                 changes.update(_result_last_checked_at=now,
                                _result_wait_ended_at=current.get("_result_wait_ended_at") or now)
+            if error_code == "UPSTREAM_OUTCOME_UNKNOWN" and recovery_reason == TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value:
+                # The original user turn was read successfully but has no
+                # result yet. Keep this distinct from a failed/unavailable
+                # read so the bounded same-session completion policy can
+                # use its fresh cursor after the investigation window.
+                changes["_result_last_checked_at"] = now
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}

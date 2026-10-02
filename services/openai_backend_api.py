@@ -3063,6 +3063,7 @@ class OpenAIBackendAPI:
         yield from self._iter_sse_payloads_capped(
             response,
             self._image_active_timeout(float(config.image_poll_timeout_secs)),
+            observe_text=True,
         )
 
     def _iter_sse_payloads_capped(

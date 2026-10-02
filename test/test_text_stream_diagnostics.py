@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from services.conversation_binding_service import ConversationBindingError
-from services.openai_backend_api import OpenAIBackendAPI, StreamHardTimeoutError
+from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, StreamHardTimeoutError
 from services.public_chat_service import project_text_execution, safe_public_execution
 from services.request_context import current_request
 from services.text_task_service import TextTaskService
@@ -81,3 +81,33 @@ def test_public_stream_diagnostics_reject_arbitrary_values():
     assert safe_public_execution({"stream_end": "PRIVATE", "stream_ended_at": float("inf"),
                                   "sse_data_count": True, "sse_parse_errors": -1,
                                   "sse_error_event": "PRIVATE", "error_body": "PRIVATE"}) == {}
+
+
+@pytest.mark.parametrize("end", ["done", "eof", "transport_error"])
+def test_image_stream_records_its_own_end_before_result_collection(monkeypatch, end):
+    monkeypatch.setattr("services.openai_backend_api.account_service.get_account", lambda token: {})
+    backend = OpenAIBackendAPI(access_token="fixture-token")
+    monkeypatch.setattr(backend, "_bootstrap", lambda: None)
+    monkeypatch.setattr(backend, "_get_chat_requirements", lambda: ChatRequirements(token="fixture"))
+    monkeypatch.setattr(backend, "_prepare_image_conversation", lambda *a, **kw: "conduit")
+    lines = [b'data: {"private_image_body":"PRIVATE_IMAGE_CONTENT"}']
+    if end == "done":
+        lines.append(b'data: [DONE]')
+    response = Response(lines, ConnectionError("PRIVATE_TRANSPORT") if end == "transport_error" else None)
+    monkeypatch.setattr(backend, "_start_image_generation", lambda *a, **kw: response)
+    stages = []
+    token = current_request.set(SimpleNamespace(record_stage=lambda stage, **fields: stages.append((stage, fields))))
+    try:
+        if end == "transport_error":
+            with pytest.raises(ConnectionError, match="PRIVATE_TRANSPORT"):
+                list(backend._stream_picture_conversation("draw", "gpt-image-2", []))
+        else:
+            list(backend._stream_picture_conversation("draw", "gpt-image-2", []))
+    finally:
+        current_request.reset(token)
+    assert len(stages) == 1
+    stage, evidence = stages[0]
+    assert stage == "stream_finished" and evidence["stream_end"] == end
+    assert evidence["sse_parse_errors"] == 0 and evidence["sse_error_event"] is False
+    assert response.closed
+    assert "PRIVATE" not in json.dumps(stages)
