@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -79,6 +80,23 @@ DEFAULT_PROXY_RUNTIME = {
 }
 
 _KEEP_CHAT_TRIAL = object()
+
+# Local pacing limits, not upstream rate-limit guarantees.
+_PACING_SETTINGS = {
+    "account_request_interval_secs": (1.0, 60.0, 5.0),
+    "account_message_interval_secs": (5.0, 300.0, 30.0),
+}
+
+
+def _pacing_value(key: str, raw: object) -> float:
+    minimum, maximum, _default = _PACING_SETTINGS[key]
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        value = float("nan")
+    if isinstance(raw, bool) or not math.isfinite(value) or not minimum <= value <= maximum:
+        raise ValueError(f"{key} must be between {minimum:g} and {maximum:g} seconds")
+    return value
 
 
 def _valid_temporary_chat_second_slot(value: object) -> bool:
@@ -437,17 +455,15 @@ class ConfigStore:
     def account_request_interval_secs(self) -> float:
         """Conservative local pacing, not an advertised upstream quota."""
         try:
-            value = float(self.data.get("account_request_interval_secs", 5.0))
-            return value if 1.0 <= value <= 60.0 else 5.0
-        except (TypeError, ValueError):
+            return _pacing_value("account_request_interval_secs", self.data.get("account_request_interval_secs", 5.0))
+        except ValueError:
             return 5.0
 
     @property
     def account_message_interval_secs(self) -> float:
         try:
-            value = float(self.data.get("account_message_interval_secs", 30.0))
-            return value if 5.0 <= value <= 300.0 else 30.0
-        except (TypeError, ValueError):
+            return _pacing_value("account_message_interval_secs", self.data.get("account_message_interval_secs", 30.0))
+        except ValueError:
             return 30.0
 
     @property
@@ -713,6 +729,8 @@ class ConfigStore:
 
     def get(self) -> dict[str, object]:
         data = dict(self.data)
+        data["account_request_interval_secs"] = self.account_request_interval_secs
+        data["account_message_interval_secs"] = self.account_message_interval_secs
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
@@ -765,6 +783,12 @@ class ConfigStore:
             return self._update_locked(data)
 
     def _update_locked(self, data: dict[str, object]) -> dict[str, object]:
+        data = dict(data or {})
+        # Reject the whole update before changing any setting. Legacy invalid
+        # stored values remain readable through their effective defaults.
+        for key in _PACING_SETTINGS:
+            if key in data:
+                data[key] = _pacing_value(key, data[key])
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
         if "backup" in next_data:
