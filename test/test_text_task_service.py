@@ -48,6 +48,39 @@ class TextTaskTests(unittest.TestCase):
         self.body = {"client_request_id": "attempt-1", "client_conversation_id": "product-gallery",
                      "messages": [{"role": "user", "content": "private prompt and image bytes"}]}
 
+    def test_recovered_success_fences_only_verifiably_expired_sent_claim(self):
+        clock = ManualClock()
+        service = TextTaskService(self.path, executor=self.queue, clock=clock)
+        cases = [(999.0, "expired", True), (1000.0, "at-deadline", True),
+                 (1001.0, "live", False), (None, "missing", False),
+                 (float("inf"), "infinite", False), ("999", "text", False),
+                 (999.0, {"malformed": True}, False)]
+        for index, (until, old_claim, clear) in enumerate(cases):
+            with self.subTest(claim=old_claim, until=until):
+                rid = "recovery-" + str(index)
+                service.submit("owner", {**self.body, "client_request_id": rid,
+                                        "client_conversation_id": rid + "-session"})
+                timeline = [{"stage": "send_call_started", "at": 990.0}]
+                service._update("owner", rid, status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                    upstream_outcome="unknown", provider_binding_id="binding", provider_account_identity="account",
+                    conversation_id="chat", _submission_started=True, _executing=True,
+                    _claim_id=old_claim, _claim_until=until, _execution_timeline=timeline,
+                    original_failure_phase="stream_read", recovery_claim_id=rid,
+                    recovery_claimed_at=clock(), recovery_lease_until=clock() + 30)
+                result = service._finish_recovery("owner", rid, rid,
+                    {"content": "original answer", "conversation_id": "chat", "parent_message_id": "answer-id"})
+                self.assertEqual(result["status"], "succeeded")
+                with service.store.connect() as db:
+                    stored = service.store.read_receipt(db, "text", "owner", rid)
+                self.assertEqual(stored["_executing"], not clear)
+                self.assertEqual(stored["_claim_id"], None if clear else old_claim)
+                self.assertEqual(stored["_claim_until"], None if clear else until)
+                self.assertIs(stored["_submission_started"], True)
+                self.assertEqual(stored["_execution_timeline"], timeline)
+                self.assertEqual(stored["provider_account_identity"], "account")
+                self.assertEqual(stored["original_failure_phase"], "stream_read")
+                self.assertTrue(stored["_input_ref"])
+
     def test_successful_queued_retry_clears_active_error_but_keeps_failure_history(self):
         runner = mock.Mock(return_value={"content": "recovered answer"})
         service = TextTaskService(self.path, runner, self.queue)

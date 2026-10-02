@@ -117,6 +117,48 @@ def test_queued_http_receipt_survives_process_restart_without_resubmission(tmp_p
     assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"queued-original"']
 
 
+
+def test_process_kill_after_sent_cursor_recovers_original_without_resubmission(tmp_path):
+    """Kill a real isolated worker after a controlled send and durable cursor."""
+    from services.task_store import TaskStore
+    body = {**_input(tmp_path, "crash-original"), "client_conversation_id": "crash-session"}
+    with _server(tmp_path, "crash-readable") as (port, key, process):
+        assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
+        _wait(lambda: (tmp_path / "sent-cursor-durable").exists())
+        store = TaskStore(tmp_path / "tasks.sqlite3")
+        with store.connect() as db:
+            before = next(row for _, _, rid, row in store.receipts(db) if rid == "crash-original")
+        assert before["status"] == "running" and before["_submission_started"]
+        assert before["conversation_id"] == "controlled-original-conversation"
+        process.kill()
+        process.wait(timeout=5)
+        assert process.returncode == -signal.SIGKILL
+    # The controlled upstream completes independently of the killed Provider.
+    (tmp_path / "original-completed").touch()
+    with _server(tmp_path, "stalled-completion") as (port, key, process):
+        after = _success(port, key, "crash-original")
+        assert after["content"] == "late original HTTP result"
+        result_file = tmp_path / "recovered-original.json"
+        result_file.write_text(json.dumps(after))
+        assert json.loads(result_file.read_text())["content"] == after["content"]
+        status, completed = _http(port, key, "POST", "/api/chat-requests/crash-original/work",
+                                  {"state": "completed", "results_saved": True})
+        assert status == 200, completed
+        work = _wait(lambda: (w if (w := _http(port, key, "GET", "/api/chat-requests/crash-original/work")[1])
+                             ["archive"]["status"] == "confirmed" else None))
+        assert not work["slot_held"]
+    with TaskStore(tmp_path / "tasks.sqlite3").connect() as db:
+        after_private = next(row for _, _, rid, row in TaskStore(tmp_path / "tasks.sqlite3").receipts(db)
+                             if rid == "crash-original")
+    for field in ("request_message_id", "provider_account_identity", "conversation_id", "_input_ref"):
+        assert after_private[field] == before[field]
+    assert after_private["_submission_started"] is True
+    assert after_private["_executing"] is False
+    assert after_private["_claim_id"] is None
+    assert after_private["_claim_until"] is None
+    assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"crash-original"']
+
+
 def test_real_socket_disconnect_keeps_original_execution_and_result(tmp_path):
     body = _input(tmp_path, "disconnected-original")
     with _server(tmp_path, "blocked-send") as (port, key, _process):
@@ -628,6 +670,66 @@ def test_http_empty_reply_auto_retry_original_polling_save_and_cleanup(tmp_path)
     assert [json.loads(line) for line in (tmp_path / "sends.jsonl").read_text().splitlines()] == ["completion-original", child]
 
 
+def test_http_empty_retry_preserves_identity_without_blocking_another_owner(tmp_path):
+    """A retained empty result retries once while an unrelated owner completes."""
+    from examples import image_client
+    from services.task_store import TaskStore
+    state, output = tmp_path / "empty-state.json", tmp_path / "empty-result.json"
+
+    def cli(port, key, command, *extra):
+        result = subprocess.run(
+            [sys.executable, str(Path(image_client.__file__)), command, "--state", str(state), *map(str, extra)],
+            env={**os.environ, "SERVER_ROOT": f"http://127.0.0.1:{port}", "CHATGPT2API_BEARER_TOKEN": key},
+            capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    with _server(tmp_path, "empty-retry-fair") as (port, key, _):
+        cli(port, key, "chat-submit", "--request-id", "completion-original", "--session-id", "original-work",
+            "--model", "fixture-text", "--prompt", "Complete this retained objective")
+
+        def replacement():
+            receipt = _http(port, key, "GET", "/api/chat-requests/completion-original")[1]
+            return receipt if receipt.get("completion", {}).get("replacement_id") else None
+        original = _wait(replacement)
+        child = original["completion"]["replacement_id"]
+        assert original["status"] == "unknown" and child != "completion-original"
+        assert original["completion"]["conversation_mode"] == "original"
+        assert original["completion"]["empty_response_confirmed"] is True
+        _wait(lambda: child in [json.loads(x) for x in (tmp_path / "sends.jsonl").read_text().splitlines()])
+
+        other_key = (tmp_path / "fixture-other-key").read_text()
+        other = {"client_request_id": "other-owner-original", "client_conversation_id": "other-work",
+                 "model": "fixture-text", "messages": [{"role": "user", "content": "independent controlled work"}]}
+        assert _http(port, other_key, "POST", "/api/chat-requests", other)[0] == 202
+        assert _success(port, other_key, "other-owner-original")["content"] == "synthetic saved answer"
+        assert _http(port, key, "GET", "/api/chat-requests/" + child)[1]["status"] == "running"
+        assert _http(port, other_key, "POST", "/api/chat-requests/other-owner-original/work",
+                     {"state": "completed", "results_saved": True})[0] == 200
+        _wait(lambda: _http(port, other_key, "GET", "/api/chat-requests/other-owner-original/work")[1]
+              ["archive"]["status"] == "confirmed")
+        (tmp_path / "release-empty-child").touch()
+        _success(port, key, child)
+        _wait(lambda: _http(port, key, "GET", "/api/chat-requests/completion-original")[1]
+              .get("completion", {}).get("selected_id") == child)
+        cli(port, key, "chat-save", "--output", output)
+        saved = json.loads(output.read_text())
+        assert saved["request_id"] == child and saved["content"] == "synthetic saved answer"
+        done = cli(port, key, "chat-completion-complete", "--reviewed")
+        assert done["original_cleanup"] == "completed" and not done["work"]["slot_held"]
+        _wait(lambda: _http(port, key, "GET", "/api/chat-requests/completion-original/completion")[1]
+              ["work"]["archive"]["status"] == "confirmed")
+
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    with store.connect() as db:
+        rows = {rid: row for _, _, rid, row in store.receipts(db)}
+    for field in ("provider_account_identity", "conversation_id"):
+        assert rows[child][field] and rows[child][field] == rows["completion-original"][field]
+    assert rows[child]["_source"] != rows["other-owner-original"]["_source"]
+    assert [json.loads(x) for x in (tmp_path / "sends.jsonl").read_text().splitlines()] == [
+        "completion-original", child, "other-owner-original"]
+
+
 @pytest.mark.parametrize("same_session", [False, True])
 def test_http_completion_cli_saves_reviews_archives_and_restores_selected_result_after_restart(tmp_path, same_session):
     from examples import image_client
@@ -748,6 +850,12 @@ def _serve(root, mode):
         _, key = auth.create_key(role="user", routes=["chat"])
         key_file.write_text(key)
         key_file.chmod(0o600)
+    if mode == "empty-retry-fair":
+        other_file = root / "fixture-other-key"
+        if not other_file.exists():
+            _, other_key = auth.create_key(role="user", owner_subject="fixture-other-owner", routes=["chat"])
+            other_file.write_text(other_key)
+            other_file.chmod(0o600)
     support.auth_service = auth
     public_chat_service.model_catalog_service = SimpleNamespace(
         known_account_types_for_model=lambda _model: frozenset({"Plus"}),
@@ -756,8 +864,11 @@ def _serve(root, mode):
     config.data["ai_review"] = {"enabled": False}
     store = TaskStore(root / "tasks.sqlite3")
     admission = PoolAdmission(store, accounts, settings=lambda: {
-        "chat_account_concurrency": 2 if mode == "parallel" else 1, "image_account_concurrency": 1, "codex_max_concurrency": 1},
+        "chat_account_concurrency": 2 if mode in {"parallel", "empty-retry-fair"} else 1, "image_account_concurrency": 1, "codex_max_concurrency": 1},
         model_types=lambda _model: {"Plus"}, pacing=lambda _account, now: {"next_at": now})
+
+    if mode == "crash-readable":
+        admission.CLAIM_SECONDS = .1
 
     def synthetic_model(body, on_cursor):
         current_request.get().before_send()
@@ -767,21 +878,28 @@ def _serve(root, mode):
             log.write(json.dumps(body["client_request_id"]) + "\n")
             log.flush()
             os.fsync(log.fileno())
-        if mode in {"stalled", "stalled-completion"} or mode in {"completion", "same-session-completion", "empty-retry"} and body["client_request_id"] == "completion-original":
+        if mode in {"stalled", "stalled-completion"} or mode in {"completion", "same-session-completion", "empty-retry", "empty-retry-fair"} and body["client_request_id"] == "completion-original":
             from services.conversation_binding_service import ConversationBindingError
             current_request.get().record_stage("send_call_started")
             current_request.get().record_stage("response_headers_received", status_code=200)
-            current_request.get().record_stage("stream_finished", stream_end="done" if mode == "empty-retry" else "transport_error",
+            current_request.get().record_stage("stream_finished", stream_end="done" if mode in {"empty-retry", "empty-retry-fair"} else "transport_error",
                                                sse_data_count=3, sse_parse_errors=0, sse_error_event=False)
             on_cursor({"conversation_id": "controlled-original-conversation",
                        **({"_automatic_generation_recovery": False} if mode == "stalled-completion" else {})})
             raise ConversationBindingError("controlled interrupted stream", code="CONVERSATION_OUTCOME_UNKNOWN")
+        if mode == "crash-readable":
+            current_request.get().record_stage("send_call_started")
+            on_cursor({"conversation_id": "controlled-original-conversation"})
+            (root / "sent-cursor-durable").touch()
+            _wait(lambda: (root / "release-crashed-send").exists(), timeout=30)
+        if mode == "empty-retry-fair" and body.get("_continue_after_terminal_empty"):
+            _wait(lambda: (root / "release-empty-child").exists(), timeout=30)
         if mode == "blocked-send":
             _wait(lambda: (root / "release-send").exists(), timeout=10)
         if mode == "parallel":
             _wait(lambda: (root / ("release-" + body["client_request_id"])).exists(), timeout=10)
         result = {"content": "synthetic saved answer"}
-        if mode in {"lifecycle", "parallel", "completion", "same-session-completion", "empty-retry"}:
+        if mode in {"lifecycle", "parallel", "completion", "same-session-completion", "empty-retry", "empty-retry-fair"}:
             conversation = body.get("conversation_id") or "upstream-" + body["client_conversation_id"]
             if body.get("_continue_after_terminal_empty"):
                 with store.connect() as db:
@@ -798,7 +916,7 @@ def _serve(root, mode):
         return result
 
     tasks = TextTaskService(store.path, runner=synthetic_model, admission=admission)
-    if mode in {"stalled", "stalled-completion", "completion", "same-session-completion", "empty-retry"}:
+    if mode in {"stalled", "stalled-completion", "completion", "same-session-completion", "empty-retry", "empty-retry-fair"}:
         # Accelerate only this isolated child fixture. Production's 900-second
         # boundary is exercised with a manual clock in the service regressions.
         TextTaskService.UNRECOVERABLE_MIN_AGE_SECONDS = .05
@@ -824,7 +942,7 @@ def _serve(root, mode):
         tasks.recovery_reader = original_read
     admission.register("text", lambda context, body: tasks._run(context.owner, context.request_id, body))
     chat_requests.text_task_service = tasks
-    if mode in {"lifecycle", "stalled-completion", "completion", "same-session-completion", "empty-retry"}:
+    if mode in {"lifecycle", "stalled-completion", "completion", "same-session-completion", "empty-retry", "empty-retry-fair"}:
         from services import text_task_service as text_module
         from services.work_lifecycle import WorkLifecycleService
         text_module.text_task_service = tasks
@@ -837,7 +955,7 @@ def _serve(root, mode):
                 raise TimeoutError("controlled lost archive response")
             return {"archived": archived}
         text_module.conversation_binding_service.set_archived = synthetic_archive
-        if mode in {"stalled-completion", "completion", "same-session-completion", "empty-retry"}:
+        if mode in {"stalled-completion", "completion", "same-session-completion", "empty-retry", "empty-retry-fair"}:
             from services.generation_completion import GenerationCompletionService
             GenerationCompletionService.STALL_SECONDS = .05
             GenerationCompletionService.INVESTIGATION_SECONDS = .5

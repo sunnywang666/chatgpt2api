@@ -928,6 +928,20 @@ class TextTaskService:
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}
+            # A process can die after sending and persisting its cursor. Once
+            # the original result is recovered, fence only its expired sending
+            # lease; otherwise the stale execution flag prevents completion.
+            # Keep a live or unverifiable lease and all original send evidence.
+            old_claim_until = current.get("_claim_until")
+            if (updated.get("status") == "succeeded"
+                    and current.get("_submission_started") is True
+                    and current.get("_executing") is True
+                    and isinstance(current.get("_claim_id"), str)
+                    and current["_claim_id"]
+                    and type(old_claim_until) in (int, float)
+                    and math.isfinite(old_claim_until)
+                    and old_claim_until <= now):
+                updated.update(_claim_id=None, _claim_until=None, _executing=False)
             self._end_execution_wait(updated, now, observed=observed)
             # Empty-response recovery is part of the original logical task.
             # Reserve at most one child, and never auto-retry that child again.
