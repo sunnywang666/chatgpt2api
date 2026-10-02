@@ -712,12 +712,60 @@ class AdmissionTests(unittest.TestCase):
                 self.assertEqual(saved[key], value)
         self.assertEqual(catalog_calls, [])
 
+    def test_expired_unsent_worker_releases_execution_marker_for_work_pause(self):
+        from services.work_lifecycle import WorkLifecycleService
+        self.submit("stopped-unsent", _public_session_ref="session-stopped-unsent")
+        old = self.admission.claim_next()
+        self.clock.now += 31
+        with self.store.transaction() as db:
+            self.admission._recover_claims(db, list(self.store.receipts(db)), self.clock())
+        receipt = self.read("text", "happy", "stopped-unsent")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(receipt["_executing"])
+        self.assertIsNone(receipt["_claim_until"])
+        with self.assertRaises(AdmissionLost):
+            old.before_send()
+        lifecycle = WorkLifecycleService(self.text, self.images, clock=self.clock)
+        work = lifecycle.update("text", {"id": "happy"}, "stopped-unsent", "paused")
+        self.assertEqual(work["state"], "paused")
+        self.assertFalse(work["slot_held"])
+        self.assertIsNone(self.admission.claim_next())
+        self.assertEqual(self.calls, [])
+
     def test_new_queued_text_still_discovers_models_for_admission(self):
         catalog_calls = []
         self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
         self.submit("new-work")
         self.assertEqual(self.admission.claim_next().request_id, "new-work")
         self.assertEqual(catalog_calls, ["fixture-text"])
+
+    def test_legacy_fenced_unsent_marker_is_cleared_without_changing_original_input(self):
+        self.submit("legacy-unsent")
+        with self.store.transaction() as db:
+            row = self.store.read_receipt(db, "text", "happy", "legacy-unsent")
+            row.update(_executing=True, _claim_id=None, _claim_until=999, _submission_started=False)
+            self.store.write_receipt(db, "text", "happy", "legacy-unsent", row)
+            self.admission._recover_claims(db, list(self.store.receipts(db)), self.clock())
+        saved = self.read("text", "happy", "legacy-unsent")
+        self.assertEqual(saved, {**row, "_executing": False, "_claim_until": None})
+        self.assertEqual(self.calls, [])
+
+    def test_legacy_marker_cleanup_does_not_change_sent_or_owned_work(self):
+        for index, change in enumerate((
+                {"status": "unknown"}, {"_claim_id": "live", "_claim_until": 2000},
+                {"_submission_started": True}, {"_executing": False})):
+            with self.subTest(change=change):
+                rid = "preserved-" + str(index)
+                self.submit(rid)
+                with self.store.transaction() as db:
+                    row = self.store.read_receipt(db, "text", "happy", rid)
+                    row.update(_executing=True, _claim_id=None, _claim_until=999,
+                               _submission_started=False)
+                    row.update(change)
+                    self.store.write_receipt(db, "text", "happy", rid, row)
+                    self.admission._recover_claims(db, [("text", "happy", rid, row.copy())], self.clock())
+                self.assertEqual(self.read("text", "happy", rid), row)
+        self.assertEqual(self.calls, [])
 
     def test_expired_captured_image_claim_preserves_real_failure_or_uses_neutral_state(self):
         for prior_code in (None, "RECOVERY_TIMED_OUT"):

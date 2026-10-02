@@ -725,6 +725,13 @@ class PoolAdmission:
     def _recover_claims(self, db, receipts, now):
         from services.text_task_service import TextTaskService
         for kind, owner, request_id, r in receipts:
+            # Older expired-unsent recovery cleared the claim but left its
+            # execution marker behind. No worker without a claim can send;
+            # clear only that fenced, unsent marker so work can be paused.
+            if (r.get("status") == "queued" and r.get("_claim_id") is None
+                    and r.get("_executing") is True and r.get("_submission_started") is False):
+                r.update(_executing=False, _claim_until=None)
+                self.store.write_receipt(db, kind, owner, request_id, r)
             if kind == "text" and TextTaskService._end_execution_wait(r, now):
                 self.store.write_receipt(db, kind, owner, request_id, r)
             if not r.get("_claim_id") or r.get("status") != "running" or float(r.get("_claim_until") or 0) > now:
@@ -738,7 +745,8 @@ class PoolAdmission:
                                  recovery_error_code=r.get("recovery_error_code") or "RECOVERY_RESULT_INCOMPLETE",
                                  recovery_phase="download_image_result", next_poll_at=0)
             else:
-                r.update(status="queued", _turn_reserved=False, _claim_id=None, upstream_unfinished=False)
+                r.update(status="queued", _turn_reserved=False, _claim_id=None,
+                         _claim_until=None, _executing=False, upstream_unfinished=False)
             self.store.write_receipt(db, kind, owner, request_id, r)
 
     def resource_snapshot(self):
