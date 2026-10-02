@@ -171,6 +171,27 @@ def test_original_recovered_before_same_session_send_closes_and_allows_later_con
     assert row(service, request_id="later-user-turn")["conversation_id"] == original["conversation_id"]
 
 
+def test_same_session_fresh_original_success_clears_active_error_and_preserves_history(setup):
+    service, admission, calls = setup
+    original = row(service)
+    child_id = start(service)["replacement_id"]
+    ctx = admission.claim_next()
+    assert ctx and ctx.request_id == child_id
+    patch_row(service, error_code="CONVERSATION_OUTCOME_UNKNOWN",
+              waiting={"reason": "previous_result_unverified"}, original_failure_phase="cursor_read")
+    service.text.recovery_reader = Mock(return_value={
+        "status": "succeeded", "content": "late original answer", "binding_status": "bound",
+        "conversation_id": original["conversation_id"], "parent_message_id": "late-final",
+    })
+    admission.execute(ctx)
+    recovered = row(service)
+    assert recovered["status"] == "succeeded" and recovered["content"] == "late original answer"
+    assert recovered.get("error_code") is None and recovered.get("waiting") is None
+    assert recovered["upstream_outcome"] == "completed"
+    assert recovered["original_failure_phase"] == "cursor_read"
+    assert calls == []
+
+
 def test_failed_label_with_inconsistent_end_metadata_cannot_start_same_session_retry(setup):
     service, admission, calls = setup
     ended_original(service)

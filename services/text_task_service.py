@@ -271,6 +271,10 @@ class TextTaskService:
     def _public(receipt):
         from services.public_chat_service import project_text_execution
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
+        if receipt.get("status") == "succeeded":
+            # Older successful retries retained their previous active error.
+            # Correct the read projection without rewriting original diagnostics.
+            result.update(error_code=None, waiting=None, upstream_outcome="completed")
         result.pop("execution", None)
         result["recovery_control"] = recovery_control(receipt)
         if (receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
@@ -884,6 +888,7 @@ class TextTaskService:
                     "recovery_retryable": False,
                     "finished_at": now,
                     "error_code": None,
+                    "waiting": None,
                     "recovery_next_at": None,
                     "recovery_error_code": None,
                     "recovery_phase": None,
@@ -1177,6 +1182,10 @@ class TextTaskService:
                 return
             if classify_before_send and receipt.get("_submission_started") is False:
                 changes.update(upstream_outcome="not_sent", _turn_reserved=False)
+            if changes.get("status") == "succeeded":
+                # Success ends the active failure; original_failure_* and the
+                # execution timeline remain available as historical evidence.
+                changes.update(error_code=None, waiting=None, upstream_outcome="completed")
             receipt = {**receipt, **changes, "updated_at": self._now()}
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
 
@@ -1701,7 +1710,8 @@ class TextTaskService:
                             if (same_session_retry(recovered, receipt) and recovered.get("status") != "succeeded"
                                     and recovered.get("request_message_id") == original.get("request_message_id")):
                                 recovered.update(validated)
-                                recovered.update(status="succeeded", upstream_outcome="completed", _turn_reserved=False)
+                                recovered.update(status="succeeded", upstream_outcome="completed",
+                                                 error_code=None, waiting=None, _turn_reserved=False)
                                 self.store.write_receipt(db, "text", owner, original["request_id"], recovered)
                     saved = retry_evidence(original or {})
                     current = retry_evidence({**(original or {}), "_retry_cursor": (validated or {}).get("_retry_cursor")})

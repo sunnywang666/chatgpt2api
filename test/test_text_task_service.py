@@ -48,6 +48,45 @@ class TextTaskTests(unittest.TestCase):
         self.body = {"client_request_id": "attempt-1", "client_conversation_id": "product-gallery",
                      "messages": [{"role": "user", "content": "private prompt and image bytes"}]}
 
+    def test_successful_queued_retry_clears_active_error_but_keeps_failure_history(self):
+        runner = mock.Mock(return_value={"content": "recovered answer"})
+        service = TextTaskService(self.path, runner, self.queue)
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            upstream_outcome="unknown", waiting={"reason": "account_or_shared_pacing"},
+            original_failure_phase="stream_open", original_exception_category="transport",
+        )
+        self.queue.run()
+        receipt = service.read("owner", "attempt-1")
+        self.assertEqual(receipt["status"], "succeeded")
+        self.assertIsNone(receipt.get("error_code"))
+        self.assertIsNone(receipt.get("waiting"))
+        self.assertEqual(receipt["upstream_outcome"], "completed")
+        with service.store.connect() as db:
+            stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        self.assertIsNone(stored.get("error_code"))
+        self.assertEqual(stored["original_failure_phase"], "stream_open")
+        self.assertEqual(stored["original_exception_category"], "transport")
+        restarted = TextTaskService(self.path, runner, self.queue)
+        self.assertEqual(restarted.submit("owner", self.body)["content"], "recovered answer")
+        runner.assert_called_once()
+
+    def test_legacy_success_read_does_not_publish_stale_error_or_rewrite_history(self):
+        from services.public_chat_service import project_public_chat_receipt
+        receipt = {"request_id": "legacy", "status": "succeeded", "content": "answer",
+                   "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "upstream_outcome": "unknown",
+                   "waiting": {"reason": "account_or_shared_pacing"},
+                   "original_failure_phase": "stream_open"}
+        projected = project_public_chat_receipt(TextTaskService._public(receipt))
+        self.assertNotIn("error_code", projected)
+        self.assertNotIn("waiting", projected)
+        self.assertEqual(projected["recovery"]["upstream_outcome"], "completed")
+        self.assertEqual(receipt["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+        self.assertEqual(receipt["original_failure_phase"], "stream_open")
+        unknown = TextTaskService._public({**receipt, "status": "unknown"})
+        self.assertEqual(unknown["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+
     def test_receipt_precedes_generation_and_completed_result_survives_restart(self):
         def runner(body, on_cursor):
             on_cursor({"provider_binding_id": "binding", "provider_account_identity": "account", "conversation_id": "chat"})
@@ -1312,10 +1351,14 @@ class TextTaskTests(unittest.TestCase):
         service.submit("owner", self.body)
         service._update("owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
                         provider_binding_id="binding", provider_account_identity="account",
-                        conversation_id="chat")
+                        conversation_id="chat", waiting={"reason": "previous_result_unverified"})
         recovered = service.read("owner", "attempt-1")
         self.assertEqual(recovered["status"], "succeeded")
         self.assertIsNone(recovered["error_code"])
+
+        with service.store.connect() as db:
+            persisted = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        self.assertIsNone(persisted.get("waiting"))
 
         def stale_update():
             service._update("owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
