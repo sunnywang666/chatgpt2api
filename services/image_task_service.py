@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR, config
-from services.task_store import TaskStore
+from services.task_store import TaskStore, recovery_control
 from contextlib import contextmanager
 from services.request_context import current_request, AdmissionLost
 from services.content_filter import request_text
@@ -470,6 +470,7 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
+        "recovery_control": recovery_control(task),
         "id": task.get("id"),
         "status": task.get("status"),
         "mode": task.get("mode"),
@@ -1498,6 +1499,7 @@ class ImageTaskService:
                 not_started = (task.get("status") == TASK_STATUS_QUEUED
                                and task.get("admission_recorded") is True
                                and task.get("upstream_unfinished") is False)
+                previous_poll_at = task.get("next_poll_at")
                 task["status"] = TASK_STATUS_ERROR
                 task["error"] = "服务已重启，未完成的图片任务已中断"
                 task["error_code"] = (
@@ -1536,6 +1538,8 @@ class ImageTaskService:
                         if known_not_submitted and task.get("conversation_id") and task.get("parent_message_id")
                         else "unavailable" if not_started or known_not_submitted else "unknown"
                     )
+                if task.get("_recovery_paused") is True:
+                    task["next_poll_at"] = previous_poll_at
                 task["updated_at"] = _now_iso()
                 changed = True
         return changed
@@ -1551,6 +1555,7 @@ class ImageTaskService:
             for key, task in self._tasks.items()
             if task.get("status") in TERMINAL_STATUSES and not _holds_upstream_slot(task)
             and not task.get("retain_receipt")
+            and not task.get("_recovery_paused")
             and task.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
             and _timestamp(task.get("updated_at")) < cutoff
         ]
@@ -1575,7 +1580,7 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 raise ValueError("task not found")
-            if task.get("_recovery_suppressed") is True:
+            if task.get("_recovery_suppressed") is True or task.get("_recovery_paused") is True:
                 # Keep this endpoint observational while an operator has
                 # explicitly stopped the old recovery path.
                 return _public_task(task)

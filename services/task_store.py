@@ -14,7 +14,19 @@ from pathlib import Path
 import sqlite3
 import stat
 import threading
+import time
 import uuid
+
+
+def recovery_control(receipt):
+    """A read pause never certifies that an already claimed operation stopped."""
+    paused = receipt.get("_recovery_paused") is True
+    in_flight = bool(receipt.get("recovery_claim_id") or receipt.get("_executing")
+                     or receipt.get("status") == "running")
+    stopped = receipt.get("_recovery_suppressed") is True
+    return {"state": "pausing" if paused and in_flight else "paused" if paused else "stopped" if stopped else "active",
+            "in_flight": in_flight,
+            "operator_stopped": stopped}
 
 
 def _pack(value):
@@ -44,6 +56,19 @@ def _unpack(value):
 
 
 class TaskStore:
+    def set_recovery_paused(self, kind, owner, request_id, paused):
+        # Serialize with both original-result claim paths. Never touch leases,
+        # outcome, retry times, original input, or conversation/slot protection.
+        with self.transaction() as db:
+            receipt = self.read_receipt(db, kind, owner, request_id)
+            if receipt is None:
+                return None
+            if (receipt.get("_recovery_paused") is True) != paused:
+                receipt["_recovery_paused"] = paused
+                receipt["_recovery_control_updated_at"] = time.time()
+                self.write_receipt(db, kind, owner, request_id, receipt)
+            return recovery_control(receipt)
+
     def __init__(self, path: Path):
         self.path = Path(path)
         self.input_dir = self.path.parent / (self.path.stem + "_inputs")

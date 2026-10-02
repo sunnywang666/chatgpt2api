@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from api.recovery_control import RecoveryControlRequest, update_recovery_control
+
 from typing import Literal
 
 from services.request_context import trusted_source
@@ -242,6 +244,14 @@ def create_router() -> APIRouter:
                 raise HTTPException(status_code=503, detail={"code": "SCHEDULING_UNAVAILABLE"}) from None
             status = 409 if "different immutable request" in str(exc) else 400
             raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-tasks/{task_id}/recovery-control")
+    async def control_image_recovery(task_id: str, body: RecoveryControlRequest, request: Request,
+                                     response: Response, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization, request=request)
+        response.headers["Cache-Control"] = "private, no-store"
+        return await update_recovery_control(image_task_service, "image", str(identity.get("id") or "anonymous"),
+                                             task_id, body)
 
     @router.post("/api/image-tasks/{task_id}/resume-poll")
     async def resume_image_poll(

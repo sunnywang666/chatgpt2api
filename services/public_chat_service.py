@@ -336,6 +336,7 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
             result[field] = value
 
     recovery_mapping = {
+        "recovery_control": "control",
         "recovery_attempt": "attempt",
         "recovery_next_at": "next_at",
         "recovery_error_code": "error_code",

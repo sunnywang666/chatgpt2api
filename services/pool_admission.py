@@ -299,7 +299,7 @@ class PoolAdmission:
         rows.sort(key=lambda row: float(row[3].get("recovery_next_at" if row[0] == "text" else "next_poll_at")
                                         or 0))
         for kind, owner, request_id, r in rows:
-            if recovery_suppressed(r):
+            if recovery_suppressed(r) or r.get("_recovery_paused") is True:
                 continue
             if kind not in self.recoveries:
                 continue
@@ -543,6 +543,7 @@ class PoolAdmission:
                             else image_receipts.get(owner, {}).get(r["_completion_of"])) or {}
                 original_work = works.get(original.get("_work_key")) or {}
                 enabled = bool(original and not recovery_suppressed(original)
+                               and original.get("_recovery_paused") is not True
                                and original_work.get("state", "active") == "active"
                                and not original.get("_completion", {}).get("selected_id"))
                 dependency = "completion_work:" + hashlib.sha256((kind + "\0" + owner + "\0" + request_id).encode()).hexdigest()
@@ -992,6 +993,8 @@ class PoolAdmission:
                 if r.get("_completion_of"):
                     original = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, r["_completion_of"]) or {}
                     original_work = works.get(original.get("_work_key")) or {}
+                    if original.get("_recovery_paused") is True:
+                        reasons = list(dict.fromkeys([*reasons, "recovery_paused"]))
                     if recovery_suppressed(original) or original_work.get("state", "active") != "active":
                         reasons = list(dict.fromkeys([*reasons, "work_not_active"]))
                 if ((deferred.ref.kind == "image" or r.get("_operation") == "image")

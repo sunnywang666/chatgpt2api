@@ -37,7 +37,7 @@ from services.conversation_binding_service import (
 )
 
 
-from services.task_store import TaskStore
+from services.task_store import TaskStore, recovery_control
 from services.request_context import current_request, AdmissionLost
 
 
@@ -272,6 +272,7 @@ class TextTaskService:
         from services.public_chat_service import project_text_execution
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
         result.pop("execution", None)
+        result["recovery_control"] = recovery_control(receipt)
         if (receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
                 and not receipt.get("_forward_protocol")):
             result["execution"] = project_text_execution(receipt)
@@ -403,7 +404,8 @@ class TextTaskService:
     @classmethod
     def _fresh_terminal_empty_continuation(cls, previous, correction, recovered):
         """Revalidate the original empty branch and the chosen retry head."""
-        if (previous or {}).get("_recovery_suppressed") is True or correction.get("_recovery_suppressed") is True:
+        if any(item.get(flag) is True for item in (previous or {}, correction)
+               for flag in ("_recovery_suppressed", "_recovery_paused")):
             return False
         saved = cls._verified_retryable_empty(previous or {})
         if not saved or not isinstance(recovered, dict):
@@ -711,7 +713,8 @@ class TextTaskService:
         return (receipt.get("_route", "chat") == "chat"
                 and receipt.get("_operation", "text") == "text"
                 and not receipt.get("_forward_protocol")
-                and receipt.get("_recovery_suppressed") is not True)
+                and receipt.get("_recovery_suppressed") is not True
+                and receipt.get("_recovery_paused") is not True)
 
     @classmethod
     def _end_execution_wait(cls, receipt, now, *, observed=False):
@@ -1009,6 +1012,7 @@ class TextTaskService:
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
                 if (previous.get("_recovery_suppressed") is not True
+                        and previous.get("_recovery_paused") is not True
                         and unknown_text_result(previous)
                         and previous.get("request_message_id")
                         and previous.get("provider_binding_id")
@@ -1098,6 +1102,8 @@ class TextTaskService:
         )
 
     def _authorize_unrecoverable(self, owner, request_id, observed):
+        if observed.get("recovery_control", {}).get("state") in {"paused", "pausing"}:
+            return observed
         if observed.get("error_code") == "RESULT_UNRECOVERABLE":
             return observed
         if observed.get("status") != "unknown":
@@ -1112,7 +1118,8 @@ class TextTaskService:
                 return {"request_id": request_id, "status": "not_found"}
             current = json.loads(row[0])
             if (current.get("status") == "succeeded" or current.get("error_code") == "RESULT_UNRECOVERABLE"
-                    or current.get("recovery_claim_id") or current.get("_executing") is True):
+                    or current.get("recovery_claim_id") or current.get("_executing") is True
+                    or current.get("_recovery_paused") is True):
                 return self._public(current)
             created_at = float(current.get("created_at") or now)
             if (
@@ -1584,7 +1591,8 @@ class TextTaskService:
             if not self._known_unsent_terminal_empty_correction(receipt, now):
                 raise ConversationBindingError("correction is not known unsent", code="CHAT_UNSENT_CORRECTION_NOT_RESUMABLE")
             previous = self.store.read_receipt(db, "text", owner, receipt["_terminal_empty_correction_of"])
-        if (previous or {}).get("_recovery_suppressed") is True or not self._verified_retryable_empty(previous or {}):
+        if (receipt.get("_recovery_paused") is True or (previous or {}).get("_recovery_paused") is True
+                or (previous or {}).get("_recovery_suppressed") is True or not self._verified_retryable_empty(previous or {})):
             raise ConversationBindingError("original terminal proof changed", code="CHAT_TERMINAL_EMPTY_UNVERIFIED")
         try:
             body = self.store.load_input(receipt["_input_ref"])

@@ -35,11 +35,11 @@ def allowed_route(method: str, path: str) -> bool:
         or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/recover", path))
         or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/archive-conversation", path))
         or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/restore-conversation", path))
-        or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/work", path))
+        or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/(?:work|recovery-control)", path))
         or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/resume-poll", path))
         or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/archive-thread", path))
         or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/restore-thread", path))
-        or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/work", path))
+        or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/(?:work|recovery-control)", path))
     )
 
 

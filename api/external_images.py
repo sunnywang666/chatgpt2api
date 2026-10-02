@@ -59,10 +59,10 @@ def _release_public_chat_body_reader() -> None:
         _public_chat_body_readers -= 1
 
 
-def _ordinary_chat_identity(request: Request):
+def _ordinary_chat_identity(request: Request, *, ordinary_only=True):
     try:
         identity = require_identity(request.headers.get("authorization"), request=request)
-        if identity.get("role") != "user":
+        if ordinary_only and identity.get("role") != "user":
             raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
         return identity, None
     except HTTPException as exc:
@@ -100,12 +100,17 @@ async def external_image_boundary(request: Request, call_next):
     elif request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/work", path):
         chat_body_limit = 1024
         chat_body_error = "IMAGE_WORK_BODY_TOO_LARGE"
+    if request.method == "POST" and re.fullmatch(r"/api/(?:chat-requests|image-tasks|conversation-bindings/text-requests)/[^/]+/recovery-control", path):
+        chat_body_limit = 1024
+        chat_body_error = "RECOVERY_CONTROL_BODY_TOO_LARGE"
     if chat_body_limit is not None:
         # Authenticate before inspecting Content-Length or consuming one byte.
         # This also protects direct Provider calls where the proxy marker is
         # absent. Hold the slot through downstream JSON parsing so a caller
         # cannot multiply the bounded body allocation with concurrent reads.
-        _, rejected = _ordinary_chat_identity(request)
+        legacy_control = (not is_external(request) and bool(re.fullmatch(
+            r"/api/(?:image-tasks|conversation-bindings/text-requests)/[^/]+/recovery-control", path)))
+        _, rejected = _ordinary_chat_identity(request, ordinary_only=not legacy_control)
         if rejected is not None:
             return rejected
         if not _try_acquire_public_chat_body_reader():

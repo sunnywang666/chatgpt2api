@@ -60,7 +60,8 @@ def replacement_send_allowed(store, db, kind, owner, request_id, receipt):
                 or any(receipt.get(k) != (root or {}).get(k) for k in (
                     "provider_account_identity", "provider_binding_id", "conversation_id", "_work_key"))):
             return False
-    return bool(root and state.get("replacement_id") == request_id
+    return bool(root and root.get("_recovery_paused") is not True
+                and state.get("replacement_id") == request_id
                 and not state.get("selected_id") and not successful(kind, root)
                 and state.get("state") != "completed")
 
@@ -243,7 +244,7 @@ class GenerationCompletionService:
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id)
             state = root.get("_completion")
-            if not state or state.get("state") == "completed":
+            if not state or state.get("state") == "completed" or root.get("_recovery_paused") is True:
                 return
             child = self._select(db, kind, owner, request_id, root)
             if state.get("selected_id"):
@@ -269,6 +270,8 @@ class GenerationCompletionService:
             if not state.get("selected_id") and not child:
                 try:
                     active = root.get("_executing") or root.get("recovery_claim_id") or root.get("status") in {"queued", "running", "not_started"}
+                    if root.get("_recovery_paused") is True:
+                        raise CompletionError("COMPLETION_ORIGINAL_RECOVERY_PAUSED")
                     if active:
                         raise CompletionError("COMPLETION_ORIGINAL_ACTIVE")
                     work = self.store.runtime(db, root.get("_work_key")) if root.get("_work_key") else None
@@ -320,7 +323,8 @@ class GenerationCompletionService:
                 if root.get("_recovery_suppressed") or original_work.get("state", "active") != "active":
                     state.update(state="needs_attention", reason="COMPLETION_WORK_NOT_ACTIVE")
             self.store.write_receipt(db, kind, owner, request_id, root)
-            submit = bool(state.get("replacement_id") and not child and not state.get("selected_id"))
+            submit = bool(state.get("replacement_id") and not child and not state.get("selected_id")
+                          and root.get("_recovery_paused") is not True)
             prepared_ref, replacement_id = state.get("prepared_input"), state.get("replacement_id")
         if submit:
             body = self.store.load_input(prepared_ref)

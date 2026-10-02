@@ -856,3 +856,37 @@ def _serve(root, mode):
 
 if __name__ == "__main__":
     _serve(Path(sys.argv[1]), sys.argv[2])
+
+
+def test_http_cli_recovery_pause_restart_resume_saves_original_once(tmp_path):
+    from examples import image_client
+    body = {**_input(tmp_path, "paused-original"), "client_conversation_id":"pause-session"}
+    state = tmp_path / "pause-state.json"
+    state.write_text(json.dumps({"schema":"chatgpt2api.chat-request.v1", "request_id":body["client_request_id"], "request":body}))
+    def cli(port, key, *args):
+        result = subprocess.run([sys.executable, str(Path(image_client.__file__)), *map(str,args)],
+            env={**os.environ, "SERVER_ROOT":f"http://127.0.0.1:{port}", "CHATGPT2API_BEARER_TOKEN":key},
+            capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+    with _server(tmp_path, "stalled") as (port,key,_):
+        assert _http(port,key,"POST","/api/chat-requests",body)[0] == 202
+        _wait(lambda: _http(port,key,"GET","/api/chat-requests/paused-original")[1].get("status") == "unknown")
+        controlled = cli(port,key,"chat-recovery-pause","--state",state)
+        assert controlled["recovery_control"]["state"] in {"paused","pausing"}
+        def settled():
+            value = _http(port,key,"GET","/api/chat-requests/paused-original")[1]
+            return value if value["recovery"]["control"]["state"] == "paused" else None
+        paused = _wait(settled)
+        (tmp_path / "original-completed").touch()
+        assert _http(port,key,"POST","/api/chat-requests/paused-original/recover",{})[1]["status"] == "unknown"
+    with _server(tmp_path,"stalled") as (port,key,_):
+        observed = cli(port,key,"chat-status","--state",state)
+        assert observed["status"] == "unknown" and observed["recovery"]["control"]["state"] == "paused"
+        assert observed["recovery"]["attempt"] == paused["recovery"]["attempt"]
+        cli(port,key,"chat-recovery-resume","--state",state)
+        _success(port,key,"paused-original")
+        cli(port,key,"chat-save","--state",state,"--output",tmp_path / "paused-result.json")
+        saved = json.loads((tmp_path / "paused-result.json").read_bytes())
+        assert saved["content"] == "late original HTTP result" and saved["request_id"] == "paused-original"
+    assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"paused-original"']

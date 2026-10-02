@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from api.recovery_control import RecoveryControlRequest, update_recovery_control
+
 from services.request_context import trusted_source
 
 import hashlib
@@ -411,6 +413,14 @@ def create_router() -> APIRouter:
             )
         except WorkLifecycleError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
+
+    @router.post("/api/chat-requests/{request_id}/recovery-control")
+    async def control_chat_recovery(request_id: str, body: RecoveryControlRequest, request: Request,
+                                    response: Response, authorization: str | None = Header(default=None)):
+        identity = _ordinary_identity(authorization, request)
+        response.headers["Cache-Control"] = "private, no-store"
+        return await update_recovery_control(text_task_service, "text", _owner(identity),
+                                             _validated_request_id(request_id), body)
 
     @router.post("/api/chat-requests/{request_id}/recover")
     async def recover_chat_request(

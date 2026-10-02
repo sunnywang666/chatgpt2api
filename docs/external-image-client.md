@@ -19,6 +19,38 @@
 
 This is an engineering client for the persistent task API. The existing public service root is `https://app.hugsweetglobal.com/ai`. Local fixture tests do not establish a reachable endpoint, a usable provider account, or a successful external image generation.
 
+## 暂停某个原请求的结果查询（候选能力）
+
+对文字调用 `POST /api/chat-requests/{request_id}/recovery-control`，对图片调用
+`POST /api/image-tasks/{client_task_id}/recovery-control`，请求体是
+`{"state":"paused"}` 或 `{"state":"active"}`。既有内部文字调用者使用
+`/api/conversation-bindings/text-requests/{request_id}/recovery-control`，仍按原认证身份归属。
+公司入口沿现有公司会话转发同一操作，不需要员工提供 Key。
+
+独立客户端复用原状态文件：
+
+```sh
+python3 examples/image_client.py --env-file .image-client.env chat-recovery-pause --state ./my-chat-request.json
+python3 examples/image_client.py --env-file .image-client.env chat-recovery-resume --state ./my-chat-request.json
+python3 examples/image_client.py --env-file .image-client.env recovery-pause --state ./my-image-task.json
+python3 examples/image_client.py --env-file .image-client.env recovery-resume --state ./my-image-task.json
+```
+
+- `recovery_control.state=paused` 停止后续自动读取；普通查询和原结果 recover 也不会暗中绕过。
+  文字公开回执位于 `recovery.control`，图片及内部文字回执位于 `recovery_control`。
+- `pausing` / `in_flight=true` 表示已有本地操作仍在途，不能宣称它已经取消。它可结束并保存原结果，
+  后续读取不会再启动。当前已开始的有界读取可能包含多次上游 HTTP；暂停不是中途断网。
+- 状态持久化、重复操作幂等。恢复不发送模型请求、不清空原输入/结果/错误/UNKNOWN、不绕过
+  `Retry-After` 和已有退避，也不解除工作流暂停或其他停止标记。
+  仍有内部停止标记时返回 `state=stopped, operator_stopped=true`，客户端明确报未恢复。
+- UNKNOWN 的账号占用和同会话顺序保护保留。关联自动纠正的未发送子请求也不能在暂停后越过发送边界。
+  该控制不是取消一般排队生成的接口，不会把未知结果改写成失败或成功。
+- 不提供“清空这些 UNKNOWN”的删除接口。删除本地记录不能终止上游，也会失去原结果读回、
+  账号会话归属和顺序证据；普通历史保留策略不得删掉暂停中的请求。这里只管理结果查询，
+  不自动隐藏待处理项、不宣称上游已停止。
+
+此能力须在匹配候选部署后才线上生效；本地与受控 HTTP 验证不是生产已应用。
+
 ## Server requirements
 
 Set `SERVER_ROOT` to the service root used by the external caller. The root may include an ingress prefix, but it must not end in `/v1`. The example environment contains the existing `/ai` service root and no credential. Do not reuse an OpenAI SDK `OPENAI_BASE_URL` value ending in `/v1`: doing so would incorrectly produce `/v1/api/...` paths.

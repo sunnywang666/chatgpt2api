@@ -738,6 +738,26 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_recovery_control(api: ApiClient, args: argparse.Namespace) -> int:
+    chat = args.command.startswith("chat-")
+    state = _load_chat_state(_chat_state_path(args)) if chat else _load_state(_state_path(args))
+    request_id = _chat_request_id(args, state) if chat else _task_id(args, state)
+    kind = "chat-requests" if chat else "image-tasks"
+    desired = "paused" if args.command.endswith("pause") else "active"
+    result = api.json("POST", f"/api/{kind}/{parse.quote(request_id, safe='')}/recovery-control",
+                      payload={"state": desired})
+    if result.get("request_id") != request_id:
+        raise ClientError("recovery control response changed the original request identity")
+    control = result.get("recovery_control") or {}
+    if desired == "active" and control.get("operator_stopped") is True:
+        _emit(result)
+        raise ClientError("automatic recovery remains stopped by another operator scope")
+    if control.get("state") not in ({"paused", "pausing"} if desired == "paused" else {"active"}):
+        raise ClientError("recovery control response did not confirm the requested state")
+    _emit(result)
+    return 0
+
+
 def _command_chat_status(api: ApiClient, args: argparse.Namespace) -> int:
     state = _load_chat_state(_chat_state_path(args))
     request_id = _chat_request_id(args, state)
@@ -956,6 +976,12 @@ def _parser() -> argparse.ArgumentParser:
         operation = subparsers.add_parser(command, help="read the original Chat receipt; recover only reads the upstream result")
         operation.add_argument("--state")
         operation.add_argument("--request-id")
+    for prefix in ("chat-", ""):
+        for action in ("pause", "resume"):
+            control = subparsers.add_parser(prefix + "recovery-" + action,
+                help="pause/resume original-result reads; never cancel or resend generation")
+            control.add_argument("--state")
+            control.add_argument("--request-id" if prefix else "--task-id")
     save = subparsers.add_parser("chat-save", help="save the original successful Chat result, never rerun the model")
     save.add_argument("--state", required=True)
     save.add_argument("--output", required=True)
@@ -1014,6 +1040,8 @@ def main(argv: list[str] | None = None) -> int:
             "resume": _command_resume,
             "download": _command_download,
         }
+        commands.update({prefix + "recovery-" + action: _command_recovery_control
+                         for prefix in ("chat-", "") for action in ("pause", "resume")})
         commands.update({prefix + "completion-" + action: _command_completion
                          for prefix in ("chat-", "") for action in ("recover", "status", "save", "complete", "rework")})
         return commands[args.command](api, args)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from api.recovery_control import RecoveryControlRequest, update_recovery_control
+
 from services.request_context import trusted_source
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -371,6 +373,14 @@ def create_router() -> APIRouter:
     async def read_bound_text_request(request_id: str, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         return await run_in_threadpool(text_task_service.read, str(identity.get("id") or "anonymous"), request_id)
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/recovery-control")
+    async def control_bound_text_recovery(request_id: str, body: RecoveryControlRequest, response: Response,
+                                          authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        response.headers["Cache-Control"] = "private, no-store"
+        return await update_recovery_control(text_task_service, "text", str(identity.get("id") or "anonymous"),
+                                             request_id, body)
 
     @router.post("/api/conversation-bindings/text-requests/{request_id}/recover")
     async def recover_bound_text_request(

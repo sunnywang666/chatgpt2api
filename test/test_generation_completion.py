@@ -381,3 +381,22 @@ def test_api_owner_isolation_and_explicit_saved_reviewed_ack(setup, monkeypatch)
     assert result.status_code == 200 and result.json()["replacement_id"]
     assert client.post(endpoint, headers={"Authorization": "owner"}, json={"action": "complete", "selected_id": "wrong", "results_saved": True}).status_code == 422
     assert not calls
+
+
+def test_recovery_pause_fences_prepared_completion_and_preserves_original(setup):
+    from services.generation_completion import replacement_send_allowed
+    service, admission, calls = setup
+    ended_original(service)
+    state = service.start("text", IDENTITY, "old-0")
+    child_id = state["replacement_id"]
+    original = row(service)
+    service.store.set_recovery_paused("text", "owner", "old-0", True)
+    service.process_one()
+    assert admission.claim_next() is None
+    with service.store.connect() as db:
+        child = service.store.read_receipt(db, "text", "owner", child_id)
+        assert not replacement_send_allowed(service.store, db, "text", "owner", child_id, child)
+    assert calls == [] and row(service)["_completion"]["replacement_id"] == child_id
+    service.store.set_recovery_paused("text", "owner", "old-0", False)
+    assert admission.claim_next().request_id == child_id
+    assert row(service)["conversation_id"] == original["conversation_id"]
