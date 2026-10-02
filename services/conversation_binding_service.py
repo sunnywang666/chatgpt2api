@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any
 
 from services.account_service import account_service
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
 from services.protocol.conversation import conversation_events
 from utils.helper import UpstreamHTTPError
 
@@ -557,9 +557,15 @@ class ConversationBindingService:
         with account_service.conversation_binding_lock(binding, body["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:
-                if body.get("_public_session_ref") and backend._get_conversation(body["conversation_id"]).get("current_node") != body["parent_message_id"]:
-                    raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH")
-                result = backend.set_conversation_archived(body["conversation_id"], body["parent_message_id"], archived)
+                # The backend checks the original turn and current cursor before
+                # PATCH, then verifies its readback. A second outer GET adds
+                # account read pressure without another mutation boundary.
+                try:
+                    result = backend.set_conversation_archived(body["conversation_id"], body["parent_message_id"], archived)
+                except ConversationArchiveCursorMismatch:
+                    if body.get("_public_session_ref"):
+                        raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH") from None
+                    raise
                 return {**body, **result}
             finally:
                 backend.close()

@@ -1699,3 +1699,69 @@ class ProductConversationArchiveTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "cursor changed"):
             backend.set_conversation_archived("chat-a", "original", False)
         backend.session.patch.assert_called_once()
+
+    def public_archive(self, backend, archived=True, account_identity="account"):
+        body = {"provider_binding_id": "binding", "provider_account_identity": "account",
+                "client_conversation_id": "work", "conversation_id": "chat-a",
+                "parent_message_id": "original", "_public_session_ref": "session"}
+        backend.close = mock.Mock()
+        accounts = mock.Mock()
+        accounts.get_bound_account_identity.return_value = account_identity
+        accounts.get_bound_text_access_token.return_value = "test-token"
+        accounts.conversation_binding_lock.return_value = nullcontext()
+        with mock.patch("services.conversation_binding_service.account_service", accounts), \
+             mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend):
+            return ConversationBindingService().set_archived(body, archived)
+
+    def test_public_archive_and_restore_use_one_preflight_and_one_readback(self):
+        for desired in (True, False):
+            with self.subTest(desired=desired):
+                backend = self.backend([
+                    {"mapping": {"original": {}}, "current_node": "original", "is_archived": not desired},
+                    {"current_node": "original", "is_archived": desired},
+                ])
+                result = self.public_archive(backend, desired)
+                self.assertIs(result["archived"], desired)
+                self.assertEqual(backend._get_conversation.call_count, 2)
+                backend.session.patch.assert_called_once()
+                backend.close.assert_called_once()
+
+    def test_public_archive_already_done_uses_one_read_and_no_patch(self):
+        backend = self.backend([{"mapping": {"original": {}}, "current_node": "original", "is_archived": True}])
+        self.assertTrue(self.public_archive(backend)["archived"])
+        backend._get_conversation.assert_called_once_with("chat-a")
+        backend.session.patch.assert_not_called()
+
+    def test_public_archive_preflight_cursor_drift_keeps_binding_mismatch(self):
+        for mapping in ({"original": {}}, {}):
+            with self.subTest(mapping=mapping):
+                backend = self.backend([{"mapping": mapping, "current_node": "newer", "is_archived": False}])
+                with self.assertRaises(ConversationBindingError) as error:
+                    self.public_archive(backend)
+                self.assertEqual(error.exception.code, "CONVERSATION_BINDING_MISMATCH")
+                backend.session.patch.assert_not_called()
+                backend._get_conversation.assert_called_once()
+
+    def test_public_archive_other_failures_are_not_preflight_mismatch(self):
+        cases = [
+            ([{"mapping": {}, "current_node": "original"}], 0),
+            ([RuntimeError("read unavailable")], 0),
+            ([{"mapping": {"original": {}}, "current_node": "original", "is_archived": False},
+              {"current_node": "newer", "is_archived": True}], 1),
+        ]
+        for documents, patches in cases:
+            with self.subTest(documents=documents):
+                backend = self.backend(documents)
+                with self.assertRaises(RuntimeError) as error:
+                    self.public_archive(backend)
+                self.assertNotIsInstance(error.exception, ConversationBindingError)
+                self.assertEqual(backend.session.patch.call_count, patches)
+                self.assertEqual(backend._get_conversation.call_count, len(documents))
+
+    def test_public_archive_changed_account_does_not_read_or_patch(self):
+        backend = self.backend([])
+        with self.assertRaises(ConversationBindingError) as error:
+            self.public_archive(backend, account_identity="other-account")
+        self.assertEqual(error.exception.code, "CONVERSATION_BINDING_MISMATCH")
+        backend._get_conversation.assert_not_called()
+        backend.session.patch.assert_not_called()

@@ -36,6 +36,11 @@ class InvalidAccessTokenError(RuntimeError):
     pass
 
 
+class ConversationArchiveCursorMismatch(RuntimeError):
+    """The pre-mutation archive read found a different current conversation turn."""
+    pass
+
+
 class ImageTaskError(RuntimeError):
     """图片生成异常基类，携带上游会话 ID 供调用方清理对话。"""
 
@@ -1288,10 +1293,10 @@ class OpenAIBackendAPI:
     def set_conversation_archived(self, conversation_id: str, parent_message_id: str, archived: bool) -> Dict[str, Any]:
         """Change visibility only after checking the original conversation and cursor."""
         document = self._get_conversation(conversation_id)
+        if str(document.get("current_node") or "").strip() != parent_message_id:
+            raise ConversationArchiveCursorMismatch("original conversation cursor changed")
         if parent_message_id not in (document.get("mapping") or {}):
             raise RuntimeError("original product turn is missing")
-        if str(document.get("current_node") or "").strip() != parent_message_id:
-            raise RuntimeError("original conversation cursor changed")
         if document.get("is_archived") is archived:
             return {"archived": archived}
         path = f"/backend-api/conversation/{conversation_id}"
