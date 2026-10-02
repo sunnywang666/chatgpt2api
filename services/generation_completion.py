@@ -366,6 +366,7 @@ class GenerationCompletionService:
                       else child_id if successful(kind, child) else None)
             if chosen:
                 state.update(selected_id=chosen, selected_at=float(self.clock()), state="result_ready", next_at=None)
+                state.pop("reason", None)
         if (child and state.get("selected_id") == request_id and not child.get("_submission_started")
                 and (child.get("status") in {"queued", "running"}
                      or child.get("status") in {"failed", "error"} and child.get("upstream_outcome") == "not_sent")):
@@ -574,6 +575,8 @@ class GenerationCompletionService:
                       "original_attempt_state": "ended" if root.get("_attempt_finished_at") else "active",
                       "empty_response_confirmed": bool(kind == "text" and self.text._verified_retryable_empty(root)),
                       "original_cleanup": "pending" if unresolved(root) and not ended else "not_required"}
+            if state.get("state") in {"result_ready", "completed"}:
+                result.pop("reason", None)
             same_retry = bool(child and kind == "text" and child.get("_terminal_empty_correction_of") == request_id
                               and child.get("_work_key") == root.get("_work_key")
                               and self.text._verified_retryable_empty(root))
@@ -646,6 +649,7 @@ class GenerationCompletionService:
                                            never_sent=not unused.get("_submission_started") and not unused.get("conversation_id"))
                     save_work(self.store, db, original_work)
             root["_completion"].update(state="completed", results_saved=True, work=work, next_at=None)
+            root["_completion"].pop("reason", None)
             self.store.write_receipt(db, kind, str(identity["id"]), request_id, root)
         return self.read(kind, identity, request_id)
 

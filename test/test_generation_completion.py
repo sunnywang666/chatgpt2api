@@ -236,6 +236,29 @@ def test_successful_missing_result_read_allows_bounded_automatic_same_session_re
     assert sum(e["stage"] == "send_call_started" for e in row(service)["_execution_timeline"]) == 1
 
 
+def test_selected_completion_drops_active_wait_reason_and_ended_recovery_count(setup):
+    service, admission, calls = setup
+    assert admission.resource_snapshot()["queue"]["recovering_original"] == 1
+    child_id = start(service)["replacement_id"]
+    with service.store.transaction() as db:
+        root = service.store.read_receipt(db, "text", "owner", "old-0")
+        root["_completion"]["reason"] = "COMPLETION_ATTEMPT_PENDING"
+        service.store.write_receipt(db, "text", "owner", "old-0", root)
+    admission.execute(admission.claim_next())
+    ready = service.read("text", IDENTITY, "old-0")
+    assert ready["state"] == "result_ready" and "reason" not in ready
+    assert admission.resource_snapshot()["queue"]["recovering_original"] == 0
+    done = service.complete("text", IDENTITY, "old-0", child_id)
+    assert done["state"] == "completed" and "reason" not in done
+    assert row(service)["status"] == "unknown"
+    # Already stored historical completion states must also project correctly.
+    with service.store.transaction() as db:
+        root = service.store.read_receipt(db, "text", "owner", "old-0")
+        root["_completion"]["reason"] = "COMPLETION_ATTEMPT_PENDING"
+        service.store.write_receipt(db, "text", "owner", "old-0", root)
+    assert "reason" not in service.read("text", IDENTITY, "old-0")
+
+
 def test_failed_label_with_inconsistent_end_metadata_cannot_start_same_session_retry(setup):
     service, admission, calls = setup
     ended_original(service)

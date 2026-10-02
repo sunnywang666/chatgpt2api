@@ -174,6 +174,7 @@ EXECUTION_ENUMS = {
     "upstream_outcome": {"not_sent", "unknown", "completed", "rejected"},
     "upstream_status": {"in_progress", "running", "pending", "queued", "finished_successfully"},
     "stream_end": {"done", "eof", "hard_timeout", "transport_error", "consumer_closed"},
+    "sse_error_category": {"rate_limit", "quota", "auth", "upstream", "unknown"},
 }
 EXECUTION_TIMES = ("accepted_at", "sent_at", "response_received_at", "first_stream_event_at",
                    "local_finished_at", "observation_started_at", "last_checked_at", "last_progress_at", "wait_ended_at", "upstream_updated_at", "stream_ended_at")
@@ -279,7 +280,7 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
         "wait_ended_at": wait_end, "upstream_updated_at": observation.get("upstream_updated_at"),
         "unchanged_reads": receipt.get("_result_no_progress_reads"), "resources": resources,
         "stream_ended_at": stream.get("at"),
-        **{key: stream[key] for key in ("stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event") if key in stream},
+        **{key: stream[key] for key in ("stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event", "sse_error_category") if key in stream},
     })
 
 

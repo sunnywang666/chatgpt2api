@@ -80,7 +80,37 @@ def test_failed_diagnostic_write_does_not_replace_original_transport_exception()
 def test_public_stream_diagnostics_reject_arbitrary_values():
     assert safe_public_execution({"stream_end": "PRIVATE", "stream_ended_at": float("inf"),
                                   "sse_data_count": True, "sse_parse_errors": -1,
-                                  "sse_error_event": "PRIVATE", "error_body": "PRIVATE"}) == {}
+                                  "sse_error_event": "PRIVATE", "sse_error_category": "PRIVATE", "error_body": "PRIVATE"}) == {}
+
+
+@pytest.mark.parametrize("code,category", [
+    ("rate_limit_exceeded", "rate_limit"), ("insufficient_quota", "quota"),
+    ("authentication_error", "auth"), ("server_error", "upstream"),
+    ("PRIVATE_UNKNOWN_CODE", "unknown"), (None, "unknown"),
+])
+@pytest.mark.parametrize("named_event", [False, True])
+def test_sse_error_retains_only_structured_category_across_restart(runtime, code, category, named_event):
+    error = {"type": code, "message": "PRIVATE_BODY rate_limit_exceeded"}
+    response = Response(([b'event: error'] if named_event else []) + [
+        ("data: " + json.dumps(error if named_event else {"error": error})).encode(), b'', b'data: [DONE]'])
+
+    def run(body):
+        current_request.get().before_send()
+        list(OpenAIBackendAPI._iter_sse_payloads_capped(None, response, 60, observe_text=True))
+        raise ConversationBindingError("unconfirmed", code="CONVERSATION_OUTCOME_UNKNOWN")
+
+    runtime.admission.register("text", lambda ctx, body: run(body))
+    runtime.service.submit("owner", {"client_request_id": "category-original", "client_conversation_id": "category-session", "model": "fixture-text",
+                                    "messages": [{"role": "user", "content": "fixture"}]})
+    runtime.admission.execute(runtime.admission.claim_next())
+    restarted = TextTaskService(runtime.store.path, admission=runtime.admission, clock=runtime.clock)
+    with restarted.store.connect() as db:
+        row = restarted.store.read_receipt(db, "text", "owner", "category-original")
+    stage = next(e for e in row["_execution_timeline"] if e["stage"] == "stream_finished")
+    public = project_text_execution(row)
+    assert stage["sse_error_category"] == public["sse_error_category"] == category
+    assert public["sse_error_event"] is True
+    assert "PRIVATE" not in json.dumps(stage) and "PRIVATE" not in json.dumps(public)
 
 
 @pytest.mark.parametrize("end", ["done", "eof", "transport_error"])

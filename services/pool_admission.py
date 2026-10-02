@@ -172,7 +172,7 @@ class ExecutionContext:
             "config_revision": settings.get("revision") if isinstance(settings, dict) else None,
             **{key: value for key, value in extra.items()
                if key in {"status_code", "upstream_request_id", "output_ref", "known", "task_status", "image_count",
-                          "stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event"}},
+                          "stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event", "sse_error_category"}},
         }
         timeline = list(receipt.get("_execution_timeline") or [])
         timeline.append(entry)
@@ -818,7 +818,10 @@ class PoolAdmission:
                 oldest = max(oldest, max(0, now - accepted))
             for reason in (r.get("waiting") or {}).get("reasons", ["awaiting_dispatch"]):
                 reasons[reason] = reasons.get(reason, 0) + 1
-        recovery = sum(1 for kind, _, _, r in receipts if not recovery_suppressed(r) and
+        recovery = sum(1 for kind, _, _, r in receipts if not recovery_suppressed(r)
+                       and r.get("_recovery_paused") is not True
+                       and (not r.get("_attempt_finished_at") or kind == "image"
+                            and bool(r.get("result_file_ids") or r.get("result_sediment_ids"))) and
                        (unknown_text_result(r) if kind == "text" else r.get("upstream_unfinished") is True
                         and r.get("status") in {"error", "unknown"}))
         saving = sum(1 for kind, _, _, r in receipts if r.get("status") == "running"
