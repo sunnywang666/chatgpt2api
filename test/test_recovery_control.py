@@ -72,7 +72,9 @@ def test_resume_never_bypasses_cooldown_or_operator_stop(tmp_path):
     text._update("owner", "old-0", recovery_next_at=2000, _recovery_suppressed=True)
     text.recovery_reader = Mock(side_effect=complete)
     for desired in (True, False):
-        text.store.set_recovery_paused("text", "owner", "old-0", desired)
+        control = text.store.set_recovery_paused("text", "owner", "old-0", desired)
+        assert control["state"] == ("paused" if desired else "stopped")
+        assert control["operator_stopped"] is True
     assert raw(text)["recovery_next_at"] == 2000
     assert raw(text)["_recovery_suppressed"] is True
     assert text.read("owner", "old-0")["recovery_control"]["state"] == "stopped"

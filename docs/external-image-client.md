@@ -42,7 +42,8 @@ python3 examples/image_client.py --env-file .image-client.env recovery-resume --
   后续读取不会再启动。当前已开始的有界读取可能包含多次上游 HTTP；暂停不是中途断网。
 - 状态持久化、重复操作幂等。恢复不发送模型请求、不清空原输入/结果/错误/UNKNOWN、不绕过
   `Retry-After` 和已有退避，也不解除工作流暂停或其他停止标记。
-  仍有内部停止标记时返回 `state=stopped, operator_stopped=true`，客户端明确报未恢复。
+  请求恢复到 active 时，若仍有内部停止标记，返回 `state=stopped, operator_stopped=true`，客户端明确报未恢复。
+  请求暂停时，`paused/pausing` 表示本次暂停意图，`operator_stopped=true` 同时说明还存在另一个停止范围。
 - UNKNOWN 的账号占用和同会话顺序保护保留。关联自动纠正的未发送子请求也不能在暂停后越过发送边界。
   该控制不是取消一般排队生成的接口，不会把未知结果改写成失败或成功。
 - 不提供“清空这些 UNKNOWN”的删除接口。删除本地记录不能终止上游，也会失去原结果读回、
