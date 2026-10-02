@@ -438,7 +438,7 @@ def rate_limit_retry_after(line) -> float:
     return retry_after_seconds(str(value)) if value is not None else 0.0
 
 
-def account_pacing_snapshot(account, now=None):
+def account_pacing_snapshot(account, now=None, *, include_turn=True):
     """Read the original clock without booking or advancing a send interval."""
     now = time.time() if now is None else now
     identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
@@ -450,7 +450,8 @@ def account_pacing_snapshot(account, now=None):
         return {"next_at": now, "cooldown_until": None}
     except (OSError, ValueError):
         return {"next_at": None, "cooldown_until": None}
-    values = [saved.get(field) for field in ("next_request", "next_turn", "cooldown_until")]
+    fields = ("next_request", "next_turn", "cooldown_until") if include_turn else ("next_request", "cooldown_until")
+    values = [saved.get(field) for field in fields]
     if any(type(value) not in (int, float) or not math.isfinite(value) for value in values):
         return {"next_at": None, "cooldown_until": None}
     return {"next_at": max(now, *values), "cooldown_until": saved["cooldown_until"]}

@@ -11,6 +11,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 
 
 class WorkLifecycleError(ValueError):
@@ -296,6 +297,15 @@ class WorkLifecycleService:
             return False
         try:
             now = float(self.clock())
+            # Read account identities before the receipt transaction, following
+            # admission's account -> store lock order. Never hold the recovery
+            # worker waiting on a known account cooldown or HTTP pacing slot.
+            accounts = getattr(getattr(self.text, "admission", None), "accounts", None)
+            account_rows = {}
+            if accounts is not None:
+                with getattr(accounts, "admission_transaction", nullcontext)():
+                    read = getattr(accounts, "admission_accounts", None) or accounts.list_accounts
+                    account_rows = {a["provider_account_identity"]: a for a in read() if a.get("provider_account_identity")}
             with self.store.transaction() as db:
                 work = None
                 for (raw,) in db.execute("SELECT value FROM task_runtime WHERE name LIKE 'work:%' ORDER BY name"):
@@ -307,13 +317,23 @@ class WorkLifecycleService:
                             and float(a.get("next_at") or 0) <= now
                             and float(a.get("claim_until") or 0) <= now):
                         try:
-                            _, current, members = self._load(db, candidate["kind"], {"id": candidate["owner"]}, a["request_id"])
+                            receipt, current, members = self._load(db, candidate["kind"], {"id": candidate["owner"]}, a["request_id"])
                             if current["version"] != a["version"] or any(_blocked(r, members=members) for r in members):
                                 raise WorkLifecycleError("WORK_TURN_UNFINISHED")
                         except WorkLifecycleError as exc:
                             a.update(status="unknown", error_code=exc.code, next_at=now + 60)
                             save_work(self.store, db, candidate)
                             continue
+                        account = account_rows.get(receipt.get("provider_account_identity"))
+                        if account is not None:
+                            from services.account_request_pacing import account_pacing_snapshot
+                            ready_at = account_pacing_snapshot(account, now, include_turn=False)["next_at"]
+                            if ready_at is None or ready_at > now:
+                                a["next_at"] = now + 60 if ready_at is None else ready_at
+                                if ready_at is None:
+                                    a.update(status="unknown", error_code="ACCOUNT_PACING_UNAVAILABLE")
+                                save_work(self.store, db, candidate)
+                                continue
                         work = candidate
                         break
                 if work is None:

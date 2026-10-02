@@ -1,4 +1,5 @@
 import json
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -190,3 +191,86 @@ def test_binding_alias_cannot_bypass_paused_work_and_other_kind_unknown_blocks_a
     with pytest.raises(WorkLifecycleError, match="WORK_TURN_UNFINISHED"):
         service.update("text", {"id": "one"}, "A-1", "completed", True)
     assert calls == []
+
+
+@pytest.mark.parametrize("kind", ["text", "image"])
+@pytest.mark.parametrize("desired", [True, False])
+def test_cooling_account_does_not_block_other_original_archive_or_restore(runtime, monkeypatch, tmp_path, kind, desired):
+    from services import account_request_pacing as pacing
+    service, store, clock, calls, _, add = runtime
+    def image_archive(identity, request_id, archived):
+        calls.append((identity["id"], request_id, archived))
+        return {"task_id": request_id, "archived": archived, "image_thread": {"id": request_id.split("-")[0]}}
+    service.images.set_thread_archived = image_archive
+    rows = [add("A-1"), add("B-2")]
+    if kind == "image":
+        with store.transaction() as db:
+            for receipt in rows:
+                request_id = receipt["request_id"]
+                db.execute("DELETE FROM requests WHERE owner=? AND id=?", ("one", request_id))
+                receipt.update(id=request_id, owner_id="one", status="success", _image_thread={"id": request_id.split("-")[0]})
+                work = store.runtime(db, receipt["_work_key"])
+                work["kind"] = "image"
+                store.set_runtime(db, work["key"], work)
+                store.write_receipt(db, "image", "one", request_id, receipt)
+    for receipt in rows:
+        service.update(kind, {"id": "one"}, receipt["request_id"], "completed", True)
+    if not desired:
+        assert service.process_one() and service.process_one()
+        calls.clear()
+        for receipt in rows:
+            service.update(kind, {"id": "one"}, receipt["request_id"], "active")
+    cold, ready = sorted(rows, key=lambda r: r["_work_key"])
+    accounts = []
+    with store.transaction() as db:
+        for label, receipt in [("cold", cold), ("ready", ready)]:
+            receipt["provider_account_identity"] = label
+            store.write_receipt(db, kind, "one", receipt["request_id"], receipt)
+            accounts.append({"provider_account_identity": label, "account_id": "workspace-" + label})
+    service.text.admission = SimpleNamespace(accounts=SimpleNamespace(admission_accounts=lambda: accounts), wake=lambda: None)
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    folder = tmp_path / "account_request_clocks"
+    folder.mkdir()
+    cold_path = folder / (hashlib.sha256(b"workspace-cold").hexdigest() + ".json")
+    cold_path.write_text(json.dumps({"next_request": 1100, "next_turn": 1200, "cooldown_until": 1060}))
+    ready_path = folder / (hashlib.sha256(b"workspace-ready").hexdigest() + ".json")
+    # A future model-message slot must not delay a GET/PATCH archive operation.
+    ready_path.write_text(json.dumps({"next_request": 999, "next_turn": 2000, "cooldown_until": 0}))
+    assert service.process_one()
+    assert calls == [("one", ready["request_id"], desired)]
+    deferred = service.get(kind, {"id": "one"}, cold["request_id"])
+    assert deferred["archive"]["status"] == "pending"
+    assert deferred["archive"]["attempts"] == 0
+    assert deferred["archive"]["next_at"] == 1100
+    assert deferred["slot_held"] is False
+    restarted = WorkLifecycleService(service.text, service.images, clock=lambda: clock[0])
+    assert not restarted.process_one(target_key=cold["_work_key"])
+    clock[0] = 1100
+    assert restarted.process_one(target_key=cold["_work_key"])
+    assert calls[-1] == ("one", cold["request_id"], desired)
+    result = restarted.get(kind, {"id": "one"}, cold["request_id"])
+    assert result["archive"]["status"] == "confirmed" and result["archive"]["attempts"] == 1
+    assert result["state"] == ("completed" if desired else "active")
+
+
+def test_unreadable_account_clock_defers_archive_without_claim_or_http(runtime, monkeypatch, tmp_path):
+    from services import account_request_pacing as pacing
+    service, store, _, calls, _, add = runtime
+    receipt = add("A-1")
+    receipt["provider_account_identity"] = "original-account"
+    with store.transaction() as db:
+        store.write_receipt(db, "text", "one", "A-1", receipt)
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    service.text.admission = SimpleNamespace(accounts=SimpleNamespace(admission_accounts=lambda: [
+        {"provider_account_identity": "original-account", "account_id": "workspace"}]))
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    folder = tmp_path / "account_request_clocks"
+    folder.mkdir()
+    (folder / (hashlib.sha256(b"workspace").hexdigest() + ".json")).write_text("broken")
+    assert not service.process_one()
+    assert calls == []
+    result = service.get("text", {"id": "one"}, "A-1")
+    assert result["archive"]["status"] == "unknown"
+    assert result["archive"]["error_code"] == "ACCOUNT_PACING_UNAVAILABLE"
+    assert result["archive"]["next_at"] == 1060
+    assert result["archive"]["attempts"] == 0 and result["slot_held"] is False
