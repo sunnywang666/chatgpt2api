@@ -564,6 +564,9 @@ class TextTaskService:
                         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
                     anchor[key] = value
             empty = recovered.get("_empty_reply_evidence")
+            from services.generation_completion import retry_evidence
+            retry = retry_evidence({**(receipt or {}), "_retry_cursor": recovered.get("_retry_cursor")})
+            anchor["_retry_cursor"] = retry
             if empty is not None:
                 valid_empty = cls._safe_empty_reply_evidence(empty, receipt or {})
                 if (not valid_empty or any(not (receipt or {}).get(k) or recovered.get(k) != receipt[k]
@@ -824,6 +827,7 @@ class TextTaskService:
                     key: value for key, value in (recovered or {}).items()
                     if (
                         key in {RECOVERY_CONVERSATION_SCAN_FIELD, TURN_END_EVIDENCE_FIELD, "_upstream_terminal", "_turn_reserved"}
+                        or key == "_retry_cursor" and not current.get("_completion", {}).get("replacement_id")
                         or key == "_empty_reply_evidence" and not current.get("_completion", {}).get("replacement_id")
                         or key == RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD
                         or key in {"conversation_id", "parent_message_id", "request_parent_message_id"}
@@ -1013,6 +1017,7 @@ class TextTaskService:
                     row = (json.dumps(previous),)
                 if (previous.get("_recovery_suppressed") is not True
                         and previous.get("_recovery_paused") is not True
+                        and not previous.get("_attempt_finished_at")
                         and unknown_text_result(previous)
                         and previous.get("request_message_id")
                         and previous.get("provider_binding_id")
@@ -1151,7 +1156,7 @@ class TextTaskService:
             )
             return self._public(updated)
 
-    def _update(self, owner, request_id, **changes):
+    def _update(self, owner, request_id, *, classify_before_send=False, **changes):
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
@@ -1170,6 +1175,8 @@ class TextTaskService:
                 # original evidence. Only the exact-ID recovery path may adopt
                 # its subsequently verified upstream result.
                 return
+            if classify_before_send and receipt.get("_submission_started") is False:
+                changes.update(upstream_outcome="not_sent", _turn_reserved=False)
             receipt = {**receipt, **changes, "updated_at": self._now()}
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
 
@@ -1397,6 +1404,15 @@ class TextTaskService:
                 reject("CHAT_CONVERSATION_CONFLICT")
             terminal_empty = bool(body.get("_continue_after_terminal_empty"))
             evidence = self._verified_retryable_empty(previous) if terminal_empty else None
+            retry_attempt = bool(body.get("_continue_after_failed_attempt"))
+            if retry_attempt:
+                from services.generation_completion import retry_evidence
+                state = previous.get("_completion") or {}
+                evidence = retry_evidence(previous)
+                if (not evidence or state.get("replacement_id") != receipt["request_id"]
+                        or body.get("_completion_of") != previous_id or state.get("selected_id")
+                        or previous.get("model") != receipt.get("model")):
+                    reject("COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
             if terminal_empty and (not evidence or previous.get("model") != receipt.get("model")):
                 reject("CHAT_TERMINAL_EMPTY_UNVERIFIED")
             if previous.get("status") != "succeeded" and not evidence:
@@ -1425,7 +1441,7 @@ class TextTaskService:
             if not previous.get("_public_session_ref"):
                 receipt["_legacy_session_anchor"] = previous_id
             receipt["_submission_parent_message_id"] = parent
-            if evidence:
+            if evidence and not retry_attempt:
                 receipt["_terminal_empty_correction_of"] = previous_id
         receipt["_public_session_ref"] = body["_public_session_ref"]
 
@@ -1513,6 +1529,10 @@ class TextTaskService:
                                 "_input_bytes": _retained_size(body),
                                 "_turn_reserved": False,
                                 "_submission_started": False})
+                if (receipt.get("_public_session_ref") and not receipt.get("_completion_of")
+                        and receipt.get("_route") == "chat" and receipt.get("_operation") == "text"
+                        and not receipt.get("_forward_protocol")):
+                    receipt["_automatic_generation_recovery"] = True
                 for field in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id"):
                     if body.get(field):
                         receipt[field] = body[field]
@@ -1666,6 +1686,33 @@ class TextTaskService:
             from services.durable_forward import run
             return run(self, owner, request_id, body)
         try:
+            if receipt.get("_same_session_retry_of"):
+                from services.generation_completion import retry_evidence, same_session_retry
+                with self.store.connect() as db:
+                    original = self.store.read_receipt(db, "text", owner, receipt["_same_session_retry_of"])
+                try:
+                    fresh = self.recovery_reader(original) if same_session_retry(original, receipt) else None
+                    validated, error, _, _ = self._safe_recovery_result(fresh, original)
+                    if validated and not error:
+                        # This is a verified original read, not a late runner
+                        # callback. It may finish a locally retired attempt.
+                        with self.store.transaction() as db:
+                            recovered = self.store.read_receipt(db, "text", owner, original["request_id"])
+                            if (same_session_retry(recovered, receipt) and recovered.get("status") != "succeeded"
+                                    and recovered.get("request_message_id") == original.get("request_message_id")):
+                                recovered.update(validated)
+                                recovered.update(status="succeeded", upstream_outcome="completed", _turn_reserved=False)
+                                self.store.write_receipt(db, "text", owner, original["request_id"], recovered)
+                    saved = retry_evidence(original or {})
+                    current = retry_evidence({**(original or {}), "_retry_cursor": (validated or {}).get("_retry_cursor")})
+                    if not saved or not current or any(current[k] != saved[k] for k in (
+                            "conversation_id", "request_message_id", "retry_parent_message_id")):
+                        raise ValueError("original branch changed")
+                except Exception:
+                    self._update(owner, request_id, status="failed", error_code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED",
+                                 upstream_outcome="not_sent", _turn_reserved=False, finished_at=self._now())
+                    return
+                body = {**body, "_failed_retry_original": original}
             if receipt.get("_supersedes_request_id"):
                 with self.store.transaction() as db:
                     previous = self._validate_supersede(self.store, db, owner, receipt, self._now())
@@ -1765,6 +1812,7 @@ class TextTaskService:
                 if (value := getattr(exc, key, None)) is not None and value != ""
             }
             self._update(owner, request_id, **cursor, **diagnostic,
+                         classify_before_send=exc.code != "CONVERSATION_OUTCOME_UNKNOWN",
                          status="unknown" if exc.code == "CONVERSATION_OUTCOME_UNKNOWN" else "failed",
                          error_code=exc.code, finished_at=self._now())
         except Exception:

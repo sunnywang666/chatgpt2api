@@ -165,6 +165,8 @@ def project_public_models(result: object) -> dict[str, Any]:
 
 
 EXECUTION_ENUMS = {
+    "attempt_state": {"active", "ended", "succeeded"},
+    "result_state": {"available", "empty", "incomplete", "not_found", "read_failed", "unknown"},
     "phase": {"queued", "preparing", "sending", "receiving", "recovering", "stalled", "completed", "failed", "unknown"},
     "send_state": {"not_sent", "attempted", "response_received", "unknown"},
     "local_state": {"not_started", "active", "ended", "unknown"},
@@ -246,7 +248,7 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
     from services.text_task_service import TextTaskService
     empty_local_released = (receipt.get("_turn_reserved") is False
                             and TextTaskService._verified_retryable_empty(receipt))
-    accounted = turn_active and not empty_local_released and (unknown_text_result(receipt) or receipt.get("_turn_reserved", True))
+    accounted = turn_active and not receipt.get("_attempt_finished_at") and not empty_local_released and (unknown_text_result(receipt) or receipt.get("_turn_reserved", True))
     resources = {
         "local_worker": "active" if local == "active" else "idle" if local in {"ended", "not_started"} else "unknown",
         "account_turn": ("held" if receipt.get("provider_account_identity") or receipt.get("_account_resource")
@@ -260,8 +262,13 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
     stream = next((item for item in reversed(receipt.get("_execution_timeline") or [])
                    if isinstance(item, dict) and item.get("stage") == "stream_finished"), {})
     return safe_public_execution({
+        "attempt_state": "succeeded" if status == "succeeded" else "ended" if receipt.get("_attempt_finished_at") or status == "failed" else "active",
+        "result_state": ("available" if status == "succeeded" else
+            {"REQUEST_RESULT_TERMINAL_EMPTY": "empty", "REQUEST_RESULT_INCOMPLETE": "incomplete",
+             "REQUEST_RESULT_NOT_FOUND": "not_found", "REQUEST_MESSAGE_NOT_FOUND": "not_found"}.get(
+                 receipt.get("recovery_reason"), "read_failed" if receipt.get("recovery_error_code") not in {None, "", "UPSTREAM_OUTCOME_UNKNOWN"} else "unknown")),
         "phase": phase, "send_state": send_state, "local_state": local,
-        "wait_state": "completed" if status == "succeeded" else "ended" if wait_end or status == "failed"
+        "wait_state": "completed" if status == "succeeded" else "ended" if wait_end or status == "failed" or receipt.get("_attempt_finished_at")
                       else "waiting" if status in {"queued", "running", "unknown"} else "unknown",
         "upstream_outcome": outcome, "upstream_status": latest.get("status"),
         "accepted_at": receipt.get("created_at"), "sent_at": sent, "response_received_at": response,

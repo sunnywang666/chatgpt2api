@@ -106,6 +106,12 @@ def test_queued_http_receipt_survives_process_restart_without_resubmission(tmp_p
         receipt = _success(port, key, body["client_request_id"])
         assert receipt["content"] == "synthetic saved answer"
         status, repeated = _http(port, key, "POST", "/api/chat-requests", body)
+        # Runtime claim occupancy can settle between the two reads; immutable
+        # identity, input/result and other receipt evidence must remain equal.
+        for value in (receipt, repeated):
+            control = value.get("recovery", {}).get("control", {})
+            assert isinstance(control.get("in_flight"), bool)
+            control.pop("in_flight")
         assert status == 200 and repeated == receipt
         assert _http(port, key, "POST", "/api/chat-requests", {**body, "messages": [{"role": "user", "content": "changed"}]})[0] == 409
     assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"queued-original"']
@@ -523,7 +529,8 @@ def _serve_images(root, completion=False, fair_recovery=False):
     rt.accounts.refresh_image_capability = rt.accounts._refresh_pool_chat
     def render(body):
         ctx = current_request.get()
-        if completion and ctx.request_id == "image-original":
+        if completion and ctx.request_id == "image-original" and not (root / "unsent-observed").exists():
+            (root / "unsent-observed").touch()
             exc = RuntimeError("controlled known-unsent failure")
             exc.code, exc.upstream_submitted = "IMAGE_GENERATION_NOT_SUBMITTED", False
             raise exc
@@ -557,6 +564,7 @@ def _serve_images(root, completion=False, fair_recovery=False):
         text_module.text_task_service = text_module.TextTaskService(rt.store.path, admission=rt.admission)
         image_module.image_task_service = rt.tasks
         rt.admission.work_lifecycle = WorkLifecycleService(text_module.text_task_service, rt.tasks)
+        GenerationCompletionService.RECHECK_SECONDS = .05
         rt.admission.generation_completion = GenerationCompletionService(text_module.text_task_service, rt.tasks, rt.admission.work_lifecycle)
         def archive(identity, task_id, archived):
             task = rt.tasks.list_tasks(identity, [task_id])["items"][0]
@@ -644,7 +652,7 @@ def test_http_completion_cli_saves_reviews_archives_and_restores_selected_result
         chosen = _wait(selected)
         child = chosen["selected_id"]
         assert child != "completion-original" and chosen["original_cleanup"] == ("not_required" if same_session else "pending")
-        assert chosen["conversation_mode"] == ("original" if same_session else "reconstructed")
+        assert chosen["conversation_mode"] == "original"
         cli(port, key, "chat-completion-complete", "--reviewed", expected=1)
     with _server(tmp_path, mode) as (port, key, _):
         assert cli(port, key, "chat-completion-status")["selected_id"] == child
@@ -652,13 +660,14 @@ def test_http_completion_cli_saves_reviews_archives_and_restores_selected_result
         saved = json.loads(output.read_text())
         assert saved["request_id"] == child and saved["content"] == "synthetic saved answer"
         done = cli(port, key, "chat-completion-complete", "--reviewed")
-        assert done["state"] == "completed" and done["original_cleanup"] == ("not_required" if same_session else "pending")
+        assert done["state"] == "completed" and done["original_cleanup"] == ("not_required" if same_session else "completed")
         endpoint = "/api/chat-requests/completion-original/completion"
         _wait(lambda: _http(port, key, "GET", endpoint)[1].get("work", {}).get("archive", {}).get("status") == "confirmed")
         cli(port, key, "chat-completion-rework")
         _wait(lambda: _http(port, key, "GET", endpoint)[1].get("work", {}).get("state") == "active")
         (tmp_path / "original-completed").touch()
-        _success(port, key, "completion-original")
+        # Retired original attempts stop polling; retained evidence stays readable.
+        assert _http(port, key, "GET", "/api/chat-requests/completion-original")[1]["status"] == "unknown"
         assert cli(port, key, "chat-completion-status")["selected_id"] == child
         assert json.loads(state.read_text())["request_id"] == "completion-original"
         assert json.loads(state.read_text())["completion_output"]["selected_id"] == child
@@ -666,8 +675,7 @@ def test_http_completion_cli_saves_reviews_archives_and_restores_selected_result
     archives = [json.loads(line) for line in (tmp_path / "archives.jsonl").read_text().splitlines()]
     assert any(a["request_id"] == child and a["archived"] for a in archives)
     assert any(a["request_id"] == child and not a["archived"] for a in archives)
-    if same_session:
-        assert all(a["conversation_id"] == "controlled-original-conversation" for a in archives)
+    assert all(a["conversation_id"] == "controlled-original-conversation" for a in archives)
 
 
 def test_http_image_completion_cli_downloads_real_bytes_before_acknowledging(tmp_path):
@@ -682,11 +690,11 @@ def test_http_image_completion_cli_downloads_real_bytes_before_acknowledging(tmp
             assert result.returncode == 0, result.stderr
             return json.loads(result.stdout)
         cli("submit", "--client-task-id", "image-original", "--thread-id", "image-work", "--prompt", "controlled image", "--model", "gpt-image-2")
-        _wait(lambda: _http(port, key, "GET", "/api/image-tasks?ids=image-original")[1]["items"][0]["status"] == "error")
+        _wait(lambda: _http(port, key, "GET", "/api/image-tasks?ids=image-original")[1]["items"][0].get("completion"))
         cli("completion-recover")  # Confirmed unsent failure needs no UNKNOWN opt-in.
         endpoint = "/api/image-tasks/image-original/completion"
         chosen = _wait(lambda: (r if (r := _http(port, key, "GET", endpoint)[1]).get("selected_id") else None))
-        assert chosen["selected_id"] != "image-original"
+        assert chosen["selected_id"] == "image-original"  # Definite pre-send retry retains the original ID.
         cli("completion-save", "--output", output)
         assert output.read_bytes() == base64.b64decode(_FIXTURE_PNG)
         assert cli("completion-complete", "--reviewed")["state"] == "completed"
@@ -765,7 +773,8 @@ def _serve(root, mode):
             current_request.get().record_stage("response_headers_received", status_code=200)
             current_request.get().record_stage("stream_finished", stream_end="done" if mode == "empty-retry" else "transport_error",
                                                sse_data_count=3, sse_parse_errors=0, sse_error_event=False)
-            on_cursor({"conversation_id": "controlled-original-conversation"})
+            on_cursor({"conversation_id": "controlled-original-conversation",
+                       **({"_automatic_generation_recovery": False} if mode == "stalled-completion" else {})})
             raise ConversationBindingError("controlled interrupted stream", code="CONVERSATION_OUTCOME_UNKNOWN")
         if mode == "blocked-send":
             _wait(lambda: (root / "release-send").exists(), timeout=10)
@@ -778,6 +787,8 @@ def _serve(root, mode):
                 with store.connect() as db:
                     previous = store.read_receipt(db, "text", current_request.get().owner, body["_previous_request_id"])
                 assert body["parent_message_id"] == tasks._verified_retryable_empty(previous)["retry_parent_message_id"]
+            elif body.get("_continue_after_failed_attempt"):
+                assert body["parent_message_id"] == body["_failed_retry_original"]["_retry_cursor"]["retry_parent_message_id"]
             elif body.get("_previous_request_id"):
                 assert body["parent_message_id"] == "answer-" + body["_previous_request_id"]
             result.update(provider_binding_id=body.get("provider_binding_id") or "fixture-binding",
@@ -799,6 +810,8 @@ def _serve(root, mode):
         from test.test_stalled_text_diagnostics import mixed_chain
         def original_read(row):
             doc = document(row)
+            doc["is_archived"] = False
+            doc["mapping"][row["request_message_id"]]["parent"] = row.get("request_parent_message_id") or "parent"
             mixed_chain(doc)
             message = doc["mapping"]["final-" + row["request_message_id"]]["message"]
             if (root / "original-completed").exists():
@@ -827,7 +840,7 @@ def _serve(root, mode):
         if mode in {"stalled-completion", "completion", "same-session-completion", "empty-retry"}:
             from services.generation_completion import GenerationCompletionService
             GenerationCompletionService.STALL_SECONDS = .05
-            GenerationCompletionService.INVESTIGATION_SECONDS = .05
+            GenerationCompletionService.INVESTIGATION_SECONDS = .5
             GenerationCompletionService.RECHECK_SECONDS = .05
             admission.generation_completion = GenerationCompletionService(tasks, SimpleNamespace(), admission.work_lifecycle)
 

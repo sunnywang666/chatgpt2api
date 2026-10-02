@@ -1460,8 +1460,30 @@ def _generate_bound_single_image(
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             thread = getattr(request.progress_callback, "image_thread", None)
+            failed_original = getattr(request.progress_callback, "failed_retry_original", None)
             try:
-                if thread and request.conversation_id:
+                if failed_original or getattr(request.progress_callback, "failed_retry_required", False):
+                    def check_retry(send=None):
+                        from services.generation_completion import retry_cursor, retry_evidence
+                        if (not isinstance(failed_original, dict) or failed_original.get("result_file_ids")
+                                or failed_original.get("result_sediment_ids") or failed_original.get("data")
+                                or failed_original.get("recovery_phase") == "download_image_result"):
+                            raise ImageGenerationError("original retry evidence unavailable",
+                                code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED", upstream_submitted=False)
+                        try:
+                            document = backend._get_conversation(request.conversation_id, **({"_send": send} if send else {}))
+                        except Exception as exc:
+                            raise ImageGenerationError("original retry branch read unavailable",
+                                code="COMPLETION_ORIGINAL_READ_UNAVAILABLE", upstream_submitted=False) from exc
+                        current = retry_cursor(document, failed_original, kind="image")
+                        saved = retry_evidence(failed_original)
+                        if not current or not saved or any(current[k] != saved[k] for k in (
+                                "conversation_id", "request_message_id", "retry_parent_message_id")):
+                            raise ImageGenerationError("original retry branch changed",
+                                code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED", upstream_submitted=False)
+                    check_retry()
+                    backend.image_pre_send_check = check_retry
+                elif thread and request.conversation_id:
                     try:
                         prior_message = getattr(request.progress_callback, "image_thread_predecessor_message", None)
                         document = backend._get_conversation(request.conversation_id)

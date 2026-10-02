@@ -110,7 +110,7 @@ def fixture_handler(state: FixtureState):
             if parsed.path in {"/ai/api/image-tasks/generations", "/ai/api/image-tasks/edits"}:
                 if state.expected_state_path is not None and state.expected_state_path.exists():
                     durable = json.loads(state.expected_state_path.read_text(encoding="utf-8"))
-                    state.prepared_state_seen = durable.get("phase") == "prepared"
+                    state.prepared_state_seen = durable.get("phase") == "unknown"
                 if parsed.path.endswith("generations"):
                     payload = json.loads(body)
                     task_id = payload["client_task_id"]

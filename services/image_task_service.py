@@ -44,6 +44,8 @@ class ConversationImageAdoptionError(ValueError):
 
 
 def _holds_upstream_slot(task: dict[str, Any]) -> bool:
+    if task.get("_attempt_finished_at") and not task.get("_executing"):
+        return False
     if "upstream_unfinished" in task:
         return task["upstream_unfinished"] is True
     # Old receipts did not distinguish local execution from upstream work.
@@ -471,6 +473,7 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "recovery_control": recovery_control(task),
+        "attempt_state": "succeeded" if task.get("status") == TASK_STATUS_SUCCESS else "ended" if task.get("_attempt_finished_at") else "active",
         "id": task.get("id"),
         "status": task.get("status"),
         "mode": task.get("mode"),
@@ -482,6 +485,10 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     }
     if task.get("_scheduling") is not None:
         item["scheduling"] = task["_scheduling"]
+    if isinstance(task.get("_completion"), dict):
+        item["completion"] = {k: task["_completion"][k] for k in (
+            "state", "reason", "replacement_id", "selected_id", "conversation_mode", "max_extra_requests")
+            if k in task["_completion"]}
     if task.get("_requested_account_ref"):
         item["account_ref"] = task["_requested_account_ref"]
     if public_thread(task):
@@ -903,6 +910,12 @@ class ImageTaskService:
             accept_thread(task, self._tasks.values(), payload, mode, output_reader=read_source)
             from services.generation_completion import attach_replacement
             attach_replacement(self.store, self._transaction_local.db, "image", owner, task_id, payload, task)
+            if task.get("_same_session_retry_of"):
+                root_id = task["_same_session_retry_of"]
+                self._tasks[owner + ":" + root_id] = self.store.read_receipt(
+                    self._transaction_local.db, "image", owner, root_id)
+            if task.get("retain_receipt") and not task.get("_completion_of") and task.get("_route", "chat") == "chat":
+                task["_automatic_generation_recovery"] = True
             from services.workflow_scheduling import prepare_receipt
             from services.work_lifecycle import ensure_work
             prepare_receipt(task, payload.get("_scheduling"), task["_source"])
@@ -1092,6 +1105,8 @@ class ImageTaskService:
             progress_callback.image_thread_result_ids = result_ids
         progress_callback.record_result_ids = record_result_ids
         progress_callback.image_thread = payload.get("_image_thread")
+        progress_callback.failed_retry_original = payload.get("_failed_retry_original")
+        progress_callback.failed_retry_required = bool(payload.get("_continue_after_failed_attempt"))
         progress_callback.image_thread_predecessor_message = payload.get("_image_thread_predecessor_message")
         progress_callback.image_thread_predecessor_result_ids = payload.get("_image_thread_predecessor_result_ids")
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
@@ -1580,7 +1595,8 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 raise ValueError("task not found")
-            if task.get("_recovery_suppressed") is True or task.get("_recovery_paused") is True:
+            saved_image = bool(task.get("result_file_ids") or task.get("result_sediment_ids"))
+            if task.get("_recovery_suppressed") is True or task.get("_recovery_paused") is True or task.get("_attempt_finished_at") and not saved_image:
                 # Keep this endpoint observational while an operator has
                 # explicitly stopped the old recovery path.
                 return _public_task(task)
@@ -1589,9 +1605,10 @@ class ImageTaskService:
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
             recheck = completion_recheck and bool(task.get("_completion")) and task.get("upstream_outcome") == "unknown"
-            if _clean(task.get("error_code")) == "RESULT_UNRECOVERABLE" and not recheck:
+            if _clean(task.get("error_code")) == "RESULT_UNRECOVERABLE" and not recheck and not saved_image:
                 return _public_task(task)
-            if _clean(task.get("error_code")) != "CONVERSATION_OUTCOME_UNKNOWN" and not recheck:
+            if (_clean(task.get("error_code")) != "CONVERSATION_OUTCOME_UNKNOWN" and not recheck
+                    and not (saved_image and task.get("error_code") == "RESULT_UNRECOVERABLE")):
                 raise ValueError("task outcome is not unknown")
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
@@ -2075,6 +2092,8 @@ class ImageTaskService:
                 try:
                     document = backend._get_conversation(conversation_id)
                     conversation_available = True
+                    from services.generation_completion import retry_cursor
+                    self._update_task(key, _retry_cursor=retry_cursor(document, task, kind="image"))
                 except Exception as exc:
                     if _upstream_status_code(exc) != 404:
                         raise
@@ -2267,7 +2286,9 @@ class ImageTaskService:
             if isinstance(exc, ImageContentPolicyError):
                 error_code = "content_policy_violation"
             terminal = error_code in {"NO_IMAGE_GENERATED", "content_policy_violation"}
-            unrecoverable = qualified_reads >= UNRECOVERABLE_QUALIFIED_READS
+            # A captured image is a download obligation, even if earlier reads
+            # exhausted the no-result budget. Keep its retry/cooldown evidence.
+            unrecoverable = qualified_reads >= UNRECOVERABLE_QUALIFIED_READS and not result_captured
             recovery_phase = (
                 "download_image_result" if result_captured else "read_image_request"
             )

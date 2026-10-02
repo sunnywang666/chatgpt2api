@@ -214,7 +214,7 @@ Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `
 
 `observation_started_at` 是首次有效原结果观察，`last_checked_at` 是最近有效观察，`last_progress_at` 仅在同一原请求的有效消息结构、状态或文本长度发生变化时出现。原分支的已知 `code`、`execution_output`、`thoughts`、`reasoning_recap` 封装也可观测，只保留类型、长度和条目计数，不持久化或公开正文；未知／媒体封装不计为有效空结果。上游 `update_time` 单独变化、无关分支变化、网络／429／授权失败不算进展。对持续 `REQUEST_RESULT_INCOMPLETE`，至少 15 分钟无可验证变化且至少 3 次有效无变化读后，持久化 `phase=stalled / wait_state=ended / wait_ended_at`：本次结果等待异常结束，原 `status=unknown` 和上游结果未知仍保留。此标记本身**不释放**账号 turn，也不放行任意同会话后续；已确认空回复的唯一关联重试按下文转交原占用，它与已有 `RESULT_UNRECOVERABLE` 合格无结果释放规则分开。迟到结果仍沿原 ID 接回，重启不重置观察或结束记录。
 
-客户端读到 `wait_state=ended` 应停止本次前台等待，保存原 ID、输入和最后回执，显示未确认的原因、`recovery.attempt/reason/next_at`，以后仍沿原 ID 恢复。`resources.local_worker/account_turn/conversation` 分别解释本地执行、账号执行位置、会话保护；工作槽位和归档以 `/work` 回执为准。示例显示：“请求已发送并收到响应；本地执行已结束；原结果连续无可验证进展，本次等待结束；上游结果未知，账号执行位置仍占用，同会话后续受保护。尚未确认空回复时禁止自动重发；确认后显示 completion 的关联重试和结果。” 这是工程状态合同，不是对生产或真实上游已恢复的声明。
+客户端读到 `wait_state=ended` 应停止本次前台等待，保存原 ID、输入和最后回执，显示未确认的原因、`recovery.attempt/reason/next_at`，旧策略以后仍沿原 ID 恢复；下文新请求的有界处置结束旧尝试后停止自动查询，保留证据并显示接续结果或确切阻塞。`resources.local_worker/account_turn/conversation` 分别解释本地执行、账号执行位置、会话保护；工作槽位和归档以 `/work` 回执为准。示例显示：“请求已发送并收到响应；本地执行已结束；原结果连续无可验证进展，本次等待结束；上游结果未知，账号执行位置仍占用，同会话后续受保护。尚未确认空回复时禁止自动重发；确认后显示 completion 的关联重试和结果。” 这是工程状态合同，不是对生产或真实上游已恢复的声明。
 
 持续推进的应用可在现有 `/api/chat-requests` 请求中提供 `client_conversation_id`；这是调用者的工作会话引用，不是上游 ChatGPT conversation ID。每轮使用不同的 `client_request_id`，除首轮外传 `previous_request_id` 指向已受理的同会话原请求。每次只提供新增输入/工具结果与必要附件，不把全部旧历史再次追加。服务在原 owner 范围和原 SQLite 插入事务中核对前序、唯一后继，并沿前轮实际账号、上游会话和已证明最终回答承接；不允许客户端传管理绑定或原始上游游标。
 
@@ -373,7 +373,7 @@ false. `local_reservation=transferred/released` reports local accounting explici
 
 GET of the original request exposes `completion` progress, `replacement_id`,
 `selected_id` and the selected result without rewriting the original receipt.
-The supplied CLI's normal `chat-save` saves that selected result and retains both
+The supplied CLI's normal `chat-save` (images: `download`) saves that selected result and retains both
 IDs. A second empty reply stops automatic sends (`COMPLETION_ATTEMPT_EXHAUSTED`)
 and releases that verified-empty attempt's local account turn while preserving
 UNKNOWN and conversation ordering for diagnosis; no silent prompt shortening, new account,
@@ -391,15 +391,42 @@ response rule return `COMPLETION_ORIGINAL_END_UNCONFIRMED`. The current adapter
 has no verified remote stop operation; no local disconnect or archive pretends
 to stop upstream generation. Image `/resume-poll` remains result recovery only.
 
-Only as a separately permitted fallback, pass `allow_unconfirmed_retry:true`
-to allow a reconstructed **new conversation** after 15 minutes of stalled
-progress plus the bounded five-minute investigation. This does not override an
-explicit account_ref or known account/workflow capacity. Missing retained
-context blocks reconstruction. Existing image artifacts are downloaded, never
-redrawn. The original UNKNOWN's conservative occupancy remains until supported
-end evidence is obtained; it is not proof that the remote account is busy.
-This API excludes external business writes and Codex routes. Repeated calls and
-restarts reuse the same reserved attempt; no attempt can create another retry.
+Newly accepted native Chat text and retained Chat image generation requests also
+use bounded failure recovery. An explicitly unsubmitted transient failure is
+requeued once under the **same request ID and exact stored input**. Long-stalled
+sent attempts get a 15-minute no-progress window plus a bounded five-minute
+investigation. Only a fresh, unbranched original user-message chain with no usable
+result permits one linked retry in the **original account and conversation**.
+The current head is rechecked immediately before POST. Partial text, generated
+image references, a later user turn, missing history, failed reads or unknown
+bindings block this path; the service does not reconstruct another conversation.
+Known image results only resume download. The retry keeps the original prompt,
+model, account selection, scheduling and image inputs; it never silently shortens
+or rewrites a task. Historical UNKNOWN receipts are not opted in by an upgrade.
+The existing `allow_unconfirmed_retry:true` flag explicitly enables this same
+bounded original-conversation policy for an older pure-generation request; it
+no longer authorizes a new conversation.
+
+When a bounded attempt is retired, automatic reads of that attempt stop and its
+local turn is released or transferred to its unique child. After a second failed
+attempt, `COMPLETION_ATTEMPT_EXHAUSTED` ends automatic sending and releases the
+work slot only if no other member is executing, reading or pending. A query
+failure keeps its real error and UNKNOWN evidence; it is never rewritten as
+“not sent.” `execution.attempt_state=ended` and `execution.result_state` distinguish
+this local ending from an upstream terminal result. Other operator pauses remain
+in force. A successful child still requires actual save/review before completion,
+archive and rework of that original conversation. No remote cancellation or
+exactly-once guarantee is implied. These rules exclude external business writes,
+compatibility forwarding and Codex routes.
+
+The independent client accepts explicit authenticated `recovery.upstream_outcome`
+or `detail.upstream_outcome=not_sent` as transport evidence. A transient 429/503
+with Retry-After permits one automatic same-ID transport retry; long cooldowns
+are persisted for a later invocation. A subsequent invocation may resend only
+when this proof is retained, input is unchanged and the exact original ID is
+absent. HTTP 404/429 alone, a timeout or a client crash never proves non-submission.
+The client saves `phase=unknown` before each POST and replaces that state only
+with an actual response; it never clears the original ID.
 
 `GET` the same `/completion` to inspect `state`, `reason`, `waiting`,
 `original_status`, `replacement_status`, `replacement_id` and `selected_id`.
@@ -429,8 +456,8 @@ its shared work only after the verified correction has succeeded and its result
 is selected; an ended-empty original alone cannot be marked completed. `work.archive` reports pending, failure
 or confirmation; `original_work.cleanup_pending` separately preserves old
 unknown occupancy and its deferred cleanup. Rework restores the selected
-conversation and never sends a new model request. A reconstructed conversation
-is explicitly identified; it is never presented as recovery of the old unknown
-conversation. Applications continue using the selected result's public session
-reference and ID after confirmed restore. Existing clients do not opt in merely
-by upgrading, timing out or receiving UNKNOWN.
+conversation and never sends a new model request. The original conversation
+is retained. Applications continue using the selected result's public session
+reference and ID after confirmed restore. Historical UNKNOWN receipts do not
+opt in merely because the service upgrades; new pure-generation requests use
+the bounded policy described above.

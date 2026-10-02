@@ -107,6 +107,14 @@ def accept_thread(task, tasks, payload, mode, *, output_reader=saved_image_bytes
     owner, thread_id = task["owner_id"], fields["image_thread_id"]
     owned = {r["id"]: r for r in tasks if r.get("owner_id") == owner}
     members = [r for r in owned.values() if (r.get("_image_thread") or {}).get("id") == thread_id]
+    def cancelled_replacement(row):
+        original = owned.get(row.get("_completion_of")) or {}
+        state = original.get("_completion") or {}
+        return (original.get("status") == "success" and state.get("selected_id") == original.get("id")
+                and state.get("replacement_id") == row.get("id")
+                and row.get("error_code") == "COMPLETION_ORIGINAL_RECOVERED"
+                and row.get("upstream_outcome") == "not_sent" and not row.get("_submission_started"))
+    members = [row for row in members if not cancelled_replacement(row)]
     members.sort(key=lambda r: r.get("_sequence", 0))
     if members and (not members[-1].get("_sequence") or len({r.get("_sequence") for r in members}) != len(members)):
         raise ImageThreadError("IMAGE_THREAD_HISTORY_INVALID")
@@ -172,6 +180,15 @@ def predecessor_state(task, owned):
     previous = owned.get(previous_id)
     if previous is None:
         return {}, "IMAGE_THREAD_PREVIOUS_MISSING"
+    if task.get("_same_session_retry_of"):
+        from services.generation_completion import same_session_retry, retry_evidence
+        if (not same_session_retry(previous, task) or previous.get("_recovery_paused")
+                or previous.get("_recovery_suppressed") or previous.get("result_file_ids")
+                or previous.get("result_sediment_ids") or previous.get("data")
+                or (previous.get("_image_thread") or {}).get("id") != thread["id"]):
+            return {}, "COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED"
+        return {**{k: previous[k] for k in _FIELDS},
+                "parent_message_id": retry_evidence(previous)["retry_parent_message_id"]}, None
     if previous.get("_recovery_suppressed"):
         return {}, "IMAGE_THREAD_PREVIOUS_RECOVERY_STOPPED"
     if (previous.get("status") == "error" and previous.get("upstream_outcome") == "generated"

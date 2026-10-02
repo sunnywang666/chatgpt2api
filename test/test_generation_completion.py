@@ -46,13 +46,13 @@ def setup(tmp_path):
         ensure_work(text.store, db, "text", "owner", "old-0", original)
         text.store.write_receipt(db, "text", "owner", "old-0", original)
         db.execute("UPDATE requests SET request_hash=? WHERE owner='owner' AND id='old-0'", (text._submission_identity("owner", body)[1],))
-    text.recovery_reader = incomplete_reader(backend)
+    text.recovery_reader = incomplete_reader(backend, lambda doc, msg: doc.update(is_archived=False))
     calls = []
     def runner(body, on_cursor):
         context = current_request.get()
         context.before_send()
         calls.append(copy.deepcopy(body))
-        return {"content": "Completed original objective", "conversation_id": "new-conversation",
+        return {"content": "Completed original objective", "conversation_id": body.get("conversation_id", "conv-0"),
                 "parent_message_id": "new-final", "_upstream_terminal": True, "upstream_outcome": "completed"}
     text.runner = runner
     admission.register("text", lambda ctx, body: text._run(ctx.owner, ctx.request_id, body))
@@ -211,13 +211,13 @@ def test_concurrent_authorization_restart_single_replacement_and_actual_completi
     assert len({r.get("replacement_id") for r in results if r.get("replacement_id")}) == 1
     saved = row(service)
     assert {k: v for k, v in saved.items() if k not in {"_completion", "updated_at"} and not k.startswith("recovery") and not k.startswith("_result") and k != "_original_result_observation"}.items() >= {
-        k: original[k] for k in ("status", "_input_ref", "request_message_id", "provider_account_identity", "conversation_id", "_turn_reserved")}.items()
+        k: original[k] for k in ("status", "_input_ref", "request_message_id", "provider_account_identity", "conversation_id")}.items()
     restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=admission.clock)
     assert start(restarted)["replacement_id"] == child_id
-    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    assert row(service)["_turn_reserved"] is False
     ctx = admission.claim_next()
     assert ctx and ctx.request_id == child_id
-    assert row(service, request_id=child_id)["provider_account_identity"] != original["provider_account_identity"]
+    assert row(service, request_id=child_id)["provider_account_identity"] == original["provider_account_identity"]
     admission.execute(ctx)
     assert len(calls) == 1
     assert calls[0]["messages"] == service.store.load_input(original["_input_ref"])["messages"]
@@ -228,12 +228,12 @@ def test_concurrent_authorization_restart_single_replacement_and_actual_completi
     with pytest.raises(CompletionError, match="MISMATCH"):
         service.complete("text", IDENTITY, "old-0", "unrelated")
     done = service.complete("text", IDENTITY, "old-0", child_id)
-    assert done["state"] == "completed" and done["original_cleanup"] == "pending"
+    assert done["state"] == "completed" and done["original_cleanup"] == "completed"
     assert done["work"]["archive"]["status"] == "pending"
-    original_work = service.lifecycle.get("text", IDENTITY, "old-0")
-    assert original_work["state"] == "completed" and original_work["cleanup_pending"] is True
-    assert original_work["completion_result_id"] == child_id
-    assert row(service)["status"] == "unknown" and row(service)["_turn_reserved"] is True
+    original_work = done["original_work"]
+    assert original_work["state"] == "completed" and not original_work["slot_held"]
+    assert original_work["request_id"] == child_id
+    assert row(service)["status"] == "unknown" and row(service)["_turn_reserved"] is False
     assert start(restarted)["selected_id"] == child_id and len(calls) == 1
     with pytest.raises(CompletionError, match="ATTEMPT_LIMIT"):
         start(restarted, rid=child_id)
@@ -346,18 +346,19 @@ def test_image_replacement_retains_exact_input_and_download_evidence_prevents_re
         service.images.submit_edit(IDENTITY, **kwargs, images=[(b"exact-original-image", "image/png", "original.png")])
     else:
         service.images.submit_generation(IDENTITY, **kwargs)
-    patch_row(service, "image", "image-original", status="error", upstream_outcome="not_sent")
+    patch_row(service, "image", "image-original", status="error", upstream_outcome="not_sent",
+              error_code="IMAGE_GENERATION_NOT_SUBMITTED", _submission_started=False)
     old = row(service, "image", "image-original")
     result = start(service, "image", "image-original")
-    new = row(service, "image", result["replacement_id"])
-    original_input = service.store.load_input(old["_input_ref"])
-    replacement_input = service.store.load_input(new["_input_ref"])
-    assert new["_completion_of"] == "image-original"
-    assert replacement_input["payload"]["prompt"] == original_input["payload"]["prompt"]
-    if mode == "edit":
-        assert replacement_input["payload"]["images"] == original_input["payload"]["images"]
-    assert not new["conversation_id"] and not new["provider_binding_id"]
-    assert start(service, "image", "image-original")["replacement_id"] == new["id"]
+    retried = row(service, "image", "image-original")
+    assert "replacement_id" not in result and retried["status"] == "queued"
+    assert retried["_completion"]["same_request_retry"]
+    assert retried["_input_ref"] == old["_input_ref"]
+    assert retried["request_hash"] == old["request_hash"]
+    patch_row(service, "image", "image-original", status="error", upstream_outcome="not_sent",
+              error_code="IMAGE_GENERATION_NOT_SUBMITTED")
+    admission.clock.now += 31
+    assert start(service, "image", "image-original")["reason"] == "COMPLETION_ORIGINAL_NOT_RETRYABLE"
     # A different original with a known generated artifact must only download.
     service.images.submit_generation(IDENTITY, **{**kwargs, "client_task_id": "download-original"})
     patch_row(service, "image", "download-original", status="error", upstream_outcome="generated", result_file_ids=["saved-file"])

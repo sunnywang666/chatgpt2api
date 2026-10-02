@@ -1,13 +1,14 @@
 """Bounded completion of a pure generation step, without rewriting its receipt.
 
-An ended original turn is retried in its original conversation first. An
-explicitly authorized unresolved replacement may use a new conversation. Its reserved ID,
+An ended or freshly verified empty original branch is retried in its original
+account and conversation. Its reserved ID,
 original input and selected result live on the original receipt in the existing
 SQLite transaction. Ordinary result reads never authorize another model send.
 """
 from __future__ import annotations
 
 import copy
+import math
 import time
 import uuid
 
@@ -28,6 +29,91 @@ def unresolved(receipt):
                 or receipt.get("upstream_unfinished") or receipt.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN")
 
 
+def retry_cursor(document, receipt, *, kind="text", now=None):
+    """A fresh, empty original branch; never an arbitrary latest conversation reply.
+
+    This proves where a bounded retry can continue, NOT that an old upstream
+    attempt was cancelled. Any result, later user, branch or missing history
+    prevents automatic continuation.
+    """
+    conversation, message = receipt.get("conversation_id"), receipt.get("request_message_id")
+    if (not conversation or not message or not isinstance(document, dict)
+            or document.get("conversation_id", conversation) != conversation
+            or document.get("is_archived") is not False):
+        return None
+    mapping, head = document.get("mapping"), document.get("current_node")
+    if not isinstance(mapping, dict) or not isinstance(head, str) or head not in mapping:
+        return None
+    original = mapping.get(message)
+    if (not isinstance(original, dict) or not isinstance(original.get("message"), dict)
+            or not isinstance(original["message"].get("author"), dict)
+            or original["message"]["author"].get("role") != "user"):
+        return None
+    expected = receipt.get("request_parent_message_id") or receipt.get("_image_thread_request_parent")
+    if expected and original.get("parent") != expected:
+        return None
+    children = {}
+    for node_id, node in mapping.items():
+        if isinstance(node, dict) and isinstance(node.get("parent"), (str, type(None))):
+            children.setdefault(node.get("parent"), []).append(node_id)
+    pending, seen = [message], set()
+    while pending:
+        node_id = pending.pop()
+        if node_id in seen:
+            return None
+        seen.add(node_id)
+        node = mapping[node_id]
+        msg = node.get("message") or {}
+        if not isinstance(msg, dict) or not isinstance(msg.get("author"), dict):
+            return None
+        role = (msg.get("author") or {}).get("role")
+        if node_id != message:
+            if role not in {"assistant", "tool"}:
+                return None
+            content = msg.get("content") or {}
+            parts = content.get("parts") if isinstance(content, dict) else None
+            # Keep partial final output as evidence, never replace it as empty.
+            if kind == "text" and msg.get("channel") in {None, "final"} and parts and any(parts):
+                return None
+            from services.openai_backend_api import OpenAIBackendAPI
+            if OpenAIBackendAPI._has_image_asset_pointer({"content": content, "metadata": msg.get("metadata")}):
+                return None
+        descendants = children.get(node_id, [])
+        if len(descendants) > 1:
+            return None
+        pending.extend(descendants)
+    if head not in seen or children.get(head):
+        return None
+    return {"conversation_id": conversation, "request_message_id": message,
+            "retry_parent_message_id": head, "observed_at": time.time() if now is None else now}
+
+
+def retry_evidence(receipt):
+    proof = receipt.get("_retry_cursor")
+    if (not isinstance(proof, dict) or set(proof) != {
+            "conversation_id", "request_message_id", "retry_parent_message_id", "observed_at"}
+            or any(not isinstance(proof.get(k), str) or not 1 <= len(proof[k]) <= 200 for k in (
+                "conversation_id", "request_message_id", "retry_parent_message_id"))
+            or proof["conversation_id"] != receipt.get("conversation_id")
+            or proof["request_message_id"] != receipt.get("request_message_id")
+            or type(proof["observed_at"]) not in {int, float} or not math.isfinite(proof["observed_at"])
+            or proof["observed_at"] <= 0
+            or any(not receipt.get(k) for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))):
+        return None
+    return proof
+
+
+def same_session_retry(root, child):
+    proof = retry_evidence(root or {})
+    root_id = (root or {}).get("request_id") or (root or {}).get("id")
+    return bool(proof and child.get("_same_session_retry_of") == root_id
+                and child.get("_completion_of") == root_id
+                and (root.get("_completion") or {}).get("replacement_id") == (child.get("request_id") or child.get("id"))
+                and child.get("_submission_parent_message_id") == proof["retry_parent_message_id"]
+                and all(child.get(k) == root.get(k) for k in (
+                    "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id", "_work_key")))
+
+
 def attach_replacement(store, db, kind, owner, request_id, payload, receipt):
     root_id = payload.get("_completion_of")
     if not root_id:
@@ -42,6 +128,27 @@ def attach_replacement(store, db, kind, owner, request_id, payload, receipt):
     if payload != expected or kind == "image" and prepared["mode"] != receipt.get("mode"):
         raise CompletionError("COMPLETION_REPLACEMENT_INPUT_CHANGED")
     receipt["_completion_of"] = root_id
+    if payload.get("_continue_after_failed_attempt"):
+        proof = retry_evidence(root)
+        if kind == "image" and proof and receipt.get("_image_thread"):
+            # Public thread envelopes forbid caller-supplied cursors. Only this
+            # exact stored server-prepared child inherits the original binding.
+            if receipt.get("client_conversation_id") != root.get("client_conversation_id"):
+                raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
+            receipt.update({k: root[k] for k in ("provider_binding_id", "provider_account_identity", "conversation_id")})
+            receipt["parent_message_id"] = proof["retry_parent_message_id"]
+        if not proof or any(receipt.get(k) != root.get(k) for k in (
+                "provider_binding_id", "provider_account_identity", "conversation_id", "client_conversation_id")):
+            raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
+        receipt.update(_same_session_retry_of=root_id,
+                       _submission_parent_message_id=proof["retry_parent_message_id"])
+        root.update(_attempt_finished_at=time.time(), _attempt_reason="ATTEMPT_REPLACED_SAME_CONVERSATION",
+                    _turn_reserved=False)
+        store.write_receipt(db, kind, owner, root_id, root)
+    elif kind == "text" and payload.get("_continue_after_terminal_empty"):
+        root.update(_attempt_finished_at=time.time(), _attempt_reason="ATTEMPT_REPLACED_SAME_CONVERSATION",
+                    _turn_reserved=False)
+        store.write_receipt(db, kind, owner, root_id, root)
 
 
 def replacement_send_allowed(store, db, kind, owner, request_id, receipt):
@@ -51,6 +158,13 @@ def replacement_send_allowed(store, db, kind, owner, request_id, receipt):
         return True
     root = store.read_receipt(db, kind, owner, root_id)
     state = (root or {}).get("_completion") or {}
+    if receipt.get("_same_session_retry_of") and not same_session_retry(root, receipt):
+        return False
+    if kind == "image" and root and (root.get("result_file_ids") or root.get("result_sediment_ids")
+                                    or root.get("data") or root.get("recovery_phase") == "download_image_result"):
+        return False
+    if state.get("conversation_mode") == "reconstructed":
+        return False
     if kind == "text" and receipt.get("_terminal_empty_correction_of"):
         from services.text_task_service import TextTaskService
         proof = TextTaskService._verified_retryable_empty(root or {})
@@ -148,53 +262,36 @@ class GenerationCompletionService:
                                _previous_request_id=request_id, _continue_after_terminal_empty=True,
                                _text_only_binding=True, _completion_of=request_id)
                 return payload
-            messages, current, seen = copy.deepcopy(body["messages"]), root, {request_id}
-            while current.get("_previous_request_id"):
-                previous_id = current["_previous_request_id"]
-                if previous_id in seen or len(seen) >= 100:
-                    raise CompletionError("COMPLETION_CONTEXT_UNAVAILABLE")
-                seen.add(previous_id)
-                previous = self.store.read_receipt(db, kind, owner, previous_id)
-                if not successful(kind, previous):
-                    raise CompletionError("COMPLETION_CONTEXT_UNAVAILABLE")
-                prior = self._load_verified_input(db, kind, owner, previous_id, previous)
-                messages = prior["messages"] + [{"role": "assistant", "content": previous["content"]}] + messages
-                current = previous
-            if current.get("_legacy_session_anchor") or len(messages) > 100:
-                raise CompletionError("COMPLETION_CONTEXT_UNAVAILABLE")
-            # Public text requests have no caller-provided external tools. Keep
-            # model, reasoning, account_ref and scheduling; discard old cursors.
-            payload = {k: body[k] for k in ("model", "reasoning_effort", "_requested_account_ref", "_scheduling") if k in body}
-            for key in ("_requested_account_ref", "_scheduling"):
-                if root.get(key) is not None:
-                    payload[key] = copy.deepcopy(root[key])
-            payload.update(client_request_id=replacement_id, messages=messages,
-                           client_conversation_id="public-" + replacement_id,
-                           _public_session_ref=replacement_id, _public_route="chat",
+            proof = retry_evidence(root)
+            if not proof or not root.get("_public_session_ref"):
+                raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
+            payload = {k: body[k] for k in ("model", "reasoning_effort", "messages", "_requested_account_ref", "_scheduling") if k in body}
+            payload.update(client_request_id=replacement_id,
+                           client_conversation_id=root["client_conversation_id"],
+                           _public_session_ref=root["_public_session_ref"], _public_route="chat",
+                           _previous_request_id=request_id, _continue_after_failed_attempt=True,
                            _text_only_binding=True, _completion_of=request_id)
             return payload
         payload = body["payload"]
+        if root.get("recovery_phase") == "download_image_result" or root.get("result_file_ids") or root.get("result_sediment_ids") or root.get("data"):
+            raise CompletionError("COMPLETION_DOWNLOAD_ORIGINAL_RESULT")
+        proof = retry_evidence(root)
+        if not proof or root.get("recovery_requires_new_conversation"):
+            raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
+        if int(payload.get("n") or 1) != 1 or payload.get("upstream_model"):
+            raise CompletionError("COMPLETION_SINGLE_OUTPUT_REQUIRED")
+        for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"):
+            payload[key] = root[key]
         for key in ("_requested_account_ref", "_scheduling"):
             if root.get(key) is not None:
                 payload[key] = copy.deepcopy(root[key])
-        # Existing images/download evidence is recovered, never regenerated.
-        if root.get("recovery_phase") == "download_image_result" or root.get("result_file_ids") or root.get("result_sediment_ids") or root.get("data"):
-            raise CompletionError("COMPLETION_DOWNLOAD_ORIGINAL_RESULT")
-        # A thread's saved edit image may be an exact complete input. A generate
-        # continuation, however, depends on upstream context absent from input.
-        if root.get("_image_thread") and (body["mode"] != "edit" or not payload.get("images")):
-            if (root["_image_thread"].get("previous_task_id") or payload.get("conversation_id")):
-                raise CompletionError("COMPLETION_CONTEXT_UNAVAILABLE")
-        if body["mode"] == "edit" and not payload.get("images"):
-            raise CompletionError("COMPLETION_CONTEXT_UNAVAILABLE")
-        if int(payload.get("n") or 1) != 1:
-            raise CompletionError("COMPLETION_SINGLE_OUTPUT_REQUIRED")
-        for key in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id",
-                    "client_conversation_id", "retain_conversation", "image_thread_id", "edit_source_task_id", "edit_source_index", "_image_thread"):
-            payload.pop(key, None)
-        if payload.get("upstream_model"):
-            raise CompletionError("COMPLETION_CONTEXT_UNAVAILABLE")
-        payload.update(image_thread_id=replacement_id, _completion_of=request_id)
+        if root.get("_image_thread"):
+            payload["image_thread_id"] = root["_image_thread"]["id"]
+        payload.update(parent_message_id=proof["retry_parent_message_id"],
+                       _continue_after_failed_attempt=True, _completion_of=request_id)
+        if root.get("_image_thread"):
+            for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id", "parent_message_id", "retain_conversation"):
+                payload.pop(key, None)
         return body
 
     @staticmethod
@@ -224,14 +321,16 @@ class GenerationCompletionService:
                 state.update(selected_id=chosen, selected_at=float(self.clock()), state="result_ready", next_at=None)
         if (child and state.get("selected_id") == request_id and not child.get("_submission_started")
                 and (child.get("status") in {"queued", "running"}
-                     or child.get("status") == "failed" and child.get("upstream_outcome") == "not_sent")):
+                     or child.get("status") in {"failed", "error"} and child.get("upstream_outcome") == "not_sent")):
             child.update(status="failed" if kind == "text" else "error", error_code="COMPLETION_ORIGINAL_RECOVERED",
                          upstream_outcome="not_sent", upstream_unfinished=False, _turn_reserved=False,
                          _claim_id=None, _claim_until=0, _executing=False)
             self.store.write_receipt(db, kind, owner, child_id, child)
             from services.workflow_scheduling import release_provisional_slot
             release_provisional_slot(self.store, db, child)
-        if kind == "text" and child and self.text._cancelled_completion_child(child, root):
+        if (child and state.get("selected_id") == request_id
+                and child.get("error_code") == "COMPLETION_ORIGINAL_RECOVERED"
+                and child.get("upstream_outcome") == "not_sent" and not child.get("_submission_started")):
             if child.get("_work_key") and child.get("_work_key") == root.get("_work_key"):
                 work = self.store.runtime(db, root["_work_key"])
                 if work and work["last_request_id"] == child_id:
@@ -239,12 +338,25 @@ class GenerationCompletionService:
                     self.store.set_runtime(db, work["key"], work)
         return child
 
+    def _release_ended_work(self, db, receipt):
+        work_key = receipt.get("_work_key")
+        if not work_key:
+            return
+        members = [r for _, _, _, r in self.store.receipts(db) if r.get("_work_key") == work_key]
+        if any(r.get("_executing") or r.get("recovery_claim_id")
+               or not r.get("_attempt_finished_at") and (unresolved(r) or r.get("status") in {"queued", "running"}) for r in members):
+            return
+        work = self.store.runtime(db, work_key)
+        if work:
+            work["slot_held"] = False
+            self.store.set_runtime(db, work_key, work)
+
     def advance(self, kind, owner, request_id):
         now = float(self.clock())
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id)
             state = root.get("_completion")
-            if not state or state.get("state") == "completed" or root.get("_recovery_paused") is True:
+            if not state or state.get("state") == "completed" or root.get("_recovery_paused") is True or root.get("_recovery_suppressed"):
                 return
             child = self._select(db, kind, owner, request_id, root)
             if state.get("selected_id"):
@@ -253,6 +365,8 @@ class GenerationCompletionService:
             # Lease the orchestration attempt; actual model admission still uses
             # the normal durable claim. Repeated API calls cannot bypass cooldown.
             if float(state.get("next_at") or 0) > now:
+                return
+            if state.get("state") == "needs_attention" and state.get("next_at") is None:
                 return
             state["next_at"] = now + self.RECHECK_SECONDS
             self.store.write_receipt(db, kind, owner, request_id, root)
@@ -277,12 +391,30 @@ class GenerationCompletionService:
                     work = self.store.runtime(db, root.get("_work_key")) if root.get("_work_key") else None
                     if work and work.get("state") != "active":
                         raise CompletionError("COMPLETION_WORK_NOT_ACTIVE")
+                    not_sent = (root.get("upstream_outcome") in {"not_sent", "not_submitted"}
+                                and root.get("_submission_started") is not True
+                                and root.get("upstream_submission_started") is not True)
+                    if not_sent:
+                        if (state.get("same_request_retry") or not (root.get("error_code") in {
+                                "TEXT_TASK_CAPACITY_EXCEEDED", "IMAGE_GENERATION_NOT_SUBMITTED",
+                                "CONVERSATION_BINDING_UNAVAILABLE", "CHAT_ARCHIVE_RESTORE_UNCONFIRMED"}
+                                or kind == "image" and root.get("error_code") == "RESULT_UNRECOVERABLE"
+                                and root.get("recovery_retryable") is True)):
+                            raise CompletionError("COMPLETION_ORIGINAL_NOT_RETRYABLE")
+                        root.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
+                                    _turn_reserved=False, _ready_at=now, error_code=None,
+                                    boot=self.text.boot if kind == "text" else root.get("boot"))
+                        state.update(state="checking_original", same_request_retry=True)
+                        self.store.write_receipt(db, kind, owner, request_id, root)
+                        self.text.admission.wake()
+                        return
                     ended = kind == "text" and self.text._verified_retryable_empty(root)
-                    if kind == "text" and root.get("conversation_id") and not ended and not state["allow_unconfirmed_retry"]:
+                    retry_authorized = state["allow_unconfirmed_retry"] or state.get("automatic_failure_retry")
+                    if kind == "text" and root.get("conversation_id") and not ended and not retry_authorized:
                         raise CompletionError("COMPLETION_ORIGINAL_END_UNCONFIRMED")
                     unknown = unresolved(root) and not ended
                     if unknown:
-                        if not state["allow_unconfirmed_retry"]:
+                        if not retry_authorized:
                             raise CompletionError("COMPLETION_ORIGINAL_END_UNCONFIRMED")
                         anchor = self._age_anchor(root)
                         if anchor is None or now < anchor + self.STALL_SECONDS + self.INVESTIGATION_SECONDS:
@@ -302,14 +434,28 @@ class GenerationCompletionService:
                         replacement_id = "completion-" + uuid.uuid4().hex
                         prepared = self._prepare(db, kind, owner, request_id, root, replacement_id)
                         state.update(replacement_id=replacement_id, prepared_input=self.store.save_input(prepared),
-                                     conversation_mode="original" if ended else "reconstructed", state="replacement_pending")
+                                     conversation_mode="original", state="replacement_pending")
                     state.pop("reason", None)
                 except CompletionError as exc:
                     state.update(state="needs_attention" if exc.code not in {
                         "COMPLETION_ORIGINAL_ACTIVE", "COMPLETION_INVESTIGATING_ORIGINAL"} else "checking_original", reason=exc.code)
+                    if state["state"] == "needs_attention":
+                        paused = exc.code in {"COMPLETION_WORK_NOT_ACTIVE", "COMPLETION_ORIGINAL_RECOVERY_PAUSED"}
+                        state["next_at"] = now + self.RECHECK_SECONDS if paused else None
+                        # End automatic investigation, not the upstream fact.
+                        definitely_unsent = root.get("upstream_outcome") in {"not_sent", "not_submitted"} and root.get("_submission_started") is not True
+                        if not active and (definitely_unsent or (state.get("allow_unconfirmed_retry") or state.get("automatic_failure_retry")) and unresolved(root)) and exc.code not in {
+                                "COMPLETION_WORK_NOT_ACTIVE", "COMPLETION_ORIGINAL_RECOVERY_PAUSED",
+                                "COMPLETION_DOWNLOAD_ORIGINAL_RESULT"}:
+                            root.update(_attempt_finished_at=now, _attempt_reason=exc.code, _turn_reserved=False)
             elif child and not state.get("selected_id"):
-                state.update(state="replacement_pending" if child.get("status") in {"queued", "running"} else "needs_attention",
-                             reason="COMPLETION_ATTEMPT_PENDING" if child.get("status") in {"queued", "running"} else "COMPLETION_ATTEMPT_EXHAUSTED")
+                child_anchor = self._age_anchor(child)
+                child_pending = (child.get("status") in {"queued", "running"}
+                    or unresolved(child) and child_anchor is not None
+                    and now < child_anchor + self.STALL_SECONDS + self.INVESTIGATION_SECONDS
+                    and not (kind == "text" and self.text._verified_retryable_empty(child)))
+                state.update(state="replacement_pending" if child_pending else "needs_attention",
+                             reason="COMPLETION_ATTEMPT_PENDING" if child_pending else "COMPLETION_ATTEMPT_EXHAUSTED")
                 if (kind == "text" and child.get("_completion_of") == request_id
                         and child.get("_terminal_empty_correction_of") == request_id
                         and all(child.get(k) == root.get(k) for k in (
@@ -322,7 +468,16 @@ class GenerationCompletionService:
                 original_work = self.store.runtime(db, root.get("_work_key", "")) or {}
                 if root.get("_recovery_suppressed") or original_work.get("state", "active") != "active":
                     state.update(state="needs_attention", reason="COMPLETION_WORK_NOT_ACTIVE")
+                if state["state"] == "needs_attention":
+                    paused = state.get("reason") == "COMPLETION_WORK_NOT_ACTIVE"
+                    state["next_at"] = now + self.RECHECK_SECONDS if paused else None
+                    if not paused and not child.get("_executing") and not child.get("recovery_claim_id"):
+                        child.update(_attempt_finished_at=now, _attempt_reason="COMPLETION_ATTEMPT_EXHAUSTED", _turn_reserved=False)
+                        root.update(_attempt_finished_at=now, _attempt_reason="COMPLETION_ATTEMPT_EXHAUSTED", _turn_reserved=False)
+                        self.store.write_receipt(db, kind, owner, state["replacement_id"], child)
             self.store.write_receipt(db, kind, owner, request_id, root)
+            if state.get("state") == "needs_attention" and root.get("_attempt_finished_at"):
+                self._release_ended_work(db, root)
             submit = bool(state.get("replacement_id") and not child and not state.get("selected_id")
                           and root.get("_recovery_paused") is not True)
             prepared_ref, replacement_id = state.get("prepared_input"), state.get("replacement_id")
@@ -335,9 +490,22 @@ class GenerationCompletionService:
                 self.images._submit(body["identity"], client_task_id=replacement_id, mode=body["mode"], payload=body["payload"])
 
     def process_one(self):
+        # Only newly accepted pure-generation requests opt into the automatic
+        # policy. Upgrading never silently replays historical UNKNOWN receipts.
+        with self.store.transaction() as db:
+            for kind, owner, rid, row in self.store.receipts(db):
+                if (row.get("_automatic_generation_recovery") and not row.get("_completion")
+                        and not row.get("_completion_of") and row.get("status") in {"unknown", "failed", "error"}
+                        and not row.get("_recovery_paused") and not row.get("_recovery_suppressed")):
+                    row["_completion"] = {"state": "checking_original", "started_at": float(self.clock()),
+                        "allow_unconfirmed_retry": False, "automatic_failure_retry": True,
+                        "max_extra_requests": 1, "next_at": float(self.clock())}
+                    self.store.write_receipt(db, kind, owner, rid, row)
         with self.store.connect() as db:
             candidates = [(kind, owner, rid) for kind, owner, rid, row in self.store.receipts(db)
                           if row.get("_completion", {}).get("state") not in {None, "completed", "result_ready"}
+                          and not row.get("_recovery_paused") and not row.get("_recovery_suppressed")
+                          and row.get("_completion", {}).get("next_at") is not None
                           and float(row["_completion"].get("next_at") or 0) <= float(self.clock())]
         if candidates:
             self.advance(*candidates[0])
@@ -359,15 +527,17 @@ class GenerationCompletionService:
                       "original_status": root.get("status"), "replacement_status": (child or {}).get("status"),
                       "stop": {"capability": "unsupported", "confirmed": False},
                       "original_turn_ended": bool(ended or successful(kind, root)),
+                      "original_attempt_state": "ended" if root.get("_attempt_finished_at") else "active",
                       "empty_response_confirmed": bool(kind == "text" and self.text._verified_retryable_empty(root)),
                       "original_cleanup": "pending" if unresolved(root) and not ended else "not_required"}
             same_retry = bool(child and kind == "text" and child.get("_terminal_empty_correction_of") == request_id
                               and child.get("_work_key") == root.get("_work_key")
                               and self.text._verified_retryable_empty(root))
+            same_retry = same_retry or bool(child and same_session_retry(root, child))
             local_receipt = child or root
             empty_released = (kind == "text" and local_receipt.get("_turn_reserved") is False
                               and self.text._verified_retryable_empty(local_receipt))
-            result["local_reservation"] = ("released" if empty_released or same_retry and successful(kind, child)
+            result["local_reservation"] = ("released" if local_receipt.get("_attempt_finished_at") or empty_released or same_retry and successful(kind, child)
                                             else "transferred" if same_retry and child.get("status") in {"queued", "running", "unknown"}
                                             else "held" if unresolved(root) and not ended else "released")
             if same_retry and not ended and successful(kind, child) and state.get("state") == "completed":

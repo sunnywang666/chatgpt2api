@@ -1226,6 +1226,7 @@ class OpenAIBackendAPI:
             stream=True,
             _account_request_deadline_monotonic=request_deadline,
             _account_request_before_send=record_actual_submission,
+            **({"_account_request_preflight": self.image_pre_send_check} if callable(getattr(self, "image_pre_send_check", None)) else {}),
         )
         if response.status_code == 404:
             response.close()
@@ -1238,6 +1239,7 @@ class OpenAIBackendAPI:
                 stream=True,
                 _account_request_deadline_monotonic=request_deadline,
                 _account_request_before_send=record_actual_submission,
+                **({"_account_request_preflight": self.image_pre_send_check} if callable(getattr(self, "image_pre_send_check", None)) else {}),
             )
         ensure_ok(response, path)
         return response

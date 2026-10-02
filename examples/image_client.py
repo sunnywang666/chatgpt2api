@@ -7,6 +7,7 @@ import argparse
 import base64
 import contextlib
 import datetime as dt
+from email.utils import parsedate_to_datetime
 import fcntl
 import hashlib
 from http.client import HTTPException
@@ -17,6 +18,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 import uuid
 from typing import Any, BinaryIO, Iterator
 from urllib import error, parse, request
@@ -34,13 +36,19 @@ class ClientError(RuntimeError):
 
 
 class HttpFailure(ClientError):
-    def __init__(self, status: int, detail: str):
+    def __init__(self, status: int, detail: str, *, not_sent=False, retry_after=None):
         self.status = status
         self.detail = detail
+        self.not_sent = not_sent
+        self.retry_after = retry_after
         super().__init__(f"HTTP {status}: {detail}")
 
 
 class UnsafeRedirect(ClientError):
+    pass
+
+
+class OriginalMissing(ClientError):
     pass
 
 
@@ -160,7 +168,8 @@ class ApiClient:
             raise
         except error.HTTPError as exc:
             detail = _http_error_detail(exc)
-            raise HttpFailure(exc.code, detail) from exc
+            raise HttpFailure(exc.code, detail, not_sent=getattr(exc, "pool_not_sent", False),
+                              retry_after=getattr(exc, "pool_retry_after", None)) from exc
         except (TimeoutError, error.URLError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             raise ClientError(f"request result is unknown: {reason}") from exc
@@ -191,12 +200,52 @@ def _http_error_detail(exc: error.HTTPError) -> str:
         value = json.loads(raw.decode("utf-8"))
     except Exception:
         return str(exc.reason or "request failed")
-    detail = value.get("detail") if isinstance(value, dict) else value
+    if isinstance(value, dict):
+        # Only the authenticated service's explicit transport verdict permits
+        # reacceptance. HTTP status alone (including 404/429) proves nothing.
+        exc.pool_not_sent = any(isinstance(value.get(key), dict) and value[key].get("upstream_outcome") == "not_sent"
+                                for key in ("recovery", "detail"))
+        retry = exc.headers.get("Retry-After", "") if exc.headers else ""
+        exc.pool_retry_after = int(retry) if len(retry) <= 5 and retry.isdigit() and int(retry) <= 86400 else None
+        if exc.pool_retry_after is None and retry:
+            try:
+                until = parsedate_to_datetime(retry)
+                if until.tzinfo is not None:
+                    exc.pool_retry_after = max(0, until.timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                pass
+    detail = value.get("detail") or value.get("error_code") if isinstance(value, dict) else value
     if isinstance(detail, dict):
         detail = detail.get("error") or detail.get("code") or detail
     if isinstance(detail, (dict, list)):
         return json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
     return str(detail or exc.reason or "request failed")
+
+
+def _submit_original(api, state_path, state, endpoint, **kwargs):
+    """One bounded transport retry, never a second generation attempt."""
+    for attempt in range(2):
+        wait_until = state.get("retry_not_before", 0)
+        delay = max(0, wait_until - time.time())
+        if delay > 30:
+            raise ClientError("original submission is not sent; retry after its persisted cooldown")
+        if delay:
+            time.sleep(delay)
+        # Invalidate the old not-sent proof BEFORE crossing the next boundary.
+        state.update(phase="unknown", updated_at=_utc_now())
+        state.pop("retry_not_before", None)
+        _atomic_write_state(state_path, state)
+        try:
+            return api.json("POST", endpoint, **kwargs)
+        except HttpFailure as exc:
+            if not exc.not_sent:
+                raise
+            state.update(phase="not_sent", http_status=exc.status, updated_at=_utc_now())
+            if exc.retry_after is not None:
+                state["retry_not_before"] = time.time() + exc.retry_after
+            _atomic_write_state(state_path, state)
+            if attempt or exc.status not in {429, 503} or exc.retry_after is None:
+                raise
 
 
 def _read_input_image(path_text: str) -> dict[str, Any]:
@@ -433,7 +482,7 @@ def _lookup_task(api: ApiClient, task_id: str) -> dict[str, Any]:
         return matches[0]
     if task_id not in missing:
         raise ClientError("task-list response did not account for the requested client task ID")
-    raise ClientError(f"server reports client task ID {task_id!r} as missing")
+    raise OriginalMissing(f"server reports client task ID {task_id!r} as missing")
 
 
 def _command_models(api: ApiClient, _args: argparse.Namespace) -> int:
@@ -454,12 +503,17 @@ def _command_submit(api: ApiClient, args: argparse.Namespace) -> int:
                 raise ClientError("--client-task-id does not match the durable state file")
             if fingerprint != state["input_fingerprint"]:
                 raise ClientError("durable client task ID already belongs to different immutable input")
-            task = _lookup_task(api, state["client_task_id"])
-            _emit(task)
-            return 0
+            try:
+                task = _lookup_task(api, state["client_task_id"])
+            except OriginalMissing:
+                if state.get("phase") != "not_sent":
+                    raise
+            else:
+                _emit(task)
+                return 0
 
-        task_id = explicit_task_id or _validate_task_id(f"image-{uuid.uuid4()}")
-        state = {
+        task_id = state["client_task_id"] if state else explicit_task_id or _validate_task_id(f"image-{uuid.uuid4()}")
+        state = state or {
             "schema_version": STATE_SCHEMA_VERSION,
             "client_task_id": task_id,
             "input_fingerprint": fingerprint,
@@ -488,8 +542,8 @@ def _command_submit(api: ApiClient, args: argparse.Namespace) -> int:
                     if key in contract:
                         fields[key] = str(contract[key])
                 body, content_type = _multipart_body(fields, images)
-                result = api.json(
-                    "POST",
+                result = _submit_original(
+                    api, state_path, state,
                     "/api/image-tasks/edits",
                     body=body,
                     content_type=content_type,
@@ -510,15 +564,15 @@ def _command_submit(api: ApiClient, args: argparse.Namespace) -> int:
                 for key in ("image_thread_id", "edit_source_task_id", "edit_source_index"):
                     if key in contract:
                         payload[key] = contract[key]
-                result = api.json("POST", "/api/image-tasks/generations", payload=payload)
+                result = _submit_original(api, state_path, state, "/api/image-tasks/generations", payload=payload)
             if result.get("id") != task_id:
                 raise ClientError("submit response changed the client task identity")
         except HttpFailure as exc:
-            state.update(phase="http_error", http_status=exc.status, updated_at=_utc_now())
+            state.update(phase="not_sent" if exc.not_sent else "http_error", http_status=exc.status, updated_at=_utc_now())
             _atomic_write_state(state_path, state)
             raise
         except ClientError:
-            state.update(phase="unknown", updated_at=_utc_now())
+            state.update(phase="not_sent" if state.get("phase") == "not_sent" else "unknown", updated_at=_utc_now())
             _atomic_write_state(state_path, state)
             raise
         state.update(
@@ -573,6 +627,11 @@ def _safe_output_path(value: str) -> Path:
 def _command_download(api: ApiClient, args: argparse.Namespace) -> int:
     state = _load_state(_state_path(args))
     task_id = _task_id(args, state)
+    task = _lookup_task(api, task_id)
+    if task.get("status") != "success" and state and task.get("completion"):
+        if args.index != 0:
+            raise ClientError("bounded completion has one output; use index 0")
+        return _command_completion(api, argparse.Namespace(**{**vars(args), "command": "completion-save"}))
     return _download_task(api, args, task_id)
 
 
@@ -704,9 +763,15 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
             request_id = _chat_request_id(args, state)
             if fingerprint != state.get("input_fingerprint"):
                 raise ClientError("Chat request already belongs to different immutable input")
-            _emit(_chat_receipt(api, request_id, conversation=conversation))
-            return 0
-        request_id = _validate_task_id(args.request_id or f"chat-{uuid.uuid4()}")
+            try:
+                existing = _chat_receipt(api, request_id, conversation=conversation)
+            except HttpFailure as exc:
+                if state.get("phase") != "not_sent" or exc.status != 404 or exc.detail != "CHAT_REQUEST_NOT_FOUND":
+                    raise
+            else:
+                _emit(existing)
+                return 0
+        request_id = state["request_id"] if state else _validate_task_id(args.request_id or f"chat-{uuid.uuid4()}")
         if args.previous_request_id:
             if request_id == args.previous_request_id:
                 raise ClientError("a new turn must have a different request ID from its predecessor")
@@ -718,7 +783,7 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
                 raise ClientError("previous Chat request cannot accept a dependent turn; recover its original result first")
             # Admission persists this dependency and sends only after the
             # previous answer finishes. Client acceptance is not a model send.
-        state = {"schema": "chatgpt2api.chat-request.v1", "request_id": request_id,
+        state = state or {"schema": "chatgpt2api.chat-request.v1", "request_id": request_id,
                  "input_fingerprint": fingerprint, "phase": "prepared", "created_at": _utc_now()}
         if account_ref is not None:
             state["account_ref"] = account_ref
@@ -726,10 +791,10 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
             state["conversation"] = conversation
         _atomic_write_state(state_path, state)
         try:
-            result = api.json("POST", "/api/chat-requests", payload={"client_request_id": request_id, **body})
+            result = _submit_original(api, state_path, state, "/api/chat-requests", payload={"client_request_id": request_id, **body})
             _verify_chat_receipt(result, request_id, conversation)
         except (ClientError, KeyboardInterrupt):
-            state.update(phase="unknown", updated_at=_utc_now())
+            state.update(phase="not_sent" if state.get("phase") == "not_sent" else "unknown", updated_at=_utc_now())
             _atomic_write_state(state_path, state)
             raise
         state.update(phase="accepted", last_status=result.get("status"), updated_at=_utc_now())

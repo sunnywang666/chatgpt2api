@@ -83,7 +83,7 @@ def constraints(receipt, works, clocks, receipts, now):
         return resources, needs, ready
     work_id = work['key']
     enabled = work.get('state', 'active') == 'active'
-    active = sum(1 for _, _, _, r in receipts if r.get('_work_key') == work_id and (
+    active = sum(1 for _, _, _, r in receipts if r.get('_work_key') == work_id and not r.get('_attempt_finished_at') and (
         r.get('status') == 'running' or r.get('upstream_unfinished') is True or r.get('upstream_outcome') == 'unknown'
         or r.get('status') == 'unknown'))
     turn = 'work_turn:' + work_id.removeprefix('work:')

@@ -102,6 +102,8 @@ def image_generation_active(kind, receipt, active):
     Native image receipts persist original result IDs before downloading; wire
     image receipts persist the original turn's explicit terminal evidence.
     """
+    if receipt.get("_attempt_finished_at") and not receipt.get("_executing"):
+        return False
     if kind != "image" and receipt.get("_operation") != "image":
         return False
     single = int(receipt.get("_expected_sends") or 1) <= 1
@@ -299,7 +301,8 @@ class PoolAdmission:
         rows.sort(key=lambda row: float(row[3].get("recovery_next_at" if row[0] == "text" else "next_poll_at")
                                         or 0))
         for kind, owner, request_id, r in rows:
-            if recovery_suppressed(r) or r.get("_recovery_paused") is True:
+            saved_image = kind == "image" and bool(r.get("result_file_ids") or r.get("result_sediment_ids"))
+            if recovery_suppressed(r) or r.get("_recovery_paused") is True or r.get("_attempt_finished_at") and not saved_image:
                 continue
             if kind not in self.recoveries:
                 continue
@@ -310,7 +313,8 @@ class PoolAdmission:
             if kind == "text":
                 due = unknown_text_result(r) and r.get("provider_binding_id") and float(r.get("recovery_next_at") or 0) <= now
             else:
-                due = (r.get("status") == "error" and r.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+                due = (r.get("status") == "error" and (r.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+                       or saved_image and r.get("error_code") == "RESULT_UNRECOVERABLE")
                        and r.get("conversation_id") and r.get("request_message_id") and float(r.get("next_poll_at") or 0) <= now)
             if due:
                 try:
@@ -413,6 +417,14 @@ class PoolAdmission:
                 corrections.setdefault((owner, previous_id), []).append((request_id, r))
         released_order_heads = set()
         transferred_empty_turns = set()
+        from services.generation_completion import same_session_retry
+        all_receipts = {(kind, owner, rid): r for kind, owner, rid, r in receipts}
+        for kind, owner, rid, r in receipts:
+            original_id = r.get("_same_session_retry_of")
+            original = all_receipts.get((kind, owner, original_id))
+            if original and same_session_retry(original, r):
+                released_order_heads.add((owner, original_id))
+                transferred_empty_turns.add((owner, original_id))
         if corrections:
             from services.text_task_service import TextTaskService
             for key, candidates in corrections.items():
@@ -492,7 +504,7 @@ class PoolAdmission:
             unknown = unresolved_result(kind, r)
             account = by_identity.get(str(r.get("provider_account_identity") or ""))
             resource = account_clock_key(account) if account else r.get("_account_resource")
-            active = status == "running" or unknown
+            active = status == "running" or unknown and not r.get("_attempt_finished_at")
             # Keep an unresolved result as its conversation's order head even
             # after the existing qualified-read policy ends local waiting.
             # This is not proof that the upstream turn ended or permission to
@@ -1179,7 +1191,7 @@ class PoolAdmission:
             if context.kind == "text" and r.get("_supersedes_request_id"):
                 from services.text_task_service import TextTaskService
                 TextTaskService._validate_supersede(self.store, db, context.owner, r, now)
-            if context.kind == "text" and r.get("_public_session_ref") and r.get("_previous_request_id") and not r.get("_terminal_empty_correction_of"):
+            if context.kind == "text" and r.get("_public_session_ref") and r.get("_previous_request_id") and not r.get("_terminal_empty_correction_of") and not r.get("_same_session_retry_of"):
                 previous = self.store.read_receipt(db, "text", context.owner, r["_previous_request_id"]) or {}
                 if (r.get("_public_previous_waiting") or previous.get("status") != "succeeded"
                         or previous.get("upstream_outcome") == "unknown"
@@ -1271,6 +1283,17 @@ class PoolAdmission:
                                   error_code="TASK_INPUT_UNAVAILABLE", _turn_reserved=False, upstream_unfinished=False)
                 return
             payload = body["payload"] if context.kind == "image" else body
+            if context.kind == "image" and r.get("_same_session_retry_of"):
+                from services.generation_completion import same_session_retry
+                with self.store.connect() as db:
+                    original = self.store.read_receipt(db, "image", context.owner, r["_same_session_retry_of"])
+                if (not same_session_retry(original, r) or original.get("result_file_ids")
+                        or original.get("result_sediment_ids") or original.get("data")
+                        or original.get("recovery_phase") == "download_image_result"):
+                    self.update_claim(context, status="error", error_code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED",
+                                      upstream_outcome="not_sent", _turn_reserved=False, upstream_unfinished=False)
+                    return
+                payload["_failed_retry_original"] = original
             payload.update({k: r[k] for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id", "_requested_account_ref", "_requested_account_identity") if r.get(k)})
             if context.kind == "image" and r.get("_image_thread"):
                 payload.update({k: r[k] for k in ("_image_thread", "_image_thread_predecessor_message",

@@ -1252,6 +1252,8 @@ class ConversationBindingService:
                 recovery_reason=TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value,
             )
         if not candidates:
+            from services.generation_completion import retry_cursor
+            continuation = retry_cursor(document, receipt)
             non_text_result = None if active_result_seen else _completed_image_result(
                 mapping, children, request_message_id, conversation_id,
             )
@@ -1282,6 +1284,7 @@ class ConversationBindingService:
                 "binding_status": "unknown",
                 "status": "running" if active_result_seen and not advanced else "unknown",
                 "recovery_reason": recovery_reason,
+                "_retry_cursor": continuation,
                 **({RESULT_OBSERVATION_FIELD: observation} if active_result_seen
                    and (observation := _result_observation(mapping, children, request_message_id, conversation_id)) else {}),
                 **({TURN_END_EVIDENCE_FIELD: ended} if not active_result_seen and terminal_empty_seen
@@ -1439,6 +1442,21 @@ class ConversationBindingService:
                         raise ConversationBindingError("original conversation restore is unconfirmed",
                                                        code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
                 backend.text_pre_send_check = check_original
+            elif body.get("_failed_retry_original"):
+                def check_failed_retry(send):
+                    from services.generation_completion import retry_cursor, retry_evidence
+                    original = body["_failed_retry_original"]
+                    try:
+                        fresh = backend._get_conversation(conversation_id, _send=send)
+                        current, saved = retry_cursor(fresh, original), retry_evidence(original)
+                    except Exception as exc:
+                        raise ConversationBindingError("original retry read unavailable",
+                                                       code="COMPLETION_ORIGINAL_READ_UNAVAILABLE") from exc
+                    if not current or not saved or any(current[k] != saved[k] for k in (
+                            "conversation_id", "request_message_id", "retry_parent_message_id")):
+                        raise ConversationBindingError("original retry branch changed",
+                                                       code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
+                backend.text_pre_send_check = check_failed_retry
             elif body.get("_empty_retry_original"):
                 def check_empty_retry(send):
                     from services.text_task_service import TextTaskService

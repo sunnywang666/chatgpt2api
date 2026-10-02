@@ -133,7 +133,7 @@ class ChatClientTest(unittest.TestCase):
             self.assertEqual(first.returncode, 1)
             self.assertEqual(calls[0][1]["account_ref"], selected)
             self.assertEqual(calls[0][2]["account_ref"], selected)
-            self.assertEqual(calls[0][2]["phase"], "prepared")
+            self.assertEqual(calls[0][2]["phase"], "unknown")
             for ref in (other, None):
                 changed = run("selected", account_ref=ref)
                 self.assertEqual(changed.returncode, 1)
@@ -199,7 +199,7 @@ class ChatClientTest(unittest.TestCase):
                 self.assertEqual(payload["client_conversation_id"], "work")
                 self.assertEqual(payload.get("previous_request_id"), previous)
                 self.assertEqual(payload["messages"], [{"role": "user", "content": [{"type": "text", "text": f"delta-{request_id}"}]}])
-                self.assertEqual(saved["phase"], "prepared")
+                self.assertEqual(saved["phase"], "unknown")
                 self.assertEqual(saved["conversation"], receipts[request_id]["conversation"])
                 text = (Path(directory) / f"{request_id}.json").read_text()
                 self.assertNotIn("fixture-only", text)
@@ -216,7 +216,7 @@ class ChatClientTest(unittest.TestCase):
                 post = calls[-1]
                 self.assertEqual(post[0], "POST")
                 self.assertEqual(post[1]["previous_request_id"], "previous")
-                self.assertEqual(post[2]["phase"], "prepared")
+                self.assertEqual(post[2]["phase"], "unknown")
                 # Restart only reads the child; it never resubmits either turn.
                 self.assertEqual(run("next-" + status, "previous").returncode, 0)
             self.assertEqual(sum(row[0] == "POST" for row in calls), 2)
@@ -299,7 +299,7 @@ class ChatClientTest(unittest.TestCase):
                 submit = ["chat-submit", "--state", str(state), "--request-id", "original", "--model", "fixture-text", "--prompt", "private test input"]
                 first = subprocess.run(base + submit, env=env, capture_output=True, text=True)
                 self.assertEqual(first.returncode, 1, first.stderr)
-                self.assertEqual(posts[0][1]["phase"], "prepared")
+                self.assertEqual(posts[0][1]["phase"], "unknown")
                 self.assertEqual(posts[0][1]["request_id"], "original")
                 self.assertEqual(json.loads(state.read_text())["phase"], "unknown")
                 repeat = subprocess.run(base + submit, env=env, capture_output=True, text=True)

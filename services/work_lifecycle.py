@@ -125,6 +125,12 @@ def _blocked(receipt, *, allow_queued=False, members=()):
         return True
     if (receipt.get("status") == "unknown" or receipt.get("upstream_outcome") == "unknown"
             or receipt.get("upstream_unfinished") is True):
+        from services.generation_completion import same_session_retry, successful
+        restored = [r for r in members if same_session_retry(receipt, r)
+                    and successful("image" if r.get("id") else "text", r)
+                    and (receipt.get("_completion") or {}).get("selected_id") == (r.get("id") or r.get("request_id"))]
+        if len(restored) == 1:
+            return False
         from services.text_task_service import TextTaskService
         evidence = TextTaskService._verified_retryable_empty(receipt)
         corrections = [r for r in members if evidence and r.get("status") == "succeeded"
