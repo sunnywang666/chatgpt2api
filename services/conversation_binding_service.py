@@ -157,7 +157,16 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
             return None
         author = message.get("author")
         role = author.get("role") if isinstance(author, dict) else None
-        if role not in {"assistant", "tool"} or message.get("status") != "finished_successfully":
+        content = message.get("content")
+        # A completed final can follow a stale in_progress reasoning snapshot.
+        # Only its known assistant ancestors qualify; active tools, code and
+        # the final itself still cannot prove that this exact turn ended.
+        stale_reasoning = (role == "assistant" and isinstance(content, dict)
+                           and content.get("content_type") in {"thoughts", "reasoning_recap"}
+                           and message.get("status") == "in_progress"
+                           and message.get("end_turn") is not True)
+        if (role not in {"assistant", "tool"}
+                or message.get("status") != "finished_successfully" and not stale_reasoning):
             return None
         if role == "assistant" and message.get("end_turn") is True:
             if message.get("channel") not in {None, "final"}:

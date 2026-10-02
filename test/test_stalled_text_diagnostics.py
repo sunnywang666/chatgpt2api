@@ -33,6 +33,52 @@ def mixed_chain(doc):
     doc["mapping"][final]["parent"] = parent
 
 
+@pytest.mark.parametrize("reasoning", ["thought", "recap"])
+def test_completed_final_after_stale_reasoning_recovers_original_without_resend(tmp_path, reasoning):
+    service, admission, backend, legacy = migration(tmp_path)
+    patch(service, _turn_reserved=True)
+    original = saved(service)
+
+    def read(row):
+        doc = document(row)
+        mixed_chain(doc)
+        final = doc["current_node"]
+        doc["mapping"][final + "-" + reasoning]["message"]["status"] = "in_progress"
+        doc["mapping"][final]["message"]["content"]["parts"] = ["original final answer"]
+        return ConversationBindingService._read_text_request_result(backend, row, document=doc)
+
+    service.recovery_reader = read
+    result = service.read("owner", "old-0")
+    assert result["status"] == "succeeded"
+    assert result["content"] == "original final answer"
+    recovered = saved(service)
+    assert all(recovered.get(key) == original.get(key) for key in (
+        "request_message_id", "request_parent_message_id", "conversation_id", "provider_account_identity", "_input_ref"))
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert backend.mock_calls == []
+
+
+@pytest.mark.parametrize("case", ["active_tool", "active_code", "active_final", "active_sibling"])
+def test_stale_reasoning_allowance_does_not_accept_unfinished_or_branched_result(tmp_path, case):
+    service, _, backend, _ = migration(tmp_path)
+    row = saved(service)
+    doc = document(row)
+    mixed_chain(doc)
+    final = doc["current_node"]
+    doc["mapping"][final + "-thought"]["message"]["status"] = "in_progress"
+    doc["mapping"][final]["message"]["content"]["parts"] = ["not sufficient by itself"]
+    if case == "active_sibling":
+        doc["mapping"]["sibling"] = {"parent": row["request_message_id"], "message": {
+            "id": "sibling", "author": {"role": "assistant"}, "status": "in_progress",
+            "end_turn": False, "content": {"content_type": "text", "parts": [""]}}}
+    else:
+        target = final + ("-output" if case == "active_tool" else "-code" if case == "active_code" else "")
+        doc["mapping"][target]["message"].update(status="in_progress", end_turn=False)
+    result = ConversationBindingService._read_text_request_result(backend, row, document=doc)
+    assert result["status"] != "succeeded"
+    assert "content" not in result
+
+
 def external_continuation(doc):
     original = doc["current_node"]
     doc["mapping"][original]["message"].update(status="in_progress", end_turn=None)
