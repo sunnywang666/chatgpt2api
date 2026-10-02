@@ -688,6 +688,37 @@ class AdmissionTests(unittest.TestCase):
         self.write_accounts(2)
         self.assertIsNone(self.admission.claim_next())
 
+    def test_unknown_originals_do_not_probe_catalog_but_keep_order_fence(self):
+        from services.pool_admission import unfinished
+        catalog_calls = []
+        self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
+        for name, values in [
+            ("unknown", {"status": "unknown"}),
+            ("failed-unknown", {"status": "failed", "error_code": "RESULT_UNRECOVERABLE",
+                                "upstream_outcome": "unknown"}),
+            ("completed-original", {"status": "failed", "error_code": "RESULT_UNRECOVERABLE",
+                                    "upstream_outcome": "unknown", "_attempt_finished_at": 999,
+                                    "_completion": {"state": "completed", "selected_id": "saved-child"}}),
+        ]:
+            self.submit(name, provider_binding_id="binding-0", provider_account_identity="account-0")
+            with self.store.transaction() as db:
+                receipt = self.store.read_receipt(db, "text", "happy", name)
+                receipt.update(values)
+                self.store.write_receipt(db, "text", "happy", name, receipt)
+            self.assertIsNone(self.admission.claim_next())
+            saved = self.read("text", "happy", name)
+            self.assertTrue(unfinished("text", saved))
+            for key, value in values.items():
+                self.assertEqual(saved[key], value)
+        self.assertEqual(catalog_calls, [])
+
+    def test_new_queued_text_still_discovers_models_for_admission(self):
+        catalog_calls = []
+        self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
+        self.submit("new-work")
+        self.assertEqual(self.admission.claim_next().request_id, "new-work")
+        self.assertEqual(catalog_calls, ["fixture-text"])
+
     def test_expired_captured_image_claim_preserves_real_failure_or_uses_neutral_state(self):
         for prior_code in (None, "RECOVERY_TIMED_OUT"):
             with self.subTest(prior_code=prior_code):

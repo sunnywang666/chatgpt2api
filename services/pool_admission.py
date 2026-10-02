@@ -934,9 +934,14 @@ class PoolAdmission:
         self._refresh_waiting_image_capabilities()
         # Catalog lookup may perform a metadata read; never do that under the
         # database/account transaction or occupy an execution worker waiting.
+        # UNKNOWN originals only need result recovery, never a new allocation.
+        # Keeping their order fence must not continually refresh model metadata
+        # (including after a completion child has finished) and starve archive
+        # reads on the same account's paced HTTP clock.
         with self.store.connect() as db:
             models = {str(r.get("model") or "auto") for kind, _, _, r in self.store.receipts(db)
-                      if kind == "text" and unfinished(kind, r) and r.get("_route", "chat") == "chat"}
+                      if kind == "text" and unfinished(kind, r) and not unknown_text_result(r)
+                      and r.get("_route", "chat") == "chat"}
         types = {}
         for model in models:
             try:
