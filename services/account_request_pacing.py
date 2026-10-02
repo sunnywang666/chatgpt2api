@@ -442,6 +442,16 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
     def paced_request(method, url, **kwargs):
         # Object-storage downloads are not ChatGPT account API calls.
         if urlparse(str(url)).hostname != "chatgpt.com":
+            # Image upload/download still has a caller deadline, but no
+            # account-clock wait. Consume our private option before requests.
+            deadline = kwargs.pop("_account_request_deadline_monotonic", None)
+            if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AccountRequestDeadlineExceeded("image transfer deadline elapsed before send")
+                timeout = kwargs.get("timeout")
+                if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+                    kwargs["timeout"] = min(float(timeout), remaining)
             return send(method, url, **kwargs)
         path = urlparse(str(url)).path.rstrip("/")
         if (str(method).upper() == "POST"

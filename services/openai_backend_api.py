@@ -272,6 +272,15 @@ class OpenAIBackendAPI:
             raise ImageActiveDeadlineExceeded("image active generation deadline exhausted")
         return max(0.001, min(float(maximum_secs), remaining))
 
+    def _image_request_options(self, maximum_secs: float) -> dict[str, Any]:
+        """Include pacing/lock waits in the same finite image request budget."""
+        timeout = self._image_active_timeout(maximum_secs)
+        options = {"timeout": timeout}
+        deadline = getattr(getattr(self, "progress_callback", None), "active_deadline_at", None)
+        if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and deadline > 0:
+            options["_account_request_deadline_monotonic"] = time.monotonic() + timeout
+        return options
+
     def close(self) -> None:
         if getattr(self, "_closed", False):
             return
@@ -1042,7 +1051,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements),
             json=payload,
-            timeout=self._image_active_timeout(60),
+            **self._image_request_options(60),
         )
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
@@ -1084,7 +1093,7 @@ class OpenAIBackendAPI:
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
                   "height": height},
-            timeout=self._image_active_timeout(60),
+            **self._image_request_options(60),
         )
         ensure_ok(response, path)
         upload_meta = response.json()
@@ -1101,7 +1110,7 @@ class OpenAIBackendAPI:
                 "Accept-Language": "en-US,en;q=0.8",
             },
             data=data,
-            timeout=self._image_active_timeout(120),
+            **self._image_request_options(120),
         )
         ensure_ok(response, "image_upload")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
@@ -1109,7 +1118,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             data="{}",
-            timeout=self._image_active_timeout(60),
+            **self._image_request_options(60),
         )
         ensure_ok(response, path)
         return {
@@ -1253,8 +1262,12 @@ class OpenAIBackendAPI:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         request = self.session.get if _send is None else lambda url, **kw: _send("GET", url, **kw)
+        # Preflight already holds the account clock and caps its raw read.
+        # Internal pacing arguments must never reach that raw HTTP transport.
+        options = (self._image_request_options(timeout_secs) if _send is None
+                   else {"timeout": self._image_active_timeout(timeout_secs)})
         response = request(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                           timeout=self._image_active_timeout(timeout_secs))
+                           **options)
         try:
             ensure_ok(response, path)
             return response.json()
@@ -2694,7 +2707,7 @@ class OpenAIBackendAPI:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    **self._image_request_options(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2703,7 +2716,7 @@ class OpenAIBackendAPI:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    **self._image_request_options(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2730,7 +2743,7 @@ class OpenAIBackendAPI:
         response = self.session.get(
             self.base_url + path,
             headers=self._headers(path, {"Accept": "application/json"}),
-            timeout=timeout_secs,
+            **self._image_request_options(timeout_secs),
         )
         ensure_ok(response, path)
         data = response.json()
@@ -2933,7 +2946,7 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            response = self.session.get(url, timeout=120)
+            response = self.session.get(url, **self._image_request_options(120))
             ensure_ok(response, "image_download")
             if response.content not in images:
                 images.append(response.content)
@@ -3125,11 +3138,8 @@ class OpenAIBackendAPI:
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
-            timeout=(
-                self._image_active_timeout(30)
-                if self.image_submission_started is False
-                else 30
-            ),
+            **(self._image_request_options(30)
+               if self.image_submission_started is False else {"timeout": 30}),
         )
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
@@ -3146,7 +3156,7 @@ class OpenAIBackendAPI:
             self.base_url + prepare_path,
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
             json={"p": p_token},
-            timeout=self._image_active_timeout(30),
+            **self._image_request_options(30),
         )
         ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
@@ -3179,7 +3189,7 @@ class OpenAIBackendAPI:
                 "proof_token": proof_token,
                 "turnstile_token": turnstile_token,
             },
-            timeout=self._image_active_timeout(30),
+            **self._image_request_options(30),
         )
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()

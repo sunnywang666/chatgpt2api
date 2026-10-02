@@ -71,6 +71,36 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_generated_ids_are_saved_before_stream_or_url_resolution_can_fail(self) -> None:
+        for failure_phase in ("stream", "resolve"):
+            with self.subTest(failure_phase=failure_phase):
+                saved = []
+                callback = lambda _step: None
+                callback.record_result_ids = lambda files, sediments: saved.append((files, sediments))
+                class Backend:
+                    def stream_conversation(self, **_kwargs):
+                        yield json.dumps({"conversation_id": "original", "message": {
+                            "author": {"role": "user"}, "content": {"parts": ["file-service://uploaded-input"]},
+                        }})
+                        yield json.dumps({"conversation_id": "original", "message": {
+                            "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
+                            "content": {"parts": ["file-service://generated-image sediment://generated-sediment"]},
+                        }})
+                        if failure_phase == "stream":
+                            raise ConnectionError("stream ended after image tool result")
+                        yield "[DONE]"
+
+                    def resolve_conversation_image_urls(self, *_args, **_kwargs):
+                        if saved != [(["generated-image"], ["generated-sediment"])]:
+                            raise AssertionError("result IDs were not durable before URL resolution")
+                        raise ConnectionError("URL resolution failed")
+
+                with self.assertRaises(ConnectionError):
+                    list(stream_image_outputs(Backend(), ConversationRequest(
+                        prompt="circle", model="gpt-image-2", progress_callback=callback,
+                    )))
+                self.assertEqual(saved, [(["generated-image"], ["generated-sediment"])])
+
     def test_stream_id_extractor_keeps_full_file_ids(self) -> None:
         payload = (
             '{"conversation_id":"conv-1"} '

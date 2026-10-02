@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
+from services.account_request_pacing import AccountRequestClock, AccountRequestDeadlineExceeded, pace_account_session
 from services.image_task_service import ImageTaskService, _authoritative_image_failure
 from services.image_thread import ImageThreadError
 from services.openai_backend_api import (
@@ -145,6 +146,99 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
+    def test_image_external_transfers_consume_deadline_without_account_clock(self):
+        from services.openai_backend_api import requests
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("services.account_request_pacing.DATA_DIR", Path(tmp)), \
+             mock.patch("services.account_request_pacing._clocks", {}), \
+             mock.patch("services.openai_backend_api.time.time", return_value=1000), \
+             mock.patch("services.account_request_pacing.time.monotonic", return_value=100), \
+             mock.patch.object(requests.Session, "request", autospec=True) as transport:
+            transport.return_value = mock.Mock(status_code=200, content=b"generated-image")
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.session = requests.Session()
+            pace_account_session(backend.session, {"account_id": "fixture"}, "fixture-token")
+            callback = lambda _step: None
+            callback.active_deadline_at = 1010
+            backend.progress_callback = callback
+            self.assertEqual(backend.download_image_bytes(["https://storage.test/result"]), [b"generated-image"])
+            backend.session.put("https://storage.test/upload", data=b"input", **backend._image_request_options(120))
+            for call in transport.call_args_list:
+                self.assertEqual(call.kwargs["timeout"], 10)
+                self.assertFalse(any(key.startswith("_account_request") for key in call.kwargs))
+            self.assertEqual(transport.call_count, 2)
+            with self.assertRaises(AccountRequestDeadlineExceeded):
+                backend.session.get("https://storage.test/result", timeout=10, _account_request_deadline_monotonic=99)
+            self.assertEqual(transport.call_count, 2)
+            backend.close()
+
+    def test_image_result_reads_cannot_wait_past_active_deadline_in_account_clock(self):
+        operations = (
+            lambda backend: backend._get_conversation("original"),
+            lambda backend: backend._query_backend_tasks("original"),
+            lambda backend: backend._get_file_download_url("generated"),
+            lambda backend: backend._get_attachment_download_url("original", "generated"),
+            lambda backend: backend.download_image_bytes(["https://images.test/generated"]),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), mock.patch("services.openai_backend_api.time.time", return_value=1000), \
+                 mock.patch("services.account_request_pacing.time.monotonic", return_value=100), \
+                 mock.patch("services.account_request_pacing.time.sleep") as sleep:
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.base_url = "https://provider.test"
+                backend._headers = lambda *_args: {}
+                callback = lambda _step: None
+                callback.active_deadline_at = 1010
+                backend.progress_callback = callback
+                clock = AccountRequestClock()
+                clock.cooldown_until = 120
+                transport = mock.Mock(return_value=mock.Mock(status_code=200, headers={}, content=b"image"))
+                transport.return_value.json.return_value = {"tasks": []}
+                backend.session = mock.Mock()
+                backend.session.get.side_effect = lambda url, **kwargs: clock.request(transport, "GET", url, **kwargs)
+                with self.assertRaises(AccountRequestDeadlineExceeded):
+                    operation(backend)
+                transport.assert_not_called()
+                sleep.assert_not_called()
+                self.assertFalse(clock.lock.locked())
+
+    def test_image_result_read_reduces_transport_timeout_after_cooldown(self):
+        now = [100.0]
+        with mock.patch("services.openai_backend_api.time.time", side_effect=lambda: now[0] + 900), \
+             mock.patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             mock.patch("services.account_request_pacing.time.sleep", side_effect=lambda secs: now.__setitem__(0, now[0] + secs)):
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.base_url = "https://provider.test"
+            backend._headers = lambda *_args: {}
+            callback = lambda _step: None
+            callback.active_deadline_at = 1010
+            backend.progress_callback = callback
+            clock = AccountRequestClock()
+            clock.cooldown_until = 104
+            transport = mock.Mock(return_value=mock.Mock(status_code=200, headers={}))
+            transport.return_value.json.return_value = {"current_node": "original"}
+            backend.session = mock.Mock()
+            backend.session.get.side_effect = lambda url, **kwargs: clock.request(transport, "GET", url, **kwargs)
+            self.assertEqual(backend._get_conversation("original"), {"current_node": "original"})
+            self.assertEqual(transport.call_args.kwargs["timeout"], 6)
+            self.assertFalse(any(key.startswith("_account_request") for key in transport.call_args.kwargs))
+
+    def test_image_preflight_raw_read_does_not_receive_pacing_kwargs(self):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://provider.test"
+        backend._headers = lambda *_args: {}
+        callback = lambda _step: None
+        callback.active_deadline_at = time.time() + 10
+        backend.progress_callback = callback
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"current_node": "original"}
+        def send(method, url, *, headers, timeout):
+            self.assertEqual(method, "GET")
+            self.assertLessEqual(timeout, 10)
+            return response
+        self.assertEqual(backend._get_conversation("original", _send=send), {"current_node": "original"})
+        response.close.assert_called_once()
+
     @mock.patch("services.openai_backend_api.account_service.require_image_account", return_value={"provider_account_identity": "fixture"})
     def test_generation_post_records_submission_boundary_before_network_call(self, _capability):
         backend = object.__new__(OpenAIBackendAPI)

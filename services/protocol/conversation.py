@@ -971,6 +971,7 @@ def stream_image_outputs(
         backend.image_request_message_id = request_message_id
     record_conversation_id = getattr(request.progress_callback, "record_conversation_id", None)
     last: dict[str, Any] = {}
+    recorded_result_ids = ([], [])
     for event in conversation_events(
             backend,
             prompt=request.prompt,
@@ -985,6 +986,12 @@ def stream_image_outputs(
         event_conversation_id = str(event.get("conversation_id") or "")
         if event_conversation_id and callable(record_conversation_id):
             record_conversation_id(event_conversation_id)
+        result_ids = (list(event.get("file_ids") or []), list(event.get("sediment_ids") or []))
+        if result_ids != recorded_result_ids:
+            # These IDs have already passed the image-tool output filter.
+            # Persist before another stream read or URL lookup can fail/wait.
+            _record_result_ids(request, *result_ids)
+            recorded_result_ids = result_ids
         if event.get("type") == "conversation.delta":
             yield ImageOutput(
                 kind="progress",
