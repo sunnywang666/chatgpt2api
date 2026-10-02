@@ -273,12 +273,15 @@ class OpenAIBackendAPI:
         return max(0.001, min(float(maximum_secs), remaining))
 
     def _image_request_options(self, maximum_secs: float) -> dict[str, Any]:
-        """Include pacing/lock waits in the same finite image request budget."""
+        """Bound waits by the active attempt, then cap the network operation."""
         timeout = self._image_active_timeout(maximum_secs)
         options = {"timeout": timeout}
         deadline = getattr(getattr(self, "progress_callback", None), "active_deadline_at", None)
         if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and deadline > 0:
-            options["_account_request_deadline_monotonic"] = time.monotonic() + timeout
+            # A slow account pace must not consume the entire per-HTTP timeout
+            # before transport starts. The account clock caps that timeout
+            # again at the send edge using the remaining active-attempt budget.
+            options["_account_request_deadline_monotonic"] = time.monotonic() + max(0.0, deadline - time.time())
         return options
 
     def close(self) -> None:

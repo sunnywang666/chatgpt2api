@@ -15,12 +15,15 @@ class CompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     action: Literal["recover", "complete", "rework"] = "recover"
     allow_unconfirmed_retry: bool = Field(default=False, strict=True)
+    retry_not_sent_failure_at: float | None = Field(default=None, gt=0, allow_inf_nan=False, strict=True)
     selected_id: str | None = Field(default=None, min_length=1, max_length=200)
     results_saved: bool = Field(default=False, strict=True)
     reviewed: bool = Field(default=False, strict=True)
 
     @model_validator(mode="after")
     def validate_action(self):
+        if self.retry_not_sent_failure_at is not None and (self.action != "recover" or self.allow_unconfirmed_retry):
+            raise ValueError("confirmed not-sent repair is a separate recovery action")
         if self.action == "complete":
             if not self.selected_id or not self.results_saved or not self.reviewed or self.allow_unconfirmed_retry:
                 raise ValueError("completion requires the selected result, saved and reviewed")
@@ -70,7 +73,8 @@ def create_router(kind):
             if body.action == "rework":
                 return await run_in_threadpool(service.rework, kind, identity, request_id, body.selected_id)
             return await run_in_threadpool(service.start, kind, identity, request_id,
-                                           allow_unconfirmed_retry=body.allow_unconfirmed_retry)
+                                           allow_unconfirmed_retry=body.allow_unconfirmed_retry,
+                                           retry_not_sent_failure_at=body.retry_not_sent_failure_at)
         except WorkLifecycleError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
     return router

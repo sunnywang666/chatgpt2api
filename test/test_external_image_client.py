@@ -27,6 +27,41 @@ TOKEN = "fixture-bearer-secret"
 PNG = b"\x89PNG\r\n\x1a\nfixture"
 
 
+def test_unsent_repair_preserves_failure_stamp_after_lost_response(tmp_path):
+    state_path = tmp_path / "original.json"
+    image_client._atomic_write_state(state_path, {
+        "schema_version": image_client.STATE_SCHEMA_VERSION,
+        "client_task_id": "original-image", "input_fingerprint": "retained", "phase": "accepted",
+    })
+    calls = []
+
+    class Api:
+        def json(self, method, endpoint, payload=None):
+            calls.append((method, payload))
+            if method == "GET":
+                return {"missing_ids": [], "items": [{"id": "original-image", "upstream_outcome": "not_submitted",
+                                   "upstream_submission_started": False, "recovery_retryable": True,
+                                   "last_recovery_failure": {"at": 1234.5}}]}
+            saved = json.loads(state_path.read_text())
+            assert saved["not_sent_retry"] == {"failure_at": 1234.5, "acknowledged": False}
+            if len(calls) == 2:
+                raise image_client.ClientError("response lost after acceptance")
+            return {"protocol": "generation-completion-v1", "kind": "image",
+                    "original_id": "original-image", "state": "checking_original"}
+
+    args = image_client._parser().parse_args([
+        "completion-recover", "--state", str(state_path), "--retry-not-sent",
+    ])
+    with unittest.TestCase().assertRaisesRegex(image_client.ClientError, "response lost after acceptance"):
+        image_client._command_completion(Api(), args)
+    with mock.patch.object(image_client, "_emit"):
+        image_client._command_completion(Api(), args)
+    assert len(calls) == 3 and calls[1] == calls[2]
+    saved = json.loads(state_path.read_text())
+    assert saved["client_task_id"] == "original-image" and saved["input_fingerprint"] == "retained"
+    assert saved["not_sent_retry"]["acknowledged"] is True
+
+
 class FixtureState:
     def __init__(self) -> None:
         self.tasks: dict[str, dict[str, object]] = {}

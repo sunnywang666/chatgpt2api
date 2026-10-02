@@ -347,7 +347,8 @@ def test_image_replacement_retains_exact_input_and_download_evidence_prevents_re
     else:
         service.images.submit_generation(IDENTITY, **kwargs)
     patch_row(service, "image", "image-original", status="error", upstream_outcome="not_sent",
-              error_code="IMAGE_GENERATION_NOT_SUBMITTED", _submission_started=False)
+              error_code="IMAGE_GENERATION_NOT_SUBMITTED", _submission_started=False,
+              active_attempt_started_at=1000, active_attempt_deadline_at=1300)
     old = row(service, "image", "image-original")
     result = start(service, "image", "image-original")
     retried = row(service, "image", "image-original")
@@ -355,6 +356,8 @@ def test_image_replacement_retains_exact_input_and_download_evidence_prevents_re
     assert retried["_completion"]["same_request_retry"]
     assert retried["_input_ref"] == old["_input_ref"]
     assert retried["request_hash"] == old["request_hash"]
+    assert retried["active_attempt_started_at"] is None and retried["active_attempt_deadline_at"] is None
+    assert retried["_execution_timeline"][-1]["previous_active_deadline_at"] == 1300
     patch_row(service, "image", "image-original", status="error", upstream_outcome="not_sent",
               error_code="IMAGE_GENERATION_NOT_SUBMITTED")
     admission.clock.now += 31
@@ -364,6 +367,83 @@ def test_image_replacement_retains_exact_input_and_download_evidence_prevents_re
     patch_row(service, "image", "download-original", status="error", upstream_outcome="generated", result_file_ids=["saved-file"])
     result = start(service, "image", "download-original")
     assert result["reason"] == "COMPLETION_DOWNLOAD_ORIGINAL_RESULT" and "replacement_id" not in result
+
+
+@pytest.fixture
+def failed_unsent_image(setup):
+    service, admission, calls = setup
+    service.images.submit_generation(IDENTITY, client_task_id="repair-image", prompt="retained input",
+                                     model="gpt-image-2", size=None)
+    patch_row(service, "image", "repair-image", status="error", upstream_outcome="not_submitted",
+              _submission_started=False, upstream_submission_started=False, upstream_unfinished=False,
+              error_code="RESULT_UNRECOVERABLE", recovery_retryable=True,
+              last_recovery_failure={"at": 2900.0, "type": "ImageGenerationError"},
+              active_attempt_started_at=2000, active_attempt_deadline_at=2300,
+              _completion={"state": "needs_attention", "allow_unconfirmed_retry": False,
+                           "same_request_retry": True, "max_extra_requests": 1, "next_at": None})
+    return service
+
+
+def test_explicit_unsent_image_repair_is_same_id_and_idempotent_across_restart(failed_unsent_image):
+    service = failed_unsent_image
+    old = row(service, "image", "repair-image")
+    service.start("image", IDENTITY, "repair-image", retry_not_sent_failure_at=2900.0)
+    retried = row(service, "image", "repair-image")
+    assert retried["status"] == "queued" and retried["_completion"]["same_request_retry"]
+    assert retried["_input_ref"] == old["_input_ref"] and retried["request_hash"] == old["request_hash"]
+    assert retried["active_attempt_deadline_at"] is None
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted.start("image", IDENTITY, "repair-image", retry_not_sent_failure_at=2900.0)
+    assert row(service, "image", "repair-image")["_execution_timeline"] == retried["_execution_timeline"]
+    patch_row(service, "image", "repair-image", status="error", last_recovery_failure={"at": 2950.0},
+              _completion={**retried["_completion"], "state": "needs_attention", "next_at": None})
+    # A delayed repeat of the old authorization cannot retry the new failure.
+    restarted.start("image", IDENTITY, "repair-image", retry_not_sent_failure_at=2900.0)
+    assert row(service, "image", "repair-image")["status"] == "error"
+    restarted.start("image", IDENTITY, "repair-image", retry_not_sent_failure_at=2950.0)
+    assert row(service, "image", "repair-image")["status"] == "queued"
+
+
+@pytest.mark.parametrize("changes", [
+    {"upstream_outcome": "unknown"}, {"upstream_submission_started": True}, {"_submission_started": True},
+    {"_executing": True}, {"result_file_ids": ["known-result"]}, {"data": [{"b64_json": "saved"}]},
+    {"_execution_timeline": [{"stage": "send_call_started", "at": 2000}]},
+    {"last_recovery_failure": {"at": 2901.0}}, {"_recovery_paused": True}, {"_recovery_suppressed": True},
+])
+def test_explicit_unsent_repair_rejects_sent_unknown_results_and_pause(failed_unsent_image, changes):
+    service = failed_unsent_image
+    patch_row(service, "image", "repair-image", **changes)
+    before = row(service, "image", "repair-image")
+    with pytest.raises(CompletionError):
+        service.start("image", IDENTITY, "repair-image", retry_not_sent_failure_at=2900.0)
+    assert row(service, "image", "repair-image") == before
+
+
+def test_explicit_unsent_repair_rejects_missing_original_input(failed_unsent_image):
+    service = failed_unsent_image
+    patch_row(service, "image", "repair-image", _input_ref="missing-original.json")
+    with pytest.raises(CompletionError, match="COMPLETION_ORIGINAL_INPUT_UNAVAILABLE"):
+        service.start("image", IDENTITY, "repair-image", retry_not_sent_failure_at=2900.0)
+    assert row(service, "image", "repair-image")["status"] == "error"
+
+
+def test_image_repair_api_owner_and_exact_failure_contract(failed_unsent_image, monkeypatch):
+    import api.generation_completion as api
+    service = failed_unsent_image
+    monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
+    monkeypatch.setattr(api, "require_identity", lambda authorization, request: {**IDENTITY, "id": authorization or "other"})
+    monkeypatch.setattr(api, "require_image_policy", lambda *a, **kw: None)
+    app = FastAPI()
+    app.include_router(api.create_router("image"))
+    client = TestClient(app)
+    endpoint = "/api/image-tasks/repair-image/completion"
+    payload = {"action": "recover", "retry_not_sent_failure_at": 2900.0}
+    assert client.post(endpoint, headers={"Authorization": "other"}, json=payload).status_code == 404
+    assert client.post(endpoint, headers={"Authorization": "owner"}, json={**payload, "allow_unconfirmed_retry": True}).status_code == 422
+    assert client.post(endpoint, headers={"Authorization": "owner"}, json={**payload, "retry_not_sent_failure_at": 2899.0}).status_code == 409
+    response = client.post(endpoint, headers={"Authorization": "owner"}, json=payload)
+    assert response.status_code == 200 and response.json()["original_id"] == "repair-image"
+    assert row(service, "image", "repair-image")["status"] == "queued"
 
 
 def test_api_owner_isolation_and_explicit_saved_reviewed_ack(setup, monkeypatch):

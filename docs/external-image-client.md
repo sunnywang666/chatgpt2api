@@ -461,3 +461,14 @@ is retained. Applications continue using the selected result's public session
 reference and ID after confirmed restore. Historical UNKNOWN receipts do not
 opt in merely because the service upgrades; new pure-generation requests use
 the bounded policy described above.
+
+If an image failed before sending and its automatic retry also failed, fix the
+reported problem first, then use `completion-recover --state original.json
+--retry-not-sent`. This explicitly requeues the same ID and verified original
+input; it never authorizes an UNKNOWN request or discards a generated result.
+The client durably binds the action to `last_recovery_failure.at` before POST.
+API callers use `{"action":"recover","retry_not_sent_failure_at":<observed at>}`
+and repeat that exact value after an uncertain response. Repeating it cannot
+authorize another attempt, including after restart. Each confirmed unsent
+image retry gets a fresh active-attempt deadline; previous deadlines and failure
+evidence remain in the receipt timeline. Automatic retry counts stay bounded.

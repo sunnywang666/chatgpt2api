@@ -205,7 +205,8 @@ class GenerationCompletionService:
             raise CompletionError("COMPLETION_PURE_GENERATION_REQUIRED")
         return row
 
-    def start(self, kind, identity, request_id, *, allow_unconfirmed_retry=False):
+    def start(self, kind, identity, request_id, *, allow_unconfirmed_retry=False,
+              retry_not_sent_failure_at=None):
         owner, now = str(identity["id"]), float(self.clock())
         if getattr(self.text, "admission", None) is None:
             raise CompletionError("COMPLETION_SCHEDULER_REQUIRED", 503)
@@ -225,9 +226,55 @@ class GenerationCompletionService:
                     "max_extra_requests": 1, "next_at": now,
                 }
                 self.store.write_receipt(db, kind, owner, request_id, root)
+            if retry_not_sent_failure_at is not None:
+                state = root["_completion"]
+                stamp = retry_not_sent_failure_at
+                if (kind != "image" or not isinstance(stamp, (int, float))
+                        or isinstance(stamp, bool) or not math.isfinite(stamp) or stamp <= 0):
+                    raise CompletionError("COMPLETION_NOT_SENT_RETRY_INVALID")
+                # A lost POST response can be retried without granting another
+                # send. Explicit repair is tied to the observed failed attempt.
+                if state.get("retried_not_sent_failure_at") != stamp:
+                    work = self.store.runtime(db, root.get("_work_key")) if root.get("_work_key") else None
+                    if (root.get("_recovery_paused") or root.get("_recovery_suppressed")
+                            or work and work.get("state") != "active"):
+                        raise CompletionError("COMPLETION_WORK_NOT_ACTIVE")
+                    if (root.get("status") != "error" or root.get("_executing") or root.get("recovery_claim_id")
+                            or root.get("upstream_outcome") not in {"not_sent", "not_submitted"}
+                            or root.get("_submission_started") is not False
+                            or root.get("upstream_submission_started") is not False
+                            or root.get("recovery_retryable") is not True
+                            or root.get("upstream_unfinished")
+                            or any(root.get(k) for k in ("data", "result_file_ids", "result_sediment_ids"))
+                            or any(e.get("stage") == "send_call_started" for e in root.get("_execution_timeline", []))
+                            or state.get("replacement_id") or state.get("selected_id")
+                            or not state.get("same_request_retry")
+                            or state.get("state") != "needs_attention"
+                            or (root.get("last_recovery_failure") or {}).get("at") != stamp):
+                        raise CompletionError("COMPLETION_NOT_SENT_RETRY_CONFLICT")
+                    self._load_verified_input(db, kind, owner, request_id, root)
+                    self._queue_not_sent(root, state, now, kind)
+                    state["retried_not_sent_failure_at"] = stamp
+                    self.store.write_receipt(db, kind, owner, request_id, root)
         self.advance(kind, owner, request_id)
         self.text.admission.wake()
         return self.read(kind, identity, request_id)
+
+    def _queue_not_sent(self, root, state, now, kind):
+        root.setdefault("_execution_timeline", []).append({
+            "stage": "not_submitted_retry_queued", "at": now,
+            "previous_active_started_at": root.get("active_attempt_started_at"),
+            "previous_active_deadline_at": root.get("active_attempt_deadline_at"),
+            "failure": copy.deepcopy(root.get("last_recovery_failure")),
+        })
+        root.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
+                    _turn_reserved=False, _ready_at=now, error_code=None,
+                    _attempt_finished_at=None, _attempt_reason=None,
+                    boot=self.text.boot if kind == "text" else root.get("boot"))
+        if kind == "image":
+            root.update(active_attempt_started_at=None, active_attempt_deadline_at=None)
+        state.update(state="checking_original", same_request_retry=True, next_at=now)
+        state.pop("reason", None)
 
     def _load_verified_input(self, db, kind, owner, request_id, receipt):
         try:
@@ -401,10 +448,7 @@ class GenerationCompletionService:
                                 or kind == "image" and root.get("error_code") == "RESULT_UNRECOVERABLE"
                                 and root.get("recovery_retryable") is True)):
                             raise CompletionError("COMPLETION_ORIGINAL_NOT_RETRYABLE")
-                        root.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
-                                    _turn_reserved=False, _ready_at=now, error_code=None,
-                                    boot=self.text.boot if kind == "text" else root.get("boot"))
-                        state.update(state="checking_original", same_request_retry=True)
+                        self._queue_not_sent(root, state, now, kind)
                         self.store.write_receipt(db, kind, owner, request_id, root)
                         self.text.admission.wake()
                         return

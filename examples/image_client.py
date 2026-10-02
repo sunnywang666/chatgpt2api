@@ -878,6 +878,22 @@ def _command_completion(api: ApiClient, args: argparse.Namespace) -> int:
         payload = None
         if action == "recover":
             payload = {"action": "recover", "allow_unconfirmed_retry": args.allow_unconfirmed_retry}
+            if getattr(args, "retry_not_sent", False):
+                if chat or args.allow_unconfirmed_retry:
+                    raise ClientError("confirmed not-sent image repair cannot authorize an unknown send")
+                repair = state.get("not_sent_retry") or {}
+                if not repair or repair.get("acknowledged"):
+                    receipt = _lookup_task(api, original_id)
+                    stamp = (receipt.get("last_recovery_failure") or {}).get("at")
+                    if (receipt.get("upstream_outcome") not in {"not_sent", "not_submitted"}
+                            or receipt.get("upstream_submission_started") is not False
+                            or receipt.get("recovery_retryable") is not True
+                            or not isinstance(stamp, (int, float)) or isinstance(stamp, bool)):
+                        raise ClientError("original image does not prove a retryable pre-submission failure")
+                    repair = {"failure_at": stamp, "acknowledged": False}
+                    state["not_sent_retry"] = repair
+                    _atomic_write_state(path, state)
+                payload["retry_not_sent_failure_at"] = repair["failure_at"]
         current = api.json("POST" if payload else "GET", endpoint, payload=payload)
         if (current.get("protocol") != "generation-completion-v1" or current.get("original_id") != original_id
                 or current.get("kind") != ("text" if chat else "image")):
@@ -887,6 +903,8 @@ def _command_completion(api: ApiClient, args: argparse.Namespace) -> int:
             if prior.get(key) and prior[key] != current.get(key):
                 raise ClientError("completion response changed its durable result selection")
         state["completion"] = current
+        if payload and "retry_not_sent_failure_at" in payload:
+            state["not_sent_retry"]["acknowledged"] = True
         _atomic_write_state(path, state)
         selected = current.get("selected_id")
         if action in {"save", "complete", "rework"} and not selected:
@@ -1070,6 +1088,9 @@ def _parser() -> argparse.ArgumentParser:
             if action == "recover":
                 operation.add_argument("--allow-unconfirmed-retry", action="store_true",
                     help="explicitly permit at most one additional generation while original stop/outcome remains unknown")
+                if not prefix:
+                    operation.add_argument("--retry-not-sent", action="store_true",
+                        help="after repair, explicitly retry the same image ID only when its latest failure proves no generation was sent")
             if action == "save":
                 operation.add_argument("--output", required=True)
             if action == "complete":
