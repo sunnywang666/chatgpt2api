@@ -546,6 +546,17 @@ class GenerationCompletionService:
                         "allow_unconfirmed_retry": False, "automatic_failure_retry": True,
                         "max_extra_requests": 1, "next_at": float(self.clock())}
                     self.store.write_receipt(db, kind, owner, rid, row)
+                state = row.get("_completion") or {}
+                if (state.get("state") not in {None, "completed", "result_ready"}
+                        and state.get("next_at") is None
+                        and not row.get("_recovery_paused") and not row.get("_recovery_suppressed")):
+                    # Original-result recovery can finish after automatic
+                    # investigation has ended. Settle saved evidence locally;
+                    # do not reopen reads/retries or starve due work with a late
+                    # original whose already-sent replacement still owns it.
+                    self._select(db, kind, owner, rid, row)
+                    if state.get("selected_id"):
+                        self.store.write_receipt(db, kind, owner, rid, row)
         with self.store.connect() as db:
             candidates = [(kind, owner, rid) for kind, owner, rid, row in self.store.receipts(db)
                           if row.get("_completion", {}).get("state") not in {None, "completed", "result_ready"}

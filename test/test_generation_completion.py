@@ -472,6 +472,73 @@ def failed_unsent_image(setup):
     return service
 
 
+@pytest.mark.parametrize("kind", ["text", "image"])
+def test_background_settles_saved_original_after_investigation_ended(setup, kind):
+    service, admission, calls = setup
+    rid = "old-0"
+    if kind == "image":
+        service.images.submit_generation(IDENTITY, client_task_id=rid, prompt="retained image",
+                                         model="gpt-image-2", size=None)
+    result = {"content": "Recovered original answer"} if kind == "text" else {
+        "data": [{"b64_json": "c2F2ZWQtb3JpZ2luYWw="}]}
+    patch_row(service, kind, rid, status="succeeded" if kind == "text" else "success",
+              **result, _completion={"state": "needs_attention", "next_at": None,
+                                    "reason": "COMPLETION_ORIGINAL_READ_UNAVAILABLE"})
+    before = row(service, kind, rid)
+    service.text.read = Mock(side_effect=AssertionError("no original HTTP read"))
+    service.images.resume_poll = Mock(side_effect=AssertionError("no original image read"))
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted.process_one()
+    after = row(service, kind, rid)
+    assert after["_completion"]["state"] == "result_ready"
+    assert after["_completion"]["selected_id"] == rid
+    assert "reason" not in after["_completion"] and "replacement_id" not in after["_completion"]
+    assert {k: v for k, v in after.items() if k != "_completion"} == {
+        k: v for k, v in before.items() if k != "_completion"}
+    restarted.process_one()
+    assert row(service, kind, rid) == after
+    assert calls == []
+
+
+@pytest.mark.parametrize("guard", ["no_result", "paused", "suppressed"])
+def test_background_settlement_never_reopens_unavailable_or_paused_original(setup, guard):
+    service, admission, calls = setup
+    changes = {"status": "succeeded", "content": "Recovered original answer"}
+    if guard == "no_result":
+        changes["content"] = ""
+    elif guard == "paused":
+        changes["_recovery_paused"] = True
+    else:
+        changes["_recovery_suppressed"] = True
+    patch_row(service, **changes, _completion={"state": "needs_attention", "next_at": None,
+                                              "reason": "COMPLETION_ORIGINAL_READ_UNAVAILABLE"})
+    before = row(service)
+    service.text.read = Mock(side_effect=AssertionError("must not resume original read"))
+    service.process_one()
+    assert row(service) == before and calls == []
+
+
+def test_background_settlement_preserves_sent_replacement_and_other_ready_work(setup):
+    service, admission, calls = setup
+    child_id = start(service)["replacement_id"]
+    state = {**row(service)["_completion"], "state": "needs_attention", "next_at": None}
+    patch_row(service, status="succeeded", content="late original", _completion=state)
+    patch_row(service, request_id=child_id, status="running", _submission_started=True)
+    service.images.submit_generation(IDENTITY, client_task_id="other-image", prompt="other image",
+                                     model="gpt-image-2", size=None)
+    patch_row(service, "image", "other-image", status="success", data=[{"b64_json": "c2F2ZWQ="}],
+              _completion={"state": "needs_attention", "next_at": None})
+    service.text.read = Mock(side_effect=AssertionError("no original read"))
+    service.process_one()
+    assert "selected_id" not in row(service)["_completion"]
+    assert row(service, request_id=child_id)["status"] == "running"
+    assert row(service, "image", "other-image")["_completion"]["selected_id"] == "other-image"
+    patch_row(service, request_id=child_id, status="succeeded", content="saved replacement")
+    service.process_one()
+    assert row(service)["_completion"]["selected_id"] == child_id
+    assert row(service)["content"] == "late original" and calls == []
+
+
 def test_explicit_unsent_image_repair_is_same_id_and_idempotent_across_restart(failed_unsent_image):
     service = failed_unsent_image
     old = row(service, "image", "repair-image")
