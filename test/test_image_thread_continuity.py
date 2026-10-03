@@ -824,7 +824,7 @@ def test_predecessor_diagnostics_are_specific_and_read_only(previous, reason):
     assert predecessor_state(task, owned) == ({}, reason)
     assert owned == before
 
-@pytest.mark.parametrize('case', ['success', 'drift', 'late_result', 'missing_root'])
+@pytest.mark.parametrize('case', ['success', 'late_original_success', 'drift', 'late_result', 'missing_root'])
 def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runtime, case):
     import time
     from services.generation_completion import GenerationCompletionService, retry_cursor
@@ -879,7 +879,7 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
                 root['_completion'] = {}
             r.store.write_receipt(db, 'image', WHO['id'], 'empty-original', root)
     r.admission.execute(ctx)
-    if case != 'success':
+    if case not in {'success', 'late_original_success'}:
         assert len(r.state.sends) == 1
         assert r.read(child_id)['upstream_outcome'] in {'not_sent', 'not_submitted'}
         return
@@ -894,6 +894,29 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
     assert result['selected_id'] == child_id
     assert completion.complete('image', WHO, 'empty-original', child_id)['state'] == 'completed'
     assert r.read('empty-original')['status'] == 'error'
+    if case == 'late_original_success':
+        with r.store.transaction() as db:
+            late = r.store.read_receipt(db, 'image', WHO['id'], 'empty-original')
+            late.update(status='success', data=[{'b64_json': base64.b64encode(SOURCE).decode()}])
+            r.store.write_receipt(db, 'image', WHO['id'], 'empty-original', late)
+    # The lifecycle worker archives the selected physical request, while the
+    # public caller may still name its original logical task. Both use the
+    # successful child's exact turn; the old UNKNOWN is retained.
+    assert r.service.archive_thread(WHO, child_id)['archived'] is True
+    assert r.service.restore_thread(WHO, 'empty-original')['archived'] is False
+    assert r.state.archive_actions[-2:] == [(cid, True), (cid, False)]
+    assert lifecycle.process_one()
+    completion.rework('image', WHO, 'empty-original', child_id)
+    assert lifecycle.process_one()
+    # Next edit accepts bytes selected for the original ID without requiring
+    # callers to replace their business IDs with internal retry IDs.
+    r.submit('after-recovery', source='empty-original')
+    with pytest.raises(ImageThreadError, match='IMAGE_THREAD_NOT_TERMINAL'):
+        r.service.archive_thread(WHO, child_id)
+    r.admission.execute(r.admission.claim_next())
+    assert r.read('after-recovery')['status'] == 'success'
+    assert r.read('after-recovery')['conversation_id'] == cid
+    assert r.read('empty-original')['status'] == ('success' if case == 'late_original_success' else 'error')
 
 
 @pytest.mark.parametrize('pruned', [False, True])

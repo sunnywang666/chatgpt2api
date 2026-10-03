@@ -462,7 +462,13 @@ or confirmation; `original_work.cleanup_pending` separately preserves old
 unknown occupancy and its deferred cleanup. Rework restores the selected
 conversation and never sends a new model request. The original conversation
 is retained. Applications continue using the selected result's public session
-reference and ID after confirmed restore. Historical UNKNOWN receipts do not
+reference after confirmed restore. For `image-thread-v1`, subsequent edits may
+keep `edit_source_task_id` equal to the original business task ID: the service
+resolves its selected same-thread result and checks the supplied bytes against
+that result. Archive/restore also resolves that selected turn while retaining
+the original failed receipt. A late successful original never replaces the
+already selected child, and any newer unfinished task still blocks archive.
+Historical UNKNOWN receipts do not
 opt in merely because the service upgrades; new pure-generation requests use
 the bounded policy described above.
 

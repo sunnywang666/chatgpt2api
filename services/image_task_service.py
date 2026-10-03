@@ -797,8 +797,15 @@ class ImageTaskService:
                 thread = (task or {}).get("_image_thread") or {}
                 members = [item for item in self._tasks.values()
                     if item.get("owner_id") == owner and (item.get("_image_thread") or {}).get("id") == thread.get("id")]
+                from services.image_thread import selected_thread_result
+                owned = {item["id"]: item for item in members}
+                # The original failed attempt stays in history. An explicitly
+                # selected terminal result resolves only that attempt, not any
+                # newer task, active generation, or unrelated unknown branch.
+                resolved = [selected_thread_result(item, owned) for item in members]
+                task = selected_thread_result(task, owned)
                 if (not thread or not members or max(members, key=lambda item: item.get("_sequence", 0)) is not task
-                        or any(item.get("status") != TASK_STATUS_SUCCESS or not item.get("_image_thread_terminal") for item in members)):
+                        or any(item.get("status") != TASK_STATUS_SUCCESS or not item.get("_image_thread_terminal") for item in resolved)):
                     raise ImageThreadError("IMAGE_THREAD_NOT_TERMINAL")
                 conversation_id = _clean(task.get("conversation_id"))
                 parent_id = _clean(task.get("parent_message_id"))
@@ -854,6 +861,11 @@ class ImageTaskService:
             with self.store.connect() as db:
                 duplicate = self.store.read_receipt(db, "image", owner, task_id)
                 source_snapshot = self.store.read_receipt(db, "image", owner, thread_fields["edit_source_task_id"])
+                if source_snapshot and (source_snapshot.get("_completion") or {}).get("selected_id"):
+                    from services.image_thread import selected_thread_result
+                    selected_id = source_snapshot["_completion"]["selected_id"]
+                    selected = self.store.read_receipt(db, "image", owner, selected_id)
+                    source_snapshot = selected_thread_result(source_snapshot, {selected_id: selected})
             if duplicate is None:
                 if source_snapshot is None:
                     raise ImageThreadError("IMAGE_THREAD_SOURCE_UNAVAILABLE")

@@ -100,6 +100,21 @@ def _source_usable(task):
             and bool(task.get("request_message_id") or task.get("adopted_source_request_message_id")))
 
 
+def selected_thread_result(task, owned):
+    """Resolve an explicit same-thread completion without rewriting its attempt."""
+    if not task:
+        return task
+    from services.generation_completion import same_session_retry
+    state = task.get("_completion") or {}
+    selected = owned.get(state.get("selected_id"))
+    if (state.get("state") not in {"result_ready", "completed"} or not selected
+            or not same_session_retry(task, selected) or not _source_usable(selected)
+            or not selected.get("_image_thread_terminal")
+            or (selected.get("_image_thread") or {}).get("id") != (task.get("_image_thread") or {}).get("id")):
+        return task
+    return selected
+
+
 def accept_thread(task, tasks, payload, mode, *, output_reader=saved_image_bytes):
     fields = input_fields(payload)
     if not fields:
@@ -120,7 +135,7 @@ def accept_thread(task, tasks, payload, mode, *, output_reader=saved_image_bytes
         raise ImageThreadError("IMAGE_THREAD_HISTORY_INVALID")
     previous = members[-1] if members else None
     source_id = fields.get("edit_source_task_id")
-    source = owned.get(source_id) if source_id else None
+    source = selected_thread_result(owned.get(source_id), owned) if source_id else None
     origin = (previous.get("_image_thread") or {}).get("origin_task_id") if previous else None
     if source_id:
         if mode != "edit" or not _source_usable(source):
@@ -172,7 +187,7 @@ def predecessor_state(task, owned):
     if thread.get("protocol") != PROTOCOL or not _id(thread.get("id")):
         return {}, "IMAGE_THREAD_HISTORY_INVALID"
     source_id = thread.get("edit_source_task_id")
-    if source_id and source_fingerprint(owned.get(source_id)) != thread.get("edit_source_fingerprint"):
+    if source_id and source_fingerprint(selected_thread_result(owned.get(source_id), owned)) != thread.get("edit_source_fingerprint"):
         return {}, "IMAGE_THREAD_SOURCE_CHANGED"
     previous_id = thread.get("previous_task_id")
     if previous_id is None:
