@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 
 from services.account_service import AccountService
@@ -1070,6 +1071,60 @@ class AdmissionTests(unittest.TestCase):
         receipt = self.read("image", "happy", "unsent")
         self.assertEqual(receipt["status"], "queued")
         self.assertFalse(any(item["stage"] == "task_finished" for item in receipt["_execution_timeline"]))
+        failure = receipt["_execution_timeline"][-1]
+        self.assertEqual(failure["stage"], "pre_submit_failure")
+        self.assertEqual(failure["error_code"], "IMAGE_RESOURCE_UNAVAILABLE")
+
+    def test_unsent_exception_retains_reason_and_retries_only_original_once(self):
+        self.image("prepare-failed")
+        context = self.admission.claim_next()
+        def fail_before_send(ctx, body):
+            self.admission.update_claim(ctx, progress="starting_generation")
+            raise RuntimeError("private request body and credential must not be logged")
+        self.admission.register("image", fail_before_send)
+        with self.assertLogs("chatgpt2api", level="WARNING") as captured:
+            self.admission.execute(context)
+        receipt = self.read("image", "happy", "prepare-failed")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(receipt["_submission_started"])
+        failure = receipt["_execution_timeline"][-1]
+        self.assertEqual(failure["stage"], "pre_submit_failure")
+        self.assertEqual(failure["phase"], "before_submit")
+        self.assertEqual(failure["error_type"], "RuntimeError")
+        self.assertNotIn("private request body", json.dumps(receipt))
+        self.assertNotIn("private request body", "\n".join(captured.output))
+        self.assertFalse(any(item["stage"] == "send_call_started" for item in receipt["_execution_timeline"]))
+        self.clock.now += 2
+        next_context = self.admission.claim_next()
+        self.assertEqual(next_context.request_id, "prepare-failed")
+        sends = []
+        def succeed(ctx, body):
+            ctx.before_send()
+            ctx.record_stage("send_call_started")
+            sends.append(ctx.request_id)
+            self.admission.update_claim(ctx, status="success", upstream_unfinished=False)
+        self.admission.register("image", succeed)
+        self.admission.execute(next_context)
+        final = self.read("image", "happy", "prepare-failed")
+        self.assertEqual(final["status"], "success")
+        self.assertEqual(sends, ["prepare-failed"])
+        self.assertEqual(sum(item["stage"] == "pre_submit_failure" for item in final["_execution_timeline"]), 1)
+        self.assertEqual(sum(item["stage"] == "send_call_started" for item in final["_execution_timeline"]), 1)
+
+    def test_unsent_diagnostic_does_not_attribute_old_attempt_progress(self):
+        self.image("stale-progress")
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "image", "happy", "stale-progress")
+            receipt["progress"] = "starting_generation"
+            self.store.write_receipt(db, "image", "happy", "stale-progress", receipt)
+        context = self.admission.claim_next()
+        self.admission.register("image", lambda *args: self.fail("handler must not start"))
+        with patch.object(self.store, "load_input", side_effect=RuntimeError("before handler")):
+            self.admission.execute(context)
+        receipt = self.read("image", "happy", "stale-progress")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertEqual(receipt["_execution_timeline"][-1]["phase"], "before_submit")
+        self.assertFalse(receipt["_submission_started"])
 
 
 if __name__ == "__main__":

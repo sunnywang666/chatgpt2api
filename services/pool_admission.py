@@ -29,6 +29,21 @@ def reset_unsent_image_attempt(kind, receipt):
                        active_attempt_deadline_at=None, started_ts=None)
 
 
+def record_unsent_failure(context, receipt, at, error_type=None):
+    """Keep why an unsent attempt returned to its original queue, without text."""
+    # progress can belong to an older attempt. Only the submission fence proves
+    # the phase here; do not attribute the failure to a stale detailed step.
+    entry = {"stage": "pre_submit_failure", "at": at, "phase": "before_submit",
+             "request_ref": hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24]}
+    if error_type:
+        entry["error_type"] = error_type
+    code = receipt.get("error_code")
+    if code in {"CONVERSATION_OUTCOME_UNKNOWN", "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}:
+        entry["error_code"] = code
+    receipt["_execution_timeline"] = [*(receipt.get("_execution_timeline") or []), entry][-32:]
+    logger.warning({"event": "pool_execution_stage", **entry})
+
+
 def account_clock_key(account):
     # Use the identity already owned by AccountRequestClock. Duplicate imports
     # of that upstream identity share both its turn and image constraints.
@@ -1322,13 +1337,14 @@ class PoolAdmission:
             payload["_request_message_id"] = r.get("request_message_id")
             with executing(context):
                 self.handlers[context.kind](context, body)
-        except Exception:
+        except Exception as exc:
             with self.store.transaction() as db:
                 r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
                 if r and r.get("_claim_id") == context.claim and r.get("status") == "running":
                     if r.get("_submission_started"):
                         r.update(status="unknown" if context.kind == "text" else "error", error_code="CONVERSATION_OUTCOME_UNKNOWN")
                     else:
+                        record_unsent_failure(context, r, float(self.clock()), type(exc).__name__)
                         r.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
                                  _turn_reserved=False, upstream_unfinished=False,
                                  _ready_at=float(self.clock()) + 1)
@@ -1341,6 +1357,7 @@ class PoolAdmission:
                 if r and r.get("_claim_id") == context.claim:
                     r["_executing"] = False
                     if not r.get("_submission_started") and r.get("error_code") in {"CONVERSATION_OUTCOME_UNKNOWN", "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}:
+                        record_unsent_failure(context, r, float(self.clock()))
                         r.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
                                  _turn_reserved=False, upstream_unfinished=False,
                                  _ready_at=float(self.clock()) + 1)
