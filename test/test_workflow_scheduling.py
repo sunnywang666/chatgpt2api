@@ -314,6 +314,41 @@ def test_before_send_rechecks_not_before_after_claim_and_returns_original_to_que
     assert rt.admission.claim_next().request_id=='one'
 
 
+def test_unsent_defer_preserves_fair_rotation_and_original_sends_once(runtime):
+    rt = runtime
+    submit(rt, 'a-first', owner='a-key-1', source='source-a', session='session-a-1',
+           scheduling={'not_before': at(990)})
+    submit(rt, 'a-second', owner='a-key-2', source='source-a', session='session-a-2')
+    submit(rt, 'b-only', owner='b-key', source='source-b', session='session-b')
+
+    first = rt.admission.claim_next()
+    assert first and (first.owner, first.request_id) == ('a-key-1', 'a-first')
+    # The final scheduling check can return an acquired claim without sending.
+    rt.admission.clock = lambda: 980
+    with pytest.raises(AdmissionLost, match='SCHEDULING_NOT_BEFORE'):
+        first.before_send()
+    saved = row(rt, 'a-first', 'a-key-1')
+    original_input = saved['_input_ref']
+    assert saved['status'] == 'queued' and saved['upstream_outcome'] == 'not_sent'
+    assert not saved['_submission_started'] and not work(rt, saved)['slot_held']
+    assert not rt.calls
+    with rt.store.connect() as db:
+        cursor = rt.store.runtime(db, 'fairness')
+    assert cursor['source'] == 'source-a'
+    assert cursor['owners']['source-a'] == 'a-key-1'
+
+    rt.admission.clock = lambda: 1001
+    for owner, request_id in [('b-key', 'b-only'), ('a-key-2', 'a-second'),
+                              ('a-key-1', 'a-first')]:
+        ctx = rt.admission.claim_next()
+        assert ctx and (ctx.owner, ctx.request_id) == (owner, request_id)
+        rt.admission.execute(ctx)
+        assert row(rt, request_id, owner)['status'] == 'success'
+    assert [x['client_conversation_id'] for x in rt.calls] == [
+        'session-b', 'session-a-2', 'session-a-1']
+    assert row(rt, 'a-first', 'a-key-1')['_input_ref'] == original_input
+
+
 @pytest.mark.parametrize('explicit_error', [False, True])
 def test_unsent_handler_requeue_releases_active_budget(runtime, explicit_error):
     rt=runtime
