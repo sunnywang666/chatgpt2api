@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 
 from api.key_policy import require_chat_text_policy, require_codex_endpoint, require_image_policy
 from api.support import require_identity
+from services.pool_admission import image_original_recovery_pending
 
 STREAM_SECONDS = 30
 CHECK_SECONDS = 1
@@ -40,7 +41,8 @@ def _snapshot(kind, service, identity, request_id):
     if status not in {"queued", "not_started", "running", "success", "succeeded", "failed", "error", "unknown"}:
         status = "unknown"
     return {"protocol": "task-notification-v1", "kind": kind, "request_id": request_id,
-            "status": status, "result_ready": ready, "result_count": result_count}
+            "status": status, "result_ready": ready, "result_count": result_count,
+            "recovering_original": kind == "image" and image_original_recovery_pending(receipt)}
 
 
 def _event(name, data):
@@ -68,7 +70,8 @@ def create_router(kind, get_service):
                     previous = state
                 if state["result_ready"]:
                     return
-                if state["status"] in {"failed", "error", "unknown", "success", "succeeded"}:
+                if (state["status"] in {"failed", "error", "unknown", "success", "succeeded"}
+                        and not state["recovering_original"]):
                     # Includes a malformed/empty success: never announce ready.
                     yield _event("needs_attention", state)
                     return

@@ -120,3 +120,44 @@ def test_policy_reduction_during_stream_never_releases_ready_result(runtime, mon
     monkeypatch.setattr(events, 'require_identity', authenticate)
     result = client.get('/api/image-tasks/original/events')
     assert 'event: access_lost' in result.text and 'event: result_ready' not in result.text
+
+
+@pytest.mark.parametrize('extra', [
+    {'upstream_unfinished': True},
+    {'upstream_unfinished': False, 'result_file_ids': ['original-file'], '_attempt_finished_at': 1},
+    {'upstream_unfinished': False, 'result_file_ids': ['original-file'], '_attempt_finished_at': 1, 'error_code': 'RESULT_UNRECOVERABLE'},
+    {'upstream_unfinished': False, '_pending_image_result_ids': {'file_ids': ['pending-file'], 'sediment_ids': []}},
+])
+def test_original_recovery_error_keeps_waiting_until_result_is_saved(runtime, monkeypatch, extra):
+    client, put, identity, _ = runtime
+    put(**{'status': 'error', 'error_code': 'CONVERSATION_OUTCOME_UNKNOWN', 'conversation_id': 'conversation',
+           'request_message_id': 'message', 'next_poll_at': 9999999999, **extra})
+    calls = 0
+    def authenticate(*a, **k):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            put(status='success', data=[{'url': 'private-result'}])
+        return identity.copy()
+    monkeypatch.setattr(events, 'require_identity', authenticate)
+    response = client.get('/api/image-tasks/original/events')
+    assert 'event: needs_attention' not in response.text
+    assert '"recovering_original":true' in response.text
+    assert 'event: result_ready' in response.text
+    assert 'private-result' not in response.text and 'original-file' not in response.text
+
+
+@pytest.mark.parametrize('extra', [
+    {'_recovery_paused': True}, {'_recovery_suppressed': True},
+    {'_attempt_finished_at': 1}, {'request_message_id': ''},
+    {'error_code': 'RESULT_UNRECOVERABLE'},
+])
+def test_stopped_or_ineligible_original_recovery_still_needs_attention(runtime, extra):
+    client, put, _, _ = runtime
+    fields = {'status': 'error', 'error_code': 'CONVERSATION_OUTCOME_UNKNOWN',
+              'conversation_id': 'conversation', 'request_message_id': 'message',
+              'upstream_unfinished': True, **extra}
+    put(**fields)
+    response = client.get('/api/image-tasks/original/events')
+    assert 'event: needs_attention' in response.text
+    assert 'event: result_ready' not in response.text

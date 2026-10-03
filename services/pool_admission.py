@@ -83,6 +83,23 @@ def unresolved_result(kind, receipt):
            or receipt.get("status") == "error" and receipt.get("upstream_unfinished") is True)
 
 
+def image_original_recovery_pending(receipt):
+    """The existing scheduler can still collect this original, including cooldown.
+
+    Captured assets may outlive the active generation attempt. Explicit pause
+    or suppression still stops their recovery; an old error alone does not.
+    This predicate reads a receipt and never starts a recovery or a model send.
+    """
+    saved = bool(receipt.get("result_file_ids") or receipt.get("result_sediment_ids")
+                 or pending_image_result_ids(receipt))
+    return bool(not recovery_suppressed(receipt) and receipt.get("_recovery_paused") is not True
+                and (not receipt.get("_attempt_finished_at") or saved)
+                and receipt.get("status") == "error"
+                and (receipt.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+                     or saved and receipt.get("error_code") == "RESULT_UNRECOVERABLE")
+                and receipt.get("conversation_id") and receipt.get("request_message_id"))
+
+
 def unfinished(kind, receipt):
     if recovery_suppressed(receipt):
         return False
@@ -328,9 +345,7 @@ class PoolAdmission:
             if kind == "text":
                 due = unknown_text_result(r) and r.get("provider_binding_id") and float(r.get("recovery_next_at") or 0) <= now
             else:
-                due = (r.get("status") == "error" and (r.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
-                       or saved_image and r.get("error_code") == "RESULT_UNRECOVERABLE")
-                       and r.get("conversation_id") and r.get("request_message_id") and float(r.get("next_poll_at") or 0) <= now)
+                due = image_original_recovery_pending(r) and float(r.get("next_poll_at") or 0) <= now
             if due:
                 try:
                     self.recoveries[kind](owner, request_id)
