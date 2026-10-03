@@ -79,6 +79,90 @@ def test_stale_reasoning_allowance_does_not_accept_unfinished_or_branched_result
     assert "content" not in result
 
 
+def completed_tool_chain(doc):
+    mixed_chain(doc)
+    final = doc["current_node"]
+    code = doc["mapping"][final + "-code"]["message"]
+    code.update(status="in_progress", end_turn=None, recipient="python")
+    tool = doc["mapping"][final + "-output"]["message"]
+    tool["author"]["name"] = "python"
+    tool["metadata"] = {"is_complete": True}
+    doc["mapping"][final]["message"]["content"]["parts"] = ["original calculated stock review"]
+    return final
+
+
+def test_completed_final_after_stale_paired_tool_call_recovers_original_without_resend(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _turn_reserved=True)
+    original = saved(service)
+
+    def read(row):
+        doc = document(row)
+        completed_tool_chain(doc)
+        return ConversationBindingService._read_text_request_result(backend, row, document=doc)
+
+    service.recovery_reader = read
+    result = service.read("owner", "old-0")
+    assert result["status"] == "succeeded"
+    assert result["content"] == "original calculated stock review"
+    recovered = saved(service)
+    assert all(recovered.get(key) == original.get(key) for key in (
+        "request_message_id", "request_parent_message_id", "conversation_id",
+        "provider_account_identity", "provider_binding_id", "_input_ref"))
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert backend.mock_calls == []
+
+
+@pytest.mark.parametrize("case", [
+    "missing_recipient", "different_tool", "tool_active", "tool_failed",
+    "tool_not_complete", "wrong_tool_content", "wrong_tool_id", "code_end_turn",
+    "code_final", "second_active_code", "active_sibling", "final_active", "empty_final",
+    "generic_recipient", "malformed_tool_node",
+])
+def test_stale_tool_call_requires_paired_complete_output_and_nonempty_final(tmp_path, case):
+    service, _, backend, _ = migration(tmp_path)
+    row = saved(service)
+    doc = document(row)
+    final = completed_tool_chain(doc)
+    code = doc["mapping"][final + "-code"]["message"]
+    tool = doc["mapping"][final + "-output"]["message"]
+    if case == "missing_recipient":
+        code.pop("recipient")
+    elif case == "generic_recipient":
+        code["recipient"] = tool["author"]["name"] = " all "
+    elif case == "malformed_tool_node":
+        doc["mapping"][final + "-output"] = 42
+    elif case == "different_tool":
+        tool["author"]["name"] = "another-tool"
+    elif case in {"tool_active", "tool_failed"}:
+        tool["status"] = "in_progress" if case == "tool_active" else "failed"
+    elif case == "tool_not_complete":
+        tool["metadata"]["is_complete"] = False
+    elif case == "wrong_tool_content":
+        tool["content"] = {"content_type": "text", "parts": ["not tool output"]}
+    elif case == "wrong_tool_id":
+        tool["id"] = "another-id"
+    elif case == "code_end_turn":
+        code["end_turn"] = True
+    elif case == "code_final":
+        code["channel"] = "final"
+    elif case == "second_active_code":
+        tool.update(author={"role": "assistant"}, status="in_progress",
+                    content={"content_type": "code", "text": "pending call"}, recipient="python")
+    elif case == "active_sibling":
+        doc["mapping"]["sibling"] = {"parent": final + "-code", "message": {
+            "id": "sibling", "author": {"role": "tool", "name": "python"},
+            "status": "in_progress", "content": {"content_type": "execution_output", "text": ""}}}
+    elif case == "final_active":
+        doc["mapping"][final]["message"].update(status="in_progress", end_turn=False)
+    else:
+        doc["mapping"][final]["message"]["content"]["parts"] = [""]
+    result = ConversationBindingService._read_text_request_result(backend, row, document=doc)
+    assert result["status"] != "succeeded"
+    assert "content" not in result and "_turn_end_evidence" not in result
+    assert "_empty_reply_evidence" not in result
+
+
 def external_continuation(doc):
     original = doc["current_node"]
     doc["mapping"][original]["message"].update(status="in_progress", end_turn=None)

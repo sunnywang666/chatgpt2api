@@ -140,7 +140,7 @@ def _request_parent_matches_receipt(
     )
 
 
-def _completed_request_turn(mapping, children, request_message_id, conversation_id):
+def _completed_request_turn(mapping, children, request_message_id, conversation_id, *, allow_completed_tool_call=False):
     """Positive terminal evidence for the exact original branch, even without a usable answer."""
     node_id, visited = request_message_id, {request_message_id}
     while True:
@@ -159,14 +159,40 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
         role = author.get("role") if isinstance(author, dict) else None
         content = message.get("content")
         # A completed final can follow a stale in_progress reasoning snapshot.
-        # Only its known assistant ancestors qualify; active tools, code and
-        # the final itself still cannot prove that this exact turn ended.
+        # Only known assistant ancestors qualify; active tools and the final
+        # itself still cannot prove that this exact turn ended.
         stale_reasoning = (role == "assistant" and isinstance(content, dict)
                            and content.get("content_type") in {"thoughts", "reasoning_recap"}
                            and message.get("status") == "in_progress"
                            and message.get("end_turn") is not True)
+        stale_tool_call = False
+        if (allow_completed_tool_call and role == "assistant" and isinstance(content, dict)
+                and content.get("content_type") == "code" and isinstance(content.get("text"), str)
+                and message.get("status") == "in_progress" and message.get("end_turn") is not True
+                and message.get("channel") in (None, "analysis")
+                and isinstance(message.get("recipient"), str) and message["recipient"].strip()
+                and message["recipient"].strip() != "all"):
+            following = children.get(node_id, [])
+            tool_node = mapping.get(following[0]) if len(following) == 1 else None
+            tool = tool_node.get("message") if isinstance(tool_node, dict) else None
+            # Some completed tool calls retain an active assistant code node.
+            # Require its exact, completed tool output before considering the
+            # later nonempty final. This exception never establishes empty
+            # reply evidence or permits another generation attempt.
+            stale_tool_call = bool(
+                isinstance(tool, dict) and tool.get("id") == following[0]
+                and isinstance(tool.get("author"), dict)
+                and tool["author"].get("role") == "tool"
+                and tool["author"].get("name") == message["recipient"]
+                and tool.get("status") == "finished_successfully"
+                and isinstance(tool.get("content"), dict)
+                and tool["content"].get("content_type") == "execution_output"
+                and isinstance(tool["content"].get("text"), str)
+                and isinstance(tool.get("metadata"), dict)
+                and tool["metadata"].get("is_complete") is True
+            )
         if (role not in {"assistant", "tool"}
-                or message.get("status") != "finished_successfully" and not stale_reasoning):
+                or message.get("status") != "finished_successfully" and not (stale_reasoning or stale_tool_call)):
             return None
         if role == "assistant" and message.get("end_turn") is True:
             if message.get("channel") not in {None, "final"}:
@@ -1308,7 +1334,8 @@ class ConversationBindingService:
                     mapping, children, request_message_id, conversation_id, document.get("current_node"))) else {}),
             }
         parent_message_id, text = candidates[0]
-        ended = _completed_request_turn(mapping, children, request_message_id, conversation_id)
+        ended = _completed_request_turn(mapping, children, request_message_id, conversation_id,
+                                        allow_completed_tool_call=True)
         if not ended or ended["final_message_id"] != parent_message_id:
             # One completed text message is insufficient when another branch
             # remains active or ambiguous. Use the same positive evidence as
