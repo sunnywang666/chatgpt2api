@@ -542,7 +542,7 @@ def test_http_restored_account_wakes_original_id_without_starving_other_owner_wo
     assert len(set(sources[:2])) == 2 and len(set(sources[2:4])) == 2
 
 
-def _serve_images(root, completion=False, fair_recovery=False):
+def _serve_images(root, completion=False, fair_recovery=False, download_recovery=False):
     import pytest
     import uvicorn
     from contextlib import asynccontextmanager
@@ -580,6 +580,18 @@ def _serve_images(root, completion=False, fair_recovery=False):
         with (root / "image-sends.jsonl").open("a") as log:
             log.write(json.dumps({"request_id": ctx.request_id, "model": body["model"], "prompt": body["prompt"],
                                   "account": ctx.selected_account()["provider_account_identity"]}) + "\n")
+        if download_recovery:
+            callback = body["progress_callback"]
+            callback.start_active_attempt()
+            callback.record_conversation_id("controlled-image-conversation")
+            callback.record_submission_started()
+            callback.record_result_ids(["fixture-generated-file"], [])
+            error = ConnectionError("controlled result download failure")
+            error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+            error.conversation_id = "controlled-image-conversation"
+            error.request_message_id = callback.request_message_id
+            error.upstream_submitted = True
+            raise error
         return {"created": 1, "data": [{"b64_json": _FIXTURE_PNG}],
                 "_provider_binding_id": body["provider_binding_id"],
                 "_provider_account_identity": body["provider_account_identity"],
@@ -587,6 +599,46 @@ def _serve_images(root, completion=False, fair_recovery=False):
                 **({"_image_thread_terminal": True} if completion else {})}
     rt.tasks.generation_handler = render
     rt.tasks.edit_handler = render
+    if download_recovery:
+        from contextlib import nullcontext
+        import base64
+        import services.openai_backend_api as backend_module
+        patches.setattr(rt.accounts, "get_bound_account_identity", lambda _binding: "account-A")
+        patches.setattr(rt.accounts, "get_bound_text_access_token", lambda _binding, **_kwargs: "fixture-A")
+        patches.setattr(rt.accounts, "conversation_binding_lock", lambda *_args: nullcontext())
+
+        class DownloadBackend:
+            def __init__(self, access_token=None):
+                assert access_token == "fixture-A"
+
+            def _get_conversation(self, *_args):
+                raise AssertionError("captured image download must not reread generation")
+
+            def _poll_image_results(self, *_args, **_kwargs):
+                raise AssertionError("captured image download must not poll generation")
+
+            def resolve_conversation_image_urls(self, conversation_id, file_ids, sediment_ids, **kwargs):
+                assert conversation_id == "controlled-image-conversation"
+                assert file_ids == ["fixture-generated-file"] and sediment_ids == []
+                assert kwargs["poll"] is False
+                return ["https://fixture.invalid/generated.png"]
+
+            def download_image_bytes(self, urls):
+                with (root / "downloads.jsonl").open("a") as log:
+                    log.write(json.dumps({"ready": (root / "download-ready").exists()}) + "\n")
+                if not (root / "download-ready").exists():
+                    raise ConnectionError("controlled result download still unavailable")
+                return [base64.b64decode(_FIXTURE_PNG)]
+
+            def get_conversation_parent_message_id(self, _conversation_id):
+                return "controlled-image-result"
+
+            def close(self):
+                pass
+
+        patches.setattr(backend_module, "OpenAIBackendAPI", DownloadBackend)
+        rt.admission.recoveries["image"] = lambda owner, task_id: rt.tasks.resume_poll(
+            {"id": owner, "role": "user"}, task_id)
     auth = AuthService(JSONStorageBackend(root / "accounts.json", root / "auth_keys.json"))
     _, secret = auth.create_key(role="user", owner_subject="fixture-person", routes=["chat"])
     (root / "fixture-key").write_text(secret)
@@ -806,6 +858,46 @@ def test_http_image_completion_cli_downloads_real_bytes_before_acknowledging(tmp
     assert len((tmp_path / "image-sends.jsonl").read_text().splitlines()) == 1
 
 
+def test_http_image_download_failure_restart_recovers_original_without_regeneration(tmp_path):
+    import base64
+    from examples import image_client
+    from services.task_store import TaskStore
+    body = {"client_task_id": "download-original", "model": "gpt-image-2", "prompt": "controlled image"}
+    def item(port, key):
+        return _http(port, key, "GET", "/api/image-tasks?ids=download-original")[1]["items"][0]
+    def private():
+        store = TaskStore(tmp_path / "text_tasks.sqlite3")
+        with store.connect() as db:
+            return next(row for kind, _, rid, row in store.receipts(db) if kind == "image" and rid == "download-original")
+    with _server(tmp_path, "image-download-recovery") as (port, key, _):
+        assert _http(port, key, "POST", "/api/image-tasks/generations", body)[0] == 200
+        failed = _wait(lambda: (row if (row := item(port, key))["status"] == "error" else None))
+        assert failed["recovery_phase"] == "download_image_result"
+        before = private()
+        assert before["result_file_ids"] == ["fixture-generated-file"]
+        assert failed["upstream_outcome"] == "generated"
+        _wait(lambda: (tmp_path / "downloads.jsonl").exists())
+        original_key = key
+    (tmp_path / "download-ready").touch()
+    with _server(tmp_path, "image-download-recovery") as (port, _, _process):
+        # Keep the real persisted 60-second download retry backoff.
+        recovered = _wait(lambda: (row if (row := item(port, original_key))["status"] == "success" else None), timeout=75)
+        after = private()
+        for field in ("id", "result_file_ids", "provider_account_identity", "conversation_id", "_input_ref"):
+            assert after[field] == before[field]
+        output = tmp_path / "actual-recovered.png"
+        result = subprocess.run([sys.executable, str(Path(image_client.__file__)), "download",
+            "--task-id", "download-original", "--output", str(output)], env={**os.environ,
+            "SERVER_ROOT": f"http://127.0.0.1:{port}", "CHATGPT2API_BEARER_TOKEN": original_key},
+            capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        assert output.read_bytes() == base64.b64decode(_FIXTURE_PNG)
+    sends = [json.loads(line) for line in (tmp_path / "image-sends.jsonl").read_text().splitlines()]
+    assert [send["request_id"] for send in sends] == ["download-original"]
+    downloads = [json.loads(line) for line in (tmp_path / "downloads.jsonl").read_text().splitlines()]
+    assert [download["ready"] for download in downloads] == [False, True]
+
+
 def _serve(root, mode):
     # Independent of the caller's optional sitecustomize offline guard: this
     # process must never initiate any outbound socket, including model probes.
@@ -818,8 +910,9 @@ def _serve(root, mode):
     import requests.sessions
     curl_cffi.requests.Session.request = forbidden
     requests.sessions.Session.request = forbidden
-    if mode in {"image-recovery", "image-completion", "image-fair-recovery"}:
-        return _serve_images(root, completion=mode == "image-completion", fair_recovery=mode == "image-fair-recovery")
+    if mode in {"image-recovery", "image-completion", "image-fair-recovery", "image-download-recovery"}:
+        return _serve_images(root, completion=mode == "image-completion", fair_recovery=mode == "image-fair-recovery",
+                             download_recovery=mode == "image-download-recovery")
 
     from contextlib import asynccontextmanager
     from types import SimpleNamespace
