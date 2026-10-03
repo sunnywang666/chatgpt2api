@@ -159,6 +159,46 @@ def test_process_kill_after_sent_cursor_recovers_original_without_resubmission(t
     assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"crash-original"']
 
 
+def test_explicit_http_recovery_after_ended_investigation_reads_original_and_closes_work(tmp_path):
+    from services.task_store import TaskStore
+    rid = "ended-original"
+    body = {**_input(tmp_path, rid), "client_conversation_id": "ended-session"}
+    with _server(tmp_path, "stalled-completion") as (port, key, _):
+        assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
+        _wait(lambda: (tmp_path / "sends.jsonl").exists())
+        _wait(lambda: _http(port, key, "GET", "/api/chat-requests/" + rid)[1]["status"] == "unknown")
+    store = TaskStore(tmp_path / "tasks.sqlite3")
+    reason = "COMPLETION_ORIGINAL_READ_UNAVAILABLE"
+    with store.transaction() as db:
+        kind, owner, _, original = next(row for row in store.receipts(db) if row[2] == rid)
+        original.update(_attempt_finished_at=time.time(), _attempt_reason=reason, recovery_next_at=0,
+                        _completion={"state": "needs_attention", "reason": reason, "next_at": None,
+                                     "allow_unconfirmed_retry": False, "max_extra_requests": 1})
+        store.write_receipt(db, kind, owner, rid, original)
+    (tmp_path / "original-completed").touch()
+    with _server(tmp_path, "stalled-completion") as (port, key, _):
+        assert _http(port, key, "GET", "/api/chat-requests/" + rid)[1]["status"] == "unknown"
+        status, recovered = _http(port, key, "POST", "/api/chat-requests/" + rid + "/recover", {})
+        assert status == 200 and recovered["status"] == "succeeded"
+        assert recovered["content"] == "late original HTTP result"
+        status, selected = _http(port, key, "GET", "/api/chat-requests/" + rid + "/completion")
+        assert status == 200 and selected["selected_id"] == rid and not selected.get("replacement_id")
+        path = tmp_path / "ended-original-result.json"
+        path.write_text(json.dumps(recovered))
+        assert json.loads(path.read_text())["content"] == recovered["content"]
+        assert _http(port, key, "POST", "/api/chat-requests/" + rid + "/work",
+                     {"state": "completed", "results_saved": True})[0] == 200
+        work = _wait(lambda: (w if (w := _http(port, key, "GET", "/api/chat-requests/" + rid + "/work")[1])
+                             ["archive"]["status"] == "confirmed" else None))
+        assert not work["slot_held"]
+    with store.connect() as db:
+        saved = store.read_receipt(db, "text", owner, rid)
+    for field in ("request_message_id", "provider_account_identity", "conversation_id", "_input_ref",
+                  "_attempt_finished_at", "_attempt_reason"):
+        assert saved[field] == original[field]
+    assert (tmp_path / "sends.jsonl").read_text().splitlines() == ['"ended-original"']
+
+
 def test_real_socket_disconnect_keeps_original_execution_and_result(tmp_path):
     body = _input(tmp_path, "disconnected-original")
     with _server(tmp_path, "blocked-send") as (port, key, _process):

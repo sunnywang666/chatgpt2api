@@ -454,6 +454,7 @@ def create_router() -> APIRouter:
             owner,
             request_id,
             False,
+            explicit_ended_recheck=True,
         )
         response.headers["Cache-Control"] = "private, no-store"
         return _projection(receipt, request_id)

@@ -994,7 +994,8 @@ class TextTaskService:
     def restore_public_session(self, owner: str, request_id: str) -> dict[str, object]:
         return self.set_public_session_archived(owner, request_id, False)
 
-    def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False):
+    def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False,
+             _explicit_ended_recheck: bool = False):
         from services.pool_admission import unknown_text_result
         recovery_claim = None
         now = self._now()
@@ -1040,9 +1041,21 @@ class TextTaskService:
                     previous = {**previous, "status": "unknown", "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "updated_at": now}
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
+                completion = previous.get("_completion") or {}
+                # A caller can recheck an original after repairing a failed
+                # read. Keep the ended attempt and automatic query stop; this
+                # grants one ordinary, paced read, never a generation retry.
+                ended_recheck = bool(
+                    _explicit_ended_recheck and previous.get("_attempt_finished_at")
+                    and previous.get("_attempt_reason") == "COMPLETION_ORIGINAL_READ_UNAVAILABLE"
+                    and isinstance(completion, dict) and completion.get("state") == "needs_attention"
+                    and completion.get("reason") == "COMPLETION_ORIGINAL_READ_UNAVAILABLE"
+                    and not completion.get("replacement_id") and not completion.get("selected_id")
+                    and not previous.get("_completion_of")
+                )
                 if (previous.get("_recovery_suppressed") is not True
                         and previous.get("_recovery_paused") is not True
-                        and not previous.get("_attempt_finished_at")
+                        and (not previous.get("_attempt_finished_at") or ended_recheck)
                         and unknown_text_result(previous)
                         and previous.get("request_message_id")
                         and previous.get("provider_binding_id")
@@ -1125,10 +1138,12 @@ class TextTaskService:
         result = self._public(json.loads(row[0]))
         return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result
 
-    def recover(self, owner: str, request_id: str, allow_unrecoverable_retry: bool = False):
+    def recover(self, owner: str, request_id: str, allow_unrecoverable_retry: bool = False,
+                *, explicit_ended_recheck: bool = False):
         return self.read(
             owner, request_id,
             allow_unrecoverable_retry=bool(allow_unrecoverable_retry),
+            _explicit_ended_recheck=explicit_ended_recheck,
         )
 
     def _authorize_unrecoverable(self, owner, request_id, observed):

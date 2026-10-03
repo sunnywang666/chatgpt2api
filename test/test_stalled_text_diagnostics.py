@@ -91,6 +91,63 @@ def completed_tool_chain(doc):
     return final
 
 
+@pytest.mark.parametrize("outcome", ["complete", "read_error", "empty"])
+def test_explicit_recheck_of_ended_original_keeps_automatic_stop_and_never_resends(tmp_path, outcome):
+    service, admission, backend, _ = migration(tmp_path)
+    reason = "COMPLETION_ORIGINAL_READ_UNAVAILABLE"
+    state = {"state": "needs_attention", "reason": reason, "next_at": None,
+             "allow_unconfirmed_retry": False, "automatic_failure_retry": True, "max_extra_requests": 1}
+    patch(service, _attempt_finished_at=1, _attempt_reason=reason, _completion=state)
+    calls = []
+    def read(row):
+        calls.append(row["request_id"])
+        if outcome == "read_error":
+            raise ConnectionError("synthetic unavailable original")
+        doc = document(row)
+        if outcome == "complete":
+            completed_tool_chain(doc)
+        return ConversationBindingService._read_text_request_result(backend, row, document=doc)
+    service.recovery_reader = read
+    assert service.read("owner", "old-0")["status"] == "unknown"
+    assert service.recover("owner", "old-0")["status"] == "unknown"
+    assert calls == []
+    result = service.recover("owner", "old-0", explicit_ended_recheck=True)
+    assert calls == ["old-0"]
+    assert result["status"] == ("succeeded" if outcome == "complete" else "unknown")
+    row = saved(service)
+    assert row["_attempt_finished_at"] == 1 and row["_attempt_reason"] == reason
+    assert row["_completion"] == state
+    if outcome == "complete":
+        assert row["content"] == "original calculated stock review"
+    else:
+        assert row["recovery_next_at"] > admission.clock.now
+        service.recover("owner", "old-0", explicit_ended_recheck=True)
+    service.read("owner", "old-0")
+    assert calls == ["old-0"] and backend.mock_calls == []
+
+
+@pytest.mark.parametrize("case", ["paused", "suppressed", "cooldown", "lease", "child", "selected",
+                                    "child_receipt", "other_reason", "other_state", "missing_completion"])
+def test_explicit_ended_original_recheck_keeps_pause_cooldown_and_successor_guards(tmp_path, case):
+    service, admission, _, _ = migration(tmp_path)
+    reason = "COMPLETION_ORIGINAL_READ_UNAVAILABLE"
+    state = {"state": "needs_attention", "reason": reason, "next_at": None}
+    changes = {"_attempt_finished_at": 1, "_attempt_reason": reason, "_completion": state}
+    if case == "paused": changes["_recovery_paused"] = True
+    if case == "suppressed": changes["_recovery_suppressed"] = True
+    if case == "cooldown": changes["recovery_next_at"] = admission.clock.now + 100
+    if case == "lease": changes["recovery_lease_until"] = admission.clock.now + 100
+    if case == "child": state["replacement_id"] = "existing-child"
+    if case == "selected": state["selected_id"] = "selected-result"
+    if case == "child_receipt": changes["_completion_of"] = "original-root"
+    if case == "other_reason": changes["_attempt_reason"] = "COMPLETION_ATTEMPT_EXHAUSTED"
+    if case == "other_state": state["state"] = "replacement_pending"
+    if case == "missing_completion": changes["_completion"] = None
+    patch(service, **changes)
+    service.recovery_reader = lambda row: pytest.fail("must not read or submit")
+    assert service.recover("owner", "old-0", explicit_ended_recheck=True)["status"] == "unknown"
+
+
 def test_completed_final_after_stale_paired_tool_call_recovers_original_without_resend(tmp_path):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _turn_reserved=True)
