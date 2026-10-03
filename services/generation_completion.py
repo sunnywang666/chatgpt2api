@@ -29,7 +29,21 @@ def unresolved(receipt):
                 or receipt.get("upstream_unfinished") or receipt.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN")
 
 
-def retry_cursor(document, receipt, *, kind="text", now=None):
+def ended_image_edit_recheck(receipt):
+    """Explicit completion recheck only; does not reopen ordinary polling."""
+    state, thread = receipt.get("_completion") or {}, receipt.get("_image_thread") or {}
+    return bool(receipt.get("_attempt_finished_at") and receipt.get("mode") == "edit"
+                and thread.get("protocol") == "image-thread-v1" and thread.get("previous_task_id")
+                and thread.get("previous_task_id") == thread.get("edit_source_task_id")
+                and receipt.get("status") == "error" and receipt.get("upstream_outcome") == "unknown"
+                and receipt.get("error_code") in {"RESULT_UNRECOVERABLE", "CONVERSATION_OUTCOME_UNKNOWN"}
+                and state.get("allow_unconfirmed_retry") is True
+                and not any(receipt.get(k) for k in ("_completion_of", "data", "result_file_ids", "result_sediment_ids",
+                    "_pending_image_result_ids", "_executing", "recovery_claim_id", "_recovery_paused", "_recovery_suppressed"))
+                and not state.get("replacement_id") and not state.get("selected_id"))
+
+
+def retry_cursor(document, receipt, *, kind="text", now=None, predecessor=None):
     """A fresh, empty original branch; never an arbitrary latest conversation reply.
 
     This proves where a bounded retry can continue, NOT that an old upstream
@@ -45,6 +59,14 @@ def retry_cursor(document, receipt, *, kind="text", now=None):
     if not isinstance(mapping, dict) or not isinstance(head, str) or head not in mapping:
         return None
     original = mapping.get(message)
+    if kind == "image" and message not in mapping:
+        from services.image_thread import absent_request_parent
+        parent = absent_request_parent(document, receipt, predecessor)
+        if parent:
+            return {"conversation_id": conversation, "request_message_id": message,
+                    "retry_parent_message_id": parent, "source": "absent_image_thread_request",
+                    "observed_at": time.time() if now is None else now}
+        return None
     if (not isinstance(original, dict) or not isinstance(original.get("message"), dict)
             or not isinstance(original["message"].get("author"), dict)
             or original["message"]["author"].get("role") != "user"):
@@ -90,8 +112,10 @@ def retry_cursor(document, receipt, *, kind="text", now=None):
 
 def retry_evidence(receipt):
     proof = receipt.get("_retry_cursor")
-    if (not isinstance(proof, dict) or set(proof) != {
-            "conversation_id", "request_message_id", "retry_parent_message_id", "observed_at"}
+    fields = {"conversation_id", "request_message_id", "retry_parent_message_id", "observed_at"}
+    if isinstance(proof, dict) and proof.get("source") == "absent_image_thread_request":
+        fields.add("source")
+    if (not isinstance(proof, dict) or set(proof) != fields
             or any(not isinstance(proof.get(k), str) or not 1 <= len(proof[k]) <= 200 for k in (
                 "conversation_id", "request_message_id", "retry_parent_message_id"))
             or proof["conversation_id"] != receipt.get("conversation_id")
@@ -226,6 +250,11 @@ class GenerationCompletionService:
                     "max_extra_requests": 1, "next_at": now,
                 }
                 self.store.write_receipt(db, kind, owner, request_id, root)
+            elif kind == "image" and allow_unconfirmed_retry and ended_image_edit_recheck(root):
+                # An explicit recover may gather fresh evidence after a repair.
+                # Keep the ended marker/history; no automatic restart on upgrade.
+                state.update(state="checking_original", next_at=now)
+                self.store.write_receipt(db, kind, owner, request_id, root)
             if retry_not_sent_failure_at is not None:
                 state = root["_completion"]
                 stamp = retry_not_sent_failure_at
@@ -325,6 +354,13 @@ class GenerationCompletionService:
         proof = retry_evidence(root)
         if not proof or root.get("recovery_requires_new_conversation"):
             raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
+        if proof.get("source") == "absent_image_thread_request":
+            from services.image_task_service import UNRECOVERABLE_QUALIFIED_READS
+            if (root.get("status") != "error" or root.get("error_code") != "RESULT_UNRECOVERABLE"
+                    or root.get("upstream_outcome") != "unknown" or root.get("upstream_unfinished") is not False
+                    or int(root.get("recovery_no_result_reads") or 0) < UNRECOVERABLE_QUALIFIED_READS
+                    or root.get("_pending_image_result_ids")):
+                raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
         if int(payload.get("n") or 1) != 1 or payload.get("upstream_model"):
             raise CompletionError("COMPLETION_SINGLE_OUTPUT_REQUIRED")
         for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"):

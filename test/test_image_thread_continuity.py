@@ -894,3 +894,148 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
     assert result['selected_id'] == child_id
     assert completion.complete('image', WHO, 'empty-original', child_id)['state'] == 'completed'
     assert r.read('empty-original')['status'] == 'error'
+
+
+@pytest.mark.parametrize('pruned', [False, True])
+@pytest.mark.parametrize('change', [None, 'archive', 'branch', 'later_user', 'assets', 'binding',
+                                   'source', 'active', 'head', 'original_present'])
+def test_absent_edit_cursor_requires_exact_saved_completed_predecessor(runtime, pruned, change):
+    from services.generation_completion import retry_cursor
+    r = runtime
+    r.state.pruned_recap = True
+    r.submit('source'); previous = run_next(r, 'source')
+    r.submit('absent-edit', source='source')
+    ctx = r.admission.claim_next()
+    task = r.read('absent-edit')
+    task['request_message_id'] = 'original-absent-message'
+    task['_image_thread_request_parent'] = previous['parent_message_id']
+    doc = copy.deepcopy(r.state.documents[previous['conversation_id']])
+    doc['is_archived'] = False
+    if pruned:
+        terminal = doc['mapping'].pop(doc['current_node'])
+        doc['current_node'] = terminal['parent']
+    if change == 'archive': doc['is_archived'] = True
+    elif change == 'branch': doc['mapping']['sibling'] = node('sibling', 'user', previous['request_message_id'])
+    elif change == 'later_user':
+        doc['mapping']['later'] = node('later', 'user', doc['current_node']); doc['current_node'] = 'later'
+    elif change == 'assets': task['_image_thread_predecessor_result_ids'] = ['file-wrong']
+    elif change == 'binding': previous['provider_binding_id'] = 'other'
+    elif change == 'source': previous['data'] = []
+    elif change == 'active': doc['mapping'][doc['current_node']]['message']['status'] = 'in_progress'
+    elif change == 'head': doc['current_node'] = previous['request_message_id']
+    elif change == 'original_present': doc['mapping'][task['request_message_id']] = node(task['request_message_id'], 'user', doc['current_node'])
+    proof = retry_cursor(doc, task, kind='image', predecessor=previous)
+    if change is None:
+        assert proof['source'] == 'absent_image_thread_request'
+        assert proof['retry_parent_message_id'] == doc['current_node']
+    else:
+        assert proof is None
+
+
+@pytest.mark.parametrize('case', ['success', 'active_tasks', 'read_failure', 'two_reads', 'presend_drift', 'ended_recheck', 'ended_before_reads'])
+def test_absent_edit_qualified_reads_then_one_same_session_completion(runtime, monkeypatch, case):
+    import time
+    from services.generation_completion import GenerationCompletionService
+    from services.text_task_service import TextTaskService
+    from services.work_lifecycle import WorkLifecycleService
+    r = runtime
+    r.state.pruned_recap = True
+    r.submit('source'); previous = run_next(r, 'source')
+    r.submit('absent-edit', source='source')
+    stream = conversation.stream_image_outputs
+    def false_start(backend, req, *args):
+        current_request.get().before_send()
+        backend.image_submission_started = True
+        req.progress_callback.record_submission_started()
+        raise TimeoutError('old pacing deadline before actual transport')
+        yield
+    monkeypatch.setattr(conversation, 'stream_image_outputs', false_start)
+    r.admission.execute(r.admission.claim_next())
+    original = r.read('absent-edit')
+    assert original['status'] == 'error' and len(r.state.sends) == 1
+    doc = r.state.documents[previous['conversation_id']]
+    doc['is_archived'] = False
+    assert original['request_message_id'] not in doc['mapping']
+    now = time.time()
+    r.admission.clock = lambda: now
+    with r.store.transaction() as db:
+        saved = r.store.read_receipt(db, 'image', WHO['id'], 'absent-edit')
+        saved.update(_execution_timeline=[{'stage': 'send_call_started', 'at': now-1300}],
+                     active_attempt_deadline_at=now-1000, _executing=False, _claim_until=0)
+        r.store.write_receipt(db, 'image', WHO['id'], 'absent-edit', saved)
+    Backend = conversation.OpenAIBackendAPI
+    def tasks(self, **kwargs):
+        assert kwargs['strict_schema'] is True
+        if case == 'read_failure': raise ConnectionError('task query unavailable')
+        return [{'status': 'running'}] if case == 'active_tasks' else []
+    monkeypatch.setattr(Backend, '_query_backend_tasks', tasks, raising=False)
+    monkeypatch.setattr(Backend, '_poll_image_results', lambda *a, **k: ([], []))
+    for _ in range(0 if case == 'ended_before_reads' else 2 if case == 'two_reads' else 3):
+        r.service._run_resume_poll('happy:absent-edit', previous['conversation_id'], 5, '', WHO,
+                                  'edit', 'gpt-image-2', True, True)
+    root = r.read('absent-edit')
+    if case in {'active_tasks', 'read_failure'}:
+        assert not root.get('_retry_cursor') and root.get('recovery_no_result_reads', 0) == 0
+        return
+    text = TextTaskService(r.store.path, admission=r.admission, clock=r.admission.clock)
+    lifecycle = WorkLifecycleService(text, r.service, clock=r.admission.clock)
+    completion = GenerationCompletionService(text, r.service, lifecycle, clock=r.admission.clock)
+    r.admission.generation_completion = completion
+    if case == 'two_reads':
+        from services.generation_completion import CompletionError
+        with r.store.connect() as db, pytest.raises(CompletionError, match='COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED'):
+            completion._prepare(db, 'image', WHO['id'], 'absent-edit', root, 'never-send')
+        return
+    if case != 'ended_before_reads':
+        assert root['error_code'] == 'RESULT_UNRECOVERABLE' and root['recovery_no_result_reads'] == 3
+        assert root['_retry_cursor']['source'] == 'absent_image_thread_request'
+    if case in {'ended_recheck', 'ended_before_reads'}:
+        import threading
+        ended_at = now-10
+        monkeypatch.setattr(time, 'time', lambda: now)
+        with r.store.transaction() as db:
+            ended = r.store.read_receipt(db, 'image', WHO['id'], 'absent-edit')
+            ended.update(_attempt_finished_at=ended_at, _attempt_reason='COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED',
+                         _retry_cursor=None, _completion_read_at=now-400,
+                         _completion={'state': 'needs_attention', 'next_at': None, 'started_at': now-1300,
+                                      'allow_unconfirmed_retry': True, 'max_extra_requests': 1})
+            r.store.write_receipt(db, 'image', WHO['id'], 'absent-edit', ended)
+        before = len(r.state.reads)
+        r.service.resume_poll(WHO, 'absent-edit', allow_unrecoverable_retry=True)
+        assert len(r.state.reads) == before, 'ordinary polling cannot reopen an ended attempt'
+        original_thread, threads = threading.Thread, []
+        def recording_thread(*args, **kwargs):
+            thread = original_thread(*args, **kwargs)
+            if kwargs.get('name', '').startswith('image-resume-'):
+                threads.append(thread)
+                start_thread = thread.start
+                def start_and_join():
+                    start_thread(); thread.join(5)
+                    assert not thread.is_alive()
+                thread.start = start_and_join
+            return thread
+        monkeypatch.setattr(threading, 'Thread', recording_thread)
+        for _ in range(3 if case == 'ended_before_reads' else 1):
+            completion.start('image', WHO, 'absent-edit', allow_unconfirmed_retry=True)
+            now += 31
+        assert len(threads) == (3 if case == 'ended_before_reads' else 1)
+        reread = r.read('absent-edit')
+        assert reread['_retry_cursor']['source'] == 'absent_image_thread_request'
+        assert reread['_attempt_reason'] in {'COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED', 'ATTEMPT_REPLACED_SAME_CONVERSATION'}
+        completion.advance('image', WHO['id'], 'absent-edit')
+    result = completion.start('image', WHO, 'absent-edit', allow_unconfirmed_retry=True)
+    child_id = result['replacement_id']
+    assert completion.start('image', WHO, 'absent-edit', allow_unconfirmed_retry=True)['replacement_id'] == child_id
+    child = r.read(child_id)
+    for key in ('provider_account_identity', 'provider_binding_id', 'conversation_id', 'client_conversation_id', '_work_key'):
+        assert child[key] == root[key]
+    monkeypatch.setattr(conversation, 'stream_image_outputs', stream)
+    if case == 'presend_drift': r.state.drift = True
+    r.admission.execute(r.admission.claim_next())
+    if case == 'presend_drift':
+        assert len(r.state.sends) == 1 and r.read(child_id)['upstream_outcome'] in {'not_sent', 'not_submitted'}
+    else:
+        assert len(r.state.sends) == 2 and r.read(child_id)['status'] == 'success'
+        assert completion.read('image', WHO, 'absent-edit')['selected_id'] == child_id
+        assert completion.complete('image', WHO, 'absent-edit', child_id)['state'] == 'completed'
+        assert r.read('absent-edit')['status'] == 'error'

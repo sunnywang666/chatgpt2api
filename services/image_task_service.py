@@ -1162,6 +1162,7 @@ class ImageTaskService:
         )
         progress_callback.image_thread = payload.get("_image_thread")
         progress_callback.failed_retry_original = payload.get("_failed_retry_original")
+        progress_callback.failed_retry_predecessor = payload.get("_failed_retry_predecessor")
         progress_callback.failed_retry_required = bool(payload.get("_continue_after_failed_attempt"))
         progress_callback.image_thread_predecessor_message = payload.get("_image_thread_predecessor_message")
         progress_callback.image_thread_predecessor_result_ids = payload.get("_image_thread_predecessor_result_ids")
@@ -1659,7 +1660,9 @@ class ImageTaskService:
             saved_image = bool(task.get("result_file_ids") or task.get("result_sediment_ids"))
             # Pending evidence permits another original read, never direct download.
             saved_image = saved_image or bool(pending_image_result_ids(task))
-            if task.get("_recovery_suppressed") is True or task.get("_recovery_paused") is True or task.get("_attempt_finished_at") and not saved_image:
+            from services.generation_completion import ended_image_edit_recheck
+            explicit_ended_recheck = completion_recheck and ended_image_edit_recheck(task)
+            if task.get("_recovery_suppressed") is True or task.get("_recovery_paused") is True or task.get("_attempt_finished_at") and not saved_image and not explicit_ended_recheck:
                 # Keep this endpoint observational while an operator has
                 # explicitly stopped the old recovery path.
                 return _public_task(task)
@@ -2077,6 +2080,8 @@ class ImageTaskService:
                 expected_parent = (task or {}).get("_image_thread_request_parent")
                 predecessor_message = (task or {}).get("_image_thread_predecessor_message")
                 predecessor_ids = (task or {}).get("_image_thread_predecessor_result_ids")
+                retry_predecessor = self._tasks.get(_task_key(_owner_id(identity),
+                    (image_thread or {}).get("previous_task_id") or ""))
             def recovered_parent(backend, result_file_ids, result_sediment_ids):
                 if image_thread:
                     return finished_parent(backend._get_conversation(conversation_id), conversation_id,
@@ -2251,6 +2256,13 @@ class ImageTaskService:
                         for record in extract_records(latest_document, request_message_id):
                             if record.get("file_ids") or record.get("sediment_ids"):
                                 return None
+                    # Only a qualified inactive snapshot can authorize an
+                    # absent edit continuation. A failed query cannot do so.
+                    proof = retry_cursor(latest_document, task, kind="image", predecessor=retry_predecessor)
+                    qualified = (not proof or proof.get("source") != "absent_image_thread_request"
+                                 or int(task.get("recovery_no_result_reads") or 0) + 1 >= UNRECOVERABLE_QUALIFIED_READS)
+                    self._update_task(key, _retry_cursor=proof,
+                        **({"_completion_read_at": time.time()} if proof and qualified else {}))
                     return False
 
                 try:

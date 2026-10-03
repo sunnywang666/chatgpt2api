@@ -1303,6 +1303,8 @@ class PoolAdmission:
                 from services.generation_completion import same_session_retry
                 with self.store.connect() as db:
                     original = self.store.read_receipt(db, "image", context.owner, r["_same_session_retry_of"])
+                    previous_id = ((original or {}).get("_image_thread") or {}).get("previous_task_id")
+                    previous = self.store.read_receipt(db, "image", context.owner, previous_id) if previous_id else None
                 if (not same_session_retry(original, r) or original.get("result_file_ids")
                         or original.get("result_sediment_ids") or original.get("data")
                         or original.get("recovery_phase") == "download_image_result"):
@@ -1310,6 +1312,7 @@ class PoolAdmission:
                                       upstream_outcome="not_sent", _turn_reserved=False, upstream_unfinished=False)
                     return
                 payload["_failed_retry_original"] = original
+                payload["_failed_retry_predecessor"] = previous
             payload.update({k: r[k] for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id", "_requested_account_ref", "_requested_account_identity") if r.get(k)})
             if context.kind == "image" and r.get("_image_thread"):
                 payload.update({k: r[k] for k in ("_image_thread", "_image_thread_predecessor_message",

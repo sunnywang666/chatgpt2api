@@ -1482,10 +1482,11 @@ def _generate_bound_single_image(
                         except Exception as exc:
                             raise ImageGenerationError("original retry branch read unavailable",
                                 code="COMPLETION_ORIGINAL_READ_UNAVAILABLE", upstream_submitted=False) from exc
-                        current = retry_cursor(document, failed_original, kind="image")
+                        current = retry_cursor(document, failed_original, kind="image",
+                            predecessor=getattr(request.progress_callback, "failed_retry_predecessor", None))
                         saved = retry_evidence(failed_original)
-                        if not current or not saved or any(current[k] != saved[k] for k in (
-                                "conversation_id", "request_message_id", "retry_parent_message_id")):
+                        if not current or not saved or any(current.get(k) != saved.get(k) for k in (
+                                "conversation_id", "request_message_id", "retry_parent_message_id", "source")):
                             raise ImageGenerationError("original retry branch changed",
                                 code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED", upstream_submitted=False)
                     check_retry()

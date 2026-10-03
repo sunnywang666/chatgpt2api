@@ -187,8 +187,11 @@ def predecessor_state(task, owned):
                 or previous.get("result_sediment_ids") or previous.get("data")
                 or (previous.get("_image_thread") or {}).get("id") != thread["id"]):
             return {}, "COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED"
-        return {**{k: previous[k] for k in _FIELDS},
-                "parent_message_id": retry_evidence(previous)["retry_parent_message_id"]}, None
+        proof = retry_evidence(previous)
+        predecessor = ({k: previous[k] for k in ("_image_thread_predecessor_message", "_image_thread_predecessor_result_ids")
+                        if k in previous} if proof.get("source") == "absent_image_thread_request" else {})
+        return {**{k: previous[k] for k in _FIELDS}, **predecessor,
+                "parent_message_id": proof["retry_parent_message_id"]}, None
     if previous.get("_recovery_suppressed"):
         return {}, "IMAGE_THREAD_PREVIOUS_RECOVERY_STOPPED"
     if (previous.get("status") == "error" and previous.get("upstream_outcome") == "generated"
@@ -283,8 +286,72 @@ def _pruned_predecessor_parent(mapping, children, request_message_id, expected_p
                 and not result_ids
                 and msg.get("end_turn") is False and msg.get("channel") is None
                 and msg.get("recipient") == "all" and observed == expected
-                and children.get(current) == [request_message_id])
+                and children.get(current, []) == ([request_message_id] if request_message_id else []))
     return False
+
+
+def absent_request_parent(document, task, previous):
+    """Continue only the saved completed predecessor when this edit is absent.
+
+    Missing arbitrary history is not retry authority. The original edit and
+    its exact persisted predecessor must still own the same unmodified branch.
+    """
+    thread = task.get("_image_thread") or {}
+    if (task.get("mode") != "edit" or not isinstance(previous, dict)
+            or thread.get("previous_task_id") != previous.get("id")
+            or thread.get("edit_source_task_id") != previous.get("id")
+            or task.get("_completion_of")):
+        return None
+    binding, reason = predecessor_state(task, {previous["id"]: previous})
+    if reason or any(not task.get(k) or binding.get(k) != task[k] for k in _FIELDS[:-1]):
+        return None
+    parent = task.get("_image_thread_request_parent")
+    prior = task.get("_image_thread_predecessor_message")
+    assets = set(task.get("_image_thread_predecessor_result_ids") or [])
+    if (not parent or parent != binding.get("parent_message_id")
+            or not prior or prior != binding.get("_image_thread_predecessor_message")
+            or not assets or assets != set(binding.get("_image_thread_predecessor_result_ids") or [])):
+        return None
+    if (not isinstance(document, dict) or document.get("conversation_id") != task.get("conversation_id")
+            or document.get("is_archived") is not False):
+        return None
+    mapping, head = document.get("mapping"), document.get("current_node")
+    if (not isinstance(mapping, dict) or not task.get("request_message_id")
+            or task["request_message_id"] in mapping or head not in mapping):
+        return None
+    children = {}
+    for mid, node in mapping.items():
+        if not isinstance(node, dict):
+            return None
+        children.setdefault(node.get("parent"), []).append(mid)
+    if parent not in mapping:
+        if _pruned_predecessor_parent(mapping, children, None, parent, prior, assets) and not children.get(head):
+            # The recap itself must be current, not another unrelated leaf.
+            node = mapping[head]
+            if (node.get("message") or {}).get("content", {}).get("content_type") == "reasoning_recap":
+                cursor = head
+                seen = set()
+                while cursor in mapping and cursor not in seen:
+                    if cursor == prior:
+                        return head
+                    seen.add(cursor)
+                    cursor = mapping[cursor].get("parent")
+        return None
+    try:
+        if finished_parent(document, task["conversation_id"], prior, expected_result_ids=assets) != parent:
+            return None
+    except ImageThreadError:
+        return None
+    # finished_parent also permits a textual terminal; absence retries require
+    # the exact saved image set, not merely a completed assistant node.
+    seen, observed, cursor = set(), set(), head
+    while cursor in mapping and cursor not in seen:
+        if cursor == prior:
+            return head if observed == assets else None
+        seen.add(cursor)
+        observed.update(_image_result_ids(mapping[cursor].get("message") or {}))
+        cursor = mapping[cursor].get("parent")
+    return None
 
 
 def finished_parent(document, conversation_id, request_message_id, *, expected_parent=None,
