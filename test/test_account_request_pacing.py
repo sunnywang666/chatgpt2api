@@ -47,6 +47,96 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_later_result_reader_cannot_overtake_waiting_reader(self):
+        now = [10000.0]
+        a_waiting, b_waiting, release_a, release_b = (threading.Event() for _ in range(4))
+        b_decided, a_sent = threading.Event(), threading.Event()
+        sent, errors = [], []
+        sleeps = {"earlier": 0, "later": 0}
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)):
+            path = Path(tmp) / "clock.json"
+            earlier = AccountRequestClock("account", path)
+            earlier.next_conversation_read = 10060
+            earlier._save()
+            later = AccountRequestClock("account", path)
+
+            def send(method, url, **kwargs):
+                name = url.rsplit("/", 1)[-1]
+                sent.append((name, now[0]))
+                (a_sent if name == "earlier" else b_decided).set()
+                return Response()
+
+            def sleep(seconds):
+                name = threading.current_thread().name
+                sleeps[name] += 1
+                if sleeps[name] == 1:
+                    (a_waiting if name == "earlier" else b_waiting).set()
+                    if not (release_a if name == "earlier" else release_b).wait(2):
+                        raise TimeoutError("reader was not released")
+                elif name == "later":
+                    b_decided.set()
+                    if not a_sent.wait(2):
+                        raise TimeoutError("earlier reader was starved")
+                    now[0] = 10120
+                else:
+                    now[0] += seconds
+
+            def read(clock, name):
+                try:
+                    clock.request(send, "GET", "https://provider/conversation/" + name)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch("services.account_request_pacing.time.sleep", side_effect=sleep):
+                a = threading.Thread(target=read, args=(earlier, "earlier"), name="earlier")
+                b = threading.Thread(target=read, args=(later, "later"), name="later")
+                a.start()
+                try:
+                    self.assertTrue(a_waiting.wait(1))
+                    b.start()
+                    self.assertTrue(b_waiting.wait(1))
+                    now[0] = 10060
+                    release_b.set()  # The later caller wins the OS lock race.
+                    self.assertTrue(b_decided.wait(1))
+                    self.assertEqual(sent, [], "later reader stole the earlier reader's turn")
+                finally:
+                    release_a.set()
+                    release_b.set()
+                    a.join(3)
+                    if b.ident is not None:
+                        b.join(3)
+            self.assertFalse(a.is_alive() or b.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(sent, [("earlier", 10060), ("later", 10120)])
+            self.assertEqual(AccountRequestClock("account", path).ordinary_read_queue, [])
+
+    def test_crashed_result_reader_expires_after_restart_without_blocking_post(self):
+        now, sent = [10000.0], []
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=lambda delay: now.__setitem__(0, now[0] + delay)), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)):
+            path = Path(tmp) / "clock.json"
+            original = AccountRequestClock("account", path)
+            original.next_conversation_read = 10060
+            with original.lock:
+                self.assertTrue(original._ordinary_read_turn("crashed-worker", now[0], 60))
+            restarted = AccountRequestClock("account", path)
+            def send(method, *args, **kwargs):
+                sent.append((method, now[0]))
+                return Response()
+            restarted.request(send, "POST", "https://provider/conversation")
+            restarted.request(send, "GET", "https://provider/conversation/result")
+            self.assertEqual(sent, [("POST", 10000), ("GET", 10090)])
+            self.assertEqual(AccountRequestClock("account", path).ordinary_read_queue, [])
+
     def test_archive_read_booking_survives_restart_and_yields_to_waiting_result(self):
         from services.request_context import guarding_archive
         now = [10000.0]
@@ -172,6 +262,7 @@ class AccountRequestPacingTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 clock.request(send, "GET", "https://provider/conversation/original")
             clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            self.assertEqual(clock.ordinary_read_queue, [])
             self.assertGreaterEqual(clock.next_conversation_read, sent[0][1] + 15)
             clock.request(send, "POST", "https://provider/conversation")
             self.assertLess(sent[1][1] - sent[0][1], 15)
@@ -242,6 +333,7 @@ class AccountRequestPacingTests(unittest.TestCase):
                               _account_request_deadline_monotonic=now[0] + 5)
             self.assertEqual(sent, [])
             self.assertFalse(clock.lock.locked())
+            self.assertEqual(clock.ordinary_read_queue, [])
             clock.request(send, "GET", "https://provider/conversation/original")
             clock = AccountRequestClock("account", Path(tmp) / "clock.json")
             self.assertEqual(clock.last_rate_limit_evidence["phase"], "conversation_read")

@@ -12,6 +12,7 @@ import math
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -87,6 +88,7 @@ class AccountRequestClock:
         self.archive_read_owner = None
         self.archive_read_until = 0.0
         self.ordinary_read_wait_until = 0.0
+        self.ordinary_read_queue = []
         self.last_read_was_archive = False
         self.cooldown_until = 0.0
         self.rate_failures = 0
@@ -117,6 +119,12 @@ class AccountRequestClock:
                 raise ValueError("Invalid saved read reservation")
             setattr(self, field, value - offset)
         self.archive_read_owner = saved.get("archive_read_owner")
+        self.ordinary_read_queue = []
+        for entry in saved.get("ordinary_read_queue", []):
+            until = float(entry["until"])
+            if not isinstance(entry.get("owner"), str) or not math.isfinite(until):
+                raise ValueError("Invalid saved result read reservation")
+            self.ordinary_read_queue.append({"owner": entry["owner"], "until": until - offset})
         self.last_read_was_archive = saved.get("last_read_was_archive") is True
         started = saved.get("last_turn_started")
         if started is not None:
@@ -134,6 +142,9 @@ class AccountRequestClock:
                      archive_read_until=self.archive_read_until + offset,
                      ordinary_read_wait_until=self.ordinary_read_wait_until + offset,
                      last_read_was_archive=self.last_read_was_archive)
+        saved["ordinary_read_queue"] = [
+            {"owner": entry["owner"], "until": entry["until"] + offset}
+            for entry in self.ordinary_read_queue]
         saved["last_turn_started"] = None if self.last_turn_started is None else self.last_turn_started + offset
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_suffix(".tmp")
@@ -142,6 +153,35 @@ class AccountRequestClock:
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(self.state_path)
+
+    def _ordinary_read_turn(self, owner, now, delay):
+        # Sleeping outside the send lock is essential, but waking readers must
+        # not race for every read edge: a busy reader could starve other results.
+        # Keep FIFO reservations in the existing cross-process clock. Renew at
+        # each wake; a dead worker's reservation expires without clearing tasks.
+        queue = [entry for entry in self.ordinary_read_queue if entry["until"] > now]
+        changed = len(queue) != len(self.ordinary_read_queue)
+        entry = next((entry for entry in queue if entry["owner"] == owner), None)
+        if entry is None:
+            entry = {"owner": owner, "until": now + max(0, delay) + 30}
+            queue.append(entry)
+            changed = True
+        elif entry["until"] < now + max(0, delay) + 5:
+            entry["until"] = now + max(0, delay) + 30
+            changed = True
+        self.ordinary_read_queue = queue
+        self.ordinary_read_wait_until = max(entry["until"] for entry in queue)
+        if changed:
+            self._save()
+        return queue[0]["owner"] == owner
+
+    def _release_ordinary_read(self, owner):
+        queue = [entry for entry in self.ordinary_read_queue if entry["owner"] != owner]
+        if len(queue) == len(self.ordinary_read_queue):
+            return
+        self.ordinary_read_queue = queue
+        self.ordinary_read_wait_until = max((entry["until"] for entry in queue), default=0.0)
+        self._save()
 
     def _reserve_archive_read(self, owner, now):
         """Called with the existing clock lock; reserve one GET, never a POST."""
@@ -246,6 +286,7 @@ class AccountRequestClock:
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
+        ordinary_owner = uuid.uuid4().hex if is_conversation_read and not read_owner else None
         if archive_guard is not None:
             archive_guard()
             # Each HTTP step must finish inside the renewed 300s work claim.
@@ -329,13 +370,10 @@ class AccountRequestClock:
                     elif is_conversation_read:
                         if self.archive_read_owner and self.archive_read_until > now:
                             read_delay = max(read_delay, self.archive_read_until - now)
-                        if read_delay > 0:
-                            until = now + read_delay + 5
-                            if deadline_at is not None:
-                                until = min(until, deadline_at)
-                            if until > self.ordinary_read_wait_until:
-                                self.ordinary_read_wait_until = until
-                                self._save()
+                        if not self._ordinary_read_turn(ordinary_owner, now, read_delay):
+                            # Give the reserved reader time to wake. Do not
+                            # consume another full upstream interval locally.
+                            read_delay = max(read_delay, 1.0)
                 except BaseException:
                     self.lock.release()
                     raise
@@ -407,8 +445,9 @@ class AccountRequestClock:
                     if read_owner and self.archive_read_owner == read_owner:
                         self.archive_read_owner = None
                         self.archive_read_until = 0.0
-                    if archive_guard is None:
-                        self.ordinary_read_wait_until = 0.0
+                    if ordinary_owner:
+                        self._release_ordinary_read(ordinary_owner)
+                        ordinary_owner = None
                 if is_turn:
                     self.next_turn = now + min(300.0, config.account_message_interval_secs * factor)
                     logger.info({"event": "account_message_start", "account": self.account_key,
@@ -488,6 +527,16 @@ class AccountRequestClock:
             release_pacing()
             release_turn()
             raise
+        finally:
+            if ordinary_owner:
+                # Deadline/preflight/transport failure must not leave a live
+                # caller's place blocking the following result reader.
+                try:
+                    with self.lock:
+                        self._release_ordinary_read(ordinary_owner)
+                except Exception as exc:
+                    logger.warning({"event": "result_read_reservation_cleanup_failed",
+                                    "account": self.account_key, "error_type": type(exc).__name__})
 
 
 def rate_limited_event(line) -> bool:
