@@ -2951,6 +2951,7 @@ class OpenAIBackendAPI:
             poll_timeout_secs: float | None = None,
             request_message_id: str = "",
     ) -> list[str]:
+        caller_file_ids, caller_sediment_ids = file_ids, sediment_ids
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
         timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
@@ -3008,6 +3009,12 @@ class OpenAIBackendAPI:
             else:
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
+                # The stream may finish before its image tool. Return the
+                # request-scoped, settled poll IDs to the protocol too, so it
+                # persists them before download and exact-turn confirmation.
+                # Pending observations from a failed poll are not promoted.
+                caller_file_ids[:] = file_ids
+                caller_sediment_ids[:] = sediment_ids
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:

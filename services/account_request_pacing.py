@@ -280,7 +280,7 @@ class AccountRequestClock:
             body = kwargs.get("json")
             if isinstance(body, dict) and isinstance(body.get("is_archived"), bool):
                 phase = "conversation_archive" if body["is_archived"] else "conversation_restore"
-        elif "/conversation/" in path and str(method).upper() == "GET":
+        elif "/conversation/" in path and "/attachment/" not in path and str(method).upper() == "GET":
             phase = "conversation_read"
         is_conversation_read = phase == "conversation_read"
         archive_guard = current_archive_guard.get() if phase in {

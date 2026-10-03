@@ -71,6 +71,44 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_polled_only_result_reaches_exact_tool_turn_confirmation(self) -> None:
+        from services.image_thread import finished_parent
+        asset = "file_00000000" + "a" * 24
+        document = _conversation([asset], [asset])
+        document["conversation_id"] = "conv-1"
+        document["mapping"]["code"] = {
+            "parent": "request", "message": {"id": "code", "author": {"role": "assistant"},
+                "status": "finished_successfully", "end_turn": False}}
+        document["mapping"]["tool"]["parent"] = "code"
+        for mid in ("request", "tool"):
+            document["mapping"][mid]["message"].update(id=mid, status="finished_successfully")
+        backend = FakeBackend([document])
+        backend.file_urls[asset] = backend.sediment_urls[asset] = "https://files.test/result.png"
+        backend._query_backend_tasks = lambda **kwargs: []
+        backend.stream_conversation = mock.Mock(return_value=iter([
+            json.dumps({"conversation_id": "conv-1"}), "[DONE]"]))
+        saved = []
+        callback = lambda _step: None
+        callback.request_message_id = "request"
+        callback.record_result_ids = lambda files, sediments: saved.append((files, sediments))
+        backend.progress_callback = callback
+        backend.download_image_bytes = mock.Mock(return_value=[b"original-image-bytes"])
+        with (
+            mock.patch.object(type(config), "image_poll_initial_wait_secs", property(lambda _: 0)),
+            mock.patch.object(type(config), "image_settle_enabled", property(lambda _: False)),
+            mock.patch.object(type(config), "image_check_before_hit_enabled", property(lambda _: False)),
+            mock.patch("services.protocol.conversation._get_detailed_error_from_tasks", return_value=""),
+        ):
+            outputs = list(stream_image_outputs(backend, ConversationRequest(
+                prompt="Change the handle to green", model="gpt-image-2", images=["fixture"],
+                progress_callback=callback)))
+        self.assertEqual(saved, [([asset], [asset])])
+        self.assertEqual(finished_parent(document, "conv-1", "request", expected_parent="prior-turn",
+            expected_result_ids=saved[0][0] + saved[0][1]), "tool")
+        self.assertEqual(len([x for x in outputs if x.kind == "result"]), 1)
+        backend.stream_conversation.assert_called_once()
+        backend.download_image_bytes.assert_called_once_with(["https://files.test/result.png"])
+
     def test_generated_ids_are_saved_before_stream_or_url_resolution_can_fail(self) -> None:
         for failure_phase in ("stream", "resolve"):
             with self.subTest(failure_phase=failure_phase):
@@ -317,6 +355,22 @@ class MultiImageResultTests(unittest.TestCase):
             )
 
         self.assertEqual(urls, ["https://files.test/one.png"])
+
+    def test_failed_poll_does_not_promote_pending_ids_to_caller(self) -> None:
+        backend = FakeBackend()
+        files, sediments, pending = [], [], []
+        def interrupted_poll(*args, **kwargs):
+            self.assertEqual(kwargs["request_message_id"], "request")
+            pending.append((["unsettled-file"], ["unsettled-sediment"]))
+            raise ImagePollTimeoutError("not settled", "conv-1")
+        backend._poll_image_results = interrupted_poll
+        with mock.patch.object(type(config), "image_check_before_hit_enabled", property(lambda _: False)), \
+             mock.patch("services.openai_backend_api.OpenAIBackendAPI._query_backend_tasks", return_value=[]):
+            with self.assertRaises(ImagePollTimeoutError):
+                backend.resolve_conversation_image_urls("conv-1", files, sediments,
+                    request_message_id="request")
+        self.assertTrue(pending)
+        self.assertEqual((files, sediments), ([], []))
 
     def test_policy_detection_requires_an_explicit_refusal(self) -> None:
         self.assertFalse(_is_content_policy_error('{"reason":"delivery_return_policy"}'))

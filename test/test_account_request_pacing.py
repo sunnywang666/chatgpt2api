@@ -47,6 +47,28 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_attachment_lookup_keeps_http_pace_without_consuming_conversation_read_turn(self):
+        now = [10000.0]
+        sent = []
+        with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 1)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)):
+            clock = AccountRequestClock("account")
+            clock.next_request = 10001
+            clock.next_conversation_read = 10060
+            def send(method, url, **kwargs):
+                sent.append(now[0])
+                return Response()
+            url = "https://provider/backend-api/conversation/c/attachment/a/download"
+            clock.request(send, "GET", url)
+            self.assertEqual(sent, [10001])
+            self.assertEqual(clock.next_conversation_read, 10060)
+            clock.cooldown_until = 10010
+            clock.request(send, "GET", url)
+            self.assertEqual(sent, [10001, 10010])
+            self.assertEqual(clock.next_conversation_read, 10060)
+
     def test_later_result_reader_cannot_overtake_waiting_reader(self):
         now = [10000.0]
         a_waiting, b_waiting, release_a, release_b = (threading.Event() for _ in range(4))
