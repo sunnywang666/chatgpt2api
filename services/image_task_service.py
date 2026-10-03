@@ -1111,6 +1111,23 @@ class ImageTaskService:
 
         progress_callback.start_active_attempt = start_active_attempt
 
+        def record_local_pacing_wait(seconds: float) -> None:
+            nonlocal active_deadline_at
+            if seconds <= 0 or active_deadline_at is None:
+                return
+            with self._transaction():
+                current = self._tasks.get(key) or {}
+                deadline = current.get("active_attempt_deadline_at")
+                if not isinstance(deadline, (int, float)) or deadline <= 0:
+                    return
+                active_deadline_at = float(deadline) + seconds
+                self._update_task(key, active_attempt_deadline_at=active_deadline_at,
+                                  active_local_pacing_wait_secs=float(current.get("active_local_pacing_wait_secs") or 0) + seconds)
+            progress_callback.active_deadline_at = active_deadline_at
+            progress_callback.local_pacing_wait_secs = float(getattr(progress_callback, "local_pacing_wait_secs", 0)) + seconds
+
+        progress_callback.record_local_pacing_wait = record_local_pacing_wait
+
         def record_conversation_id(conversation_id: str) -> None:
             conversation_id = _clean(conversation_id)
             if conversation_id:
@@ -1322,6 +1339,7 @@ class ImageTaskService:
                               **(
                                   {
                                       "upstream_submission_started": False,
+                                      "_submission_started": False,
                                       "upstream_outcome": "not_submitted",
                                       **(
                                           {

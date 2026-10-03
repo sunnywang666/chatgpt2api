@@ -268,6 +268,111 @@ class ImageTaskServiceTests(unittest.TestCase):
                     self.assertEqual(transport.call_args.kwargs["timeout"], expected_timeout)
                 self.assertFalse(clock.lock.locked())
 
+    def test_image_local_read_pacing_preserves_active_budget_but_not_http_time(self):
+        now = [100.0]
+        with mock.patch("services.openai_backend_api.time.time", side_effect=lambda: now[0] + 900), \
+             mock.patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             mock.patch("services.account_request_pacing.time.sleep", side_effect=lambda secs: now.__setitem__(0, now[0] + secs)):
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.base_url = "https://provider.test"
+            backend._headers = lambda *_args: {}
+            callback = lambda _step: None
+            callback.active_deadline_at = 1300
+            callback.local_pacing_wait_secs = 0
+            def credit(seconds):
+                callback.active_deadline_at += seconds
+                callback.local_pacing_wait_secs += seconds
+            callback.record_local_pacing_wait = credit
+            backend.progress_callback = callback
+            clock = AccountRequestClock()
+            response = mock.Mock(status_code=200, headers={})
+            response.json.return_value = {"current_node": "original"}
+            def transport(*args, **kwargs):
+                self.assertFalse(any(k.startswith('_account_request') for k in kwargs))
+                now[0] += 1
+                return response
+            backend.session = mock.Mock()
+            backend.session.get.side_effect = lambda url, **kwargs: clock.request(transport, "GET", url, **kwargs)
+            for _ in range(8):
+                clock.next_conversation_read = now[0] + 60
+                backend._get_conversation("original")
+            self.assertEqual(callback.local_pacing_wait_secs, 480)
+            self.assertEqual(backend._image_active_timeout(300), 292)
+
+    def test_image_provider_cooldown_is_not_credited_as_local_wait(self):
+        with mock.patch("services.openai_backend_api.time.time", return_value=1000), \
+             mock.patch("services.account_request_pacing.time.monotonic", return_value=100):
+            backend = object.__new__(OpenAIBackendAPI)
+            callback = lambda _step: None
+            callback.active_deadline_at = 1010
+            callback.record_local_pacing_wait = mock.Mock()
+            backend.progress_callback = callback
+            clock = AccountRequestClock()
+            clock.cooldown_until = 160
+            transport = mock.Mock()
+            with self.assertRaises(AccountRequestDeadlineExceeded):
+                clock.request(transport, "GET", "https://provider.test/conversation/original", **backend._image_request_options(60))
+            transport.assert_not_called()
+            callback.record_local_pacing_wait.assert_not_called()
+            self.assertEqual(clock.cooldown_until, 160)
+
+    @mock.patch("services.openai_backend_api.account_service.require_image_account")
+    def test_final_local_deadline_after_reservation_remains_known_unsent(self, _capability):
+        from services.request_context import executing
+        now = [100.0]
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "synthetic-fixture"
+        backend.base_url = "https://provider.test"
+        backend.image_request_message_id = "original"
+        backend.image_submission_started = False
+        backend.retain_bound_conversation = True
+        backend._image_model_settings = lambda _model: ("gpt-image", "")
+        backend._image_headers = lambda *_args: {}
+        callback = lambda _step: None
+        callback.active_deadline_at = 1001
+        callback.record_submission_started = lambda: now.__setitem__(0, 102)
+        backend.progress_callback = callback
+        clock = AccountRequestClock()
+        transport = mock.Mock()
+        backend.session = mock.Mock()
+        backend.session.post.side_effect = lambda url, **kwargs: clock.request(transport, "POST", url, **kwargs)
+        context = mock.Mock(owner="owner", request_id="request")
+        context.log_fields.return_value = {}
+        with mock.patch("services.openai_backend_api.time.time", side_effect=lambda: now[0] + 900), \
+             mock.patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), executing(context):
+            with self.assertRaises(AccountRequestDeadlineExceeded):
+                backend._start_image_generation("cat", ChatRequirements(token="fixture"), "conduit", "gpt-image-2")
+        transport.assert_not_called()
+        context.record_stage.assert_not_called()
+        self.assertFalse(backend.image_submission_started)
+
+    @mock.patch("services.openai_backend_api.account_service.require_image_account")
+    def test_endpoint_404_fallback_local_deadline_is_known_unsent(self, _capability):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "synthetic-fixture"
+        backend.base_url = "https://provider.test"
+        backend.image_request_message_id = "original"
+        backend.image_submission_started = False
+        backend.retain_bound_conversation = True
+        backend._image_model_settings = lambda _model: ("gpt-image", "")
+        backend._image_headers = lambda *_args: {}
+        backend.progress_callback = lambda _step: None
+        first = mock.Mock(status_code=404)
+        calls = []
+        def post(url, **kwargs):
+            calls.append(url)
+            kwargs['_account_request_before_send']()
+            if len(calls) == 1:
+                return first
+            raise AccountRequestDeadlineExceeded("local wait before fallback transport")
+        backend.session = mock.Mock()
+        backend.session.post.side_effect = post
+        with self.assertRaises(AccountRequestDeadlineExceeded):
+            backend._start_image_generation("cat", ChatRequirements(token="fixture"), "conduit", "gpt-image-2")
+        self.assertEqual(len(calls), 2)
+        first.close.assert_called_once()
+        self.assertFalse(backend.image_submission_started)
+
     @mock.patch("services.openai_backend_api.account_service.require_image_account", return_value={"provider_account_identity": "fixture"})
     def test_generation_post_records_submission_boundary_before_network_call(self, _capability):
         backend = object.__new__(OpenAIBackendAPI)
@@ -825,6 +930,23 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(reloaded["active_attempt_started_at"], task["active_attempt_started_at"])
             self.assertEqual(reloaded["active_attempt_deadline_at"], task["active_attempt_deadline_at"])
 
+    def test_local_pacing_credit_is_persisted_without_resetting_active_budget(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "tasks.json"
+            def handler(payload):
+                callback = payload["progress_callback"]
+                callback.start_active_attempt()
+                callback.record_local_pacing_wait(60)
+                callback.record_local_pacing_wait(420)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+            service = self.make_service(path, handler)
+            service.submit_generation(OWNER, client_task_id="paced", prompt="cat", model="gpt-image-2", size=None)
+            wait_for_task(service, OWNER, "paced", "success")
+            restarted = self.make_service(path)
+            with restarted._transaction():
+                task = restarted._tasks["owner-1:paced"]
+                self.assertEqual(task["active_local_pacing_wait_secs"], 480)
+                self.assertAlmostEqual(task["active_attempt_deadline_at"] - task["active_attempt_started_at"], 780)
     def test_bound_account_and_chat_lock_waits_precede_active_budget(self):
         marks = {}
 

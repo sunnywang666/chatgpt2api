@@ -23,7 +23,7 @@ from curl_cffi import requests
 from PIL import Image
 
 from services.account_service import account_service
-from services.account_request_pacing import pace_account_session, retry_after_seconds
+from services.account_request_pacing import AccountRequestDeadlineExceeded, pace_account_session, retry_after_seconds
 from services.config import config
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
@@ -287,6 +287,8 @@ class OpenAIBackendAPI:
             # before transport starts. The account clock caps that timeout
             # again at the send edge using the remaining active-attempt budget.
             options["_account_request_deadline_monotonic"] = time.monotonic() + max(0.0, deadline - time.time())
+            if callable(getattr(self.progress_callback, "record_local_pacing_wait", None)):
+                options["_account_request_local_wait"] = self.progress_callback.record_local_pacing_wait
         return options
 
     def close(self) -> None:
@@ -1221,6 +1223,7 @@ class OpenAIBackendAPI:
         )
         request_timeout = self._image_active_timeout(300)
         request_deadline = time.monotonic() + request_timeout
+        local_wait = getattr(getattr(self, "progress_callback", None), "record_local_pacing_wait", None)
 
         def record_actual_submission() -> None:
             # Upload, bootstrap, and prepare can take long enough for local
@@ -1235,29 +1238,44 @@ class OpenAIBackendAPI:
                 record_submission_started()
             self.image_submission_started = True
 
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-            json=payload,
-            timeout=request_timeout,
-            stream=True,
-            _account_request_deadline_monotonic=request_deadline,
-            _account_request_before_send=record_actual_submission,
-            **({"_account_request_preflight": self.image_pre_send_check} if callable(getattr(self, "image_pre_send_check", None)) else {}),
-        )
-        if response.status_code == 404:
-            response.close()
-            path = "/backend-api/conversation"
+        try:
             response = self.session.post(
                 self.base_url + path,
                 headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
                 json=payload,
-                timeout=self._image_active_timeout(300),
+                timeout=request_timeout,
                 stream=True,
                 _account_request_deadline_monotonic=request_deadline,
                 _account_request_before_send=record_actual_submission,
+                **({"_account_request_local_wait": local_wait} if callable(local_wait) else {}),
                 **({"_account_request_preflight": self.image_pre_send_check} if callable(getattr(self, "image_pre_send_check", None)) else {}),
             )
+        except AccountRequestDeadlineExceeded:
+            # This typed local exception is raised before transport. A durable
+            # send reservation is not proof that the POST actually happened.
+            self.image_submission_started = False
+            raise
+        if response.status_code == 404:
+            response.close()
+            path = "/backend-api/conversation"
+            # An explicit endpoint-not-found response did not start generation.
+            # The fallback has its own durable reservation/transport boundary.
+            self.image_submission_started = False
+            try:
+                response = self.session.post(
+                    self.base_url + path,
+                    headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+                    json=payload,
+                    timeout=self._image_active_timeout(300),
+                    stream=True,
+                    _account_request_deadline_monotonic=time.monotonic() + self._image_active_timeout(300),
+                    _account_request_before_send=record_actual_submission,
+                    **({"_account_request_local_wait": local_wait} if callable(local_wait) else {}),
+                    **({"_account_request_preflight": self.image_pre_send_check} if callable(getattr(self, "image_pre_send_check", None)) else {}),
+                )
+            except AccountRequestDeadlineExceeded:
+                self.image_submission_started = False
+                raise
         ensure_ok(response, path)
         return response
 
@@ -2518,6 +2536,7 @@ class OpenAIBackendAPI:
         if not request_message_id:
             raise RuntimeError("image result boundary unavailable: submitted message id missing")
         start = time.time()
+        initial_pacing_wait = float(getattr(getattr(self, "progress_callback", None), "local_pacing_wait_secs", 0))
         attempt = 0
         interval = float(config.image_poll_interval_secs)
         initial_wait = float(config.image_poll_initial_wait_secs)
@@ -2542,7 +2561,8 @@ class OpenAIBackendAPI:
         })
 
         def _remaining() -> float:
-            return timeout_secs - (time.time() - start)
+            pacing_wait = float(getattr(getattr(self, "progress_callback", None), "local_pacing_wait_secs", 0)) - initial_pacing_wait
+            return timeout_secs - (time.time() - start - pacing_wait)
 
         # Recovery has already read this exact conversation under the account
         # clock. Consume that fresh observation once; a second immediate GET

@@ -186,6 +186,7 @@ class AccountRequestClock:
 
     def request(self, send, method, url, **kwargs):
         deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
+        local_wait = kwargs.pop("_account_request_local_wait", None)
         before_send = kwargs.pop("_account_request_before_send", None)
         preflight = kwargs.pop("_account_request_preflight", None)
         if not isinstance(deadline_at, (int, float)) or isinstance(deadline_at, bool):
@@ -213,6 +214,22 @@ class AccountRequestClock:
             timeout = kwargs.get("timeout")
             if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
                 kwargs["timeout"] = max(0.001, min(float(timeout), remaining))
+
+        def wait_for_pace(delay: float, message: str) -> None:
+            nonlocal deadline_at
+            remaining = remaining_budget()
+            # Credit only our configured pacing wait. A provider cooldown is
+            # still bounded by the caller's deadline and is never shortened.
+            credit = callable(local_wait) and self.cooldown_until <= time.monotonic()
+            if remaining is not None and (remaining <= 0 or (not credit and delay >= remaining)):
+                raise AccountRequestDeadlineExceeded(message)
+            started_wait = time.monotonic()
+            time.sleep(delay)
+            elapsed = max(0.0, time.monotonic() - started_wait)
+            if credit and elapsed:
+                local_wait(elapsed)
+                if deadline_at is not None:
+                    deadline_at += elapsed
 
         path = urlparse(str(url)).path.rstrip("/")
         is_turn = str(method).upper() == "POST" and (path.endswith("/conversation") or path.endswith("/responses"))
@@ -328,10 +345,7 @@ class AccountRequestClock:
                 # and delay a generation POST that is otherwise ready. Reload
                 # all deadlines under the cross-process lock after waking.
                 self.lock.release()
-                remaining = remaining_budget()
-                if remaining is not None and read_delay >= remaining:
-                    raise AccountRequestDeadlineExceeded("account request deadline elapsed during read wait")
-                time.sleep(read_delay)
+                wait_for_pace(read_delay, "account request deadline elapsed during read wait")
             try:
                 if self.rate_failures and time.monotonic() - self.last_rate_limit >= 900:
                     self.rate_failures = 0
@@ -339,10 +353,7 @@ class AccountRequestClock:
                             self.next_turn if is_turn else 0.0)
                 delay = ready - time.monotonic()
                 if delay > 0:
-                    remaining = remaining_budget()
-                    if remaining is not None and delay >= remaining:
-                        raise AccountRequestDeadlineExceeded("account request deadline elapsed during cooldown wait")
-                    time.sleep(delay)
+                    wait_for_pace(delay, "account request deadline elapsed during cooldown wait")
                 if preflight is not None:
                     # A superseded original may arrive during the cooldown.
                     # This GET shares the held pacing lock and raw transport;
@@ -376,14 +387,9 @@ class AccountRequestClock:
                     # The metadata GET does not bypass the account request pace.
                     delay = max(self.next_request, self.cooldown_until, self.next_turn if is_turn else 0.0) - time.monotonic()
                     if delay > 0:
-                        remaining = remaining_budget()
-                        if remaining is not None and delay >= remaining:
-                            raise AccountRequestDeadlineExceeded("deadline elapsed after preflight")
-                        time.sleep(delay)
+                        wait_for_pace(delay, "deadline elapsed after preflight")
                 if context is not None and is_turn:
                     context.before_send()
-                    if hasattr(context, "record_stage"):
-                        context.record_stage("send_call_started")
                 if callable(before_send):
                     before_send()
                 if archive_guard is not None:
@@ -420,6 +426,8 @@ class AccountRequestClock:
                 # Saving pacing state and the submission receipt can consume
                 # part of the declared budget; cap once more at the send edge.
                 cap_timeout_before_send()
+                if context is not None and is_turn and hasattr(context, "record_stage"):
+                    context.record_stage("send_call_started")
                 sent_at = time.monotonic()
                 try:
                     response = observed_send(method, url, phase, **kwargs)
@@ -597,6 +605,7 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
             # Image upload/download still has a caller deadline, but no
             # account-clock wait. Consume our private option before requests.
             deadline = kwargs.pop("_account_request_deadline_monotonic", None)
+            kwargs.pop("_account_request_local_wait", None)
             if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
