@@ -47,6 +47,105 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_archive_read_booking_survives_restart_and_yields_to_waiting_result(self):
+        from services.request_context import guarding_archive
+        now = [10000.0]
+        sent = []
+        injected = [False]
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)):
+            path = Path(tmp) / "clock.json"
+            original = AccountRequestClock("account", path)
+            original.next_conversation_read = now[0] + 60
+            with original.lock:
+                self.assertTrue(original._reserve_archive_read("old-work-v1", now[0]))
+            clock = AccountRequestClock("account", path)
+            def send(method, url, **kwargs):
+                sent.append((method, url.rsplit("/", 1)[-1], now[0]))
+                return Response()
+            def advance(seconds):
+                self.assertFalse(clock.lock.locked())
+                if not injected[0]:
+                    injected[0] = True
+                    clock.request(send, "POST", "https://provider/conversation",
+                                  _account_request_deadline_monotonic=now[0] + .5)
+                    now[0] = 10060
+                    archive = AccountRequestClock("account", path)
+                    with guarding_archive(lambda: None, read_owner="old-work-v1"):
+                        archive.request(send, "GET", "https://provider/conversation/archive-first")
+                    with archive.lock:
+                        self.assertFalse(archive._reserve_archive_read("old-work-v1", now[0]))
+                    now[0] = 10065
+                else:
+                    now[0] += seconds
+            with patch("services.account_request_pacing.time.sleep", side_effect=advance):
+                clock.request(send, "GET", "https://provider/conversation/result")
+                with guarding_archive(lambda: None, read_owner="old-work-v1"):
+                    clock.request(send, "GET", "https://provider/conversation/archive-readback")
+            self.assertEqual([(m, name) for m, name, _ in sent], [
+                ("POST", "conversation"), ("GET", "archive-first"),
+                ("GET", "result"), ("GET", "archive-readback")])
+            self.assertEqual([at for _, _, at in sent], [10000, 10060, 10120, 10180])
+
+    def test_abandoned_archive_read_booking_expires_without_blocking_post(self):
+        now = [10000.0]
+        sent = []
+        with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=lambda delay: now.__setitem__(0, now[0] + delay)), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)):
+            clock = AccountRequestClock()
+            clock.next_conversation_read = now[0] + 60
+            with clock.lock:
+                self.assertTrue(clock._reserve_archive_read("abandoned", now[0]))
+                self.assertFalse(clock._reserve_archive_read("another-work", now[0]))
+            def send(method, *args, **kwargs):
+                sent.append((method, now[0]))
+                return Response()
+            clock.request(send, "POST", "https://provider/conversation")
+            clock.request(send, "GET", "https://provider/conversation/result")
+            self.assertEqual(sent, [("POST", 10000), ("GET", 10065)])
+            clock.next_conversation_read = now[0] + 300
+            with clock.lock:
+                self.assertFalse(clock._reserve_archive_read("too-late", now[0]))
+
+    def test_archive_attempt_consumes_booking_on_rate_limit_or_transport_error(self):
+        from services.request_context import guarding_archive
+        for outcome in ("rate_limit", "transport"):
+            with self.subTest(outcome=outcome), \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                 patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)):
+                clock = AccountRequestClock()
+                with clock.lock:
+                    self.assertTrue(clock._reserve_archive_read("original", time.monotonic()))
+                def send(*args, **kwargs):
+                    if outcome == "transport":
+                        raise OSError("transport interrupted")
+                    response = Response()
+                    response.status_code = 429
+                    return response
+                with guarding_archive(lambda: None, read_owner="original"):
+                    if outcome == "transport":
+                        with self.assertRaises(OSError):
+                            clock.request(send, "GET", "https://provider/conversation/original")
+                    else:
+                        self.assertEqual(clock.request(send, "GET", "https://provider/conversation/original").status_code, 429)
+                        self.assertGreater(clock.cooldown_until, time.monotonic())
+                self.assertIsNone(clock.archive_read_owner)
+                self.assertFalse(clock.lock.locked())
+
+    def test_waiter_persistence_failure_releases_shared_clock(self):
+        clock = AccountRequestClock()
+        clock.next_conversation_read = time.monotonic() + 60
+        with patch.object(clock, "_save", side_effect=OSError("fixture")), self.assertRaises(OSError):
+            clock.request(lambda *a, **k: self.fail("unexpected send"), "GET", "https://provider/conversation/original")
+        self.assertFalse(clock.lock.locked())
+
     def test_conversation_read_floor_survives_restart_and_transport_failure(self):
         now = [10000.0]
         sent = []

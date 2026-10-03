@@ -6,6 +6,7 @@ import re
 
 current_request = ContextVar("provider_original_request", default=None)
 current_archive_guard = ContextVar("provider_archive_guard", default=None)
+current_archive_read_owner = ContextVar("provider_archive_read_owner", default=None)
 _FAIR_SOURCE = re.compile(r"^(?:user|company):[0-9a-f]{64}$")
 
 
@@ -28,11 +29,13 @@ def executing(context):
 
 
 @contextmanager
-def guarding_archive(check_and_renew):
+def guarding_archive(check_and_renew, *, read_owner=None):
     token = current_archive_guard.set(check_and_renew)
+    read_token = current_archive_read_owner.set(read_owner)
     try:
         yield
     finally:
+        current_archive_read_owner.reset(read_token)
         current_archive_guard.reset(token)
 
 

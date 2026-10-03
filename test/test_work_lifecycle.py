@@ -56,6 +56,39 @@ def test_completion_persists_original_archive_intent_and_releases_only_its_work(
     assert not service.process_one()
 
 
+def test_read_deferral_books_oldest_archive_outside_receipt_transaction(runtime, monkeypatch):
+    from services import account_request_pacing as pacing
+    service, store, now, calls, _, add = runtime
+    first = add("Z-1")
+    service.update("text", {"id": "one"}, "Z-1", "completed", True)
+    now[0] += 1
+    second = add("A-2")
+    service.update("text", {"id": "one"}, "A-2", "completed", True)
+    with store.transaction() as db:
+        for row in (first, second):
+            row["provider_account_identity"] = "same-account"
+            store.write_receipt(db, "text", "one", row["request_id"], row)
+    service.text.admission = SimpleNamespace(accounts=SimpleNamespace(
+        admission_accounts=lambda: [{"provider_account_identity": "same-account"}]))
+    monkeypatch.setattr(pacing, "account_pacing_snapshot", lambda *a, **k: {"next_at": 1060, "cooldown_until": 0})
+    booked = []
+    def book(account, owner):
+        # A second connection can take a write transaction only after the
+        # scheduler committed its selection; no DB -> clock lock inversion.
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.rollback()
+        booked.append(owner)
+    monkeypatch.setattr(pacing, "reserve_account_archive_read", book)
+    assert not service.process_one()
+    from services.work_lifecycle import _archive_read_owner
+    with store.connect() as db:
+        expected = _archive_read_owner(store.runtime(db, first["_work_key"]))
+    assert booked == [expected]
+    assert calls == []
+    assert service.get("text", {"id": "one"}, "Z-1")["archive"]["attempts"] == 0
+
+
 def test_archive_failure_and_restart_recover_original_target_without_occupying_new_work(runtime):
     service, store, clock, calls, fail, add = runtime
     add("A-1")

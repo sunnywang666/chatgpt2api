@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 from services.config import DATA_DIR, config
 from utils.log import logger
-from services.request_context import current_request, current_archive_guard
+from services.request_context import current_request, current_archive_guard, current_archive_read_owner
 
 
 class ProcessMutex:
@@ -84,6 +84,10 @@ class AccountRequestClock:
         self.next_request = 0.0
         self.next_turn = 0.0
         self.next_conversation_read = 0.0
+        self.archive_read_owner = None
+        self.archive_read_until = 0.0
+        self.ordinary_read_wait_until = 0.0
+        self.last_read_was_archive = False
         self.cooldown_until = 0.0
         self.rate_failures = 0
         self.last_rate_limit = 0.0
@@ -107,6 +111,13 @@ class AccountRequestClock:
         if not math.isfinite(read_at):
             raise ValueError("Invalid saved conversation read clock")
         self.next_conversation_read = read_at - offset
+        for field in ("archive_read_until", "ordinary_read_wait_until"):
+            value = float(saved.get(field, 0.0))
+            if not math.isfinite(value):
+                raise ValueError("Invalid saved read reservation")
+            setattr(self, field, value - offset)
+        self.archive_read_owner = saved.get("archive_read_owner")
+        self.last_read_was_archive = saved.get("last_read_was_archive") is True
         started = saved.get("last_turn_started")
         if started is not None:
             self.last_turn_started = float(started) - offset
@@ -119,6 +130,10 @@ class AccountRequestClock:
                  ("next_request", "next_turn", "next_conversation_read", "cooldown_until", "last_rate_limit")}
         saved["rate_failures"] = self.rate_failures
         saved["last_rate_limit_evidence"] = self.last_rate_limit_evidence
+        saved.update(archive_read_owner=self.archive_read_owner,
+                     archive_read_until=self.archive_read_until + offset,
+                     ordinary_read_wait_until=self.ordinary_read_wait_until + offset,
+                     last_read_was_archive=self.last_read_was_archive)
         saved["last_turn_started"] = None if self.last_turn_started is None else self.last_turn_started + offset
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_suffix(".tmp")
@@ -127,6 +142,22 @@ class AccountRequestClock:
             handle.flush()
             os.fsync(handle.fileno())
         temporary.replace(self.state_path)
+
+    def _reserve_archive_read(self, owner, now):
+        """Called with the existing clock lock; reserve one GET, never a POST."""
+        if not getattr(config, "account_conversation_read_interval_secs", 0.0):
+            return True
+        ready = max(now, self.next_request, self.cooldown_until, self.next_conversation_read)
+        if ready - now >= 235:
+            return False  # An archive HTTP step has a 240 second finite budget.
+        if self.archive_read_owner and self.archive_read_until > now:
+            return self.archive_read_owner == owner
+        if self.last_read_was_archive and self.ordinary_read_wait_until > now:
+            return False
+        self.archive_read_owner = owner
+        self.archive_read_until = ready + 5
+        self._save()
+        return True
 
     def limited(self, retry_after=0.0, *, evidence=None):
         # A successful metadata GET does not prove that generation capacity has
@@ -197,6 +228,7 @@ class AccountRequestClock:
         is_conversation_read = phase == "conversation_read"
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
+        read_owner = current_archive_read_owner.get() if archive_guard is not None else None
         if archive_guard is not None:
             archive_guard()
             # Each HTTP step must finish inside the renewed 300s work claim.
@@ -268,8 +300,28 @@ class AccountRequestClock:
         try:
             while True:
                 acquire_with_budget(self.lock)
-                read_delay = max(self.next_request, self.cooldown_until,
-                                 self.next_conversation_read) - time.monotonic()
+                try:
+                    now = time.monotonic()
+                    read_delay = max(self.next_request, self.cooldown_until,
+                                     self.next_conversation_read) - now
+                    if is_conversation_read and read_owner:
+                        if not self._reserve_archive_read(read_owner, now):
+                            other = self.archive_read_until if self.archive_read_until > now else 0.0
+                            ordinary = self.ordinary_read_wait_until if self.last_read_was_archive else 0.0
+                            read_delay = max(read_delay, other - now, ordinary - now)
+                    elif is_conversation_read:
+                        if self.archive_read_owner and self.archive_read_until > now:
+                            read_delay = max(read_delay, self.archive_read_until - now)
+                        if read_delay > 0:
+                            until = now + read_delay + 5
+                            if deadline_at is not None:
+                                until = min(until, deadline_at)
+                            if until > self.ordinary_read_wait_until:
+                                self.ordinary_read_wait_until = until
+                                self._save()
+                except BaseException:
+                    self.lock.release()
+                    raise
                 if not is_conversation_read or read_delay <= 0:
                     break
                 # Waiting for a read must not occupy the shared send-edge lock
@@ -345,6 +397,12 @@ class AccountRequestClock:
                 read_interval = min(300.0, getattr(config, "account_conversation_read_interval_secs", 0.0) * factor)
                 if is_conversation_read:
                     self.next_conversation_read = now + read_interval
+                    self.last_read_was_archive = archive_guard is not None
+                    if read_owner and self.archive_read_owner == read_owner:
+                        self.archive_read_owner = None
+                        self.archive_read_until = 0.0
+                    if archive_guard is None:
+                        self.ordinary_read_wait_until = 0.0
                 if is_turn:
                     self.next_turn = now + min(300.0, config.account_message_interval_secs * factor)
                     logger.info({"event": "account_message_start", "account": self.account_key,
@@ -495,6 +553,28 @@ def account_pacing_snapshot(account, now=None, *, include_turn=True, include_con
 
 _clocks: dict[str, AccountRequestClock] = {}
 _clocks_lock = threading.Lock()
+
+
+def reserve_account_archive_read(account, owner):
+    """Best-effort booking outside SQLite transactions; never wait on HTTP."""
+    identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
+    if not identity or not getattr(config, "account_conversation_read_interval_secs", 0.0):
+        return False
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    try:
+        with _clocks_lock:
+            clock = _clocks.get(key)
+            if clock is None:
+                clock = AccountRequestClock(key[:12], DATA_DIR / "account_request_clocks" / f"{key}.json")
+                _clocks[key] = clock
+        if not clock.lock.acquire(blocking=False):
+            return False
+        try:
+            return clock._reserve_archive_read(owner, time.monotonic())
+        finally:
+            clock.lock.release()
+    except (OSError, ValueError):
+        return False
 
 
 def pace_account_session(session, account: dict, access_token: str) -> None:

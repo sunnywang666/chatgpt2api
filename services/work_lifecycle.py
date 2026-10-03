@@ -165,6 +165,10 @@ def _projection(work):
                 "cleanup_pending": bool(work.get("cleanup_pending"))} if work.get("completion_result_id") else {})}
 
 
+def _archive_read_owner(work):
+    return hashlib.sha256(f"{work['key']}:{work['archive']['version']}".encode()).hexdigest()
+
+
 class WorkLifecycleService:
     def __init__(self, text_service, image_service, *, clock=time.time):
         self.text, self.images, self.store = text_service, image_service, text_service.store
@@ -264,7 +268,7 @@ class WorkLifecycleService:
         supported = supported and not never_sent
         work["archive"] = {"status": "pending" if supported else "not_applicable", "desired": desired,
                            "scope": "upstream_conversation" if supported else "provider_work",
-                           "next_at": now if supported else None, "attempts": 0,
+                           "next_at": now if supported else None, "requested_at": now, "attempts": 0,
                            "request_id": work["last_request_id"], "version": work["version"]}
         if not supported:
             # Native Codex / legacy single-request protocols expose no verified
@@ -308,8 +312,10 @@ class WorkLifecycleService:
                     account_rows = {a["provider_account_identity"]: a for a in read() if a.get("provider_account_identity")}
             with self.store.transaction() as db:
                 work = None
-                for (raw,) in db.execute("SELECT value FROM task_runtime WHERE name LIKE 'work:%' ORDER BY name"):
-                    candidate = json.loads(raw)
+                reservations = {}
+                candidates = [json.loads(raw) for (raw,) in db.execute("SELECT value FROM task_runtime WHERE name LIKE 'work:%'")]
+                candidates.sort(key=lambda w: ((w.get("archive") or {}).get("requested_at", w.get("updated_at", 0)), w["key"]))
+                for candidate in candidates:
                     if target_key is not None and candidate["key"] != target_key:
                         continue
                     a = candidate.get("archive") or {}
@@ -343,18 +349,27 @@ class WorkLifecycleService:
                                 a["next_at"] = now + 60 if ready_at is None else ready_at
                                 if ready_at is None:
                                     a.update(status="unknown", error_code="ACCOUNT_PACING_UNAVAILABLE")
+                                elif float(account_pacing_snapshot(account, now, include_turn=False).get("cooldown_until") or 0) <= now:
+                                    # Book after committing: HTTP guards acquire
+                                    # SQLite while holding the clock, never invert it.
+                                    reservations.setdefault(receipt["provider_account_identity"],
+                                                            (account, _archive_read_owner(candidate)))
                                 save_work(self.store, db, candidate)
                                 continue
                         work = candidate
                         break
-                if work is None:
-                    return False
-                archive = work["archive"]
-                request_id = archive["request_id"]
-                claim = uuid.uuid4().hex
-                archive.update(status="running", claim=claim, claim_until=now + 300,
-                               attempts=int(archive.get("attempts") or 0) + 1)
-                save_work(self.store, db, work)
+                if work is not None:
+                    archive = work["archive"]
+                    request_id = archive["request_id"]
+                    claim = uuid.uuid4().hex
+                    archive.update(status="running", claim=claim, claim_until=now + 300,
+                                   attempts=int(archive.get("attempts") or 0) + 1)
+                    save_work(self.store, db, work)
+            from services.account_request_pacing import reserve_account_archive_read
+            for account, owner in reservations.values():
+                reserve_account_archive_read(account, owner)
+            if work is None:
+                return False
             error_code = None
             def check_and_renew_archive():
                 with self.store.transaction() as db:
@@ -369,7 +384,7 @@ class WorkLifecycleService:
                     save_work(self.store, db, current)
             try:
                 from services.request_context import guarding_archive
-                with guarding_archive(check_and_renew_archive):
+                with guarding_archive(check_and_renew_archive, read_owner=_archive_read_owner(work)):
                     if work["kind"] == "text":
                         result = self.text.set_public_session_archived(work["owner"], request_id, archive["desired"])
                         valid = (result.get("request_id") == request_id
