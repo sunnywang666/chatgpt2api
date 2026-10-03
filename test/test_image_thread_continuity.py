@@ -102,7 +102,9 @@ def runtime(tmp_path, monkeypatch):
         def get_conversation_parent_message_id(self, cid):
             state.naive_reads += 1
             raise AssertionError("new thread may not accept arbitrary current_node")
-        def set_conversation_archived(self, cid, parent, archived):
+        def set_conversation_archived(self, cid, parent, archived, *, validate_document=None):
+            if validate_document is not None:
+                validate_document(self._get_conversation(cid))
             assert parent in state.documents[cid]["mapping"]
             state.documents[cid]["is_archived"] = archived
             state.archive_actions.append((cid, archived))
@@ -1062,3 +1064,31 @@ def test_absent_edit_qualified_reads_then_one_same_session_completion(runtime, m
         assert completion.read('image', WHO, 'absent-edit')['selected_id'] == child_id
         assert completion.complete('image', WHO, 'absent-edit', child_id)['state'] == 'completed'
         assert r.read('absent-edit')['status'] == 'error'
+
+
+def test_archive_uses_same_fresh_precheck_for_validator_and_keeps_readback():
+    from types import SimpleNamespace
+    backend = object.__new__(RealOpenAIBackendAPI)
+    backend.base_url = 'https://fixture.invalid'
+    backend._headers = lambda *a, **k: {}
+    reads, patches, validated = [], [], []
+    document = {'current_node': 'parent', 'mapping': {'parent': {}}, 'is_archived': False}
+    def get(cid):
+        reads.append(cid)
+        return {**document}
+    def patch(*a, **k):
+        patches.append(k)
+        document['is_archived'] = True
+        return SimpleNamespace(status_code=200, raise_for_status=lambda: None, json=lambda: {})
+    backend._get_conversation = get
+    backend.session = SimpleNamespace(patch=patch)
+    def reject(doc):
+        assert doc['is_archived'] is False
+        raise ValueError('terminal result changed')
+    with pytest.raises(ValueError, match='terminal result changed'):
+        backend.set_conversation_archived('original', 'parent', True, validate_document=reject)
+    assert len(reads) == 1 and not patches
+    reads.clear()
+    backend.set_conversation_archived('original', 'parent', True, validate_document=lambda doc: validated.append(doc))
+    assert len(reads) == 2 and len(patches) == 1 and len(validated) == 1
+    assert validated[0]['is_archived'] is False

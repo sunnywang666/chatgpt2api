@@ -1309,7 +1309,8 @@ class OpenAIBackendAPI:
             raise RuntimeError("upstream conversation has no authoritative current_node")
         return parent_message_id
 
-    def set_conversation_archived(self, conversation_id: str, parent_message_id: str, archived: bool) -> Dict[str, Any]:
+    def set_conversation_archived(self, conversation_id: str, parent_message_id: str, archived: bool,
+                                  *, validate_document=None) -> Dict[str, Any]:
         """Change visibility only after checking the original conversation and cursor."""
         with observing_archive_step("precheck"):
             document = self._get_conversation(conversation_id)
@@ -1317,6 +1318,10 @@ class OpenAIBackendAPI:
             raise ConversationArchiveCursorMismatch("original conversation cursor changed")
         if parent_message_id not in (document.get("mapping") or {}):
             raise RuntimeError("original product turn is missing")
+        if validate_document is not None:
+            # Both checks use this fresh pre-PATCH read, never a cached poll
+            # snapshot from before the result download.
+            validate_document(document)
         if document.get("is_archived") is archived:
             return {"archived": archived}
         path = f"/backend-api/conversation/{conversation_id}"

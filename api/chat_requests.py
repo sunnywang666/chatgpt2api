@@ -209,6 +209,8 @@ def create_router() -> APIRouter:
     router = APIRouter()
     from api.generation_completion import create_router as completion_router
     router.include_router(completion_router("text"))
+    from api.task_events import create_router as events_router
+    router.include_router(events_router("text", lambda: text_task_service))
 
     @router.post("/api/chat-requests")
     async def create_chat_request(

@@ -535,3 +535,37 @@ class ExternalImageClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_result_notification_reconnect_preserves_original_chat_state(tmp_path):
+    path = tmp_path / 'chat.json'
+    original = {'schema': 'chatgpt2api.chat-request.v1', 'request_id': 'original-chat',
+                'phase': 'accepted', 'input_fingerprint': 'unchanged'}
+    path.write_text(json.dumps(original))
+    calls = []
+    class Response(io.BytesIO):
+        headers = {'Content-Type': 'text/event-stream; charset=utf-8'}
+    class Api:
+        def open(self, method, endpoint):
+            calls.append((method, endpoint))
+            if len(calls) == 1:
+                return Response(b'event: reconnect\ndata: {"request_id":"original-chat"}\n\n')
+            return Response(b'event: result_ready\ndata: {"protocol":"task-notification-v1","kind":"text","request_id":"original-chat","result_ready":true,"result_count":1}\n\n')
+    args = image_client._parser().parse_args(['chat-wait', '--state', str(path), '--max-wait-seconds', '5'])
+    with mock.patch.object(image_client.time, 'sleep'), mock.patch.object(image_client, '_emit') as emit:
+        assert image_client._command_wait(Api(), args) == 0
+    assert calls == [('GET', '/api/chat-requests/original-chat/events')] * 2
+    assert json.loads(path.read_text()) == original
+    assert emit.call_args.args[0]['result_ready'] is True
+
+
+def test_result_notification_rejects_wrong_original_and_never_submits(tmp_path):
+    class Response(io.BytesIO):
+        headers = {'Content-Type': 'text/event-stream'}
+    class Api:
+        def open(self, method, endpoint):
+            assert method == 'GET' and endpoint == '/api/image-tasks/original/events'
+            return Response(b'event: result_ready\ndata: {"request_id":"different","result_ready":true}\n\n')
+    args = image_client._parser().parse_args(['wait', '--state', str(tmp_path / 'absent.json'), '--task-id', 'original'])
+    with unittest.TestCase().assertRaisesRegex(image_client.ClientError, 'original request identity'):
+        image_client._command_wait(Api(), args)

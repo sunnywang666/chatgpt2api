@@ -482,3 +482,19 @@ and repeat that exact value after an uncertain response. Repeating it cannot
 authorize another attempt, including after restart. Each confirmed unsent
 image retry gets a fresh active-attempt deadline; previous deadlines and failure
 evidence remain in the receipt timeline. Automatic retry counts stay bounded.
+
+### 等待已保存的原结果
+
+普通程序 Key 可以 GET `/api/image-tasks/{task_id}/events` 或
+`/api/chat-requests/{request_id}/events` 订阅 `text/event-stream`，无需额外凭据。
+Python 客户端提供 `wait --state 原图片状态.json` 和
+`chat-wait --state 原文字状态.json`，可用 `--max-wait-seconds` 限定本次等待。
+收到 `result_ready` 后命令成功退出，立即运行原 `download` 或 `chat-save` 保存并读回结果；
+无需再固定等几秒。通知仅说明该原请求已有持久结果，不表示审核完成、工作完成或已归档。
+
+通知读取账号池的本地持久回执，不触发上游查询或提交。它不是上游生成结束的推送协议，
+也不能把上游 SSE 断开当成生成成功。连接最长 30 秒；`reconnect`、EOF 或重连只重新 GET
+原 ID，可能再次收到相同状态，客户端不得因此重发任务或重复处理文件。
+`needs_attention` 表示需要读取原回执/completion，不能据此自动重画；
+`access_lost` 表示密钥访问结束。等待超时保留原 ID，客户端退出码 2，不创建新任务。
+事件只含原 ID、类别、状态、是否就绪及结果数量，不传密钥、结果正文或上游游标。

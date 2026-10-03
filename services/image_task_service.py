@@ -16,7 +16,7 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.task_store import TaskStore, recovery_control, pending_image_result_ids
 from contextlib import contextmanager
-from services.request_context import current_request, AdmissionLost, observing_archive_step
+from services.request_context import current_request, AdmissionLost
 from utils.log import logger
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
@@ -816,12 +816,13 @@ class ImageTaskService:
             backend = OpenAIBackendAPI(access_token=token)
             try:
                 result_ids = (task.get("result_file_ids") or []) + (task.get("result_sediment_ids") or [])
-                with observing_archive_step("terminal_check"):
-                    actual_parent = finished_parent(backend._get_conversation(conversation_id), conversation_id,
+                def validate_terminal(document):
+                    actual_parent = finished_parent(document, conversation_id,
                         request_id, expected_result_ids=result_ids)
-                if actual_parent != parent_id:
-                    raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
-                backend.set_conversation_archived(conversation_id, parent_id, archived)
+                    if actual_parent != parent_id:
+                        raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                backend.set_conversation_archived(conversation_id, parent_id, archived,
+                                                 validate_document=validate_terminal)
             finally:
                 backend.close()
         return {"image_thread": public_thread(task), "archived": archived, "task_id": task_id}

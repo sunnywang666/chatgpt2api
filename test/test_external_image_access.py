@@ -70,6 +70,21 @@ class ExternalImageAccessTests(unittest.TestCase):
     def headers(self, secret=None):
         return {"Authorization": "Bearer " + (secret or self.secret_a), "X-Workbench-Image-Client": "1", "X-Forwarded-Prefix": "/ai"}
 
+    def test_public_notification_is_owner_scoped_and_revoked_key_is_rejected(self):
+        with self.tasks.store.transaction() as db:
+            self.tasks.store.write_receipt(db, "image", self.key_a["id"], "saved", {
+                "id": "saved", "model": "gpt-image-2", "status": "success",
+                "data": [{"url": "private-result-url"}],
+            })
+        response = self.client.get("/api/image-tasks/saved/events", headers=self.headers())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("event: result_ready", response.text)
+        self.assertNotIn("private-result-url", response.text)
+        self.assertEqual(self.client.get("/api/image-tasks/saved/events", headers=self.headers(self.secret_b)).status_code, 404)
+        self.assertTrue(self.auth.revoke_owned_key("workbench:org:a", self.key_a["id"]))
+        self.assertEqual(self.client.get("/api/image-tasks/saved/events", headers=self.headers()).status_code, 401)
+        self.assertFalse(self.calls)
+
     def test_narrowed_policy_preserves_own_old_receipt_download_and_read_only_resume(self):
         body = {"client_task_id": "policy-history", "prompt": "sample", "model": "gpt-image-2"}
         self.assertEqual(self.client.post("/api/image-tasks/generations", headers=self.headers(), json=body).status_code, 200)

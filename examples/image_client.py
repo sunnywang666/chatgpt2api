@@ -591,6 +591,62 @@ def _command_status(api: ApiClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_wait(api: ApiClient, args: argparse.Namespace) -> int:
+    """Subscribe to the original saved result; reconnects are GET-only."""
+    is_chat = args.command == "chat-wait"
+    state = _load_chat_state(_chat_state_path(args)) if is_chat else _load_state(_state_path(args))
+    rid = _chat_request_id(args, state) if is_chat else _task_id(args, state)
+    kind = "text" if is_chat else "image"
+    prefix = "/api/chat-requests/" if is_chat else "/api/image-tasks/"
+    endpoint = prefix + parse.quote(rid, safe="") + "/events"
+    if not 1 <= args.max_wait_seconds <= 86400:
+        raise ClientError("--max-wait-seconds must be between 1 and 86400")
+    deadline = time.monotonic() + args.max_wait_seconds
+    while time.monotonic() < deadline:
+        with api.open("GET", endpoint) as response:
+            if "text/event-stream" not in str(response.headers.get("Content-Type", "")):
+                raise ClientError("result notification endpoint did not return an event stream")
+            event = ""
+            while time.monotonic() < deadline:
+                line = response.readline(8193)
+                if not line:
+                    break
+                if len(line) > 8192:
+                    raise ClientError("notification exceeds size limit")
+                try:
+                    line = line.decode("utf-8").strip()
+                except UnicodeDecodeError as exc:
+                    raise ClientError("invalid result notification") from exc
+                if line.startswith("event: "):
+                    event = line[7:]
+                elif line.startswith("data: "):
+                    try:
+                        data = json.loads(line[6:])
+                    except ValueError as exc:
+                        raise ClientError("invalid result notification") from exc
+                    if not isinstance(data, dict) or data.get("request_id") != rid:
+                        raise ClientError("notification changed the original request identity")
+                    if event == "result_ready":
+                        if (data.get("protocol") != "task-notification-v1" or data.get("kind") != kind
+                                or data.get("result_ready") is not True):
+                            raise ClientError("invalid ready notification")
+                        # A notification only wakes the caller. Download/save
+                        # still checks the authoritative original receipt.
+                        _emit(data)
+                        return 0
+                    if event == "needs_attention":
+                        _emit(data)
+                        return 2
+                    if event == "access_lost":
+                        raise ClientError("notification access ended; check the original request authorization")
+        # Bounded reconnect; no submit or recovery POST on disconnect/EOF.
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(1, remaining))
+    _emit({"request_id": rid, "result_ready": False, "waiting": True})
+    return 2
+
+
 def _command_resume(api: ApiClient, args: argparse.Namespace) -> int:
     if not 5 <= args.extra_timeout_secs <= 120:
         raise ClientError("--extra-timeout-secs must be between 5 and 120")
@@ -1036,6 +1092,12 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--state")
     status.add_argument("--task-id")
 
+    for command in ("wait", "chat-wait"):
+        wait = subparsers.add_parser(command, help="wait for the original persisted result notification; never resend")
+        wait.add_argument("--state")
+        wait.add_argument("--request-id" if command == "chat-wait" else "--task-id")
+        wait.add_argument("--max-wait-seconds", type=int, default=600)
+
     resume = subparsers.add_parser("resume", help="continue polling the original unknown-outcome receipt")
     resume.add_argument("--state")
     resume.add_argument("--task-id")
@@ -1123,6 +1185,8 @@ def main(argv: list[str] | None = None) -> int:
             "rework": _command_work_lifecycle,
             "submit": _command_submit,
             "status": _command_status,
+            "wait": _command_wait,
+            "chat-wait": _command_wait,
             "resume": _command_resume,
             "download": _command_download,
         }
