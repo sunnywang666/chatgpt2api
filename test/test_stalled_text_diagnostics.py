@@ -79,7 +79,7 @@ def test_stale_reasoning_allowance_does_not_accept_unfinished_or_branched_result
     assert "content" not in result
 
 
-def completed_tool_chain(doc):
+def completed_tool_chain(doc, reasoning_status=None):
     mixed_chain(doc)
     final = doc["current_node"]
     code = doc["mapping"][final + "-code"]["message"]
@@ -87,6 +87,13 @@ def completed_tool_chain(doc):
     tool = doc["mapping"][final + "-output"]["message"]
     tool["author"]["name"] = "python"
     tool["metadata"] = {"is_complete": True}
+    if reasoning_status:
+        node_id = final + "-tool-thought"
+        doc["mapping"][node_id] = {"parent": final + "-code", "message": {
+            "id": node_id, "author": {"role": "assistant"}, "recipient": "all",
+            "status": reasoning_status, "end_turn": False,
+            "content": {"content_type": "thoughts", "thoughts": []}}}
+        doc["mapping"][final + "-output"]["parent"] = node_id
     doc["mapping"][final]["message"]["content"]["parts"] = ["original calculated stock review"]
     return final
 
@@ -148,14 +155,15 @@ def test_explicit_ended_original_recheck_keeps_pause_cooldown_and_successor_guar
     assert service.recover("owner", "old-0", explicit_ended_recheck=True)["status"] == "unknown"
 
 
-def test_completed_final_after_stale_paired_tool_call_recovers_original_without_resend(tmp_path):
+@pytest.mark.parametrize("reasoning_status", [None, "in_progress", "finished_successfully"])
+def test_completed_final_after_stale_paired_tool_call_recovers_original_without_resend(tmp_path, reasoning_status):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _turn_reserved=True)
     original = saved(service)
 
     def read(row):
         doc = document(row)
-        completed_tool_chain(doc)
+        completed_tool_chain(doc, reasoning_status)
         return ConversationBindingService._read_text_request_result(backend, row, document=doc)
 
     service.recovery_reader = read
@@ -176,11 +184,12 @@ def test_completed_final_after_stale_paired_tool_call_recovers_original_without_
     "code_final", "second_active_code", "active_sibling", "final_active", "empty_final",
     "generic_recipient", "malformed_tool_node",
 ])
-def test_stale_tool_call_requires_paired_complete_output_and_nonempty_final(tmp_path, case):
+@pytest.mark.parametrize("reasoning_status", [None, "in_progress"])
+def test_stale_tool_call_requires_paired_complete_output_and_nonempty_final(tmp_path, case, reasoning_status):
     service, _, backend, _ = migration(tmp_path)
     row = saved(service)
     doc = document(row)
-    final = completed_tool_chain(doc)
+    final = completed_tool_chain(doc, reasoning_status)
     code = doc["mapping"][final + "-code"]["message"]
     tool = doc["mapping"][final + "-output"]["message"]
     if case == "missing_recipient":
@@ -214,6 +223,40 @@ def test_stale_tool_call_requires_paired_complete_output_and_nonempty_final(tmp_
         doc["mapping"][final]["message"].update(status="in_progress", end_turn=False)
     else:
         doc["mapping"][final]["message"]["content"]["parts"] = [""]
+    result = ConversationBindingService._read_text_request_result(backend, row, document=doc)
+    assert result["status"] != "succeeded"
+    assert "content" not in result and "_turn_end_evidence" not in result
+    assert "_empty_reply_evidence" not in result
+
+
+@pytest.mark.parametrize("case", ["branch", "wrong_id", "failed", "end_turn", "final_channel",
+                                  "tool_recipient", "code", "recap", "nested_thought"])
+def test_tool_thought_bridge_requires_one_nonterminal_assistant_thought(tmp_path, case):
+    service, _, backend, _ = migration(tmp_path)
+    row = saved(service)
+    doc = document(row)
+    final = completed_tool_chain(doc, "in_progress")
+    node_id = final + "-tool-thought"
+    thought = doc["mapping"][node_id]["message"]
+    if case in {"branch", "nested_thought"}:
+        sibling = copy.deepcopy(doc["mapping"][node_id])
+        sibling["parent"] = node_id
+        sibling["message"]["id"] = "extra-thought"
+        doc["mapping"]["extra-thought"] = sibling
+        if case == "nested_thought":
+            doc["mapping"][final + "-output"]["parent"] = "extra-thought"
+    elif case == "wrong_id":
+        thought["id"] = "wrong-id"
+    elif case == "failed":
+        thought["status"] = "failed"
+    elif case == "end_turn":
+        thought["end_turn"] = True
+    elif case == "final_channel":
+        thought["channel"] = "final"
+    elif case == "tool_recipient":
+        thought["recipient"] = "python"
+    else:
+        thought["content"] = {"content_type": case, "text": "not a thought bridge"}
     result = ConversationBindingService._read_text_request_result(backend, row, document=doc)
     assert result["status"] != "succeeded"
     assert "content" not in result and "_turn_end_evidence" not in result

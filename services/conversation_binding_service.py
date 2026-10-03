@@ -175,6 +175,21 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
             following = children.get(node_id, [])
             tool_node = mapping.get(following[0]) if len(following) == 1 else None
             tool = tool_node.get("message") if isinstance(tool_node, dict) else None
+            # The persisted view can place one assistant thought snapshot
+            # between a call and its output. It is transparent only on the
+            # same unique chain; another call, branch or terminal is not.
+            if (isinstance(tool, dict) and tool.get("id") == following[0]
+                    and isinstance(tool.get("author"), dict)
+                    and tool["author"].get("role") == "assistant"
+                    and isinstance(tool.get("content"), dict)
+                    and tool["content"].get("content_type") == "thoughts"
+                    and tool.get("status") in {"in_progress", "finished_successfully"}
+                    and tool.get("end_turn") is not True
+                    and tool.get("channel") in (None, "analysis")
+                    and tool.get("recipient") in (None, "all")):
+                following = children.get(following[0], [])
+                tool_node = mapping.get(following[0]) if len(following) == 1 else None
+                tool = tool_node.get("message") if isinstance(tool_node, dict) else None
             # Some completed tool calls retain an active assistant code node.
             # Require its exact, completed tool output before considering the
             # later nonempty final. This exception never establishes empty
