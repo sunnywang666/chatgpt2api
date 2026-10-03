@@ -146,14 +146,22 @@ def _recovery_failure_code(exc: BaseException, phase: str, *, result_captured: b
     return "RECOVERY_READ_FAILED"
 
 
+_IMAGE_THREAD_FAILURE_CODES = frozenset({
+    "IMAGE_THREAD_UPSTREAM_CHANGED", "IMAGE_THREAD_TURN_UNCONFIRMED",
+})
+
+
 def _failure_details(exc: BaseException, phase: str) -> dict[str, Any]:
     # Persist diagnosis without exception text, response bodies, URLs or headers.
-    return {
+    details = {
         "phase": phase,
         "type": type(exc).__name__[:80],
         "status_code": _upstream_status_code(exc),
         "at": time.time(),
     }
+    if isinstance(exc, ImageThreadError) and isinstance(exc.code, str) and exc.code in _IMAGE_THREAD_FAILURE_CODES:
+        details["code"] = exc.code
+    return details
 
 
 def _public_failure_details(value: object) -> dict[str, Any]:
@@ -170,12 +178,15 @@ def _public_failure_details(value: object) -> dict[str, Any]:
     name = value.get("type")
     status = value.get("status_code")
     at = value.get("at")
-    return {
+    details = {
         "phase": phase if isinstance(phase, str) and phase in phases else "unknown",
         "type": name if isinstance(name, str) and len(name) <= 80 and name.isidentifier() else "Error",
         "status_code": status if type(status) is int and 100 <= status <= 599 else None,
         "at": at if type(at) in (int, float) and math.isfinite(at) and at >= 0 else None,
     }
+    if name == "ImageThreadError" and isinstance(value.get("code"), str) and value["code"] in _IMAGE_THREAD_FAILURE_CODES:
+        details["code"] = value["code"]
+    return details
 
 
 def _safe_recovery_error(code: str, phase: str) -> str:
@@ -2040,11 +2051,15 @@ class ImageTaskService:
                 pending_ids = pending_image_result_ids(task) if task else {}
                 image_thread = (task or {}).get("_image_thread")
                 expected_parent = (task or {}).get("_image_thread_request_parent")
+                predecessor_message = (task or {}).get("_image_thread_predecessor_message")
+                predecessor_ids = (task or {}).get("_image_thread_predecessor_result_ids")
             def recovered_parent(backend, result_file_ids, result_sediment_ids):
                 if image_thread:
                     return finished_parent(backend._get_conversation(conversation_id), conversation_id,
                         request_message_id, expected_parent=expected_parent,
-                        expected_result_ids=result_file_ids + result_sediment_ids)
+                        expected_result_ids=result_file_ids + result_sediment_ids,
+                        predecessor_request_message_id=predecessor_message,
+                        predecessor_result_ids=predecessor_ids)
                 return backend.get_conversation_parent_message_id(conversation_id)
             if not binding_id or not account_identity or not client_conversation_id:
                 error = RuntimeError("conversation binding unavailable: task authority missing")

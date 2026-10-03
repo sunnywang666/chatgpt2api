@@ -1546,7 +1546,9 @@ def _generate_bound_single_image(
                     next_parent_message_id = finished_parent(backend._get_conversation(last_conversation_id),
                         last_conversation_id, str(getattr(backend, "image_request_message_id", "")),
                         expected_parent=request.parent_message_id or None,
-                        expected_result_ids=getattr(request.progress_callback, "image_thread_result_ids", None))
+                        expected_result_ids=getattr(request.progress_callback, "image_thread_result_ids", None),
+                        predecessor_request_message_id=getattr(request.progress_callback, "image_thread_predecessor_message", None),
+                        predecessor_result_ids=getattr(request.progress_callback, "image_thread_predecessor_result_ids", None))
                 else:
                     next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
                 for output in outputs:

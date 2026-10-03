@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from services.account_request_pacing import AccountRequestClock, AccountRequestDeadlineExceeded, pace_account_session
-from services.image_task_service import ImageTaskService, _authoritative_image_failure
+from services.image_task_service import ImageTaskService, _authoritative_image_failure, _failure_details
 from services.image_thread import ImageThreadError
 from services.openai_backend_api import (
     ChatRequirements,
@@ -1197,12 +1197,28 @@ class ImageTaskServiceTests(unittest.TestCase):
                 "phase": "https://private.test/token", "type": "token=private",
                 "status_code": "secret", "at": float("nan"),
                 "body": "Authorization: private", "url": "https://private.test",
+                "code": "https://private.test/token",
             })
             public = self.make_service(path).list_tasks(OWNER, ["policy-task"])["items"][0]
             self.assertEqual(public["last_recovery_failure"], {
                 "phase": "unknown", "type": "Error", "status_code": None, "at": None,
             })
             self.assertNotIn("private", json.dumps(public))
+
+    def test_original_image_confirmation_reason_survives_restart_without_exception_text(self):
+        for code in ("IMAGE_THREAD_UPSTREAM_CHANGED", "IMAGE_THREAD_TURN_UNCONFIRMED"):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp_dir:
+                error = ImageThreadError(code)
+                error.args = ("Authorization: private",)
+                detail = _failure_details(error, "confirm_image_turn")
+                path = Path(tmp_dir) / "image_tasks.json"
+                write_policy_task(path, result_file_ids=["original-file"],
+                    recovery_error_code="RECOVERY_THREAD_UNCONFIRMED", last_recovery_failure=detail)
+                restored = self.make_service(path)
+                public = restored.list_tasks(OWNER, ["policy-task"])["items"][0]
+                self.assertEqual(public["last_recovery_failure"]["code"], code)
+                self.assertEqual(restored._tasks["owner-1:policy-task"]["result_file_ids"], ["original-file"])
+                self.assertNotIn("private", json.dumps(public))
 
     def test_generated_download_rate_limit_and_auth_keep_phase_and_failure_type(self):
         for status, expected_code, retry_after in (

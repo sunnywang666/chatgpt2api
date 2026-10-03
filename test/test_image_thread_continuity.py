@@ -77,7 +77,7 @@ def runtime(tmp_path, monkeypatch):
     admission.register("image", lambda ctx, body: service._run_task(ctx.owner+":"+ctx.request_id,
         body["mode"], {**body["payload"], "retain_conversation": True}, body["identity"], body["payload"]["model"]))
     state = SimpleNamespace(sends=[], documents={}, fail_after_send=False, fail_after_result=False,
-        tool_leaf=False, drift=False, final_pending=False, reads=[], polls=[], naive_reads=0, archive_actions=[])
+        tool_leaf=False, pruned_recap=False, drift=False, final_pending=False, reads=[], polls=[], naive_reads=0, archive_actions=[])
     account_stub = SimpleNamespace(get_bound_account_identity=lambda _b: "account-0",
         acquire_bound_image_access_token=lambda *a, **k: "fixture-token", get_account=lambda _t: rows[0],
         conversation_binding_lock=lambda *a: nullcontext(), mark_image_result=lambda *a: None,
@@ -143,13 +143,25 @@ def runtime(tmp_path, monkeypatch):
         old = state.documents.get(cid)
         if old:
             assert old["current_node"] == req.parent_message_id
-        if state.tool_leaf:
+        if state.tool_leaf or state.pruned_recap:
             doc, result_id = tool_document(cid, rid, req.parent_message_id or "root")
+            if state.pruned_recap:
+                doc["mapping"].pop(rid + "-code")
+                doc["mapping"][rid + "-image"]["parent"] = rid
+                recap = node(rid + "-recap", "assistant", doc["current_node"])
+                recap["message"]["recipient"] = "all"
+                recap["message"]["content"] = {"content_type": "reasoning_recap", "content": "fixture"}
+                doc["mapping"][rid + "-recap"] = recap
+                doc["mapping"][rid + "-final"] = node(rid + "-final", "assistant", rid + "-recap", end=True)
+                doc["current_node"] = rid + "-final"
         else:
             doc = document(cid, rid, req.parent_message_id or "root")
             result_id = "file-" + rid
         if old:
             doc["mapping"] = {**old["mapping"], **doc["mapping"]}
+            if state.pruned_recap:
+                prior = doc["mapping"].pop(req.parent_message_id)
+                doc["mapping"][rid]["parent"] = prior["parent"]
         state.documents[cid] = doc
         if state.fail_after_send:
             raise ConnectionError("fixture reply lost after sending")
@@ -637,6 +649,80 @@ def test_tool_leaf_accepts_exact_saved_asset():
     doc, result_id = tool_document()
     assert finished_parent(doc, "conversation-a", "request-a", expected_parent="root",
         expected_result_ids=[result_id, result_id]) == "request-a-image"
+
+
+@pytest.mark.parametrize("change", [None, "missing-prior", "missing-assets", "wrong-assets", "extra-assets",
+    "parent-still-present", "sibling", "later-user", "unfinished", "not-recap", "terminal-recap",
+    "recap-channel", "recap-recipient", "middle-assistant", "recap-sibling", "recap-same-asset", "no-tool",
+    "current-assets", "current-drift", "current-unfinished"])
+def test_pruned_previous_final_requires_exact_completed_predecessor_and_recap(change):
+    doc, asset = tool_document()
+    doc["mapping"].pop("request-a-code")
+    doc["mapping"]["request-a-image"]["parent"] = "request-a"
+    recap = node("recap", "assistant", "request-a-image")
+    recap["message"]["recipient"] = "all"
+    recap["message"]["content"] = {"content_type": "reasoning_recap", "content": "fixture"}
+    doc["mapping"]["recap"] = recap
+    child = document("conversation-a", "edit", "recap")
+    doc["mapping"].update(child["mapping"])
+    doc["current_node"] = child["current_node"]
+    prior, assets = "request-a", [asset]
+    if change == "missing-prior": prior = None
+    elif change == "missing-assets": assets = []
+    elif change == "wrong-assets": assets = ["file_00000000" + "f" * 24]
+    elif change == "extra-assets": assets += ["file_00000000" + "f" * 24]
+    elif change == "parent-still-present": doc["mapping"]["removed-final"] = node("removed-final", "assistant", "recap", end=True)
+    elif change == "sibling": doc["mapping"]["sibling"] = node("sibling", "assistant", "request-a")
+    elif change == "later-user": recap["message"]["author"]["role"] = "user"
+    elif change == "unfinished": doc["mapping"]["request-a-image"]["message"]["status"] = "in_progress"
+    elif change == "not-recap": recap["message"]["content"]["content_type"] = "text"
+    elif change == "terminal-recap": recap["message"]["end_turn"] = True
+    elif change == "recap-channel": recap["message"]["channel"] = "final"
+    elif change == "recap-recipient": recap["message"]["recipient"] = "image_gen"
+    elif change == "middle-assistant": doc["mapping"]["request-a-image"]["message"]["author"]["role"] = "assistant"
+    elif change == "recap-sibling": doc["mapping"]["sibling"] = node("sibling", "user", "recap")
+    elif change == "recap-same-asset": recap["message"]["metadata"] = {"asset_pointer": "file-service://" + asset}
+    elif change == "no-tool":
+        doc["mapping"].pop("request-a-image")
+        recap["parent"] = "request-a"
+    elif change == "current-assets": doc["mapping"]["edit-image"]["message"]["content"] = {
+        "content_type": "multimodal_text", "parts": [{"content_type": "image_asset_pointer",
+        "asset_pointer": "file-service://file_00000000" + "f" * 24}]}
+    elif change == "current-drift": doc["current_node"] = "recap"
+    elif change == "current-unfinished": doc["mapping"]["edit-final"]["message"]["status"] = "in_progress"
+    def confirm():
+        return finished_parent(doc, "conversation-a", "edit", expected_parent="removed-final",
+            expected_result_ids=["file_00000000" + "e" * 24],
+            predecessor_request_message_id=prior, predecessor_result_ids=assets)
+    if change is None:
+        assert confirm() == "edit-final"
+    else:
+        with pytest.raises(ImageThreadError): confirm()
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_image_edit_keeps_original_turn_when_upstream_prunes_previous_final(runtime, recover):
+    r = runtime
+    r.state.pruned_recap = True
+    r.submit("source")
+    first = run_next(r, "source")
+    r.state.fail_after_result = recover
+    r.submit("edited", source="source")
+    ctx = r.admission.claim_next()
+    r.admission.execute(ctx)
+    original = r.read("edited")
+    if recover:
+        assert original["status"] == "error"
+        restored = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
+        restored._run_resume_poll("happy:edited", original["conversation_id"], 5, "", WHO,
+            "edit", "gpt-image-2", False, False)
+    final = r.read("edited")
+    assert final["status"] == "success", final
+    assert final["conversation_id"] == first["conversation_id"]
+    assert final["_image_thread_request_parent"] == first["parent_message_id"]
+    assert final["request_message_id"] == original["request_message_id"]
+    assert final["data"] and final["_image_thread_terminal"]
+    assert len(r.state.sends) == 2
 
 
 @pytest.mark.parametrize("change", [None, "missing-asset", "extra-asset", "unfinished", "sibling", "drift"])
