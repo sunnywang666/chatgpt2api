@@ -590,6 +590,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["error_code"], "RESULT_UNRECOVERABLE")
             self.assertEqual(task["error"], "bootstrap connection timed out")
             self.assertEqual(task["progress"], "bootstrapping")
+            self.assertEqual(task["last_recovery_failure"]["phase"], "bootstrap")
             self.assertFalse(task["upstream_submission_started"])
             self.assertFalse(task["upstream_unfinished"])
             self.assertEqual(task["upstream_outcome"], "not_submitted")
@@ -1010,12 +1011,52 @@ class ImageTaskServiceTests(unittest.TestCase):
                 self.assertEqual(failed["recovery_error_code"], expected)
                 self.assertEqual(failed["recovery_phase"], "download_image_result")
                 detail = failed["last_recovery_failure"]
-                self.assertEqual(detail["phase"], "collect_image_result")
+                self.assertEqual(detail["phase"], "handler_operation")
                 self.assertEqual(detail["type"], error_type.__name__)
                 self.assertNotIn("bearer-secret", json.dumps(failed))
                 self.assertNotIn("private.test", json.dumps(failed))
                 restored = self.make_service(path).list_tasks(OWNER, ["captured-task"])["items"][0]
                 self.assertEqual(restored["last_recovery_failure"], detail)
+
+    def test_handler_failure_reports_observed_phase_separately_from_recovery_action(self):
+        for step, expected_phase in (
+            ("preparing_conversation", "prepare_conversation"),
+            ("starting_generation", "start_image_generation"),
+            ("generating", "stream_image_generation"),
+            ("image_stream_resolve_start", "resolve_image_result"),
+            ("receiving_image", "receive_image_result"),
+            (None, "handler_operation"),
+            ("unrecognized_step", "handler_operation"),
+        ):
+            with self.subTest(step=step), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                def handler(payload):
+                    callback = payload["progress_callback"]
+                    callback.record_submission_started()
+                    callback.record_conversation_id("conversation-1")
+                    if step is not None:
+                        callback(step)
+                    raise ImageGenerationError(
+                        "Authorization: bearer-secret URL=https://private.test/signed",
+                        conversation_id="conversation-1",
+                        request_message_id=callback.request_message_id,
+                        upstream_submitted=True,
+                    )
+                service = self.make_service(path, handler)
+                service.submit_generation(
+                    OWNER, client_task_id="phase-task", prompt="cat", model="gpt-image-2", size=None,
+                    provider_binding_id="binding-1", provider_account_identity="account-1",
+                    client_conversation_id="client-1", retain_conversation=True,
+                )
+                failed = wait_for_task(service, OWNER, "phase-task", "error")
+                self.assertEqual(failed["last_recovery_failure"]["phase"], expected_phase)
+                self.assertEqual(failed["recovery_phase"], "read_image_request")
+                self.assertEqual(failed["recovery_error_code"], "RECOVERY_READ_FAILED")
+                self.assertEqual(failed["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+                self.assertNotIn("bearer-secret", json.dumps(failed))
+                self.assertNotIn("private.test", json.dumps(failed))
+                restored = self.make_service(path).list_tasks(OWNER, ["phase-task"])["items"][0]
+                self.assertEqual(restored["last_recovery_failure"], failed["last_recovery_failure"])
 
     def test_restart_captured_result_does_not_invent_a_download_failure(self):
         for prior_code in (None, "RECOVERY_TIMED_OUT"):

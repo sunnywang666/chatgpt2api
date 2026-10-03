@@ -162,6 +162,9 @@ def _public_failure_details(value: object) -> dict[str, Any]:
     phases = {
         "collect_image_result", "validate_image_result", "read_image_request",
         "resolve_image_result", "download_image_result", "confirm_image_turn", "save_image_result",
+        "handler_operation", "select_image_account", "upload_image_reference", "bootstrap",
+        "chat_requirements", "prepare_conversation", "start_image_generation",
+        "stream_image_generation", "receive_image_result",
     }
     phase = value.get("phase")
     name = value.get("type")
@@ -1039,8 +1042,23 @@ class ImageTaskService:
         if not request_message_id:
             request_message_id = str(uuid.uuid4())
             self._update_task(key, request_message_id=request_message_id)
+        # Keep the last reported operation separate from the recovery action.
+        # Capturing a file ID alone does not prove that downloading started.
+        handler_failure_phase = "handler_operation"
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
+            nonlocal handler_failure_phase
+            handler_failure_phase = {
+                "getting_account": "select_image_account",
+                "uploading": "upload_image_reference",
+                "bootstrapping": "bootstrap",
+                "getting_token": "chat_requirements",
+                "preparing_conversation": "prepare_conversation",
+                "starting_generation": "start_image_generation",
+                "generating": "stream_image_generation",
+                "image_stream_resolve_start": "resolve_image_result",
+                "receiving_image": "receive_image_result",
+            }.get(step, "handler_operation")
             self._update_task(key, progress=step)
         progress_callback.request_message_id = request_message_id
         progress_callback.active_deadline_at = (
@@ -1111,7 +1129,7 @@ class ImageTaskService:
         progress_callback.image_thread_predecessor_result_ids = payload.get("_image_thread_predecessor_result_ids")
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
-        failure_phase = "collect_image_result"
+        failure_phase = "handler_operation"
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
@@ -1184,6 +1202,8 @@ class ImageTaskService:
                 account_email=account_email,
             )
         except Exception as exc:
+            if failure_phase == "handler_operation":
+                failure_phase = handler_failure_phase
             error_message = str(exc) or "image task failed"
             with self._transaction():
                 current = dict(self._tasks.get(key) or {})
