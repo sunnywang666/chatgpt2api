@@ -75,6 +75,119 @@ def test_archive_failure_and_restart_recover_original_target_without_occupying_n
     assert restarted.get("text", {"id": "one"}, "B-2")["slot_held"] is True
 
 
+def test_stale_archive_cannot_patch_after_another_worker_restores(runtime, monkeypatch):
+    from services.account_request_pacing import AccountRequestClock
+    from services.config import config
+    service, store, now, calls, _, add = runtime
+    add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    other = WorkLifecycleService(service.text, service.images, clock=lambda: now[0])
+    # Give the replacement worker an independent transport, as in another process.
+    other.text = SimpleNamespace(store=store, admission=None,
+        set_public_session_archived=lambda owner, rid, desired: {
+            "request_id": rid, "archived": desired, "conversation": {"client_conversation_id": "A"}})
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 0))
+    clock = AccountRequestClock()
+    def send(method, url, **kwargs):
+        calls.append(method)
+        if method == "GET":
+            now[0] += 301
+            assert other.process_one()
+            other.update("text", {"id": "one"}, "A-1", "active")
+            assert other.process_one()
+        return SimpleNamespace(status_code=200, headers={})
+    def stale_archive(*args):
+        clock.request(send, "GET", "https://provider/conversation/original", timeout=60)
+        clock.request(send, "PATCH", "https://provider/conversation/original",
+                      json={"is_archived": True}, timeout=60)
+        pytest.fail("stale worker reached PATCH")
+    service.text.set_public_session_archived = stale_archive
+    assert service.process_one()
+    assert calls == ["GET"]
+    current = service.get("text", {"id": "one"}, "A-1")
+    assert current["state"] == "active" and current["archive"]["archived"] is False
+
+
+def test_archive_guard_rechecks_after_pacing_and_bounds_each_wait(runtime, monkeypatch):
+    from services.account_request_pacing import AccountRequestClock
+    from services.config import config
+    from services.request_context import current_archive_guard
+    service, store, now, calls, _, add = runtime
+    receipt = add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    clock = AccountRequestClock()
+    import time
+    clock.next_request = time.monotonic() + 10
+    def steal_claim(seconds):
+        with store.transaction() as db:
+            work = store.runtime(db, receipt["_work_key"])
+            work["archive"]["claim"] = "new-worker"
+            work["archive"]["claim_until"] = now[0] + 300
+            store.set_runtime(db, work["key"], work)
+    monkeypatch.setattr("services.account_request_pacing.time.sleep", steal_claim)
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
+    def archive(*args):
+        assert current_archive_guard.get() is not None
+        clock.request(lambda *a, **kw: calls.append("PATCH"), "PATCH",
+                      "https://provider/conversation/original", json={"is_archived": True}, timeout=60)
+    service.text.set_public_session_archived = archive
+    assert service.process_one() and calls == []
+    assert current_archive_guard.get() is None
+    with store.connect() as db:
+        assert store.runtime(db, receipt["_work_key"])["archive"]["claim"] == "new-worker"
+
+
+def test_archive_renews_claim_before_readback_wait(runtime, monkeypatch):
+    from services.account_request_pacing import AccountRequestClock
+    from services.config import config
+    service, store, now, calls, _, add = runtime
+    receipt = add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    other = WorkLifecycleService(service.text, service.images, clock=lambda: now[0])
+    monkeypatch.setattr("services.account_request_pacing.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("services.account_request_pacing.time.sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 300))
+    clock = AccountRequestClock()
+    def send(method, url, **kwargs):
+        calls.append(method)
+        assert kwargs["timeout"] <= 60
+        with store.connect() as db:
+            work = store.runtime(db, receipt["_work_key"])
+            assert work["archive"]["claim_until"] == now[0] + 300
+        now[0] += 50
+        assert not other.process_one()
+        return SimpleNamespace(status_code=200, headers={})
+    def archive(owner, rid, desired):
+        for method in ["GET", "PATCH", "GET"]:
+            clock.request(send, method, "https://provider/conversation/original",
+                          json={"is_archived": True} if method == "PATCH" else None, timeout=60)
+        return {"request_id": rid, "archived": desired, "conversation": {"client_conversation_id": "A"}}
+    service.text.set_public_session_archived = archive
+    assert service.process_one()
+    assert now[0] > 1300  # The original unrenewed claim would already have expired.
+    assert calls == ["GET", "PATCH", "GET"]
+    assert service.get("text", {"id": "one"}, "A-1")["archive"]["status"] == "confirmed"
+
+
+def test_archive_read_wait_exceeding_claim_budget_does_not_send(runtime, monkeypatch):
+    from services.account_request_pacing import AccountRequestClock
+    from services.config import config
+    import time
+    service, _, _, calls, _, add = runtime
+    add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    clock = AccountRequestClock()
+    clock.next_conversation_read = time.monotonic() + 300
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
+    service.text.set_public_session_archived = lambda *a: clock.request(
+        lambda *a, **kw: calls.append("GET"), "GET", "https://provider/conversation/original", timeout=60)
+    assert service.process_one() and calls == []
+    assert service.get("text", {"id": "one"}, "A-1")["archive"]["status"] == "unknown"
+    assert not clock.lock.locked()
+
+
 def test_rework_requires_restore_confirmation_before_next_turn(runtime):
     service, _, _, calls, _, add = runtime
     add("A-1")
@@ -195,7 +308,8 @@ def test_binding_alias_cannot_bypass_paused_work_and_other_kind_unknown_blocks_a
 
 @pytest.mark.parametrize("kind", ["text", "image"])
 @pytest.mark.parametrize("desired", [True, False])
-def test_cooling_account_does_not_block_other_original_archive_or_restore(runtime, monkeypatch, tmp_path, kind, desired):
+@pytest.mark.parametrize("read_only_wait", [False, True])
+def test_cooling_account_does_not_block_other_original_archive_or_restore(runtime, monkeypatch, tmp_path, kind, desired, read_only_wait):
     from services import account_request_pacing as pacing
     service, store, clock, calls, _, add = runtime
     def image_archive(identity, request_id, archived):
@@ -232,7 +346,8 @@ def test_cooling_account_does_not_block_other_original_archive_or_restore(runtim
     folder = tmp_path / "account_request_clocks"
     folder.mkdir()
     cold_path = folder / (hashlib.sha256(b"workspace-cold").hexdigest() + ".json")
-    cold_path.write_text(json.dumps({"next_request": 1100, "next_turn": 1200, "cooldown_until": 1060}))
+    cold_path.write_text(json.dumps({"next_request": 999, "next_turn": 1200, "cooldown_until": 0, "next_conversation_read": 1100}
+                                    if read_only_wait else {"next_request": 1100, "next_turn": 1200, "cooldown_until": 1060}))
     ready_path = folder / (hashlib.sha256(b"workspace-ready").hexdigest() + ".json")
     # A future model-message slot must not delay a GET/PATCH archive operation.
     ready_path.write_text(json.dumps({"next_request": 999, "next_turn": 2000, "cooldown_until": 0}))

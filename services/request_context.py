@@ -5,6 +5,7 @@ import hashlib
 import re
 
 current_request = ContextVar("provider_original_request", default=None)
+current_archive_guard = ContextVar("provider_archive_guard", default=None)
 _FAIR_SOURCE = re.compile(r"^(?:user|company):[0-9a-f]{64}$")
 
 
@@ -24,6 +25,15 @@ def executing(context):
         yield
     finally:
         current_request.reset(token)
+
+
+@contextmanager
+def guarding_archive(check_and_renew):
+    token = current_archive_guard.set(check_and_renew)
+    try:
+        yield
+    finally:
+        current_archive_guard.reset(token)
 
 
 def trusted_source(identity, request=None):

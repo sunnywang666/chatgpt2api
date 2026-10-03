@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 from services.config import DATA_DIR, config
 from utils.log import logger
-from services.request_context import current_request
+from services.request_context import current_request, current_archive_guard
 
 
 class ProcessMutex:
@@ -195,6 +195,14 @@ class AccountRequestClock:
         elif "/conversation/" in path and str(method).upper() == "GET":
             phase = "conversation_read"
         is_conversation_read = phase == "conversation_read"
+        archive_guard = current_archive_guard.get() if phase in {
+            "conversation_read", "conversation_archive", "conversation_restore"} else None
+        if archive_guard is not None:
+            archive_guard()
+            # Each HTTP step must finish inside the renewed 300s work claim.
+            # Revalidate again after pacing, immediately before the send edge.
+            archive_deadline = time.monotonic() + 240
+            deadline_at = min(deadline_at, archive_deadline) if deadline_at is not None else archive_deadline
         raw_model = (kwargs.get("json") or {}).get("model") if isinstance(kwargs.get("json"), dict) else None
         model = raw_model if isinstance(raw_model, str) and len(raw_model) <= 160 else None
         request_ref = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24] if context else None
@@ -326,6 +334,8 @@ class AccountRequestClock:
                         context.record_stage("send_call_started")
                 if callable(before_send):
                     before_send()
+                if archive_guard is not None:
+                    archive_guard()
                 # Receipt persistence and final fences must not consume the
                 # interval reserved for the following upstream request.
                 now = time.monotonic()
@@ -462,7 +472,7 @@ def rate_limit_retry_after(line) -> float:
     return retry_after_seconds(str(value)) if value is not None else 0.0
 
 
-def account_pacing_snapshot(account, now=None, *, include_turn=True):
+def account_pacing_snapshot(account, now=None, *, include_turn=True, include_conversation_read=False):
     """Read the original clock without booking or advancing a send interval."""
     now = time.time() if now is None else now
     identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
@@ -476,6 +486,8 @@ def account_pacing_snapshot(account, now=None, *, include_turn=True):
         return {"next_at": None, "cooldown_until": None}
     fields = ("next_request", "next_turn", "cooldown_until") if include_turn else ("next_request", "cooldown_until")
     values = [saved.get(field) for field in fields]
+    if include_conversation_read:
+        values.append(saved.get("next_conversation_read", 0.0))
     if any(type(value) not in (int, float) or not math.isfinite(value) for value in values):
         return {"next_at": None, "cooldown_until": None}
     return {"next_at": max(now, *values), "cooldown_until": saved["cooldown_until"]}

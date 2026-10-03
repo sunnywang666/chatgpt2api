@@ -338,7 +338,7 @@ class WorkLifecycleService:
                                 save_work(self.store, db, candidate)
                                 continue
                             from services.account_request_pacing import account_pacing_snapshot
-                            ready_at = account_pacing_snapshot(account, now, include_turn=False)["next_at"]
+                            ready_at = account_pacing_snapshot(account, now, include_turn=False, include_conversation_read=True)["next_at"]
                             if ready_at is None or ready_at > now:
                                 a["next_at"] = now + 60 if ready_at is None else ready_at
                                 if ready_at is None:
@@ -356,15 +356,28 @@ class WorkLifecycleService:
                                attempts=int(archive.get("attempts") or 0) + 1)
                 save_work(self.store, db, work)
             error_code = None
+            def check_and_renew_archive():
+                with self.store.transaction() as db:
+                    current = self.store.runtime(db, work["key"])
+                    active = (current or {}).get("archive") or {}
+                    now = float(self.clock())
+                    if (not current or current["version"] != work["version"]
+                            or active.get("claim") != claim or active.get("desired") is not archive["desired"]
+                            or float(active.get("claim_until") or 0) <= now):
+                        raise WorkLifecycleError("WORK_ARCHIVE_CLAIM_LOST")
+                    active["claim_until"] = now + 300
+                    save_work(self.store, db, current)
             try:
-                if work["kind"] == "text":
-                    result = self.text.set_public_session_archived(work["owner"], request_id, archive["desired"])
-                    valid = (result.get("request_id") == request_id
-                             and result.get("conversation", {}).get("client_conversation_id") == work["work_ref"])
-                else:
-                    result = self.images.set_thread_archived({"id": work["owner"], "role": "user"}, request_id, archive["desired"])
-                    valid = (result.get("task_id") == request_id
-                             and result.get("image_thread", {}).get("id") == work["work_ref"])
+                from services.request_context import guarding_archive
+                with guarding_archive(check_and_renew_archive):
+                    if work["kind"] == "text":
+                        result = self.text.set_public_session_archived(work["owner"], request_id, archive["desired"])
+                        valid = (result.get("request_id") == request_id
+                                 and result.get("conversation", {}).get("client_conversation_id") == work["work_ref"])
+                    else:
+                        result = self.images.set_thread_archived({"id": work["owner"], "role": "user"}, request_id, archive["desired"])
+                        valid = (result.get("task_id") == request_id
+                                 and result.get("image_thread", {}).get("id") == work["work_ref"])
                 if not valid or result.get("archived") is not archive["desired"]:
                     raise WorkLifecycleError("WORK_ARCHIVE_UNCONFIRMED")
             except Exception as exc:
