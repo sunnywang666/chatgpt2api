@@ -792,6 +792,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
+    emitted_text = ""
     while True:
         if token and token in attempted_tokens:
             raise RuntimeError("no available text account")
@@ -802,7 +803,6 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             active_backend = OpenAIBackendAPI(access_token=token)
             if recoverable:
                 active_backend.retain_bound_conversation = True
-            done = False
             for event in conversation_events(
                 active_backend,
                 messages=request.messages,
@@ -817,20 +817,43 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                         if receipt.get("conversation_id"):
                             raise RuntimeError("original conversation identity changed")
                         context.admission.update_claim(context, conversation_id=conversation_id)
-                    if event.get("type") == "conversation.done":
-                        done = True
-                        context.terminal(True)
                 if event.get("type") != "conversation.delta":
                     continue
                 delta = str(event.get("delta") or "")
                 if delta:
                     emitted = True
+                    emitted_text += delta
                     yield delta
-            if recoverable and not done:
-                # A transport EOF cannot authorize the formatter's final event.
-                from services.conversation_binding_service import ConversationBindingError
-                raise ConversationBindingError("original stream ended without its terminal event",
-                                               code="CONVERSATION_OUTCOME_UNKNOWN")
+            if recoverable:
+                # [DONE] and EOF describe the transport, not our model turn.
+                # Verify the exact persisted user branch before emitting a
+                # successful wire terminator or releasing its account turn.
+                from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
+                receipt = context.receipt()
+                try:
+                    if not receipt.get("conversation_id") or not receipt.get("request_message_id"):
+                        raise ValueError("original cursor is unavailable")
+                    recovered = ConversationBindingService._read_text_request_result(active_backend, receipt)
+                except Exception as exc:
+                    raise ConversationBindingError("original stream result could not be verified",
+                                                   code="CONVERSATION_OUTCOME_UNKNOWN") from exc
+                if recovered.get("status") != "succeeded":
+                    raise ConversationBindingError("original stream result is not complete",
+                                                   code="CONVERSATION_OUTCOME_UNKNOWN")
+                context.terminal(True)
+                final_text = sanitize_output_text(recovered["content"])
+                # The saved-result reader strips outer whitespace. Preserve
+                # whitespace already delivered without treating it as drift.
+                delivered = emitted_text.lstrip()
+                if final_text == delivered.rstrip():
+                    remaining = ""
+                elif final_text.startswith(delivered):
+                    remaining = final_text[len(delivered):]
+                else:
+                    raise ConversationBindingError("original stream prefix does not match its saved result",
+                                                   code="CONVERSATION_OUTCOME_UNKNOWN")
+                if remaining:
+                    yield remaining
             account_service.mark_text_used(token)
             return
         except Exception as exc:
@@ -948,6 +971,7 @@ def stream_image_outputs(
         backend.image_request_message_id = request_message_id
     record_conversation_id = getattr(request.progress_callback, "record_conversation_id", None)
     last: dict[str, Any] = {}
+    recorded_result_ids = ([], [])
     for event in conversation_events(
             backend,
             prompt=request.prompt,
@@ -962,6 +986,12 @@ def stream_image_outputs(
         event_conversation_id = str(event.get("conversation_id") or "")
         if event_conversation_id and callable(record_conversation_id):
             record_conversation_id(event_conversation_id)
+        result_ids = (list(event.get("file_ids") or []), list(event.get("sediment_ids") or []))
+        if result_ids != recorded_result_ids:
+            # These IDs have already passed the image-tool output filter.
+            # Persist before another stream read or URL lookup can fail/wait.
+            _record_result_ids(request, *result_ids)
+            recorded_result_ids = result_ids
         if event.get("type") == "conversation.delta":
             yield ImageOutput(
                 kind="progress",
@@ -1437,8 +1467,30 @@ def _generate_bound_single_image(
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             thread = getattr(request.progress_callback, "image_thread", None)
+            failed_original = getattr(request.progress_callback, "failed_retry_original", None)
             try:
-                if thread and request.conversation_id:
+                if failed_original or getattr(request.progress_callback, "failed_retry_required", False):
+                    def check_retry(send=None):
+                        from services.generation_completion import retry_cursor, retry_evidence
+                        if (not isinstance(failed_original, dict) or failed_original.get("result_file_ids")
+                                or failed_original.get("result_sediment_ids") or failed_original.get("data")
+                                or failed_original.get("recovery_phase") == "download_image_result"):
+                            raise ImageGenerationError("original retry evidence unavailable",
+                                code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED", upstream_submitted=False)
+                        try:
+                            document = backend._get_conversation(request.conversation_id, **({"_send": send} if send else {}))
+                        except Exception as exc:
+                            raise ImageGenerationError("original retry branch read unavailable",
+                                code="COMPLETION_ORIGINAL_READ_UNAVAILABLE", upstream_submitted=False) from exc
+                        current = retry_cursor(document, failed_original, kind="image")
+                        saved = retry_evidence(failed_original)
+                        if not current or not saved or any(current[k] != saved[k] for k in (
+                                "conversation_id", "request_message_id", "retry_parent_message_id")):
+                            raise ImageGenerationError("original retry branch changed",
+                                code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED", upstream_submitted=False)
+                    check_retry()
+                    backend.image_pre_send_check = check_retry
+                elif thread and request.conversation_id:
                     try:
                         prior_message = getattr(request.progress_callback, "image_thread_predecessor_message", None)
                         document = backend._get_conversation(request.conversation_id)
@@ -1494,7 +1546,9 @@ def _generate_bound_single_image(
                     next_parent_message_id = finished_parent(backend._get_conversation(last_conversation_id),
                         last_conversation_id, str(getattr(backend, "image_request_message_id", "")),
                         expected_parent=request.parent_message_id or None,
-                        expected_result_ids=getattr(request.progress_callback, "image_thread_result_ids", None))
+                        expected_result_ids=getattr(request.progress_callback, "image_thread_result_ids", None),
+                        predecessor_request_message_id=getattr(request.progress_callback, "image_thread_predecessor_message", None),
+                        predecessor_result_ids=getattr(request.progress_callback, "image_thread_predecessor_result_ids", None))
                 else:
                     next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
                 for output in outputs:

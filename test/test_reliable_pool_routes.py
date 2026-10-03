@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -20,7 +21,9 @@ def runtime(tmp_path, monkeypatch):
     logs = log_service.LogService(tmp_path / "calls.jsonl")
     monkeypatch.setattr(log_service, "log_service", logs)
     account = {"access_token": "fixture-only-token", "account_id": "physical-account", "provider_account_identity": "account-0",
-               "source_type": "web", "type": "Plus", "status": "正常", "quota": 99, "conversation_binding_ids": ["binding-0"]}
+               "source_type": "web", "type": "Plus", "status": "正常", "quota": 99, "conversation_binding_ids": ["binding-0"],
+               "limits_progress": [{"feature_name": "image_gen", "remaining": 99}],
+               "capacity_observed_at": datetime.now(timezone.utc).isoformat()}
     (tmp_path / "accounts.json").write_text(json.dumps([account]))
     clock = Clock()
     accounts, store, admission = build(tmp_path, clock)
@@ -108,7 +111,9 @@ def test_company_key_and_internal_http_entries_share_durable_claims(company, tmp
     from services.storage.json_storage import JSONStorageBackend
     from api import ai
     row = {"access_token": "fixture-token", "account_id": "physical", "provider_account_identity": "account-0",
-           "source_type": "web", "type": "Plus", "status": "正常", "quota": 99, "conversation_binding_ids": ["binding-0"]}
+           "source_type": "web", "type": "Plus", "status": "正常", "quota": 99, "conversation_binding_ids": ["binding-0"],
+               "limits_progress": [{"feature_name": "image_gen", "remaining": 99}],
+               "capacity_observed_at": datetime.now(timezone.utc).isoformat()}
     path = tmp_path / "pool-only.json"
     path.write_text(json.dumps([row]))
     accounts = AccountService(JSONStorageBackend(path))
@@ -172,6 +177,38 @@ def test_native_codex_uses_original_durable_claim_and_exact_payload(runtime, mon
     assert len(session.calls) == 1
 
 
+def test_selected_native_codex_receipt_binds_exact_account_before_final_post(runtime, monkeypatch):
+    """The public ref is persisted privately; the controlled upstream never sees it."""
+    from services.codex_service import CodexService
+    from test.test_codex_service import FakeResponse, FakeSession, SessionFactory, observation
+
+    account = runtime.account
+    runtime.accounts.update_account(account["access_token"], {"codex_observation": observation()})
+    monkeypatch.setattr(runtime.accounts, "refresh_codex_access_token", lambda token, **_kwargs: token)
+    session = FakeSession(post_response=FakeResponse(payload={"id": "response-selected", "output": []}))
+    native = CodexService(runtime.accounts, SessionFactory([session]))
+    runtime.admission.codex = native
+    monkeypatch.setattr("services.codex_service.codex_service", native)
+
+    who = {"id": "native-user", "role": "user"}
+    account_ref = runtime.accounts.pool_account_ref(account)
+    payload = {"model": "gpt-5.6-codex", "input": [], "account_ref": account_ref}
+    saved = durable_forward.envelope(who, payload, request("selected-codex"), "codex")
+    runtime.service.submit(who["id"], saved)
+    receipt = durable_forward.raw_receipt(runtime.service, who["id"], "selected-codex")
+    assert receipt["_requested_account_ref"] == account_ref
+    assert receipt["_requested_account_identity"] == "account-0"
+    assert "account_ref" not in runtime.store.load_input(receipt["_input_ref"])["_forward"]["payload"]
+
+    claimed = runtime.admission.claim_next()
+    assert claimed is not None
+    runtime.admission.execute(claimed)
+    assert json.loads(session.calls[0][2]["data"]) == {"model": "gpt-5.6-codex", "input": []}
+    final = durable_forward.raw_receipt(runtime.service, who["id"], "selected-codex")
+    assert final["provider_account_identity"] == "account-0"
+    assert len(session.calls) == 1
+
+
 def test_native_upstream_sse_limit_keeps_layer_and_cooldown_evidence(runtime, monkeypatch):
     from test.test_codex_service import FakeResponse
     response = FakeResponse(chunks=[b'data: {"type":"response.failed","response":{"id":"response-limited","error":{"code":"rate_limit_exceeded","retry_after_seconds":400}}}\n\n'], content_type="text/event-stream")
@@ -205,6 +242,7 @@ def test_legacy_multi_image_slots_cannot_escape_claim_or_redraw_a_slot(runtime, 
     saved = durable_forward.envelope({"id": "owner", "role": "user"}, {"model": "gpt-image-2", "n": 2}, request(), "openai_v1_image_generations", operation="image")
     runtime.service.submit("owner", saved)
     ctx = runtime.admission.claim_next()
+    assert ctx is not None
     sent = []
     def generate(req, index, total):
         assert current_request.get() is ctx

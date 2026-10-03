@@ -107,6 +107,14 @@ def accept_thread(task, tasks, payload, mode, *, output_reader=saved_image_bytes
     owner, thread_id = task["owner_id"], fields["image_thread_id"]
     owned = {r["id"]: r for r in tasks if r.get("owner_id") == owner}
     members = [r for r in owned.values() if (r.get("_image_thread") or {}).get("id") == thread_id]
+    def cancelled_replacement(row):
+        original = owned.get(row.get("_completion_of")) or {}
+        state = original.get("_completion") or {}
+        return (original.get("status") == "success" and state.get("selected_id") == original.get("id")
+                and state.get("replacement_id") == row.get("id")
+                and row.get("error_code") == "COMPLETION_ORIGINAL_RECOVERED"
+                and row.get("upstream_outcome") == "not_sent" and not row.get("_submission_started"))
+    members = [row for row in members if not cancelled_replacement(row)]
     members.sort(key=lambda r: r.get("_sequence", 0))
     if members and (not members[-1].get("_sequence") or len({r.get("_sequence") for r in members}) != len(members)):
         raise ImageThreadError("IMAGE_THREAD_HISTORY_INVALID")
@@ -138,6 +146,14 @@ def accept_thread(task, tasks, payload, mode, *, output_reader=saved_image_bytes
         supplied = images[index][0]
         if not isinstance(supplied, bytes) or hashlib.sha256(original).digest() != hashlib.sha256(supplied).digest():
             raise ImageThreadError("IMAGE_THREAD_SOURCE_MISMATCH")
+    if previous:
+        previous_identity = previous.get("provider_account_identity") or previous.get("_requested_account_identity")
+        requested_identity = task.get("_requested_account_identity")
+        if requested_identity and previous_identity and requested_identity != previous_identity:
+            raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
+        if not requested_identity and previous.get("_requested_account_identity"):
+            task["_requested_account_identity"] = previous["_requested_account_identity"]
+            task["_requested_account_ref"] = previous["_requested_account_ref"]
     task["_image_thread"] = {"protocol": PROTOCOL, "id": thread_id,
                              "previous_task_id": previous["id"] if previous else None,
                              "edit_source_task_id": source_id, "origin_task_id": origin,
@@ -164,6 +180,15 @@ def predecessor_state(task, owned):
     previous = owned.get(previous_id)
     if previous is None:
         return {}, "IMAGE_THREAD_PREVIOUS_MISSING"
+    if task.get("_same_session_retry_of"):
+        from services.generation_completion import same_session_retry, retry_evidence
+        if (not same_session_retry(previous, task) or previous.get("_recovery_paused")
+                or previous.get("_recovery_suppressed") or previous.get("result_file_ids")
+                or previous.get("result_sediment_ids") or previous.get("data")
+                or (previous.get("_image_thread") or {}).get("id") != thread["id"]):
+            return {}, "COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED"
+        return {**{k: previous[k] for k in _FIELDS},
+                "parent_message_id": retry_evidence(previous)["retry_parent_message_id"]}, None
     if previous.get("_recovery_suppressed"):
         return {}, "IMAGE_THREAD_PREVIOUS_RECOVERY_STOPPED"
     if (previous.get("status") == "error" and previous.get("upstream_outcome") == "generated"
@@ -184,6 +209,9 @@ def predecessor_state(task, owned):
     if previous.get("client_conversation_id") != task.get("client_conversation_id"):
         return {}, "IMAGE_THREAD_HISTORY_INVALID"
     binding = {k: previous[k] for k in _FIELDS}
+    if (task.get("_requested_account_identity")
+            and task["_requested_account_identity"] != binding["provider_account_identity"]):
+        return {}, "IMAGE_ACCOUNT_SELECTION_CONFLICT"
     for key in ("provider_binding_id", "provider_account_identity"):
         if task.get(key) and task[key] != binding[key]:
             return {}, "IMAGE_THREAD_BINDING_CHANGED"
@@ -217,8 +245,51 @@ def _image_result_ids(message):
     return set(file_ids) | set(sediment_ids)
 
 
+def _pruned_predecessor_parent(mapping, children, request_message_id, expected_parent,
+                               predecessor_request_message_id, predecessor_result_ids):
+    """Recognize the observed removal of a previous image turn's final node.
+
+    The server can attach the next request to the preserved reasoning recap.
+    Require the exact saved prior request and assets, not an arbitrary ancestor.
+    """
+    expected = {v for v in (predecessor_result_ids or ()) if isinstance(v, str) and v}
+    if not expected_parent or expected_parent in mapping or not expected:
+        return False
+    prior = mapping.get(predecessor_request_message_id)
+    message = prior.get("message") if isinstance(prior, dict) else None
+    if (not isinstance(message, dict) or message.get("id") != predecessor_request_message_id
+            or (message.get("author") or {}).get("role") != "user"
+            or message.get("status") != "finished_successfully"):
+        return False
+    seen, current, observed = {predecessor_request_message_id}, predecessor_request_message_id, set()
+    for _ in range(len(mapping)):
+        following = children.get(current, [])
+        if len(following) != 1 or following[0] in seen or following[0] == request_message_id:
+            return False
+        current = following[0]
+        seen.add(current)
+        msg = mapping[current].get("message")
+        if (not isinstance(msg, dict) or msg.get("id") != current
+                or msg.get("status") != "finished_successfully" or msg.get("end_turn") is True):
+            return False
+        result_ids = _image_result_ids(msg)
+        role = (msg.get("author") or {}).get("role")
+        if role == "tool":
+            observed.update(result_ids)
+            if not observed <= expected:
+                return False
+            continue
+        return (role == "assistant" and (msg.get("content") or {}).get("content_type") == "reasoning_recap"
+                and not result_ids
+                and msg.get("end_turn") is False and msg.get("channel") is None
+                and msg.get("recipient") == "all" and observed == expected
+                and children.get(current) == [request_message_id])
+    return False
+
+
 def finished_parent(document, conversation_id, request_message_id, *, expected_parent=None,
-                    expected_result_ids=None):
+                    expected_result_ids=None, predecessor_request_message_id=None,
+                    predecessor_result_ids=None):
     """Prove one exact completed turn, not the newest arbitrary current_node.
 
     User/manual successors, siblings, missing nodes and unfinished tools are
@@ -233,14 +304,17 @@ def finished_parent(document, conversation_id, request_message_id, *, expected_p
     message = root.get("message") if isinstance(root, dict) else None
     if not isinstance(message, dict) or message.get("id") != request_message_id or (message.get("author") or {}).get("role") != "user":
         raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED")
-    if expected_parent is not None and root.get("parent") != expected_parent:
-        raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
     children = {}
     for key, node in mapping.items():
         if isinstance(node, dict):
             children.setdefault(node.get("parent"), []).append(key)
-    if expected_parent is not None and children.get(expected_parent) != [request_message_id]:
-        raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+    if expected_parent is not None:
+        if root.get("parent") != expected_parent:
+            if not _pruned_predecessor_parent(mapping, children, request_message_id, expected_parent,
+                                              predecessor_request_message_id, predecessor_result_ids):
+                raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+        elif children.get(expected_parent) != [request_message_id]:
+            raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
     seen, current = {request_message_id}, request_message_id
     saw_assistant = False
     expected = {item for item in (expected_result_ids or ()) if isinstance(item, str) and item}

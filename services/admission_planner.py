@@ -125,6 +125,9 @@ class WaitingRequest:
     ready_at: float = 0.0
     bound_account: str | None = None
     order_group: str | None = None
+    # Scheduled work may rotate within one authenticated source.  Legacy
+    # receipts leave this unset and retain the owner/sequence ordering below.
+    fair_group: str | None = None
     needs: tuple[Need, ...] = () # global worker/memory demands, distinct from Offer
 
     def __post_init__(self) -> None:
@@ -134,7 +137,7 @@ class WaitingRequest:
         _number(self.ready_at)
         if type(self.payload_saved) is not bool or self.state not in _STATES:
             raise InvalidSnapshot('invalid request state')
-        for value in (self.bound_account, self.order_group):
+        for value in (self.bound_account, self.order_group, self.fair_group):
             if value is not None:
                 _name(value)
         _unique_needs(self.needs)
@@ -151,6 +154,7 @@ class Snapshot:
     last_source: str | None = None
     last_account: str | None = None
     last_owner_by_source: tuple[tuple[str, str], ...] = ()
+    last_group_by_source: tuple[tuple[str, str], ...] = ()
     # One already accepted request may use a temporary second Chat turn. The
     # extra place is never offered to another request or another account.
     scoped_extra_turn: tuple[RequestRef, str] | None = None
@@ -167,6 +171,9 @@ class Snapshot:
         for source, owner in self.last_owner_by_source:
             _name(source)
             _name(owner)
+        for source, group in self.last_group_by_source:
+            _name(source)
+            _name(group)
         if self.scoped_extra_turn is not None:
             ref, resource = self.scoped_extra_turn
             if not isinstance(ref, RequestRef):
@@ -226,6 +233,11 @@ def _rotate(values: list[str], after: str | None) -> list[str]:
     return values[offset:] + values[:offset]
 
 
+def fairness_lane(fair_group: str | None) -> str:
+    """Return the persisted subgroup cursor without colliding with legacy."""
+    return 'legacy' if fair_group is None else 'workflow:' + fair_group
+
+
 def choose_next(snapshot: Snapshot, now: float) -> Selection:
     """Return at most one dispatch; the caller MUST reserve it atomically.
 
@@ -264,76 +276,88 @@ def choose_next(snapshot: Snapshot, now: float) -> Selection:
 
     deferred: list[Deferred] = []
     wakeups: list[float] = []
-    sources = _rotate([r.source for r in pending], snapshot.last_source)
-    for source in sources:
-        owners = _rotate([r.ref.owner for r in pending if r.source == source],
-                         dict(snapshot.last_owner_by_source).get(source))
-        owner_position = {owner: index for index, owner in enumerate(owners)}
-        source_requests = sorted((r for r in pending if r.source == source),
-                                 key=lambda r: (owner_position[r.ref.owner], r.sequence, r.ref))
-        for request in source_requests:
-            reasons: set[str] = set()
-            if not request.payload_saved:
-                reasons.add('input_not_durable')
-            if request.order_group is not None:
-                group = (request.ref.owner, request.order_group)
-                if order_head[group].ref != request.ref:
-                    reasons.add('earlier_group_request_unfinished')
-            if request.ready_at > now:
-                reasons.add('request_wait_until')
-            if reasons:
-                wake = request.ready_at if reasons == {'request_wait_until'} else None
-                deferred.append(Deferred(request.ref, tuple(sorted(reasons)), wake))
-                if wake is not None:
-                    wakeups.append(wake)
-                continue
-
-            matches = [o for o in offers if o.enabled
-                       and (o.route, o.model, o.operation) ==
-                           (request.route, request.model, request.operation)
-                       and (request.bound_account is None or request.bound_account == o.account)]
-            account_order = _rotate([o.account for o in matches], snapshot.last_account)
-            position = {name: i for i, name in enumerate(account_order)}
-            matches.sort(key=lambda o: (o.preference, position[o.account]))
-            possible_wakeups: list[float] = []
-            if not matches:
-                reasons.add('bound_account_unavailable' if request.bound_account else 'no_matching_account')
-            for offer in matches:
-                needs = request.needs + offer.needs
-                _unique_needs(needs)
-                blockers: set[str] = set()
-                future_times: list[float] = []
-                reservations: list[tuple[str, float]] = []
-                for need in needs:
-                    resource = resources[need.resource]
-                    if resource.occupied is None:
-                        blockers.add('occupancy_unknown')
-                    elif resource.occupied + need.units > resource.capacity:
-                        blockers.add('resource_full')
-                    elif (snapshot.scoped_extra_turn is not None
-                          and need.resource == snapshot.scoped_extra_turn[1]
-                          and resource.occupied >= 1
-                          and request.ref != snapshot.scoped_extra_turn[0]):
-                        blockers.add('resource_full')
-                    if resource.next_at is None:
-                        blockers.add('availability_time_unknown')
-                    elif resource.next_at > now:
-                        blockers.add('account_or_shared_pacing')
-                        future_times.append(resource.next_at)
-                    if resource.interval:
-                        reservations.append((resource.key, now + resource.interval))
-                if not blockers:
-                    return Selection(Dispatch(request.ref, offer.account, source,
-                                              snapshot.revision, needs,
-                                              tuple(reservations), now),
-                                     tuple(deferred), None)
-                reasons.update(blockers)
-                # When occupancy is full/unknown, a release/readback is needed.
-                # A guessed timer cannot promise that an in-flight job is done.
-                if blockers <= {'account_or_shared_pacing'} and future_times:
-                    possible_wakeups.append(max(future_times))
-            wake = min(possible_wakeups) if possible_wakeups else None
+    def select_request(request: WaitingRequest) -> Dispatch | None:
+        reasons: set[str] = set()
+        if not request.payload_saved:
+            reasons.add('input_not_durable')
+        if request.order_group is not None:
+            group = (request.ref.owner, request.order_group)
+            if order_head[group].ref != request.ref:
+                reasons.add('earlier_group_request_unfinished')
+        if request.ready_at > now:
+            reasons.add('request_wait_until')
+        if reasons:
+            wake = request.ready_at if reasons == {'request_wait_until'} else None
             deferred.append(Deferred(request.ref, tuple(sorted(reasons)), wake))
             if wake is not None:
                 wakeups.append(wake)
+            return None
+
+        matches = [o for o in offers if o.enabled
+                   and (o.route, o.model, o.operation) ==
+                       (request.route, request.model, request.operation)
+                   and (request.bound_account is None or request.bound_account == o.account)]
+        account_order = _rotate([o.account for o in matches], snapshot.last_account)
+        position = {name: i for i, name in enumerate(account_order)}
+        matches.sort(key=lambda o: (o.preference, position[o.account]))
+        possible_wakeups: list[float] = []
+        if not matches:
+            reasons.add('bound_account_unavailable' if request.bound_account else 'no_matching_account')
+        for offer in matches:
+            needs = request.needs + offer.needs
+            _unique_needs(needs)
+            blockers: set[str] = set()
+            future_times: list[float] = []
+            reservations: list[tuple[str, float]] = []
+            for need in needs:
+                resource = resources[need.resource]
+                if resource.occupied is None:
+                    blockers.add('occupancy_unknown')
+                elif resource.occupied + need.units > resource.capacity:
+                    blockers.add('resource_full')
+                elif (snapshot.scoped_extra_turn is not None
+                      and need.resource == snapshot.scoped_extra_turn[1]
+                      and resource.occupied >= 1
+                      and request.ref != snapshot.scoped_extra_turn[0]):
+                    blockers.add('resource_full')
+                if resource.next_at is None:
+                    blockers.add('availability_time_unknown')
+                elif resource.next_at > now:
+                    blockers.add('account_or_shared_pacing')
+                    future_times.append(resource.next_at)
+                if resource.interval:
+                    reservations.append((resource.key, now + resource.interval))
+            if not blockers:
+                return Dispatch(request.ref, offer.account, request.source,
+                                snapshot.revision, needs, tuple(reservations), now)
+            reasons.update(blockers)
+            # When occupancy is full/unknown, a release/readback is needed.
+            # A guessed timer cannot promise that an in-flight job is done.
+            if blockers <= {'account_or_shared_pacing'} and future_times:
+                possible_wakeups.append(max(future_times))
+        wake = min(possible_wakeups) if possible_wakeups else None
+        deferred.append(Deferred(request.ref, tuple(sorted(reasons)), wake))
+        if wake is not None:
+            wakeups.append(wake)
+        return None
+
+    sources = _rotate([r.source for r in pending], snapshot.last_source)
+    for source in sources:
+        source_pending = [r for r in pending if r.source == source]
+        owners = _rotate([r.ref.owner for r in source_pending],
+                         dict(snapshot.last_owner_by_source).get(source))
+        owner_position = {owner: index for index, owner in enumerate(owners)}
+        # The legacy lane retains owner/sequence order when it is the only
+        # lane, but participates in this same rotation when scheduled work is
+        # present.  A workflow ID can never collide with the legacy cursor.
+        grouped: dict[str, list[WaitingRequest]] = {}
+        for request in source_pending:
+            grouped.setdefault(fairness_lane(request.fair_group), []).append(request)
+        for lane in _rotate(list(grouped), dict(snapshot.last_group_by_source).get(source)):
+            requests_in_group = sorted(grouped[lane],
+                                       key=lambda r: (owner_position[r.ref.owner], r.sequence, r.ref))
+            for request in requests_in_group:
+                dispatch = select_request(request)
+                if dispatch is not None:
+                    return Selection(dispatch, tuple(deferred), None)
     return Selection(None, tuple(deferred), min(wakeups) if wakeups else None)

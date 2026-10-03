@@ -2,6 +2,7 @@
 import base64
 import copy
 import hashlib
+from datetime import datetime, timezone
 from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -62,9 +63,12 @@ def tool_document(cid="conversation-a", rid="request-a", parent="root"):
 def runtime(tmp_path, monkeypatch):
     rows = [{"access_token": "fixture-token", "account_id": "fixture-upstream",
              "provider_account_identity": "account-0", "type": "Plus", "status": "正常",
-             "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-0"]}]
+             "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-0"],
+             "limits_progress": [{"feature_name": "image_gen", "remaining": 999}],
+             "capacity_observed_at": datetime.now(timezone.utc).isoformat()}]
     (tmp_path / "accounts.json").write_text(json.dumps(rows))
     accounts = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    monkeypatch.setattr(accounts, "refresh_image_capability", lambda _: None)
     store = TaskStore(tmp_path / "text_tasks.sqlite3")
     admission = PoolAdmission(store, accounts, clock=lambda: 1000.0,
         settings=lambda: {"image_account_concurrency": 4, "chat_account_concurrency": 4, "codex_max_concurrency": 4},
@@ -73,7 +77,7 @@ def runtime(tmp_path, monkeypatch):
     admission.register("image", lambda ctx, body: service._run_task(ctx.owner+":"+ctx.request_id,
         body["mode"], {**body["payload"], "retain_conversation": True}, body["identity"], body["payload"]["model"]))
     state = SimpleNamespace(sends=[], documents={}, fail_after_send=False, fail_after_result=False,
-        tool_leaf=False, drift=False, final_pending=False, reads=[], polls=[], naive_reads=0, archive_actions=[])
+        tool_leaf=False, pruned_recap=False, drift=False, final_pending=False, reads=[], polls=[], naive_reads=0, archive_actions=[])
     account_stub = SimpleNamespace(get_bound_account_identity=lambda _b: "account-0",
         acquire_bound_image_access_token=lambda *a, **k: "fixture-token", get_account=lambda _t: rows[0],
         conversation_binding_lock=lambda *a: nullcontext(), mark_image_result=lambda *a: None,
@@ -84,10 +88,11 @@ def runtime(tmp_path, monkeypatch):
     for mod in (openai_v1_image_edit, openai_v1_image_generations):
         monkeypatch.setattr(mod, "count_text_tokens", lambda *a, **k: 0)
     class Backend:
+        _has_image_asset_pointer = RealOpenAIBackendAPI._has_image_asset_pointer
         def __init__(self, access_token):
             assert access_token == "fixture-token"
             self.image_submission_started = False
-        def _get_conversation(self, cid):
+        def _get_conversation(self, cid, **kwargs):
             state.reads.append(cid)
             doc = copy.deepcopy(state.documents[cid])
             if state.drift:
@@ -107,7 +112,7 @@ def runtime(tmp_path, monkeypatch):
         def resolve_conversation_image_urls(self, cid, files, sediment, **kwargs):
             assert kwargs["request_message_id"] in state.documents[cid]["mapping"]
             return ["https://fixture.invalid/original.png"]
-        def _poll_image_results(self, cid, timeout, *, request_message_id):
+        def _poll_image_results(self, cid, timeout, *, request_message_id, initial_document=None):
             assert request_message_id in state.documents[cid]["mapping"]
             state.polls.append((cid, request_message_id))
             _, result_id = tool_document(cid, request_message_id)
@@ -126,6 +131,8 @@ def runtime(tmp_path, monkeypatch):
         cid = req.conversation_id or "conversation-" + str(len(state.documents))
         backend.image_request_message_id = rid
         context = current_request.get()
+        if callable(getattr(backend, "image_pre_send_check", None)):
+            backend.image_pre_send_check()
         context.before_send()
         backend.image_submission_started = True
         callback.record_submission_started()
@@ -136,13 +143,25 @@ def runtime(tmp_path, monkeypatch):
         old = state.documents.get(cid)
         if old:
             assert old["current_node"] == req.parent_message_id
-        if state.tool_leaf:
+        if state.tool_leaf or state.pruned_recap:
             doc, result_id = tool_document(cid, rid, req.parent_message_id or "root")
+            if state.pruned_recap:
+                doc["mapping"].pop(rid + "-code")
+                doc["mapping"][rid + "-image"]["parent"] = rid
+                recap = node(rid + "-recap", "assistant", doc["current_node"])
+                recap["message"]["recipient"] = "all"
+                recap["message"]["content"] = {"content_type": "reasoning_recap", "content": "fixture"}
+                doc["mapping"][rid + "-recap"] = recap
+                doc["mapping"][rid + "-final"] = node(rid + "-final", "assistant", rid + "-recap", end=True)
+                doc["current_node"] = rid + "-final"
         else:
             doc = document(cid, rid, req.parent_message_id or "root")
             result_id = "file-" + rid
         if old:
             doc["mapping"] = {**old["mapping"], **doc["mapping"]}
+            if state.pruned_recap:
+                prior = doc["mapping"].pop(req.parent_message_id)
+                doc["mapping"][rid]["parent"] = prior["parent"]
         state.documents[cid] = doc
         if state.fail_after_send:
             raise ConnectionError("fixture reply lost after sending")
@@ -176,6 +195,27 @@ def run_next(r, expected):
     result = r.read(expected)
     assert result["status"] == "success", result
     return result
+
+
+def test_advanced_selector_reaches_actual_bound_protocol_and_thread(runtime):
+    r = runtime
+    selected = r.admission.accounts.list_accounts()[0]
+    ref = r.admission.accounts.pool_account_ref(selected)
+    # Another fully eligible physical account must not change the explicit choice.
+    other = {**selected, "access_token": "other-fixture", "account_id": "other-upstream",
+             "provider_account_identity": "other-account", "conversation_binding_ids": []}
+    other.pop("managed_pool_account_ref", None)
+    with r.admission.accounts._lock:
+        r.admission.accounts._accounts[other["access_token"]] = other
+        r.admission.accounts._save_accounts()
+    r.service.submit_generation(WHO, client_task_id="chosen", prompt="fixture", model="gpt-image-2",
+                                size=None, account_ref=ref, image_thread_id="product-a")
+    first = run_next(r, "chosen")
+    r.submit("inherited")
+    second = run_next(r, "inherited")
+    assert [send["account"] for send in r.state.sends] == ["account-0", "account-0"]
+    assert first["_requested_account_ref"] == second["_requested_account_ref"] == ref
+    assert first["conversation_id"] == second["conversation_id"]
 
 
 def test_same_product_images_and_edit_of_earlier_image_use_original_real_conversation(runtime):
@@ -467,7 +507,8 @@ def test_generated_image_recovery_proves_original_final_then_releases_waiting_su
     assert r.state.sends[1]["parent"]==recovered["parent_message_id"]
 
 
-def test_generated_tool_leaf_recovery_downloads_original_and_releases_successor(runtime):
+@pytest.mark.parametrize("retired", [False, True, "legacy-unrecoverable"])
+def test_generated_tool_leaf_recovery_downloads_original_and_releases_successor(runtime, retired):
     r = runtime
     r.state.tool_leaf = True
     r.state.fail_after_result = True
@@ -478,9 +519,31 @@ def test_generated_tool_leaf_recovery_downloads_original_and_releases_successor(
     assert original["upstream_outcome"] == "generated"
     assert r.admission.claim_next() is None
     r.state.fail_after_result = False
+    if retired:
+        with r.store.transaction() as db:
+            saved = r.store.read_receipt(db, "image", "happy", "a1")
+            saved.update(_attempt_finished_at=1000, _turn_reserved=False, next_poll_at=0)
+            if retired == "legacy-unrecoverable":
+                # Old exhausted reads discarded phase/outcome even when IDs
+                # were retained. Their exact-original downloader still applies.
+                saved.update(error_code="RESULT_UNRECOVERABLE", upstream_outcome="unknown", recovery_phase="")
+            r.store.write_receipt(db, "image", "happy", "a1", saved)
     restarted = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
-    restarted._run_resume_poll("happy:a1", original["conversation_id"], 5, "", WHO,
-        "edit", "gpt-image-2", False, False)
+    if retired:
+        # Exercise the public recovery guard too: ending an empty attempt must
+        # never disable download of an already discovered original image.
+        import time
+        if retired == "legacy-unrecoverable":
+            r.admission.recoveries["image"] = lambda owner, rid: restarted.resume_poll(WHO, rid, 5)
+            r.admission.recover_one()
+        else:
+            restarted.resume_poll(WHO, "a1", 5)
+        deadline = time.monotonic() + 3
+        while r.read("a1")["status"] == "running" and time.monotonic() < deadline:
+            time.sleep(.01)
+    else:
+        restarted._run_resume_poll("happy:a1", original["conversation_id"], 5, "", WHO,
+            "edit", "gpt-image-2", False, False)
     recovered = r.read("a1")
     assert recovered["status"] == "success", (recovered.get("error_code"), recovered.get("recovery_error_code"), recovered.get("error"))
     assert recovered["_image_thread_terminal"] is True
@@ -588,6 +651,80 @@ def test_tool_leaf_accepts_exact_saved_asset():
         expected_result_ids=[result_id, result_id]) == "request-a-image"
 
 
+@pytest.mark.parametrize("change", [None, "missing-prior", "missing-assets", "wrong-assets", "extra-assets",
+    "parent-still-present", "sibling", "later-user", "unfinished", "not-recap", "terminal-recap",
+    "recap-channel", "recap-recipient", "middle-assistant", "recap-sibling", "recap-same-asset", "no-tool",
+    "current-assets", "current-drift", "current-unfinished"])
+def test_pruned_previous_final_requires_exact_completed_predecessor_and_recap(change):
+    doc, asset = tool_document()
+    doc["mapping"].pop("request-a-code")
+    doc["mapping"]["request-a-image"]["parent"] = "request-a"
+    recap = node("recap", "assistant", "request-a-image")
+    recap["message"]["recipient"] = "all"
+    recap["message"]["content"] = {"content_type": "reasoning_recap", "content": "fixture"}
+    doc["mapping"]["recap"] = recap
+    child = document("conversation-a", "edit", "recap")
+    doc["mapping"].update(child["mapping"])
+    doc["current_node"] = child["current_node"]
+    prior, assets = "request-a", [asset]
+    if change == "missing-prior": prior = None
+    elif change == "missing-assets": assets = []
+    elif change == "wrong-assets": assets = ["file_00000000" + "f" * 24]
+    elif change == "extra-assets": assets += ["file_00000000" + "f" * 24]
+    elif change == "parent-still-present": doc["mapping"]["removed-final"] = node("removed-final", "assistant", "recap", end=True)
+    elif change == "sibling": doc["mapping"]["sibling"] = node("sibling", "assistant", "request-a")
+    elif change == "later-user": recap["message"]["author"]["role"] = "user"
+    elif change == "unfinished": doc["mapping"]["request-a-image"]["message"]["status"] = "in_progress"
+    elif change == "not-recap": recap["message"]["content"]["content_type"] = "text"
+    elif change == "terminal-recap": recap["message"]["end_turn"] = True
+    elif change == "recap-channel": recap["message"]["channel"] = "final"
+    elif change == "recap-recipient": recap["message"]["recipient"] = "image_gen"
+    elif change == "middle-assistant": doc["mapping"]["request-a-image"]["message"]["author"]["role"] = "assistant"
+    elif change == "recap-sibling": doc["mapping"]["sibling"] = node("sibling", "user", "recap")
+    elif change == "recap-same-asset": recap["message"]["metadata"] = {"asset_pointer": "file-service://" + asset}
+    elif change == "no-tool":
+        doc["mapping"].pop("request-a-image")
+        recap["parent"] = "request-a"
+    elif change == "current-assets": doc["mapping"]["edit-image"]["message"]["content"] = {
+        "content_type": "multimodal_text", "parts": [{"content_type": "image_asset_pointer",
+        "asset_pointer": "file-service://file_00000000" + "f" * 24}]}
+    elif change == "current-drift": doc["current_node"] = "recap"
+    elif change == "current-unfinished": doc["mapping"]["edit-final"]["message"]["status"] = "in_progress"
+    def confirm():
+        return finished_parent(doc, "conversation-a", "edit", expected_parent="removed-final",
+            expected_result_ids=["file_00000000" + "e" * 24],
+            predecessor_request_message_id=prior, predecessor_result_ids=assets)
+    if change is None:
+        assert confirm() == "edit-final"
+    else:
+        with pytest.raises(ImageThreadError): confirm()
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_image_edit_keeps_original_turn_when_upstream_prunes_previous_final(runtime, recover):
+    r = runtime
+    r.state.pruned_recap = True
+    r.submit("source")
+    first = run_next(r, "source")
+    r.state.fail_after_result = recover
+    r.submit("edited", source="source")
+    ctx = r.admission.claim_next()
+    r.admission.execute(ctx)
+    original = r.read("edited")
+    if recover:
+        assert original["status"] == "error"
+        restored = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
+        restored._run_resume_poll("happy:edited", original["conversation_id"], 5, "", WHO,
+            "edit", "gpt-image-2", False, False)
+    final = r.read("edited")
+    assert final["status"] == "success", final
+    assert final["conversation_id"] == first["conversation_id"]
+    assert final["_image_thread_request_parent"] == first["parent_message_id"]
+    assert final["request_message_id"] == original["request_message_id"]
+    assert final["data"] and final["_image_thread_terminal"]
+    assert len(r.state.sends) == 2
+
+
 @pytest.mark.parametrize("change", [None, "missing-asset", "extra-asset", "unfinished", "sibling", "drift"])
 def test_consecutive_image_tool_results_require_exact_original_branch_and_all_saved_assets(change):
     doc, first_id = tool_document()
@@ -637,10 +774,14 @@ def test_send_guard_rechecks_source_after_claim_and_before_the_network(runtime):
 def test_thread_capability_matches_ingress_without_changing_private_catalog(runtime, monkeypatch, enabled, ingress):
     from api import ai, company_requests
     import services.image_task_service as image_module
+    import services.public_chat_service as public_chat_module
     r = runtime
     catalog = {"object": "list", "data": []}
     monkeypatch.setattr(ai, "require_identity", lambda *a, **k: WHO)
     monkeypatch.setattr(ai.openai_v1_models, "list_models", lambda: catalog)
+    # An intentionally empty known catalog is different from discovery being
+    # unavailable. Keep this contract test independent of global cache state.
+    monkeypatch.setattr(public_chat_module.model_catalog_service, "catalog_is_unknown", lambda: False)
     monkeypatch.setattr(image_module, "image_task_service", r.service)
     if not enabled:
         r.service.admission = None
@@ -682,3 +823,74 @@ def test_predecessor_diagnostics_are_specific_and_read_only(previous, reason):
     before = copy.deepcopy(owned)
     assert predecessor_state(task, owned) == ({}, reason)
     assert owned == before
+
+@pytest.mark.parametrize('case', ['success', 'drift', 'late_result', 'missing_root'])
+def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runtime, case):
+    import time
+    from services.generation_completion import GenerationCompletionService, retry_cursor
+    from services.text_task_service import TextTaskService
+    from services.work_lifecycle import WorkLifecycleService
+    r = runtime
+    r.state.fail_after_send = True
+    r.submit('empty-original')
+    r.admission.execute(r.admission.claim_next())
+    original = r.read('empty-original')
+    assert original['status'] == 'error' and len(r.state.sends) == 1
+    cid, mid = original['conversation_id'], original['request_message_id']
+    doc = r.state.documents[cid]
+    doc['is_archived'] = False
+    for key, value in doc['mapping'].items():
+        if key != mid:
+            value['message']['content']['parts'] = []
+            value['message'].update(status='in_progress', end_turn=None)
+    now = time.time()
+    r.admission.clock = lambda: now
+    with r.store.transaction() as db:
+        saved = r.store.read_receipt(db, 'image', WHO['id'], 'empty-original')
+        saved.update(_completion_read_at=now, _retry_cursor=retry_cursor(doc, original, kind='image'),
+                     _execution_timeline=[{'stage': 'send_call_started', 'at': now-1300}],
+                     _executing=False, _claim_id=None, _claim_until=0)
+        r.store.write_receipt(db, 'image', WHO['id'], 'empty-original', saved)
+    text = TextTaskService(r.store.path, admission=r.admission, clock=r.admission.clock)
+    lifecycle = WorkLifecycleService(text, r.service, clock=r.admission.clock)
+    completion = GenerationCompletionService(text, r.service, lifecycle, clock=r.admission.clock)
+    r.admission.generation_completion = completion
+    result = completion.start('image', WHO, 'empty-original', allow_unconfirmed_retry=True)
+    assert result.get('replacement_id'), result
+    child_id = result['replacement_id']; child = r.read(child_id)
+    for key in ('provider_account_identity','provider_binding_id','conversation_id','client_conversation_id','_work_key'):
+        assert child[key] == original[key]
+    assert child['_image_thread']['id'] == original['_image_thread']['id']
+    assert child['_image_thread']['previous_task_id'] == 'empty-original'
+    assert r.read('empty-original')['_attempt_finished_at']
+    assert not r.read('empty-original')['_turn_reserved']
+    ctx = r.admission.claim_next()
+    assert ctx and ctx.request_id == child_id
+    r.state.fail_after_send = False
+    if case == 'drift': r.state.drift = True
+    if case in {'late_result', 'missing_root'}:
+        with r.store.transaction() as db:
+            root = r.store.read_receipt(db, 'image', WHO['id'], 'empty-original')
+            if case == 'late_result':
+                root.update(result_file_ids=['already-generated'], upstream_outcome='generated', recovery_phase='download_image_result')
+            else:
+                # Identity loss has the same fail-closed effect as a missing row,
+                # without bypassing the store's retention policy in the fixture.
+                root['_completion'] = {}
+            r.store.write_receipt(db, 'image', WHO['id'], 'empty-original', root)
+    r.admission.execute(ctx)
+    if case != 'success':
+        assert len(r.state.sends) == 1
+        assert r.read(child_id)['upstream_outcome'] in {'not_sent', 'not_submitted'}
+        return
+    assert len(r.state.sends) == 2
+    assert r.state.sends[-1]['account'] == r.state.sends[0]['account']
+    assert r.state.sends[-1]['conversation'] == cid
+    assert r.state.sends[-1]['images'] == r.state.sends[0]['images']
+    assert r.read(child_id)['status'] == 'success'
+    from services.image_thread import saved_image_bytes
+    assert saved_image_bytes(r.read(child_id)) == OUTPUT
+    result = completion.read('image', WHO, 'empty-original')
+    assert result['selected_id'] == child_id
+    assert completion.complete('image', WHO, 'empty-original', child_id)['state'] == 'completed'
+    assert r.read('empty-original')['status'] == 'error'

@@ -257,22 +257,36 @@ def dispatch_model(body):
 
 
 def envelope(identity, payload, request, protocol, *, operation="text", compact=False):
+    # `account_ref` is a public account-selection directive, not an upstream field.
+    # Retain it only in the original durable envelope so it participates in
+    # idempotency and is resolved to a private identity by the task service.
+    forward_payload = dict(payload)
+    account_ref = forward_payload.pop("account_ref", None) if "account_ref" in forward_payload else None
+    scheduling = forward_payload.pop("_scheduling", None)
     headers = {k.lower(): v for k, v in request.headers.items() if k.lower() in FORWARDED_HEADERS}
-    request_id = str(headers.get("x-client-request-id") or payload.get("client_request_id") or uuid.uuid4().hex)
+    request_id = str(headers.get("x-client-request-id") or forward_payload.get("client_request_id") or uuid.uuid4().hex)
     route = "codex" if protocol == "codex" else "chat"
-    model = str(payload.get("model") or "auto")
+    model = str(forward_payload.get("model") or "auto")
     from utils.helper import is_codex_image_model
     if operation == "image" and is_codex_image_model(model):
-        from services.openai_backend_api import CODEX_RESPONSES_MODEL
-        route, model = "codex", CODEX_RESPONSES_MODEL
+        # Admission must see the image alias, not the internal Codex text
+        # transport model, to require fresh image capability on this account.
+        route = "codex"
     body = {"client_request_id": request_id, "client_conversation_id": str(payload.get("client_conversation_id") or headers.get("session-id") or headers.get("thread-id") or ""),
             "model": model, "_route": route, "_operation": operation,
-            "_expected_sends": max(1, min(4, int(payload.get("n") or 1))) if operation == "image" else 1,
-            "_forward": {"protocol": protocol, "payload": payload, "headers": headers,
+            "_expected_sends": max(1, min(4, int(forward_payload.get("n") or 1))) if operation == "image" else 1,
+            "_forward": {"protocol": protocol, "payload": forward_payload, "headers": headers,
                          "identity": {k: identity[k] for k in ("id", "name", "role") if k in identity}, "compact": compact}}
+    # The original envelope retains the caller-visible opaque reference for
+    # idempotency. TextTaskService resolves it once into a private stable
+    # identity; protocol payloads never receive that identity.
+    if account_ref is not None:
+        body["_requested_account_ref"] = account_ref
+    if scheduling is not None:
+        body["_scheduling"] = scheduling
     if route == "codex":
         from services.codex_service import codex_service
-        body["client_conversation_id"] = codex_service._affinity_key(identity, headers, payload)
+        body["client_conversation_id"] = codex_service._affinity_key(identity, headers, forward_payload)
     return body
 
 
@@ -288,10 +302,16 @@ async def respond(identity, payload, request, protocol, *, operation="text", com
     owner, request_id = str(identity["id"]), body["client_request_id"]
     from fastapi.concurrency import run_in_threadpool
     from services.conversation_binding_service import ConversationBindingError
+    from services.image_thread import ImageThreadError
+    from services.work_lifecycle import WorkLifecycleError
     try:
         await run_in_threadpool(service.submit, owner, body, source=trusted_source(identity, request))
+    except ImageThreadError as exc:
+        raise HTTPException(exc.status, detail={"code": exc.code}) from None
     except ConversationBindingError:
         raise HTTPException(409, detail={"code": "REQUEST_ID_CONFLICT", "request_id": request_id}) from None
+    except WorkLifecycleError as exc:
+        raise HTTPException(exc.status, detail={"code": exc.code}) from None
     # Async waiting consumes no executor worker. HTTP cancellation affects only
     # this subscriber, not the original receipt or its independently held claim.
     while True:

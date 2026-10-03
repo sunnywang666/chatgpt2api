@@ -7,8 +7,10 @@ import argparse
 import base64
 import contextlib
 import datetime as dt
+from email.utils import parsedate_to_datetime
 import fcntl
 import hashlib
+from http.client import HTTPException
 import json
 import mimetypes
 import os
@@ -16,6 +18,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 import uuid
 from typing import Any, BinaryIO, Iterator
 from urllib import error, parse, request
@@ -33,13 +36,19 @@ class ClientError(RuntimeError):
 
 
 class HttpFailure(ClientError):
-    def __init__(self, status: int, detail: str):
+    def __init__(self, status: int, detail: str, *, not_sent=False, retry_after=None):
         self.status = status
         self.detail = detail
+        self.not_sent = not_sent
+        self.retry_after = retry_after
         super().__init__(f"HTTP {status}: {detail}")
 
 
 class UnsafeRedirect(ClientError):
+    pass
+
+
+class OriginalMissing(ClientError):
     pass
 
 
@@ -159,7 +168,8 @@ class ApiClient:
             raise
         except error.HTTPError as exc:
             detail = _http_error_detail(exc)
-            raise HttpFailure(exc.code, detail) from exc
+            raise HttpFailure(exc.code, detail, not_sent=getattr(exc, "pool_not_sent", False),
+                              retry_after=getattr(exc, "pool_retry_after", None)) from exc
         except (TimeoutError, error.URLError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             raise ClientError(f"request result is unknown: {reason}") from exc
@@ -168,8 +178,11 @@ class ApiClient:
         if payload is not None:
             body = _json_bytes(payload)
             content_type = "application/json"
-        with self.open(method, endpoint, body=body, content_type=content_type) as response:
-            raw = response.read(MAX_JSON_BYTES + 1)
+        try:
+            with self.open(method, endpoint, body=body, content_type=content_type) as response:
+                raw = response.read(MAX_JSON_BYTES + 1)
+        except (OSError, HTTPException) as exc:
+            raise ClientError("response interrupted; query the original durable request") from exc
         if len(raw) > MAX_JSON_BYTES:
             raise ClientError("server JSON response exceeds 4 MiB")
         try:
@@ -187,12 +200,52 @@ def _http_error_detail(exc: error.HTTPError) -> str:
         value = json.loads(raw.decode("utf-8"))
     except Exception:
         return str(exc.reason or "request failed")
-    detail = value.get("detail") if isinstance(value, dict) else value
+    if isinstance(value, dict):
+        # Only the authenticated service's explicit transport verdict permits
+        # reacceptance. HTTP status alone (including 404/429) proves nothing.
+        exc.pool_not_sent = any(isinstance(value.get(key), dict) and value[key].get("upstream_outcome") == "not_sent"
+                                for key in ("recovery", "detail"))
+        retry = exc.headers.get("Retry-After", "") if exc.headers else ""
+        exc.pool_retry_after = int(retry) if len(retry) <= 5 and retry.isdigit() and int(retry) <= 86400 else None
+        if exc.pool_retry_after is None and retry:
+            try:
+                until = parsedate_to_datetime(retry)
+                if until.tzinfo is not None:
+                    exc.pool_retry_after = max(0, until.timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                pass
+    detail = value.get("detail") or value.get("error_code") if isinstance(value, dict) else value
     if isinstance(detail, dict):
         detail = detail.get("error") or detail.get("code") or detail
     if isinstance(detail, (dict, list)):
         return json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
     return str(detail or exc.reason or "request failed")
+
+
+def _submit_original(api, state_path, state, endpoint, **kwargs):
+    """One bounded transport retry, never a second generation attempt."""
+    for attempt in range(2):
+        wait_until = state.get("retry_not_before", 0)
+        delay = max(0, wait_until - time.time())
+        if delay > 30:
+            raise ClientError("original submission is not sent; retry after its persisted cooldown")
+        if delay:
+            time.sleep(delay)
+        # Invalidate the old not-sent proof BEFORE crossing the next boundary.
+        state.update(phase="unknown", updated_at=_utc_now())
+        state.pop("retry_not_before", None)
+        _atomic_write_state(state_path, state)
+        try:
+            return api.json("POST", endpoint, **kwargs)
+        except HttpFailure as exc:
+            if not exc.not_sent:
+                raise
+            state.update(phase="not_sent", http_status=exc.status, updated_at=_utc_now())
+            if exc.retry_after is not None:
+                state["retry_not_before"] = time.time() + exc.retry_after
+            _atomic_write_state(state_path, state)
+            if attempt or exc.status not in {429, 503} or exc.retry_after is None:
+                raise
 
 
 def _read_input_image(path_text: str) -> dict[str, Any]:
@@ -222,7 +275,7 @@ def _read_input_image(path_text: str) -> dict[str, Any]:
 
 def _request_contract(args: argparse.Namespace, images: list[dict[str, Any]]) -> dict[str, Any]:
     mode = "edit" if images else "generate"
-    return {
+    contract = {
         "schema": "chatgpt2api.persistent-image-input.v1",
         "mode": mode,
         "prompt_sha256": hashlib.sha256(args.prompt.encode("utf-8")).hexdigest(),
@@ -234,6 +287,64 @@ def _request_contract(args: argparse.Namespace, images: list[dict[str, Any]]) ->
             for item in images
         ],
     }
+    account_ref = _selected_account(args)
+    if account_ref is not None:
+        contract["account_ref"] = account_ref
+    contract.update(_image_work_fields(args, images))
+    scheduling = _scheduling(args)
+    if scheduling is not None:
+        contract["scheduling"] = scheduling
+    return contract
+
+
+def _selected_account(args: argparse.Namespace) -> str | None:
+    account_ref = getattr(args, "account_ref", None)
+    if account_ref is not None and not re.fullmatch(r"car_[A-Za-z0-9_-]{43}", account_ref):
+        raise ClientError("--account-ref must be an opaque car_ reference from the model directory")
+    return account_ref
+
+
+def _scheduling(args: argparse.Namespace) -> dict | None:
+    fields = ("workflow_id", "workflow_concurrency", "min_send_interval_seconds", "not_before", "wait_deadline")
+    result = {key: getattr(args, key) for key in fields if getattr(args, key, None) is not None}
+    if not result:
+        return None
+    if "workflow_concurrency" in result and (not result.get("workflow_id") or not 1 <= result["workflow_concurrency"] <= 64):
+        raise ClientError("--workflow-concurrency requires --workflow-id and a value from 1 to 64")
+    if "min_send_interval_seconds" in result and not 0 <= result["min_send_interval_seconds"] <= 86400:
+        raise ClientError("--min-send-interval-seconds must be from 0 to 86400")
+    dates = {}
+    for key in ("not_before", "wait_deadline"):
+        if key in result:
+            try:
+                dates[key] = dt.datetime.fromisoformat(result[key].replace("Z", "+00:00"))
+                if dates[key].tzinfo is None or dates[key].utcoffset() != dt.timedelta(0):
+                    raise ValueError()
+            except ValueError:
+                raise ClientError(f"--{key.replace('_', '-')} requires UTC ISO8601") from None
+    if len(dates) == 2 and dates["wait_deadline"] <= dates["not_before"]:
+        raise ClientError("wait deadline must follow not-before")
+    return result
+
+
+def _image_work_fields(args: argparse.Namespace, images: list[dict[str, Any]]) -> dict[str, Any]:
+    thread = getattr(args, "thread_id", None)
+    source = getattr(args, "source_task_id", None)
+    index = getattr(args, "source_index", 0)
+    if thread is None:
+        if source is not None or index:
+            raise ClientError("--source-task-id and --source-index require --thread-id")
+        return {}
+    fields: dict[str, Any] = {"image_thread_id": _validate_task_id(thread)}
+    if args.model != "gpt-image-2":
+        raise ClientError("image threads require the advertised gpt-image-2 route")
+    if source is not None:
+        if not images or not 0 <= index < len(images):
+            raise ClientError("--source-index must identify a supplied original result image")
+        fields.update(edit_source_task_id=_validate_task_id(source), edit_source_index=index)
+    elif index:
+        raise ClientError("--source-index requires --source-task-id")
+    return fields
 
 
 def _fingerprint(contract: dict[str, Any]) -> str:
@@ -371,7 +482,7 @@ def _lookup_task(api: ApiClient, task_id: str) -> dict[str, Any]:
         return matches[0]
     if task_id not in missing:
         raise ClientError("task-list response did not account for the requested client task ID")
-    raise ClientError(f"server reports client task ID {task_id!r} as missing")
+    raise OriginalMissing(f"server reports client task ID {task_id!r} as missing")
 
 
 def _command_models(api: ApiClient, _args: argparse.Namespace) -> int:
@@ -392,12 +503,17 @@ def _command_submit(api: ApiClient, args: argparse.Namespace) -> int:
                 raise ClientError("--client-task-id does not match the durable state file")
             if fingerprint != state["input_fingerprint"]:
                 raise ClientError("durable client task ID already belongs to different immutable input")
-            task = _lookup_task(api, state["client_task_id"])
-            _emit(task)
-            return 0
+            try:
+                task = _lookup_task(api, state["client_task_id"])
+            except OriginalMissing:
+                if state.get("phase") != "not_sent":
+                    raise
+            else:
+                _emit(task)
+                return 0
 
-        task_id = explicit_task_id or _validate_task_id(f"image-{uuid.uuid4()}")
-        state = {
+        task_id = state["client_task_id"] if state else explicit_task_id or _validate_task_id(f"image-{uuid.uuid4()}")
+        state = state or {
             "schema_version": STATE_SCHEMA_VERSION,
             "client_task_id": task_id,
             "input_fingerprint": fingerprint,
@@ -418,9 +534,16 @@ def _command_submit(api: ApiClient, args: argparse.Namespace) -> int:
                 }
                 if args.size:
                     fields["size"] = args.size
+                if "account_ref" in contract:
+                    fields["account_ref"] = contract["account_ref"]
+                if "scheduling" in contract:
+                    fields["scheduling"] = json.dumps(contract["scheduling"], separators=(",", ":"))
+                for key in ("image_thread_id", "edit_source_task_id", "edit_source_index"):
+                    if key in contract:
+                        fields[key] = str(contract[key])
                 body, content_type = _multipart_body(fields, images)
-                result = api.json(
-                    "POST",
+                result = _submit_original(
+                    api, state_path, state,
                     "/api/image-tasks/edits",
                     body=body,
                     content_type=content_type,
@@ -434,15 +557,22 @@ def _command_submit(api: ApiClient, args: argparse.Namespace) -> int:
                 }
                 if args.size:
                     payload["size"] = args.size
-                result = api.json("POST", "/api/image-tasks/generations", payload=payload)
+                if "account_ref" in contract:
+                    payload["account_ref"] = contract["account_ref"]
+                if "scheduling" in contract:
+                    payload["scheduling"] = contract["scheduling"]
+                for key in ("image_thread_id", "edit_source_task_id", "edit_source_index"):
+                    if key in contract:
+                        payload[key] = contract[key]
+                result = _submit_original(api, state_path, state, "/api/image-tasks/generations", payload=payload)
             if result.get("id") != task_id:
                 raise ClientError("submit response changed the client task identity")
         except HttpFailure as exc:
-            state.update(phase="http_error", http_status=exc.status, updated_at=_utc_now())
+            state.update(phase="not_sent" if exc.not_sent else "http_error", http_status=exc.status, updated_at=_utc_now())
             _atomic_write_state(state_path, state)
             raise
         except ClientError:
-            state.update(phase="unknown", updated_at=_utc_now())
+            state.update(phase="not_sent" if state.get("phase") == "not_sent" else "unknown", updated_at=_utc_now())
             _atomic_write_state(state_path, state)
             raise
         state.update(
@@ -498,6 +628,15 @@ def _command_download(api: ApiClient, args: argparse.Namespace) -> int:
     state = _load_state(_state_path(args))
     task_id = _task_id(args, state)
     task = _lookup_task(api, task_id)
+    if task.get("status") != "success" and state and task.get("completion"):
+        if args.index != 0:
+            raise ClientError("bounded completion has one output; use index 0")
+        return _command_completion(api, argparse.Namespace(**{**vars(args), "command": "completion-save"}))
+    return _download_task(api, args, task_id)
+
+
+def _download_task(api: ApiClient, args: argparse.Namespace, task_id: str, *, emit=True) -> int:
+    task = _lookup_task(api, task_id)
     if task.get("status") != "success":
         raise ClientError(f"task is not successful; current status is {task.get('status')!r}")
     data = task.get("data")
@@ -514,9 +653,11 @@ def _command_download(api: ApiClient, args: argparse.Namespace) -> int:
         if length.isdigit() and int(length) > MAX_DOWNLOAD_BYTES:
             raise ClientError("download exceeds 100 MiB")
         fd = -1
+        created = False
         total = 0
         try:
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
             with os.fdopen(fd, "wb") as handle:
                 fd = -1
                 while True:
@@ -527,15 +668,21 @@ def _command_download(api: ApiClient, args: argparse.Namespace) -> int:
                     if total > MAX_DOWNLOAD_BYTES:
                         raise ClientError("download exceeds 100 MiB")
                     handle.write(chunk)
+                if total == 0 or (length.isdigit() and total != int(length)):
+                    raise ClientError("download incomplete; retry downloading the original result")
                 handle.flush()
                 os.fsync(handle.fileno())
-        except Exception:
+        except BaseException as exc:
             if fd >= 0:
                 os.close(fd)
-            with contextlib.suppress(FileNotFoundError):
-                target.unlink()
+            if created:
+                with contextlib.suppress(FileNotFoundError):
+                    target.unlink()
+            if isinstance(exc, (OSError, HTTPException)):
+                raise ClientError("download or save failed; retry downloading the original result") from exc
             raise
-    _emit({"client_task_id": task_id, "index": args.index, "output": str(target), "bytes": total})
+    if emit:
+        _emit({"client_task_id": task_id, "index": args.index, "output": str(target), "bytes": total})
     return 0
 
 
@@ -593,6 +740,12 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
         parts.append({"type": "image_url", "image_url": {"url":
             f"data:{item['content_type']};base64," + base64.b64encode(item["data"]).decode("ascii")}})
     body = {"model": args.model, "messages": [{"role": "user", "content": parts}]}
+    scheduling = _scheduling(args)
+    if scheduling is not None:
+        body["scheduling"] = scheduling
+    account_ref = _selected_account(args)
+    if account_ref is not None:
+        body["account_ref"] = account_ref
     conversation = None
     if args.previous_request_id is not None and args.session_id is None:
         raise ClientError("--previous-request-id requires --session-id")
@@ -610,9 +763,15 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
             request_id = _chat_request_id(args, state)
             if fingerprint != state.get("input_fingerprint"):
                 raise ClientError("Chat request already belongs to different immutable input")
-            _emit(_chat_receipt(api, request_id, conversation=conversation))
-            return 0
-        request_id = _validate_task_id(args.request_id or f"chat-{uuid.uuid4()}")
+            try:
+                existing = _chat_receipt(api, request_id, conversation=conversation)
+            except HttpFailure as exc:
+                if state.get("phase") != "not_sent" or exc.status != 404 or exc.detail != "CHAT_REQUEST_NOT_FOUND":
+                    raise
+            else:
+                _emit(existing)
+                return 0
+        request_id = state["request_id"] if state else _validate_task_id(args.request_id or f"chat-{uuid.uuid4()}")
         if args.previous_request_id:
             if request_id == args.previous_request_id:
                 raise ClientError("a new turn must have a different request ID from its predecessor")
@@ -620,22 +779,46 @@ def _command_chat_submit(api: ApiClient, args: argparse.Namespace) -> int:
             prior_session = previous.get("conversation")
             if not isinstance(prior_session, dict) or prior_session.get("protocol") != "sequential-v1" or prior_session.get("client_conversation_id") != args.session_id:
                 raise ClientError("previous Chat request does not belong to this sequential-v1 session")
-            if previous.get("status") != "succeeded":
-                raise ClientError("previous Chat request is not succeeded; query its original ID before submitting this turn")
-        state = {"schema": "chatgpt2api.chat-request.v1", "request_id": request_id,
+            if previous.get("status") not in {"succeeded", "queued", "running"}:
+                raise ClientError("previous Chat request cannot accept a dependent turn; recover its original result first")
+            # Admission persists this dependency and sends only after the
+            # previous answer finishes. Client acceptance is not a model send.
+        state = state or {"schema": "chatgpt2api.chat-request.v1", "request_id": request_id,
                  "input_fingerprint": fingerprint, "phase": "prepared", "created_at": _utc_now()}
+        if account_ref is not None:
+            state["account_ref"] = account_ref
         if conversation is not None:
             state["conversation"] = conversation
         _atomic_write_state(state_path, state)
         try:
-            result = api.json("POST", "/api/chat-requests", payload={"client_request_id": request_id, **body})
+            result = _submit_original(api, state_path, state, "/api/chat-requests", payload={"client_request_id": request_id, **body})
             _verify_chat_receipt(result, request_id, conversation)
         except (ClientError, KeyboardInterrupt):
-            state.update(phase="unknown", updated_at=_utc_now())
+            state.update(phase="not_sent" if state.get("phase") == "not_sent" else "unknown", updated_at=_utc_now())
             _atomic_write_state(state_path, state)
             raise
         state.update(phase="accepted", last_status=result.get("status"), updated_at=_utc_now())
         _atomic_write_state(state_path, state)
+    _emit(result)
+    return 0
+
+
+def _command_recovery_control(api: ApiClient, args: argparse.Namespace) -> int:
+    chat = args.command.startswith("chat-")
+    state = _load_chat_state(_chat_state_path(args)) if chat else _load_state(_state_path(args))
+    request_id = _chat_request_id(args, state) if chat else _task_id(args, state)
+    kind = "chat-requests" if chat else "image-tasks"
+    desired = "paused" if args.command.endswith("pause") else "active"
+    result = api.json("POST", f"/api/{kind}/{parse.quote(request_id, safe='')}/recovery-control",
+                      payload={"state": desired})
+    if result.get("request_id") != request_id:
+        raise ClientError("recovery control response changed the original request identity")
+    control = result.get("recovery_control") or {}
+    if desired == "active" and control.get("operator_stopped") is True:
+        _emit(result)
+        raise ClientError("automatic recovery remains stopped by another operator scope")
+    if control.get("state") not in ({"paused", "pausing"} if desired == "paused" else {"active"}):
+        raise ClientError("recovery control response did not confirm the requested state")
     _emit(result)
     return 0
 
@@ -645,6 +828,185 @@ def _command_chat_status(api: ApiClient, args: argparse.Namespace) -> int:
     request_id = _chat_request_id(args, state)
     _emit(_chat_receipt(api, request_id, recover=args.command == "chat-recover",
                         conversation=state.get("conversation") if state else None))
+    return 0
+
+
+def _command_chat_save(api: ApiClient, args: argparse.Namespace) -> int:
+    state = _load_chat_state(_chat_state_path(args))
+    request_id = _chat_request_id(args, state)
+    result = _chat_receipt(api, request_id, conversation=state.get("conversation") if state else None)
+    if result.get("status") != "succeeded" and state and result.get("completion"):
+        # The original receipt stays UNKNOWN. Save the server-selected linked
+        # result under its real ID and retain both identities in the state file.
+        return _command_completion(api, argparse.Namespace(**{**vars(args), "command": "chat-completion-save"}))
+    return _save_chat_result(result, request_id, args.output)
+
+
+def _save_chat_result(result, request_id, output, *, emit=True):
+    if result.get("status") != "succeeded" or not isinstance(result.get("content"), str):
+        raise ClientError("original Chat result is not ready to save")
+    target = _safe_output_path(output)
+    created = False
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(_json_bytes(result))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        if created:
+            with contextlib.suppress(FileNotFoundError):
+                target.unlink()
+        raise
+    if emit:
+        _emit({"request_id": request_id, "output": str(target), "bytes": target.stat().st_size})
+    return 0
+
+
+def _command_completion(api: ApiClient, args: argparse.Namespace) -> int:
+    """Keep the original state and record the one server-created selected result."""
+    chat = args.command.startswith("chat-")
+    path = _chat_state_path(args) if chat else _state_path(args)
+    action = args.command.rsplit("-", 1)[-1]
+    with _state_lock(path):
+        state = _load_chat_state(path) if chat else _load_state(path)
+        if not state:
+            raise ClientError("completion requires the original durable state file")
+        original_id = state["request_id" if chat else "client_task_id"]
+        endpoint = f"/api/{'chat-requests' if chat else 'image-tasks'}/{parse.quote(original_id, safe='')}/completion"
+        payload = None
+        if action == "recover":
+            payload = {"action": "recover", "allow_unconfirmed_retry": args.allow_unconfirmed_retry}
+            if getattr(args, "retry_not_sent", False):
+                if chat or args.allow_unconfirmed_retry:
+                    raise ClientError("confirmed not-sent image repair cannot authorize an unknown send")
+                repair = state.get("not_sent_retry") or {}
+                if not repair or repair.get("acknowledged"):
+                    receipt = _lookup_task(api, original_id)
+                    stamp = (receipt.get("last_recovery_failure") or {}).get("at")
+                    if (receipt.get("upstream_outcome") not in {"not_sent", "not_submitted"}
+                            or receipt.get("upstream_submission_started") is not False
+                            or receipt.get("recovery_retryable") is not True
+                            or not isinstance(stamp, (int, float)) or isinstance(stamp, bool)):
+                        raise ClientError("original image does not prove a retryable pre-submission failure")
+                    repair = {"failure_at": stamp, "acknowledged": False}
+                    state["not_sent_retry"] = repair
+                    _atomic_write_state(path, state)
+                payload["retry_not_sent_failure_at"] = repair["failure_at"]
+        current = api.json("POST" if payload else "GET", endpoint, payload=payload)
+        if (current.get("protocol") != "generation-completion-v1" or current.get("original_id") != original_id
+                or current.get("kind") != ("text" if chat else "image")):
+            raise ClientError("completion response changed original identity")
+        prior = state.get("completion") or {}
+        for key in ("replacement_id", "selected_id"):
+            if prior.get(key) and prior[key] != current.get(key):
+                raise ClientError("completion response changed its durable result selection")
+        state["completion"] = current
+        if payload and "retry_not_sent_failure_at" in payload:
+            state["not_sent_retry"]["acknowledged"] = True
+        _atomic_write_state(path, state)
+        selected = current.get("selected_id")
+        if action in {"save", "complete", "rework"} and not selected:
+            raise ClientError("no verified result selected; preserve the original task and inspect completion reason")
+        if action == "save":
+            if chat:
+                result = current.get("result") or {}
+                _verify_chat_receipt(result, selected)
+                _save_chat_result(result, selected, args.output, emit=False)
+            else:
+                _download_task(api, argparse.Namespace(output=args.output, index=0), selected, emit=False)
+            output = Path(args.output).expanduser().resolve(strict=True)
+            saved = output.read_bytes()
+            state["completion_output"] = {"selected_id": selected, "path": str(output),
+                                          "bytes": len(saved), "sha256": hashlib.sha256(saved).hexdigest()}
+            _atomic_write_state(path, state)
+        elif action in {"complete", "rework"}:
+            if action == "complete":
+                saved = state.get("completion_output") or {}
+                if saved.get("selected_id") != selected or not args.reviewed:
+                    raise ClientError("save and review the selected actual result before completing the task")
+                data = Path(saved["path"]).read_bytes()
+                if not data or len(data) != saved["bytes"] or hashlib.sha256(data).hexdigest() != saved["sha256"]:
+                    raise ClientError("saved result no longer matches; task remains incomplete")
+            payload = {"action": action, "selected_id": selected}
+            if action == "complete":
+                payload.update(results_saved=True, reviewed=True)
+            current = api.json("POST", endpoint, payload=payload)
+            if current.get("original_id") != original_id or current.get("selected_id") != selected:
+                raise ClientError("completion acknowledgement changed result identity")
+            state["completion"] = current
+            _atomic_write_state(path, state)
+    _emit(current)
+    return 0
+
+
+def _command_work_status(api: ApiClient, args: argparse.Namespace) -> int:
+    chat = args.command.startswith("chat-")
+    path = _chat_state_path(args) if chat else _state_path(args)
+    with _state_lock(path):
+        state = _load_chat_state(path) if chat else _load_state(path)
+        if not state:
+            raise ClientError("work status requires the original state file")
+        request_id = state["request_id" if chat else "client_task_id"]
+        ref = (state.get("conversation") or {}).get("client_conversation_id") if chat else state.get("input", {}).get("image_thread_id")
+        endpoint = f"/api/{'chat-requests' if chat else 'image-tasks'}/{parse.quote(request_id, safe='')}/work"
+        result = api.json("GET", endpoint)
+        if (result.get("protocol") != "work-v1" or result.get("request_id") != request_id
+                or result.get("kind") != ("text" if chat else "image") or ref and result.get("work_ref") != ref):
+            raise ClientError("work response changed original identity")
+        state["work"] = result
+        _atomic_write_state(path, state)
+    _emit(result)
+    return 0
+
+
+def _command_work_lifecycle(api: ApiClient, args: argparse.Namespace) -> int:
+    """An explicit work-complete event archives; rework restores that same work."""
+    chat = args.command.startswith("chat-")
+    archived = args.command in {"complete", "chat-complete"}
+    path = _chat_state_path(args) if chat else _state_path(args)
+    with _state_lock(path):
+        state = _load_chat_state(path) if chat else _load_state(path)
+        if state is None:
+            raise ClientError("work lifecycle requires the original durable state file")
+        if chat:
+            task_id = _chat_request_id(args, state)
+            expected = state.get("conversation")
+            if not isinstance(expected, dict) or not expected.get("client_conversation_id"):
+                raise ClientError("work lifecycle requires an original sequential-v1 session")
+            current = _chat_receipt(api, task_id, conversation=expected)
+            if current.get("status") != "succeeded":
+                raise ClientError("work is not complete; query the original request before archiving or rework")
+            endpoint = f"/api/chat-requests/{parse.quote(task_id, safe='')}/{'archive' if archived else 'restore'}-conversation"
+        else:
+            task_id = state["client_task_id"]
+            thread_id = state.get("input", {}).get("image_thread_id")
+            current = _lookup_task(api, task_id)
+            expected = current.get("image_thread")
+            if (not thread_id or not isinstance(expected, dict) or expected.get("protocol") != "image-thread-v1"
+                    or expected.get("id") != thread_id):
+                raise ClientError("work lifecycle requires the original image-thread-v1 receipt")
+            if current.get("status") != "success":
+                raise ClientError("work is not complete; query the original image before archiving or rework")
+            endpoint = f"/api/image-tasks/{parse.quote(task_id, safe='')}/{'archive' if archived else 'restore'}-thread"
+        state["lifecycle"] = {"operation": "archive" if archived else "restore", "status": "prepared", "updated_at": _utc_now()}
+        _atomic_write_state(path, state)
+        try:
+            result = api.json("POST", endpoint, payload={})
+            scope = result.get("conversation") if chat else result.get("image_thread")
+            id_key, scope_key = ("request_id", "client_conversation_id") if chat else ("task_id", "id")
+            if (result.get(id_key) != task_id or result.get("archived") is not archived
+                    or not isinstance(scope, dict) or scope.get("protocol") != expected.get("protocol")
+                    or scope.get(scope_key) != expected.get(scope_key)):
+                raise ClientError("lifecycle response did not confirm the original work and archive state")
+        except ClientError:
+            state["lifecycle"].update(status="unknown", updated_at=_utc_now())
+            _atomic_write_state(path, state)
+            raise
+        state["lifecycle"].update(status="confirmed", archived=archived, updated_at=_utc_now())
+        _atomic_write_state(path, state)
+    _emit(result)
     return 0
 
 
@@ -662,6 +1024,10 @@ def _parser() -> argparse.ArgumentParser:
     submit.add_argument("--client-task-id", help="stable 1..200 character URL-safe caller ID; generated when omitted")
     submit.add_argument("--prompt", required=True)
     submit.add_argument("--model", required=True, help="choose an ID returned by the models command")
+    submit.add_argument("--account-ref", help="advanced: require this opaque company account; omission keeps automatic allocation")
+    submit.add_argument("--thread-id", help="application work reference for an image-thread-v1 conversation")
+    submit.add_argument("--source-task-id", help="original successful task whose saved image is supplied for rework")
+    submit.add_argument("--source-index", type=int, default=0, help="index of the supplied original result among --image inputs")
     submit.add_argument("--size")
     submit.add_argument("--quality", default="auto")
     submit.add_argument("--image", action="append", default=[], metavar="PATH", help="repeat for an edit task")
@@ -685,6 +1051,7 @@ def _parser() -> argparse.ArgumentParser:
     chat.add_argument("--request-id")
     chat.add_argument("--session-id", help="application work session; requires Provider sequential-v1")
     chat.add_argument("--previous-request-id", help="previous succeeded request in the same session; checked before a new submit")
+    chat.add_argument("--account-ref", help="advanced: require this opaque company account; omission keeps automatic allocation")
     chat.add_argument("--model", required=True)
     chat.add_argument("--prompt", required=True)
     chat.add_argument("--image", action="append", default=[])
@@ -692,6 +1059,42 @@ def _parser() -> argparse.ArgumentParser:
         operation = subparsers.add_parser(command, help="read the original Chat receipt; recover only reads the upstream result")
         operation.add_argument("--state")
         operation.add_argument("--request-id")
+    for prefix in ("chat-", ""):
+        for action in ("pause", "resume"):
+            control = subparsers.add_parser(prefix + "recovery-" + action,
+                help="pause/resume original-result reads; never cancel or resend generation")
+            control.add_argument("--state")
+            control.add_argument("--request-id" if prefix else "--task-id")
+    save = subparsers.add_parser("chat-save", help="save the original successful Chat result, never rerun the model")
+    save.add_argument("--state", required=True)
+    save.add_argument("--output", required=True)
+    for command in ("work-status", "chat-work-status"):
+        work = subparsers.add_parser(command, help="read original work and automatic archive/restore progress")
+        work.add_argument("--state", required=True)
+    for operation in (submit, chat):
+        operation.add_argument("--workflow-id")
+        operation.add_argument("--workflow-concurrency", type=int)
+        operation.add_argument("--min-send-interval-seconds", type=float)
+        operation.add_argument("--not-before", help="UTC ISO8601 earliest actual send")
+        operation.add_argument("--wait-deadline", help="UTC ISO8601 deadline for work that has not yet been sent")
+    for command in ("complete", "rework", "chat-complete", "chat-rework"):
+        lifecycle = subparsers.add_parser(command, help="archive completed work or restore its original conversation for rework")
+        lifecycle.add_argument("--state", required=True)
+    for prefix in ("chat-", ""):
+        for action in ("recover", "status", "save", "complete", "rework"):
+            operation = subparsers.add_parser(prefix + "completion-" + action,
+                help="bounded pure-generation recovery with original identity and selected saved result")
+            operation.add_argument("--state", required=True)
+            if action == "recover":
+                operation.add_argument("--allow-unconfirmed-retry", action="store_true",
+                    help="explicitly permit at most one additional generation while original stop/outcome remains unknown")
+                if not prefix:
+                    operation.add_argument("--retry-not-sent", action="store_true",
+                        help="after repair, explicitly retry the same image ID only when its latest failure proves no generation was sent")
+            if action == "save":
+                operation.add_argument("--output", required=True)
+            if action == "complete":
+                operation.add_argument("--reviewed", action="store_true")
     return parser
 
 
@@ -711,11 +1114,22 @@ def main(argv: list[str] | None = None) -> int:
             "chat-submit": _command_chat_submit,
             "chat-status": _command_chat_status,
             "chat-recover": _command_chat_status,
+            "chat-save": _command_chat_save,
+            "work-status": _command_work_status,
+            "chat-work-status": _command_work_status,
+            "chat-complete": _command_work_lifecycle,
+            "chat-rework": _command_work_lifecycle,
+            "complete": _command_work_lifecycle,
+            "rework": _command_work_lifecycle,
             "submit": _command_submit,
             "status": _command_status,
             "resume": _command_resume,
             "download": _command_download,
         }
+        commands.update({prefix + "recovery-" + action: _command_recovery_control
+                         for prefix in ("chat-", "") for action in ("pause", "resume")})
+        commands.update({prefix + "completion-" + action: _command_completion
+                         for prefix in ("chat-", "") for action in ("recover", "status", "save", "complete", "rework")})
         return commands[args.command](api, args)
     except (ClientError, ValueError) as exc:
         _emit({"error": str(exc)}, stream=sys.stderr)

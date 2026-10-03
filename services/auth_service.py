@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -39,6 +40,25 @@ class AuthService:
     def _clean(value: object) -> str:
         return str(value or "").strip()
 
+    @classmethod
+    def _owner_subject(cls, value: object) -> str:
+        """Canonicalize the server-owned principal without exposing it to callers."""
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            except (TypeError, ValueError):
+                return ""
+        return cls._clean(value)
+
+    @classmethod
+    def _fair_source(cls, item: dict[str, object]) -> str | None:
+        # A legacy key with no owner remains its own lane.  A managed user's
+        # keys share only a hash of the canonical server-side owner principal.
+        if item.get("role") != "user":
+            return None
+        owner_subject = cls._owner_subject(item.get("owner_subject"))
+        return "user:" + _hash_key(owner_subject) if owner_subject else None
+
     @staticmethod
     def _default_name(role: object) -> str:
         return "管理员密钥" if str(role or "").strip().lower() == "admin" else "普通用户"
@@ -58,7 +78,7 @@ class AuthService:
         last_used_at = self._clean(raw.get("last_used_at")) or None
         return {
             "id": item_id,
-            "owner_subject": self._clean(raw.get("owner_subject")),
+            "owner_subject": self._owner_subject(raw.get("owner_subject")),
             "name": name,
             "role": role,
             "key_hash": key_hash,
@@ -134,7 +154,10 @@ class AuthService:
             raise ValueError("这个专用密钥已经存在，请换一个新的密钥")
         return key_hash
 
-    def _has_name_locked(self, name: str, *, role: AuthRole | None = None, exclude_id: str = "") -> bool:
+    def _has_name_locked(
+        self, name: str, *, role: AuthRole | None = None,
+        exclude_id: str = "", owner_subject: str | None = None,
+    ) -> bool:
         candidate = self._clean(name)
         if not candidate:
             return False
@@ -144,33 +167,49 @@ class AuthService:
                 continue
             if role is not None and item.get("role") != role:
                 continue
+            if owner_subject is not None and self._clean(item.get("owner_subject")) != owner_subject:
+                continue
             if self._clean(item.get("name")) == candidate:
                 return True
         return False
 
-    def _build_default_name_locked(self, role: AuthRole, *, exclude_id: str = "") -> str:
+    def _build_default_name_locked(
+        self, role: AuthRole, *, exclude_id: str = "",
+        owner_subject: str | None = None,
+    ) -> str:
         base_name = self._default_name(role)
-        if not self._has_name_locked(base_name, role=role, exclude_id=exclude_id):
+        if not self._has_name_locked(base_name, role=role, exclude_id=exclude_id,
+                                     owner_subject=owner_subject):
             return base_name
         suffix = 2
         while True:
             candidate = f"{base_name} {suffix}"
-            if not self._has_name_locked(candidate, role=role, exclude_id=exclude_id):
+            if not self._has_name_locked(candidate, role=role, exclude_id=exclude_id,
+                                         owner_subject=owner_subject):
                 return candidate
             suffix += 1
 
-    def _build_name_locked(self, name: str, *, role: AuthRole, exclude_id: str = "") -> str:
+    def _build_name_locked(
+        self, name: str, *, role: AuthRole, exclude_id: str = "",
+        owner_subject: str | None = None,
+    ) -> str:
+        # A display name belongs to its user's key list; it is not a global
+        # credential identity. Hash uniqueness and ID-based ownership checks
+        # remain global and unchanged. None retains the legacy helper lookup.
         candidate = self._clean(name)
         if not candidate:
-            return self._build_default_name_locked(role, exclude_id=exclude_id)
-        if self._has_name_locked(candidate, role=role, exclude_id=exclude_id):
+            return self._build_default_name_locked(role, exclude_id=exclude_id,
+                                                   owner_subject=owner_subject)
+        if self._has_name_locked(candidate, role=role, exclude_id=exclude_id,
+                                 owner_subject=owner_subject):
             raise ValueError("这个名称已经在使用中了，换一个更容易区分的名称吧")
         return candidate
 
-    def create_key(self, *, role: AuthRole, name: str = "", owner_subject: str = "", routes: list[str] | None = None) -> tuple[dict[str, object], str]:
+    def create_key(self, *, role: AuthRole, name: str = "", owner_subject: object = "", routes: list[str] | None = None) -> tuple[dict[str, object], str]:
         policy = make_policy(routes if routes is not None else ["chat"], revision=1) if role == "user" else None
+        owner_subject = self._owner_subject(owner_subject)
         with self._transaction():
-            normalized_name = self._build_name_locked(name, role=role)
+            normalized_name = self._build_name_locked(name, role=role, owner_subject=owner_subject)
             while True:
                 raw_key = f"sk-{secrets.token_urlsafe(24)}"
                 try:
@@ -229,6 +268,7 @@ class AuthService:
                         str(updates.get("name") or ""),
                         role=next_role,
                         exclude_id=normalized_id,
+                        owner_subject=self._clean(next_item.get("owner_subject")),
                     )
                 if "enabled" in updates and updates.get("enabled") is not None:
                     next_item["enabled"] = bool(updates.get("enabled"))
@@ -318,7 +358,14 @@ class AuthService:
                 if last_flush_at is None or (now - last_flush_at).total_seconds() >= 60:
                     item["last_used_at"] = now.isoformat()
                     self._last_used_flush_at[item_id] = now
-                return self._public_item(item)
+                identity = self._public_item(item)
+                fair_source = self._fair_source(item)
+                if fair_source:
+                    # This marker is internal authentication state. It is not
+                    # part of the public key listing/projection.
+                    identity["_fair_source"] = fair_source
+                    identity["_authenticated_fair_source"] = True
+                return identity
         return None
 
 

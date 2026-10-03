@@ -8,8 +8,10 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 
 from services.account_service import AccountService
+from services.model_service import ModelRoute
 from services.storage.json_storage import JSONStorageBackend
 from services.task_store import TaskStore
 from services.pool_admission import PoolAdmission
@@ -28,6 +30,7 @@ class Clock:
 def build(root, clock=None):
     root = Path(root)
     accounts = AccountService(JSONStorageBackend(root / "accounts.json"))
+    accounts.refresh_image_capability = lambda account_ref: None  # metadata is fixture-controlled
     store = TaskStore(root / "text_tasks.sqlite3")
     admission = PoolAdmission(store, accounts, clock=clock or (lambda: 1000.0),
                               settings=lambda: {"image_account_concurrency": 4, "codex_max_concurrency": 4},
@@ -77,7 +80,9 @@ class AdmissionTests(unittest.TestCase):
     def write_accounts(self, count):
         self.rows = [{"access_token": "fixture-token-" + str(i), "account_id": "upstream-" + str(i),
                       "provider_account_identity": "account-" + str(i), "type": "Plus", "status": "正常",
-                      "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-" + str(i)]}
+                      "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-" + str(i)],
+                      "limits_progress": [{"feature_name": "image_gen", "remaining": 999}],
+                      "capacity_observed_at": datetime.now(timezone.utc).isoformat()}
                      for i in range(count)]
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
 
@@ -108,6 +113,38 @@ class AdmissionTests(unittest.TestCase):
     def read(self, kind, owner, name):
         with self.store.connect() as db:
             return self.store.read_receipt(db, kind, owner, name)
+
+    def test_pending_public_successor_claims_immediately_and_rechecks_original_before_send(self):
+        session = {"client_conversation_id": "public-chain", "_public_route": "chat", "_public_session_ref": "public-chain"}
+        self.submit("first", **session)
+        self.submit("next", **session, _previous_request_id="first")
+        with self.store.transaction() as db:
+            original = self.store.read_receipt(db, "text", "happy", "first")
+            original.update(status="succeeded", upstream_outcome="completed", provider_binding_id="binding-0",
+                            provider_account_identity="account-0", conversation_id="chat-0", parent_message_id="answer-0")
+            self.store.write_receipt(db, "text", "happy", "first", original)
+        claim = self.admission.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.request_id, "next")
+        self.assertIsNone(self.admission.claim_next())
+        for key, changed in (("status", "unknown"), ("upstream_outcome", "unknown"),
+                             ("parent_message_id", "drift"), ("provider_account_identity", "other")):
+            with self.subTest(key=key):
+                with self.store.transaction() as db:
+                    self.store.write_receipt(db, "text", "happy", "first", {**original, key: changed})
+                with self.assertRaises(AdmissionLost):
+                    claim.before_send()
+                self.assertEqual(self.calls, [])
+                with self.store.transaction() as db:
+                    self.store.write_receipt(db, "text", "happy", "first", original)
+                self.clock.now += 2
+                claim = self.admission.claim_next()
+                self.assertIsNotNone(claim)
+        self.admission.execute(claim)
+        self.assertEqual(len(self.calls), 1)
+        sent = self.calls[0][2]
+        self.assertEqual(sent["parent_message_id"], "answer-0")
+        self.assertEqual(sent["conversation_id"], "chat-0")
 
     def test_completed_image_with_iso_creation_time_cannot_stop_text_recovery(self):
         self.image("saved-image")
@@ -285,10 +322,11 @@ class AdmissionTests(unittest.TestCase):
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         self.image("image")
         self.assertIsNone(self.admission.claim_next())
-        self.rows[0].update(managed_disabled=False, quota=0)
+        self.rows[0].update(managed_disabled=False, quota=0, limits_progress=[{"feature_name": "image_gen", "remaining": 0}])
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         self.assertIsNone(self.admission.claim_next())
         self.rows[0]["quota"] = 999
+        self.rows[0]["limits_progress"] = [{"feature_name": "image_gen", "remaining": 999}]
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         self.assertEqual(self.admission.claim_next().request_id, "image")
 
@@ -322,6 +360,7 @@ class AdmissionTests(unittest.TestCase):
         self.image("reserved")
         ctx = self.admission.claim_next()
         self.rows[0]["quota"] = 0
+        self.rows[0]["limits_progress"] = [{"feature_name": "image_gen", "remaining": 0}]
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         with self.assertRaises(AdmissionLost):
             ctx.before_send()
@@ -439,6 +478,23 @@ class AdmissionTests(unittest.TestCase):
         self.submit("other", owner="wb")
         self.assertEqual(self.admission.claim_next().request_id, "other")
         self.assertIsNone(self.admission.claim_next())
+
+    def test_durable_model_route_never_claims_same_plan_unobserved_account(self):
+        self.accounts.add_account_items([{
+            "access_token": "fixture-token-observed", "account_id": "upstream-observed",
+            "provider_account_identity": "account-observed", "type": "Plus", "status": "正常",
+            "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-observed"],
+        }])
+        self.admission.model_types = lambda _model: ModelRoute(
+            account_types=frozenset({"Plus"}), account_identities=frozenset({"account-observed"}),
+        )
+        self.submit("observed-only")
+
+        context = self.admission.claim_next()
+
+        self.assertIsNotNone(context)
+        receipt = self.read("text", "happy", "observed-only")
+        self.assertEqual(receipt["provider_account_identity"], "account-observed")
 
     def terminal_empty_correction_pair(self):
         session = "same-public-session"
@@ -631,6 +687,106 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.read("text", "happy", "original")["status"], "unknown")
         self.write_accounts(2)
         self.assertIsNone(self.admission.claim_next())
+
+    def test_unknown_originals_do_not_probe_catalog_but_keep_order_fence(self):
+        from services.pool_admission import unfinished
+        catalog_calls = []
+        self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
+        for name, values in [
+            ("unknown", {"status": "unknown"}),
+            ("failed-unknown", {"status": "failed", "error_code": "RESULT_UNRECOVERABLE",
+                                "upstream_outcome": "unknown"}),
+            ("completed-original", {"status": "failed", "error_code": "RESULT_UNRECOVERABLE",
+                                    "upstream_outcome": "unknown", "_attempt_finished_at": 999,
+                                    "_completion": {"state": "completed", "selected_id": "saved-child"}}),
+        ]:
+            self.submit(name, provider_binding_id="binding-0", provider_account_identity="account-0")
+            with self.store.transaction() as db:
+                receipt = self.store.read_receipt(db, "text", "happy", name)
+                receipt.update(values)
+                self.store.write_receipt(db, "text", "happy", name, receipt)
+            self.assertIsNone(self.admission.claim_next())
+            saved = self.read("text", "happy", name)
+            self.assertTrue(unfinished("text", saved))
+            for key, value in values.items():
+                self.assertEqual(saved[key], value)
+        self.assertEqual(catalog_calls, [])
+
+    def test_expired_unsent_worker_releases_execution_marker_for_work_pause(self):
+        from services.work_lifecycle import WorkLifecycleService
+        self.submit("stopped-unsent", _public_session_ref="session-stopped-unsent")
+        old = self.admission.claim_next()
+        self.clock.now += 31
+        with self.store.transaction() as db:
+            self.admission._recover_claims(db, list(self.store.receipts(db)), self.clock())
+        receipt = self.read("text", "happy", "stopped-unsent")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(receipt["_executing"])
+        self.assertIsNone(receipt["_claim_until"])
+        with self.assertRaises(AdmissionLost):
+            old.before_send()
+        lifecycle = WorkLifecycleService(self.text, self.images, clock=self.clock)
+        work = lifecycle.update("text", {"id": "happy"}, "stopped-unsent", "paused")
+        self.assertEqual(work["state"], "paused")
+        self.assertFalse(work["slot_held"])
+        self.assertIsNone(self.admission.claim_next())
+        self.assertEqual(self.calls, [])
+
+    def test_new_queued_text_still_discovers_models_for_admission(self):
+        catalog_calls = []
+        self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
+        self.submit("new-work")
+        self.assertEqual(self.admission.claim_next().request_id, "new-work")
+        self.assertEqual(catalog_calls, ["fixture-text"])
+
+    def test_legacy_fenced_unsent_marker_is_cleared_without_changing_original_input(self):
+        self.submit("legacy-unsent")
+        with self.store.transaction() as db:
+            row = self.store.read_receipt(db, "text", "happy", "legacy-unsent")
+            row.update(_executing=True, _claim_id=None, _claim_until=999, _submission_started=False)
+            self.store.write_receipt(db, "text", "happy", "legacy-unsent", row)
+            self.admission._recover_claims(db, list(self.store.receipts(db)), self.clock())
+        saved = self.read("text", "happy", "legacy-unsent")
+        self.assertEqual(saved, {**row, "_executing": False, "_claim_until": None})
+        self.assertEqual(self.calls, [])
+
+    def test_legacy_marker_cleanup_does_not_change_sent_or_owned_work(self):
+        for index, change in enumerate((
+                {"status": "unknown"}, {"_claim_id": "live", "_claim_until": 2000},
+                {"_submission_started": True}, {"_executing": False})):
+            with self.subTest(change=change):
+                rid = "preserved-" + str(index)
+                self.submit(rid)
+                with self.store.transaction() as db:
+                    row = self.store.read_receipt(db, "text", "happy", rid)
+                    row.update(_executing=True, _claim_id=None, _claim_until=999,
+                               _submission_started=False)
+                    row.update(change)
+                    self.store.write_receipt(db, "text", "happy", rid, row)
+                    self.admission._recover_claims(db, [("text", "happy", rid, row.copy())], self.clock())
+                self.assertEqual(self.read("text", "happy", rid), row)
+        self.assertEqual(self.calls, [])
+
+    def test_expired_captured_image_claim_preserves_real_failure_or_uses_neutral_state(self):
+        for prior_code in (None, "RECOVERY_TIMED_OUT"):
+            with self.subTest(prior_code=prior_code):
+                rid = "captured-" + str(prior_code)
+                self.image(rid)
+                context = self.admission.claim_next()
+                context.before_send()
+                context.record_stage("send_call_started")
+                detail = {"phase": "collect_image_result", "type": "TimeoutError", "at": 1000}
+                self.admission.update_claim(context, result_file_ids=["original-file"],
+                    recovery_error_code=prior_code, last_recovery_failure=detail)
+                self.clock.now += 31
+                self.assertIsNone(self.admission.claim_next())
+                record = self.read("image", "happy", rid)
+                self.assertEqual(record["recovery_error_code"], prior_code or "RECOVERY_RESULT_INCOMPLETE")
+                self.assertEqual(record["last_recovery_failure"], detail)
+                self.assertEqual(record["recovery_phase"], "download_image_result")
+                self.assertEqual(record["result_file_ids"], ["original-file"])
+                self.assertFalse(record["upstream_unfinished"])
+                self.assertEqual(sum(e["stage"] == "send_call_started" for e in record["_execution_timeline"]), 1)
 
     def test_account_disabled_between_claim_and_send_is_not_sent(self):
         self.submit("original")

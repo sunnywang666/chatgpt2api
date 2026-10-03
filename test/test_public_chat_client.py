@@ -31,6 +31,21 @@ def session_client(directory):
 
         def do_POST(self):
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path.endswith(("/archive-conversation", "/restore-conversation")):
+                request_id = self.path.split("/")[-2]
+                saved = json.loads((Path(directory) / f"{request_id}.json").read_text())
+                calls.append(("LIFECYCLE", self.path, saved))
+                if request_id + "-lifecycle" in disconnect:
+                    self.close_connection = True
+                    return
+                scope = receipts[request_id]["conversation"]
+                body = json.dumps({"request_id": request_id, "conversation": scope,
+                                   "archived": self.path.endswith("/archive-conversation")}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             request_id = payload["client_request_id"]
             saved = json.loads((Path(directory) / f"{request_id}.json").read_text())
             calls.append(("POST", payload, saved))
@@ -51,7 +66,7 @@ def session_client(directory):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    def run(request_id, previous=None, session="work", command="chat-submit"):
+    def run(request_id, previous=None, session="work", command="chat-submit", account_ref=None):
         args = [sys.executable, str(CLIENT), "--server-root", f"http://127.0.0.1:{server.server_port}/ai",
                 "--timeout", "1", command, "--state", str(Path(directory) / f"{request_id}.json")]
         if command == "chat-submit":
@@ -59,6 +74,10 @@ def session_client(directory):
                      "--session-id", session]
             if previous:
                 args += ["--previous-request-id", previous]
+            if account_ref is not None:
+                args += ["--account-ref", account_ref]
+        elif command == "chat-save":
+            args += ["--output", str(Path(directory) / f"{request_id}-result.json")]
         return subprocess.run(args, env={**os.environ, "CHATGPT2API_BEARER_TOKEN": "fixture-only"},
                               capture_output=True, text=True)
 
@@ -70,6 +89,71 @@ def session_client(directory):
 
 
 class ChatClientTest(unittest.TestCase):
+    def test_save_original_result_after_process_restart_without_another_submit(self):
+        with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, receipts, _):
+            self.assertEqual(run("save-original").returncode, 0)
+            result = run("save-original", command="chat-save")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            saved = json.loads((Path(directory) / "save-original-result.json").read_text())
+            self.assertEqual(saved, receipts["save-original"])
+            self.assertEqual(run("save-original", command="chat-save").returncode, 1)
+            self.assertEqual(sum(call[0] == "POST" for call in calls), 1)
+
+    def test_explicit_work_complete_and_rework_keep_original_session(self):
+        with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, receipts, disconnect):
+            self.assertEqual(run("work-final").returncode, 0)
+            receipts["work-final"]["status"] = "unknown"
+            self.assertEqual(run("work-final", command="chat-complete").returncode, 1)
+            self.assertFalse(any(row[0] == "LIFECYCLE" for row in calls))
+            receipts["work-final"]["status"] = "succeeded"
+            disconnect.add("work-final-lifecycle")
+            self.assertEqual(run("work-final", command="chat-complete").returncode, 1)
+            saved = json.loads((Path(directory) / "work-final.json").read_text())
+            self.assertEqual(saved["lifecycle"]["status"], "unknown")
+            self.assertEqual(saved["request_id"], "work-final")
+            disconnect.clear()
+            for command, archived in (("chat-complete", True), ("chat-rework", False)):
+                result = run("work-final", command=command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIs(json.loads(result.stdout)["archived"], archived)
+                saved = json.loads((Path(directory) / "work-final.json").read_text())
+                self.assertEqual(saved["lifecycle"]["status"], "confirmed")
+                self.assertEqual(saved["conversation"]["client_conversation_id"], "work")
+            for row in calls:
+                if row[0] == "LIFECYCLE":
+                    self.assertEqual(row[2]["lifecycle"]["status"], "prepared")
+            self.assertEqual(sum(row[0] == "POST" for row in calls), 1)
+
+    def test_advanced_account_selection_is_immutable_and_restart_reads_original(self):
+        selected = "car_" + "a" * 43
+        other = "car_" + "b" * 43
+        with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, _, disconnect):
+            disconnect.add("selected")
+            first = run("selected", account_ref=selected)
+            self.assertEqual(first.returncode, 1)
+            self.assertEqual(calls[0][1]["account_ref"], selected)
+            self.assertEqual(calls[0][2]["account_ref"], selected)
+            self.assertEqual(calls[0][2]["phase"], "unknown")
+            for ref in (other, None):
+                changed = run("selected", account_ref=ref)
+                self.assertEqual(changed.returncode, 1)
+                self.assertIn("immutable input", changed.stderr)
+            repeat = run("selected", account_ref=selected)
+            self.assertEqual(repeat.returncode, 0, repeat.stderr)
+            status = run("selected", command="chat-status")
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertEqual([call[0] for call in calls], ["POST", "GET", "GET"])
+
+    def test_invalid_account_reference_never_writes_or_sends(self):
+        with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, _, _):
+            for ref in ("", "token", "car_short", "car_" + "a" * 42, "car_" + "a" * 44):
+                with self.subTest(ref=ref):
+                    result = run("invalid", account_ref=ref)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("opaque car_ reference", result.stderr)
+                    self.assertFalse((Path(directory) / "invalid.json").exists())
+            self.assertEqual(calls, [])
+
     def test_invalid_session_references_cannot_silently_become_a_new_conversation(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "invalid.json"
@@ -115,15 +199,31 @@ class ChatClientTest(unittest.TestCase):
                 self.assertEqual(payload["client_conversation_id"], "work")
                 self.assertEqual(payload.get("previous_request_id"), previous)
                 self.assertEqual(payload["messages"], [{"role": "user", "content": [{"type": "text", "text": f"delta-{request_id}"}]}])
-                self.assertEqual(saved["phase"], "prepared")
+                self.assertEqual(saved["phase"], "unknown")
                 self.assertEqual(saved["conversation"], receipts[request_id]["conversation"])
                 text = (Path(directory) / f"{request_id}.json").read_text()
                 self.assertNotIn("fixture-only", text)
                 self.assertNotIn(f"delta-{request_id}", text)
 
-    def test_incomplete_or_unconfirmed_predecessor_never_submits_next_turn(self):
+    def test_queued_or_running_predecessor_can_accept_a_durable_dependent_turn(self):
         with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, receipts, _):
-            for index, status in enumerate(("queued", "running", "not_started", "unknown", "failed", "missing", "wrong_session", "old_protocol")):
+            for status in ("queued", "running"):
+                receipts["previous"] = {"request_id": "previous", "route": "chat", "status": status,
+                    "conversation": {"protocol": "sequential-v1", "client_conversation_id": "work",
+                                     "previous_request_id": None}}
+                result = run("next-" + status, "previous")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                post = calls[-1]
+                self.assertEqual(post[0], "POST")
+                self.assertEqual(post[1]["previous_request_id"], "previous")
+                self.assertEqual(post[2]["phase"], "unknown")
+                # Restart only reads the child; it never resubmits either turn.
+                self.assertEqual(run("next-" + status, "previous").returncode, 0)
+            self.assertEqual(sum(row[0] == "POST" for row in calls), 2)
+
+    def test_failed_or_unconfirmed_predecessor_never_submits_next_turn(self):
+        with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, receipts, _):
+            for index, status in enumerate(("not_started", "unknown", "failed", "missing", "wrong_session", "old_protocol")):
                 with self.subTest(status=status):
                     receipt = {"request_id": "previous", "route": "chat", "status": status, "conversation": {
                         "protocol": "sequential-v1", "client_conversation_id": "work", "previous_request_id": None}}
@@ -135,7 +235,7 @@ class ChatClientTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 1)
                     self.assertFalse((Path(directory) / f"next-{index}.json").exists())
             self.assertTrue(all(call[0] == "GET" for call in calls))
-            self.assertEqual(len(calls), 8)
+            self.assertEqual(len(calls), 6)
 
     def test_missing_session_confirmation_preserves_original_and_never_falls_back(self):
         with tempfile.TemporaryDirectory() as directory, session_client(directory) as (run, calls, receipts, _):
@@ -199,7 +299,7 @@ class ChatClientTest(unittest.TestCase):
                 submit = ["chat-submit", "--state", str(state), "--request-id", "original", "--model", "fixture-text", "--prompt", "private test input"]
                 first = subprocess.run(base + submit, env=env, capture_output=True, text=True)
                 self.assertEqual(first.returncode, 1, first.stderr)
-                self.assertEqual(posts[0][1]["phase"], "prepared")
+                self.assertEqual(posts[0][1]["phase"], "unknown")
                 self.assertEqual(posts[0][1]["request_id"], "original")
                 self.assertEqual(json.loads(state.read_text())["phase"], "unknown")
                 repeat = subprocess.run(base + submit, env=env, capture_output=True, text=True)

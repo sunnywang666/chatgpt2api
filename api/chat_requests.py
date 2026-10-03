@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from api.recovery_control import RecoveryControlRequest, update_recovery_control
+
 from services.request_context import trusted_source
 
 import hashlib
@@ -11,7 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from api.image_inputs import normalize_inline_chat_messages
-from api.key_policy import require_chat_text_policy
+from api.key_policy import require_chat_text_policy, require_codex_endpoint
 from api.support import require_identity
 from services.content_filter import check_request, request_shape, request_text
 from services.conversation_binding_service import ConversationBindingError
@@ -23,6 +25,7 @@ from services.public_chat_service import (
     require_public_text_model,
 )
 from services.text_task_service import text_task_service
+from services.work_lifecycle import WorkLifecycleError, get_work_lifecycle_service
 
 
 class PublicChatRequest(BaseModel):
@@ -34,6 +37,7 @@ class PublicChatRequest(BaseModel):
         pattern=r"^[A-Za-z0-9_.:-]+$",
     )
     model: str = Field(min_length=1, max_length=200)
+    account_ref: str | None = Field(default=None, strict=True, pattern=r"^car_[A-Za-z0-9_-]{43}$")
     messages: list[dict[str, object]] = Field(min_length=1, max_length=100)
     reasoning_effort: Literal["high"] | None = None
     # An application-owned work session, NOT an upstream conversation cursor.
@@ -41,6 +45,8 @@ class PublicChatRequest(BaseModel):
     previous_request_id: str | None = Field(default=None, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9_.:-]+$")
     # A new corrective turn, never a retry of the original sent request.
     continue_after_terminal_empty: bool = Field(default=False, strict=True)
+    # Caller pacing belongs to the durable receipt, never the upstream payload.
+    scheduling: object | None = None
 
     @field_validator("client_conversation_id", "previous_request_id", mode="before")
     @classmethod
@@ -58,6 +64,20 @@ class PublicChatRequest(BaseModel):
         if self.client_conversation_id and self.messages[-1].get("role") != "user":
             raise ValueError("a sequential turn must end with its new user input")
         return self
+
+    @field_validator("account_ref", mode="before")
+    @classmethod
+    def reject_null_account_ref(cls, value):
+        if value is None:
+            raise ValueError("account_ref must be omitted or an advertised account reference")
+        return value
+
+    @field_validator("scheduling", mode="before")
+    @classmethod
+    def reject_null_scheduling(cls, value):
+        if value is None:
+            raise ValueError("scheduling must be omitted or an object")
+        return value
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
@@ -83,6 +103,21 @@ class OriginalRecoveryRequest(BaseModel):
 
 class ArchivePublicSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class WorkLifecycleUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["active", "paused", "completed"]
+    results_saved: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def completed_requires_saved_results(self):
+        if self.state == "completed" and self.results_saved is not True:
+            raise ValueError("results_saved=true is required when state is completed")
+        if self.state != "completed" and self.results_saved:
+            raise ValueError("results_saved applies only when state is completed")
+        return self
 
 
 def _ordinary_identity(authorization: str | None, request: Request) -> dict[str, object]:
@@ -113,6 +148,11 @@ def _payload(owner: str, body: PublicChatRequest, messages: list[dict]) -> dict:
         "_text_only_binding": True,
         "_public_route": "chat",
     }
+    if body.account_ref is not None:
+        payload["_requested_account_ref"] = body.account_ref
+    if body.scheduling is not None:
+        from services.workflow_scheduling import normalize_scheduling
+        payload["_scheduling"] = normalize_scheduling(body.scheduling)
     if body.client_conversation_id is not None:
         digest = hashlib.sha256(f"{owner}\0session\0{body.client_conversation_id}".encode()).hexdigest()
         payload["client_conversation_id"] = f"public-session-{digest}"
@@ -148,8 +188,27 @@ def _projection(receipt: dict, request_id: str) -> dict:
         raise HTTPException(503, detail={"code": exc.code}) from None
 
 
+async def _require_work_route_policy(identity: dict[str, object], owner: str, request_id: str) -> None:
+    """Authorize lifecycle access by the original durable route, not its URL."""
+    receipt = await run_in_threadpool(_raw_text_receipt, owner, request_id)
+    if receipt is None:
+        raise _not_found(request_id)
+    if receipt.get("_route") == "codex":
+        require_codex_endpoint(identity)
+    else:
+        require_chat_text_policy(identity, endpoint="/api/chat-requests", model=receipt.get("model"))
+
+
+def _raw_text_receipt(owner: str, request_id: str) -> dict[str, object] | None:
+    """Read the owner-scoped receipt only for server-side route authorization."""
+    with text_task_service.store.connect() as db:
+        return text_task_service.store.read_receipt(db, "text", owner, request_id)
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
+    from api.generation_completion import create_router as completion_router
+    router.include_router(completion_router("text"))
 
     @router.post("/api/chat-requests")
     async def create_chat_request(
@@ -161,7 +220,12 @@ def create_router() -> APIRouter:
         identity = _ordinary_identity(authorization, request)
         owner = _owner(identity)
         messages = await run_in_threadpool(normalize_inline_chat_messages, body.messages)
-        payload = _payload(owner, body, messages)
+        try:
+            payload = _payload(owner, body, messages)
+        except ValueError as exc:
+            if str(exc).startswith("SCHEDULING_INVALID"):
+                raise HTTPException(400, detail={"code": "SCHEDULING_INVALID"}) from None
+            raise
         try:
             # Check immutable identity before current model/capacity admission.
             # A prior accepted request remains readable when the catalog later
@@ -195,9 +259,10 @@ def create_router() -> APIRouter:
 
         require_chat_text_policy(identity, endpoint="/api/chat-requests", model=body.model)
         try:
-            require_public_text_model(body.model)
+            await run_in_threadpool(require_public_text_model, body.model)
         except PublicChatContractError as exc:
-            raise HTTPException(400, detail={"code": exc.code, "error": str(exc)}) from None
+            raise HTTPException(503 if exc.code == "MODEL_DISCOVERY_UNAVAILABLE" else 400,
+                                detail={"code": exc.code, "error": str(exc)}) from None
         except Exception:
             raise HTTPException(503, detail={"code": "MODEL_DISCOVERY_UNAVAILABLE"}) from None
 
@@ -226,6 +291,13 @@ def create_router() -> APIRouter:
                         "request_id": body.client_request_id,
                         **({"previous_request_id": body.previous_request_id} if body.previous_request_id else {})},
             ) from exc
+        except WorkLifecycleError as exc:
+            call.log("提交失败", status="failed", error=exc.code)
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except ValueError as exc:
+            if str(exc) == "SCHEDULING_UNAVAILABLE":
+                raise HTTPException(503, detail={"code": "SCHEDULING_UNAVAILABLE"}) from None
+            raise
         except HTTPException as exc:
             call.log("提交失败", status="failed", error=str(exc.detail))
             raise
@@ -246,7 +318,17 @@ def create_router() -> APIRouter:
         identity = _ordinary_identity(authorization, request)
         request_id = _validated_request_id(request_id)
         try:
+            if text_task_service.admission is not None:
+                owner = _owner(identity)
+                await _require_work_route_policy(identity, owner, request_id)
+                return await run_in_threadpool(
+                    get_work_lifecycle_service().set_archived, "text", identity, request_id, True,
+                )
             return await run_in_threadpool(text_task_service.archive_public_session, _owner(identity), request_id)
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except HTTPException:
+            raise
         except ConversationBindingError as exc:
             status = 404 if exc.code == "CHAT_REQUEST_NOT_FOUND" else 409
             raise HTTPException(status, detail={"code": exc.code}) from None
@@ -260,7 +342,17 @@ def create_router() -> APIRouter:
         identity = _ordinary_identity(authorization, request)
         request_id = _validated_request_id(request_id)
         try:
+            if text_task_service.admission is not None:
+                owner = _owner(identity)
+                await _require_work_route_policy(identity, owner, request_id)
+                return await run_in_threadpool(
+                    get_work_lifecycle_service().set_archived, "text", identity, request_id, False,
+                )
             return await run_in_threadpool(text_task_service.restore_public_session, _owner(identity), request_id)
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except HTTPException:
+            raise
         except ConversationBindingError as exc:
             status = 404 if exc.code == "CHAT_REQUEST_NOT_FOUND" else 409
             raise HTTPException(status, detail={"code": exc.code}) from None
@@ -278,7 +370,57 @@ def create_router() -> APIRouter:
         request_id = _validated_request_id(request_id)
         receipt = await run_in_threadpool(text_task_service.read, _owner(identity), request_id)
         response.headers["Cache-Control"] = "private, no-store"
-        return _projection(receipt, request_id)
+        result = _projection(receipt, request_id)
+        completion = getattr(text_task_service.admission, "generation_completion", None)
+        if receipt.get("completion") and completion is not None:
+            # Preserve the original attempt's status. The original polling URL
+            # also exposes its logical task and the selected retry's real ID.
+            result["completion"] = await run_in_threadpool(completion.read, "text", identity, request_id)
+        return result
+
+    @router.get("/api/chat-requests/{request_id}/work")
+    async def read_chat_work(
+        request_id: str,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = _ordinary_identity(authorization, request)
+        request_id = _validated_request_id(request_id)
+        owner = _owner(identity)
+        await _require_work_route_policy(identity, owner, request_id)
+        try:
+            return await run_in_threadpool(
+                get_work_lifecycle_service().get, "text", identity, request_id,
+            )
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+
+    @router.post("/api/chat-requests/{request_id}/work")
+    async def update_chat_work(
+        request_id: str,
+        body: WorkLifecycleUpdateRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = _ordinary_identity(authorization, request)
+        request_id = _validated_request_id(request_id)
+        owner = _owner(identity)
+        await _require_work_route_policy(identity, owner, request_id)
+        try:
+            return await run_in_threadpool(
+                get_work_lifecycle_service().update,
+                "text", identity, request_id, body.state, body.results_saved,
+            )
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+
+    @router.post("/api/chat-requests/{request_id}/recovery-control")
+    async def control_chat_recovery(request_id: str, body: RecoveryControlRequest, request: Request,
+                                    response: Response, authorization: str | None = Header(default=None)):
+        identity = _ordinary_identity(authorization, request)
+        response.headers["Cache-Control"] = "private, no-store"
+        return await update_recovery_control(text_task_service, "text", _owner(identity),
+                                             _validated_request_id(request_id), body)
 
     @router.post("/api/chat-requests/{request_id}/recover")
     async def recover_chat_request(
@@ -312,6 +454,7 @@ def create_router() -> APIRouter:
             owner,
             request_id,
             False,
+            explicit_ended_recheck=True,
         )
         response.headers["Cache-Control"] = "private, no-store"
         return _projection(receipt, request_id)

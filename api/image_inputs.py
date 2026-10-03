@@ -34,6 +34,7 @@ MAX_BASE64_INPUT_CHARS = 4 * ((MAX_IMAGE_REFERENCE_BYTES + 2) // 3)
 MAX_CHAT_TEXT_BYTES = 1024 * 1024
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
+ACCOUNT_REF_PATTERN = re.compile(r"^car_[A-Za-z0-9_-]{43}$")
 
 
 def _input_error(message: str) -> HTTPException:
@@ -119,6 +120,37 @@ def _parse_count(value: object) -> int:
     return count
 
 
+def account_ref_from_fields(fields: dict[str, Any]) -> str | None:
+    """Keep the advertised pool reference distinct from private identities."""
+    if "account_ref" not in fields:
+        return None
+    value = fields["account_ref"]
+    if not isinstance(value, str) or not ACCOUNT_REF_PATTERN.fullmatch(value):
+        raise HTTPException(status_code=400, detail={"code": "IMAGE_ACCOUNT_REF_INVALID"})
+    return value
+
+
+def scheduling_from_fields(fields: dict[str, Any]) -> dict[str, Any] | None:
+    """Parse the public scheduling object once for JSON and multipart edits."""
+    if "scheduling" not in fields:
+        return None
+    value = fields["scheduling"]
+    if value is None:
+        raise HTTPException(status_code=400, detail={"code": "SCHEDULING_INVALID"})
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail={"code": "SCHEDULING_INVALID"}) from None
+    try:
+        from services.workflow_scheduling import normalize_scheduling
+        return normalize_scheduling(value)
+    except ValueError as exc:
+        if str(exc).startswith("SCHEDULING_INVALID"):
+            raise HTTPException(status_code=400, detail={"code": "SCHEDULING_INVALID"}) from None
+        raise
+
+
 def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     """构造图片编辑载荷：从表单或 JSON 字段提取通用参数。"""
     prompt = _clean(fields.get("prompt"))
@@ -135,6 +167,12 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     }
     if "client_task_id" in fields:
         payload["client_task_id"] = _clean(fields.get("client_task_id"))
+    account_ref = account_ref_from_fields(fields)
+    if account_ref is not None:
+        payload["account_ref"] = account_ref
+    scheduling = scheduling_from_fields(fields)
+    if scheduling is not None:
+        payload["scheduling"] = scheduling
     for field in (
         "provider_binding_id",
         "provider_account_identity",
@@ -271,7 +309,7 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
 
     form = await request.form()
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream",
+    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream", "account_ref", "scheduling",
                 "image_thread_id", "edit_source_task_id", "edit_source_index", "provider_binding_id",
                 "provider_account_identity", "client_conversation_id", "conversation_id", "parent_message_id",
                 "retain_conversation", "upstream_model"):

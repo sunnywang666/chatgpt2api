@@ -9,13 +9,15 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
-from services.image_task_service import ImageTaskService, _authoritative_image_failure
+from services.account_request_pacing import AccountRequestClock, AccountRequestDeadlineExceeded, pace_account_session
+from services.image_task_service import ImageTaskService, _authoritative_image_failure, _failure_details
 from services.image_thread import ImageThreadError
 from services.openai_backend_api import (
     ChatRequirements,
     ImageActiveDeadlineExceeded,
     ImageContentPolicyError,
     ImagePollTimeoutError,
+    ImageStreamHardTimeoutError,
     OpenAIBackendAPI,
 )
 from services.protocol.conversation import (
@@ -144,8 +146,237 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
-    def test_generation_post_records_submission_boundary_before_network_call(self):
+    def test_image_external_transfers_consume_deadline_without_account_clock(self):
+        from services.openai_backend_api import requests
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("services.account_request_pacing.DATA_DIR", Path(tmp)), \
+             mock.patch("services.account_request_pacing._clocks", {}), \
+             mock.patch("services.openai_backend_api.time.time", return_value=1000), \
+             mock.patch("services.account_request_pacing.time.monotonic", return_value=100), \
+             mock.patch.object(requests.Session, "request", autospec=True) as transport:
+            transport.return_value = mock.Mock(status_code=200, content=b"generated-image")
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.session = requests.Session()
+            pace_account_session(backend.session, {"account_id": "fixture"}, "fixture-token")
+            callback = lambda _step: None
+            callback.active_deadline_at = 1010
+            backend.progress_callback = callback
+            self.assertEqual(backend.download_image_bytes(["https://storage.test/result"]), [b"generated-image"])
+            backend.session.put("https://storage.test/upload", data=b"input", **backend._image_request_options(120))
+            for call in transport.call_args_list:
+                self.assertEqual(call.kwargs["timeout"], 10)
+                self.assertFalse(any(key.startswith("_account_request") for key in call.kwargs))
+            self.assertEqual(transport.call_count, 2)
+            with self.assertRaises(AccountRequestDeadlineExceeded):
+                backend.session.get("https://storage.test/result", timeout=10, _account_request_deadline_monotonic=99)
+            self.assertEqual(transport.call_count, 2)
+            backend.close()
+
+    def test_image_result_reads_cannot_wait_past_active_deadline_in_account_clock(self):
+        operations = (
+            lambda backend: backend._get_conversation("original"),
+            lambda backend: backend._query_backend_tasks("original"),
+            lambda backend: backend._get_file_download_url("generated"),
+            lambda backend: backend._get_attachment_download_url("original", "generated"),
+            lambda backend: backend.download_image_bytes(["https://images.test/generated"]),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), mock.patch("services.openai_backend_api.time.time", return_value=1000), \
+                 mock.patch("services.account_request_pacing.time.monotonic", return_value=100), \
+                 mock.patch("services.account_request_pacing.time.sleep") as sleep:
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.base_url = "https://provider.test"
+                backend._headers = lambda *_args: {}
+                callback = lambda _step: None
+                callback.active_deadline_at = 1010
+                backend.progress_callback = callback
+                clock = AccountRequestClock()
+                clock.cooldown_until = 120
+                transport = mock.Mock(return_value=mock.Mock(status_code=200, headers={}, content=b"image"))
+                transport.return_value.json.return_value = {"tasks": []}
+                backend.session = mock.Mock()
+                backend.session.get.side_effect = lambda url, **kwargs: clock.request(transport, "GET", url, **kwargs)
+                with self.assertRaises(AccountRequestDeadlineExceeded):
+                    operation(backend)
+                transport.assert_not_called()
+                sleep.assert_not_called()
+                self.assertFalse(clock.lock.locked())
+
+    def test_image_result_read_reduces_transport_timeout_after_cooldown(self):
+        now = [100.0]
+        with mock.patch("services.openai_backend_api.time.time", side_effect=lambda: now[0] + 900), \
+             mock.patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             mock.patch("services.account_request_pacing.time.sleep", side_effect=lambda secs: now.__setitem__(0, now[0] + secs)):
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.base_url = "https://provider.test"
+            backend._headers = lambda *_args: {}
+            callback = lambda _step: None
+            callback.active_deadline_at = 1010
+            backend.progress_callback = callback
+            clock = AccountRequestClock()
+            clock.cooldown_until = 104
+            transport = mock.Mock(return_value=mock.Mock(status_code=200, headers={}))
+            transport.return_value.json.return_value = {"current_node": "original"}
+            backend.session = mock.Mock()
+            backend.session.get.side_effect = lambda url, **kwargs: clock.request(transport, "GET", url, **kwargs)
+            self.assertEqual(backend._get_conversation("original"), {"current_node": "original"})
+            self.assertEqual(transport.call_args.kwargs["timeout"], 6)
+            self.assertFalse(any(key.startswith("_account_request") for key in transport.call_args.kwargs))
+
+    def test_image_preflight_raw_read_does_not_receive_pacing_kwargs(self):
         backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://provider.test"
+        backend._headers = lambda *_args: {}
+        callback = lambda _step: None
+        callback.active_deadline_at = time.time() + 10
+        backend.progress_callback = callback
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"current_node": "original"}
+        def send(method, url, *, headers, timeout):
+            self.assertEqual(method, "GET")
+            self.assertLessEqual(timeout, 10)
+            return response
+        self.assertEqual(backend._get_conversation("original", _send=send), {"current_node": "original"})
+        response.close.assert_called_once()
+
+    def test_image_pacing_wait_uses_active_budget_not_network_timeout(self):
+        for active_seconds, expected_timeout in ((120, 30), (45, 10), (30, None)):
+            now = [100.0]
+            with self.subTest(active_seconds=active_seconds), \
+                 mock.patch("services.openai_backend_api.time.time", side_effect=lambda: now[0] + 900), \
+                 mock.patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+                 mock.patch("services.account_request_pacing.time.sleep", side_effect=lambda secs: now.__setitem__(0, now[0] + secs)):
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.base_url = "https://provider.test"
+                backend._headers = lambda *_args: {}
+                callback = lambda _step: None
+                callback.active_deadline_at = 1000 + active_seconds
+                backend.progress_callback = callback
+                clock = AccountRequestClock()
+                clock.next_request = 135
+                transport = mock.Mock(return_value=mock.Mock(status_code=200, headers={}))
+                transport.return_value.json.return_value = {"current_node": "original"}
+                backend.session = mock.Mock()
+                backend.session.get.side_effect = lambda url, **kwargs: clock.request(transport, "GET", url, **kwargs)
+                if expected_timeout is None:
+                    with self.assertRaises(AccountRequestDeadlineExceeded):
+                        backend._get_conversation("original", timeout_secs=30)
+                    transport.assert_not_called()
+                else:
+                    self.assertEqual(backend._get_conversation("original", timeout_secs=30), {"current_node": "original"})
+                    self.assertEqual(now[0], 135)
+                    self.assertEqual(transport.call_args.kwargs["timeout"], expected_timeout)
+                self.assertFalse(clock.lock.locked())
+
+    def test_image_local_read_pacing_preserves_active_budget_but_not_http_time(self):
+        now = [100.0]
+        with mock.patch("services.openai_backend_api.time.time", side_effect=lambda: now[0] + 900), \
+             mock.patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             mock.patch("services.account_request_pacing.time.sleep", side_effect=lambda secs: now.__setitem__(0, now[0] + secs)):
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.base_url = "https://provider.test"
+            backend._headers = lambda *_args: {}
+            callback = lambda _step: None
+            callback.active_deadline_at = 1300
+            callback.local_pacing_wait_secs = 0
+            def credit(seconds):
+                callback.active_deadline_at += seconds
+                callback.local_pacing_wait_secs += seconds
+            callback.record_local_pacing_wait = credit
+            backend.progress_callback = callback
+            clock = AccountRequestClock()
+            response = mock.Mock(status_code=200, headers={})
+            response.json.return_value = {"current_node": "original"}
+            def transport(*args, **kwargs):
+                self.assertFalse(any(k.startswith('_account_request') for k in kwargs))
+                now[0] += 1
+                return response
+            backend.session = mock.Mock()
+            backend.session.get.side_effect = lambda url, **kwargs: clock.request(transport, "GET", url, **kwargs)
+            for _ in range(8):
+                clock.next_conversation_read = now[0] + 60
+                backend._get_conversation("original")
+            self.assertEqual(callback.local_pacing_wait_secs, 480)
+            self.assertEqual(backend._image_active_timeout(300), 292)
+
+    def test_image_provider_cooldown_is_not_credited_as_local_wait(self):
+        with mock.patch("services.openai_backend_api.time.time", return_value=1000), \
+             mock.patch("services.account_request_pacing.time.monotonic", return_value=100):
+            backend = object.__new__(OpenAIBackendAPI)
+            callback = lambda _step: None
+            callback.active_deadline_at = 1010
+            callback.record_local_pacing_wait = mock.Mock()
+            backend.progress_callback = callback
+            clock = AccountRequestClock()
+            clock.cooldown_until = 160
+            transport = mock.Mock()
+            with self.assertRaises(AccountRequestDeadlineExceeded):
+                clock.request(transport, "GET", "https://provider.test/conversation/original", **backend._image_request_options(60))
+            transport.assert_not_called()
+            callback.record_local_pacing_wait.assert_not_called()
+            self.assertEqual(clock.cooldown_until, 160)
+
+    @mock.patch("services.openai_backend_api.account_service.require_image_account")
+    def test_final_local_deadline_after_reservation_remains_known_unsent(self, _capability):
+        from services.request_context import executing
+        now = [100.0]
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "synthetic-fixture"
+        backend.base_url = "https://provider.test"
+        backend.image_request_message_id = "original"
+        backend.image_submission_started = False
+        backend.retain_bound_conversation = True
+        backend._image_model_settings = lambda _model: ("gpt-image", "")
+        backend._image_headers = lambda *_args: {}
+        callback = lambda _step: None
+        callback.active_deadline_at = 1001
+        callback.record_submission_started = lambda: now.__setitem__(0, 102)
+        backend.progress_callback = callback
+        clock = AccountRequestClock()
+        transport = mock.Mock()
+        backend.session = mock.Mock()
+        backend.session.post.side_effect = lambda url, **kwargs: clock.request(transport, "POST", url, **kwargs)
+        context = mock.Mock(owner="owner", request_id="request")
+        context.log_fields.return_value = {}
+        with mock.patch("services.openai_backend_api.time.time", side_effect=lambda: now[0] + 900), \
+             mock.patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), executing(context):
+            with self.assertRaises(AccountRequestDeadlineExceeded):
+                backend._start_image_generation("cat", ChatRequirements(token="fixture"), "conduit", "gpt-image-2")
+        transport.assert_not_called()
+        context.record_stage.assert_not_called()
+        self.assertFalse(backend.image_submission_started)
+
+    @mock.patch("services.openai_backend_api.account_service.require_image_account")
+    def test_endpoint_404_fallback_local_deadline_is_known_unsent(self, _capability):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "synthetic-fixture"
+        backend.base_url = "https://provider.test"
+        backend.image_request_message_id = "original"
+        backend.image_submission_started = False
+        backend.retain_bound_conversation = True
+        backend._image_model_settings = lambda _model: ("gpt-image", "")
+        backend._image_headers = lambda *_args: {}
+        backend.progress_callback = lambda _step: None
+        first = mock.Mock(status_code=404)
+        calls = []
+        def post(url, **kwargs):
+            calls.append(url)
+            kwargs['_account_request_before_send']()
+            if len(calls) == 1:
+                return first
+            raise AccountRequestDeadlineExceeded("local wait before fallback transport")
+        backend.session = mock.Mock()
+        backend.session.post.side_effect = post
+        with self.assertRaises(AccountRequestDeadlineExceeded):
+            backend._start_image_generation("cat", ChatRequirements(token="fixture"), "conduit", "gpt-image-2")
+        self.assertEqual(len(calls), 2)
+        first.close.assert_called_once()
+        self.assertFalse(backend.image_submission_started)
+
+    @mock.patch("services.openai_backend_api.account_service.require_image_account", return_value={"provider_account_identity": "fixture"})
+    def test_generation_post_records_submission_boundary_before_network_call(self, _capability):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "synthetic-fixture"
         backend.base_url = "https://chatgpt.example.test"
         backend.image_request_message_id = "request-message-1"
         backend.image_submission_started = False
@@ -243,8 +474,10 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertEqual(len(observed_timeouts), 6)
         self.assertTrue(all(0 < timeout <= 2.0 for timeout in observed_timeouts))
 
-    def test_generation_post_is_not_called_when_submission_boundary_cannot_be_persisted(self):
+    @mock.patch("services.openai_backend_api.account_service.require_image_account", return_value={"provider_account_identity": "fixture"})
+    def test_generation_post_is_not_called_when_submission_boundary_cannot_be_persisted(self, _capability):
         backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "synthetic-fixture"
         backend.base_url = "https://chatgpt.example.test"
         backend.image_request_message_id = "request-message-1"
         backend.image_submission_started = False
@@ -462,6 +695,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["error_code"], "RESULT_UNRECOVERABLE")
             self.assertEqual(task["error"], "bootstrap connection timed out")
             self.assertEqual(task["progress"], "bootstrapping")
+            self.assertEqual(task["last_recovery_failure"]["phase"], "bootstrap")
             self.assertFalse(task["upstream_submission_started"])
             self.assertFalse(task["upstream_unfinished"])
             self.assertEqual(task["upstream_outcome"], "not_submitted")
@@ -696,6 +930,23 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(reloaded["active_attempt_started_at"], task["active_attempt_started_at"])
             self.assertEqual(reloaded["active_attempt_deadline_at"], task["active_attempt_deadline_at"])
 
+    def test_local_pacing_credit_is_persisted_without_resetting_active_budget(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "tasks.json"
+            def handler(payload):
+                callback = payload["progress_callback"]
+                callback.start_active_attempt()
+                callback.record_local_pacing_wait(60)
+                callback.record_local_pacing_wait(420)
+                return {"data": [{"url": "http://example.test/image.png"}]}
+            service = self.make_service(path, handler)
+            service.submit_generation(OWNER, client_task_id="paced", prompt="cat", model="gpt-image-2", size=None)
+            wait_for_task(service, OWNER, "paced", "success")
+            restarted = self.make_service(path)
+            with restarted._transaction():
+                task = restarted._tasks["owner-1:paced"]
+                self.assertEqual(task["active_local_pacing_wait_secs"], 480)
+                self.assertAlmostEqual(task["active_attempt_deadline_at"] - task["active_attempt_started_at"], 780)
     def test_bound_account_and_chat_lock_waits_precede_active_budget(self):
         marks = {}
 
@@ -768,6 +1019,47 @@ class ImageTaskServiceTests(unittest.TestCase):
 
         self.assertEqual(outputs[0].conversation_id, "conversation-1")
 
+    def test_actual_submission_replaces_stale_not_submitted_outcome(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            observed = {}
+
+            def handler(payload):
+                # The same request previously returned to admission before
+                # sending because its original conversation was unreadable.
+                service._update_task(
+                    "owner-1:resumed-send", upstream_outcome="not_submitted",
+                    upstream_submission_started=False,
+                    error_code="IMAGE_THREAD_PREVIOUS_UNCONFIRMED",
+                    waiting={"reason": "archive_restore"}, recovery_retryable=True,
+                )
+                callback = payload["progress_callback"]
+                callback.record_submission_started()
+                observed.update(service.list_tasks(OWNER, ["resumed-send"])["items"][0])
+                error = ConnectionError("response lost after submission")
+                error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+                error.upstream_submitted = True
+                raise error
+
+            service = self.make_service(path, handler)
+            service.submit_generation(
+                OWNER, client_task_id="resumed-send", prompt="cat", model="gpt-image-2", size=None,
+                provider_binding_id="binding-1", provider_account_identity="account-1",
+                client_conversation_id="client-1", retain_conversation=True,
+            )
+            failed = wait_for_task(service, OWNER, "resumed-send", "error")
+            self.assertEqual(observed["upstream_outcome"], "unknown")
+            self.assertTrue(observed["upstream_submission_started"])
+            self.assertFalse(observed.get("error_code"))
+            self.assertFalse(observed.get("waiting"))
+            self.assertFalse(observed.get("recovery_retryable"))
+            self.assertEqual(failed["upstream_outcome"], "unknown")
+            self.assertEqual(failed["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+            restarted = self.make_service(path)
+            reloaded = restarted.list_tasks(OWNER, ["resumed-send"])["items"][0]
+            self.assertEqual(reloaded["upstream_outcome"], "unknown")
+            self.assertTrue(reloaded["upstream_submission_started"])
+
     def test_generated_result_download_failure_resumes_download_without_poll_or_generation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
@@ -793,10 +1085,12 @@ class ImageTaskServiceTests(unittest.TestCase):
             )
             failed = wait_for_task(service, OWNER, "download-task", "error")
             self.assertEqual(failed["recovery_phase"], "download_image_result")
-            self.assertEqual(failed["recovery_error_code"], "RECOVERY_DOWNLOAD_FAILED")
+            self.assertEqual(failed["recovery_error_code"], "RECOVERY_TRANSPORT_FAILED")
             self.assertEqual(failed["upstream_outcome"], "generated")
             self.assertFalse(failed["upstream_unfinished"])
             self.assertNotIn("token=secret", failed["error"])
+            service._update_task("owner-1:download-task", active_attempt_deadline_at=time.time() - 1)
+            failed = service.list_tasks(OWNER, ["download-task"])["items"][0]
             active_started_at = failed["active_attempt_started_at"]
             active_deadline_at = failed["active_attempt_deadline_at"]
             service = self.make_service(path)
@@ -849,6 +1143,245 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(succeeded["active_attempt_deadline_at"], active_deadline_at)
             self.assertEqual(DownloadBackend.polls, 0)
             self.assertEqual(DownloadBackend.reads, 0)
+
+    def test_pending_image_ids_survive_restart_without_skipping_settle_or_releasing_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            def handler(payload):
+                callback = payload["progress_callback"]
+                callback.record_submission_started()
+                callback.record_conversation_id("conversation-1")
+                callback.record_pending_result_ids(["pending-file"], [])
+                error = ImagePollTimeoutError("settle budget exhausted", "conversation-1")
+                error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+                error.upstream_submitted = True
+                raise error
+            service = self.make_service(path, handler)
+            service.submit_generation(
+                OWNER, client_task_id="pending-task", prompt="cat", model="gpt-image-2", size=None,
+                provider_binding_id="binding-1", provider_account_identity="account-1",
+                client_conversation_id="client-1", retain_conversation=True,
+            )
+            failed = wait_for_task(service, OWNER, "pending-task", "error")
+            self.assertTrue(failed["upstream_unfinished"])
+            self.assertEqual(failed["recovery_phase"], "read_image_request")
+            service = self.make_service(path)
+            self.assertEqual(service._tasks["owner-1:pending-task"]["_pending_image_result_ids"],
+                             {"file_ids": ["pending-file"], "sediment_ids": []})
+            from services.pool_admission import image_generation_active
+            self.assertTrue(image_generation_active("image", service._tasks["owner-1:pending-task"], False))
+            calls = []
+            from services.openai_backend_api import OpenAIBackendAPI as RealBackend
+            from services.config import config
+            original_message = service._tasks["owner-1:pending-task"]["request_message_id"]
+            class PendingBackend(RealBackend):
+                reads = 0
+                def __init__(self, access_token=None, proxy_url=None):
+                    pass
+                def _get_conversation(self, _conversation_id):
+                    PendingBackend.reads += 1
+                    return {"current_node": "image", "mapping": {
+                        original_message: {"message": {"author": {"role": "user"}}},
+                        "image": {"parent": original_message, "message": {
+                            "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
+                            "content": {"parts": ["file-service://pending-file", "file-service://second-file"]}}}}}
+                def _poll_image_results(self, _conversation_id, _timeout, **kwargs):
+                    if not kwargs.get("require_fresh_result_ids"):
+                        raise AssertionError("pending IDs must be observed again")
+                    if not kwargs.get("initial_document"):
+                        raise AssertionError("reuse this recovery attempt's fresh snapshot")
+                    calls.append(("poll", kwargs["initial_file_ids"]))
+                    return super()._poll_image_results(_conversation_id, _timeout, **kwargs)
+                def resolve_conversation_image_urls(self, _conversation_id, files, sediments, **kwargs):
+                    calls.append(("resolve", files))
+                    return ["https://provider.test/result.png"]
+                def download_image_bytes(self, _urls):
+                    calls.append(("download", []))
+                    return [b"image-result"]
+                def get_conversation_parent_message_id(self, _conversation_id):
+                    return "result-parent"
+                def close(self):
+                    pass
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", PendingBackend),
+                mock.patch.dict(config.data, {"image_settle_enabled": True, "image_settle_secs": 0.5,
+                    "image_check_before_hit_enabled": True, "image_poll_initial_wait_secs": 10}),
+            ):
+                with mock.patch.dict(config.data, {"image_settle_secs": 30}), mock.patch(
+                    "services.image_task_service.time.sleep"
+                ) as sleep:
+                    service._run_resume_poll("owner-1:pending-task", "conversation-1", 5,
+                                             "http://provider", OWNER, "generate", "gpt-image-2", False, False)
+                    sleep.assert_called_once_with(5)
+                    self.assertEqual(PendingBackend.reads, 0)
+                    self.assertEqual(calls, [])
+                    self.assertEqual(service._tasks["owner-1:pending-task"]["status"], "error")
+                    self.assertEqual(service._tasks["owner-1:pending-task"]["_pending_image_result_ids"],
+                                     {"file_ids": ["pending-file"], "sediment_ids": []})
+                service._update_task("owner-1:pending-task", next_poll_at=0)
+                service.resume_poll(OWNER, "pending-task", 5, "http://provider")
+                still_pending = wait_for_task(service, OWNER, "pending-task", "error")
+                for worker in threading.enumerate():
+                    if worker.name == "image-resume-pending-task":
+                        worker.join(timeout=2)
+                        self.assertFalse(worker.is_alive())
+                self.assertEqual(calls, [("poll", ["pending-file"])])
+                self.assertEqual(PendingBackend.reads, 1)
+                self.assertTrue(still_pending["upstream_unfinished"])
+                service = self.make_service(path)
+                service._update_task("owner-1:pending-task", next_poll_at=0,
+                                     _attempt_finished_at=time.time(), error_code="RESULT_UNRECOVERABLE")
+                from services.pool_admission import PoolAdmission
+                service.admission = PoolAdmission(service.store, None)
+                service.admission.recoveries["image"] = lambda owner, task_id: service.resume_poll(
+                    {"id": owner, "role": "user"}, task_id, 5, "http://provider")
+                service.admission.recover_one()
+                succeeded = wait_for_task(service, OWNER, "pending-task", "success")
+                # A visible success precedes the admission worker's final claim
+                # release. Keep its SQLite directory until that worker exits.
+                for worker in threading.enumerate():
+                    if worker.name == "image-resume-pending-task":
+                        worker.join(timeout=2)
+                        self.assertFalse(worker.is_alive())
+            self.assertEqual(calls[1], ("poll", ["pending-file", "second-file"]))
+            self.assertEqual(calls[2][0], "resolve")
+            self.assertEqual(calls[3][0], "download")
+            self.assertEqual(PendingBackend.reads, 2)
+            self.assertIsNone(service._tasks["owner-1:pending-task"].get("_pending_image_result_ids"))
+            self.assertEqual(succeeded["image_session_parent_id"], "result-parent")
+
+    def test_successful_handler_clears_pending_observations(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            def handler(payload):
+                payload["progress_callback"].record_pending_result_ids(["observed-file"], [])
+                return {"data": [{"url": "https://provider.test/finished.png"}]}
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_generation(OWNER, client_task_id="pending-success", prompt="cat",
+                                      model="gpt-image-2", size=None)
+            wait_for_task(service, OWNER, "pending-success", "success")
+            self.assertIsNone(service._tasks["owner-1:pending-success"].get("_pending_image_result_ids"))
+
+    def test_captured_result_failure_keeps_cause_without_claiming_download_failed(self):
+        for error_type, expected in (
+            (ImageStreamHardTimeoutError, "RECOVERY_TIMED_OUT"),
+            (ImageActiveDeadlineExceeded, "RECOVERY_TIMED_OUT"),
+            (RuntimeError, "RECOVERY_RESULT_INCOMPLETE"),
+        ):
+            with self.subTest(error_type=error_type), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                def handler(payload):
+                    callback = payload["progress_callback"]
+                    callback.start_active_attempt()
+                    callback.record_submission_started()
+                    callback.record_conversation_id("conversation-1")
+                    callback.record_result_ids(["file-generated"], [])
+                    error = error_type("Authorization: bearer-secret URL=https://private.test/signed")
+                    error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+                    error.conversation_id = "conversation-1"
+                    error.request_message_id = callback.request_message_id
+                    error.upstream_submitted = True
+                    raise error
+                service = self.make_service(path, handler)
+                service.submit_generation(
+                    OWNER, client_task_id="captured-task", prompt="cat", model="gpt-image-2", size=None,
+                    provider_binding_id="binding-1", provider_account_identity="account-1",
+                    client_conversation_id="client-1", retain_conversation=True,
+                )
+                failed = wait_for_task(service, OWNER, "captured-task", "error")
+                self.assertEqual(failed["recovery_error_code"], expected)
+                self.assertEqual(failed["recovery_phase"], "download_image_result")
+                detail = failed["last_recovery_failure"]
+                self.assertEqual(detail["phase"], "handler_operation")
+                self.assertEqual(detail["type"], error_type.__name__)
+                self.assertNotIn("bearer-secret", json.dumps(failed))
+                self.assertNotIn("private.test", json.dumps(failed))
+                restored = self.make_service(path).list_tasks(OWNER, ["captured-task"])["items"][0]
+                self.assertEqual(restored["last_recovery_failure"], detail)
+
+    def test_handler_failure_reports_observed_phase_separately_from_recovery_action(self):
+        for step, expected_phase in (
+            ("preparing_conversation", "prepare_conversation"),
+            ("starting_generation", "start_image_generation"),
+            ("generating", "stream_image_generation"),
+            ("image_stream_resolve_start", "resolve_image_result"),
+            ("receiving_image", "receive_image_result"),
+            (None, "handler_operation"),
+            ("unrecognized_step", "handler_operation"),
+        ):
+            with self.subTest(step=step), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                def handler(payload):
+                    callback = payload["progress_callback"]
+                    callback.record_submission_started()
+                    callback.record_conversation_id("conversation-1")
+                    if step is not None:
+                        callback(step)
+                    raise ImageGenerationError(
+                        "Authorization: bearer-secret URL=https://private.test/signed",
+                        conversation_id="conversation-1",
+                        request_message_id=callback.request_message_id,
+                        upstream_submitted=True,
+                    )
+                service = self.make_service(path, handler)
+                service.submit_generation(
+                    OWNER, client_task_id="phase-task", prompt="cat", model="gpt-image-2", size=None,
+                    provider_binding_id="binding-1", provider_account_identity="account-1",
+                    client_conversation_id="client-1", retain_conversation=True,
+                )
+                failed = wait_for_task(service, OWNER, "phase-task", "error")
+                self.assertEqual(failed["last_recovery_failure"]["phase"], expected_phase)
+                self.assertEqual(failed["recovery_phase"], "read_image_request")
+                self.assertEqual(failed["recovery_error_code"], "RECOVERY_READ_FAILED")
+                self.assertEqual(failed["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+                self.assertNotIn("bearer-secret", json.dumps(failed))
+                self.assertNotIn("private.test", json.dumps(failed))
+                restored = self.make_service(path).list_tasks(OWNER, ["phase-task"])["items"][0]
+                self.assertEqual(restored["last_recovery_failure"], failed["last_recovery_failure"])
+
+    def test_restart_captured_result_does_not_invent_a_download_failure(self):
+        for prior_code in (None, "RECOVERY_TIMED_OUT"):
+            with self.subTest(prior_code=prior_code), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                detail = {"phase": "collect_image_result", "type": "TimeoutError", "status_code": None, "at": 1000}
+                write_policy_task(path, status="running", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                    result_file_ids=["original-file"], recovery_error_code=prior_code, last_recovery_failure=detail)
+                restored = self.make_service(path).list_tasks(OWNER, ["policy-task"])["items"][0]
+                self.assertEqual(restored["recovery_error_code"], prior_code or "RECOVERY_RESULT_INCOMPLETE")
+                self.assertEqual(restored["last_recovery_failure"], detail)
+                self.assertEqual(restored["recovery_phase"], "download_image_result")
+
+    def test_public_failure_details_drop_untrusted_persisted_fields(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path, last_recovery_failure={
+                "phase": "https://private.test/token", "type": "token=private",
+                "status_code": "secret", "at": float("nan"),
+                "body": "Authorization: private", "url": "https://private.test",
+                "code": "https://private.test/token",
+            })
+            public = self.make_service(path).list_tasks(OWNER, ["policy-task"])["items"][0]
+            self.assertEqual(public["last_recovery_failure"], {
+                "phase": "unknown", "type": "Error", "status_code": None, "at": None,
+            })
+            self.assertNotIn("private", json.dumps(public))
+
+    def test_original_image_confirmation_reason_survives_restart_without_exception_text(self):
+        for code in ("IMAGE_THREAD_UPSTREAM_CHANGED", "IMAGE_THREAD_TURN_UNCONFIRMED"):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as tmp_dir:
+                error = ImageThreadError(code)
+                error.args = ("Authorization: private",)
+                detail = _failure_details(error, "confirm_image_turn")
+                path = Path(tmp_dir) / "image_tasks.json"
+                write_policy_task(path, result_file_ids=["original-file"],
+                    recovery_error_code="RECOVERY_THREAD_UNCONFIRMED", last_recovery_failure=detail)
+                restored = self.make_service(path)
+                public = restored.list_tasks(OWNER, ["policy-task"])["items"][0]
+                self.assertEqual(public["last_recovery_failure"]["code"], code)
+                self.assertEqual(restored._tasks["owner-1:policy-task"]["result_file_ids"], ["original-file"])
+                self.assertNotIn("private", json.dumps(public))
 
     def test_generated_download_rate_limit_and_auth_keep_phase_and_failure_type(self):
         for status, expected_code, retry_after in (
@@ -1071,7 +1604,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
     def test_expired_deadline_preserves_running_request_and_transport_failures(self):
         for scenario, expected_code in (
-            ("running", "RECOVERY_READ_FAILED"),
+            ("running", "RECOVERY_TIMED_OUT"),
             ("transport", "RECOVERY_TRANSPORT_FAILED"),
         ):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp_dir:
@@ -1235,7 +1768,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 def __init__(self, access_token=None, proxy_url=None):
                     self.access_token = access_token
 
-                def _poll_image_results(self, conversation_id, timeout, request_message_id=""):
+                def _poll_image_results(self, conversation_id, timeout, request_message_id="", initial_document=None):
                     self.poll = (conversation_id, timeout, request_message_id)
                     self.poll_calls.append(self.poll)
                     return ["file-1"], []
@@ -1330,7 +1863,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                             },
                         }
 
-                    def _poll_image_results(self, conversation_id, timeout, request_message_id=""):
+                    def _poll_image_results(self, conversation_id, timeout, request_message_id="", initial_document=None):
                         self.poll_calls.append((conversation_id, timeout, request_message_id))
                         # An empty /backend-api/tasks result and no branch image
                         # identifiers do not prove success or failure.

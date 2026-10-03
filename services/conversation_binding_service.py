@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any
 
 from services.account_service import account_service
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
 from services.protocol.conversation import conversation_events
 from utils.helper import UpstreamHTTPError
 
@@ -22,6 +22,7 @@ class TextRecoveryReason(str, Enum):
     REQUEST_BRANCH_AMBIGUOUS = "REQUEST_BRANCH_AMBIGUOUS"
     REQUEST_BRANCH_SUPERSEDED = "REQUEST_BRANCH_SUPERSEDED"
     REQUEST_RESULT_INCOMPLETE = "REQUEST_RESULT_INCOMPLETE"
+    REQUEST_CONVERSATION_ADVANCED = "REQUEST_CONVERSATION_ADVANCED"
     REQUEST_RESULT_NOT_FOUND = "REQUEST_RESULT_NOT_FOUND"
     REQUEST_RESULT_TERMINAL_EMPTY = "REQUEST_RESULT_TERMINAL_EMPTY"
     REQUEST_RESULT_NON_TEXT = "REQUEST_RESULT_NON_TEXT"
@@ -33,6 +34,88 @@ class TextRecoveryReason(str, Enum):
 _ACTIVE_TEXT_RESULT_STATUSES = frozenset({"in_progress", "running", "pending", "queued"})
 NON_TEXT_RESULT_FIELD = "_non_text_result"
 TURN_END_EVIDENCE_FIELD = "_turn_end_evidence"
+RESULT_OBSERVATION_FIELD = "_original_result_observation"
+OBSERVED_CONTENT_TYPES = frozenset({"text", "code", "execution_output", "thoughts", "reasoning_recap"})
+
+
+def _content_observation(content):
+    """Measure known text/tool envelopes without retaining their contents."""
+    if not isinstance(content, dict):
+        return None
+    kind = content.get("content_type")
+    if not isinstance(kind, str):
+        return None
+    items = finished = 0
+    if kind == "text":
+        parts = content.get("parts")
+        if not isinstance(parts, list) or any(not isinstance(part, str) for part in parts):
+            return None
+        chars = sum(len(part) for part in parts)
+    elif kind in {"code", "execution_output", "reasoning_recap"}:
+        text = content.get("content" if kind == "reasoning_recap" else "text")
+        if not isinstance(text, str):
+            return None
+        chars = len(text)
+    elif kind == "thoughts":
+        thoughts = content.get("thoughts")
+        if not isinstance(thoughts, list) or len(thoughts) > 128:
+            return None
+        chars, items = 0, len(thoughts)
+        for thought in thoughts:
+            if (not isinstance(thought, dict)
+                    or not isinstance(thought.get("summary"), str)
+                    or not isinstance(thought.get("content"), str)
+                    or type(thought.get("finished")) is not bool
+                    or not isinstance(thought.get("chunks"), list)
+                    or len(thought["chunks"]) > 512
+                    or any(not isinstance(chunk, str) for chunk in thought["chunks"])):
+                return None
+            chars += len(thought["summary"]) + len(thought["content"]) + sum(map(len, thought["chunks"]))
+            items += len(thought["chunks"])
+            finished += int(thought["finished"])
+    else:
+        return None  # Media or unknown envelopes cannot qualify as empty text.
+    return {"content_type": kind, "text_chars": chars, "content_items": items, "finished_items": finished}
+
+
+def _result_observation(mapping, children, request_message_id, conversation_id):
+    """Observe only this request's unambiguous branch, never message contents.
+
+    An upstream heartbeat timestamp alone is not generation progress. Keep a
+    bounded structural/text-length observation to distinguish a changing turn
+    from a stale in_progress label. Missing or branching nodes cannot qualify.
+    """
+    node_id, visited, nodes, updated_at = request_message_id, {request_message_id}, [], None
+    while children.get(node_id):
+        successors = children[node_id]
+        if len(successors) != 1 or len(nodes) >= 128:
+            return None
+        node_id = successors[0]
+        if node_id in visited:
+            return None
+        visited.add(node_id)
+        message = (mapping.get(node_id) or {}).get("message")
+        if not isinstance(message, dict) or message.get("id") != node_id:
+            return None
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        if role == "user":
+            return None  # A later user turn cannot establish our progress.
+        status = message.get("status")
+        if role not in {"assistant", "tool"} or status not in _ACTIVE_TEXT_RESULT_STATUSES | {"finished_successfully"}:
+            return None
+        content = _content_observation(message.get("content"))
+        if content is None:
+            return None
+        nodes.append({"id": node_id, "role": role, "status": status,
+                      "end_turn": message.get("end_turn") is True, **content})
+        value = message.get("update_time")
+        if type(value) in (int, float) and math.isfinite(value) and value > 0:
+            updated_at = max(updated_at or value, value)
+    if not nodes:
+        return None
+    return {"conversation_id": conversation_id, "request_message_id": request_message_id,
+            "nodes": nodes, "upstream_updated_at": updated_at}
 
 
 def _request_parent_matches_receipt(
@@ -57,7 +140,7 @@ def _request_parent_matches_receipt(
     )
 
 
-def _completed_request_turn(mapping, children, request_message_id, conversation_id):
+def _completed_request_turn(mapping, children, request_message_id, conversation_id, *, allow_completed_tool_call=False):
     """Positive terminal evidence for the exact original branch, even without a usable answer."""
     node_id, visited = request_message_id, {request_message_id}
     while True:
@@ -74,7 +157,57 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
             return None
         author = message.get("author")
         role = author.get("role") if isinstance(author, dict) else None
-        if role not in {"assistant", "tool"} or message.get("status") != "finished_successfully":
+        content = message.get("content")
+        # A completed final can follow a stale in_progress reasoning snapshot.
+        # Only known assistant ancestors qualify; active tools and the final
+        # itself still cannot prove that this exact turn ended.
+        stale_reasoning = (role == "assistant" and isinstance(content, dict)
+                           and content.get("content_type") in {"thoughts", "reasoning_recap"}
+                           and message.get("status") == "in_progress"
+                           and message.get("end_turn") is not True)
+        stale_tool_call = False
+        if (allow_completed_tool_call and role == "assistant" and isinstance(content, dict)
+                and content.get("content_type") == "code" and isinstance(content.get("text"), str)
+                and message.get("status") == "in_progress" and message.get("end_turn") is not True
+                and message.get("channel") in (None, "analysis")
+                and isinstance(message.get("recipient"), str) and message["recipient"].strip()
+                and message["recipient"].strip() != "all"):
+            following = children.get(node_id, [])
+            tool_node = mapping.get(following[0]) if len(following) == 1 else None
+            tool = tool_node.get("message") if isinstance(tool_node, dict) else None
+            # The persisted view can place one assistant thought snapshot
+            # between a call and its output. It is transparent only on the
+            # same unique chain; another call, branch or terminal is not.
+            if (isinstance(tool, dict) and tool.get("id") == following[0]
+                    and isinstance(tool.get("author"), dict)
+                    and tool["author"].get("role") == "assistant"
+                    and isinstance(tool.get("content"), dict)
+                    and tool["content"].get("content_type") == "thoughts"
+                    and tool.get("status") in {"in_progress", "finished_successfully"}
+                    and tool.get("end_turn") is not True
+                    and tool.get("channel") in (None, "analysis")
+                    and tool.get("recipient") in (None, "all")):
+                following = children.get(following[0], [])
+                tool_node = mapping.get(following[0]) if len(following) == 1 else None
+                tool = tool_node.get("message") if isinstance(tool_node, dict) else None
+            # Some completed tool calls retain an active assistant code node.
+            # Require its exact, completed tool output before considering the
+            # later nonempty final. This exception never establishes empty
+            # reply evidence or permits another generation attempt.
+            stale_tool_call = bool(
+                isinstance(tool, dict) and tool.get("id") == following[0]
+                and isinstance(tool.get("author"), dict)
+                and tool["author"].get("role") == "tool"
+                and tool["author"].get("name") == message["recipient"]
+                and tool.get("status") == "finished_successfully"
+                and isinstance(tool.get("content"), dict)
+                and tool["content"].get("content_type") == "execution_output"
+                and isinstance(tool["content"].get("text"), str)
+                and isinstance(tool.get("metadata"), dict)
+                and tool["metadata"].get("is_complete") is True
+            )
+        if (role not in {"assistant", "tool"}
+                or message.get("status") != "finished_successfully" and not (stale_reasoning or stale_tool_call)):
             return None
         if role == "assistant" and message.get("end_turn") is True:
             if message.get("channel") not in {None, "final"}:
@@ -87,6 +220,100 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
                     return None
             return {"conversation_id": conversation_id, "request_message_id": request_message_id,
                     "final_message_id": node_id, "observed_at": time.time()}
+
+
+def _completed_external_successor(mapping, children, request_message_id, current_node, conversation_id):
+    """A later user turn completed on the same unambiguous current chain.
+
+    This is diagnostic evidence only: it neither ends the original turn nor
+    makes the later answer an answer to the original request.
+    """
+    if not isinstance(current_node, str):
+        return False
+    node_id, seen, later_user = current_node, set(), None
+    while node_id != request_message_id:
+        if not node_id or node_id in seen or len(seen) >= 128:
+            return False
+        seen.add(node_id)
+        node = mapping.get(node_id)
+        message = node.get("message") if isinstance(node, dict) else None
+        if not isinstance(message, dict) or message.get("id") != node_id:
+            return False
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        if role not in {"user", "assistant", "tool"}:
+            return False
+        if role == "user" and later_user is None:
+            later_user = node_id
+        parent = node.get("parent")
+        if not isinstance(parent, str) or children.get(parent) != [node_id]:
+            return False
+        node_id = parent
+    if not later_user:
+        return False
+    ended = _completed_request_turn(mapping, children, later_user, conversation_id)
+    return bool(ended and ended["final_message_id"] == current_node)
+
+
+def _empty_reply_evidence(mapping, children, request_message_id, conversation_id, current_node):
+    """Observe an empty original final and a safe current cursor, not remote cancellation.
+
+    Some completed HTTP responses leave an empty final marked in_progress. The
+    task service separately requires durable local response-end evidence before
+    allowing the user's one same-conversation retry of this observation.
+    """
+    node_id, seen = request_message_id, {request_message_id}
+    while len(seen) <= 128:
+        successors = children.get(node_id, [])
+        if len(successors) != 1:
+            return None
+        node_id = successors[0]
+        if node_id in seen:
+            return None
+        seen.add(node_id)
+        node = mapping.get(node_id)
+        message = node.get("message") if isinstance(node, dict) else None
+        if not isinstance(message, dict) or message.get("id") != node_id:
+            return None
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        if role not in {"assistant", "tool"}:
+            return None
+        following = children.get(node_id, [])
+        final = (role == "assistant" and message.get("channel") in {None, "final"}
+                 and (not following or all(
+                     isinstance(mapping.get(child), dict)
+                     and isinstance(mapping[child].get("message"), dict)
+                     and mapping[child]["message"].get("id") == child
+                     and isinstance(mapping[child]["message"].get("author"), dict)
+                     and mapping[child]["message"]["author"].get("role") == "user"
+                     for child in following)))
+        content = message.get("content")
+        if final:
+            parts = content.get("parts") if isinstance(content, dict) else None
+            if (not isinstance(content, dict) or content.get("content_type") != "text"
+                    or not isinstance(parts, list) or not all(isinstance(p, str) for p in parts)
+                    or "".join(parts).strip()):
+                return None
+            if not isinstance(current_node, str):
+                return None
+            if current_node != node_id and not _completed_external_successor(
+                    mapping, children, node_id, current_node, conversation_id):
+                return None
+            return {"conversation_id": conversation_id, "request_message_id": request_message_id,
+                    "final_message_id": node_id, "retry_parent_message_id": current_node,
+                    "observed_at": time.time()}
+        # Reasoning snapshots can retain in_progress even after a later final
+        # exists. Only known assistant reasoning envelopes get that allowance;
+        # tools/code must still be complete. The caller also proves local close.
+        stale_reasoning = (role == "assistant" and isinstance(content, dict)
+                           and content.get("content_type") in {"thoughts", "reasoning_recap"}
+                           and message.get("status") == "in_progress")
+        if (message.get("status") != "finished_successfully" and not stale_reasoning or not isinstance(content, dict)
+                or content.get("content_type") not in OBSERVED_CONTENT_TYPES
+                or role == "tool" and content.get("content_type") != "execution_output"):
+            return None
+    return None
 
 
 def is_recovery_image_pointer(value: object) -> bool:
@@ -371,9 +598,15 @@ class ConversationBindingService:
         with account_service.conversation_binding_lock(binding, body["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:
-                if body.get("_public_session_ref") and backend._get_conversation(body["conversation_id"]).get("current_node") != body["parent_message_id"]:
-                    raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH")
-                result = backend.set_conversation_archived(body["conversation_id"], body["parent_message_id"], archived)
+                # The backend checks the original turn and current cursor before
+                # PATCH, then verifies its readback. A second outer GET adds
+                # account read pressure without another mutation boundary.
+                try:
+                    result = backend.set_conversation_archived(body["conversation_id"], body["parent_message_id"], archived)
+                except ConversationArchiveCursorMismatch:
+                    if body.get("_public_session_ref"):
+                        raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH") from None
+                    raise
                 return {**body, **result}
             finally:
                 backend.close()
@@ -1075,6 +1308,8 @@ class ConversationBindingService:
                 recovery_reason=TextRecoveryReason.REQUEST_BRANCH_AMBIGUOUS.value,
             )
         if not candidates:
+            from services.generation_completion import retry_cursor
+            continuation = retry_cursor(document, receipt)
             non_text_result = None if active_result_seen else _completed_image_result(
                 mapping, children, request_message_id, conversation_id,
             )
@@ -1088,7 +1323,11 @@ class ConversationBindingService:
                     "parent_message_id": non_text_result["final_message_id"],
                     NON_TEXT_RESULT_FIELD: non_text_result,
                 }
-            if active_result_seen:
+            advanced = active_result_seen and later_user_seen and _completed_external_successor(
+                mapping, children, request_message_id, document.get("current_node"), conversation_id)
+            if advanced:
+                recovery_reason = TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value
+            elif active_result_seen:
                 recovery_reason = TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
             elif terminal_empty_seen:
                 recovery_reason = TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
@@ -1099,13 +1338,19 @@ class ConversationBindingService:
             return {
                 **result,
                 "binding_status": "unknown",
-                "status": "running" if active_result_seen else "unknown",
+                "status": "running" if active_result_seen and not advanced else "unknown",
                 "recovery_reason": recovery_reason,
+                "_retry_cursor": continuation,
+                **({RESULT_OBSERVATION_FIELD: observation} if active_result_seen
+                   and (observation := _result_observation(mapping, children, request_message_id, conversation_id)) else {}),
                 **({TURN_END_EVIDENCE_FIELD: ended} if not active_result_seen and terminal_empty_seen
                    and (ended := _completed_request_turn(mapping, children, request_message_id, conversation_id)) else {}),
+                **({"_empty_reply_evidence": empty} if (empty := _empty_reply_evidence(
+                    mapping, children, request_message_id, conversation_id, document.get("current_node"))) else {}),
             }
         parent_message_id, text = candidates[0]
-        ended = _completed_request_turn(mapping, children, request_message_id, conversation_id)
+        ended = _completed_request_turn(mapping, children, request_message_id, conversation_id,
+                                        allow_completed_tool_call=True)
         if not ended or ended["final_message_id"] != parent_message_id:
             # One completed text message is insufficient when another branch
             # remains active or ambiguous. Use the same positive evidence as
@@ -1159,6 +1404,11 @@ class ConversationBindingService:
         client_conversation_id = str(body.get("client_conversation_id") or "").strip()
         conversation_id = str(body.get("conversation_id") or "").strip()
         parent_message_id = str(body.get("parent_message_id") or "").strip()
+        requested_identity = body.get("_requested_account_identity")
+        if body.get("_requested_account_ref") and not requested_identity:
+            raise ConversationBindingError("account selection has no durable identity", code="CHAT_ACCOUNT_SELECTION_CONFLICT")
+        if requested_identity and account_identity and requested_identity != account_identity:
+            raise ConversationBindingError("account selection conflicts with binding", code="CHAT_ACCOUNT_SELECTION_CONFLICT")
         model = str(body.get("model") or "auto").strip() or "auto"
         image_model = str(body.get("image_model") or "gpt-image-2").strip() or "gpt-image-2"
         messages = body.get("messages")
@@ -1202,8 +1452,11 @@ class ConversationBindingService:
                 if body.get("_text_only_binding") is True:
                     binding_id, account_identity = account_service.create_text_conversation_binding(
                         text_model=model,
+                        **({"requested_account_identity": requested_identity} if requested_identity else {}),
                     )
                 else:
+                    if requested_identity:
+                        raise ConversationBindingError("account selection requires ordinary text binding", code="CHAT_ACCOUNT_SELECTION_CONFLICT")
                     binding_id, account_identity, image_token = account_service.create_conversation_binding(
                         image_model=image_model, text_model=model
                     )
@@ -1211,6 +1464,8 @@ class ConversationBindingService:
             except RuntimeError as exc:
                 raise ConversationBindingError(str(exc)) from exc
 
+        if requested_identity and account_identity != requested_identity:
+            raise ConversationBindingError("selected account changed", code="CHAT_ACCOUNT_SELECTION_CONFLICT")
         if on_cursor:
             on_cursor({"provider_binding_id": binding_id, "provider_account_identity": account_identity,
                        "client_conversation_id": client_conversation_id,
@@ -1220,6 +1475,7 @@ class ConversationBindingService:
                 binding_id,
                 model=model,
                 for_message=True,
+                **({"requested_account_identity": requested_identity} if requested_identity else {}),
             )
         except RuntimeError as exc:
             raise ConversationBindingError(str(exc)) from exc
@@ -1243,6 +1499,36 @@ class ConversationBindingService:
                         raise ConversationBindingError("original conversation restore is unconfirmed",
                                                        code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
                 backend.text_pre_send_check = check_original
+            elif body.get("_failed_retry_original"):
+                def check_failed_retry(send):
+                    from services.generation_completion import retry_cursor, retry_evidence
+                    original = body["_failed_retry_original"]
+                    try:
+                        fresh = backend._get_conversation(conversation_id, _send=send)
+                        current, saved = retry_cursor(fresh, original), retry_evidence(original)
+                    except Exception as exc:
+                        raise ConversationBindingError("original retry read unavailable",
+                                                       code="COMPLETION_ORIGINAL_READ_UNAVAILABLE") from exc
+                    if not current or not saved or any(current[k] != saved[k] for k in (
+                            "conversation_id", "request_message_id", "retry_parent_message_id")):
+                        raise ConversationBindingError("original retry branch changed",
+                                                       code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
+                backend.text_pre_send_check = check_failed_retry
+            elif body.get("_empty_retry_original"):
+                def check_empty_retry(send):
+                    from services.text_task_service import TextTaskService
+                    original = body["_empty_retry_original"]
+                    try:
+                        fresh_document = backend._get_conversation(conversation_id, _send=send)
+                        fresh = self._read_text_request_result(backend, original, document=fresh_document)
+                    except Exception as exc:
+                        raise ConversationBindingError("empty-response original read unavailable",
+                                                       code="CHAT_TERMINAL_EMPTY_READ_UNAVAILABLE") from exc
+                    if (fresh_document.get("is_archived") is True or not TextTaskService._fresh_terminal_empty_continuation(
+                            original, body["_empty_retry_receipt"], fresh)):
+                        raise ConversationBindingError("empty-response retry cursor changed",
+                                                       code="CHAT_TERMINAL_EMPTY_UNVERIFIED")
+                backend.text_pre_send_check = check_empty_retry
             failure_phase = "stream_open"
             try:
                 # All bound text consumers can resume an archived Chat. The

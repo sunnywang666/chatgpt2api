@@ -320,15 +320,17 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         backend.base_url = "https://chatgpt.test"
         backend.session = FakeSession()
         backend._image_headers = lambda path, *_args: {"x-test-path": path}
-
-        response = backend._start_image_generation(
-            "make an image",
-            ChatRequirements(token="requirements"),
-            "conduit",
-            "gpt-image-2",
-            conversation_id="conversation-1",
-            parent_message_id="message-1",
-        )
+        backend.access_token = "fixture-capability-token"
+        with mock.patch("services.openai_backend_api.account_service.require_image_account") as capability:
+            response = backend._start_image_generation(
+                "make an image",
+                ChatRequirements(token="requirements"),
+                "conduit",
+                "gpt-image-2",
+                conversation_id="conversation-1",
+                parent_message_id="message-1",
+            )
+        self.assertEqual(capability.call_args_list, [mock.call("fixture-capability-token", "gpt-image-2")] * 2)
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(backend.session.responses[0].closed)
@@ -726,6 +728,73 @@ class TextResultRecoveryTests(unittest.TestCase):
                 },
             },
         }
+
+    def test_limited_bound_account_reads_and_archives_without_sending_a_new_turn(self):
+        from services.account_service import AccountService
+        from services.storage.json_storage import JSONStorageBackend
+
+        with tempfile.TemporaryDirectory() as directory:
+            accounts = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
+            accounts.add_account_items([{
+                "access_token": "limited-token", "source_type": "web", "type": "Plus", "status": "限流",
+            }])
+            accounts.refresh_access_token = lambda token, **_kwargs: token
+            with accounts._lock:
+                binding = accounts._conversation_binding_for_token_locked("limited-token")
+                identity = accounts._provider_account_identity_for_token_locked("limited-token")
+
+            calls = []
+
+            class FakeBackend:
+                def __init__(self, *, access_token):
+                    self.access_token = access_token
+                    calls.append(("open", access_token))
+
+                def _get_conversation(self, _conversation_id):
+                    calls.append(("read", self.access_token))
+                    return TextResultRecoveryTests().request_document()
+
+                def set_conversation_archived(self, conversation_id, parent_message_id, archived):
+                    calls.append(("archive", conversation_id, parent_message_id, archived))
+                    return {"archived": archived}
+
+                def close(self):
+                    calls.append(("close", self.access_token))
+
+            receipt = self.request_receipt(
+                provider_binding_id=binding,
+                provider_account_identity=identity,
+            )
+            service = ConversationBindingService()
+            with (
+                mock.patch("services.conversation_binding_service.account_service", accounts),
+                mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FakeBackend),
+            ):
+                result = service.read_text_request(receipt)
+                archived = service.set_archived({
+                    "provider_binding_id": binding,
+                    "provider_account_identity": identity,
+                    "client_conversation_id": "client-one",
+                    "conversation_id": "conversation-one",
+                    "parent_message_id": "prior-answer",
+                }, True)
+                with self.assertRaises(ConversationBindingError):
+                    service.complete_text({
+                        "provider_binding_id": binding,
+                        "provider_account_identity": identity,
+                        "client_conversation_id": "client-one",
+                        "model": "auto",
+                        "messages": [{"role": "user", "content": "must not send"}],
+                    })
+
+            self.assertEqual(result["status"], "succeeded")
+            self.assertTrue(archived["archived"])
+            self.assertIn(("read", "limited-token"), calls)
+            self.assertIn(("archive", "conversation-one", "prior-answer", True), calls)
+            # The explicit message path was rejected before it opened another
+            # upstream client or emitted a replacement request.
+            self.assertEqual(calls.count(("open", "limited-token")), 2)
+            self.assertEqual(accounts.get_account("limited-token")["status"], "限流")
 
     def test_request_recovery_reads_completed_original_after_later_user_turn(self):
         backend = mock.Mock()
@@ -1630,3 +1699,69 @@ class ProductConversationArchiveTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "cursor changed"):
             backend.set_conversation_archived("chat-a", "original", False)
         backend.session.patch.assert_called_once()
+
+    def public_archive(self, backend, archived=True, account_identity="account"):
+        body = {"provider_binding_id": "binding", "provider_account_identity": "account",
+                "client_conversation_id": "work", "conversation_id": "chat-a",
+                "parent_message_id": "original", "_public_session_ref": "session"}
+        backend.close = mock.Mock()
+        accounts = mock.Mock()
+        accounts.get_bound_account_identity.return_value = account_identity
+        accounts.get_bound_text_access_token.return_value = "test-token"
+        accounts.conversation_binding_lock.return_value = nullcontext()
+        with mock.patch("services.conversation_binding_service.account_service", accounts), \
+             mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend):
+            return ConversationBindingService().set_archived(body, archived)
+
+    def test_public_archive_and_restore_use_one_preflight_and_one_readback(self):
+        for desired in (True, False):
+            with self.subTest(desired=desired):
+                backend = self.backend([
+                    {"mapping": {"original": {}}, "current_node": "original", "is_archived": not desired},
+                    {"current_node": "original", "is_archived": desired},
+                ])
+                result = self.public_archive(backend, desired)
+                self.assertIs(result["archived"], desired)
+                self.assertEqual(backend._get_conversation.call_count, 2)
+                backend.session.patch.assert_called_once()
+                backend.close.assert_called_once()
+
+    def test_public_archive_already_done_uses_one_read_and_no_patch(self):
+        backend = self.backend([{"mapping": {"original": {}}, "current_node": "original", "is_archived": True}])
+        self.assertTrue(self.public_archive(backend)["archived"])
+        backend._get_conversation.assert_called_once_with("chat-a")
+        backend.session.patch.assert_not_called()
+
+    def test_public_archive_preflight_cursor_drift_keeps_binding_mismatch(self):
+        for mapping in ({"original": {}}, {}):
+            with self.subTest(mapping=mapping):
+                backend = self.backend([{"mapping": mapping, "current_node": "newer", "is_archived": False}])
+                with self.assertRaises(ConversationBindingError) as error:
+                    self.public_archive(backend)
+                self.assertEqual(error.exception.code, "CONVERSATION_BINDING_MISMATCH")
+                backend.session.patch.assert_not_called()
+                backend._get_conversation.assert_called_once()
+
+    def test_public_archive_other_failures_are_not_preflight_mismatch(self):
+        cases = [
+            ([{"mapping": {}, "current_node": "original"}], 0),
+            ([RuntimeError("read unavailable")], 0),
+            ([{"mapping": {"original": {}}, "current_node": "original", "is_archived": False},
+              {"current_node": "newer", "is_archived": True}], 1),
+        ]
+        for documents, patches in cases:
+            with self.subTest(documents=documents):
+                backend = self.backend(documents)
+                with self.assertRaises(RuntimeError) as error:
+                    self.public_archive(backend)
+                self.assertNotIsInstance(error.exception, ConversationBindingError)
+                self.assertEqual(backend.session.patch.call_count, patches)
+                self.assertEqual(backend._get_conversation.call_count, len(documents))
+
+    def test_public_archive_changed_account_does_not_read_or_patch(self):
+        backend = self.backend([])
+        with self.assertRaises(ConversationBindingError) as error:
+            self.public_archive(backend, account_identity="other-account")
+        self.assertEqual(error.exception.code, "CONVERSATION_BINDING_MISMATCH")
+        backend._get_conversation.assert_not_called()
+        backend.session.patch.assert_not_called()

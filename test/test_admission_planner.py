@@ -5,9 +5,10 @@ from pathlib import Path
 from services.admission_planner import *
 
 
-def request(n=0, source='happy', account=None, group=None, state='queued', operation='image', route='chat', model='fixture-model'):
-    return WaitingRequest(RequestRef(source, operation, f'request-{n}'), source, n, route, model, operation,
+def request(n=0, source='happy', owner=None, account=None, group=None, fair_group=None, state='queued', operation='image', route='chat', model='fixture-model'):
+    return WaitingRequest(RequestRef(owner or source, operation, f'request-{n}'), source, n, route, model, operation,
                           True, state=state, bound_account=account, order_group=group,
+                          fair_group=fair_group,
                           needs=(Need('workers'),))
 
 
@@ -52,8 +53,12 @@ def apply_in_fixture(snapshot, dispatch, *, finish_turn=False):
             updated = replace(updated, occupied=resource.occupied)
         resources.append(updated)
     rows = tuple(replace(r, state='active', bound_account=dispatch.account) if r.ref == dispatch.ref else r for r in snapshot.requests)
+    selected = next(row for row in snapshot.requests if row.ref == dispatch.ref)
+    groups = dict(snapshot.last_group_by_source)
+    groups[dispatch.source] = fairness_lane(selected.fair_group)
     return replace(snapshot, resources=tuple(resources), requests=rows, revision=snapshot.revision + '+reserved',
-                   last_source=dispatch.source, last_account=dispatch.account)
+                   last_source=dispatch.source, last_account=dispatch.account,
+                   last_group_by_source=tuple(groups.items()))
 
 
 class PlannerTests(unittest.TestCase):
@@ -161,6 +166,82 @@ class PlannerTests(unittest.TestCase):
             sources.append(out.dispatch.source)
             snap=apply_in_fixture(snap,out.dispatch,finish_turn=True)
         self.assertEqual(sources,['happy','ozon','wb']*3)
+
+    def test_scheduled_workflows_round_robin_within_one_source(self):
+        snap = fixture(2, requests=[
+            request(0, source='user:one', fair_group='workflow-a'),
+            request(1, source='user:one', fair_group='workflow-a'),
+            request(2, source='user:one', fair_group='workflow-b'),
+        ], interval=0)
+        selected = []
+        for _ in range(3):
+            dispatch = choose_next(snap, 100).dispatch
+            selected.append(dispatch.ref.request_id)
+            snap = apply_in_fixture(snap, dispatch, finish_turn=True)
+        self.assertEqual(selected, ['request-0', 'request-2', 'request-1'])
+
+    def test_workflow_groups_do_not_expand_source_turns(self):
+        snap = fixture(requests=[
+            request(0, source='user:one', fair_group='workflow-a'),
+            request(1, source='user:one', fair_group='workflow-b'),
+            request(2, source='user:two', fair_group='workflow-a'),
+            request(3, source='user:two', fair_group='workflow-b'),
+        ], interval=0)
+        selected = []
+        for _ in range(4):
+            dispatch = choose_next(snap, 100).dispatch
+            selected.append(dispatch.source)
+            snap = apply_in_fixture(snap, dispatch, finish_turn=True)
+        self.assertEqual(selected, ['user:one', 'user:two', 'user:one', 'user:two'])
+
+    def test_legacy_and_workflows_share_one_rotating_source_lane(self):
+        snap = fixture(2, requests=[
+            request(0, source='user:one'),
+            request(1, source='user:one', fair_group='workflow-a'),
+            request(2, source='user:one', fair_group='workflow-b'),
+            request(3, source='user:two'),
+            request(4, source='user:two', fair_group='workflow-a'),
+            request(5, source='user:two', fair_group='workflow-b'),
+        ], interval=0)
+        selected = []
+        for _ in range(6):
+            dispatch = choose_next(snap, 100).dispatch
+            selected.append((dispatch.source, dispatch.ref.request_id))
+            snap = apply_in_fixture(snap, dispatch, finish_turn=True)
+        self.assertEqual(selected, [
+            ('user:one', 'request-0'), ('user:two', 'request-3'),
+            ('user:one', 'request-1'), ('user:two', 'request-4'),
+            ('user:one', 'request-2'), ('user:two', 'request-5'),
+        ])
+
+    def test_workflow_rotation_is_scoped_to_user_not_key_owner(self):
+        snap = fixture(2, requests=[
+            request(0, source='user:one', owner='key-a', fair_group='workflow-a'),
+            request(1, source='user:one', owner='key-a', fair_group='workflow-a'),
+            request(2, source='user:one', owner='key-b', fair_group='workflow-b'),
+            request(3, source='user:two', owner='key-c', fair_group='workflow-a'),
+            request(4, source='user:two', owner='key-c', fair_group='workflow-b'),
+        ], interval=0)
+        selected = []
+        for _ in range(5):
+            dispatch = choose_next(snap, 100).dispatch
+            selected.append((dispatch.source, dispatch.ref.owner, dispatch.ref.request_id))
+            snap = apply_in_fixture(snap, dispatch, finish_turn=True)
+        self.assertEqual(selected, [
+            ('user:one', 'key-a', 'request-0'),
+            ('user:two', 'key-c', 'request-3'),
+            ('user:one', 'key-b', 'request-2'),
+            ('user:two', 'key-c', 'request-4'),
+            ('user:one', 'key-a', 'request-1'),
+        ])
+
+    def test_unavailable_workflow_group_does_not_block_ready_group(self):
+        snap = fixture(2, requests=[
+            request(0, source='user:one', account='account-0', fair_group='workflow-a'),
+            request(1, source='user:one', account='account-1', fair_group='workflow-b'),
+        ])
+        snap = resource_update(snap, 'account-0:turn', next_at=200)
+        self.assertEqual(choose_next(snap, 100).dispatch.ref.request_id, 'request-1')
 
     def test_missing_old_cursor_does_not_reset_to_first(self):
         snap=replace(fixture(2,requests=[request(1,'happy'),request(2,'wb')]),last_source='ozon')

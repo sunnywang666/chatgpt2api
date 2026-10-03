@@ -19,7 +19,7 @@ class ModelListTests(unittest.TestCase):
             mock.patch.object(
                 openai_v1_models.model_catalog_service,
                 "list_models",
-                return_value={"object": "list", "data": []},
+                return_value={"object": "list", "data": [{"id": "gpt-image-2"}]},
             ),
             mock.patch.object(
                 openai_v1_models.account_service,
@@ -29,6 +29,11 @@ class ModelListTests(unittest.TestCase):
                     {"access_token": "token-web-team", "type": "Team", "source_type": "web"},
                     {"access_token": "token-codex-team", "type": "Team", "source_type": "codex"},
                 ],
+            ),
+            mock.patch.object(
+                openai_v1_models.model_catalog_service,
+                "image_capability_rows",
+                return_value=[{"account_ref": "car_observed"}],
             ),
         ):
             result = openai_v1_models.list_models()
@@ -54,6 +59,11 @@ class ModelListTests(unittest.TestCase):
                     {"access_token": "token-web-plus", "type": "Plus", "source_type": "web"},
                 ],
             ),
+            mock.patch.object(
+                openai_v1_models.model_catalog_service,
+                "image_capability_rows",
+                return_value=[{"account_ref": "car_observed"}],
+            ),
         ):
             result = openai_v1_models.list_models()
 
@@ -61,6 +71,28 @@ class ModelListTests(unittest.TestCase):
         self.assertIn("gpt-image-2", ids)
         self.assertNotIn("codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
+
+    def test_list_models_does_not_treat_unobserved_web_account_as_image_capability(self):
+        with (
+            mock.patch.object(
+                openai_v1_models.model_catalog_service,
+                "list_models",
+                return_value={"object": "list", "data": [{"id": "gpt-image-2"}]},
+            ),
+            mock.patch.object(
+                openai_v1_models.account_service,
+                "list_accounts",
+                return_value=[{"access_token": "token-web-plus", "type": "Plus", "source_type": "web"}],
+            ),
+            mock.patch.object(
+                openai_v1_models.model_catalog_service,
+                "image_capability_rows",
+                return_value=[],
+            ),
+        ):
+            result = openai_v1_models.list_models()
+
+        self.assertNotIn("gpt-image-2", {item["id"] for item in result["data"]})
 
     def test_list_models_function(self):
         """测试直接调用服务层获取模型列表。"""

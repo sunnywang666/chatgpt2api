@@ -159,14 +159,14 @@ class CodexLoginFlowTests(unittest.TestCase):
         service = self.service(http)
         request_id = str(uuid.uuid4())
 
-        pending = service.start("workbench:org:one", "owned", "import", request_id)
+        pending = service.start("workbench:org:one", "pool", "import", request_id)
         self.assertEqual(pending["state"], "pending")
         self.assertEqual(pending["verification_url"], CodexLoginService.VERIFICATION_URL)
         self.assertEqual(pending["user_code"], "ABCD-EFGH")
         self.assertNotIn("device_auth_id", pending)
         service._run(pending["id"])
 
-        succeeded = service.get("workbench:org:one", "owned", pending["id"])
+        succeeded = service.get("workbench:org:one", "pool", pending["id"])
         self.assertEqual(succeeded["state"], "succeeded")
         self.assertTrue(succeeded["account_ref"].startswith("car_"))
         self.assertNotIn("user_code", succeeded)
@@ -180,14 +180,14 @@ class CodexLoginFlowTests(unittest.TestCase):
 
         call_count = len(http.calls)
         self.assertEqual(
-            service.start("workbench:org:one", "owned", "import", request_id),
+            service.start("workbench:org:one", "pool", "import", request_id),
             succeeded,
         )
         self.assertEqual(len(http.calls), call_count)
         with self.assertRaisesRegex(CodexLoginError, "idempotency_conflict"):
             service.start(
                 "workbench:org:one",
-                "owned",
+                "pool",
                 "attach",
                 request_id,
                 succeeded["account_ref"],
@@ -1076,21 +1076,21 @@ class CodexLoginFlowTests(unittest.TestCase):
     def test_cancel_expiry_restart_and_owner_scope_erase_device_material(self):
         http = FakeHttp([device_start(), device_start(), device_start()])
         service = self.service(http)
-        cancelled = service.start("workbench:org:one", "owned", "import", str(uuid.uuid4()))
+        cancelled = service.start("workbench:org:one", "pool", "import", str(uuid.uuid4()))
         with self.assertRaisesRegex(CodexLoginError, "not_found"):
-            service.get("workbench:org:two", "owned", cancelled["id"])
+            service.get("workbench:org:two", "pool", cancelled["id"])
         with self.assertRaisesRegex(CodexLoginError, "not_found"):
-            service.get("workbench:org:one", "pool", cancelled["id"])
-        result = service.cancel("workbench:org:one", "owned", cancelled["id"])
+            service.get("workbench:org:one", "owned", cancelled["id"])
+        result = service.cancel("workbench:org:one", "pool", cancelled["id"])
         self.assertEqual(result["state"], "cancelled")
         self.assertNotIn("user_code", result)
 
-        expiring = service.start("workbench:org:one", "owned", "import", str(uuid.uuid4()))
+        expiring = service.start("workbench:org:one", "pool", "import", str(uuid.uuid4()))
         self.clock.now += CodexLoginService.SESSION_TTL_SECONDS + 1
         service._run(expiring["id"])
-        self.assertEqual(service.get("workbench:org:one", "owned", expiring["id"])["state"], "expired")
+        self.assertEqual(service.get("workbench:org:one", "pool", expiring["id"])["state"], "expired")
 
-        pending = service.start("workbench:org:one", "owned", "import", str(uuid.uuid4()))
+        pending = service.start("workbench:org:one", "pool", "import", str(uuid.uuid4()))
         restarted = CodexLoginService(
             self.sessions_path,
             self.accounts,
@@ -1099,7 +1099,7 @@ class CodexLoginFlowTests(unittest.TestCase):
             sleeper=lambda _seconds: None,
             auto_start_workers=False,
         )
-        interrupted = restarted.get("workbench:org:one", "owned", pending["id"])
+        interrupted = restarted.get("workbench:org:one", "pool", pending["id"])
         self.assertEqual(interrupted["state"], "interrupted")
         self.assertEqual(interrupted["error_code"], "codex_login_interrupted")
         text = self.sessions_path.read_text()
@@ -1110,18 +1110,18 @@ class CodexLoginFlowTests(unittest.TestCase):
         http = FakeHttp([device_start(), device_start()])
         service = self.service(http)
         service.MAX_ACTIVE_PER_OWNER = 1
-        first = service.start("workbench:org:one", "owned", "import", str(uuid.uuid4()))
+        first = service.start("workbench:org:one", "pool", "import", str(uuid.uuid4()))
         with self.assertRaisesRegex(CodexLoginError, "capacity"):
-            service.start("workbench:org:one", "owned", "import", str(uuid.uuid4()))
-        second = service.start("workbench:org:two", "owned", "import", str(uuid.uuid4()))
+            service.start("workbench:org:one", "pool", "import", str(uuid.uuid4()))
+        second = service.start("workbench:org:two", "pool", "import", str(uuid.uuid4()))
         service.MAX_ACTIVE_GLOBAL = 2
         with self.assertRaisesRegex(CodexLoginError, "capacity"):
-            service.start("workbench:org:three", "owned", "import", str(uuid.uuid4()))
+            service.start("workbench:org:three", "pool", "import", str(uuid.uuid4()))
         with service._lock:
             service._sessions[first["id"]]["state"] = "completing"
         with self.assertRaisesRegex(CodexLoginError, "completion_in_progress"):
-            service.cancel("workbench:org:one", "owned", first["id"])
-        self.assertEqual(service.cancel("workbench:org:two", "owned", second["id"])["state"], "cancelled")
+            service.cancel("workbench:org:one", "pool", first["id"])
+        self.assertEqual(service.cancel("workbench:org:two", "pool", second["id"])["state"], "cancelled")
 
     def test_poll_429_backoff_and_unknown_exchange_never_retry(self):
         http = FakeHttp([
@@ -1131,9 +1131,9 @@ class CodexLoginFlowTests(unittest.TestCase):
             RuntimeError("private upstream response"),
         ])
         service = self.service(http)
-        pending = service.start("workbench:org:one", "owned", "import", str(uuid.uuid4()))
+        pending = service.start("workbench:org:one", "pool", "import", str(uuid.uuid4()))
         service._run(pending["id"])
-        failed = service.get("workbench:org:one", "owned", pending["id"])
+        failed = service.get("workbench:org:one", "pool", pending["id"])
         self.assertEqual(failed["state"], "failed")
         self.assertEqual(failed["error_code"], "codex_login_exchange_outcome_unknown")
         self.assertEqual(failed["poll_after_seconds"], 180)
@@ -1145,13 +1145,13 @@ class CodexLoginFlowTests(unittest.TestCase):
             FakeHttp([]).factory,
             auto_start_workers=False,
         )
-        self.assertEqual(restarted.get("workbench:org:one", "owned", pending["id"]), failed)
+        self.assertEqual(restarted.get("workbench:org:one", "pool", pending["id"]), failed)
 
     def test_session_save_failure_after_account_commit_recovers_by_readback(self):
         imported = credentials("durable-account")
         http = FakeHttp([device_start(), device_complete(), token_exchange(imported)])
         service = self.service(http)
-        pending = service.start("workbench:org:one", "owned", "import", str(uuid.uuid4()))
+        pending = service.start("workbench:org:one", "pool", "import", str(uuid.uuid4()))
         original_save = service._save_locked
         saves = 0
 
@@ -1164,7 +1164,7 @@ class CodexLoginFlowTests(unittest.TestCase):
 
         with patch.object(service, "_save_locked", side_effect=fail_final_save):
             service._run(pending["id"])
-        self.assertEqual(service.get("workbench:org:one", "owned", pending["id"])["state"], "succeeded")
+        self.assertEqual(service.get("workbench:org:one", "pool", pending["id"])["state"], "succeeded")
         self.assertEqual(len(http.calls), 3)
 
         restarted = CodexLoginService(
@@ -1173,7 +1173,7 @@ class CodexLoginFlowTests(unittest.TestCase):
             FakeHttp([]).factory,
             auto_start_workers=False,
         )
-        recovered = restarted.get("workbench:org:one", "owned", pending["id"])
+        recovered = restarted.get("workbench:org:one", "pool", pending["id"])
         self.assertEqual(recovered["state"], "succeeded")
         self.assertEqual(len(self.accounts.list_owned_accounts("workbench:org:one")), 1)
         self.assertNotIn("completion_authorization_ref", self.sessions_path.read_text())
@@ -1187,7 +1187,7 @@ class CodexLoginFlowTests(unittest.TestCase):
         incoming = credentials("device-new")
         http = FakeHttp([device_start(), device_complete(), token_exchange(incoming)])
         service = self.service(http)
-        pending = service.start("workbench:org:two", "owned", "import", str(uuid.uuid4()))
+        pending = service.start("workbench:org:two", "pool", "import", str(uuid.uuid4()))
         original_save = service._save_locked
         saves = 0
 
@@ -1204,7 +1204,7 @@ class CodexLoginFlowTests(unittest.TestCase):
             self.sessions_path, AccountService(JSONStorageBackend(self.accounts.storage.file_path)),
             FakeHttp([]).factory, auto_start_workers=False,
         )
-        recovered = restarted.get("workbench:org:two", "owned", pending["id"])
+        recovered = restarted.get("workbench:org:two", "pool", pending["id"])
         self.assertEqual(recovered["state"], "succeeded")
         self.assertEqual(recovered["import_status"], "updated")
         self.assertEqual(recovered["codex"]["state"], "observed")
@@ -1225,10 +1225,10 @@ class CodexLoginFlowTests(unittest.TestCase):
         incoming = credentials("uncertain-new")
         http = FakeHttp([device_start(), device_complete(), token_exchange(incoming)])
         service = self.service(http)
-        pending = service.start("workbench:org:two", "owned", "import", str(uuid.uuid4()))
+        pending = service.start("workbench:org:two", "pool", "import", str(uuid.uuid4()))
         with patch.object(JSONStorageBackend, "_sync_directory", side_effect=OSError("durability pending")):
             service._run(pending["id"])
-            uncertain = service.get("workbench:org:two", "owned", pending["id"])
+            uncertain = service.get("workbench:org:two", "pool", pending["id"])
             self.assertEqual(uncertain["state"], "interrupted")
             self.assertEqual(uncertain["error_code"], "codex_login_save_failed")
         restarted_accounts = AccountService(JSONStorageBackend(self.accounts.storage.file_path))
@@ -1236,7 +1236,7 @@ class CodexLoginFlowTests(unittest.TestCase):
             self.sessions_path, restarted_accounts, FakeHttp([]).factory,
             auto_start_workers=False,
         )
-        recovered = restarted.get("workbench:org:two", "owned", pending["id"])
+        recovered = restarted.get("workbench:org:two", "pool", pending["id"])
         self.assertEqual(recovered["state"], "succeeded")
         self.assertEqual(recovered["import_status"], "updated")
         self.assertEqual(recovered["codex"]["state"], "observed")
@@ -1254,11 +1254,11 @@ class CodexLoginFlowTests(unittest.TestCase):
         self.assertNotEqual(incoming["id_token"], attached["id_token"])
         http = FakeHttp([device_start(), device_complete(), token_exchange(incoming)])
         service = self.service(http)
-        pending = service.start("workbench:org:two", "owned", "import", str(uuid.uuid4()))
+        pending = service.start("workbench:org:two", "pool", "import", str(uuid.uuid4()))
         with patch.object(self.accounts, "_request_access_token_refresh", side_effect=AssertionError("device exchange is proof")), \
                 patch.object(JSONStorageBackend, "_sync_directory", side_effect=OSError("durability pending")):
             service._run(pending["id"])
-            uncertain = service.get("workbench:org:two", "owned", pending["id"])
+            uncertain = service.get("workbench:org:two", "pool", pending["id"])
             self.assertEqual(uncertain["state"], "interrupted")
             self.assertEqual(uncertain["error_code"], "codex_login_save_failed")
         saved = self.accounts.storage.load_accounts()[0]
@@ -1268,7 +1268,7 @@ class CodexLoginFlowTests(unittest.TestCase):
             self.sessions_path, restarted_accounts, FakeHttp([]).factory,
             auto_start_workers=False,
         )
-        recovered = restarted.get("workbench:org:two", "owned", pending["id"])
+        recovered = restarted.get("workbench:org:two", "pool", pending["id"])
         self.assertEqual(recovered["state"], "succeeded")
         self.assertEqual(recovered["import_status"], "updated")
         self.assertEqual(len(http.calls), 3)
@@ -1287,10 +1287,10 @@ class CodexLoginFlowTests(unittest.TestCase):
         incoming = credentials("directory-fault")
         http = FakeHttp([device_start(), device_complete(), token_exchange(incoming)])
         service = self.service(http)
-        pending = service.start("workbench:org:one", "owned", "attach", str(uuid.uuid4()), original["authorization_ref"])
+        pending = service.start("workbench:org:one", "pool", "attach", str(uuid.uuid4()), original["authorization_ref"])
         with patch.object(JSONStorageBackend, "_sync_directory", side_effect=OSError("durability pending")):
             service._run(pending["id"])
-            uncertain = service.get("workbench:org:one", "owned", pending["id"])
+            uncertain = service.get("workbench:org:one", "pool", pending["id"])
             self.assertEqual(uncertain["state"], "interrupted")
             self.assertEqual(uncertain["error_code"], "codex_login_save_failed")
             with self.assertRaises(AccountCommitUncertain):
@@ -1298,9 +1298,9 @@ class CodexLoginFlowTests(unittest.TestCase):
             self.assertIn("completion_credential_digest", self.sessions_path.read_text())
         restarted_accounts = AccountService(JSONStorageBackend(self.accounts.storage.file_path))
         restarted = CodexLoginService(self.sessions_path, restarted_accounts, FakeHttp([]).factory, auto_start_workers=False)
-        self.assertEqual(restarted.get("workbench:org:one", "owned", pending["id"])["state"], "succeeded")
+        self.assertEqual(restarted.get("workbench:org:one", "pool", pending["id"])["state"], "succeeded")
         # The same process can also settle its cache through original GET only.
-        self.assertEqual(service.get("workbench:org:one", "owned", pending["id"])["state"], "succeeded")
+        self.assertEqual(service.get("workbench:org:one", "pool", pending["id"])["state"], "succeeded")
         self.assertEqual(len(http.calls), 3)
         after = self.accounts.storage.load_accounts()[0]
         for field in ("access_token", "refresh_token", "id_token", "managed_owner", "managed_account_id", "codex_affinities", "codex_response_ids"):
@@ -1315,10 +1315,10 @@ class CodexLoginFlowTests(unittest.TestCase):
         incoming = credentials("new-account", subject="other", account_id=OTHER_ACCOUNT_ID)
         http = FakeHttp([device_start(), device_complete(), token_exchange(incoming)])
         service = self.service(http)
-        pending = service.start("workbench:org:one", "owned", "import", str(uuid.uuid4()))
+        pending = service.start("workbench:org:one", "pool", "import", str(uuid.uuid4()))
         with patch.object(JSONStorageBackend, "save_accounts", side_effect=OSError("before replace")):
             service._run(pending["id"])
-        result = service.get("workbench:org:one", "owned", pending["id"])
+        result = service.get("workbench:org:one", "pool", pending["id"])
         self.assertEqual(result["state"], "failed")
         self.assertEqual(result["error_code"], "codex_login_save_not_applied")
         self.assertEqual(self.accounts.storage.file_path.read_bytes(), before)
@@ -1329,7 +1329,7 @@ class CodexLoginFlowTests(unittest.TestCase):
         incoming = credentials("new")
         item = self.accounts.import_owned_codex_authorization("workbench:org:one", old)
         result = self.accounts.codex_login_completion_readback(
-            "workbench:org:one", "owned", "attach", item["authorization_ref"],
+            "workbench:org:one", "pool", "attach", item["authorization_ref"],
             item["authorization_ref"], AccountService.codex_credential_digest(incoming))
         self.assertFalse(result["applied"])
 
@@ -1341,7 +1341,7 @@ class CodexLoginFlowTests(unittest.TestCase):
         service = self.service(http)
         pending = service.start(
             "workbench:org:one",
-            "owned",
+            "pool",
             "attach",
             str(uuid.uuid4()),
             account_ref,
@@ -1351,7 +1351,7 @@ class CodexLoginFlowTests(unittest.TestCase):
             "workbench:org:one", item["id"], newer
         )
         service._run(pending["id"])
-        failed = service.get("workbench:org:one", "owned", pending["id"])
+        failed = service.get("workbench:org:one", "pool", pending["id"])
         self.assertEqual(failed["state"], "failed")
         self.assertEqual(failed["error_code"], "codex_login_stale_target")
         self.assertEqual(self.accounts.list_accounts()[0]["codex_credentials"], newer)
@@ -1360,12 +1360,34 @@ class CodexLoginFlowTests(unittest.TestCase):
         with self.assertRaisesRegex(CodexAuthorizationAttachError, "account_conflict"):
             self.accounts.attach_codex_authorization(wrong_identity, account_ref)
 
-    def test_pool_requires_attach_and_ambiguous_ref_fails_before_network(self):
+    def test_accepted_legacy_device_import_completes_and_survives_restart(self):
+        http = FakeHttp([device_start(), device_complete(), token_exchange(credentials("legacy"))])
+        service = self.service(http)
+        owner = "workbench:org:one"
+        request_id = str(uuid.uuid4())
+        started = service.start(owner, "pool", "import", request_id)
+        record = service._sessions[started["id"]]
+        record["scope"] = "owned"
+        record["request_hash"] = service._request_hash("owned", "import", "")
+        service._save_locked()
+        self.assertEqual(service.start(owner, "owned", "import", request_id)["id"], started["id"])
+        with self.assertRaisesRegex(CodexLoginError, "not_found"):
+            service.get(owner, "pool", started["id"])
+        service._run(started["id"])
+        completed = service.get(owner, "owned", started["id"])
+        self.assertEqual(completed["state"], "succeeded")
+        self.assertEqual(len(http.calls), 3)
+        restored = self.service(FakeHttp([]))
+        self.assertEqual(restored.get(owner, "owned", started["id"]), completed)
+        self.assertEqual(restored.start(owner, "owned", "import", request_id), completed)
+        self.assertEqual(len(self.accounts.list_pool_accounts()), 1)
+
+    def test_legacy_start_rejected_and_ambiguous_ref_fails_before_network(self):
         item = self.add_primary()
         http = FakeHttp([])
         service = self.service(http)
-        with self.assertRaisesRegex(CodexLoginError, "invalid_mode"):
-            service.start("workbench:boss", "pool", "import", str(uuid.uuid4()))
+        with self.assertRaisesRegex(CodexLoginError, "COMPANY_ACCOUNT_ENTRY_REQUIRED"):
+            service.start("workbench:boss", "owned", "import", str(uuid.uuid4()))
 
         duplicate = credentials("duplicate")
         self.accounts.add_account_items([{

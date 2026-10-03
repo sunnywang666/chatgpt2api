@@ -226,15 +226,52 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
+def _sse_error_category(event: dict) -> str:
+    # Interpret only fixed structured codes. Never retain error text, body,
+    # headers or an arbitrary upstream code in diagnostics.
+    error = event.get("error")
+    error = error if isinstance(error, dict) else event
+    codes = {value for key in ("code", "type") if isinstance(value := error.get(key), str)}
+    for category, allowed in (
+        ("quota", {"insufficient_quota", "quota_exceeded", "usage_limit_reached"}),
+        ("rate_limit", {"rate_limit_exceeded", "rate_limit_error", "too_many_requests"}),
+        ("auth", {"invalid_api_key", "authentication_error", "unauthorized", "invalid_token"}),
+        ("upstream", {"server_error", "internal_error", "internal_server_error", "overloaded_error"}),
+    ):
+        if codes & allowed:
+            return category
+    return "unknown"
+
+
+def iter_sse_payloads(response: requests.Response, *, observation: dict | None = None) -> Iterator[str]:
+    error_event = False
     for raw_line in response.iter_lines():
         if not raw_line:
+            error_event = False
             continue
         line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
+        if line.startswith("event:"):
+            error_event = line[6:].strip() == "error"
+        if observation is not None and error_event:
+            observation["sse_error_event"] = True
+            observation.setdefault("sse_error_category", "unknown")
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
         if payload:
+            if observation is not None:
+                observation["sse_data_count"] = min(observation.get("sse_data_count", 0) + 1, 2147483647)
+                if payload == "[DONE]":
+                    observation["stream_end"] = "done"
+                else:
+                    try:
+                        event = json.loads(payload)
+                    except (ValueError, TypeError):
+                        observation["sse_parse_errors"] = min(observation.get("sse_parse_errors", 0) + 1, 2147483647)
+                    else:
+                        if isinstance(event, dict) and (error_event or event.get("type") == "error" or event.get("error")):
+                            observation["sse_error_event"] = True
+                            observation["sse_error_category"] = _sse_error_category(event)
             yield payload
 
 

@@ -1,7 +1,7 @@
 """Internal Workbench management bridge; never exposed by public AI ingress."""
 import time
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from typing import Literal
@@ -143,13 +143,27 @@ async def chat_login_operation(handler, *args):
         raise HTTPException(status, detail={"code": exc.code}) from None
 
 
+def _private_no_store(response: Response) -> None:
+    # Includes one-time Key material and login URLs on successful responses.
+    # The public Workbench bridge already applies the same response policy.
+    response.headers["Cache-Control"] = "private, no-store"
+
+
 def create_router() -> APIRouter:
-    router = APIRouter(prefix="/api/workbench/ai")
+    router = APIRouter(
+        prefix="/api/workbench/ai", dependencies=[Depends(_private_no_store)],
+    )
 
     @router.get("/accounts")
     async def accounts(authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
-        owner = owner_scope(authorization, x_workbench_account_owner)
-        return {"items": await run_in_threadpool(account_service.list_owned_accounts, owner)}
+        owner_scope(authorization, x_workbench_account_owner)
+        raise HTTPException(
+            410,
+            detail={"code": "COMPANY_ACCOUNT_ENTRY_REQUIRED",
+                    "automatic_retry": False,
+                    "message": "Use the company account pool management entry."},
+            headers={"Cache-Control": "private, no-store"},
+        )
 
     @router.get("/pool/accounts")
     async def pool_accounts(authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
@@ -212,17 +226,25 @@ def create_router() -> APIRouter:
 
     @router.post("/accounts")
     async def import_account(body: ImportAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
-        owner = owner_scope(authorization, x_workbench_account_owner)
-        payload = {key: value.get_secret_value() if isinstance(value, SecretStr) else value for key, value in body if value is not None}
-        return {"item": await account_operation(account_service.import_owned_account, owner, payload)}
+        owner_scope(authorization, x_workbench_account_owner)
+        raise HTTPException(
+            410,
+            detail={"code": "COMPANY_ACCOUNT_ENTRY_REQUIRED",
+                    "automatic_retry": False,
+                    "message": "Use the company account pool management entry."},
+            headers={"Cache-Control": "private, no-store"},
+        )
 
     @router.post("/accounts/{account_id}/codex-authorization")
     async def attach_owned_codex_authorization(account_id: str, body: CodexAuthorization, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
-        owner = owner_scope(authorization, x_workbench_account_owner)
-        payload = {key: value.get_secret_value() if isinstance(value, SecretStr) else value for key, value in body if value is not None}
-        payload.pop("account_ref", None)
-        await account_operation(account_service.attach_owned_codex_authorization, owner, account_id, payload)
-        return {"attached": True}
+        owner_scope(authorization, x_workbench_account_owner)
+        raise HTTPException(
+            410,
+            detail={"code": "COMPANY_ACCOUNT_ENTRY_REQUIRED",
+                    "automatic_retry": False,
+                    "message": "Use the company account pool management entry."},
+            headers={"Cache-Control": "private, no-store"},
+        )
 
     @router.post("/pool/codex-authorization")
     async def attach_codex_authorization(body: CodexAuthorization, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
@@ -362,13 +384,25 @@ def create_router() -> APIRouter:
 
     @router.post("/accounts/{account_id}/refresh")
     async def refresh_account(account_id: str, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
-        owner = owner_scope(authorization, x_workbench_account_owner)
-        return {"item": await account_operation(account_service.refresh_owned_account, owner, account_id)}
+        owner_scope(authorization, x_workbench_account_owner)
+        raise HTTPException(
+            410,
+            detail={"code": "COMPANY_ACCOUNT_ENTRY_REQUIRED",
+                    "automatic_retry": False,
+                    "message": "Use the company account pool management entry."},
+            headers={"Cache-Control": "private, no-store"},
+        )
 
     @router.post("/accounts/{account_id}/enabled")
     async def enable_account(account_id: str, body: EnabledAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
-        owner = owner_scope(authorization, x_workbench_account_owner)
-        return {"item": await account_operation(account_service.set_owned_account_enabled, owner, account_id, body.enabled)}
+        owner_scope(authorization, x_workbench_account_owner)
+        raise HTTPException(
+            410,
+            detail={"code": "COMPANY_ACCOUNT_ENTRY_REQUIRED",
+                    "automatic_retry": False,
+                    "message": "Use the company account pool management entry."},
+            headers={"Cache-Control": "private, no-store"},
+        )
 
     @router.get("/models")
     async def models(authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
