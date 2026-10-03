@@ -241,6 +241,55 @@ class MultiImageResultTests(unittest.TestCase):
                     initial_file_ids=["pending-file"], require_fresh_result_ids=True)
         self.assertGreaterEqual(backend.calls, 1)
 
+    def test_recovery_reuses_one_fresh_read_across_short_poll_windows(self) -> None:
+        backend = FakeBackend()
+        backend._get_conversation = mock.Mock(side_effect=AssertionError("second GET would wait read60"))
+        backend._query_backend_tasks = mock.Mock(side_effect=AssertionError("snapshot already read"))
+        observed = []
+        backend.progress_callback = lambda _step: None
+        backend.progress_callback.record_pending_result_ids = lambda files, sediments: observed.append((files, sediments))
+        with mock.patch.dict(config.data, {
+            "image_poll_initial_wait_secs": 10, "image_check_before_hit_enabled": True,
+            "image_settle_enabled": True, "image_settle_secs": 2,
+        }), mock.patch("services.openai_backend_api.time.sleep") as sleep:
+            with self.assertRaisesRegex(ImagePollTimeoutError, "尚未确认稳定图片结果"):
+                backend._poll_image_results("conv-1", 5, request_message_id="request",
+                    initial_document=_conversation(["one"]))
+            self.assertEqual(observed, [(["one"], [])])
+            with self.assertRaises(ImagePollTimeoutError):
+                backend._poll_image_results("conv-1", 5, request_message_id="request",
+                    initial_file_ids=["one"], require_fresh_result_ids=True,
+                    initial_document=_conversation(["one", "two"]))
+            self.assertEqual(observed[-1], (["one", "two"], []))
+            self.assertEqual(backend._poll_image_results("conv-1", 5,
+                request_message_id="request", initial_file_ids=["one", "two"],
+                require_fresh_result_ids=True, initial_document=_conversation(["two", "one"])),
+                (["one", "two"], []))
+            sleep.assert_not_called()
+        backend._get_conversation.assert_not_called()
+        backend._query_backend_tasks.assert_not_called()
+
+    def test_fresh_recovery_snapshot_cannot_confirm_missing_or_later_turn_ids(self) -> None:
+        later = _conversation([])
+        later["mapping"].update({
+            "later-user": {"parent": "tool", "message": {"author": {"role": "user"}}},
+            "later-image": {"parent": "later-user", "message": {
+                "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
+                "content": {"parts": ["file-service://one"]}}},
+        })
+        later["current_node"] = "later-image"
+        with mock.patch.dict(config.data, {"image_check_before_hit_enabled": True,
+                "image_settle_enabled": True}), mock.patch("services.openai_backend_api.time.sleep"):
+            for document in (_conversation([]), later):
+                with self.subTest(document=document):
+                    backend = FakeBackend()
+                    backend._get_conversation = mock.Mock(side_effect=AssertionError("unexpected GET"))
+                    with self.assertRaises(ImagePollTimeoutError):
+                        backend._poll_image_results("conv-1", 5, request_message_id="request",
+                            initial_file_ids=["one"], require_fresh_result_ids=True,
+                            initial_document=document)
+                    backend._get_conversation.assert_not_called()
+
     def test_resolver_uses_file_and_sediment_urls(self) -> None:
         backend = FakeBackend()
         backend.file_urls = {"file-one": "https://files.test/one.png"}

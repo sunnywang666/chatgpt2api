@@ -2500,6 +2500,7 @@ class OpenAIBackendAPI:
             initial_sediment_ids: list[str] | None = None,
             request_message_id: str = "",
             require_fresh_result_ids: bool = False,
+            initial_document: dict | None = None,
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
@@ -2525,6 +2526,7 @@ class OpenAIBackendAPI:
         self._add_unique(file_ids, initial_file_ids or [])
         self._add_unique(sediment_ids, initial_sediment_ids or [])
         has_initial_ids = bool(file_ids or sediment_ids)
+        single_snapshot = initial_document is not None
         last_hit_key: tuple[tuple[str, ...], tuple[str, ...]] | None = (
             (tuple(file_ids), tuple(sediment_ids)) if has_initial_ids else None
         )
@@ -2542,11 +2544,15 @@ class OpenAIBackendAPI:
         def _remaining() -> float:
             return timeout_secs - (time.time() - start)
 
-        if has_initial_ids and config.image_settle_enabled:
+        # Recovery has already read this exact conversation under the account
+        # clock. Consume that fresh observation once; a second immediate GET
+        # cannot fit a short recovery budget when the read interval is longer.
+        # The caller waits the settle interval BEFORE acquiring this snapshot.
+        if initial_document is None and has_initial_ids and config.image_settle_enabled:
             settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
             if settle_for > 0:
                 time.sleep(settle_for)
-        elif initial_wait > 0:
+        elif initial_document is None and initial_wait > 0:
             jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
             sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
             if sleep_for > 0:
@@ -2581,11 +2587,12 @@ class OpenAIBackendAPI:
         last_read_was_transport = False
         while _remaining() > 0:
             attempt += 1
+            supplied_snapshot = initial_document is not None
             # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
             # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
             last_task_error = ""
             try:
-                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                tasks = [] if supplied_snapshot else self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
                 for task in tasks:
                     is_error, error_msg, metadata = self.check_task_error(task)
                     if is_error and error_msg:
@@ -2607,7 +2614,8 @@ class OpenAIBackendAPI:
                 })
 
             try:
-                conversation = self._get_conversation(conversation_id)
+                conversation = initial_document if supplied_snapshot else self._get_conversation(conversation_id)
+                initial_document = None
             except UpstreamHTTPError as exc:
                 last_read_status = exc.status_code
                 last_retry_after = exc.retry_after
@@ -2670,11 +2678,13 @@ class OpenAIBackendAPI:
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
             if file_ids or sediment_ids:
-                if require_fresh_result_ids and (
+                if (require_fresh_result_ids or supplied_snapshot) and (
                     not set(file_ids).issubset(current_file_ids)
                     or not set(sediment_ids).issubset(current_sediment_ids)
                 ):
                     # A saved observation cannot confirm itself after restart.
+                    if supplied_snapshot:
+                        break
                     wait = min(interval, max(0.0, _remaining()))
                     if wait > 0:
                         time.sleep(wait)
@@ -2698,11 +2708,17 @@ class OpenAIBackendAPI:
                 logger.info({"event": "image_poll_hit_pending_settle", "conversation_id": conversation_id,
                              "file_ids": file_ids, "sediment_ids": sediment_ids,
                              "settle_secs": config.image_settle_secs})
+                if supplied_snapshot:
+                    # The durable pending IDs become the first observation for
+                    # the next original read, never a generated result now.
+                    break
                 wait = min(config.image_settle_secs, max(0.0, _remaining()))
                 if wait > 0:
                     time.sleep(wait)
                     continue
                 return file_ids, sediment_ids
+            if supplied_snapshot:
+                break
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
                           "elapsed_secs": round(time.time() - start, 1)})
             wait = min(interval, max(0.0, _remaining()))
@@ -2718,9 +2734,10 @@ class OpenAIBackendAPI:
             "last_task_error": last_task_error if last_task_error else None,
         })
         exc = ImagePollTimeoutError(
-            f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
-            f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
-            f"也可能是账号被限流或生图队列拥堵导致。",
+            ("本次原会话读取尚未确认稳定图片结果，等待下一次原请求读取。" if single_snapshot else
+             f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
+             f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
+             f"也可能是账号被限流或生图队列拥堵导致。"),
             conversation_id or "",
         )
         if last_task_error:

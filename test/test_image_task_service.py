@@ -1008,21 +1008,27 @@ class ImageTaskServiceTests(unittest.TestCase):
             from services.pool_admission import image_generation_active
             self.assertTrue(image_generation_active("image", service._tasks["owner-1:pending-task"], False))
             calls = []
-            class PendingBackend:
-                settled = False
+            from services.openai_backend_api import OpenAIBackendAPI as RealBackend
+            from services.config import config
+            original_message = service._tasks["owner-1:pending-task"]["request_message_id"]
+            class PendingBackend(RealBackend):
+                reads = 0
                 def __init__(self, access_token=None, proxy_url=None):
                     pass
                 def _get_conversation(self, _conversation_id):
-                    return {"current_node": "active", "mapping": {
-                        "active": {"message": {"status": "in_progress"}}}}
+                    PendingBackend.reads += 1
+                    return {"current_node": "image", "mapping": {
+                        original_message: {"message": {"author": {"role": "user"}}},
+                        "image": {"parent": original_message, "message": {
+                            "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
+                            "content": {"parts": ["file-service://pending-file", "file-service://second-file"]}}}}}
                 def _poll_image_results(self, _conversation_id, _timeout, **kwargs):
                     if not kwargs.get("require_fresh_result_ids"):
                         raise AssertionError("pending IDs must be observed again")
+                    if not kwargs.get("initial_document"):
+                        raise AssertionError("reuse this recovery attempt's fresh snapshot")
                     calls.append(("poll", kwargs["initial_file_ids"]))
-                    self.progress_callback.record_pending_result_ids(["pending-file", "second-file"], [])
-                    if not self.settled:
-                        raise ImagePollTimeoutError("still settling", "conversation-1")
-                    return ["pending-file", "second-file"], []
+                    return super()._poll_image_results(_conversation_id, _timeout, **kwargs)
                 def resolve_conversation_image_urls(self, _conversation_id, files, sediments, **kwargs):
                     calls.append(("resolve", files))
                     return ["https://provider.test/result.png"]
@@ -1038,24 +1044,49 @@ class ImageTaskServiceTests(unittest.TestCase):
                 mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="token"),
                 mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
                 mock.patch("services.openai_backend_api.OpenAIBackendAPI", PendingBackend),
+                mock.patch.dict(config.data, {"image_settle_enabled": True, "image_settle_secs": 0.5,
+                    "image_check_before_hit_enabled": True, "image_poll_initial_wait_secs": 10}),
             ):
-                service.resume_poll(OWNER, "pending-task", 30, "http://provider")
+                with mock.patch.dict(config.data, {"image_settle_secs": 30}), mock.patch(
+                    "services.image_task_service.time.sleep"
+                ) as sleep:
+                    service._run_resume_poll("owner-1:pending-task", "conversation-1", 5,
+                                             "http://provider", OWNER, "generate", "gpt-image-2", False, False)
+                    sleep.assert_called_once_with(5)
+                    self.assertEqual(PendingBackend.reads, 0)
+                    self.assertEqual(calls, [])
+                    self.assertEqual(service._tasks["owner-1:pending-task"]["status"], "error")
+                    self.assertEqual(service._tasks["owner-1:pending-task"]["_pending_image_result_ids"],
+                                     {"file_ids": ["pending-file"], "sediment_ids": []})
+                service._update_task("owner-1:pending-task", next_poll_at=0)
+                service.resume_poll(OWNER, "pending-task", 5, "http://provider")
                 still_pending = wait_for_task(service, OWNER, "pending-task", "error")
+                for worker in threading.enumerate():
+                    if worker.name == "image-resume-pending-task":
+                        worker.join(timeout=2)
+                        self.assertFalse(worker.is_alive())
                 self.assertEqual(calls, [("poll", ["pending-file"])])
+                self.assertEqual(PendingBackend.reads, 1)
                 self.assertTrue(still_pending["upstream_unfinished"])
                 service = self.make_service(path)
                 service._update_task("owner-1:pending-task", next_poll_at=0,
                                      _attempt_finished_at=time.time(), error_code="RESULT_UNRECOVERABLE")
-                PendingBackend.settled = True
                 from services.pool_admission import PoolAdmission
                 service.admission = PoolAdmission(service.store, None)
                 service.admission.recoveries["image"] = lambda owner, task_id: service.resume_poll(
-                    {"id": owner, "role": "user"}, task_id, 30, "http://provider")
+                    {"id": owner, "role": "user"}, task_id, 5, "http://provider")
                 service.admission.recover_one()
                 succeeded = wait_for_task(service, OWNER, "pending-task", "success")
+                # A visible success precedes the admission worker's final claim
+                # release. Keep its SQLite directory until that worker exits.
+                for worker in threading.enumerate():
+                    if worker.name == "image-resume-pending-task":
+                        worker.join(timeout=2)
+                        self.assertFalse(worker.is_alive())
             self.assertEqual(calls[1], ("poll", ["pending-file", "second-file"]))
             self.assertEqual(calls[2][0], "resolve")
             self.assertEqual(calls[3][0], "download")
+            self.assertEqual(PendingBackend.reads, 2)
             self.assertIsNone(service._tasks["owner-1:pending-task"].get("_pending_image_result_ids"))
             self.assertEqual(succeeded["image_session_parent_id"], "result-parent")
 
@@ -1558,7 +1589,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 def __init__(self, access_token=None, proxy_url=None):
                     self.access_token = access_token
 
-                def _poll_image_results(self, conversation_id, timeout, request_message_id=""):
+                def _poll_image_results(self, conversation_id, timeout, request_message_id="", initial_document=None):
                     self.poll = (conversation_id, timeout, request_message_id)
                     self.poll_calls.append(self.poll)
                     return ["file-1"], []
@@ -1653,7 +1684,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                             },
                         }
 
-                    def _poll_image_results(self, conversation_id, timeout, request_message_id=""):
+                    def _poll_image_results(self, conversation_id, timeout, request_message_id="", initial_document=None):
                         self.poll_calls.append((conversation_id, timeout, request_message_id))
                         # An empty /backend-api/tasks result and no branch image
                         # identifiers do not prove success or failure.

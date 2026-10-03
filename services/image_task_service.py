@@ -2026,7 +2026,7 @@ class ImageTaskService:
         failure_phase = "read_image_request"
         try:
             from services.account_service import account_service
-            from services.openai_backend_api import ImageContentPolicyError, OpenAIBackendAPI
+            from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
             with self._transaction():
@@ -2126,6 +2126,17 @@ class ImageTaskService:
                     )
                     return
                 try:
+                    # Pending IDs came from a previous authoritative read.
+                    # Wait before the new snapshot, not after it, so the next
+                    # matching observation retains the existing settle delay.
+                    if pending_ids and config.image_settle_enabled:
+                        settle_wait = min(max(0.0, float(config.image_settle_secs)),
+                                          max(0.0, float(extra_timeout_secs)))
+                        if settle_wait:
+                            time.sleep(settle_wait)
+                        extra_timeout_secs = max(0.0, float(extra_timeout_secs) - settle_wait)
+                        if extra_timeout_secs <= 0:
+                            raise ImagePollTimeoutError("原会话结果仍待稳定确认，保留原请求继续读取。", conversation_id)
                     document = backend._get_conversation(conversation_id)
                     conversation_available = True
                     from services.generation_completion import retry_cursor
@@ -2214,6 +2225,7 @@ class ImageTaskService:
                         conversation_id,
                         extra_timeout_secs,
                         request_message_id=request_message_id,
+                        initial_document=document,
                         **pending_options,
                     )
                 except Exception as exc:

@@ -112,7 +112,7 @@ def runtime(tmp_path, monkeypatch):
         def resolve_conversation_image_urls(self, cid, files, sediment, **kwargs):
             assert kwargs["request_message_id"] in state.documents[cid]["mapping"]
             return ["https://fixture.invalid/original.png"]
-        def _poll_image_results(self, cid, timeout, *, request_message_id):
+        def _poll_image_results(self, cid, timeout, *, request_message_id, initial_document=None):
             assert request_message_id in state.documents[cid]["mapping"]
             state.polls.append((cid, request_message_id))
             _, result_id = tool_document(cid, request_message_id)
@@ -688,10 +688,14 @@ def test_send_guard_rechecks_source_after_claim_and_before_the_network(runtime):
 def test_thread_capability_matches_ingress_without_changing_private_catalog(runtime, monkeypatch, enabled, ingress):
     from api import ai, company_requests
     import services.image_task_service as image_module
+    import services.public_chat_service as public_chat_module
     r = runtime
     catalog = {"object": "list", "data": []}
     monkeypatch.setattr(ai, "require_identity", lambda *a, **k: WHO)
     monkeypatch.setattr(ai.openai_v1_models, "list_models", lambda: catalog)
+    # An intentionally empty known catalog is different from discovery being
+    # unavailable. Keep this contract test independent of global cache state.
+    monkeypatch.setattr(public_chat_module.model_catalog_service, "catalog_is_unknown", lambda: False)
     monkeypatch.setattr(image_module, "image_task_service", r.service)
     if not enabled:
         r.service.admission = None
