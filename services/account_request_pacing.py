@@ -20,7 +20,8 @@ from urllib.parse import urlparse
 
 from services.config import DATA_DIR, config
 from utils.log import logger
-from services.request_context import current_request, current_archive_guard, current_archive_read_owner
+from services.request_context import (current_request, current_archive_guard, current_archive_read_owner,
+                                      current_archive_observation, current_archive_step)
 
 
 class ProcessMutex:
@@ -296,6 +297,8 @@ class AccountRequestClock:
         raw_model = (kwargs.get("json") or {}).get("model") if isinstance(kwargs.get("json"), dict) else None
         model = raw_model if isinstance(raw_model, str) and len(raw_model) <= 160 else None
         request_ref = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24] if context else None
+        archive_observation = (current_archive_observation.get() or {}) if archive_guard is not None else {}
+        request_ref = request_ref or archive_observation.get("request_ref")
 
         def observed_send(send_method, send_url, send_phase, **send_kwargs):
             # Count actual transport attempts, including metadata/preflight GETs.
@@ -325,6 +328,8 @@ class AccountRequestClock:
                 status = getattr(response, "status_code", None)
                 logger.info({"event": "account_http_attempt", "account": self.account_key,
                              "request_ref": request_ref, "layer": "upstream_chatgpt",
+                             "work_ref": archive_observation.get("work_ref"),
+                             "archive_step": current_archive_step.get() if archive_guard is not None else None,
                              "method": verb if verb in {"GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "OPTIONS"} else "OTHER",
                              "phase": send_phase, "endpoint_kind": endpoint_kind, "started_at": started_at,
                              "headers_elapsed_secs": round(time.monotonic() - started, 6),

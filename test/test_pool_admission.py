@@ -1061,6 +1061,47 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(finished[0]["queue_wait_seconds"], 0)
         self.assertEqual(len(self.calls), 1)
 
+    def test_image_artifact_stage_follows_commit_and_does_not_repeat_on_read(self):
+        from services.request_context import executing
+        self.image("saved-image")
+        context = self.admission.claim_next()
+        original_record = context.record_stage
+        observed = []
+        def record(stage, **extra):
+            saved = context.receipt()
+            self.assertEqual(saved["status"], "success")
+            self.assertEqual(saved["data"], [{"b64_json": "cG5n"}])
+            observed.append(stage)
+            return original_record(stage, **extra)
+        context.record_stage = record
+        with executing(context):
+            self.images._update_task("happy:saved-image", status="success", data=[{"b64_json": "cG5n"}])
+            self.images._update_task("happy:saved-image", status="success", data=[{"b64_json": "cG5n"}])
+        self.assertEqual(observed, ["artifact_saved"])
+        saved = context.receipt()
+        event = next(e for e in saved["_execution_timeline"] if e["stage"] == "artifact_saved")
+        self.assertEqual(event["image_count"], 1)
+        self.assertFalse(any(e["stage"] == "send_call_started" for e in saved["_execution_timeline"]))
+
+    def test_image_artifact_observation_failure_cannot_undo_saved_result(self):
+        from services.request_context import executing
+        self.image("saved-image")
+        context = self.admission.claim_next()
+        with patch.object(context, "record_stage", side_effect=RuntimeError("observation unavailable")), executing(context):
+            self.images._update_task("happy:saved-image", status="success", data=[{"b64_json": "cG5n"}])
+        self.assertEqual(context.receipt()["status"], "success")
+
+    def test_image_artifact_is_not_announced_when_persistence_fails(self):
+        from services.request_context import executing
+        self.image("saved-image")
+        context = self.admission.claim_next()
+        with patch.object(context, "record_stage") as record, \
+                patch.object(self.images, "_save_locked", side_effect=RuntimeError("storage unavailable")), \
+                executing(context), self.assertRaisesRegex(RuntimeError, "storage unavailable"):
+            self.images._update_task("happy:saved-image", status="success", data=[{"b64_json": "cG5n"}])
+        record.assert_not_called()
+        self.assertNotEqual(context.receipt()["status"], "success")
+
     def test_unsent_capacity_wait_is_not_logged_as_terminal_failure(self):
         self.image("unsent")
         context = self.admission.claim_next()

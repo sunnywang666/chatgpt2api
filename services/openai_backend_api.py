@@ -25,6 +25,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.account_request_pacing import AccountRequestDeadlineExceeded, pace_account_session, retry_after_seconds
 from services.config import config
+from services.request_context import observing_archive_step
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -1310,7 +1311,8 @@ class OpenAIBackendAPI:
 
     def set_conversation_archived(self, conversation_id: str, parent_message_id: str, archived: bool) -> Dict[str, Any]:
         """Change visibility only after checking the original conversation and cursor."""
-        document = self._get_conversation(conversation_id)
+        with observing_archive_step("precheck"):
+            document = self._get_conversation(conversation_id)
         if str(document.get("current_node") or "").strip() != parent_message_id:
             raise ConversationArchiveCursorMismatch("original conversation cursor changed")
         if parent_message_id not in (document.get("mapping") or {}):
@@ -1318,12 +1320,14 @@ class OpenAIBackendAPI:
         if document.get("is_archived") is archived:
             return {"archived": archived}
         path = f"/backend-api/conversation/{conversation_id}"
-        response = self.session.patch(self.base_url + path,
-            headers=self._headers(path, {"Accept": "application/json", "Content-Type": "application/json"}),
-            json={"is_archived": archived}, timeout=60)
+        with observing_archive_step("patch"):
+            response = self.session.patch(self.base_url + path,
+                headers=self._headers(path, {"Accept": "application/json", "Content-Type": "application/json"}),
+                json={"is_archived": archived}, timeout=60)
         ensure_ok(response, path)
         # A timeout on PATCH is safe to recover by reading this exact chat first.
-        readback = self._get_conversation(conversation_id)
+        with observing_archive_step("readback"):
+            readback = self._get_conversation(conversation_id)
         if str(readback.get("current_node") or "").strip() != parent_message_id:
             raise RuntimeError("original conversation cursor changed during archive update")
         if readback.get("is_archived") is not archived:

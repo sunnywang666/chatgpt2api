@@ -156,11 +156,13 @@ def _blocked(receipt, *, allow_queued=False, members=()):
 def _projection(work):
     archive = work.get("archive") or {"status": "not_requested", "desired": None}
     safe_archive = {key: archive[key] for key in (
-        "status", "desired", "archived", "next_at", "error_code", "attempts", "scope") if key in archive}
+        "status", "desired", "archived", "next_at", "error_code", "attempts", "scope",
+        "requested_at", "attempt_started_at", "confirmed_at") if key in archive}
     return {"protocol": "work-v1", "kind": work["kind"], "work_ref": work["work_ref"],
             "request_id": work["last_request_id"], "state": work["state"],
             "slot_held": work["slot_held"], "version": work["version"],
             "results_saved": bool(work.get("results_saved")), "archive": safe_archive,
+            **({"results_saved_at": work["results_saved_at"]} if work.get("results_saved_at") is not None else {}),
             **({"completion_result_id": work["completion_result_id"],
                 "cleanup_pending": bool(work.get("cleanup_pending"))} if work.get("completion_result_id") else {})}
 
@@ -240,7 +242,9 @@ class WorkLifecycleService:
             if state == "completed":
                 # The immutable target and archive intent are committed in the
                 # same transaction as releasing this work's workflow slot.
-                work.update(state="completed", slot_held=False, results_saved=True)
+                # This is the caller's saved-result attestation, not a timestamp
+                # claiming that we observed the caller's filesystem write.
+                work.update(state="completed", slot_held=False, results_saved=True, results_saved_at=now)
                 never_sent = all(r.get("upstream_outcome") == "not_sent"
                                  and not r.get("_submission_started") and not r.get("conversation_id")
                                  for r in members)
@@ -363,7 +367,7 @@ class WorkLifecycleService:
                     request_id = archive["request_id"]
                     claim = uuid.uuid4().hex
                     archive.update(status="running", claim=claim, claim_until=now + 300,
-                                   attempts=int(archive.get("attempts") or 0) + 1)
+                                   attempts=int(archive.get("attempts") or 0) + 1, attempt_started_at=now)
                     save_work(self.store, db, work)
             from services.account_request_pacing import reserve_account_archive_read
             for account, owner in reservations.values():
@@ -384,7 +388,8 @@ class WorkLifecycleService:
                     save_work(self.store, db, current)
             try:
                 from services.request_context import guarding_archive
-                with guarding_archive(check_and_renew_archive, read_owner=_archive_read_owner(work)):
+                with guarding_archive(check_and_renew_archive, read_owner=_archive_read_owner(work),
+                                      request_key=work["owner"] + ":" + request_id, work_key=work["key"]):
                     if work["kind"] == "text":
                         result = self.text.set_public_session_archived(work["owner"], request_id, archive["desired"])
                         valid = (result.get("request_id") == request_id
@@ -408,12 +413,14 @@ class WorkLifecycleService:
                 if error_code:
                     updated.update(status="unknown", next_at=float(self.clock()) + min(300, 2 ** min(updated["attempts"], 8)))
                 else:
-                    updated.update(status="confirmed", archived=updated["desired"], next_at=None)
+                    updated.update(status="confirmed", archived=updated["desired"], next_at=None,
+                                   confirmed_at=float(self.clock()))
                     if current.get("cleanup_pending") and updated["desired"]:
                         current.update(cleanup_pending=False, slot_held=False)
                     if current["state"] == "restoring":
                         current["state"] = "active"
                         current["results_saved"] = False
+                        current.pop("results_saved_at", None)
                 save_work(self.store, db, current)
             return True
         finally:

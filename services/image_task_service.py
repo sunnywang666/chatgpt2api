@@ -16,7 +16,8 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.task_store import TaskStore, recovery_control, pending_image_result_ids
 from contextlib import contextmanager
-from services.request_context import current_request, AdmissionLost
+from services.request_context import current_request, AdmissionLost, observing_archive_step
+from utils.log import logger
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
@@ -815,8 +816,9 @@ class ImageTaskService:
             backend = OpenAIBackendAPI(access_token=token)
             try:
                 result_ids = (task.get("result_file_ids") or []) + (task.get("result_sediment_ids") or [])
-                actual_parent = finished_parent(backend._get_conversation(conversation_id), conversation_id,
-                    request_id, expected_result_ids=result_ids)
+                with observing_archive_step("terminal_check"):
+                    actual_parent = finished_parent(backend._get_conversation(conversation_id), conversation_id,
+                        request_id, expected_result_ids=result_ids)
                 if actual_parent != parent_id:
                     raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
                 backend.set_conversation_archived(conversation_id, parent_id, archived)
@@ -1438,6 +1440,7 @@ class ImageTaskService:
             pass
 
     def _update_task(self, key: str, **updates: Any) -> None:
+        saved_count = None
         with self._transaction():
             task = self._tasks.get(key)
             if task is None:
@@ -1447,11 +1450,24 @@ class ImageTaskService:
                 raise AdmissionLost("original image claim changed")
             if task.get("status") == TASK_STATUS_SUCCESS and updates.get("status") not in (None, TASK_STATUS_SUCCESS):
                 return
+            if (task.get("status") != TASK_STATUS_SUCCESS and updates.get("status") == TASK_STATUS_SUCCESS
+                    and isinstance(updates.get("data"), list) and updates["data"]):
+                saved_count = len(updates["data"])
             task.update(updates)
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
             self._save_locked()
             self._slot_condition.notify_all()
+        # Normal dispatch and original-result recovery both persist here. Emit
+        # after commit, never on merely receiving an ID or downloading bytes.
+        if (saved_count is not None and getattr(self._transaction_local, "db", None) is None
+                and context is not None and context.kind == "image"
+                and key == _task_key(context.owner, context.request_id)):
+            try:
+                context.record_stage("artifact_saved", image_count=saved_count)
+            except Exception:
+                # Observability must not turn a committed result into a retry.
+                logger.warning({"event": "pool_artifact_observation_unavailable", "layer": "provider"})
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():

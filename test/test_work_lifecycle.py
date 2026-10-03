@@ -56,6 +56,79 @@ def test_completion_persists_original_archive_intent_and_releases_only_its_work(
     assert not service.process_one()
 
 
+def test_archive_timestamps_follow_confirmation_not_patch_or_failed_attempt(runtime):
+    service, _, now, _, fail, add = runtime
+    add("A-1")
+    completed = service.update("text", {"id": "one"}, "A-1", "completed", True)
+    assert completed["results_saved_at"] == completed["archive"]["requested_at"] == 1000
+    assert "confirmed_at" not in completed["archive"]
+    now[0] = 1001
+    assert service.update("text", {"id": "one"}, "A-1", "completed", True)["results_saved_at"] == 1000
+    fail[0] = True
+    assert service.process_one()
+    failed = service.get("text", {"id": "one"}, "A-1")
+    assert failed["archive"]["attempt_started_at"] == 1001
+    assert "confirmed_at" not in failed["archive"]
+    now[0] = 1010
+    fail[0] = False
+    assert service.process_one()
+    confirmed = service.get("text", {"id": "one"}, "A-1")
+    assert confirmed["archive"]["confirmed_at"] == 1010
+    assert confirmed["archive"]["attempt_started_at"] == 1010
+    assert confirmed["archive"]["requested_at"] == confirmed["results_saved_at"] == 1000
+    now[0] = 1020
+    restoring = service.update("text", {"id": "one"}, "A-1", "active")
+    assert "confirmed_at" not in restoring["archive"]
+    assert service.process_one()
+    assert "results_saved_at" not in service.get("text", {"id": "one"}, "A-1")
+
+
+def test_archive_http_steps_are_attributed_without_changing_read_pacing(runtime, monkeypatch):
+    from services.account_request_pacing import AccountRequestClock
+    from services.config import config
+    from services.openai_backend_api import OpenAIBackendAPI
+    from services.request_context import current_archive_observation, current_archive_step
+    service, _, now, _, _, add = runtime
+    receipt = add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    monkeypatch.setattr("services.account_request_pacing.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("services.account_request_pacing.time.time", lambda: now[0])
+    monkeypatch.setattr("services.account_request_pacing.time.sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 1))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 60))
+    events, reads, archived = [], [], [False]
+    monkeypatch.setattr("services.account_request_pacing.logger.info", lambda event: events.append(event))
+    clock = AccountRequestClock()
+    def send(method, url, **kwargs):
+        if method == "PATCH":
+            archived[0] = kwargs["json"]["is_archived"]
+        else:
+            reads.append(now[0])
+        now[0] += 1
+        return SimpleNamespace(status_code=200, headers={}, json=lambda: {
+            "current_node": "parent", "mapping": {"parent": {}}, "is_archived": archived[0]})
+    backend = object.__new__(OpenAIBackendAPI)
+    backend.base_url = "https://fixture.test"
+    backend._headers = lambda *args: {}
+    backend._get_conversation = lambda cid: clock.request(send, "GET", backend.base_url + "/conversation/" + cid, timeout=60).json()
+    backend.session = SimpleNamespace(patch=lambda url, **kw: clock.request(send, "PATCH", url, **kw))
+    def archive(owner, rid, desired):
+        result = backend.set_conversation_archived("private-conversation", "parent", desired)
+        return {**result, "request_id": rid, "conversation": {"client_conversation_id": "A"}}
+    service.text.set_public_session_archived = archive
+    assert service.process_one()
+    attempts = [e for e in events if e.get("event") == "account_http_attempt"]
+    assert [e["archive_step"] for e in attempts] == ["precheck", "patch", "readback"]
+    assert [e["phase"] for e in attempts] == ["conversation_read", "conversation_archive", "conversation_read"]
+    assert {e["request_ref"] for e in attempts} == {hashlib.sha256(b"one:A-1").hexdigest()[:24]}
+    assert {e["work_ref"] for e in attempts} == {hashlib.sha256(receipt["_work_key"].encode()).hexdigest()[:24]}
+    assert reads[1] - reads[0] >= 60
+    assert "private-conversation" not in json.dumps(attempts)
+    assert "one:A-1" not in json.dumps(attempts)
+    assert current_archive_observation.get() is None and current_archive_step.get() is None
+    assert service.get("text", {"id": "one"}, "A-1")["archive"]["confirmed_at"] >= reads[-1]
+
+
 def test_read_deferral_books_oldest_archive_outside_receipt_transaction(runtime, monkeypatch):
     from services import account_request_pacing as pacing
     service, store, now, calls, _, add = runtime
