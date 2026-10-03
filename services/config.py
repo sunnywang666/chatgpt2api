@@ -85,6 +85,7 @@ _KEEP_CHAT_TRIAL = object()
 _PACING_SETTINGS = {
     "account_request_interval_secs": (1.0, 60.0, 5.0),
     "account_message_interval_secs": (5.0, 300.0, 30.0),
+    "account_conversation_read_interval_secs": (0.0, 300.0, 0.0),
 }
 
 
@@ -467,6 +468,14 @@ class ConfigStore:
             return 30.0
 
     @property
+    def account_conversation_read_interval_secs(self) -> float:
+        """Extra floor for conversation GETs; zero preserves the shared pace."""
+        try:
+            return _pacing_value("account_conversation_read_interval_secs", self.data.get("account_conversation_read_interval_secs", 0.0))
+        except ValueError:
+            return 0.0
+
+    @property
     def image_account_concurrency(self) -> int:
         try:
             return max(1, int(self._resource_data().get("image_account_concurrency", self.data.get("image_account_concurrency", 3))))
@@ -731,6 +740,7 @@ class ConfigStore:
         data = dict(self.data)
         data["account_request_interval_secs"] = self.account_request_interval_secs
         data["account_message_interval_secs"] = self.account_message_interval_secs
+        data["account_conversation_read_interval_secs"] = self.account_conversation_read_interval_secs
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs

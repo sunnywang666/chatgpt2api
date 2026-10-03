@@ -83,6 +83,7 @@ class AccountRequestClock:
         self.turn_lock = ProcessMutex(state_path.with_suffix(".turn.lock") if state_path else None)
         self.next_request = 0.0
         self.next_turn = 0.0
+        self.next_conversation_read = 0.0
         self.cooldown_until = 0.0
         self.rate_failures = 0
         self.last_rate_limit = 0.0
@@ -102,6 +103,10 @@ class AccountRequestClock:
             setattr(self, field, value - offset)
         self.rate_failures = max(0, int(saved["rate_failures"]))
         self.last_rate_limit_evidence = saved.get("last_rate_limit_evidence")
+        read_at = float(saved.get("next_conversation_read", 0.0))
+        if not math.isfinite(read_at):
+            raise ValueError("Invalid saved conversation read clock")
+        self.next_conversation_read = read_at - offset
         started = saved.get("last_turn_started")
         if started is not None:
             self.last_turn_started = float(started) - offset
@@ -111,7 +116,7 @@ class AccountRequestClock:
             return
         offset = time.time() - time.monotonic()
         saved = {field: getattr(self, field) + offset for field in
-                 ("next_request", "next_turn", "cooldown_until", "last_rate_limit")}
+                 ("next_request", "next_turn", "next_conversation_read", "cooldown_until", "last_rate_limit")}
         saved["rate_failures"] = self.rate_failures
         saved["last_rate_limit_evidence"] = self.last_rate_limit_evidence
         saved["last_turn_started"] = None if self.last_turn_started is None else self.last_turn_started + offset
@@ -189,6 +194,7 @@ class AccountRequestClock:
                 phase = "conversation_archive" if body["is_archived"] else "conversation_restore"
         elif "/conversation/" in path and str(method).upper() == "GET":
             phase = "conversation_read"
+        is_conversation_read = phase == "conversation_read"
         raw_model = (kwargs.get("json") or {}).get("model") if isinstance(kwargs.get("json"), dict) else None
         model = raw_model if isinstance(raw_model, str) and len(raw_model) <= 160 else None
         request_ref = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24] if context else None
@@ -252,7 +258,20 @@ class AccountRequestClock:
                         context.release_turn()
 
         try:
-            acquire_with_budget(self.lock)
+            while True:
+                acquire_with_budget(self.lock)
+                read_delay = max(self.next_request, self.cooldown_until,
+                                 self.next_conversation_read) - time.monotonic()
+                if not is_conversation_read or read_delay <= 0:
+                    break
+                # Waiting for a read must not occupy the shared send-edge lock
+                # and delay a generation POST that is otherwise ready. Reload
+                # all deadlines under the cross-process lock after waking.
+                self.lock.release()
+                remaining = remaining_budget()
+                if remaining is not None and read_delay >= remaining:
+                    raise AccountRequestDeadlineExceeded("account request deadline elapsed during read wait")
+                time.sleep(read_delay)
             try:
                 if self.rate_failures and time.monotonic() - self.last_rate_limit >= 900:
                     self.rate_failures = 0
@@ -313,6 +332,9 @@ class AccountRequestClock:
                 cap_timeout_before_send()
                 factor = 2 ** min(self.rate_failures, 4)
                 self.next_request = now + min(60.0, config.account_request_interval_secs * factor)
+                read_interval = min(300.0, getattr(config, "account_conversation_read_interval_secs", 0.0) * factor)
+                if is_conversation_read:
+                    self.next_conversation_read = now + read_interval
                 if is_turn:
                     self.next_turn = now + min(300.0, config.account_message_interval_secs * factor)
                     logger.info({"event": "account_message_start", "account": self.account_key,
@@ -337,6 +359,8 @@ class AccountRequestClock:
                     # Keep the pre-send durable reservation for crash safety,
                     # then account for its I/O delay even if transport fails.
                     self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
+                    if is_conversation_read:
+                        self.next_conversation_read = max(self.next_conversation_read, sent_at + read_interval)
                     if is_turn:
                         self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
                         self.last_turn_started = sent_at

@@ -73,6 +73,7 @@ class PacingSettingsTests(unittest.TestCase):
         for key, bad in [
             ("account_request_interval_secs", [0, .5, 61, True, None, "bad", float("nan"), float("inf")]),
             ("account_message_interval_secs", [1, 2, 4.99, 301, False, None, "-inf"]),
+            ("account_conversation_read_interval_secs", [-1, 301, False, None, "bad", float("nan")]),
         ]:
             for value in bad:
                 with self.subTest(key=key, value=value):
@@ -116,6 +117,17 @@ class PacingSettingsTests(unittest.TestCase):
         self.store.update({"proxy": "unrelated-allowed"})
         self.assertEqual(self.store.data["account_message_interval_secs"], 2)
         self.assertEqual(self.store.get()["account_message_interval_secs"], 30)
+
+    def test_conversation_read_setting_is_independent_and_defaults_to_no_extra_floor(self):
+        from services.config import ConfigStore
+        self.assertEqual(self.store.get()["account_conversation_read_interval_secs"], 0)
+        for value in (0, 15, 300, "2.5"):
+            settings = self.store.update({"account_conversation_read_interval_secs": value})
+            reopened = ConfigStore(self.path)
+            self.assertEqual(settings["account_conversation_read_interval_secs"], float(value))
+            self.assertEqual(reopened.account_conversation_read_interval_secs, float(value))
+            self.assertEqual(reopened.account_request_interval_secs, 5)
+            self.assertEqual(reopened.account_message_interval_secs, 30)
 
     def test_settings_api_rejects_bad_pacing_and_reads_effective_legacy_value(self):
         from fastapi import FastAPI
