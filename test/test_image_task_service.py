@@ -897,6 +897,47 @@ class ImageTaskServiceTests(unittest.TestCase):
 
         self.assertEqual(outputs[0].conversation_id, "conversation-1")
 
+    def test_actual_submission_replaces_stale_not_submitted_outcome(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            observed = {}
+
+            def handler(payload):
+                # The same request previously returned to admission before
+                # sending because its original conversation was unreadable.
+                service._update_task(
+                    "owner-1:resumed-send", upstream_outcome="not_submitted",
+                    upstream_submission_started=False,
+                    error_code="IMAGE_THREAD_PREVIOUS_UNCONFIRMED",
+                    waiting={"reason": "archive_restore"}, recovery_retryable=True,
+                )
+                callback = payload["progress_callback"]
+                callback.record_submission_started()
+                observed.update(service.list_tasks(OWNER, ["resumed-send"])["items"][0])
+                error = ConnectionError("response lost after submission")
+                error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+                error.upstream_submitted = True
+                raise error
+
+            service = self.make_service(path, handler)
+            service.submit_generation(
+                OWNER, client_task_id="resumed-send", prompt="cat", model="gpt-image-2", size=None,
+                provider_binding_id="binding-1", provider_account_identity="account-1",
+                client_conversation_id="client-1", retain_conversation=True,
+            )
+            failed = wait_for_task(service, OWNER, "resumed-send", "error")
+            self.assertEqual(observed["upstream_outcome"], "unknown")
+            self.assertTrue(observed["upstream_submission_started"])
+            self.assertFalse(observed.get("error_code"))
+            self.assertFalse(observed.get("waiting"))
+            self.assertFalse(observed.get("recovery_retryable"))
+            self.assertEqual(failed["upstream_outcome"], "unknown")
+            self.assertEqual(failed["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+            restarted = self.make_service(path)
+            reloaded = restarted.list_tasks(OWNER, ["resumed-send"])["items"][0]
+            self.assertEqual(reloaded["upstream_outcome"], "unknown")
+            self.assertTrue(reloaded["upstream_submission_started"])
+
     def test_generated_result_download_failure_resumes_download_without_poll_or_generation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"

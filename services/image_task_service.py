@@ -1118,7 +1118,13 @@ class ImageTaskService:
         progress_callback.record_conversation_id = record_conversation_id
 
         def record_submission_started() -> None:
-            self._update_task(key, upstream_submission_started=True)
+            # A previously deferred request may still carry a proven-unsent
+            # outcome. Once the POST begins, only a later result can settle it.
+            self._update_task(
+                key, upstream_submission_started=True, upstream_outcome="unknown",
+                error_code="", waiting={}, recovery_retryable=False,
+                recovery_requires_new_conversation=False,
+            )
         progress_callback.record_submission_started = record_submission_started
 
         def record_result_ids(file_ids: list[str], sediment_ids: list[str]) -> None:
