@@ -18,6 +18,17 @@ import time
 import uuid
 
 
+def pending_image_result_ids(receipt):
+    """Request-scoped observations that still require an authoritative settle read."""
+    value = receipt.get("_pending_image_result_ids")
+    if not isinstance(value, dict):
+        return {}
+    result = {field: list(dict.fromkeys(item.strip() for item in value.get(field, [])
+              if isinstance(item, str) and item.strip())) if isinstance(value.get(field), list) else []
+              for field in ("file_ids", "sediment_ids")}
+    return result if any(result.values()) else {}
+
+
 def recovery_control(receipt):
     """A read pause never certifies that an already claimed operation stopped."""
     paused = receipt.get("_recovery_paused") is True

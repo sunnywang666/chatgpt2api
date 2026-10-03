@@ -981,6 +981,95 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(DownloadBackend.polls, 0)
             self.assertEqual(DownloadBackend.reads, 0)
 
+    def test_pending_image_ids_survive_restart_without_skipping_settle_or_releasing_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            def handler(payload):
+                callback = payload["progress_callback"]
+                callback.record_submission_started()
+                callback.record_conversation_id("conversation-1")
+                callback.record_pending_result_ids(["pending-file"], [])
+                error = ImagePollTimeoutError("settle budget exhausted", "conversation-1")
+                error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+                error.upstream_submitted = True
+                raise error
+            service = self.make_service(path, handler)
+            service.submit_generation(
+                OWNER, client_task_id="pending-task", prompt="cat", model="gpt-image-2", size=None,
+                provider_binding_id="binding-1", provider_account_identity="account-1",
+                client_conversation_id="client-1", retain_conversation=True,
+            )
+            failed = wait_for_task(service, OWNER, "pending-task", "error")
+            self.assertTrue(failed["upstream_unfinished"])
+            self.assertEqual(failed["recovery_phase"], "read_image_request")
+            service = self.make_service(path)
+            self.assertEqual(service._tasks["owner-1:pending-task"]["_pending_image_result_ids"],
+                             {"file_ids": ["pending-file"], "sediment_ids": []})
+            from services.pool_admission import image_generation_active
+            self.assertTrue(image_generation_active("image", service._tasks["owner-1:pending-task"], False))
+            calls = []
+            class PendingBackend:
+                settled = False
+                def __init__(self, access_token=None, proxy_url=None):
+                    pass
+                def _get_conversation(self, _conversation_id):
+                    return {"current_node": "active", "mapping": {
+                        "active": {"message": {"status": "in_progress"}}}}
+                def _poll_image_results(self, _conversation_id, _timeout, **kwargs):
+                    if not kwargs.get("require_fresh_result_ids"):
+                        raise AssertionError("pending IDs must be observed again")
+                    calls.append(("poll", kwargs["initial_file_ids"]))
+                    self.progress_callback.record_pending_result_ids(["pending-file", "second-file"], [])
+                    if not self.settled:
+                        raise ImagePollTimeoutError("still settling", "conversation-1")
+                    return ["pending-file", "second-file"], []
+                def resolve_conversation_image_urls(self, _conversation_id, files, sediments, **kwargs):
+                    calls.append(("resolve", files))
+                    return ["https://provider.test/result.png"]
+                def download_image_bytes(self, _urls):
+                    calls.append(("download", []))
+                    return [b"image-result"]
+                def get_conversation_parent_message_id(self, _conversation_id):
+                    return "result-parent"
+                def close(self):
+                    pass
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", PendingBackend),
+            ):
+                service.resume_poll(OWNER, "pending-task", 30, "http://provider")
+                still_pending = wait_for_task(service, OWNER, "pending-task", "error")
+                self.assertEqual(calls, [("poll", ["pending-file"])])
+                self.assertTrue(still_pending["upstream_unfinished"])
+                service = self.make_service(path)
+                service._update_task("owner-1:pending-task", next_poll_at=0,
+                                     _attempt_finished_at=time.time(), error_code="RESULT_UNRECOVERABLE")
+                PendingBackend.settled = True
+                from services.pool_admission import PoolAdmission
+                service.admission = PoolAdmission(service.store, None)
+                service.admission.recoveries["image"] = lambda owner, task_id: service.resume_poll(
+                    {"id": owner, "role": "user"}, task_id, 30, "http://provider")
+                service.admission.recover_one()
+                succeeded = wait_for_task(service, OWNER, "pending-task", "success")
+            self.assertEqual(calls[1], ("poll", ["pending-file", "second-file"]))
+            self.assertEqual(calls[2][0], "resolve")
+            self.assertEqual(calls[3][0], "download")
+            self.assertIsNone(service._tasks["owner-1:pending-task"].get("_pending_image_result_ids"))
+            self.assertEqual(succeeded["image_session_parent_id"], "result-parent")
+
+    def test_successful_handler_clears_pending_observations(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            def handler(payload):
+                payload["progress_callback"].record_pending_result_ids(["observed-file"], [])
+                return {"data": [{"url": "https://provider.test/finished.png"}]}
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_generation(OWNER, client_task_id="pending-success", prompt="cat",
+                                      model="gpt-image-2", size=None)
+            wait_for_task(service, OWNER, "pending-success", "success")
+            self.assertIsNone(service._tasks["owner-1:pending-success"].get("_pending_image_result_ids"))
+
     def test_captured_result_failure_keeps_cause_without_claiming_download_failed(self):
         for error_type, expected in (
             (ImageStreamHardTimeoutError, "RECOVERY_TIMED_OUT"),

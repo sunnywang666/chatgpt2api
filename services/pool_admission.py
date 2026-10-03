@@ -17,7 +17,7 @@ import uuid
 
 from services.admission_planner import Need, Resource, Offer, RequestRef, WaitingRequest, Snapshot, choose_next, fairness_lane
 from services.request_context import AdmissionLost, executing, safe_account_ref
-from services.task_store import TaskStore
+from services.task_store import TaskStore, pending_image_result_ids
 from services import workflow_scheduling
 from utils.log import logger
 
@@ -301,7 +301,7 @@ class PoolAdmission:
         rows.sort(key=lambda row: float(row[3].get("recovery_next_at" if row[0] == "text" else "next_poll_at")
                                         or 0))
         for kind, owner, request_id, r in rows:
-            saved_image = kind == "image" and bool(r.get("result_file_ids") or r.get("result_sediment_ids"))
+            saved_image = kind == "image" and bool(r.get("result_file_ids") or r.get("result_sediment_ids") or pending_image_result_ids(r))
             if recovery_suppressed(r) or r.get("_recovery_paused") is True or r.get("_attempt_finished_at") and not saved_image:
                 continue
             if kind not in self.recoveries:
@@ -829,7 +829,7 @@ class PoolAdmission:
         recovery = sum(1 for kind, _, _, r in receipts if not recovery_suppressed(r)
                        and r.get("_recovery_paused") is not True
                        and (not r.get("_attempt_finished_at") or kind == "image"
-                            and bool(r.get("result_file_ids") or r.get("result_sediment_ids"))) and
+                            and bool(r.get("result_file_ids") or r.get("result_sediment_ids") or pending_image_result_ids(r))) and
                        (unknown_text_result(r) if kind == "text" else r.get("upstream_unfinished") is True
                         and r.get("status") in {"error", "unknown"}))
         saving = sum(1 for kind, _, _, r in receipts if r.get("status") == "running"

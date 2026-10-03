@@ -2499,6 +2499,7 @@ class OpenAIBackendAPI:
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
             request_message_id: str = "",
+            require_fresh_result_ids: bool = False,
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
@@ -2631,13 +2632,25 @@ class OpenAIBackendAPI:
                 last_retry_after = None
                 last_read_was_transport = False
 
+            previous_ids = (tuple(file_ids), tuple(sediment_ids))
+            current_file_ids: set[str] = set()
+            current_sediment_ids: set[str] = set()
             for record in self._extract_image_tool_records(conversation, request_message_id):
                 for file_id in record["file_ids"]:
+                    current_file_ids.add(file_id)
                     if file_id not in file_ids:
                         file_ids.append(file_id)
                 for sediment_id in record["sediment_ids"]:
+                    current_sediment_ids.add(sediment_id)
                     if sediment_id not in sediment_ids:
                         sediment_ids.append(sediment_id)
+
+            # Preserve request-scoped observations before another paced read
+            # can exhaust the budget. They are not settled/downloadable yet.
+            if previous_ids != (tuple(file_ids), tuple(sediment_ids)):
+                record_pending = getattr(getattr(self, "progress_callback", None), "record_pending_result_ids", None)
+                if callable(record_pending):
+                    record_pending(list(file_ids), list(sediment_ids))
 
             # 检查对话文本中是否包含内容政策违规错误
             # 当上游拒绝生成图片时，错误消息会出现在对话文档的 assistant 消息中，
@@ -2657,6 +2670,15 @@ class OpenAIBackendAPI:
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
             if file_ids or sediment_ids:
+                if require_fresh_result_ids and (
+                    not set(file_ids).issubset(current_file_ids)
+                    or not set(sediment_ids).issubset(current_sediment_ids)
+                ):
+                    # A saved observation cannot confirm itself after restart.
+                    wait = min(interval, max(0.0, _remaining()))
+                    if wait > 0:
+                        time.sleep(wait)
+                    continue
                 if not config.image_check_before_hit_enabled:
                     # 先check再hit 机制关闭：直接返回首次发现的 file_ids
                     logger.info({"event": "image_poll_hit_no_settle", "conversation_id": conversation_id,

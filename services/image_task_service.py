@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR, config
-from services.task_store import TaskStore, recovery_control
+from services.task_store import TaskStore, recovery_control, pending_image_result_ids
 from contextlib import contextmanager
 from services.request_context import current_request, AdmissionLost
 from services.content_filter import request_text
@@ -1116,12 +1116,16 @@ class ImageTaskService:
                 key,
                 result_file_ids=list(dict.fromkeys(str(item) for item in file_ids if item)),
                 result_sediment_ids=list(dict.fromkeys(str(item) for item in sediment_ids if item)),
+                _pending_image_result_ids=None,
                 progress="receiving_image",
                 upstream_outcome="generated",
                 upstream_unfinished=False,
             )
             progress_callback.image_thread_result_ids = result_ids
         progress_callback.record_result_ids = record_result_ids
+        progress_callback.record_pending_result_ids = lambda files, sediments: self._update_task(
+            key, _pending_image_result_ids={"file_ids": files, "sediment_ids": sediments},
+        )
         progress_callback.image_thread = payload.get("_image_thread")
         progress_callback.failed_retry_original = payload.get("_failed_retry_original")
         progress_callback.failed_retry_required = bool(payload.get("_continue_after_failed_attempt"))
@@ -1171,6 +1175,7 @@ class ImageTaskService:
             self._update_task(
                 key,
                 status=TASK_STATUS_SUCCESS,
+                _pending_image_result_ids=None,
                 data=data,
                 usage=usage,
                 error="",
@@ -1465,6 +1470,7 @@ class ImageTaskService:
                 "recovery_error_code": _clean(item.get("recovery_error_code")),
                 "recovery_phase": _clean(item.get("recovery_phase")),
                 "last_recovery_failure": _public_failure_details(item.get("last_recovery_failure")),
+                "_pending_image_result_ids": pending_image_result_ids(item) or None,
                 "recovery_retry_after_seconds": item.get("recovery_retry_after_seconds"),
                 "deadline_recovery_started": item.get("deadline_recovery_started") is True,
                 "result_file_ids": [
@@ -1616,6 +1622,8 @@ class ImageTaskService:
             if task is None:
                 raise ValueError("task not found")
             saved_image = bool(task.get("result_file_ids") or task.get("result_sediment_ids"))
+            # Pending evidence permits another original read, never direct download.
+            saved_image = saved_image or bool(pending_image_result_ids(task))
             if task.get("_recovery_suppressed") is True or task.get("_recovery_paused") is True or task.get("_attempt_finished_at") and not saved_image:
                 # Keep this endpoint observational while an operator has
                 # explicitly stopped the old recovery path.
@@ -1964,6 +1972,7 @@ class ImageTaskService:
                 try:
                     current.update({
                         "status": TASK_STATUS_SUCCESS,
+                        "_pending_image_result_ids": None,
                         "data": data,
                         "error": "",
                         "error_code": "",
@@ -2028,6 +2037,7 @@ class ImageTaskService:
                 request_message_id = _clean(task.get("request_message_id")) if task else ""
                 persisted_file_ids = list(task.get("result_file_ids") or []) if task else []
                 persisted_sediment_ids = list(task.get("result_sediment_ids") or []) if task else []
+                pending_ids = pending_image_result_ids(task) if task else {}
                 image_thread = (task or {}).get("_image_thread")
                 expected_parent = (task or {}).get("_image_thread_request_parent")
             def recovered_parent(backend, result_file_ids, result_sediment_ids):
@@ -2049,6 +2059,11 @@ class ImageTaskService:
             access_token = account_service.get_bound_text_access_token(binding_id, model="auto")
             with account_service.conversation_binding_lock(binding_id, client_conversation_id):
                 backend = OpenAIBackendAPI(access_token=access_token)
+                def record_pending_ids(files, sediments):
+                    pending_ids.update(file_ids=files, sediment_ids=sediments)
+                    self._update_task(key, _pending_image_result_ids=dict(pending_ids))
+                backend.progress_callback = lambda _step: None
+                backend.progress_callback.record_pending_result_ids = record_pending_ids
                 if persisted_file_ids or persisted_sediment_ids:
                     self._update_task(key, progress="receiving_image", recovery_phase="download_image_result")
                     failure_phase = "resolve_image_result"
@@ -2082,6 +2097,7 @@ class ImageTaskService:
                     self._update_task(
                         key,
                         status=TASK_STATUS_SUCCESS,
+                        _pending_image_result_ids=None,
                         data=data,
                         error="",
                         error_code="",
@@ -2188,14 +2204,21 @@ class ImageTaskService:
                     return False
 
                 try:
+                    pending_options = (
+                        {"initial_file_ids": pending_ids.get("file_ids", []),
+                         "initial_sediment_ids": pending_ids.get("sediment_ids", []),
+                         "require_fresh_result_ids": True}
+                        if pending_ids else {}
+                    )
                     file_ids, sediment_ids = backend._poll_image_results(
                         conversation_id,
                         extra_timeout_secs,
                         request_message_id=request_message_id,
+                        **pending_options,
                     )
                 except Exception as exc:
                     if (
-                        no_active_task
+                        not pending_ids and no_active_task
                         and branch_state in {"terminal_without_result", "unattributable", "no_result"}
                         and exc.__class__.__name__ == "ImagePollTimeoutError"
                     ):
@@ -2208,7 +2231,7 @@ class ImageTaskService:
                     raise
                 if not file_ids and not sediment_ids:
                     if (
-                        no_active_task
+                        not pending_ids and no_active_task
                         and branch_state in {"terminal_without_result", "unattributable", "no_result"}
                     ):
                         latest_requirement = latest_unrecoverable_requirement()
@@ -2225,6 +2248,7 @@ class ImageTaskService:
                     key,
                     result_file_ids=list(dict.fromkeys(file_ids)),
                     result_sediment_ids=list(dict.fromkeys(sediment_ids)),
+                    _pending_image_result_ids=None,
                     progress="receiving_image",
                     upstream_outcome="generated",
                     upstream_unfinished=False,
@@ -2257,6 +2281,7 @@ class ImageTaskService:
             self._update_task(
                 key,
                 status=TASK_STATUS_SUCCESS,
+                _pending_image_result_ids=None,
                 data=data,
                 error="",
                 error_code="",
