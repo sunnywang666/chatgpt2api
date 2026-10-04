@@ -640,7 +640,7 @@ class ImageTaskService:
                 self._save_locked()
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, *, task_key: str | None = None):
         with self._lock:
             if getattr(self._transaction_local, "db", None) is not None:
                 yield self._transaction_local.db
@@ -648,7 +648,16 @@ class ImageTaskService:
             with self.store.transaction() as db:
                 self._transaction_local.db = db
                 try:
-                    self._tasks = {key: json.loads(raw) for key, raw in db.execute("SELECT task_key,receipt FROM image_requests")}
+                    if task_key is None:
+                        self._tasks = {key: json.loads(raw) for key, raw in db.execute("SELECT task_key,receipt FROM image_requests")}
+                    else:
+                        # A progress update needs only its current durable
+                        # receipt, not every historical image's base64 bytes.
+                        row = db.execute("SELECT receipt FROM image_requests WHERE task_key=?", (task_key,)).fetchone()
+                        if row is None:
+                            self._tasks.pop(task_key, None)
+                        else:
+                            self._tasks[task_key] = json.loads(row[0])
                     yield db
                 finally:
                     self._transaction_local.db = None
@@ -1463,7 +1472,8 @@ class ImageTaskService:
 
     def _update_task(self, key: str, **updates: Any) -> None:
         saved_count = None
-        with self._transaction():
+        nested = getattr(self._transaction_local, "db", None) is not None
+        with self._transaction(task_key=key):
             task = self._tasks.get(key)
             if task is None:
                 return
@@ -1495,7 +1505,9 @@ class ImageTaskService:
                          "image_count": len(asset_ids)}][-32:]
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
-            self._save_locked()
+            # Existing nested callers may have changed other receipts in their
+            # outer transaction; preserve that transaction's save behavior.
+            self._save_locked(task_key=None if nested else key)
             self._slot_condition.notify_all()
         # Normal dispatch and original-result recovery both persist here. Emit
         # after commit, never on merely receiving an ID or downloading bytes.
@@ -1615,15 +1627,16 @@ class ImageTaskService:
             tasks[_task_key(owner, task_id)] = task
         return tasks
 
-    def _save_locked(self) -> None:
+    def _save_locked(self, *, task_key: str | None = None) -> None:
+        tasks = self._tasks.values() if task_key is None else (self._tasks[task_key],)
         db = getattr(self._transaction_local, "db", None)
         if db is None:
             # Compatibility for existing maintenance/tests using the local lock.
             with self.store.transaction() as db:
-                for task in self._tasks.values():
+                for task in tasks:
                     self.store.write_receipt(db, "image", task["owner_id"], task["id"], task)
             return
-        for task in self._tasks.values():
+        for task in tasks:
             self.store.write_receipt(db, "image", task["owner_id"], task["id"], task)
 
     def _recover_unfinished_locked(self) -> bool:

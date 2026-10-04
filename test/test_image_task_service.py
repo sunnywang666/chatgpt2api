@@ -982,6 +982,53 @@ class ImageTaskServiceTests(unittest.TestCase):
             restarted = self.make_service(path)
             self.assertNotIn("_first_qualified_image_assets_observed_at", restarted._tasks["owner-1:policy-task"])
 
+    def test_progress_update_reads_current_original_without_loading_or_rewriting_history(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            key = "owner-1:policy-task"
+            with service.store.transaction() as db:
+                original = service.store.read_receipt(db, "image", "owner-1", "policy-task")
+                original["external_revision"] = "newer-durable-value"
+                service.store.write_receipt(db, "image", "owner-1", "policy-task", original)
+                history = {"id": "history", "owner_id": "owner-1", "status": "success",
+                           "data": [{"b64_json": "unrelated-historical-image" + "a" * 1_000_000}]}
+                service.store.write_receipt(db, "image", "owner-1", "history", history)
+                raw_history = db.execute("SELECT receipt FROM image_requests WHERE task_key='owner-1:history'").fetchone()[0]
+            loads = json.loads
+            def bounded_load(raw, *args, **kwargs):
+                self.assertNotIn("unrelated-historical-image", raw)
+                return loads(raw, *args, **kwargs)
+            with mock.patch("services.image_task_service.json.loads", side_effect=bounded_load), \
+                    mock.patch.object(service.store, "write_receipt", wraps=service.store.write_receipt) as writes:
+                service._update_task(key, progress="receiving_image")
+                self.assertEqual(writes.call_count, 1)
+            with service.store.connect() as db:
+                updated = service.store.read_receipt(db, "image", "owner-1", "policy-task")
+                self.assertEqual(updated["external_revision"], "newer-durable-value")
+                self.assertEqual(updated["progress"], "receiving_image")
+                self.assertEqual(db.execute("SELECT receipt FROM image_requests WHERE task_key='owner-1:history'").fetchone()[0], raw_history)
+            # A missing durable receipt must not be resurrected from _tasks.
+            with service.store.transaction() as db:
+                db.execute("DELETE FROM image_requests WHERE task_key=?", (key,))
+            service._update_task(key, progress="late-callback")
+            self.assertNotIn(key, service._tasks)
+            with service.store.connect() as db:
+                self.assertIsNone(service.store.read_receipt(db, "image", "owner-1", "policy-task"))
+
+    def test_nested_progress_update_preserves_outer_transaction_changes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            with service._transaction():
+                service._tasks["owner-1:other"] = {"id": "other", "owner_id": "owner-1", "status": "success"}
+                service._update_task("owner-1:policy-task", progress="receiving_image")
+            with service.store.connect() as db:
+                self.assertEqual(service.store.read_receipt(db, "image", "owner-1", "other")["status"], "success")
+                self.assertEqual(service.store.read_receipt(db, "image", "owner-1", "policy-task")["progress"], "receiving_image")
+
     def test_active_attempt_budget_starts_after_account_slot_wait_and_survives_restart(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
@@ -1243,6 +1290,13 @@ class ImageTaskServiceTests(unittest.TestCase):
             ):
                 service.admission.recover_one()
                 succeeded = wait_for_task(service, OWNER, "download-task", "success")
+                # Success commits before the recovery worker clears its claim.
+                # Keep fixtures alive through that cleanup instead of removing
+                # the temporary database underneath the worker.
+                for worker in threading.enumerate():
+                    if worker.name == "image-resume-download-task":
+                        worker.join(timeout=2)
+                        self.assertFalse(worker.is_alive())
 
             self.assertEqual(succeeded["image_session_parent_id"], "result-parent")
             self.assertEqual(succeeded["active_attempt_started_at"], active_started_at)
