@@ -671,7 +671,14 @@ class PoolAdmission:
                 if len(candidates) == 1:
                     chat_capacity = 2
                     scoped_extra_turn = (candidates[0].ref, turn_key)
-            new = Resource(turn_key, chat_capacity, None if unknown_unbound else occupied.get(turn_key, 0), pace.get("next_at"))
+            # Capacity admits bounded preparation; the durable HTTP clock still
+            # gates every request and the final model POST. Waiting for a prior
+            # POST's message interval here needlessly delays the next independent
+            # conversation's bootstrap/requirements/prepare work as well.
+            ready = pace.get("next_at")
+            if ready is not None and "cooldown_until" in pace:
+                ready = max(now, float(pace.get("cooldown_until") or 0))
+            new = Resource(turn_key, chat_capacity, None if unknown_unbound else occupied.get(turn_key, 0), ready)
             resources[turn_key] = new
             previous = resources.get(image_key)
             resources[image_key] = Resource(image_key, min(previous.capacity, image_slots) if previous else image_slots,

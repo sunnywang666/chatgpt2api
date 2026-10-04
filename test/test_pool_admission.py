@@ -96,6 +96,28 @@ class AdmissionTests(unittest.TestCase):
         return self.images.submit_generation({"id": owner, "role": "user", "external_image_client": True},
                                              client_task_id=name, prompt="private image input", model="gpt-image-2", size=None)
 
+    def test_independent_image_preparation_uses_capacity_before_next_send_clock(self):
+        self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 2}
+        self.admission.pacing = lambda account, now: {"next_at": now + 30, "cooldown_until": 0}
+        for name in ("first", "second", "third"):
+            self.image(name)
+        first = self.admission.claim_next()
+        self.assertIsNotNone(first)
+        second = self.admission.claim_next()
+        self.assertIsNotNone(second)
+        self.assertEqual({first.request_id, second.request_id}, {"first", "second"})
+        self.assertIsNone(self.admission.claim_next())
+        self.assertEqual(self.calls, [])  # Claiming prepares work; it never sends.
+
+    def test_preparation_still_waits_for_cooldown_or_unreadable_account_clock(self):
+        self.image("original")
+        self.admission.pacing = lambda account, now: {"next_at": now + 30, "cooldown_until": now + 20}
+        self.assertIsNone(self.admission.claim_next())
+        self.admission.pacing = lambda account, now: {"next_at": None, "cooldown_until": None}
+        self.assertIsNone(self.admission.claim_next())
+        self.admission.pacing = lambda account, now: {"next_at": now + 30, "cooldown_until": now - 1}
+        self.assertEqual(self.admission.claim_next().request_id, "original")
+
     def test_legacy_explicitly_unsent_retry_retains_real_input_for_restart(self):
         body = {"client_request_id": "legacy", "client_conversation_id": "legacy-session",
                 "model": "fixture-text", "_public_route": "chat", "messages": [{"role": "user", "content": "original"}]}
