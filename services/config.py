@@ -95,8 +95,12 @@ def _pacing_value(key: str, raw: object) -> float:
         value = float(raw)
     except (TypeError, ValueError, OverflowError):
         value = float("nan")
-    if isinstance(raw, bool) or not math.isfinite(value) or not minimum <= value <= maximum:
-        raise ValueError(f"{key} must be between {minimum:g} and {maximum:g} seconds")
+    # Explicit zero removes only the HTTP start-spacing floor. Message pacing,
+    # conversation-read pacing and persisted upstream cooldowns remain separate.
+    zero_http_spacing = key == "account_request_interval_secs" and value == 0
+    if isinstance(raw, bool) or not math.isfinite(value) or not (zero_http_spacing or minimum <= value <= maximum):
+        allowed = f"0 or between {minimum:g} and {maximum:g}" if key == "account_request_interval_secs" else f"between {minimum:g} and {maximum:g}"
+        raise ValueError(f"{key} must be {allowed} seconds")
     return value
 
 

@@ -71,7 +71,7 @@ class PacingSettingsTests(unittest.TestCase):
 
     def test_invalid_pacing_rejects_entire_update_without_saving(self):
         for key, bad in [
-            ("account_request_interval_secs", [0, .09, 61, True, None, "bad", float("nan"), float("inf")]),
+            ("account_request_interval_secs", [-1, .05, .09, 61, True, False, None, "bad", float("nan"), float("inf")]),
             ("account_message_interval_secs", [1, 2, 4.99, 301, False, None, "-inf"]),
             ("account_conversation_read_interval_secs", [-1, 301, False, None, "bad", float("nan")]),
         ]:
@@ -93,7 +93,7 @@ class PacingSettingsTests(unittest.TestCase):
 
     def test_valid_boundaries_persist_and_match_runtime_after_reopen(self):
         from services.config import ConfigStore
-        for http, message in [(.1, 5), (.5, 5), (1, 5), (60, 300), ("2.5", "7.5")]:
+        for http, message in [(0, 5), ("0", 5), (.1, 5), (.5, 5), (1, 5), (60, 300), ("2.5", "7.5")]:
             with self.subTest(http=http, message=message):
                 settings = self.store.update({"account_request_interval_secs": http,
                                               "account_message_interval_secs": message})
@@ -151,6 +151,13 @@ class PacingSettingsTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.json()["config"]["account_request_interval_secs"], .1)
                 self.assertEqual(response.json()["config"]["account_message_interval_secs"], 5)
+                response = client.post("/api/settings", json={"account_request_interval_secs": 0})
+                self.assertEqual(response.status_code, 200)
+                from services.config import ConfigStore
+                reopened = ConfigStore(self.path)
+                self.assertEqual(reopened.account_request_interval_secs, 0)
+                self.assertEqual(reopened.account_message_interval_secs, 5)
+                self.assertEqual(reopened.account_conversation_read_interval_secs, 0)
 
 
 if __name__ == "__main__":

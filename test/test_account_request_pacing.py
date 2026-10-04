@@ -48,6 +48,70 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_zero_http_spacing_preserves_durable_message_and_429_waits(self):
+        from services.config import ConfigStore
+        import services.account_request_pacing as pacing
+        for limited_path in ("/conversation/original", "/backend-api/me"):
+            with self.subTest(limited_path=limited_path), tempfile.TemporaryDirectory() as tmp:
+                settings_path = Path(tmp) / "config.json"
+                settings_path.write_text(json.dumps({"auth-key": "test-only"}))
+                settings = ConfigStore(settings_path)
+                settings.update({"account_request_interval_secs": 0,
+                                 "account_message_interval_secs": 5,
+                                 "account_conversation_read_interval_secs": 0})
+                path, now, sent = Path(tmp) / "clock.json", [10000.0], []
+                def send(method, url, **kwargs):
+                    sent.append(now[0])
+                    response = Response()
+                    if len(sent) == 3:
+                        response.status_code = 429
+                        response.headers = {"Retry-After": "120"}
+                    return response
+                def sleep(seconds):
+                    now[0] += seconds
+                with patch.object(pacing, "config", ConfigStore(settings_path)), \
+                     patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+                     patch.object(pacing.time, "time", side_effect=lambda: 1700000000 + now[0]), \
+                     patch.object(pacing.time, "sleep", side_effect=sleep):
+                    for method, url in (("POST", "/conversation"), ("POST", "/conversation"),
+                                        ("GET", limited_path), ("GET", limited_path)):
+                        AccountRequestClock("account", path).request(send, method, "https://provider" + url)
+                    self.assertEqual(sent, [10000, 10005, 10005, 10125])
+
+    def test_persisted_zero_http_spacing_allows_reads_to_overlap(self):
+        from services.config import ConfigStore
+        import services.account_request_pacing as pacing
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "config.json"
+            settings_path.write_text(json.dumps({"auth-key": "test-only"}))
+            settings = ConfigStore(settings_path)
+            settings.update({"account_request_interval_secs": 0,
+                             "account_message_interval_secs": 5,
+                             "account_conversation_read_interval_secs": 0})
+            path = Path(tmp) / "clock.json"
+            all_entered = threading.Barrier(4)
+            errors, responses = [], []
+            def send(*args, **kwargs):
+                # All four transports must enter before any response returns.
+                all_entered.wait(timeout=3)
+                return Response()
+            def read(index):
+                try:
+                    responses.append(AccountRequestClock("account", path).request(
+                        send, "GET", f"https://provider/conversation/{index}"))
+                except BaseException as exc:
+                    errors.append(exc)
+            with patch.object(pacing, "config", ConfigStore(settings_path)):
+                workers = [threading.Thread(target=read, args=(i,)) for i in range(4)]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(5)
+                self.assertTrue(all(not worker.is_alive() for worker in workers))
+                self.assertEqual(errors, [])
+                self.assertEqual(len(responses), 4)
+                self.assertEqual(AccountRequestClock("account", path).ordinary_read_queue, [])
+
     def test_account_metadata_does_not_block_original_result_delivery(self):
         init_body = {"gizmo_id": None, "requested_default_model": None,
                      "conversation_id": None, "timezone_offset_min": -480}
