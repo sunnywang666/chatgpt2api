@@ -18,11 +18,53 @@ from pathlib import Path
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
+from curl_cffi import CurlInfo
 
 from services.config import DATA_DIR, config
 from utils.log import logger
 from services.request_context import (current_request, current_archive_guard, current_archive_read_owner,
                                       current_archive_observation, current_archive_step)
+
+
+# libcurl times are cumulative from request start, not individual phase durations.
+# Never collect URL/IP/header/body fields in this diagnostic projection.
+_TRANSPORT_INFO_FIELDS = {
+    CurlInfo.NAMELOOKUP_TIME: "namelookup_secs",
+    CurlInfo.CONNECT_TIME: "connect_secs",
+    CurlInfo.APPCONNECT_TIME: "appconnect_secs",
+    CurlInfo.PRETRANSFER_TIME: "pretransfer_secs",
+    CurlInfo.STARTTRANSFER_TIME: "starttransfer_secs",
+    CurlInfo.TOTAL_TIME: "total_secs",
+    CurlInfo.NUM_CONNECTS: "num_connects",
+    CurlInfo.OS_ERRNO: "os_errno",
+    CurlInfo.HTTP_CONNECTCODE: "http_connect_code",
+    CurlInfo.SIZE_DOWNLOAD_T: "downloaded_bytes",
+}
+
+
+def _transport_snapshot(response):
+    """Use the library's pre-reset snapshot even when perform raised."""
+    result = {}
+    try:
+        status = getattr(response, "status_code", None)
+        if type(status) is int and 100 <= status <= 599:
+            result["transport_response_status"] = status
+        infos = getattr(response, "infos", None)
+        if isinstance(infos, dict):
+            values = {}
+            for info, name in _TRANSPORT_INFO_FIELDS.items():
+                value = infos.get(info)
+                if name.endswith("_secs"):
+                    if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 86400:
+                        values[name] = round(float(value), 6)
+                elif type(value) is int and 0 <= value <= 2 ** 53:
+                    values[name] = value
+            if values:
+                result["transport_details"] = values
+    except Exception:
+        # A diagnostic accessor must not replace the original transport error.
+        pass
+    return result
 
 
 class ProcessMutex:
@@ -390,6 +432,7 @@ class AccountRequestClock:
             response = None
             transport_error = None
             transport_code = None
+            transport_snapshot = {}
             try:
                 if read_started is not None:
                     read_started(started)
@@ -409,6 +452,10 @@ class AccountRequestClock:
                     code = None
                 if isinstance(code, int) and not isinstance(code, bool) and 0 <= code <= 999:
                     transport_code = int(code)
+                try:
+                    transport_snapshot = _transport_snapshot(getattr(exc, "response", None))
+                except Exception:
+                    pass
                 raise
             finally:
                 verb = str(send_method).upper()
@@ -429,6 +476,7 @@ class AccountRequestClock:
                              "status_code": status if isinstance(status, int) and not isinstance(status, bool) else None,
                              "outcome": "response" if response is not None else "transport_error",
                              "transport_error_type": transport_error, "transport_error_code": transport_code,
+                             **(transport_snapshot if response is None else _transport_snapshot(response)),
                              "request_timeout_secs": timeout,
                              "stream": bool(send_kwargs.get("stream"))})
         # Serialize only the send edge. The account activity reservation lives
@@ -885,6 +933,11 @@ def _send_with_bounded_stream_close(session, send, method, url, **kwargs):
 def pace_account_session(session, account: dict, access_token: str) -> None:
     if not access_token:
         return
+    from curl_cffi.requests import Session
+    if isinstance(session, Session):
+        # Both supported curl_cffi versions snapshot these before reset, on
+        # success and on exceptions. This does not issue additional requests.
+        session.curl_infos = list(dict.fromkeys([*session.curl_infos, *_TRANSPORT_INFO_FIELDS]))
     # Account identity survives access-token refresh. No raw credential is
     # retained in the clock registry, logs or exceptions.
     identity = str(account.get("account_id") or account.get("provider_account_identity") or access_token)

@@ -948,6 +948,9 @@ class AccountRequestPacingTests(unittest.TestCase):
             @property
             def code(self):
                 raise ValueError("secret-property")
+            @property
+            def response(self):
+                raise ValueError("secret-response")
         error = BadCode("secret-original")
         with patch("services.account_request_pacing.logger.info") as log:
             def fail(*args, **kwargs):
@@ -961,6 +964,34 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertEqual(attempt["transport_error_type"], "OSError")
             self.assertIsNone(attempt["transport_error_code"])
             self.assertIsNone(attempt["request_timeout_secs"])
+            self.assertNotIn("secret-", repr(attempt))
+
+    def test_partial_transport_response_keeps_only_finite_allowlisted_metrics(self):
+        from types import SimpleNamespace
+        from curl_cffi import CurlInfo
+        error = OSError("secret-original")
+        error.response = SimpleNamespace(status_code=200, infos={
+            CurlInfo.TOTAL_TIME: 12.5, CurlInfo.CONNECT_TIME: .2,
+            CurlInfo.NAMELOOKUP_TIME: float("nan"), CurlInfo.APPCONNECT_TIME: True,
+            CurlInfo.PRETRANSFER_TIME: -1, CurlInfo.STARTTRANSFER_TIME: "secret-time",
+            CurlInfo.NUM_CONNECTS: 1, CurlInfo.OS_ERRNO: 0,
+            CurlInfo.SIZE_DOWNLOAD_T: 5, CurlInfo.HTTP_CONNECTCODE: 200,
+            CurlInfo.EFFECTIVE_URL: "secret-url", CurlInfo.PRIMARY_IP: "secret-address",
+        })
+        with patch("services.account_request_pacing.logger.info") as log:
+            def fail(*args, **kwargs):
+                raise error
+            with self.assertRaises(OSError) as caught:
+                AccountRequestClock("account-hash").request(fail, "GET", "https://provider/conversation/secret-id")
+            self.assertIs(caught.exception, error)
+            attempt = next(c.args[0] for c in log.call_args_list
+                           if c.args[0].get("event") == "account_http_attempt")
+            self.assertEqual(attempt["outcome"], "transport_error")
+            self.assertIsNone(attempt["status_code"])
+            self.assertEqual(attempt["transport_response_status"], 200)
+            self.assertEqual(attempt["transport_details"], {
+                "total_secs": 12.5, "connect_secs": .2, "num_connects": 1,
+                "os_errno": 0, "downloaded_bytes": 5, "http_connect_code": 200})
             self.assertNotIn("secret-", repr(attempt))
 
     def test_actual_send_gap_includes_slow_fence_and_durable_clock_write(self):
@@ -1328,6 +1359,64 @@ class ReadRateLimitIsolationTests(unittest.TestCase):
                 self.assertEqual(clock.rate_failures, 1)
                 self.assertEqual(clock.conversation_read_rate_failures, 0)
                 self.assertEqual(clock.cooldown_until, at + 60)
+
+
+def test_native_partial_response_timeout_keeps_stage_snapshot(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit
+    from curl_cffi import requests
+    from curl_cffi.requests.exceptions import Timeout
+    import services.account_request_pacing as pacing
+    from services.config import ConfigStore
+
+    release = threading.Event()
+    received = []
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_GET(self):
+            received.append(self.path)
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b"hello")
+            self.wfile.flush()
+            release.wait(2)
+            self.close_connection = True
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    session = requests.Session(trust_env=False)
+    raw_send = session.request
+    session.request = lambda method, url, **kw: raw_send(
+        method, f"http://127.0.0.1:{server.server_port}" + urlsplit(url).path, **kw)
+    (tmp_path / "config.json").write_text(json.dumps({"auth-key": "test-only"}))
+    settings = ConfigStore(tmp_path / "config.json")
+    settings.update({"account_request_interval_secs": 0, "account_conversation_read_interval_secs": 0})
+    monkeypatch.setattr(pacing, "config", settings)
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    pacing.pace_account_session(session, {"account_id": "fixture-only"}, "fixture-token")
+    try:
+        with patch("services.account_request_pacing.logger.info") as log:
+            with __import__("pytest").raises(Timeout):
+                session.get("https://chatgpt.com/backend-api/conversation/original", timeout=.2)
+            attempt = next(c.args[0] for c in log.call_args_list
+                           if c.args[0].get("event") == "account_http_attempt")
+        assert attempt["outcome"] == "transport_error"
+        assert attempt["transport_error_code"] == 28 and attempt["status_code"] is None
+        assert attempt["transport_response_status"] == 200
+        metrics = attempt["transport_details"]
+        assert metrics["downloaded_bytes"] == 5
+        assert metrics["num_connects"] == 1
+        assert 0 <= metrics["connect_secs"] <= metrics["starttransfer_secs"] < metrics["total_secs"]
+        assert .15 <= metrics["total_secs"] < 1
+        assert len(received) == 1, "diagnostics must not retry"
+    finally:
+        release.set()
+        session.close()
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":
