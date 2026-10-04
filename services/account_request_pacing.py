@@ -388,14 +388,37 @@ class AccountRequestClock:
             elif endpoint.endswith("/conversations"):
                 endpoint_kind = "conversation_list"
             response = None
+            transport_error = None
+            transport_code = None
             try:
                 if read_started is not None:
                     read_started(started)
                 response = send(send_method, send_url, **send_kwargs)
                 return response
+            except Exception as exc:
+                # Exception messages/URLs may contain credentials. Retain only
+                # known class names and a numeric transport code for diagnosis.
+                names = {"TimeoutError", "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
+                         "ConnectionResetError", "SSLError", "ProxyError", "DNSError", "OSError",
+                         "CurlError", "RequestsError", "RequestException", "CertificateVerifyError"}
+                transport_error = next((cls.__name__ for cls in type(exc).__mro__
+                                        if cls.__name__ in names), "other")
+                try:
+                    code = getattr(exc, "code", None)
+                except Exception:
+                    code = None
+                if isinstance(code, int) and not isinstance(code, bool) and 0 <= code <= 999:
+                    transport_code = int(code)
+                raise
             finally:
                 verb = str(send_method).upper()
                 status = getattr(response, "status_code", None)
+                try:
+                    timeout = send_kwargs.get("timeout")
+                    timeout = (float(timeout) if isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+                               and math.isfinite(timeout) and timeout > 0 else None)
+                except (ValueError, TypeError, OverflowError):
+                    timeout = None
                 logger.info({"event": "account_http_attempt", "account": self.account_key,
                              "request_ref": request_ref, "layer": "upstream_chatgpt",
                              "work_ref": archive_observation.get("work_ref"),
@@ -405,6 +428,8 @@ class AccountRequestClock:
                              "headers_elapsed_secs": round(time.monotonic() - started, 6),
                              "status_code": status if isinstance(status, int) and not isinstance(status, bool) else None,
                              "outcome": "response" if response is not None else "transport_error",
+                             "transport_error_type": transport_error, "transport_error_code": transport_code,
+                             "request_timeout_secs": timeout,
                              "stream": bool(send_kwargs.get("stream"))})
         # Serialize only the send edge. The account activity reservation lives
         # in PoolAdmission until the response stream is terminal; holding this

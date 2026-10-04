@@ -911,8 +911,57 @@ class AccountRequestPacingTests(unittest.TestCase):
             attempts = [c.args[0] for c in log.call_args_list if c.args[0].get("event") == "account_http_attempt"]
             self.assertEqual(len(attempts), 1)
             self.assertEqual(attempts[0]["outcome"], "transport_error")
+            self.assertEqual(attempts[0]["transport_error_type"], "OSError")
             self.assertIsNone(attempts[0]["status_code"])
             self.assertNotIn("secret-", repr(attempts))
+
+    def test_transport_diagnostics_keep_only_safe_category_code_and_send_timeout(self):
+        from enum import IntEnum
+        class Code(IntEnum):
+            TIMEOUT = 28
+        class PrivateError(TimeoutError):
+            pass
+        cases = [(PrivateError("secret-token-and-url"), Code.TIMEOUT, "TimeoutError", 28),
+                 (RuntimeError("secret-token-and-url"), "secret-code", "other", None),
+                 (RuntimeError("secret-token-and-url"), True, "other", None)]
+        for error, code, category, expected in cases:
+            error.code = code
+            with self.subTest(category=category, code=expected), \
+                 patch("services.account_request_pacing.logger.info") as log:
+                def fail(*args, **kwargs):
+                    raise error
+                clock = AccountRequestClock("account-hash")
+                with self.assertRaises(type(error)) as caught:
+                    clock.request(fail, "GET", "https://provider/conversation/secret-id", timeout=12.5)
+                self.assertIs(caught.exception, error)
+                attempt = next(c.args[0] for c in log.call_args_list
+                               if c.args[0].get("event") == "account_http_attempt")
+                self.assertEqual(attempt["transport_error_type"], category)
+                self.assertEqual(attempt["transport_error_code"], expected)
+                self.assertEqual(attempt["request_timeout_secs"], 12.5)
+                self.assertIsNone(attempt["status_code"])
+                self.assertNotIn("secret-", repr(attempt))
+                self.assertNotIn("PrivateError", repr(attempt))
+
+    def test_diagnostic_extraction_failure_cannot_replace_transport_exception(self):
+        class BadCode(OSError):
+            @property
+            def code(self):
+                raise ValueError("secret-property")
+        error = BadCode("secret-original")
+        with patch("services.account_request_pacing.logger.info") as log:
+            def fail(*args, **kwargs):
+                raise error
+            with self.assertRaises(OSError) as caught:
+                AccountRequestClock("account-hash").request(
+                    fail, "GET", "https://provider/conversation/secret-id", timeout=10 ** 1000)
+            self.assertIs(caught.exception, error)
+            attempt = next(c.args[0] for c in log.call_args_list
+                           if c.args[0].get("event") == "account_http_attempt")
+            self.assertEqual(attempt["transport_error_type"], "OSError")
+            self.assertIsNone(attempt["transport_error_code"])
+            self.assertIsNone(attempt["request_timeout_secs"])
+            self.assertNotIn("secret-", repr(attempt))
 
     def test_actual_send_gap_includes_slow_fence_and_durable_clock_write(self):
         for method, message_interval, fail_first in (("GET", 0, False), ("POST", 5, False), ("GET", 0, True), ("POST", 5, True)):
