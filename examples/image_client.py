@@ -1049,7 +1049,42 @@ def _command_work_lifecycle(api: ApiClient, args: argparse.Namespace) -> int:
         state["lifecycle"] = {"operation": "archive" if archived else "restore", "status": "prepared", "updated_at": _utc_now()}
         _atomic_write_state(path, state)
         try:
-            result = api.json("POST", endpoint, payload={})
+            try:
+                result = api.json("POST", endpoint, payload={})
+            except HttpFailure as exc:
+                if not archived or (exc.status, exc.detail) not in {
+                    (409, "WORK_TURN_UNFINISHED"), (503, "WORK_ARCHIVE_UNCONFIRMED")
+                }:
+                    raise
+                # A saved result can precede execution-claim cleanup; a
+                # committed archive intent can precede its upstream readback.
+                # Read this same work instead of labelling either as UNKNOWN.
+                work = api.json("GET", f"/api/{'chat-requests' if chat else 'image-tasks'}/{parse.quote(task_id, safe='')}/work")
+                ref = expected.get("client_conversation_id" if chat else "id")
+                if (not isinstance(work, dict) or work.get("protocol") != "work-v1" or work.get("request_id") != task_id
+                        or work.get("kind") != ("text" if chat else "image") or work.get("work_ref") != ref
+                        or work.get("state") not in {"active", "completed"}
+                        or exc.detail == "WORK_ARCHIVE_UNCONFIRMED" and work.get("state") != "completed"):
+                    raise ClientError("pending lifecycle response changed the original work")
+                state["work"] = work
+                archive = work.get("archive") or {}
+                if not isinstance(archive, dict):
+                    raise ClientError("original work archive is not confirmed or safely pending")
+                if work["state"] == "active":
+                    lifecycle = "waiting_turn"
+                elif (archive.get("status") == "confirmed" and archive.get("archived") is True
+                      and archive.get("desired") is True):
+                    lifecycle = "confirmed"
+                elif archive.get("status") in {"pending", "running"} and archive.get("desired") is True and not archive.get("error_code"):
+                    lifecycle = "pending"
+                else:
+                    raise ClientError("original work archive is not confirmed or safely pending")
+                state["lifecycle"].update(status=lifecycle, updated_at=_utc_now())
+                if lifecycle == "confirmed":
+                    state["lifecycle"]["archived"] = True
+                _atomic_write_state(path, state)
+                _emit({"request_id": task_id, "waiting": lifecycle != "confirmed", "work": work})
+                return 0 if lifecycle == "confirmed" else 2
             scope = result.get("conversation") if chat else result.get("image_thread")
             id_key, scope_key = ("request_id", "client_conversation_id") if chat else ("task_id", "id")
             if (result.get(id_key) != task_id or result.get("archived") is not archived

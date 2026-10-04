@@ -569,3 +569,114 @@ def test_result_notification_rejects_wrong_original_and_never_submits(tmp_path):
     args = image_client._parser().parse_args(['wait', '--state', str(tmp_path / 'absent.json'), '--task-id', 'original'])
     with unittest.TestCase().assertRaisesRegex(image_client.ClientError, 'original request identity'):
         image_client._command_wait(Api(), args)
+
+
+def test_complete_preserves_original_work_during_cleanup_and_archive_pending(tmp_path):
+    for status, detail, work_state, lifecycle in [
+        (409, "WORK_TURN_UNFINISHED", "active", "waiting_turn"),
+        (503, "WORK_ARCHIVE_UNCONFIRMED", "completed", "pending"),
+    ]:
+        path = tmp_path / (str(status) + ".json")
+        image_client._atomic_write_state(path, {"schema_version": 1, "client_task_id": "original",
+            "input_fingerprint": "immutable", "phase": "accepted", "input": {"image_thread_id": "thread"}})
+        calls = []
+        class Api:
+            def json(self, method, endpoint, payload=None):
+                calls.append((method, endpoint))
+                if method == "POST":
+                    raise image_client.HttpFailure(status, detail)
+                return {"protocol": "work-v1", "kind": "image", "request_id": "original",
+                        "work_ref": "thread", "state": work_state, "archive": {"status": "pending", "desired": True}}
+        args = image_client._parser().parse_args(["complete", "--state", str(path)])
+        with mock.patch.object(image_client, "_lookup_task", return_value={"status": "success",
+                "image_thread": {"protocol": "image-thread-v1", "id": "thread"}}), mock.patch.object(image_client, "_emit") as emit:
+            assert image_client._command_work_lifecycle(Api(), args) == 2
+            assert emit.call_args.args[0]["waiting"] is True
+        saved = json.loads(path.read_text())
+        assert saved["lifecycle"]["status"] == lifecycle
+        assert saved["client_task_id"] == "original" and saved["input_fingerprint"] == "immutable"
+        assert calls == [("POST", "/api/image-tasks/original/archive-thread"), ("GET", "/api/image-tasks/original/work")]
+
+
+def test_complete_rejects_other_work_on_pending_readback(tmp_path):
+    path = tmp_path / "original.json"
+    image_client._atomic_write_state(path, {"schema_version": 1, "client_task_id": "original",
+        "input_fingerprint": "immutable", "phase": "accepted", "input": {"image_thread_id": "thread"}})
+    class Api:
+        def json(self, method, endpoint, payload=None):
+            if method == "POST":
+                raise image_client.HttpFailure(409, "WORK_TURN_UNFINISHED")
+            return {"protocol": "work-v1", "kind": "image", "request_id": "other",
+                    "work_ref": "thread", "state": "active"}
+    args = image_client._parser().parse_args(["complete", "--state", str(path)])
+    with mock.patch.object(image_client, "_lookup_task", return_value={"status": "success",
+            "image_thread": {"protocol": "image-thread-v1", "id": "thread"}}):
+        with unittest.TestCase().assertRaisesRegex(image_client.ClientError, "changed the original work"):
+            image_client._command_work_lifecycle(Api(), args)
+    assert json.loads(path.read_text())["lifecycle"]["status"] == "unknown"
+
+
+def test_chat_complete_preserves_original_work_while_turn_is_finishing(tmp_path):
+    path = tmp_path / "chat.json"
+    conversation = {"protocol": "sequential-v1", "client_conversation_id": "session"}
+    image_client._atomic_write_state(path, {"schema": "chatgpt2api.chat-request.v1",
+        "request_id": "original-chat", "input_fingerprint": "immutable", "phase": "accepted",
+        "conversation": conversation})
+    calls = []
+    class Api:
+        def json(self, method, endpoint, payload=None):
+            calls.append((method, endpoint))
+            if method == "POST":
+                raise image_client.HttpFailure(409, "WORK_TURN_UNFINISHED")
+            return {"protocol": "work-v1", "kind": "text", "request_id": "original-chat",
+                    "work_ref": "session", "state": "active"}
+    args = image_client._parser().parse_args(["chat-complete", "--state", str(path)])
+    with mock.patch.object(image_client, "_chat_receipt", return_value={"status": "succeeded"}), mock.patch.object(image_client, "_emit"):
+        assert image_client._command_work_lifecycle(Api(), args) == 2
+    saved = json.loads(path.read_text())
+    assert saved["lifecycle"]["status"] == "waiting_turn"
+    assert saved["conversation"] == conversation
+    assert calls == [("POST", "/api/chat-requests/original-chat/archive-conversation"),
+                     ("GET", "/api/chat-requests/original-chat/work")]
+
+
+def test_complete_classifies_archive_readback_without_hiding_unknown_or_confirmation(tmp_path):
+    for chat in (False, True):
+        for index, (archive, code, lifecycle) in enumerate([
+            ({"status": "running", "desired": True}, 2, "pending"),
+            ({"status": "confirmed", "desired": True, "archived": True}, 0, "confirmed"),
+            ({"status": "unknown", "desired": True, "error_code": "UPSTREAM_AUTH_REQUIRED"}, None, "unknown"),
+            ({"status": "pending", "desired": True, "error_code": "UPSTREAM_RATE_LIMITED"}, None, "unknown"),
+            ({"status": "confirmed", "desired": False, "archived": False}, None, "unknown"),
+            (["malformed"], None, "unknown"),
+        ]):
+            path = tmp_path / (str(chat) + str(index) + ".json")
+            conversation = {"protocol": "sequential-v1", "client_conversation_id": "work"}
+            state = ({"schema": "chatgpt2api.chat-request.v1", "request_id": "original", "conversation": conversation}
+                     if chat else {"schema_version": 1, "client_task_id": "original", "input": {"image_thread_id": "work"}})
+            state.update(input_fingerprint="immutable", phase="accepted")
+            image_client._atomic_write_state(path, state)
+            calls = []
+            class Api:
+                def json(self, method, endpoint, payload=None):
+                    calls.append((method, endpoint))
+                    if method == "POST":
+                        raise image_client.HttpFailure(503, "WORK_ARCHIVE_UNCONFIRMED")
+                    return {"protocol": "work-v1", "kind": "text" if chat else "image", "request_id": "original",
+                            "work_ref": "work", "state": "completed", "archive": archive}
+            args = image_client._parser().parse_args(["chat-complete" if chat else "complete", "--state", str(path)])
+            with mock.patch.object(image_client, "_lookup_task", return_value={"status": "success",
+                    "image_thread": {"protocol": "image-thread-v1", "id": "work"}}), \
+                    mock.patch.object(image_client, "_chat_receipt", return_value={"status": "succeeded"}), \
+                    mock.patch.object(image_client, "_emit") as emit:
+                if code is None:
+                    with unittest.TestCase().assertRaisesRegex(image_client.ClientError, "not confirmed or safely pending"):
+                        image_client._command_work_lifecycle(Api(), args)
+                    emit.assert_not_called()
+                else:
+                    assert image_client._command_work_lifecycle(Api(), args) == code
+                    assert emit.call_args.args[0]["waiting"] is (code == 2)
+            saved = json.loads(path.read_text())
+            assert saved["lifecycle"]["status"] == lifecycle
+            assert saved["work"]["archive"] == archive
+            assert [method for method, _ in calls] == ["POST", "GET"]
