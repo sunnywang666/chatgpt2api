@@ -48,6 +48,31 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_waiting_fifo_reader_rechecks_at_fractional_http_pace(self):
+        for http_interval, expected_wait in ((.1, .1), (.5, .5), (5, 1)):
+            with self.subTest(http_interval=http_interval):
+                now = [10000.0]
+                sent, sleeps = [], []
+                clock = AccountRequestClock("account")
+                clock.ordinary_read_queue = [{"owner": "earlier", "until": 10030}]
+                def sleep(seconds):
+                    sleeps.append(seconds)
+                    self.assertEqual(sent, [], "later reader bypassed the queued owner")
+                    self.assertEqual(clock.ordinary_read_queue[0]["owner"], "earlier")
+                    # The earlier reader takes its turn while this caller waits.
+                    with clock.lock:
+                        clock._release_ordinary_read("earlier")
+                    now[0] += seconds
+                with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("services.account_request_pacing.time.sleep", side_effect=sleep), \
+                     patch.object(type(config), "account_request_interval_secs", property(lambda _: http_interval)), \
+                     patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+                    clock.request(lambda *a, **k: sent.append(now[0]) or Response(),
+                                  "GET", "https://provider/conversation/original")
+                self.assertEqual(sleeps, [expected_wait])
+                self.assertEqual(sent, [10000 + expected_wait])
+                self.assertEqual(clock.ordinary_read_queue, [])
+
     def test_fractional_http_floor_preserves_model_floor_and_retry_after(self):
         now = [10000.0]
         sent = []
@@ -375,7 +400,9 @@ class AccountRequestPacingTests(unittest.TestCase):
                 return Response()
             restarted.request(send, "POST", "https://provider/conversation")
             restarted.request(send, "GET", "https://provider/conversation/result")
-            self.assertEqual(sent, [("POST", 10000), ("GET", 10090)])
+            self.assertEqual([method for method, _ in sent], ["POST", "GET"])
+            self.assertEqual(sent[0][1], 10000)
+            self.assertAlmostEqual(sent[1][1], 10090, delta=1e-6)
             self.assertEqual(AccountRequestClock("account", path).ordinary_read_queue, [])
 
     def test_archive_read_booking_survives_restart_and_yields_to_waiting_result(self):

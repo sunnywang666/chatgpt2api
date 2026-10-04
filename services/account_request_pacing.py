@@ -422,8 +422,10 @@ class AccountRequestClock:
                             read_delay = max(read_delay, self.archive_read_until - now)
                         if not self._ordinary_read_turn(ordinary_owner, now, read_delay):
                             # Give the reserved reader time to wake. Do not
-                            # consume another full upstream interval locally.
-                            read_delay = max(read_delay, 1.0)
+                            # consume another full upstream interval locally,
+                            # or add a whole second to fractional HTTP pacing.
+                            retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
+                            read_delay = max(read_delay, retry_check)
                 except BaseException:
                     self.lock.release()
                     raise
