@@ -77,6 +77,10 @@ class AccountRequestDeadlineExceeded(TimeoutError):
     pass
 
 
+def _backoff_seconds(failures):
+    return min(900.0, 60.0 * (2 ** min(max(0, failures - 1), 4)))
+
+
 class AccountRequestClock:
     def __init__(self, account_key="", state_path: Path | None = None) -> None:
         self.account_key = account_key
@@ -94,6 +98,8 @@ class AccountRequestClock:
         self.cooldown_until = 0.0
         self.rate_failures = 0
         self.last_rate_limit = 0.0
+        self.conversation_read_rate_failures = 0
+        self.last_conversation_read_rate_limit = 0.0
         self.last_rate_limit_evidence = None
         self.last_turn_started = None
         self._load()
@@ -109,6 +115,13 @@ class AccountRequestClock:
                 raise ValueError("Invalid saved account request clock")
             setattr(self, field, value - offset)
         self.rate_failures = max(0, int(saved["rate_failures"]))
+        # Old clocks may contain mixed limit history. Keep their global backoff;
+        # the last evidence alone cannot reconstruct all previous limit phases.
+        self.conversation_read_rate_failures = max(0, int(saved.get("conversation_read_rate_failures", 0)))
+        read_limit_at = float(saved.get("last_conversation_read_rate_limit", 0.0))
+        if not math.isfinite(read_limit_at):
+            raise ValueError("Invalid saved conversation read limit")
+        self.last_conversation_read_rate_limit = read_limit_at - offset
         self.last_rate_limit_evidence = saved.get("last_rate_limit_evidence")
         read_at = float(saved.get("next_conversation_read", 0.0))
         if not math.isfinite(read_at):
@@ -138,6 +151,8 @@ class AccountRequestClock:
         saved = {field: getattr(self, field) + offset for field in
                  ("next_request", "next_turn", "next_conversation_read", "cooldown_until", "last_rate_limit")}
         saved["rate_failures"] = self.rate_failures
+        saved["conversation_read_rate_failures"] = self.conversation_read_rate_failures
+        saved["last_conversation_read_rate_limit"] = self.last_conversation_read_rate_limit + offset
         saved["last_rate_limit_evidence"] = self.last_rate_limit_evidence
         saved.update(archive_read_owner=self.archive_read_owner,
                      archive_read_until=self.archive_read_until + offset,
@@ -200,18 +215,44 @@ class AccountRequestClock:
         self._save()
         return True
 
-    def limited(self, retry_after=0.0, *, evidence=None):
-        # A successful metadata GET does not prove that generation capacity has
-        # recovered. Keep the shared backoff for a quiet 15-minute window.
-        self.rate_failures += 1
-        self.last_rate_limit = time.monotonic()
-        fallback = min(900.0, 60.0 * (2 ** min(self.rate_failures - 1, 4)))
-        self.cooldown_until = self.last_rate_limit + max(fallback, retry_after)
+    def _expire_backoff(self):
+        now = time.monotonic()
+        if self.rate_failures and now - self.last_rate_limit >= 900:
+            self.rate_failures = 0
+        if self.conversation_read_rate_failures and now - self.last_conversation_read_rate_limit >= 900:
+            self.conversation_read_rate_failures = 0
+
+    def _read_cooldown_until(self):
+        if not self.conversation_read_rate_failures:
+            return 0.0
+        return self.last_conversation_read_rate_limit + _backoff_seconds(self.conversation_read_rate_failures)
+
+    def limited(self, retry_after=0.0, *, evidence=None, retry_after_present=False):
+        # A conversation GET limit without Retry-After backs off that read lane.
+        # Explicit provider waits and limits from other/unknown phases retain
+        # the account-wide protection. Successful unrelated HTTP never resets it.
+        self._expire_backoff()
+        read_only = ((evidence or {}).get("phase") == "conversation_read"
+                     and not retry_after_present and retry_after <= 0)
+        now = time.monotonic()
+        if read_only:
+            self.conversation_read_rate_failures += 1
+            self.last_conversation_read_rate_limit = now
+            failures = self.conversation_read_rate_failures
+            wait = _backoff_seconds(failures)
+            self.next_conversation_read = max(self.next_conversation_read, now + wait)
+        else:
+            self.rate_failures += 1
+            self.last_rate_limit = now
+            failures = self.rate_failures
+            wait = max(_backoff_seconds(failures), retry_after)
+            self.cooldown_until = max(self.cooldown_until, now + wait)
         context = current_request.get()
         observed = {"layer": "upstream_chatgpt", "phase": "unknown", "origin": "http_429",
                     **(evidence or {}), "retry_after_seconds": retry_after,
-                    "cooldown_seconds": max(fallback, retry_after),
-                    "cooldown_until": time.time() + max(fallback, retry_after),
+                    "scope": "conversation_read" if read_only else "account",
+                    "cooldown_seconds": wait,
+                    "cooldown_until": time.time() + wait,
                     "observed_at": time.time(), "account": self.account_key}
         if context is not None:
             observed["request_ref"] = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24]
@@ -222,8 +263,8 @@ class AccountRequestClock:
         if context is not None:
             context.record_limit(observed)
         logger.warning({"event": "account_rate_limited", "account": self.account_key,
-                        "consecutive_limits": self.rate_failures,
-                        "retry_after_secs": retry_after, "cooldown_secs": max(fallback, retry_after), **observed})
+                        "consecutive_limits": failures,
+                        "retry_after_secs": retry_after, "cooldown_secs": wait, **observed})
 
     def request(self, send, method, url, **kwargs):
         deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
@@ -261,7 +302,8 @@ class AccountRequestClock:
             remaining = remaining_budget()
             # Credit only our configured pacing wait. A provider cooldown is
             # still bounded by the caller's deadline and is never shortened.
-            credit = callable(local_wait) and self.cooldown_until <= time.monotonic()
+            provider_wait = max(self.cooldown_until, self._read_cooldown_until() if is_conversation_read else 0)
+            credit = callable(local_wait) and provider_wait <= time.monotonic()
             if remaining is not None and (remaining <= 0 or (not credit and delay >= remaining)):
                 raise AccountRequestDeadlineExceeded(message)
             started_wait = time.monotonic()
@@ -390,8 +432,7 @@ class AccountRequestClock:
                 self.lock.release()
                 wait_for_pace(read_delay, "account request deadline elapsed during read wait")
             try:
-                if self.rate_failures and time.monotonic() - self.last_rate_limit >= 900:
-                    self.rate_failures = 0
+                self._expire_backoff()
                 ready = max(self.next_request, self.cooldown_until,
                             self.next_turn if is_turn else 0.0)
                 delay = ready - time.monotonic()
@@ -424,6 +465,7 @@ class AccountRequestClock:
                             request_id = (response.headers.get("x-request-id") or response.headers.get("openai-request-id"))
                             safe_id = request_id if isinstance(request_id, str) and len(request_id) <= 160 and request_id.isascii() and not any(c.isspace() for c in request_id) else None
                             self.limited(retry_after_seconds(response.headers.get("Retry-After")),
+                                         retry_after_present="Retry-After" in response.headers,
                                          evidence={"phase": "conversation_preflight", "model": model, "origin": "http_429", "upstream_request_id": safe_id})
                         return response
                     preflight(read_original)
@@ -443,7 +485,8 @@ class AccountRequestClock:
                 cap_timeout_before_send()
                 factor = 2 ** min(self.rate_failures, 4)
                 self.next_request = now + min(60.0, config.account_request_interval_secs * factor)
-                read_interval = min(300.0, getattr(config, "account_conversation_read_interval_secs", 0.0) * factor)
+                read_factor = 2 ** min(max(self.rate_failures, self.conversation_read_rate_failures), 4)
+                read_interval = min(300.0, getattr(config, "account_conversation_read_interval_secs", 0.0) * read_factor)
                 if is_conversation_read:
                     self.next_conversation_read = now + read_interval
                     self.last_read_was_archive = archive_guard is not None
@@ -490,7 +533,8 @@ class AccountRequestClock:
                 upstream_id = response_headers.get("x-request-id") or response_headers.get("openai-request-id")
                 safe_id = upstream_id if isinstance(upstream_id, str) and len(upstream_id) <= 160 and upstream_id.isascii() and not any(c.isspace() for c in upstream_id) else None
                 if response.status_code == 429:
-                    self.limited(retry_after_seconds(response.headers.get("Retry-After")),
+                    self.limited(retry_after_seconds(response_headers.get("Retry-After")),
+                                 retry_after_present="Retry-After" in response_headers,
                                  evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id})
                 if context is not None and is_turn and hasattr(context, "record_stage"):
                     context.record_stage("response_headers_received", status_code=response.status_code,
@@ -610,7 +654,18 @@ def account_pacing_snapshot(account, now=None, *, include_turn=True, include_con
         values.append(saved.get("next_conversation_read", 0.0))
     if any(type(value) not in (int, float) or not math.isfinite(value) for value in values):
         return {"next_at": None, "cooldown_until": None}
-    return {"next_at": max(now, *values), "cooldown_until": saved["cooldown_until"]}
+    cooldown = saved["cooldown_until"]
+    if include_conversation_read:
+        try:
+            failures = max(0, int(saved.get("conversation_read_rate_failures", 0)))
+            limited_at = float(saved.get("last_conversation_read_rate_limit", 0.0))
+            if not math.isfinite(limited_at):
+                raise ValueError("Invalid saved conversation read limit")
+        except (TypeError, ValueError, OverflowError):
+            return {"next_at": None, "cooldown_until": None}
+        if failures:
+            cooldown = max(cooldown, limited_at + _backoff_seconds(failures))
+    return {"next_at": max(now, cooldown, *values), "cooldown_until": cooldown}
 
 
 _clocks: dict[str, AccountRequestClock] = {}
