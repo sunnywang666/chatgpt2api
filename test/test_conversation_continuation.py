@@ -1681,7 +1681,105 @@ class TextResultRecoveryTests(unittest.TestCase):
                 self.assertEqual(wrong.status_code, 409)
                 identity.side_effect = HTTPException(status_code=401)
                 self.assertEqual(client.get("/api/conversation-bindings/text", params=self.cursor).status_code, 401)
-        backend._get_conversation.assert_called_once_with("conversation-one", deadline_monotonic=mock.ANY)
+        backend._get_conversation.assert_called_once_with("conversation-one", deadline_monotonic=mock.ANY,
+                                                         connect_timeout_secs=10.0)
+
+    def test_direct_read_reconnects_once_with_same_cursor_and_deadline(self):
+        from curl_cffi.requests.exceptions import SSLError
+        from curl_cffi import CurlInfo
+        backend = mock.Mock()
+        response = SimpleNamespace(status_code=0, infos={CurlInfo.NUM_CONNECTS:1,
+            CurlInfo.APPCONNECT_TIME:0., CurlInfo.SIZE_DOWNLOAD_T:0})
+        backend._get_conversation.side_effect = [SSLError("private TLS detail", code=35, response=response), self.document()]
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+        ):
+            result = ConversationBindingService().read_text(self.cursor)
+        self.assertEqual(result["content"], '{"name_ru":"Набор"}')
+        self.assertEqual(backend._get_conversation.call_count, 2)
+        self.assertEqual(backend._get_conversation.call_args_list[0], backend._get_conversation.call_args_list[1])
+        backend.stream_conversation.assert_not_called()
+        backend.close.assert_called_once()
+
+    def test_direct_read_does_not_retry_certificate_http_or_ambiguous_timeouts(self):
+        from curl_cffi import CurlInfo
+        from curl_cffi.requests.exceptions import RequestException
+        for code, status, infos, expected in (
+            (35, 0, {}, False), (60, 0, {}, False), (28, 0, {}, False),
+            (35, 401, {}, False), (35, 403, {}, False), (35, 429, {}, False),
+            (35, 0, {CurlInfo.HTTP_CONNECTCODE: 407}, False),
+            (35, 0, {CurlInfo.NUM_CONNECTS: 1, CurlInfo.APPCONNECT_TIME: 0., CurlInfo.SIZE_DOWNLOAD_T: 0}, True),
+            (35, 0, {CurlInfo.NUM_CONNECTS: 0, CurlInfo.APPCONNECT_TIME: 0., CurlInfo.SIZE_DOWNLOAD_T: 0}, False),
+            (35, 0, {CurlInfo.NUM_CONNECTS: 1, CurlInfo.APPCONNECT_TIME: 0., CurlInfo.SIZE_DOWNLOAD_T: 5}, False),
+            (28, 0, {CurlInfo.NUM_CONNECTS: 1, CurlInfo.APPCONNECT_TIME: 0., CurlInfo.SIZE_DOWNLOAD_T: 0}, True),
+            (28, 0, {CurlInfo.NUM_CONNECTS: 0, CurlInfo.APPCONNECT_TIME: 0., CurlInfo.SIZE_DOWNLOAD_T: 0}, False),
+            (28, 200, {CurlInfo.NUM_CONNECTS: 1, CurlInfo.APPCONNECT_TIME: 0., CurlInfo.SIZE_DOWNLOAD_T: 5}, False),
+            (28, 0, {CurlInfo.NUM_CONNECTS: 1, CurlInfo.APPCONNECT_TIME: False, CurlInfo.SIZE_DOWNLOAD_T: 0}, False),
+        ):
+            with self.subTest(code=code, status=status, expected=expected):
+                error = RequestException("private", code=code, response=SimpleNamespace(status_code=status, infos=infos))
+                self.assertEqual(ConversationBindingService._retryable_direct_read_connection(error), expected)
+
+    def test_direct_read_retry_is_bounded_and_never_outlives_original_budget(self):
+        from curl_cffi.requests.exceptions import SSLError
+        from curl_cffi import CurlInfo
+        for expired in (False, True):
+            with self.subTest(expired=expired):
+                now = [100.]
+                error = SSLError("private", code=35, response=SimpleNamespace(status_code=0,
+                    infos={CurlInfo.NUM_CONNECTS:1, CurlInfo.APPCONNECT_TIME:0., CurlInfo.SIZE_DOWNLOAD_T:0}))
+                backend = mock.Mock()
+                def fail(*a, **kw):
+                    if expired: now[0] = 161.
+                    raise error
+                backend._get_conversation.side_effect = fail
+                with (
+                    mock.patch("services.conversation_binding_service.time", SimpleNamespace(monotonic=lambda:now[0])),
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
+                    mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+                ):
+                    with self.assertRaises(SSLError) as caught:
+                        ConversationBindingService().read_text(self.cursor)
+                self.assertIs(caught.exception, error)
+                self.assertEqual(backend._get_conversation.call_count, 1 if expired else 2)
+                backend.close.assert_called_once()
+
+    def test_direct_read_retry_respects_cooldown_arriving_after_first_connection(self):
+        from curl_cffi import CurlInfo
+        from curl_cffi.requests.exceptions import SSLError
+        from services.account_request_pacing import AccountRequestClock, AccountRequestDeadlineExceeded
+        with tempfile.TemporaryDirectory() as directory:
+            clock = AccountRequestClock("fixture", Path(directory)/"clock.json")
+            def fail_connection(*args, **kwargs):
+                with clock.lock:
+                    clock.limited(900, retry_after_present=True)
+                raise SSLError("private", code=35, response=SimpleNamespace(status_code=0,
+                    infos={CurlInfo.NUM_CONNECTS:1, CurlInfo.APPCONNECT_TIME:0., CurlInfo.SIZE_DOWNLOAD_T:0}))
+            raw = mock.Mock(side_effect=fail_connection)
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.base_url = "https://fixture.invalid"
+            backend._headers = lambda path, headers: headers
+            backend.session = SimpleNamespace(
+                get=lambda url, **kw: clock.request(raw, "GET", url, **kw), close=lambda: None)
+            with (
+                mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
+                mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
+                mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+            ):
+                started = time.monotonic()
+                with self.assertRaises(AccountRequestDeadlineExceeded):
+                    ConversationBindingService().read_text(self.cursor)
+                self.assertLess(time.monotonic()-started, 1)
+            raw.assert_called_once()
+            self.assertEqual(clock.ordinary_read_queue, [])
+            self.assertFalse(clock.lock.locked())
+            self.assertGreater(clock.cooldown_until-time.monotonic(), 899)
 
 
 if __name__ == "__main__":

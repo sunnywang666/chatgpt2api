@@ -950,6 +950,16 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
     raw_send = session.request
 
     def send(method, url, **kwargs):
+        connect = kwargs.pop("_account_request_connect_timeout_secs", None)
+        timeout = kwargs.get("timeout")
+        if (str(method).upper() == "GET" and not kwargs.get("stream")
+                and type(connect) in (int, float) and math.isfinite(connect) and connect > 0
+                and type(timeout) in (int, float) and math.isfinite(timeout) and timeout > 0):
+            # Convert only AFTER the clock has capped the remaining budget.
+            # curl_cffi sums this pair for TIMEOUT_MS; never add connect time
+            # to the caller's existing deadline or mutate shared curl options.
+            connect = min(connect, timeout)
+            kwargs["timeout"] = (connect, timeout - connect)
         return _send_with_bounded_stream_close(session, raw_send, method, url, **kwargs)
 
     def paced_request(method, url, **kwargs):

@@ -1419,5 +1419,53 @@ def test_native_partial_response_timeout_keeps_stage_snapshot(tmp_path, monkeypa
         server.server_close()
 
 
+def test_native_get_connect_cap_preserves_total_deadline(tmp_path, monkeypatch):
+    import socketserver
+    from urllib.parse import urlsplit
+    from curl_cffi import requests
+    from curl_cffi.requests.exceptions import Timeout
+    import services.account_request_pacing as pacing
+    from services.config import ConfigStore
+    from services.conversation_binding_service import ConversationBindingService
+    release = threading.Event()
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(4096)  # Receive ClientHello, then deliberately withhold TLS.
+            release.wait(2)
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    session = requests.Session(trust_env=False)
+    raw_send = session.request
+    session.request = lambda method, url, **kw: raw_send(
+        method, f"https://127.0.0.1:{server.server_address[1]}"+urlsplit(url).path, **kw)
+    (tmp_path / "config.json").write_text(json.dumps({"auth-key":"test-only"}))
+    settings = ConfigStore(tmp_path / "config.json")
+    settings.update({"account_request_interval_secs":0, "account_conversation_read_interval_secs":0})
+    monkeypatch.setattr(pacing, "config", settings)
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    pacing.pace_account_session(session, {"account_id":"fixture-only"}, "fixture-token")
+    try:
+        with patch("services.account_request_pacing.logger.info") as log:
+            started = time.monotonic()
+            with __import__("pytest").raises(Timeout) as caught:
+                session.get("https://chatgpt.com/backend-api/conversation/original", timeout=.8,
+                            _account_request_deadline_monotonic=started+.7,
+                            _account_request_connect_timeout_secs=.15)
+        assert .1 <= time.monotonic()-started < .6
+        assert ConversationBindingService._retryable_direct_read_connection(caught.value)
+        attempt = next(c.args[0] for c in log.call_args_list if c.args[0].get("event")=="account_http_attempt")
+        assert .6 < attempt["request_timeout_secs"] <= .7
+        assert attempt["transport_details"]["appconnect_secs"] == 0
+        assert attempt["transport_details"]["downloaded_bytes"] == 0
+        assert attempt.get("transport_response_status") is None
+    finally:
+        release.set()
+        session.close()
+        server.shutdown()
+        server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

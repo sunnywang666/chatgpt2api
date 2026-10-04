@@ -7,6 +7,8 @@ import time
 from datetime import datetime
 from enum import Enum
 from typing import Any
+from curl_cffi import CurlInfo
+from curl_cffi.requests.exceptions import RequestException
 
 from services.account_service import account_service
 from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
@@ -1128,15 +1130,52 @@ class ConversationBindingService:
         with account_service.conversation_binding_lock(binding_id, body["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:
-                return self._read_text_result(backend, body, deadline_monotonic=deadline)
+                for attempt in range(2):
+                    try:
+                        return self._read_text_result(backend, body, deadline_monotonic=deadline,
+                                                      connect_timeout_secs=10.0)
+                    except Exception as exc:
+                        if (attempt or time.monotonic() >= deadline
+                                or not self._retryable_direct_read_connection(exc)):
+                            raise
             finally:
                 backend.close()
 
     @staticmethod
+    def _retryable_direct_read_connection(exc):
+        """Only one new connection for a failed, read-only original cursor GET.
+
+        This does not apply to durable task recovery, polling, archive or sends.
+        A timeout after HTTP/partial data and certificate/auth/rate errors are
+        not retryable here. A reused TLS connection has num_connects=0 and
+        cannot be mistaken for a new handshake that hit its connection cap.
+        """
+        try:
+            if not isinstance(exc, RequestException) or exc.code not in (28, 35):
+                return False
+            response = exc.response
+            if response is not None and response.status_code:
+                return False
+            infos = getattr(response, "infos", {}) or {}
+            if infos.get(CurlInfo.HTTP_CONNECTCODE) in (401, 403, 407, 429):
+                return False
+            return (type(infos.get(CurlInfo.NUM_CONNECTS)) is int
+                    and infos[CurlInfo.NUM_CONNECTS] > 0
+                    and type(infos.get(CurlInfo.APPCONNECT_TIME)) in (int, float)
+                    and infos.get(CurlInfo.APPCONNECT_TIME) == 0
+                    and type(infos.get(CurlInfo.SIZE_DOWNLOAD_T)) is int
+                    and infos.get(CurlInfo.SIZE_DOWNLOAD_T) == 0)
+        except Exception:
+            return False
+
+    @staticmethod
     def _read_text_result(
         backend: OpenAIBackendAPI, cursor: dict[str, Any], *, deadline_monotonic: float | None = None,
+        connect_timeout_secs: float | None = None,
     ) -> dict[str, Any]:
         options = {} if deadline_monotonic is None else {"deadline_monotonic": deadline_monotonic}
+        if connect_timeout_secs is not None:
+            options["connect_timeout_secs"] = connect_timeout_secs
         document = backend._get_conversation(cursor["conversation_id"], **options)
         if document.get("conversation_id", cursor["conversation_id"]) != cursor["conversation_id"]:
             raise ConversationBindingError("conversation identity changed", code="CONVERSATION_BINDING_MISMATCH")
