@@ -502,4 +502,12 @@ Python 客户端提供 `wait --state 原图片状态.json` 和
 图片原回执暂时为 `error`、但账号池仍会自动读取或保存原结果时，事件包含
 `recovering_original:true`，客户端继续等原 ID，不提前报终局失败。明确暂停、停止恢复，
 或不再具备自动恢复条件时才发送 `needs_attention`；冷却期间不会触发额外查询。
-事件只含原 ID、类别、状态、是否就绪、结果数量及是否仍在恢复，不传密钥、结果正文或上游游标。
+图片回执和事件还包含 `result_stage`：`queued`（排队）、`preparing`（尚未开始上游提交）、
+`submission_unconfirmed`（旧回执等缺少提交证据，不能断言未发送）、
+`submitted`（已开始上游提交，尚未发现图片）、`assets_discovered`（已发现图片标识，结果尚未确认保存）、
+`downloaded_waiting_original_confirmation`（图片已私密下载，等待核对原会话）、
+`result_ready`（原结果已确认并保存）、`needs_attention`（已暂停、停止或需要处理的失败）。
+`submitted` 本身不证明上游已接受；`assets_discovered` 不证明生成已结束。
+中间阶段变化也会发 `state`，但不触发重发、额外上游查询或自动宣布任务完成。
+仍须结合原有 `status`、恢复状态与冷却信息处理失败和等待；收到 `result_ready` 才下载交付文件。
+事件不传密钥、结果正文、私密缓存引用或上游图片标识。

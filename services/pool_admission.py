@@ -105,6 +105,34 @@ def image_original_recovery_pending(receipt):
                 and receipt.get("conversation_id") and receipt.get("request_message_id"))
 
 
+def image_result_stage(receipt):
+    """Safe progress derived from the receipt, never from a new upstream read.
+
+    Asset discovery and private download are not a publishable result. Keep
+    explicit stops and terminal failures visible even when cached assets exist.
+    """
+    status = receipt.get("status")
+    if status == "success":
+        return "result_ready" if isinstance(receipt.get("data"), list) and receipt["data"] else "needs_attention"
+    if (receipt.get("_recovery_paused") is True or recovery_suppressed(receipt)
+            or status not in {"queued", "running"} and not image_original_recovery_pending(receipt)):
+        return "needs_attention"
+    cached = receipt.get("_pending_image_output")
+    if isinstance(cached, dict) and cached.get("output_ref") and isinstance(cached.get("coverage"), dict):
+        return "downloaded_waiting_original_confirmation"
+    if (receipt.get("result_file_ids") or receipt.get("result_sediment_ids")
+            or pending_image_result_ids(receipt)):
+        return "assets_discovered"
+    if receipt.get("upstream_submission_started") is True:
+        return "submitted"
+    if status == "queued":
+        return "queued"
+    if receipt.get("upstream_submission_started") is False:
+        return "preparing"
+    # Older receipts may lack a submit marker even after an upstream write.
+    return "submission_unconfirmed"
+
+
 def unfinished(kind, receipt):
     if recovery_suppressed(receipt):
         return False
@@ -1287,6 +1315,7 @@ class PoolAdmission:
                 if (r.get("provider_binding_id")
                         and self.accounts.get_bound_account_identity(r["provider_binding_id"]) != r.get("provider_account_identity")):
                     raise AdmissionLost("original image binding changed before send")
+            send_observation = {}
             if r.get("_route") == "codex":
                 if self.codex is None or self.codex._eligible_account(selected, "" if context.kind == "image" or r.get("_operation") == "image" else r.get("model", ""), allow_probe=False) is None:
                     raise AdmissionLost("original Codex model is unavailable before send")
@@ -1302,6 +1331,8 @@ class PoolAdmission:
                                    and image_generation_active(kind, other, other.get("status") == "running" or unresolved_result(kind, other)))
                     if capacity < occupied:
                         raise AdmissionLost("original image capacity decreased before send")
+                    send_observation = {"image_capacity_at_send": capacity,
+                                        "image_occupied_at_send_including_current": occupied}
                 if any(isinstance(limit, dict) and limit.get("feature_name") == r.get("model") and limit.get("remaining") == 0
                        for limit in selected.get("limits_progress") or []):
                     raise AdmissionLost("original model quota is unavailable before send")
@@ -1309,7 +1340,7 @@ class PoolAdmission:
             if r.get("_supersedes_request_id"):
                 r.update(upstream_outcome="unknown", error_code=None, waiting=None)
             timeline = list(r.get("_execution_timeline") or [])
-            timeline.append({"stage": "send_guard_passed", "at": now})
+            timeline.append({"stage": "send_guard_passed", "at": now, **send_observation})
             r.update(_submission_started=True, _last_sent_sequence=sequence, _turn_reserved=True,
                      _claim_until=now + self.CLAIM_SECONDS, _execution_timeline=timeline[-32:])
             self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)

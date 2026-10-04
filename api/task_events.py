@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 
 from api.key_policy import require_chat_text_policy, require_codex_endpoint, require_image_policy
 from api.support import require_identity
-from services.pool_admission import image_original_recovery_pending
+from services.pool_admission import image_original_recovery_pending, image_result_stage
 
 STREAM_SECONDS = 30
 CHECK_SECONDS = 1
@@ -58,6 +58,7 @@ def _snapshot(kind, service, identity, request_id):
         status = "unknown"
     return {"protocol": "task-notification-v1", "kind": kind, "request_id": request_id,
             "status": status, "result_ready": ready, "result_count": result_count,
+            **({"result_stage": image_result_stage(receipt)} if kind == "image" else {}),
             "retrying_unsent": _retrying_unsent(receipt),
             "recovering_original": kind == "image" and image_original_recovery_pending(receipt)}
 

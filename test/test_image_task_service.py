@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from services.account_request_pacing import AccountRequestClock, AccountRequestDeadlineExceeded, pace_account_session
-from services.image_task_service import ImageTaskService, _authoritative_image_failure, _failure_details
+from services.image_task_service import ImageTaskService, _authoritative_image_failure, _failure_details, _public_task
 from services.image_thread import ImageThreadError
 from services.openai_backend_api import (
     ChatRequirements,
@@ -923,6 +923,65 @@ class ImageTaskServiceTests(unittest.TestCase):
             retention_days_getter=lambda: 30,
         )
 
+    def test_public_result_stage_never_publishes_private_assets_or_hides_stops(self):
+        cached = {"output_ref": "private-output-ref", "coverage": {"file_ids": ["private-asset-id"]}}
+        recovering = {"status": "error", "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
+                      "conversation_id": "original", "request_message_id": "request",
+                      "result_file_ids": ["private-asset-id"], "_pending_image_output": cached}
+        cases = [
+            ({"status": "queued"}, "queued"),
+            ({"status": "running", "upstream_submission_started": False}, "preparing"),
+            ({"status": "running", "upstream_outcome": "unknown", "conversation_id": "original"}, "submission_unconfirmed"),
+            ({"status": "running", "upstream_submission_started": True}, "submitted"),
+            ({"status": "running", "_pending_image_result_ids": {"file_ids": ["private-asset-id"]}}, "assets_discovered"),
+            ({"status": "running", "result_file_ids": ["private-asset-id"]}, "assets_discovered"),
+            (recovering, "downloaded_waiting_original_confirmation"),
+            ({**recovering, "_recovery_paused": True}, "needs_attention"),
+            ({**recovering, "_recovery_suppressed": True}, "needs_attention"),
+            ({**recovering, "error_code": "content_policy_violation"}, "needs_attention"),
+            ({"status": "success", "data": []}, "needs_attention"),
+            ({"status": "success", "data": [{"url": "confirmed-result"}]}, "result_ready"),
+        ]
+        for receipt, expected in cases:
+            with self.subTest(expected=expected, receipt=receipt):
+                public = _public_task(receipt)
+                self.assertEqual(public["result_stage"], expected)
+                self.assertNotIn("private-", json.dumps(public))
+
+    def test_first_qualified_assets_observation_is_atomic_and_survives_restart(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_unfinished=True)
+            service = self.make_service(path)
+            key = "owner-1:policy-task"
+            service._update_task(key, _pending_image_result_ids={"file_ids": ["pending"]})
+            self.assertNotIn("_first_qualified_image_assets_observed_at", service._tasks[key])
+            service._update_task(key, result_file_ids=["original-file"], upstream_unfinished=True)
+            self.assertNotIn("_first_qualified_image_assets_observed_at", service._tasks[key])
+            # Merely ending an old attempt is not a newly observed asset read.
+            service._update_task(key, upstream_unfinished=False)
+            self.assertNotIn("_first_qualified_image_assets_observed_at", service._tasks[key])
+            service._update_task(key, result_file_ids=["original-file"], result_sediment_ids=["original-file", "sediment"])
+            first = service._tasks[key]["_first_qualified_image_assets_observed_at"]
+            self.assertGreater(first, 0)
+            self.assertEqual(service._tasks[key]["_first_qualified_image_asset_id_count"], 2)
+            restarted = self.make_service(path)
+            restarted._update_task(key, result_file_ids=["original-file"], result_sediment_ids=["sediment"])
+            task = restarted._tasks[key]
+            self.assertEqual(task["_first_qualified_image_assets_observed_at"], first)
+            observations = [e for e in task["_execution_timeline"] if e["stage"] == "qualified_image_assets_observed"]
+            self.assertEqual(observations, [{"stage": "qualified_image_assets_observed", "at": first, "image_count": 2}])
+            self.assertNotIn("original-file", json.dumps(observations))
+
+    def test_historical_assets_without_observation_keep_unknown_timestamp(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", result_file_ids=["old-file"])
+            service = self.make_service(path)
+            service._update_task("owner-1:policy-task", progress="receiving_image")
+            restarted = self.make_service(path)
+            self.assertNotIn("_first_qualified_image_assets_observed_at", restarted._tasks["owner-1:policy-task"])
+
     def test_active_attempt_budget_starts_after_account_slot_wait_and_survives_restart(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
@@ -1134,6 +1193,8 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(failed["upstream_outcome"], "generated")
             self.assertFalse(failed["upstream_unfinished"])
             self.assertNotIn("token=secret", failed["error"])
+            first_assets_observed = service._tasks["owner-1:download-task"]["_first_qualified_image_assets_observed_at"]
+            self.assertGreater(first_assets_observed, 0)
             service._update_task("owner-1:download-task", active_attempt_deadline_at=time.time() - 1)
             failed = service.list_tasks(OWNER, ["download-task"])["items"][0]
             active_started_at = failed["active_attempt_started_at"]
@@ -1188,6 +1249,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(succeeded["active_attempt_deadline_at"], active_deadline_at)
             self.assertEqual(DownloadBackend.polls, 0)
             self.assertEqual(DownloadBackend.reads, 0)
+            self.assertEqual(service._tasks["owner-1:download-task"]["_first_qualified_image_assets_observed_at"], first_assets_observed)
 
     def test_downloaded_original_is_private_and_reused_after_confirmation_failure(self):
         from services.request_context import executing
@@ -1956,6 +2018,12 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["image_session_parent_id"], "message-2")
             self.assertEqual(task["data"], [{"url": "http://content-provider/images/result.png"}])
             self.assertEqual(FakeBackend.poll_calls, [("conversation-1", 30, "request-message-1")])
+            recovered = service._tasks["owner-1:unknown-task"]
+            self.assertGreater(recovered["_first_qualified_image_assets_observed_at"], 0)
+            self.assertEqual(recovered["_first_qualified_image_asset_id_count"], 1)
+            restarted = self.make_service(Path(tmp_dir) / "image_tasks.json")
+            self.assertEqual(restarted._tasks["owner-1:unknown-task"]["_first_qualified_image_assets_observed_at"],
+                             recovered["_first_qualified_image_assets_observed_at"])
 
     def test_unknown_resume_keeps_404_and_empty_final_without_images_unknown(self):
         scenarios = ("conversation-404", "empty-final-and-tasks")

@@ -79,6 +79,33 @@ def test_running_to_committed_result_and_revocation(runtime, monkeypatch):
     assert 'event: access_lost' in result.text and 'event: result_ready' not in result.text
 
 
+def test_image_stages_emit_state_changes_without_exposing_assets(runtime, monkeypatch):
+    client, put, identity, _ = runtime
+    put(status='running', upstream_outcome='unknown', conversation_id='original')
+    changes = iter([
+        {'status': 'running', 'upstream_submission_started': False},
+        {'status': 'running', 'upstream_submission_started': True},
+        {'status': 'running', 'result_file_ids': ['private-asset']},
+        {'status': 'running', '_pending_image_output': {'output_ref': 'private-ref', 'coverage': {}}},
+        {'status': 'success', 'data': [{'url': 'private-result'}]},
+    ])
+    calls = 0
+    def authenticate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            put(**next(changes))
+        return identity.copy()
+    monkeypatch.setattr(events, 'require_identity', authenticate)
+    response = client.get('/api/image-tasks/original/events')
+    payloads = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ')]
+    assert [p['result_stage'] for p in payloads] == ['submission_unconfirmed', 'preparing', 'submitted', 'assets_discovered',
+        'downloaded_waiting_original_confirmation', 'result_ready']
+    assert response.text.count('event: state\n') == 5
+    assert response.text.count('event: result_ready\n') == 1
+    assert 'private-' not in response.text
+
+
 def test_policy_change_and_bounded_wait(runtime, monkeypatch):
     client, put, identity, _ = runtime
     put(status='running', data=[])

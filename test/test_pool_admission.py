@@ -1073,7 +1073,14 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(snapshot["image"]["inflight"], 0)
         self.assertEqual(snapshot["queue"]["saving_images"], 1)
         self.assertGreater(snapshot["execution"]["active_input_bytes"], 0)
-        self.assertEqual(self.admission.claim_next().request_id, "next")
+        next_context = self.admission.claim_next()
+        self.assertEqual(next_context.request_id, "next")
+        next_context.before_send()
+        for context in (first, next_context):
+            event = next(e for e in context.receipt()["_execution_timeline"] if e["stage"] == "send_guard_passed")
+            self.assertEqual(event["image_capacity_at_send"], 1)
+            self.assertEqual(event["image_occupied_at_send_including_current"], 1)
+            self.assertNotIn("original-file", json.dumps(event))
         self.assertEqual(first.receipt(), before)
 
     def test_unknown_or_multi_send_image_keeps_generation_capacity(self):

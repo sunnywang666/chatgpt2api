@@ -261,6 +261,7 @@ def test_first_download_stays_private_until_confirmed_and_survives_restart(runti
     assert calls["download"] == 1
     if fail_confirmation:
         assert original["status"] == "error" and not original.get("data")
+        assert r.service.list_tasks(WHO, ["original"])["items"][0]["result_stage"] == "downloaded_waiting_original_confirmation"
         assert calls["published"] == 0
         cached = original["_pending_image_output"]
         with r.store.output_file(cached["output_ref"]) as handle:
@@ -278,6 +279,7 @@ def test_first_download_stays_private_until_confirmed_and_survives_restart(runti
     assert not result.get("_pending_image_output")
     assert calls["download"] == calls["published"] == len(r.state.sends) == 1
     assert result["conversation_id"] == original["conversation_id"]
+    assert r.service.list_tasks(WHO, ["original"])["items"][0]["result_stage"] == "result_ready"
 
 
 def test_private_image_output_cannot_escape_through_chunk_or_collection():

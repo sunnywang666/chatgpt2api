@@ -16,6 +16,7 @@ from typing import Any
 
 from services.config import DATA_DIR, config
 from services.task_store import TaskStore, recovery_control, pending_image_result_ids
+from services.pool_admission import image_result_stage
 from contextlib import contextmanager
 from services.request_context import current_request, AdmissionLost
 from utils.log import logger
@@ -505,6 +506,7 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "attempt_state": "succeeded" if task.get("status") == TASK_STATUS_SUCCESS else "ended" if task.get("_attempt_finished_at") else "active",
         "id": task.get("id"),
         "status": task.get("status"),
+        "result_stage": image_result_stage(task),
         "mode": task.get("mode"),
         "model": task.get("model"),
         "size": task.get("size"),
@@ -1474,6 +1476,23 @@ class ImageTaskService:
                     and isinstance(updates.get("data"), list) and updates["data"]):
                 saved_count = len(updates["data"])
             task.update(updates)
+            # Record the first newly observed qualified IDs atomically. An old
+            # receipt or an unrelated status update must not invent this time.
+            observed_ids = any(updates.get(field) for field in ("result_file_ids", "result_sediment_ids"))
+            first_observation = task.get("_first_qualified_image_assets_observed_at")
+            if (observed_ids and task.get("upstream_unfinished") is False and task.get("request_message_id")
+                    and not (type(first_observation) in (int, float)
+                             and math.isfinite(first_observation) and first_observation > 0)):
+                asset_ids = {item for field in ("result_file_ids", "result_sediment_ids")
+                             for item in (task.get(field) if isinstance(task.get(field), list) else [])
+                             if isinstance(item, str) and item}
+                if asset_ids:
+                    observed_at = time.time()
+                    task["_first_qualified_image_assets_observed_at"] = observed_at
+                    task["_first_qualified_image_asset_id_count"] = len(asset_ids)
+                    task["_execution_timeline"] = [*(task.get("_execution_timeline") or []),
+                        {"stage": "qualified_image_assets_observed", "at": observed_at,
+                         "image_count": len(asset_ids)}][-32:]
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
             self._save_locked()
