@@ -204,7 +204,10 @@ class ExecutionContext:
             "config_revision": settings.get("revision") if isinstance(settings, dict) else None,
             **{key: value for key, value in extra.items()
                if key in {"status_code", "upstream_request_id", "output_ref", "known", "task_status", "image_count",
-                          "stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event", "sse_error_category"}},
+                          "stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event", "sse_error_category",
+                          "sse_message_snapshot_events", "sse_terminal_assistant_events", "sse_terminal_id_events",
+                          "sse_terminal_final_channel_events", "sse_terminal_parent_events",
+                          "sse_terminal_direct_parent_match_events"}},
         }
         timeline = list(receipt.get("_execution_timeline") or [])
         timeline.append(entry)

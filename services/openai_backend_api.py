@@ -3092,6 +3092,7 @@ class OpenAIBackendAPI:
                     f"conversation stream exceeded hard limit of {int(TEXT_STREAM_HARD_CAP_SECS)} seconds"
                 ),
                 observe_text=True,
+                request_message_id=str(getattr(self, "text_request_message_id", "") or ""),
             )
         finally:
             response.close()
@@ -3144,6 +3145,7 @@ class OpenAIBackendAPI:
             response,
             self._image_active_timeout(float(config.image_poll_timeout_secs)),
             observe_text=True,
+            request_message_id=str(getattr(self, "image_request_message_id", "") or ""),
         )
 
     def _iter_sse_payloads_capped(
@@ -3154,6 +3156,7 @@ class OpenAIBackendAPI:
             timeout_error_type: type[StreamHardTimeoutError] = ImageStreamHardTimeoutError,
             timeout_message: str | None = None,
             observe_text: bool = False,
+            request_message_id: str = "",
     ) -> Iterator[str]:
         """按墙钟硬上限消费图片 SSE 流，避免上游异常时长连接被无限挂起。
 
@@ -3172,7 +3175,8 @@ class OpenAIBackendAPI:
         )
         observation = {"sse_data_count": 0, "sse_parse_errors": 0, "sse_error_event": False} if observe_text else None
         try:
-            payloads = iter_sse_payloads(response, observation=observation) if observe_text else iter_sse_payloads(response)
+            payloads = (iter_sse_payloads(response, observation=observation, request_message_id=request_message_id)
+                        if observe_text else iter_sse_payloads(response))
             for payload in payloads:
                 yield payload
                 if time.monotonic() >= deadline:

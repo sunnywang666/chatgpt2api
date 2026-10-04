@@ -243,7 +243,50 @@ def _sse_error_category(event: dict) -> str:
     return "unknown"
 
 
-def iter_sse_payloads(response: requests.Response, *, observation: dict | None = None) -> Iterator[str]:
+def _observe_sse_message(event: dict, observation: dict, request_message_id: str) -> None:
+    """Count complete message snapshots, never infer completion from patches.
+
+    These are event counts, not unique messages or authority to skip the
+    original-branch GET. No message IDs, text, URLs or field values are saved.
+    """
+    def count(key):
+        observation[key] = min(observation.get(key, 0) + 1, 2147483647)
+
+    value = event.get("v")
+    frame = value if isinstance(value, dict) and isinstance(value.get("message"), dict) else event
+    message = frame.get("message")
+    if not isinstance(message, dict):
+        return
+    count("sse_message_snapshot_events")
+    author = message.get("author")
+    if not isinstance(author, dict) or author.get("role") != "assistant":
+        return
+    if message.get("status") != "finished_successfully" or message.get("end_turn") is not True:
+        return
+    count("sse_terminal_assistant_events")
+    has_id = isinstance(message.get("id"), str) and bool(message["id"])
+    if has_id:
+        count("sse_terminal_id_events")
+    metadata = message.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if message.get("channel") == "final" or metadata.get("channel") == "final":
+        count("sse_terminal_final_channel_events")
+    parents = {parent for container in (frame, message, metadata)
+               for key in ("parent", "parent_id")
+               if isinstance(parent := container.get(key), str) and parent}
+    if parents:
+        count("sse_terminal_parent_events")
+    if has_id and request_message_id and parents == {request_message_id}:
+        count("sse_terminal_direct_parent_match_events")
+
+
+def iter_sse_payloads(response: requests.Response, *, observation: dict | None = None,
+                      request_message_id: str = "") -> Iterator[str]:
+    if observation is not None:
+        for key in ("sse_message_snapshot_events", "sse_terminal_assistant_events", "sse_terminal_id_events",
+                    "sse_terminal_final_channel_events", "sse_terminal_parent_events",
+                    "sse_terminal_direct_parent_match_events"):
+            observation.setdefault(key, 0)
     error_event = False
     for raw_line in response.iter_lines():
         if not raw_line:
@@ -269,6 +312,8 @@ def iter_sse_payloads(response: requests.Response, *, observation: dict | None =
                     except (ValueError, TypeError):
                         observation["sse_parse_errors"] = min(observation.get("sse_parse_errors", 0) + 1, 2147483647)
                     else:
+                        if isinstance(event, dict):
+                            _observe_sse_message(event, observation, request_message_id)
                         if isinstance(event, dict) and (error_event or event.get("type") == "error" or event.get("error")):
                             observation["sse_error_event"] = True
                             observation["sse_error_category"] = _sse_error_category(event)

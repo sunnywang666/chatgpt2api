@@ -141,3 +141,73 @@ def test_image_stream_records_its_own_end_before_result_collection(monkeypatch, 
     assert evidence["sse_parse_errors"] == 0 and evidence["sse_error_event"] is False
     assert response.closed
     assert "PRIVATE" not in json.dumps(stages)
+
+
+def test_sse_terminal_observations_preserve_unknown_and_never_store_nodes_or_content(runtime):
+    request_node = "PRIVATE_ORIGINAL_USER_NODE"
+    message = {"id": "PRIVATE_ASSISTANT_NODE", "author": {"role": "assistant"},
+               "status": "finished_successfully", "end_turn": True, "channel": "final",
+               "metadata": {"parent_id": request_node},
+               "content": {"parts": ["PRIVATE_TEXT https://private.test/?token=PRIVATE_TOKEN"]}}
+    events = [{"v": {"message": message}}, {"message": message},
+              {"message": {**message, "parent_id": "PRIVATE_DIFFERENT_PARENT"}},
+              {"message": {**message, "id": ""}},
+              {"message": {**message, "end_turn": "true"}},
+              {"message": {**message, "status": "in_progress"}},
+              {"message": {**message, "author": {"role": "tool"}}},
+              {"p": "/message/end_turn", "v": True}]
+    payloads = [json.dumps(event) for event in events] + ["[DONE]"]
+    response = Response([("data: " + payload).encode() for payload in payloads])
+
+    def run(body):
+        current_request.get().before_send()
+        assert list(OpenAIBackendAPI._iter_sse_payloads_capped(
+            None, response, 60, observe_text=True, request_message_id=request_node)) == payloads
+        raise ConversationBindingError("still needs original branch verification", code="CONVERSATION_OUTCOME_UNKNOWN")
+
+    runtime.admission.register("text", lambda ctx, body: run(body))
+    runtime.service.submit("owner", {"client_request_id": "terminal-evidence", "client_conversation_id": "terminal-session",
+                                     "model": "fixture-text", "messages": [{"role": "user", "content": "fixture"}]})
+    runtime.admission.execute(runtime.admission.claim_next())
+    restarted = TextTaskService(runtime.store.path, admission=runtime.admission, clock=runtime.clock)
+    with restarted.store.connect() as db:
+        row = restarted.store.read_receipt(db, "text", "owner", "terminal-evidence")
+    evidence = next(e for e in row["_execution_timeline"] if e["stage"] == "stream_finished")
+    assert evidence["sse_message_snapshot_events"] == 7
+    assert evidence["sse_terminal_assistant_events"] == 4
+    assert evidence["sse_terminal_id_events"] == 3
+    assert evidence["sse_terminal_final_channel_events"] == 4
+    assert evidence["sse_terminal_parent_events"] == 4
+    assert evidence["sse_terminal_direct_parent_match_events"] == 2
+    assert row["status"] != "succeeded"
+    assert sum(e["stage"] == "send_guard_passed" for e in row["_execution_timeline"]) == 1
+    assert "PRIVATE" not in json.dumps(evidence)
+
+
+def test_sse_done_or_patch_alone_is_not_a_terminal_message_snapshot():
+    from utils.helper import iter_sse_payloads
+    observation = {}
+    response = Response([b'data: {"p":"/message/end_turn","v":true}', b'data: [DONE]'])
+    list(iter_sse_payloads(response, observation=observation, request_message_id="original"))
+    assert observation["stream_end"] == "done"
+    assert observation["sse_terminal_assistant_events"] == 0
+    assert observation["sse_terminal_direct_parent_match_events"] == 0
+
+
+def test_image_stream_passes_original_node_to_safe_observation(monkeypatch):
+    monkeypatch.setattr("services.openai_backend_api.account_service.get_account", lambda token: {})
+    backend = OpenAIBackendAPI(access_token="fixture-token")
+    backend.image_request_message_id = "PRIVATE_IMAGE_USER_NODE"
+    monkeypatch.setattr(backend, "_bootstrap", lambda: None)
+    monkeypatch.setattr(backend, "_get_chat_requirements", lambda: ChatRequirements(token="fixture"))
+    monkeypatch.setattr(backend, "_prepare_image_conversation", lambda *a, **kw: "conduit")
+    response = Response([b'data: {"message":{"id":"PRIVATE_ASSISTANT","author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"parent_id":"PRIVATE_IMAGE_USER_NODE"}}', b'data: [DONE]'])
+    monkeypatch.setattr(backend, "_start_image_generation", lambda *a, **kw: response)
+    stages = []
+    token = current_request.set(SimpleNamespace(record_stage=lambda stage, **fields: stages.append((stage, fields))))
+    try:
+        list(backend._stream_picture_conversation("draw", "gpt-image-2", []))
+    finally:
+        current_request.reset(token)
+    assert stages[0][1]["sse_terminal_direct_parent_match_events"] == 1
+    assert "PRIVATE" not in json.dumps(stages)
