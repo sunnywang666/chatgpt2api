@@ -232,6 +232,37 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual(backend.calls, 3)
         self.assertEqual(observed, [(["file-one"], []), (["file-one", "file-two"], ["sed-one"])])
 
+    def test_strict_terminal_shortcut_does_not_change_recovery_or_legacy_polling(self) -> None:
+        for mode in ("initial-ids", "initial-document", "fresh-recovery", "check-disabled",
+                     "settle-disabled", "asset-drift", "legacy"):
+            with self.subTest(mode=mode):
+                docs = [_conversation(["file-one"])]
+                if mode == "asset-drift":
+                    docs += [_conversation(["file-two"]), _conversation(["file-two"])]
+                backend = FakeBackend(docs)
+                check = mock.Mock(return_value=True)
+                if mode != "legacy": backend.image_poll_terminal_check = check
+                # First changed observation is not confirmed; accumulated stale
+                # IDs must never be passed to the shortcut on a later snapshot.
+                if mode == "asset-drift": check.return_value = False
+                kwargs = {"request_message_id": "request"}
+                if mode == "initial-ids": kwargs["initial_file_ids"] = ["file-one"]
+                if mode == "initial-document": kwargs["initial_document"] = docs[0]
+                if mode == "fresh-recovery": kwargs["require_fresh_result_ids"] = True
+                with mock.patch.dict(config.data, {
+                    "image_poll_initial_wait_secs": 0, "image_poll_interval_secs": .01,
+                    "image_check_before_hit_enabled": mode != "check-disabled",
+                    "image_settle_enabled": mode != "settle-disabled", "image_settle_secs": .01,
+                }):
+                    if mode == "initial-document":
+                        with self.assertRaises(ImagePollTimeoutError):
+                            backend._poll_image_results("conv-1", 1, **kwargs)
+                    else:
+                        backend._poll_image_results("conv-1", 10, **kwargs)
+                self.assertEqual(check.call_count, 1 if mode == "asset-drift" else 0)
+                if mode in {"fresh-recovery", "legacy"}: self.assertEqual(backend.calls, 2)
+                if mode == "initial-document": self.assertEqual(backend.calls, 0)
+
     def test_poll_keeps_request_scoped_ids_when_settle_exhausts_budget(self) -> None:
         document = _conversation(["file-original"])
         document["mapping"].update({

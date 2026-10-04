@@ -288,6 +288,96 @@ def test_private_image_output_cannot_escape_through_chunk_or_collection():
     assert "cHJpdmF0ZQ==" not in repr(private)
 
 
+@pytest.mark.parametrize("change", ["none", "unfinished", "wrong-parent", "sibling", "current", "late-drift"])
+def test_strict_terminal_poll_saves_settle_read_but_keeps_post_download_fence(runtime, monkeypatch, change):
+    from services.config import config
+    r = runtime
+    r.submit("prior"); run_next(r, "prior")
+    backend_class = conversation.OpenAIBackendAPI
+    monkeypatch.setattr(backend_class, "_current_message_branch_ids",
+                        staticmethod(RealOpenAIBackendAPI._current_message_branch_ids), raising=False)
+    calls = {"read": 0, "download": 0, "publish": 0}
+
+    def events(backend, **kwargs):
+        callback = backend.progress_callback
+        rid = callback.request_message_id
+        cid = kwargs["conversation_id"]
+        current_request.get().before_send()
+        backend.image_request_message_id = rid
+        backend.image_submission_started = True
+        callback.record_submission_started(); callback.record_conversation_id(cid)
+        doc, _ = tool_document(cid, rid, kwargs["parent_message_id"])
+        doc["mapping"] = {**r.state.documents[cid]["mapping"], **doc["mapping"]}
+        r.state.documents[cid] = doc
+        r.state.sends.append({"conversation": cid, "message": rid})
+        yield {"conversation_id": cid, "file_ids": [], "turn_use_case": "image gen"}
+
+    def read(backend, cid):
+        calls["read"] += 1
+        doc = copy.deepcopy(r.state.documents[cid])
+        rid = backend.image_request_message_id
+        if calls["read"] == 1:
+            if change == "unfinished": doc["mapping"][rid + "-image"]["message"]["status"] = "in_progress"
+            if change == "wrong-parent": doc["mapping"][rid]["parent"] = "foreign"
+            if change == "sibling": doc["mapping"]["sibling"] = node("sibling", "assistant", rid)
+            if change == "current": doc["current_node"] = rid
+        if change == "late-drift" and calls["download"]:
+            doc["mapping"]["foreign"] = node("foreign", "user", doc["current_node"])
+            doc["current_node"] = "foreign"
+        return doc
+
+    def poll(backend, cid, timeout, *args, **kwargs):
+        # Run the real polling algorithm with the callback installed by the
+        # real bound wrapper; transport alone is controlled.
+        probe = RealOpenAIBackendAPI.__new__(RealOpenAIBackendAPI)
+        probe.progress_callback = backend.progress_callback
+        if hasattr(backend, "image_poll_terminal_check"):
+            probe.image_poll_terminal_check = backend.image_poll_terminal_check
+        probe._get_conversation = lambda c: read(backend, c)
+        probe._query_backend_tasks = lambda **_kw: []
+        return probe._poll_image_results(cid, timeout, *args, **kwargs)
+
+    def resolve(_backend, _cid, files, sediments, **_kwargs):
+        return ["https://fixture.invalid/original.png"] if files or sediments else []
+
+    def download(_backend, _urls):
+        calls["download"] += 1
+        return [OUTPUT]
+
+    def publish(items, *_args, **_kwargs):
+        calls["publish"] += 1
+        assert calls["read"] >= 2, "fresh post-download confirmation must precede publication"
+        return {"data": items}
+
+    for name, value in {"image_poll_initial_wait_secs": 0, "image_poll_interval_secs": .01,
+                        "image_check_before_hit_enabled": True, "image_settle_enabled": True,
+                        "image_settle_secs": .01}.items(): monkeypatch.setitem(config.data, name, value)
+    monkeypatch.setattr(conversation, "conversation_events", events)
+    monkeypatch.setattr(conversation, "stream_image_outputs", REAL_IMAGE_STREAM)
+    monkeypatch.setattr(conversation, "_get_detailed_error_from_tasks", lambda *_a, **_k: "")
+    monkeypatch.setattr(conversation, "format_image_result", publish)
+    for name, value in {"_poll_image_results": poll, "_get_conversation": read,
+                        "resolve_conversation_image_urls": resolve, "download_image_bytes": download}.items():
+        monkeypatch.setattr(backend_class, name, value)
+    # The continuation precheck is outside the measured result polling reads.
+    original_read = read
+    def with_precheck(backend, cid):
+        if not hasattr(backend, "image_request_message_id"):
+            return copy.deepcopy(r.state.documents[cid])
+        return original_read(backend, cid)
+    monkeypatch.setattr(backend_class, "_get_conversation", with_precheck)
+    r.submit("original"); r.admission.execute(r.admission.claim_next())
+    result = r.read("original")
+    assert calls["read"] == (2 if change in {"none", "late-drift"} else 3)
+    assert calls["download"] == 1 and len(r.state.sends) == 2
+    if change == "late-drift":
+        assert result["status"] == "error" and not result.get("data") and calls["publish"] == 0
+        assert result.get("_pending_image_output"), "retain private original on late branch change"
+    else:
+        assert result["status"] == "success" and calls["publish"] == 1
+        assert result["conversation_id"] == r.read("prior")["conversation_id"]
+
+
 def test_advanced_selector_reaches_actual_bound_protocol_and_thread(runtime):
     r = runtime
     selected = r.admission.accounts.list_accounts()[0]

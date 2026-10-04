@@ -1519,6 +1519,23 @@ def _generate_bound_single_image(
                             code=getattr(exc, "code", "IMAGE_THREAD_PREVIOUS_UNCONFIRMED"), upstream_submitted=False) from exc
                 request = replace(request)
                 request._defer_image_publication = True
+                if thread:
+                    def poll_terminal(document, conversation_id, request_message_id, files, sediments):
+                        try:
+                            finished_parent(document, conversation_id, request_message_id,
+                                expected_parent=request.parent_message_id or None,
+                                expected_result_ids=files + sediments,
+                                predecessor_request_message_id=getattr(request.progress_callback,
+                                    "image_thread_predecessor_message", None),
+                                predecessor_result_ids=getattr(request.progress_callback,
+                                    "image_thread_predecessor_result_ids", None))
+                            return True
+                        except ImageThreadError:
+                            return False
+                    # A strictly finished first observation needs no repeated
+                    # asset-ID settle read. The post-download fresh fence below
+                    # remains mandatory before publishing any saved result.
+                    backend.image_poll_terminal_check = poll_terminal
                 for output in stream_image_outputs(backend, request, index, total):
                     last_conversation_id = output.conversation_id or last_conversation_id
                     output.account_email = output.account_email or account_email

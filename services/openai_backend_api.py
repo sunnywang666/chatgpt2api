@@ -2728,6 +2728,14 @@ class OpenAIBackendAPI:
                     logger.info({"event": "image_poll_hit", "conversation_id": conversation_id, "file_ids": file_ids,
                                  "sediment_ids": sediment_ids})
                     return file_ids, sediment_ids
+                terminal_check = getattr(self, "image_poll_terminal_check", None)
+                if (config.image_settle_enabled and not supplied_snapshot and not has_initial_ids
+                        and not require_fresh_result_ids and callable(terminal_check)
+                        and set(file_ids) == current_file_ids and set(sediment_ids) == current_sediment_ids
+                        and terminal_check(conversation, conversation_id, request_message_id,
+                                           list(file_ids), list(sediment_ids)) is True):
+                    logger.info({"event": "image_poll_strict_terminal_hit", "conversation_id": conversation_id})
+                    return file_ids, sediment_ids
                 last_hit_key = hit_key
                 if not config.image_settle_enabled:
                     # 二次确认机制关闭：直接返回首次发现的 file_ids
