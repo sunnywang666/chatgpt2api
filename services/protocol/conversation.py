@@ -7,6 +7,7 @@ import json
 import re
 import threading
 import time
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Iterator
@@ -17,6 +18,7 @@ from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import (
+    ImageActiveDeadlineExceeded,
     ImageContentPolicyError,
     ImagePollTimeoutError,
     OpenAIBackendAPI,
@@ -798,7 +800,12 @@ def conversation_events(
         conversation_id=conversation_id,
         parent_message_id=parent_message_id,
     )
-    yield from iter_conversation_payloads(payloads, history_text, history_messages)
+    try:
+        yield from iter_conversation_payloads(payloads, history_text, history_messages)
+    finally:
+        close = getattr(payloads, "close", None)
+        if callable(close):
+            close()
 
 
 def text_backend(model: str = "auto") -> OpenAIBackendAPI:
@@ -979,6 +986,39 @@ def _remove_image_conversation_later(
     threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 
 
+def _stream_image_terminal_result(backend, event, request_message_id, file_ids, sediment_ids, expected_parent=""):
+    """One signal-triggered read; a tool leaf cannot close an open image stream."""
+    from services.request_context import AdmissionLost
+    from services.account_request_pacing import AccountRequestDeadlineExceeded
+    check = getattr(backend, "image_poll_terminal_check", None)
+    conversation_id = str(event.get("conversation_id") or "")
+    if not conversation_id or not request_message_id or not (file_ids or sediment_ids):
+        return False
+    try:
+        document = backend._get_conversation(conversation_id)
+        current = (document.get("mapping", {}).get(document.get("current_node")) or {}).get("message") or {}
+        if (current.get("author", {}).get("role") != "assistant"
+                or current.get("status") != "finished_successfully"
+                or current.get("end_turn") is not True or current.get("channel") not in (None, "final")):
+            return False
+        records = backend._extract_image_tool_records(document, request_message_id)
+        if ({x for record in records for x in record["file_ids"]} != set(file_ids)
+                or {x for record in records for x in record["sediment_ids"]} != set(sediment_ids)):
+            return False
+        if callable(check):
+            return check(document, conversation_id, request_message_id, file_ids, sediment_ids) is True
+        finished_parent(document, conversation_id, request_message_id,
+                        expected_parent=expected_parent or None, expected_result_ids=file_ids+sediment_ids)
+        return True
+    except (AdmissionLost, AccountRequestDeadlineExceeded, ImageActiveDeadlineExceeded):
+        raise
+    except Exception:
+        # The paced transport has already persisted any 429 cooldown. Continue
+        # this original stream/recovery; never submit another generation here.
+        logger.info({"event": "image_stream_result_check_deferred", "conversation_id": conversation_id})
+        return False
+
+
 def stream_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -993,7 +1033,9 @@ def stream_image_outputs(
     record_conversation_id = getattr(request.progress_callback, "record_conversation_id", None)
     last: dict[str, Any] = {}
     recorded_result_ids = ([], [])
-    for event in conversation_events(
+    checked_signals = set()
+    stream_result_confirmed = False
+    events = conversation_events(
             backend,
             prompt=request.prompt,
             model=request.model,
@@ -1002,40 +1044,57 @@ def stream_image_outputs(
             quality=request.quality,
             conversation_id=request.conversation_id,
             parent_message_id=request.parent_message_id,
-    ):
-        last = event
-        event_conversation_id = str(event.get("conversation_id") or "")
-        if event_conversation_id and callable(record_conversation_id):
-            record_conversation_id(event_conversation_id)
-        result_ids = (list(event.get("file_ids") or []), list(event.get("sediment_ids") or []))
-        if result_ids != recorded_result_ids:
-            # These IDs have already passed the image-tool output filter.
-            # Persist before another stream read or URL lookup can fail/wait.
-            _record_result_ids(request, *result_ids)
-            recorded_result_ids = result_ids
-        if event.get("type") == "conversation.delta":
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                text=str(event.get("delta") or ""),
-                upstream_event_type="conversation.delta",
-                conversation_id=str(event.get("conversation_id") or ""),
-            )
-            continue
-        if event.get("type") == "conversation.event":
-            raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                upstream_event_type=raw_type,
-                conversation_id=str(event.get("conversation_id") or ""),
-            )
-
+    )
+    with closing(events):
+        for event in events:
+            last = event
+            event_conversation_id = str(event.get("conversation_id") or "")
+            if event_conversation_id and callable(record_conversation_id):
+                record_conversation_id(event_conversation_id)
+            result_ids = (list(event.get("file_ids") or []), list(event.get("sediment_ids") or []))
+            if result_ids != recorded_result_ids:
+                # These IDs have already passed the image-tool output filter.
+                # Persist before another stream read or URL lookup can fail/wait.
+                _record_result_ids(request, *result_ids)
+                recorded_result_ids = result_ids
+            raw = event.get("raw") or {}
+            value = raw.get("v") if isinstance(raw, dict) else None
+            message = (raw.get("message") or (value.get("message") if isinstance(value, dict) else None)) if isinstance(raw, dict) else None
+            terminal_signal = (isinstance(message, dict) and message.get("end_turn") is True
+                               and message.get("status") == "finished_successfully"
+                               and (message.get("author") or {}).get("role") == "assistant")
+            signal = (tuple(result_ids[0]), tuple(result_ids[1]),
+                      str(message.get("id") or "final") if terminal_signal else "assets")
+            if (result_ids[0] or result_ids[1]) and signal not in checked_signals:
+                checked_signals.add(signal)
+                original_message_id = str(getattr(backend, "image_request_message_id", "") or request_message_id)
+                if _stream_image_terminal_result(backend, event, original_message_id, *result_ids,
+                                                 expected_parent=request.parent_message_id):
+                    stream_result_confirmed = True
+                    logger.info({"event": "image_stream_result_confirmed", "conversation_id": event_conversation_id})
+                    break
+            if event.get("type") == "conversation.delta":
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    text=str(event.get("delta") or ""),
+                    upstream_event_type="conversation.delta",
+                    conversation_id=str(event.get("conversation_id") or ""),
+                )
+                continue
+            if event.get("type") == "conversation.event":
+                raw = event.get("raw")
+                raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    upstream_event_type=raw_type,
+                    conversation_id=str(event.get("conversation_id") or ""),
+                )
     submitted_request_message_id = str(
         getattr(backend, "image_request_message_id", "") or "",
     ).strip()
@@ -1059,7 +1118,7 @@ def stream_image_outputs(
         request.progress_callback("image_stream_resolve_start")
     if message and not file_ids and not sediment_ids and last.get("blocked"):
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
-        detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
+        detailed_error = _get_detailed_error_from_tasks(backend, conversation_id, wait_secs=0)
         error_text = detailed_error or message or "Image generation was rejected by upstream policy."
         raise ImageContentPolicyError(error_text, conversation_id)
     should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
@@ -1078,29 +1137,8 @@ def stream_image_outputs(
             "message_preview": message[:200],
         })
 
-    # 在轮询图片之前，先检查 /backend-api/tasks/ 是否有 moderation 拦截
-    # 这样可以避免不必要的长时间轮询超时
-    # 注意：当 should_poll_for_image 为 True 或检测到文本回复时，
-    # 即使 tasks 报告了"错误"，也不能直接返回——因为上游可能将工具调用的 JSON 参数
-    # （如 {"size":"1792x1024","n":1}）标记为 is_error，而实际上图片正在异步生成中。
-    # 此时应继续轮询图片。
-    detailed_error = ""
-    if not file_ids and not sediment_ids and conversation_id:
-        detailed_error = _get_detailed_error_from_tasks(backend, conversation_id, timeout_secs=5.0, wait_secs=1.0)
-        if detailed_error and not should_poll_for_image and not is_text_reply:
-            logger.info({
-                "event": "image_task_error_before_poll",
-                "conversation_id": conversation_id,
-                "error": detailed_error,
-            })
-            yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=detailed_error, conversation_id=conversation_id)
-            return
-        if detailed_error and (should_poll_for_image or is_text_reply):
-            logger.info({
-                "event": "image_task_error_skipped_for_poll",
-                "conversation_id": conversation_id,
-                "error": detailed_error,
-            })
+    # Read the original conversation first. The poller diagnoses task errors
+    # only when that authoritative read has no result assets.
 
     # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
@@ -1121,6 +1159,7 @@ def stream_image_outputs(
         image_urls = backend.resolve_conversation_image_urls(
             conversation_id, file_ids, sediment_ids, poll_timeout_secs=poll_timeout,
             request_message_id=request_message_id,
+            **({"poll": False} if stream_result_confirmed else {}),
         )
     except (ImageContentPolicyError, ImagePollTimeoutError) as exc:
         # 当检测到文本回复时，task error 不应直接判定为内容策略违规，

@@ -585,10 +585,10 @@ class GenerationCompletionService:
                     self.store.write_receipt(db, kind, owner, rid, row)
                 state = row.get("_completion") or {}
                 if (state.get("state") not in {None, "completed", "result_ready"}
-                        and state.get("next_at") is None
                         and not row.get("_recovery_paused") and not row.get("_recovery_suppressed")):
                     # Original-result recovery can finish after automatic
-                    # investigation has ended. Settle saved evidence locally;
+                    # investigation has ended or while its retry timer is still
+                    # pending. Settle saved evidence locally without waiting;
                     # do not reopen reads/retries or starve due work with a late
                     # original whose already-sent replacement still owns it.
                     self._select(db, kind, owner, rid, row)

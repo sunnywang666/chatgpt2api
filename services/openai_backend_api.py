@@ -2536,10 +2536,8 @@ class OpenAIBackendAPI:
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
-        - Sleeps image_poll_initial_wait_secs first (default 10s, +jitter). ChatGPT
-          image generation takes ~30s; polling immediately wastes requests and trips
-          a transient 429 the upstream returns within ~200ms of the SSE stream
-          closing (the conversation document is not yet committed).
+        - The first authoritative read runs as soon as the account clock allows.
+          Stream/asset signals do not add an unconditional initial or settle wait.
         - Subsequent polls are image_poll_interval_secs apart (default 10s).
         - On upstream 429 / 5xx or network errors, backs off exponentially
           (capped at 16s, +jitter) honoring Retry-After when present.
@@ -2553,7 +2551,6 @@ class OpenAIBackendAPI:
         initial_pacing_wait = float(getattr(getattr(self, "progress_callback", None), "local_pacing_wait_secs", 0))
         attempt = 0
         interval = float(config.image_poll_interval_secs)
-        initial_wait = float(config.image_poll_initial_wait_secs)
         file_ids: list[str] = []
         sediment_ids: list[str] = []
         self._add_unique(file_ids, initial_file_ids or [])
@@ -2561,13 +2558,13 @@ class OpenAIBackendAPI:
         has_initial_ids = bool(file_ids or sediment_ids)
         single_snapshot = initial_document is not None
         last_hit_key: tuple[tuple[str, ...], tuple[str, ...]] | None = (
-            (tuple(file_ids), tuple(sediment_ids)) if has_initial_ids else None
+            (tuple(file_ids), tuple(sediment_ids)) if has_initial_ids and single_snapshot else None
         )
         logger.info({
             "event": "image_poll_start",
             "conversation_id": conversation_id,
             "timeout_secs": timeout_secs,
-            "initial_wait_secs": initial_wait,
+            "initial_wait_secs": 0,
             "interval_secs": interval,
             "initial_file_ids": file_ids,
             "initial_sediment_ids": sediment_ids,
@@ -2581,16 +2578,8 @@ class OpenAIBackendAPI:
         # Recovery has already read this exact conversation under the account
         # clock. Consume that fresh observation once; a second immediate GET
         # cannot fit a short recovery budget when the read interval is longer.
-        # The caller waits the settle interval BEFORE acquiring this snapshot.
-        if initial_document is None and has_initial_ids and config.image_settle_enabled:
-            settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
-            if settle_for > 0:
-                time.sleep(settle_for)
-        elif initial_document is None and initial_wait > 0:
-            jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
-            sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+        # The recovery caller already enforced any pending-observation settle
+        # window. Live streams instead get a first read before any fallback wait.
 
         def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
             # retry_after=0 means "retry immediately" — must not be coerced via falsy check.
@@ -2622,30 +2611,6 @@ class OpenAIBackendAPI:
         while _remaining() > 0:
             attempt += 1
             supplied_snapshot = initial_document is not None
-            # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
-            # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
-            last_task_error = ""
-            try:
-                tasks = [] if supplied_snapshot else self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
-                for task in tasks:
-                    is_error, error_msg, metadata = self.check_task_error(task)
-                    if is_error and error_msg:
-                        last_task_error = error_msg
-                        logger.info({
-                            "event": "image_poll_task_error_not_blocking",
-                            "conversation_id": conversation_id,
-                            "attempt": attempt,
-                            "error_msg": error_msg,
-                            "metadata": metadata,
-                        })
-            except Exception as exc:
-                # tasks 查询失败不影响正常轮询流程
-                logger.debug({
-                    "event": "image_poll_task_check_failed",
-                    "conversation_id": conversation_id,
-                    "attempt": attempt,
-                    "error": str(exc),
-                })
 
             try:
                 conversation = initial_document if supplied_snapshot else self._get_conversation(conversation_id)
@@ -2694,6 +2659,32 @@ class OpenAIBackendAPI:
                 if callable(record_pending):
                     record_pending(list(file_ids), list(sediment_ids))
 
+            if not file_ids and not sediment_ids:
+                # Successful asset reads need no separate task-list query. Only
+                # diagnose a missing result after the authoritative conversation read.
+                last_task_error = ""
+                try:
+                    tasks = [] if supplied_snapshot else self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                    for task in tasks:
+                        is_error, error_msg, metadata = self.check_task_error(task)
+                        if is_error and error_msg:
+                            last_task_error = error_msg
+                            logger.info({
+                                "event": "image_poll_task_error_not_blocking",
+                                "conversation_id": conversation_id,
+                                "attempt": attempt,
+                                "error_msg": error_msg,
+                                "metadata": metadata,
+                            })
+                except Exception as exc:
+                    # tasks 查询失败不影响正常轮询流程
+                    logger.debug({
+                        "event": "image_poll_task_check_failed",
+                        "conversation_id": conversation_id,
+                        "attempt": attempt,
+                        "error": str(exc),
+                    })
+
             # 检查对话文本中是否包含内容政策违规错误
             # 当上游拒绝生成图片时，错误消息会出现在对话文档的 assistant 消息中，
             # 而非 /backend-api/tasks/ 的 task error 结构中。
@@ -2734,7 +2725,7 @@ class OpenAIBackendAPI:
                                  "sediment_ids": sediment_ids})
                     return file_ids, sediment_ids
                 terminal_check = getattr(self, "image_poll_terminal_check", None)
-                if (config.image_settle_enabled and not supplied_snapshot and not has_initial_ids
+                if (config.image_settle_enabled and not supplied_snapshot
                         and not require_fresh_result_ids and callable(terminal_check)
                         and set(file_ids) == current_file_ids and set(sediment_ids) == current_sediment_ids
                         and terminal_check(conversation, conversation_id, request_message_id,
@@ -2771,8 +2762,8 @@ class OpenAIBackendAPI:
             "conversation_id": conversation_id,
             "timeout_secs": timeout_secs,
             "attempts_made": attempt,
-            # attempts_made == 0 means the initial_wait consumed the entire budget — no HTTP attempted.
-            "initial_wait_exhausted_budget": attempt == 0,
+            # No read was attempted if the active budget was already exhausted.
+            "budget_exhausted_before_first_read": attempt == 0,
             "last_task_error": last_task_error if last_task_error else None,
         })
         exc = ImagePollTimeoutError(

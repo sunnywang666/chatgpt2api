@@ -473,7 +473,8 @@ def failed_unsent_image(setup):
 
 
 @pytest.mark.parametrize("kind", ["text", "image"])
-def test_background_settles_saved_original_after_investigation_ended(setup, kind):
+@pytest.mark.parametrize("pending_delay", [None, 30])
+def test_background_settles_saved_original_without_waiting_for_investigation(setup, kind, pending_delay):
     service, admission, calls = setup
     rid = "old-0"
     if kind == "image":
@@ -482,7 +483,7 @@ def test_background_settles_saved_original_after_investigation_ended(setup, kind
     result = {"content": "Recovered original answer"} if kind == "text" else {
         "data": [{"b64_json": "c2F2ZWQtb3JpZ2luYWw="}]}
     patch_row(service, kind, rid, status="succeeded" if kind == "text" else "success",
-              **result, _completion={"state": "needs_attention", "next_at": None,
+              **result, _completion={"state": "needs_attention", "next_at": service.clock()+pending_delay if pending_delay else None,
                                     "reason": "COMPLETION_ORIGINAL_READ_UNAVAILABLE"})
     before = row(service, kind, rid)
     service.text.read = Mock(side_effect=AssertionError("no original HTTP read"))
