@@ -1144,6 +1144,79 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(DownloadBackend.polls, 0)
             self.assertEqual(DownloadBackend.reads, 0)
 
+    def test_downloaded_original_is_private_and_reused_after_confirmation_failure(self):
+        for alteration in ("unchanged", "asset_drift", "corrupt", "confirmation_still_fails"):
+            with self.subTest(alteration=alteration), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", error="",
+                                  result_file_ids=["original-file"], result_sediment_ids=[],
+                                  _image_thread={"protocol": "image-thread-v1"})
+                service = self.make_service(path)
+                service._update_task("owner-1:policy-task", _image_thread={"id": "original-thread"})
+                calls = {"download": 0, "resolve": 0, "confirm": 0}
+                fail_confirmation = [True]
+
+                class Backend:
+                    def __init__(self, **_kwargs): pass
+                    def resolve_conversation_image_urls(self, *_args, **_kwargs):
+                        calls["resolve"] += 1
+                        return ["https://provider.test/original.png"]
+                    def download_image_bytes(self, _urls):
+                        calls["download"] += 1
+                        return [b"original-image-bytes"]
+                    def _get_conversation(self, _conversation_id): return {}
+                    def close(self): pass
+
+                def confirm(*_args, **_kwargs):
+                    calls["confirm"] += 1
+                    if fail_confirmation[0]:
+                        error = RuntimeError("read rate limit")
+                        error.status_code = 429
+                        raise error
+                    return "verified-parent"
+
+                def resume(current):
+                    current._run_resume_poll("owner-1:policy-task", "conversation-1", 60,
+                                             "http://localhost", OWNER, "generate", "gpt-image-2", False, False)
+
+                with (
+                    mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="token"),
+                    mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", Backend),
+                    mock.patch("services.image_task_service.finished_parent", side_effect=confirm),
+                    mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "http://localhost/verified.png"}]}) as publish,
+                ):
+                    resume(service)
+                    self.assertEqual(calls["download"], 1)
+                    publish.assert_not_called()
+                    public = service.list_tasks(OWNER, ["policy-task"])["items"][0]
+                    self.assertFalse(public.get("data"))
+                    self.assertNotIn("_pending_image_output", public)
+                    cached = service._tasks["owner-1:policy-task"]["_pending_image_output"]
+                    with service.store.output_file(cached["output_ref"]) as handle:
+                        self.assertIn(b"b64_json", handle.read())
+                    service = self.make_service(path)
+                    if alteration == "asset_drift":
+                        service._update_task("owner-1:policy-task", result_file_ids=["different-file"])
+                    elif alteration == "corrupt":
+                        with service.store.output_file(cached["output_ref"], append=True) as handle:
+                            handle.write(b"corrupt")
+                    elif alteration == "confirmation_still_fails":
+                        resume(service)
+                        self.assertEqual(calls["download"], 1)
+                        publish.assert_not_called()
+                    fail_confirmation[0] = False
+                    resume(service)
+                    succeeded = service.list_tasks(OWNER, ["policy-task"])["items"][0]
+                    self.assertEqual(succeeded["status"], "success")
+                    self.assertEqual(succeeded["image_session_parent_id"], "verified-parent")
+                    self.assertEqual(calls["download"], 2 if alteration in {"asset_drift", "corrupt"} else 1)
+                    self.assertEqual(calls["resolve"], calls["download"])
+                    self.assertEqual(calls["confirm"], 3 if alteration == "confirmation_still_fails" else 2)
+                    publish.assert_called_once()
+                    self.assertIsNone(service._tasks["owner-1:policy-task"]["_pending_image_output"])
+
     def test_pending_image_ids_survive_restart_without_skipping_settle_or_releasing_capacity(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"

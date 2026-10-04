@@ -5,6 +5,7 @@ from services.image_thread import (PROTOCOL as IMAGE_THREAD_PROTOCOL, ImageThrea
 import json
 import math
 import hashlib
+import os
 import threading
 import time
 import uuid
@@ -2119,6 +2120,50 @@ class ImageTaskService:
                         predecessor_request_message_id=predecessor_message,
                         predecessor_result_ids=predecessor_ids)
                 return backend.get_conversation_parent_message_id(conversation_id)
+            def downloaded_items(backend, files, sediments):
+                # A final conversation read may fail after download. Keep bytes
+                # private until that read succeeds, and reuse them on recovery.
+                import base64
+                from services.durable_forward import MAX_OUTPUT_BYTES
+                nonlocal failure_phase
+                coverage = {"conversation_id": conversation_id, "request_message_id": request_message_id,
+                            "file_ids": list(files), "sediment_ids": list(sediments)}
+                cached = (task or {}).get("_pending_image_output") or {}
+                if isinstance(cached, dict) and cached.get("coverage") == coverage:
+                    try:
+                        with self.store.output_file(cached["output_ref"]) as handle:
+                            encoded = handle.read(MAX_OUTPUT_BYTES + 1)
+                        if len(encoded) > MAX_OUTPUT_BYTES:
+                            raise ValueError("private image output limit")
+                        items = json.loads(encoded)
+                        if not isinstance(items, list) or not items:
+                            raise ValueError("private image output empty")
+                        for item in items:
+                            if not isinstance(item, dict) or set(item) != {"b64_json"} or not base64.b64decode(item["b64_json"], validate=True):
+                                raise ValueError("invalid private image output")
+                        return items
+                    except (OSError, ValueError, KeyError, TypeError):
+                        pass  # Missing/corrupt private cache: fetch the same assets.
+                failure_phase = "resolve_image_result"
+                image_urls = backend.resolve_conversation_image_urls(
+                    conversation_id, files, sediments, poll=False, request_message_id=request_message_id)
+                if not image_urls:
+                    raise RuntimeError("generated image URL could not be resolved")
+                failure_phase = "download_image_result"
+                downloaded = backend.download_image_bytes(image_urls)
+                if not downloaded:
+                    raise RuntimeError("generated image could not be downloaded")
+                items = [{"b64_json": base64.b64encode(value).decode("ascii")} for value in downloaded]
+                encoded = json.dumps(items).encode()
+                if len(encoded) > MAX_OUTPUT_BYTES:
+                    raise ValueError("private image output limit")
+                ref = self.store.create_output()
+                with self.store.output_file(ref, append=True) as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                self._update_task(key, _pending_image_output={"output_ref": ref, "coverage": coverage})
+                return items
             if not binding_id or not account_identity or not client_conversation_id:
                 error = RuntimeError("conversation binding unavailable: task authority missing")
                 error.status_code = 403
@@ -2139,24 +2184,7 @@ class ImageTaskService:
                 backend.progress_callback.record_pending_result_ids = record_pending_ids
                 if persisted_file_ids or persisted_sediment_ids:
                     self._update_task(key, progress="receiving_image", recovery_phase="download_image_result")
-                    failure_phase = "resolve_image_result"
-                    image_urls = backend.resolve_conversation_image_urls(
-                        conversation_id,
-                        persisted_file_ids,
-                        persisted_sediment_ids,
-                        poll=False,
-                        request_message_id=request_message_id,
-                    )
-                    if not image_urls:
-                        raise RuntimeError("generated image URL could not be resolved")
-                    failure_phase = "download_image_result"
-                    downloaded = backend.download_image_bytes(image_urls)
-                    if not downloaded:
-                        raise RuntimeError("generated image could not be downloaded")
-                    image_items = [
-                        {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
-                        for image_data in downloaded
-                    ]
+                    image_items = downloaded_items(backend, persisted_file_ids, persisted_sediment_ids)
                     failure_phase = "confirm_image_turn"
                     parent_message_id = recovered_parent(backend, persisted_file_ids, persisted_sediment_ids)
                     failure_phase = "save_image_result"
@@ -2171,6 +2199,7 @@ class ImageTaskService:
                         key,
                         status=TASK_STATUS_SUCCESS,
                         _pending_image_result_ids=None,
+                        _pending_image_output=None,
                         data=data,
                         error="",
                         error_code="",
@@ -2347,19 +2376,7 @@ class ImageTaskService:
                     recovery_phase="download_image_result",
                 )
 
-                failure_phase = "resolve_image_result"
-                image_urls = backend.resolve_conversation_image_urls(
-                    conversation_id, file_ids, sediment_ids, poll=False,
-                    request_message_id=request_message_id,
-                )
-                if not image_urls:
-                    raise RuntimeError("图片 URL 解析失败")
-
-                failure_phase = "download_image_result"
-                image_items = [
-                    {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
-                    for image_data in backend.download_image_bytes(image_urls)
-                ]
+                image_items = downloaded_items(backend, file_ids, sediment_ids)
                 failure_phase = "confirm_image_turn"
                 parent_message_id = recovered_parent(backend, file_ids, sediment_ids)
             failure_phase = "save_image_result"
@@ -2374,6 +2391,7 @@ class ImageTaskService:
                 key,
                 status=TASK_STATUS_SUCCESS,
                 _pending_image_result_ids=None,
+                _pending_image_output=None,
                 data=data,
                 error="",
                 error_code="",
