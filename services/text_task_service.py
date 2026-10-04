@@ -1080,7 +1080,22 @@ class TextTaskService:
         if not row:
             return {"request_id": request_id, "status": "not_found"}
         if recovery_claim:
+            # Account pacing and a slow original response can outlive the
+            # initial lease. Keep that same claim alive so an ordinary client
+            # read cannot start a duplicate GET while the background read runs.
+            recovery_done = threading.Event()
+            def keep_recovery_claim():
+                while not recovery_done.wait(max(0.01, self.RECOVERY_LEASE_SECONDS / 3)):
+                    try:
+                        self._update_recovery_claim(owner, recovery_claim[1],
+                                                    recovery_lease_until=self._now() + self.RECOVERY_LEASE_SECONDS)
+                    except Exception:
+                        return
+            lease_thread = threading.Thread(target=keep_recovery_claim, name="original-read-lease", daemon=True)
+            lease_started = False
             try:
+                lease_thread.start()
+                lease_started = True
                 from services import durable_image_forward
                 if durable_image_forward.supported(recovery_claim[1]):
                     recovered = durable_image_forward.recover(self, owner, recovery_claim[1])
@@ -1134,6 +1149,10 @@ class TextTaskService:
                     retry_after_seconds=retry_after_seconds,
                     recovery_reason=None, count_unrecoverable=allow_unrecoverable_retry,
                 )
+            finally:
+                recovery_done.set()
+                if lease_started:
+                    lease_thread.join(timeout=1)
             return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result
         result = self._public(json.loads(row[0]))
         return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result

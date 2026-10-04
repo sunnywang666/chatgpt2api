@@ -310,6 +310,11 @@ class PoolAdmission:
         self.handlers = {}
         self.recoveries = {}
         self._recovery_thread = None
+        # A local I/O bound, not an upstream concurrency or rate limit. Waiting
+        # originals stay in the existing store, never in an executor queue.
+        self._original_read_slots = threading.BoundedSemaphore(4)
+        self._original_read_lock = threading.Lock()
+        self._original_reads = set()
         self._event = threading.Event()
         self._stop = threading.Event()
         self._thread = None
@@ -344,7 +349,8 @@ class PoolAdmission:
                         break
                     threading.Thread(target=self.execute, args=(claim,), name="original-task-execute", daemon=True).start()
                 if self._recovery_thread is None or not self._recovery_thread.is_alive():
-                    self._recovery_thread = threading.Thread(target=self.recover_one, name="original-result-read", daemon=True)
+                    self._recovery_thread = threading.Thread(target=self.recover_one, kwargs={"background": True},
+                                                             name="original-result-read", daemon=True)
                     self._recovery_thread.start()
             except Exception:
                 # Invalid snapshots/storage are not permission to bypass
@@ -355,11 +361,80 @@ class PoolAdmission:
             # client retry. Timed waits never occupy execution workers.
             self._event.wait(1.0)
 
-    def recover_one(self):
+    def _dispatch_original_read(self, kind, owner, request_id, function, receipt):
+        if self._stop.is_set():
+            return False
+        # Do not fill the local workers with known pacing waits. The transport
+        # still checks the same persisted clock immediately before its GET.
+        with self._account_guard():
+            account = next((a for a in self._rows()
+                            if a.get("provider_account_identity") == receipt.get("provider_account_identity")), None)
+        if account is not None:
+            if account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
+                return False
+            now = float(self.clock())
+            if self.pacing:
+                pacing = self.pacing(account, now)
+            else:
+                from services.account_request_pacing import account_pacing_snapshot
+                pacing = account_pacing_snapshot(account, now, include_turn=False, include_conversation_read=True)
+            if pacing.get("next_at") is None or pacing["next_at"] > now:
+                return False
+        key = physical_conversation_key(receipt)
+        if key is None:
+            account_key = receipt.get("provider_account_identity") or receipt.get("provider_binding_id")
+            client_conversation = receipt.get("client_conversation_id")
+            key = ((account_key, client_conversation) if account_key and client_conversation
+                   else (kind, owner, request_id))
+        with self._original_read_lock:
+            if key in self._original_reads or not self._original_read_slots.acquire(blocking=False):
+                return False
+            self._original_reads.add(key)
+
+        def run():
+            try:
+                function(owner, request_id)
+            except Exception:
+                pass  # The original handler persists the bounded failure.
+            finally:
+                with self._original_read_lock:
+                    self._original_reads.discard(key)
+                    self._original_read_slots.release()
+                self.wake()
+        try:
+            threading.Thread(target=run, name="original-result-io", daemon=True).start()
+        except Exception:
+            with self._original_read_lock:
+                self._original_reads.discard(key)
+                self._original_read_slots.release()
+            raise
+        return True
+
+    def recover_one(self, *, background=False):
         now = float(self.clock())
+        image_dispatched = False
+        def dispatch(kind, owner, request_id, function, receipt):
+            nonlocal image_dispatched
+            # Image recovery owns a separate asynchronous worker. Preserve its
+            # existing one-dispatch-per-scan cadence; the local read permit only
+            # bounds synchronous text I/O, not that image worker's lifetime.
+            if kind == "image" and image_dispatched:
+                return False
+            started = self._dispatch_original_read(kind, owner, request_id, function, receipt)
+            if started and kind == "image":
+                image_dispatched = True
+            return started
+        lifecycle = getattr(self, "work_lifecycle", None)
+        if background and lifecycle is not None:
+            # Its existing bounded, per-account workers must get a chance even
+            # while there is a continuous backlog of original result reads.
+            lifecycle.process_one(background=True)
         completion = getattr(self, "generation_completion", None)
         if completion is not None:
-            completion.process_one()
+            if background:
+                completion.process_one(dispatch=dispatch)
+            else:
+                completion.process_one()
         with self.store.connect() as db:
             rows = list(self.store.receipts(db, statuses=("unknown", "failed", "error")))
         # Use the existing persisted retry timestamps. A short-backoff legacy
@@ -383,13 +458,15 @@ class PoolAdmission:
             else:
                 due = image_original_recovery_pending(r) and float(r.get("next_poll_at") or 0) <= now
             if due:
+                if background:
+                    dispatch(kind, owner, request_id, self.recoveries[kind], r)
+                    continue
                 try:
                     self.recoveries[kind](owner, request_id)
                 except Exception:
                     pass  # Original read handlers retain bounded retry evidence.
                 return
-        lifecycle = getattr(self, "work_lifecycle", None)
-        if lifecycle is not None:
+        if not background and lifecycle is not None:
             lifecycle.process_one(background=True)
 
     def run_recovery(self, context, function, args):

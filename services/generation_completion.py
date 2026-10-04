@@ -570,7 +570,7 @@ class GenerationCompletionService:
             else:
                 self.images._submit(body["identity"], client_task_id=replacement_id, mode=body["mode"], payload=body["payload"])
 
-    def process_one(self):
+    def process_one(self, *, dispatch=None):
         # Only newly accepted pure-generation requests opt into the automatic
         # policy. Upgrading never silently replays historical UNKNOWN receipts.
         with self.store.transaction() as db:
@@ -595,14 +595,18 @@ class GenerationCompletionService:
                     if state.get("selected_id"):
                         self.store.write_receipt(db, kind, owner, rid, row)
         with self.store.connect() as db:
-            candidates = [(kind, owner, rid) for kind, owner, rid, row in self.store.receipts(
+            candidates = [(kind, owner, rid, row) for kind, owner, rid, row in self.store.receipts(
                               db, statuses=(), include_pending_completion=True)
                           if row.get("_completion", {}).get("state") not in {None, "completed", "result_ready"}
                           and not row.get("_recovery_paused") and not row.get("_recovery_suppressed")
                           and row.get("_completion", {}).get("next_at") is not None
                           and float(row["_completion"].get("next_at") or 0) <= float(self.clock())]
         if candidates:
-            self.advance(*candidates[0])
+            if dispatch is None:
+                self.advance(*candidates[0][:3])
+            else:
+                for kind, owner, rid, row in candidates:
+                    dispatch(kind, owner, rid, lambda o, r, k=kind: self.advance(k, o, r), row)
 
     def read(self, kind, identity, request_id):
         owner = str(identity["id"])
