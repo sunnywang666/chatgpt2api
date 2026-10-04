@@ -327,6 +327,22 @@ class AccountRequestClock:
         elif "/conversation/" in path and "/attachment/" not in path and str(method).upper() == "GET":
             phase = "conversation_read"
         is_conversation_read = phase == "conversation_read"
+        # Only the three read-only account observations used by get_user_info
+        # may receive outside the pacing lock. Other account_read operations
+        # include writes and authentication; the phase alone is not sufficient.
+        metadata_kind = {
+            ("GET", "/backend-api/me"): "account_profile",
+            ("GET", "/backend-api/accounts/check/v4-2023-04-27"): "account_subscription",
+        }.get((str(method).upper(), path))
+        body = kwargs.get("json")
+        if (str(method).upper() == "POST" and path == "/backend-api/conversation/init"
+                and isinstance(body, dict)
+                and set(body) == {"gizmo_id", "requested_default_model", "conversation_id", "timezone_offset_min"}
+                and all(body[k] is None for k in ("gizmo_id", "requested_default_model", "conversation_id"))
+                and isinstance(body["timezone_offset_min"], (int, float))
+                and not isinstance(body["timezone_offset_min"], bool)):
+            metadata_kind = "account_limits"
+        concurrent_io = is_conversation_read or metadata_kind is not None
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
@@ -349,7 +365,7 @@ class AccountRequestClock:
             # messages: conversation URLs and signed downloads can contain secrets.
             started_at, started = time.time(), time.monotonic()
             endpoint = urlparse(str(send_url)).path.rstrip("/")
-            endpoint_kind = send_phase
+            endpoint_kind = metadata_kind or send_phase
             if "/attachment/" in endpoint:
                 endpoint_kind = "attachment"
             elif "/files/" in endpoint or endpoint.endswith("/files"):
@@ -411,7 +427,7 @@ class AccountRequestClock:
                 try:
                     now = time.monotonic()
                     read_delay = max(self.next_request, self.cooldown_until,
-                                     self.next_conversation_read) - now
+                                     self.next_conversation_read if is_conversation_read else 0) - now
                     if is_conversation_read and read_owner:
                         if not self._reserve_archive_read(read_owner, now):
                             other = self.archive_read_until if self.archive_read_until > now else 0.0
@@ -429,9 +445,9 @@ class AccountRequestClock:
                 except BaseException:
                     self.lock.release()
                     raise
-                if not is_conversation_read or read_delay <= 0:
+                if not concurrent_io or read_delay <= 0:
                     break
-                # Waiting for a read must not occupy the shared send-edge lock
+                # Waiting for a safe read must not occupy the shared send-edge lock
                 # and delay a generation POST that is otherwise ready. Reload
                 # all deadlines under the cross-process lock after waking.
                 self.lock.release()
@@ -524,11 +540,11 @@ class AccountRequestClock:
                     context.record_stage("send_call_started")
                 sent_at = time.monotonic()
                 try:
-                    if is_conversation_read:
+                    if concurrent_io:
                         # Keep the durable clock through the local transport-call
                         # edge, not through the network response. Other original
                         # conversations may read once their own start floor is due.
-                        # The caller still joins this one timeout-limited GET;
+                        # The caller still joins this one timeout-limited request;
                         # no retry, detached task or new scheduling queue is added.
                         entered = threading.Event()
                         outcome = {}
@@ -548,7 +564,7 @@ class AccountRequestClock:
                                 entered.set()
                         worker_context = copy_context()
                         worker = threading.Thread(target=worker_context.run, args=(read_io,),
-                                                  name="original-conversation-read")
+                                                  name="account-metadata-read" if metadata_kind else "original-conversation-read")
                         worker.start()
                         reservation_error = None
                         floor_durable = False
@@ -558,7 +574,8 @@ class AccountRequestClock:
                                 raise outcome["error"]
                             sent_at = outcome["started_at"]
                             self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
-                            self.next_conversation_read = max(self.next_conversation_read, sent_at + read_interval)
+                            if is_conversation_read:
+                                self.next_conversation_read = max(self.next_conversation_read, sent_at + read_interval)
                             self._save()
                             floor_durable = True
                         except BaseException as exc:
@@ -611,7 +628,7 @@ class AccountRequestClock:
                     self.limited(retry_after_seconds(response_headers.get("Retry-After")),
                                  retry_after_present="Retry-After" in response_headers,
                                  evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id})
-                if is_conversation_read and reservation_error is not None:
+                if concurrent_io and reservation_error is not None:
                     response.close()
                     raise reservation_error
                 if context is not None and is_turn and hasattr(context, "record_stage"):

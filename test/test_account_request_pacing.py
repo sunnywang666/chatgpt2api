@@ -48,6 +48,54 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_account_metadata_does_not_block_original_result_delivery(self):
+        init_body = {"gizmo_id": None, "requested_default_model": None,
+                     "conversation_id": None, "timezone_offset_min": -480}
+        for method, path, body in (
+            ("GET", "/backend-api/me", None),
+            ("POST", "/backend-api/conversation/init", init_body),
+            ("GET", "/backend-api/accounts/check/v4-2023-04-27", None),
+        ):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                 patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+                state = Path(tmp) / "clock.json"
+                entered, release, delivered = threading.Event(), threading.Event(), threading.Event()
+                errors, sent = [], []
+                def send(verb, url, **kwargs):
+                    sent.append((verb, url))
+                    if url.endswith(path):
+                        entered.set()
+                        if not release.wait(3):
+                            raise TimeoutError("test metadata was not released")
+                    return Response()
+                def metadata():
+                    try:
+                        AccountRequestClock("account", state).request(send, method, "https://provider" + path, json=body)
+                    except BaseException as exc:
+                        errors.append(exc)
+                def read():
+                    try:
+                        AccountRequestClock("account", state).request(send, "GET", "https://provider/conversation/original")
+                        delivered.set()
+                    except BaseException as exc:
+                        errors.append(exc)
+                worker, reader = threading.Thread(target=metadata), threading.Thread(target=read)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    reader.start()
+                    self.assertTrue(delivered.wait(1), "slow account metadata blocked original result delivery")
+                    self.assertTrue(worker.is_alive())
+                finally:
+                    release.set()
+                    worker.join(4)
+                    if reader.ident is not None:
+                        reader.join(4)
+                self.assertFalse(worker.is_alive() or reader.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(sent), 2, "metadata or original result was replayed")
+
     def test_waiting_fifo_reader_rechecks_at_fractional_http_pace(self):
         for http_interval, expected_wait in ((.1, .1), (.5, .5), (5, 1)):
             with self.subTest(http_interval=http_interval):
@@ -72,6 +120,143 @@ class AccountRequestPacingTests(unittest.TestCase):
                 self.assertEqual(sleeps, [expected_wait])
                 self.assertEqual(sent, [10000 + expected_wait])
                 self.assertEqual(clock.ordinary_read_queue, [])
+
+    def test_metadata_preserves_read_queue_and_persisted_http_floor(self):
+        now = [10000.0]
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 2)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)):
+            path = Path(tmp) / "clock.json"
+            clock = AccountRequestClock("account", path)
+            clock.next_conversation_read = 10300
+            clock.ordinary_read_queue = [{"owner": "waiting-original", "until": 10300}]
+            clock.archive_read_owner, clock.archive_read_until = "archive", 10200
+            clock._save()
+            def sleep(seconds):
+                # Another clock instance can inspect/admit work during pacing;
+                # only the network-start reservation needs the process lock.
+                other = AccountRequestClock("account", path)
+                self.assertTrue(other.lock.acquire(blocking=False))
+                other.lock.release()
+                now[0] += seconds
+            with patch("services.account_request_pacing.time.sleep", side_effect=sleep):
+                for endpoint in ("me", "accounts/check/v4-2023-04-27"):
+                    AccountRequestClock("account", path).request(
+                        lambda *a, **kw: sent.append(now[0]) or Response(),
+                        "GET", "https://provider/backend-api/" + endpoint)
+            self.assertEqual(sent, [10000, 10002])
+            restored = AccountRequestClock("account", path)
+            self.assertAlmostEqual(restored.next_request, 10004, delta=1e-6)
+            self.assertEqual(restored.next_conversation_read, 10300)
+            self.assertEqual(restored.ordinary_read_queue, [{"owner": "waiting-original", "until": 10300}])
+            self.assertEqual(restored.archive_read_owner, "archive")
+            self.assertEqual(restored.archive_read_until, 10200)
+
+    def test_late_metadata_or_result_does_not_erase_concurrent_429(self):
+        for slow_path, limited_path, scope in (
+            ("/backend-api/me", "/conversation/original", "conversation_read"),
+            ("/conversation/original", "/backend-api/me", "account"),
+            ("/backend-api/accounts/check/v4-2023-04-27", "/backend-api/me", "account"),
+        ):
+            with self.subTest(slow_path=slow_path, limited_path=limited_path), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                 patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+                path = Path(tmp) / "clock.json"
+                entered, release = threading.Event(), threading.Event()
+                errors = []
+                def send(method, url, **kwargs):
+                    response = Response()
+                    if url.endswith(slow_path):
+                        entered.set()
+                        if not release.wait(3):
+                            raise TimeoutError("concurrent account request remained serialized")
+                    else:
+                        response.status_code = 429
+                        response.headers = {}
+                    return response
+                def slow():
+                    try:
+                        AccountRequestClock("account", path).request(send, "GET", "https://provider" + slow_path)
+                    except BaseException as exc:
+                        errors.append(exc)
+                worker = threading.Thread(target=slow)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    AccountRequestClock("account", path).request(send, "GET", "https://provider" + limited_path)
+                    before = json.loads(path.read_text())
+                finally:
+                    release.set()
+                    worker.join(4)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                after = json.loads(path.read_text())
+                self.assertEqual(after["last_rate_limit_evidence"]["scope"], scope)
+                for field in ("rate_failures", "conversation_read_rate_failures", "last_rate_limit_evidence"):
+                    self.assertEqual(after[field], before[field])
+                for field in ("cooldown_until", "next_conversation_read"):
+                    self.assertGreaterEqual(after[field], before[field] - .001)
+
+    def test_non_metadata_init_or_write_retains_send_fence(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        for endpoint, body in (
+            ("/backend-api/conversation/init", {"conversation_id": "existing"}),
+            ("/backend-api/conversation/init", {"gizmo_id": None, "requested_default_model": None,
+                                              "conversation_id": None, "timezone_offset_min": -480,
+                                              "prompt": "an actual operation"}),
+            ("/backend-api/files", {}),
+        ):
+            with self.subTest(endpoint=endpoint, body=body), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                 patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+                path = Path(tmp) / "clock.json"
+                entered, release = threading.Event(), threading.Event()
+                errors, sent = [], []
+                def send(method, url, **kwargs):
+                    sent.append(method)
+                    entered.set()
+                    if not release.wait(3):
+                        raise TimeoutError("test write was not released")
+                    return Response()
+                def write():
+                    try:
+                        AccountRequestClock("account", path).request(send, "POST", "https://provider" + endpoint, json=body)
+                    except BaseException as exc:
+                        errors.append(exc)
+                read_errors, deadline_set = [], threading.Event()
+                deadline = [0.0]
+                def read():
+                    try:
+                        deadline[0] = time.monotonic() + .05
+                        deadline_set.set()
+                        AccountRequestClock("account", path).request(send, "GET", "https://provider/conversation/original",
+                            _account_request_deadline_monotonic=deadline[0])
+                    except BaseException as exc:
+                        read_errors.append(exc)
+                worker, reader = threading.Thread(target=write), threading.Thread(target=read)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    reader.start()
+                    self.assertTrue(deadline_set.wait(1))
+                    # Deadline cleanup can wait for the write's lock. Keep the
+                    # lock owner controlled here, rather than waiting for the
+                    # reader to finish before releasing that same owner.
+                    time.sleep(max(0, deadline[0] - time.monotonic()) + .05)
+                    self.assertEqual(sent, ["POST"])
+                finally:
+                    release.set()
+                    worker.join(4)
+                    if reader.ident is not None:
+                        reader.join(4)
+                self.assertFalse(worker.is_alive() or reader.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(read_errors), 1)
+                self.assertIsInstance(read_errors[0], AccountRequestDeadlineExceeded)
+                self.assertEqual(sent, ["POST"])
 
     def test_fractional_http_floor_preserves_model_floor_and_retry_after(self):
         now = [10000.0]
