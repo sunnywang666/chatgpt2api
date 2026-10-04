@@ -21,6 +21,22 @@ STREAM_SECONDS = 30
 CHECK_SECONDS = 1
 
 
+def _retrying_unsent(receipt):
+    # The handler can persist an error before PoolAdmission.execute's finally
+    # returns this same unsent request to the queue. Only that live claim's
+    # narrow retry window is nonterminal; no model send or recovery starts here.
+    claim_until = receipt.get("_claim_until")
+    return bool(receipt.get("status") in {"error", "failed", "unknown"}
+                and receipt.get("error_code") in {"CONVERSATION_OUTCOME_UNKNOWN",
+                    "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}
+                and receipt.get("_submission_started") is False
+                and receipt.get("_executing") is True and receipt.get("_claim_id")
+                and isinstance(claim_until, (int, float)) and claim_until > time.time()
+                and not receipt.get("_attempt_finished_at")
+                and receipt.get("_recovery_paused") is not True
+                and receipt.get("_recovery_suppressed") is not True)
+
+
 def _snapshot(kind, service, identity, request_id):
     with service.store.connect() as db:
         receipt = service.store.read_receipt(db, kind, str(identity["id"]), request_id)
@@ -42,6 +58,7 @@ def _snapshot(kind, service, identity, request_id):
         status = "unknown"
     return {"protocol": "task-notification-v1", "kind": kind, "request_id": request_id,
             "status": status, "result_ready": ready, "result_count": result_count,
+            "retrying_unsent": _retrying_unsent(receipt),
             "recovering_original": kind == "image" and image_original_recovery_pending(receipt)}
 
 
@@ -71,7 +88,7 @@ def create_router(kind, get_service):
                 if state["result_ready"]:
                     return
                 if (state["status"] in {"failed", "error", "unknown", "success", "succeeded"}
-                        and not state["recovering_original"]):
+                        and not state["recovering_original"] and not state["retrying_unsent"]):
                     # Includes a malformed/empty success: never announce ready.
                     yield _event("needs_attention", state)
                     return

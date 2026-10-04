@@ -161,3 +161,47 @@ def test_stopped_or_ineligible_original_recovery_still_needs_attention(runtime, 
     response = client.get('/api/image-tasks/original/events')
     assert 'event: needs_attention' in response.text
     assert 'event: result_ready' not in response.text
+
+
+@pytest.mark.parametrize("kind,status,code", [("image", "error", "IMAGE_RESOURCE_UNAVAILABLE"),
+    ("text", "failed", "CONVERSATION_BINDING_UNAVAILABLE"),
+    ("text", "unknown", "CONVERSATION_OUTCOME_UNKNOWN")])
+def test_claimed_unsent_resource_failure_waits_for_original_requeue(runtime, monkeypatch, kind, status, code):
+    client, put, identity, _ = runtime
+    put(kind=kind, status=status, error_code=code,
+        _submission_started=False, _executing=True, _claim_id="original-claim",
+        _claim_until=9999999999)
+    calls = 0
+    def authenticate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            put(kind=kind, status="queued", _submission_started=False)
+        elif calls == 3:
+            put(kind=kind, **({"status": "success", "data": [{"url": "private"}]}
+                             if kind == "image" else {"status": "succeeded", "content": "private"}))
+        return identity.copy()
+    monkeypatch.setattr(events, "require_identity", authenticate)
+    prefix = "image-tasks" if kind == "image" else "chat-requests"
+    response = client.get("/api/" + prefix + "/original/events")
+    assert "event: needs_attention" not in response.text
+    assert '"retrying_unsent":true' in response.text
+    assert "event: result_ready" in response.text
+    assert "original-claim" not in response.text and "private" not in response.text
+
+
+@pytest.mark.parametrize("extra", [
+    {"_submission_started": True}, {"_executing": False}, {"_claim_id": None},
+    {"_claim_until": 1}, {"_recovery_paused": True}, {"_recovery_suppressed": True},
+    {"_attempt_finished_at": 1}, {"_submission_started": None},
+    {"error_code": "TASK_INPUT_UNAVAILABLE"},
+])
+def test_unsent_wait_never_hides_finished_or_paused_failure(runtime, extra):
+    client, put, _, _ = runtime
+    fields = {"status": "error", "error_code": "CONVERSATION_BINDING_UNAVAILABLE",
+              "_submission_started": False, "_executing": True,
+              "_claim_id": "claim", "_claim_until": 9999999999, **extra}
+    put(**fields)
+    response = client.get("/api/image-tasks/original/events")
+    assert "event: needs_attention" in response.text
+    assert "event: result_ready" not in response.text
