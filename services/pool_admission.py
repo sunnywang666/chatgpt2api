@@ -536,6 +536,7 @@ class PoolAdmission:
         for kind, owner, request_id, r in receipts:
             if kind == "image":
                 image_receipts.setdefault(owner, {})[request_id] = r
+        ordered_receipts = [row for row in receipts if (row[1], row[2]) not in released_order_heads]
         for kind, owner, request_id, r in receipts:
             status = r.get("status")
             pending = unfinished(kind, r)
@@ -600,7 +601,7 @@ class PoolAdmission:
                 thread_resources.append(Resource(dependency, int(enabled), 0, now))
                 thread_needs += (Need(dependency),)
             scheduling_resources, scheduling_needs, scheduling_ready = workflow_scheduling.constraints(
-                r, works, workflow_clocks, [row for row in receipts if (row[1], row[2]) not in released_order_heads], now)
+                r, works, workflow_clocks, ordered_receipts, now)
             thread_resources.extend(scheduling_resources)
             physical_needs = ()
             physical = physical_conversation_key(r)
@@ -947,7 +948,7 @@ class PoolAdmission:
         if not callable(refresh) or float(self.clock()) < self._next_image_probe:
             return
         with self.store.connect() as db:
-            waiting = [r for kind, _, _, r in self.store.receipts(db)
+            waiting = [r for kind, _, _, r in self.store.receipts(db, statuses=("queued",))
                        if (kind == "image" or r.get("_operation") == "image")
                        and r.get("status") == "queued" and not r.get("_submission_started")]
         if not waiting:
@@ -992,7 +993,7 @@ class PoolAdmission:
         # (including after a completion child has finished) and starve archive
         # reads on the same account's paced HTTP clock.
         with self.store.connect() as db:
-            models = {str(r.get("model") or "auto") for kind, _, _, r in self.store.receipts(db)
+            models = {str(r.get("model") or "auto") for kind, _, _, r in self.store.receipts(db, statuses=("queued", "running", "not_started"))
                       if kind == "text" and unfinished(kind, r) and not unknown_text_result(r)
                       and r.get("_route", "chat") == "chat"}
         types = {}
@@ -1003,7 +1004,7 @@ class PoolAdmission:
                 types[model] = set()
         if self.codex is not None:
             with self.store.connect() as db:
-                native_models = {r.get("model") for _, _, _, r in self.store.receipts(db)
+                native_models = {r.get("model") for _, _, _, r in self.store.receipts(db, statuses=("queued",))
                                  if r.get("status") == "queued" and r.get("_route") == "codex"}
             # Reuse the existing bounded metadata refresh, outside the claim
             # transaction. This never sends a model request.

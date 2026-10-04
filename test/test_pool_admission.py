@@ -747,6 +747,38 @@ class AdmissionTests(unittest.TestCase):
         self.write_accounts(2)
         self.assertIsNone(self.admission.claim_next())
 
+    def test_catalog_prefilter_retains_live_text_but_planner_keeps_saved_image_data(self):
+        expected_models = set()
+        for status in ("queued", "running", "not_started"):
+            self.submit("catalog-" + status)
+            with self.store.transaction() as db:
+                receipt = self.store.read_receipt(db, "text", "happy", "catalog-" + status)
+                receipt.update(status=status, model="catalog-" + status)
+                self.store.write_receipt(db, "text", "happy", "catalog-" + status, receipt)
+            expected_models.add("catalog-" + status)
+        self.image("saved-catalog-image")
+        data = [{"b64_json": "saved-source-preserved" * 1000}]
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "image", "happy", "saved-catalog-image")
+            receipt.update(status="success", data=data, upstream_unfinished=False)
+            self.store.write_receipt(db, "image", "happy", "saved-catalog-image", receipt)
+        catalog_calls, reads = [], []
+        self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
+        original = self.store.receipts
+        def observed(db, **kwargs):
+            rows = list(original(db, **kwargs))
+            reads.append((kwargs, rows))
+            return iter(rows)
+        with patch.object(self.store, "receipts", side_effect=observed):
+            self.admission.claim_next()
+        self.assertTrue(expected_models <= set(catalog_calls))
+        filtered = [rows for args, rows in reads if args.get("statuses") == ("queued", "running", "not_started")]
+        self.assertEqual(len(filtered), 1)
+        self.assertNotIn("saved-catalog-image", [rid for _, _, rid, _ in filtered[0]])
+        complete = [r for args, rows in reads if not args for _, _, rid, r in rows if rid == "saved-catalog-image"]
+        self.assertTrue(complete)
+        self.assertTrue(all(r["data"] == data for r in complete))
+
     def test_unknown_originals_do_not_probe_catalog_but_keep_order_fence(self):
         from services.pool_admission import unfinished
         catalog_calls = []
