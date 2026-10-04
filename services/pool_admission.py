@@ -357,7 +357,7 @@ class PoolAdmission:
                 return
         lifecycle = getattr(self, "work_lifecycle", None)
         if lifecycle is not None:
-            lifecycle.process_one()
+            lifecycle.process_one(background=True)
 
     def run_recovery(self, context, function, args):
         done = threading.Event()

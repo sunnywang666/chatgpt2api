@@ -1,5 +1,6 @@
 import json
 import hashlib
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -54,6 +55,138 @@ def test_completion_persists_original_archive_intent_and_releases_only_its_work(
     with store.connect() as db:
         assert store.read_receipt(db, "text", "one", "A-1") == a
     assert not service.process_one()
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_waiting_archive_does_not_block_another_account_or_overlap_same_account(runtime, background):
+    service, store, _, _, _, add = runtime
+    keys = {}
+    for rid, account in (("A-1", "account-a"), ("A2-2", "account-a"), ("B-3", "account-b")):
+        receipt = add(rid)
+        with store.transaction() as db:
+            receipt["provider_account_identity"] = account
+            store.write_receipt(db, "text", "one", rid, receipt)
+        keys[rid] = receipt["_work_key"]
+        service.update("text", {"id": "one"}, rid, "completed", True)
+    entered, release = threading.Event(), threading.Event()
+    finished = threading.Event()
+    def wake():
+        if service.get("text", {"id": "one"}, "A-1")["archive"]["status"] == "confirmed":
+            finished.set()
+    service.text.admission = SimpleNamespace(wake=wake)
+    calls = []
+    def archive(owner, rid, desired):
+        calls.append(rid)
+        if rid == "A-1":
+            entered.set()
+            assert release.wait(3)
+        return {"request_id": rid, "archived": desired,
+                "conversation": {"client_conversation_id": rid.split("-")[0]}}
+    service.text.set_public_session_archived = archive
+    first = threading.Thread(target=lambda: service.process_one(target_key=keys["A-1"], background=background))
+    first.start()
+    try:
+        assert entered.wait(1)
+        assert not service.process_one(target_key=keys["A2-2"])
+        assert service.process_one(target_key=keys["B-3"])
+        assert calls == ["A-1", "B-3"]
+        assert service.get("text", {"id": "one"}, "B-3")["archive"]["status"] == "confirmed"
+    finally:
+        release.set()
+        first.join(3)
+        assert finished.wait(2)
+    assert not first.is_alive()
+    assert service.process_one(target_key=keys["A2-2"])
+
+
+def test_background_archive_does_not_occupy_original_result_recovery(runtime):
+    from services.pool_admission import PoolAdmission
+    from services.request_context import current_archive_guard, current_archive_read_owner
+    service, store, now, calls, _, add = runtime
+    add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    service.text.admission = SimpleNamespace(wake=finished.set)
+    def archive(owner, rid, desired):
+        assert callable(current_archive_guard.get()) and current_archive_read_owner.get()
+        current_archive_guard.get()()
+        entered.set()
+        assert release.wait(3)
+        calls.append(rid)
+        return {"request_id": rid, "archived": desired, "conversation": {"client_conversation_id": "A"}}
+    service.text.set_public_session_archived = archive
+    admission = SimpleNamespace(store=store, clock=lambda: now[0], recoveries={}, work_lifecycle=service)
+    try:
+        PoolAdmission.recover_one(admission)
+        assert entered.wait(1) and not finished.is_set()
+        # The recovery loop already returned while its original archive waits.
+        assert service.get("text", {"id": "one"}, "A-1")["archive"]["status"] == "running"
+        assert not service.process_one()
+    finally:
+        release.set()
+        assert finished.wait(2)
+    assert calls == ["A-1"]
+    assert service.get("text", {"id": "one"}, "A-1")["archive"]["status"] == "confirmed"
+
+
+@pytest.mark.parametrize("previous_error", [None, "UPSTREAM_READ_FAILED"])
+def test_background_archive_start_failure_releases_original_claim(runtime, monkeypatch, previous_error):
+    service, store, now, calls, _, add = runtime
+    receipt = add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    if previous_error:
+        with store.transaction() as db:
+            work = store.runtime(db, receipt["_work_key"])
+            work["archive"].update(status="unknown", error_code=previous_error)
+            store.set_runtime(db, work["key"], work)
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", lambda _: (_ for _ in ()).throw(RuntimeError("worker start failed")))
+        with pytest.raises(RuntimeError, match="worker start failed"):
+            service.process_one(background=True)
+    with store.connect() as db:
+        archive = store.runtime(db, receipt["_work_key"])["archive"]
+    assert archive["status"] == "pending" and archive["claim"] is None and archive["claim_until"] is None
+    assert archive["error_code"] == (previous_error or "WORK_ARCHIVE_DISPATCH_FAILED") and calls == []
+    now[0] += 1
+    assert service.process_one()
+    assert service.get("text", {"id": "one"}, "A-1")["archive"]["status"] == "confirmed"
+
+
+def test_archive_workers_are_bounded_and_release_capacity(runtime):
+    service, store, _, _, _, add = runtime
+    release = threading.Event()
+    entered = [threading.Event() for _ in range(4)]
+    finished = threading.Event()
+    count, lock = [0], threading.Lock()
+    def wake():
+        with lock:
+            count[0] += 1
+            if count[0] == 4:
+                finished.set()
+    keys = []
+    for i in range(5):
+        rid = f"work{i}-{i}"
+        keys.append(add(rid)["_work_key"])
+        service.update("text", {"id": "one"}, rid, "completed", True)
+    service.text.admission = SimpleNamespace(wake=wake)
+    def archive(owner, rid, desired):
+        i = int(rid.split("-")[-1])
+        if i < 4:
+            entered[i].set()
+            assert release.wait(3)
+        return {"request_id": rid, "archived": desired, "conversation": {"client_conversation_id": rid.split("-")[0]}}
+    service.text.set_public_session_archived = archive
+    try:
+        for key, event in zip(keys, entered):
+            assert service.process_one(target_key=key, background=True)
+            assert event.wait(1)
+        assert not service.process_one(background=True)
+        assert service.get("text", {"id": "one"}, "work4-4")["archive"]["status"] == "pending"
+    finally:
+        release.set()
+        assert finished.wait(2)
+    assert service.process_one()
+    assert service.get("text", {"id": "one"}, "work4-4")["archive"]["status"] == "confirmed"
 
 
 def test_archive_timestamps_follow_confirmation_not_patch_or_failed_attempt(runtime):
@@ -181,7 +314,8 @@ def test_archive_failure_and_restart_recover_original_target_without_occupying_n
     assert restarted.get("text", {"id": "one"}, "B-2")["slot_held"] is True
 
 
-def test_stale_archive_cannot_patch_after_another_worker_restores(runtime, monkeypatch):
+@pytest.mark.parametrize("background", [False, True])
+def test_stale_archive_cannot_patch_after_another_worker_restores(runtime, monkeypatch, background):
     from services.account_request_pacing import AccountRequestClock
     from services.config import config
     service, store, now, calls, _, add = runtime
@@ -192,6 +326,8 @@ def test_stale_archive_cannot_patch_after_another_worker_restores(runtime, monke
     other.text = SimpleNamespace(store=store, admission=None,
         set_public_session_archived=lambda owner, rid, desired: {
             "request_id": rid, "archived": desired, "conversation": {"client_conversation_id": "A"}})
+    finished = threading.Event()
+    service.text.admission = SimpleNamespace(wake=finished.set)
     monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
     monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 0))
     clock = AccountRequestClock()
@@ -209,7 +345,8 @@ def test_stale_archive_cannot_patch_after_another_worker_restores(runtime, monke
                       json={"is_archived": True}, timeout=60)
         pytest.fail("stale worker reached PATCH")
     service.text.set_public_session_archived = stale_archive
-    assert service.process_one()
+    assert service.process_one(background=background)
+    assert finished.wait(2)
     assert calls == ["GET"]
     current = service.get("text", {"id": "one"}, "A-1")
     assert current["state"] == "active" and current["archive"]["archived"] is False

@@ -176,6 +176,8 @@ class WorkLifecycleService:
         self.text, self.images, self.store = text_service, image_service, text_service.store
         self.clock = clock
         self._operation_lock = threading.Lock()
+        self._operation_slots = threading.BoundedSemaphore(4)
+        self._active_accounts = set()
 
     def _load(self, db, kind, identity, request_id):
         owner = str(identity["id"])
@@ -298,11 +300,18 @@ class WorkLifecycleService:
         from services.image_thread import public_thread
         return {"task_id": request_id, "archived": archived, "image_thread": public_thread(receipt)}
 
-    def process_one(self, *, target_key=None):
-        # Only the existing admission recovery loop calls this. The local lock
-        # avoids concurrent archive and restore operations across HTTP readers.
-        if not self._operation_lock.acquire(blocking=False):
+    def process_one(self, *, target_key=None, background=False):
+        # Claim under a short local guard and the durable transaction. A paced
+        # archive must not occupy the original-result recovery worker or block
+        # another account. One in-flight archive per account also prevents a
+        # single read clock from occupying all four local workers.
+        if not self._operation_slots.acquire(blocking=False):
             return False
+        if not self._operation_lock.acquire(blocking=False):
+            self._operation_slots.release()
+            return False
+        work = None
+        account_key = None
         try:
             now = float(self.clock())
             # Read account identities before the receipt transaction, following
@@ -334,6 +343,9 @@ class WorkLifecycleService:
                             a.update(status="unknown", error_code=exc.code, next_at=now + 60)
                             save_work(self.store, db, candidate)
                             continue
+                        candidate_account = receipt.get("provider_account_identity") or receipt.get("provider_binding_id") or candidate["key"]
+                        if candidate_account in self._active_accounts:
+                            continue
                         account = account_rows.get(receipt.get("provider_account_identity"))
                         if account is not None:
                             refresh_error = str(account.get("last_token_refresh_error") or "").lower()
@@ -361,6 +373,7 @@ class WorkLifecycleService:
                                 save_work(self.store, db, candidate)
                                 continue
                         work = candidate
+                        account_key = candidate_account
                         break
                 if work is not None:
                     archive = work["archive"]
@@ -369,11 +382,53 @@ class WorkLifecycleService:
                     archive.update(status="running", claim=claim, claim_until=now + 300,
                                    attempts=int(archive.get("attempts") or 0) + 1, attempt_started_at=now)
                     save_work(self.store, db, work)
+            if work is not None:
+                self._active_accounts.add(account_key)
+        except Exception:
+            self._operation_slots.release()
+            raise
+        finally:
+            self._operation_lock.release()
+        if work is None:
+            self._operation_slots.release()
             from services.account_request_pacing import reserve_account_archive_read
             for account, owner in reservations.values():
                 reserve_account_archive_read(account, owner)
-            if work is None:
-                return False
+            return False
+        # The claim is durable before dispatch. A failed thread start must not
+        # strand that original intent for the full 300-second lease.
+        if background:
+            try:
+                threading.Thread(target=self._run_claim, args=(work, claim, account_key, reservations),
+                                 name="original-work-archive", daemon=True).start()
+            except Exception:
+                try:
+                    with self.store.transaction() as db:
+                        current = self.store.runtime(db, work["key"])
+                        active = (current or {}).get("archive") or {}
+                        if current and current["version"] == work["version"] and active.get("claim") == claim:
+                            active.update(status="pending", claim=None, claim_until=None,
+                                          error_code=active.get("error_code") or "WORK_ARCHIVE_DISPATCH_FAILED",
+                                          next_at=float(self.clock()) + 1)
+                            save_work(self.store, db, current)
+                finally:
+                    self._release_operation(account_key)
+                raise
+            return True
+        return self._run_claim(work, claim, account_key, reservations)
+
+    def _release_operation(self, account_key):
+        with self._operation_lock:
+            self._active_accounts.discard(account_key)
+        self._operation_slots.release()
+        admission = getattr(self.text, "admission", None)
+        if admission is not None:
+            admission.wake()
+
+    def _run_claim(self, work, claim, account_key, reservations):
+        archive = work["archive"]
+        request_id = archive["request_id"]
+        try:
             error_code = None
             def check_and_renew_archive():
                 with self.store.transaction() as db:
@@ -387,6 +442,9 @@ class WorkLifecycleService:
                     active["claim_until"] = now + 300
                     save_work(self.store, db, current)
             try:
+                from services.account_request_pacing import reserve_account_archive_read
+                for account, owner in reservations.values():
+                    reserve_account_archive_read(account, owner)
                 from services.request_context import guarding_archive
                 with guarding_archive(check_and_renew_archive, read_owner=_archive_read_owner(work),
                                       request_key=work["owner"] + ":" + request_id, work_key=work["key"]):
@@ -424,7 +482,7 @@ class WorkLifecycleService:
                 save_work(self.store, db, current)
             return True
         finally:
-            self._operation_lock.release()
+            self._release_operation(account_key)
 
 
 def get_work_lifecycle_service():
