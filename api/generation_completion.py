@@ -67,6 +67,12 @@ def create_router(kind):
     async def update_completion(request_id: str, body: CompletionRequest, request: Request,
                                 authorization: str | None = Header(default=None)):
         identity, service = authorize(request, authorization, request_id, enforce_policy=True)
+        company_original_only = getattr(request.state, "company_identity", None) is not None
+        if company_original_only and (
+            kind != "image" or body.action != "recover" or body.allow_unconfirmed_retry
+            or body.model_fields_set - {"action", "allow_unconfirmed_retry", "retry_not_sent_failure_at"}
+        ):
+            raise HTTPException(403, detail={"code": "COMPANY_ORIGINAL_RECOVERY_REQUIRED"})
         try:
             if body.action == "complete":
                 return await run_in_threadpool(service.complete, kind, identity, request_id, body.selected_id)
@@ -74,7 +80,8 @@ def create_router(kind):
                 return await run_in_threadpool(service.rework, kind, identity, request_id, body.selected_id)
             return await run_in_threadpool(service.start, kind, identity, request_id,
                                            allow_unconfirmed_retry=body.allow_unconfirmed_retry,
-                                           retry_not_sent_failure_at=body.retry_not_sent_failure_at)
+                                           retry_not_sent_failure_at=body.retry_not_sent_failure_at,
+                                           original_only=company_original_only)
         except WorkLifecycleError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
     return router

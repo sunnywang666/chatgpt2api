@@ -230,13 +230,16 @@ class GenerationCompletionService:
         return row
 
     def start(self, kind, identity, request_id, *, allow_unconfirmed_retry=False,
-              retry_not_sent_failure_at=None):
+              retry_not_sent_failure_at=None, original_only=False):
         owner, now = str(identity["id"]), float(self.clock())
         if getattr(self.text, "admission", None) is None:
             raise CompletionError("COMPLETION_SCHEDULER_REQUIRED", 503)
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id)
             state = root.get("_completion")
+            if original_only and (kind != "image" or allow_unconfirmed_retry
+                                  or state and state.get("replacement_id")):
+                raise CompletionError("COMPLETION_POLICY_CONFLICT")
             if state and state["allow_unconfirmed_retry"] != allow_unconfirmed_retry:
                 if allow_unconfirmed_retry and not state.get("replacement_id") and not state.get("selected_id"):
                     state.update(allow_unconfirmed_retry=True, authorized_at=now, next_at=now)
@@ -254,6 +257,13 @@ class GenerationCompletionService:
                 # An explicit recover may gather fresh evidence after a repair.
                 # Keep the ended marker/history; no automatic restart on upgrade.
                 state.update(state="checking_original", next_at=now)
+                self.store.write_receipt(db, kind, owner, request_id, root)
+            if original_only:
+                # The company ingress can recover the original receipt or a
+                # proven unsent attempt, but cannot authorize a successor.
+                # Persist the existing request budget so background/restart
+                # recovery observes the same boundary as this HTTP call.
+                root["_completion"]["max_extra_requests"] = 0
                 self.store.write_receipt(db, kind, owner, request_id, root)
             if retry_not_sent_failure_at is not None:
                 state = root["_completion"]
@@ -512,6 +522,8 @@ class GenerationCompletionService:
                     elif not ended and root.get("status") not in {"failed", "error"}:
                         raise CompletionError("COMPLETION_ORIGINAL_NOT_TERMINAL")
                     if not state.get("replacement_id"):
+                        if state.get("max_extra_requests") == 0:
+                            raise CompletionError("COMPLETION_ORIGINAL_ONLY")
                         replacement_id = "completion-" + uuid.uuid4().hex
                         prepared = self._prepare(db, kind, owner, request_id, root, replacement_id)
                         state.update(replacement_id=replacement_id, prepared_input=self.store.save_input(prepared),

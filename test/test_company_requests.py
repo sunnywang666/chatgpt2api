@@ -37,6 +37,8 @@ class Queue:
 
 @pytest.fixture
 def company(tmp_path, monkeypatch):
+    tmp_path = tmp_path / "company"
+    tmp_path.mkdir()
     auth = AuthService(JSONStorageBackend(tmp_path / "accounts.json"))
     _, admin = auth.create_key(role="admin")
     old_key, ordinary = auth.create_key(role="user", routes=["chat"])
@@ -264,3 +266,95 @@ def test_multiple_company_connectors_share_user_fairness_without_sharing_receipt
     # The same field on a normal external credential grants no scheduling lane.
     request.state.company_identity = None
     assert trusted_source(one, request) == "key:" + one["id"]
+
+
+# Reuse the real durable recovery fixture; only its upstream is controlled.
+from test.test_generation_completion import setup, failed_unsent_image
+
+
+@pytest.fixture
+def company_repair(company, failed_unsent_image, monkeypatch):
+    import api.generation_completion as completion_api
+    service = failed_unsent_image
+    identity = company_identity("company", "employee", CONNECTOR)
+    with service.store.transaction() as db:
+        original = service.store.read_receipt(db, "image", "owner", "repair-image")
+        original["owner_id"] = identity["id"]
+        source = service.store.load_input(original["_input_ref"])
+        source["identity"] = identity
+        original["_input_ref"] = service.store.save_input(source)
+        service.store.write_receipt(db, "image", identity["id"], "repair-image", original)
+        db.execute("DELETE FROM image_requests WHERE task_key=?", ("owner:repair-image",))
+    monkeypatch.setattr(completion_api, "get_generation_completion_service", lambda: service)
+    return company, service, identity
+
+
+def company_image_row(service, identity):
+    with service.store.connect() as db:
+        return service.store.read_receipt(db, "image", identity["id"], "repair-image")
+
+
+def test_company_completion_restores_only_owned_unsent_original(company_repair, monkeypatch):
+    from services.generation_completion import GenerationCompletionService
+    company, service, identity = company_repair
+    endpoint = PREFIX + "/api/image-tasks/repair-image/completion"
+    payload = {"action": "recover", "allow_unconfirmed_retry": False,
+               "retry_not_sent_failure_at": 2900.0}
+    original = company_image_row(service, identity)
+    for headers in (company.headers(user="other"), company.headers(org="other"),
+                    company.headers(connector=OTHER_CONNECTOR)):
+        assert company.client.get(endpoint, headers=headers).status_code == 404
+        assert company.client.post(endpoint, headers=headers, json=payload).status_code == 404
+    assert company_image_row(service, identity) == original
+    assert company.client.get(endpoint, headers=company.headers()).status_code == 200
+    assert company.client.post(endpoint, headers=company.headers(),
+                               json={**payload, "retry_not_sent_failure_at": 2899.0}).status_code == 409
+    assert company_image_row(service, identity) == original
+    response = company.client.post(endpoint, headers=company.headers(), json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["original_id"] == "repair-image"
+    assert "replacement_id" not in response.json()
+    restored = company_image_row(service, identity)
+    assert restored["status"] == "queued" and restored["_completion"]["max_extra_requests"] == 0
+    assert restored["_input_ref"] == original["_input_ref"]
+    assert restored["request_hash"] == original["request_hash"]
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    monkeypatch.setattr("api.generation_completion.get_generation_completion_service", lambda: restarted)
+    assert company.client.post(endpoint, headers=company.headers(), json=payload).status_code == 200
+    assert company_image_row(service, identity)["_execution_timeline"] == restored["_execution_timeline"]
+    with service.store.connect() as db:
+        assert db.execute("SELECT count(*) FROM image_requests").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("payload", [
+    {"action": "complete", "selected_id": "repair-image", "results_saved": True, "reviewed": True},
+    {"action": "rework", "selected_id": "repair-image"},
+    {"action": "recover", "allow_unconfirmed_retry": True},
+    {"action": "recover", "reviewed": False},
+    {"action": "recover", "results_saved": False},
+    {"action": "recover", "selected_id": None},
+    {"action": "recover", "unexpected": "field"},
+])
+def test_company_completion_rejects_other_actions_and_fields(company_repair, payload):
+    company, service, identity = company_repair
+    before = company_image_row(service, identity)
+    response = company.client.post(PREFIX + "/api/image-tasks/repair-image/completion",
+                                   headers=company.headers(), json=payload)
+    assert response.status_code in (403, 422), response.text
+    assert company_image_row(service, identity) == before
+
+
+def test_company_completion_saved_original_never_regenerates(company_repair):
+    company, service, identity = company_repair
+    with service.store.transaction() as db:
+        original = service.store.read_receipt(db, "image", identity["id"], "repair-image")
+        original.update(status="success", data=[{"b64_json": base64.b64encode(company.png).decode()}])
+        service.store.write_receipt(db, "image", identity["id"], "repair-image", original)
+    service.images.resume_poll = Mock(side_effect=AssertionError("saved result must not be polled"))
+    response = company.client.post(PREFIX + "/api/image-tasks/repair-image/completion",
+                                   headers=company.headers(), json={"action": "recover"})
+    assert response.status_code == 200, response.text
+    assert response.json()["selected_id"] == "repair-image"
+    assert "replacement_id" not in response.json()
+    assert company_image_row(service, identity)["data"] == original["data"]
+    service.images.resume_poll.assert_not_called()

@@ -637,3 +637,38 @@ def test_recovery_pause_fences_prepared_completion_and_preserves_original(setup)
     service.store.set_recovery_paused("text", "owner", "old-0", False)
     assert admission.claim_next().request_id == child_id
     assert row(service)["conversation_id"] == original["conversation_id"]
+
+
+def test_original_only_image_policy_survives_restart_and_prevents_successor(setup):
+    service, admission, calls = setup
+    service.images.submit_generation(IDENTITY, client_task_id="original-only", prompt="retained input",
+                                     model="gpt-image-2", size=None)
+    patch_row(service, "image", "original-only", status="error", upstream_outcome="failed",
+              _submission_started=True, upstream_submission_started=True,
+              _completion={"state": "checking_original", "allow_unconfirmed_retry": False,
+                           "automatic_failure_retry": True, "max_extra_requests": 1, "next_at": None})
+    service._prepare = Mock(side_effect=AssertionError("must not prepare a successor"))
+    result = service.start("image", IDENTITY, "original-only", original_only=True)
+    assert result["reason"] == "COMPLETION_ORIGINAL_ONLY" and result["max_extra_requests"] == 0
+    assert "replacement_id" not in result
+    patch_row(service, "image", "original-only", _completion={
+        **row(service, "image", "original-only")["_completion"], "state": "checking_original", "next_at": 0})
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted._prepare = service._prepare
+    restarted.advance("image", "owner", "original-only")
+    assert "replacement_id" not in row(service, "image", "original-only")["_completion"]
+    service._prepare.assert_not_called()
+    with service.store.connect() as db:
+        assert db.execute("SELECT count(*) FROM image_requests").fetchone()[0] == 1
+    assert calls == []
+
+
+def test_original_only_policy_does_not_cancel_existing_successor(failed_unsent_image):
+    service = failed_unsent_image
+    prior = row(service, "image", "repair-image")
+    patch_row(service, "image", "repair-image", _completion={
+        **prior["_completion"], "replacement_id": "existing-authorized-attempt"})
+    before = row(service, "image", "repair-image")
+    with pytest.raises(CompletionError, match="COMPLETION_POLICY_CONFLICT"):
+        service.start("image", IDENTITY, "repair-image", original_only=True)
+    assert row(service, "image", "repair-image") == before
