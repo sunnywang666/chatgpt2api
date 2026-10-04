@@ -48,6 +48,38 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_fractional_http_floor_preserves_model_floor_and_retry_after(self):
+        now = [10000.0]
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: .1)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 5)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+            path = Path(tmp) / "clock.json"
+
+            def send(method, url, **kwargs):
+                sent.append((method, now[0]))
+                response = Response()
+                if url.endswith("/limited"):
+                    response.status_code = 429
+                    response.headers = {"Retry-After": "30"}
+                return response
+
+            # A new clock instance must keep the fractional persisted floor.
+            for name in ("first", "second"):
+                AccountRequestClock("account", path).request(send, "GET", "https://provider/conversation/" + name)
+            # Persisted wall-clock floats lose sub-microsecond precision.
+            self.assertAlmostEqual(sent[1][1] - sent[0][1], .1, delta=1e-6)
+            for _ in range(2):
+                AccountRequestClock("account", path).request(send, "POST", "https://provider/conversation")
+            self.assertGreaterEqual(sent[3][1] - sent[2][1], 5)
+            AccountRequestClock("account", path).request(send, "GET", "https://provider/conversation/limited")
+            AccountRequestClock("account", path).request(send, "GET", "https://provider/conversation/recovered")
+            self.assertGreaterEqual(sent[-1][1] - sent[-2][1], 30)
+
     def test_attachment_lookup_keeps_http_pace_without_consuming_conversation_read_turn(self):
         now = [10000.0]
         sent = []

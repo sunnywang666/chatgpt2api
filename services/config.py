@@ -83,7 +83,7 @@ _KEEP_CHAT_TRIAL = object()
 
 # Local pacing limits, not upstream rate-limit guarantees.
 _PACING_SETTINGS = {
-    "account_request_interval_secs": (1.0, 60.0, 5.0),
+    "account_request_interval_secs": (0.1, 60.0, 5.0),
     "account_message_interval_secs": (5.0, 300.0, 30.0),
     "account_conversation_read_interval_secs": (0.0, 300.0, 0.0),
 }

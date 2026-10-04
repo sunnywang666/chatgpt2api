@@ -71,7 +71,7 @@ class PacingSettingsTests(unittest.TestCase):
 
     def test_invalid_pacing_rejects_entire_update_without_saving(self):
         for key, bad in [
-            ("account_request_interval_secs", [0, .5, 61, True, None, "bad", float("nan"), float("inf")]),
+            ("account_request_interval_secs", [0, .09, 61, True, None, "bad", float("nan"), float("inf")]),
             ("account_message_interval_secs", [1, 2, 4.99, 301, False, None, "-inf"]),
             ("account_conversation_read_interval_secs", [-1, 301, False, None, "bad", float("nan")]),
         ]:
@@ -93,18 +93,19 @@ class PacingSettingsTests(unittest.TestCase):
 
     def test_valid_boundaries_persist_and_match_runtime_after_reopen(self):
         from services.config import ConfigStore
-        for http, message in [(1, 5), (60, 300), ("2.5", "7.5")]:
+        for http, message in [(.1, 5), (.5, 5), (1, 5), (60, 300), ("2.5", "7.5")]:
             with self.subTest(http=http, message=message):
                 settings = self.store.update({"account_request_interval_secs": http,
                                               "account_message_interval_secs": message})
                 reopened = ConfigStore(self.path)
                 self.assertEqual(settings["account_request_interval_secs"], reopened.account_request_interval_secs)
+                self.assertEqual(settings["account_request_interval_secs"], float(http))
                 self.assertEqual(settings["account_message_interval_secs"], reopened.account_message_interval_secs)
                 self.assertEqual(settings["account_message_interval_secs"], float(message))
 
     def test_legacy_invalid_get_shows_effective_values_without_rewriting_file(self):
         from services.config import ConfigStore
-        raw = {"auth-key": "test-pacing-settings-secret", "account_request_interval_secs": .5,
+        raw = {"auth-key": "test-pacing-settings-secret", "account_request_interval_secs": .05,
                "account_message_interval_secs": 2}
         self.path.write_text(json.dumps(raw))
         self.store = ConfigStore(self.path)
@@ -145,9 +146,10 @@ class PacingSettingsTests(unittest.TestCase):
                 response = client.get("/api/settings")
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.json()["config"]["account_message_interval_secs"], 30)
-                response = client.post("/api/settings", json={"account_request_interval_secs": 1,
+                response = client.post("/api/settings", json={"account_request_interval_secs": .1,
                                                               "account_message_interval_secs": 5})
                 self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["config"]["account_request_interval_secs"], .1)
                 self.assertEqual(response.json()["config"]["account_message_interval_secs"], 5)
 
 
