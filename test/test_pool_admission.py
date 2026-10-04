@@ -1174,6 +1174,19 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(failure["stage"], "pre_submit_failure")
         self.assertEqual(failure["error_code"], "IMAGE_RESOURCE_UNAVAILABLE")
 
+    def test_unsent_binding_reason_is_preserved_in_timeline_on_requeue(self):
+        self.image("binding-unavailable")
+        context = self.admission.claim_next()
+        def unavailable(ctx, body):
+            self.admission.update_claim(ctx, status="error", error_code="CONVERSATION_BINDING_UNAVAILABLE",
+                                        last_recovery_failure={"binding_reason": "image_capacity_stale"})
+        self.admission.register("image", unavailable)
+        self.admission.execute(context)
+        receipt = self.read("image", "happy", "binding-unavailable")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(receipt["_submission_started"])
+        self.assertEqual(receipt["_execution_timeline"][-1]["binding_reason"], "image_capacity_stale")
+
     def test_unsent_exception_retains_reason_and_retries_only_original_once(self):
         self.image("prepare-failed")
         context = self.admission.claim_next()

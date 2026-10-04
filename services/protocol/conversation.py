@@ -1453,6 +1453,11 @@ def _generate_bound_single_image(
         # This block ends before any backend/stream is created. Preserve that
         # positive evidence; the same error code elsewhere can be uncertain.
         error.upstream_submitted = False
+        error.binding_reason = getattr(exc, "binding_reason", None) or {
+            "conversation binding unavailable: binding id is required": "binding_id_required",
+            "conversation binding unavailable: bound account missing": "bound_account_missing",
+            "conversation binding unavailable: bound account cannot generate images": "bound_image_capability_unavailable",
+        }.get(str(exc))
         raise error from exc
 
     slot_acquired = bool(token)

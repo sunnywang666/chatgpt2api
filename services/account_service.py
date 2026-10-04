@@ -1788,7 +1788,15 @@ class AccountService:
                         or not self._account_matches_any_plan_type(account, plan_types)
                         or not self._account_matches_source_type(account, source_type)
                 ):
-                    raise RuntimeError("conversation binding unavailable: bound account cannot generate images")
+                    from services.owned_accounts import image_capability_projection
+                    reason = image_capability_projection(account).get("reason")
+                    error = RuntimeError("conversation binding unavailable: bound account cannot generate images")
+                    error.binding_reason = (
+                        "image_capacity_" + reason
+                        if reason in {"disabled", "auth_required", "limited", "read_failed", "stale"}
+                        else "bound_image_capability_unavailable"
+                    )
+                    raise error
                 if int(self._image_inflight.get(access_token, 0)) < min(max_concurrency, self.image_account_capacity(account, image_model)):
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token

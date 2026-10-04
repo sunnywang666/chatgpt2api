@@ -151,6 +151,11 @@ def _recovery_failure_code(exc: BaseException, phase: str, *, result_captured: b
 _IMAGE_THREAD_FAILURE_CODES = frozenset({
     "IMAGE_THREAD_UPSTREAM_CHANGED", "IMAGE_THREAD_TURN_UNCONFIRMED",
 })
+_BINDING_FAILURE_REASONS = frozenset({
+    "binding_id_required", "bound_account_missing", "bound_image_capability_unavailable",
+    "image_capacity_disabled", "image_capacity_auth_required", "image_capacity_limited",
+    "image_capacity_read_failed", "image_capacity_stale",
+})
 
 
 def _failure_details(exc: BaseException, phase: str) -> dict[str, Any]:
@@ -163,6 +168,11 @@ def _failure_details(exc: BaseException, phase: str) -> dict[str, Any]:
     }
     if isinstance(exc, ImageThreadError) and isinstance(exc.code, str) and exc.code in _IMAGE_THREAD_FAILURE_CODES:
         details["code"] = exc.code
+    reason = getattr(exc, "binding_reason", None)
+    if (getattr(exc, "code", None) == "CONVERSATION_BINDING_UNAVAILABLE"
+            and getattr(exc, "upstream_submitted", None) is False
+            and isinstance(reason, str) and reason in _BINDING_FAILURE_REASONS):
+        details["binding_reason"] = reason
     return details
 
 
@@ -188,6 +198,9 @@ def _public_failure_details(value: object) -> dict[str, Any]:
     }
     if name == "ImageThreadError" and isinstance(value.get("code"), str) and value["code"] in _IMAGE_THREAD_FAILURE_CODES:
         details["code"] = value["code"]
+    reason = value.get("binding_reason")
+    if isinstance(reason, str) and reason in _BINDING_FAILURE_REASONS:
+        details["binding_reason"] = reason
     return details
 
 

@@ -40,6 +40,11 @@ def record_unsent_failure(context, receipt, at, error_type=None):
     code = receipt.get("error_code")
     if code in {"CONVERSATION_OUTCOME_UNKNOWN", "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}:
         entry["error_code"] = code
+    if code == "CONVERSATION_BINDING_UNAVAILABLE":
+        from services.image_task_service import _public_failure_details
+        reason = _public_failure_details(receipt.get("last_recovery_failure")).get("binding_reason")
+        if reason:
+            entry["binding_reason"] = reason
     receipt["_execution_timeline"] = [*(receipt.get("_execution_timeline") or []), entry][-32:]
     logger.warning({"event": "pool_execution_stage", **entry})
 

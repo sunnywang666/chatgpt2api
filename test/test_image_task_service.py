@@ -1477,6 +1477,29 @@ class ImageTaskServiceTests(unittest.TestCase):
                 self.assertEqual(restored["last_recovery_failure"], detail)
                 self.assertEqual(restored["recovery_phase"], "download_image_result")
 
+    def test_binding_diagnosis_survives_protocol_and_public_readback_without_text(self):
+        for message, reason in [
+            ("conversation binding unavailable: bound account missing", "bound_account_missing"),
+            ("conversation binding unavailable: bound account cannot generate images", "bound_image_capability_unavailable"),
+            ("secret token or response body", None),
+        ]:
+            with self.subTest(reason=reason):
+                request = ConversationRequest(model="gpt-image-2", prompt="mug", provider_binding_id="binding",
+                                              provider_account_identity="account", client_conversation_id="client")
+                with mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", side_effect=RuntimeError(message)), \
+                        mock.patch("services.protocol.conversation.OpenAIBackendAPI") as backend, \
+                        self.assertRaises(ImageGenerationError) as failure:
+                    _generate_bound_single_image(request, 1, 1)
+                backend.assert_not_called()
+                detail = _failure_details(failure.exception, "select_image_account")
+                self.assertEqual(detail.get("binding_reason"), reason)
+                self.assertNotIn(message, json.dumps(detail))
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    path = Path(tmp_dir) / "image_tasks.json"
+                    write_policy_task(path, last_recovery_failure=detail)
+                    public = self.make_service(path).list_tasks(OWNER, ["policy-task"])["items"][0]
+                    self.assertEqual(public["last_recovery_failure"].get("binding_reason"), reason)
+
     def test_public_failure_details_drop_untrusted_persisted_fields(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
@@ -1485,6 +1508,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 "status_code": "secret", "at": float("nan"),
                 "body": "Authorization: private", "url": "https://private.test",
                 "code": "https://private.test/token",
+                "binding_reason": "https://private.test/token",
             })
             public = self.make_service(path).list_tasks(OWNER, ["policy-task"])["items"][0]
             self.assertEqual(public["last_recovery_failure"], {

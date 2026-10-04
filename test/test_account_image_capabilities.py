@@ -201,6 +201,20 @@ class AccountCapabilityTests(unittest.TestCase):
                 service.create_conversation_binding(image_model="gpt-image-2")
             self.assertFalse(any(service._image_inflight.values()))
 
+    def test_bound_image_stale_capacity_retains_safe_reason_without_claiming_slot(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "fixture", "type": "Plus", "status": "正常", **image_observation(10)}])
+            service.fetch_remote_info = lambda token, event="": service.get_account(token)
+            service.refresh_access_token = lambda token, event="": token
+            binding, _, token = service.create_conversation_binding(image_model="gpt-image-2")
+            service.release_image_slot(token)
+            service.update_account(token, {"capacity_used_since_observation": True})
+            with self.assertRaises(RuntimeError) as failure:
+                service.acquire_bound_image_access_token(binding, image_model="gpt-image-2")
+            self.assertEqual(failure.exception.binding_reason, "image_capacity_stale")
+            self.assertFalse(any(service._image_inflight.values()))
+
     def test_free_account_transport_rejects_messages_but_allows_result_queries(self):
         from services.account_request_pacing import pace_account_session, AccountRequestClock
         from unittest.mock import Mock
