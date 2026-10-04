@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Iterator
 
 import tiktoken
@@ -331,6 +331,7 @@ class ConversationRequest:
     parent_message_id: str = ""
     retain_conversation: bool = False
     upstream_model: str = ""
+    _defer_image_publication: bool = field(default=False, init=False, repr=False)
 
 
 @dataclass
@@ -361,6 +362,7 @@ class ImageOutput:
     provider_account_identity: str = ""
     parent_message_id: str = ""
     image_thread_terminal: bool = False
+    _pending_image_items: list[dict[str, Any]] = field(default_factory=list, repr=False)
 
     def to_chunk(self) -> dict[str, Any]:
         chunk: dict[str, Any] = {
@@ -449,6 +451,25 @@ def _record_result_ids(
     callback = getattr(request.progress_callback, "record_result_ids", None)
     if callable(callback) and (file_ids or sediment_ids):
         callback(list(dict.fromkeys(file_ids)), list(dict.fromkeys(sediment_ids)))
+
+
+def _downloaded_image_output(request, items, *, conversation_id, request_message_id,
+                             file_ids, sediment_ids, index, total):
+    output = ImageOutput(kind="result", model=request.model, index=index, total=total,
+                         conversation_id=conversation_id)
+    if request._defer_image_publication:
+        callback = getattr(request.progress_callback, "record_downloaded_image_items", None)
+        if callable(callback):
+            callback({"conversation_id": conversation_id, "request_message_id": request_message_id,
+                      "file_ids": list(dict.fromkeys(file_ids)),
+                      "sediment_ids": list(dict.fromkeys(sediment_ids))}, items)
+        # Bound generation collects this internally and verifies the exact turn
+        # before formatting it. Neither to_chunk nor collection exposes this field.
+        output._pending_image_items = items
+    else:
+        output.data = format_image_result(items, request.prompt, request.response_format,
+                                          request.base_url, output.created)["data"]
+    return output
 
 
 def _start_active_attempt(request: ConversationRequest) -> None:
@@ -1134,15 +1155,11 @@ def stream_image_outputs(
             {"b64_json": base64.b64encode(image_data).decode("ascii")}
             for image_data in backend.download_image_bytes(image_urls)
         ]
-        data = format_image_result(
-            image_items,
-            request.prompt,
-            request.response_format,
-            request.base_url,
-            int(time.time()),
-        )["data"]
-        if data:
-            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+        output = _downloaded_image_output(request, image_items,
+            conversation_id=conversation_id, request_message_id=request_message_id,
+            file_ids=file_ids, sediment_ids=sediment_ids, index=index, total=total)
+        if output.data or output._pending_image_items:
+            yield output
         return
 
     if message:
@@ -1201,15 +1218,11 @@ def stream_image_outputs(
                         {"b64_json": base64.b64encode(image_data).decode("ascii")}
                         for image_data in backend.download_image_bytes(image_urls)
                     ]
-                    data = format_image_result(
-                        image_items,
-                        request.prompt,
-                        request.response_format,
-                        request.base_url,
-                        int(time.time()),
-                    )["data"]
-                    if data:
-                        yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+                    output = _downloaded_image_output(request, image_items,
+                        conversation_id=conversation_id, request_message_id=request_message_id,
+                        file_ids=file_ids, sediment_ids=sediment_ids, index=index, total=total)
+                    if output.data or output._pending_image_items:
+                        yield output
                         return
             if active_budget_configured:
                 raise ImagePollTimeoutError(
@@ -1292,15 +1305,11 @@ def stream_image_outputs(
                     {"b64_json": base64.b64encode(image_data).decode("ascii")}
                     for image_data in backend.download_image_bytes(image_urls)
                 ]
-                data = format_image_result(
-                    image_items,
-                    request.prompt,
-                    request.response_format,
-                    request.base_url,
-                    int(time.time()),
-                )["data"]
-                if data:
-                    yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+                output = _downloaded_image_output(request, image_items,
+                    conversation_id=conversation_id, request_message_id=request_message_id,
+                    file_ids=file_ids, sediment_ids=sediment_ids, index=index, total=total)
+                if output.data or output._pending_image_items:
+                    yield output
                     return
         
         if active_budget_configured:
@@ -1508,6 +1517,8 @@ def _generate_bound_single_image(
                     except Exception as exc:
                         raise ImageGenerationError("Original image conversation cannot yet be continued",
                             code=getattr(exc, "code", "IMAGE_THREAD_PREVIOUS_UNCONFIRMED"), upstream_submitted=False) from exc
+                request = replace(request)
+                request._defer_image_publication = True
                 for output in stream_image_outputs(backend, request, index, total):
                     last_conversation_id = output.conversation_id or last_conversation_id
                     output.account_email = output.account_email or account_email
@@ -1553,6 +1564,10 @@ def _generate_bound_single_image(
                 else:
                     next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
                 for output in outputs:
+                    if output._pending_image_items:
+                        output.data = format_image_result(output._pending_image_items, request.prompt,
+                            request.response_format, request.base_url, output.created)["data"]
+                        output._pending_image_items = []
                     output.provider_binding_id = binding_id
                     output.provider_account_identity = account_identity
                     output.conversation_id = last_conversation_id

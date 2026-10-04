@@ -25,6 +25,8 @@ from services.request_context import current_request
 from services.protocol import conversation, openai_v1_image_edit, openai_v1_image_generations
 from services.openai_backend_api import OpenAIBackendAPI as RealOpenAIBackendAPI
 
+REAL_IMAGE_STREAM = conversation.stream_image_outputs
+
 
 def png(color):
     out = BytesIO()
@@ -197,6 +199,93 @@ def run_next(r, expected):
     result = r.read(expected)
     assert result["status"] == "success", result
     return result
+
+
+@pytest.mark.parametrize("path", ["direct", "text_retry", "fallback"])
+@pytest.mark.parametrize("fail_confirmation", [False, True])
+def test_first_download_stays_private_until_confirmed_and_survives_restart(runtime, monkeypatch, path, fail_confirmation):
+    r = runtime
+    backend_class = conversation.OpenAIBackendAPI
+    fail = [fail_confirmation]
+    calls = {"download": 0, "resolve": 0, "published": 0}
+
+    def events(backend, **kwargs):
+        callback = backend.progress_callback
+        rid = callback.request_message_id
+        cid = "conversation-first-download"
+        current_request.get().before_send()
+        backend.image_request_message_id = rid
+        backend.image_submission_started = True
+        callback.record_submission_started()
+        callback.record_conversation_id(cid)
+        doc, asset = tool_document(cid, rid)
+        r.state.documents[cid] = doc
+        r.state.sends.append({"conversation": cid, "message": rid})
+        yield {"conversation_id": cid, "file_ids": [asset] if path == "direct" else [],
+               "text": '{"referenced_image_ids": ["input"]}' if path == "text_retry" else "",
+               "turn_use_case": "image gen"}
+
+    def resolve(_backend, cid, files, sediments, **_kwargs):
+        calls["resolve"] += 1
+        return ["https://fixture.invalid/original.png"] if files or sediments else []
+
+    def poll(_backend, cid, *_args, request_message_id, **_kwargs):
+        _, asset = tool_document(cid, request_message_id)
+        return [asset], []
+
+    def download(_backend, _urls):
+        calls["download"] += 1
+        return [OUTPUT]
+
+    def read(_backend, cid):
+        if fail[0]:
+            raise TimeoutError("original final read unavailable")
+        return copy.deepcopy(r.state.documents[cid])
+
+    def publish(items, *_args, **_kwargs):
+        assert not fail[0], "no public image storage before exact final confirmation"
+        calls["published"] += 1
+        return {"data": [{"b64_json": items[0]["b64_json"], "url": "https://fixture.invalid/confirmed.png"}]}
+
+    monkeypatch.setattr(conversation, "conversation_events", events)
+    monkeypatch.setattr(conversation, "stream_image_outputs", REAL_IMAGE_STREAM)
+    monkeypatch.setattr(conversation, "_get_detailed_error_from_tasks", lambda *_a, **_k: "")
+    monkeypatch.setattr(backend_class, "resolve_conversation_image_urls", resolve)
+    monkeypatch.setattr(backend_class, "_poll_image_results", poll)
+    monkeypatch.setattr(backend_class, "download_image_bytes", download)
+    monkeypatch.setattr(backend_class, "_get_conversation", read)
+    monkeypatch.setattr(conversation, "format_image_result", publish)
+    r.submit("original")
+    r.admission.execute(r.admission.claim_next())
+    original = r.read("original")
+    assert calls["download"] == 1
+    if fail_confirmation:
+        assert original["status"] == "error" and not original.get("data")
+        assert calls["published"] == 0
+        cached = original["_pending_image_output"]
+        with r.store.output_file(cached["output_ref"]) as handle:
+            import os
+            assert os.fstat(handle.fileno()).st_mode & 0o077 == 0
+            assert json.loads(handle.read())[0]["b64_json"] == base64.b64encode(OUTPUT).decode()
+        restarted = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
+        fail[0] = False
+        resolves_before = calls["resolve"]
+        restarted._run_resume_poll("happy:original", original["conversation_id"], 5, "", WHO,
+                                   "edit", "gpt-image-2", False, False)
+        assert calls["resolve"] == resolves_before
+    result = r.read("original")
+    assert result["status"] == "success" and result["_image_thread_terminal"] is True
+    assert not result.get("_pending_image_output")
+    assert calls["download"] == calls["published"] == len(r.state.sends) == 1
+    assert result["conversation_id"] == original["conversation_id"]
+
+
+def test_private_image_output_cannot_escape_through_chunk_or_collection():
+    private = conversation.ImageOutput(kind="result", model="gpt-image-2", index=1, total=1,
+                                      _pending_image_items=[{"b64_json": "cHJpdmF0ZQ=="}])
+    assert private.to_chunk()["data"] == []
+    assert conversation.collect_image_outputs([private])["data"] == []
+    assert "cHJpdmF0ZQ==" not in repr(private)
 
 
 def test_advanced_selector_reaches_actual_bound_protocol_and_thread(runtime):

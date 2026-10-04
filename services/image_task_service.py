@@ -1167,12 +1167,16 @@ class ImageTaskService:
                 result_file_ids=list(dict.fromkeys(str(item) for item in file_ids if item)),
                 result_sediment_ids=list(dict.fromkeys(str(item) for item in sediment_ids if item)),
                 _pending_image_result_ids=None,
+                _pending_image_output=None,
                 progress="receiving_image",
                 upstream_outcome="generated",
                 upstream_unfinished=False,
             )
             progress_callback.image_thread_result_ids = result_ids
         progress_callback.record_result_ids = record_result_ids
+        progress_callback.record_downloaded_image_items = lambda coverage, items: self._store_pending_image_output(
+            key, coverage, items,
+        )
         progress_callback.record_pending_result_ids = lambda files, sediments: self._update_task(
             key, _pending_image_result_ids={"file_ids": files, "sediment_ids": sediments},
         )
@@ -1227,6 +1231,7 @@ class ImageTaskService:
                 key,
                 status=TASK_STATUS_SUCCESS,
                 _pending_image_result_ids=None,
+                _pending_image_output=None,
                 data=data,
                 usage=usage,
                 error="",
@@ -2073,6 +2078,33 @@ class ImageTaskService:
             if backend is not None:
                 backend.close()
 
+    def _store_pending_image_output(self, key, coverage, items):
+        """Keep downloaded originals private until exact-turn confirmation."""
+        import base64
+        from services.durable_forward import MAX_OUTPUT_BYTES
+        if not isinstance(items, list) or not items:
+            raise ValueError("private image output empty")
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {"b64_json"} or not base64.b64decode(item["b64_json"], validate=True):
+                raise ValueError("invalid private image output")
+        encoded = json.dumps(items).encode()
+        if len(encoded) > MAX_OUTPUT_BYTES:
+            raise ValueError("private image output limit")
+        ref = self.store.create_output()
+        with self.store.output_file(ref, append=True) as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with self._transaction():
+            current = self._tasks.get(key) or {}
+            actual = {"conversation_id": _clean(current.get("conversation_id")),
+                      "request_message_id": _clean(current.get("request_message_id")),
+                      "file_ids": list(current.get("result_file_ids") or []),
+                      "sediment_ids": list(current.get("result_sediment_ids") or [])}
+            if actual != coverage:
+                raise AdmissionLost("original image output coverage changed")
+            self._update_task(key, _pending_image_output={"output_ref": ref, "coverage": coverage})
+
     def _run_resume_poll(
         self,
         key: str,
@@ -2163,12 +2195,7 @@ class ImageTaskService:
                 encoded = json.dumps(items).encode()
                 if len(encoded) > MAX_OUTPUT_BYTES:
                     raise ValueError("private image output limit")
-                ref = self.store.create_output()
-                with self.store.output_file(ref, append=True) as handle:
-                    handle.write(encoded)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                self._update_task(key, _pending_image_output={"output_ref": ref, "coverage": coverage})
+                self._store_pending_image_output(key, coverage, items)
                 return items
             if not binding_id or not account_identity or not client_conversation_id:
                 error = RuntimeError("conversation binding unavailable: task authority missing")
