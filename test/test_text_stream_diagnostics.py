@@ -290,6 +290,11 @@ def test_native_curl_silent_image_stream_does_not_hold_result_or_timeout(monkeyp
     monkeypatch.setattr(pacing, "config", settings)
     monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
     monkeypatch.setattr(pacing, "_clocks", {})
+    # Parallel curl-version runs must not share the repository image index.
+    monkeypatch.setattr("services.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr("services.image_storage_service.config", settings)
+    monkeypatch.setattr("services.image_storage_service.image_storage_service.index_file",
+                        tmp_path / "image_index.json")
     pacing.pace_account_session(session, {"account_id": "fixture-only"}, "fixture-token")
     backend = object.__new__(OpenAIBackendAPI)
     backend.access_token, backend.account, backend.session = "fixture-token", {}, session

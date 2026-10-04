@@ -319,6 +319,7 @@ class AccountRequestClock:
                         "retry_after_secs": retry_after, "cooldown_secs": wait, **observed})
 
     def request(self, send, method, url, **kwargs):
+        io_cleanup = kwargs.pop("_account_request_io_cleanup", None)
         deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
         local_wait = kwargs.pop("_account_request_local_wait", None)
         before_send = kwargs.pop("_account_request_before_send", None)
@@ -643,6 +644,12 @@ class AccountRequestClock:
                             except BaseException as exc:
                                 outcome["error"] = exc
                             finally:
+                                if callable(io_cleanup):
+                                    try:
+                                        io_cleanup()
+                                    except Exception:
+                                        logger.warning({"event": "account_read_transport_cleanup_failed",
+                                                        "account": self.account_key})
                                 entered.set()
                         worker_context = copy_context()
                         worker = threading.Thread(target=worker_context.run, args=(read_io,),
@@ -949,6 +956,20 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
             _clocks[key] = clock
     raw_send = session.request
 
+    def close_read_transport():
+        # Buffered GETs run on a joined, short-lived I/O thread. Session.close
+        # on the caller cannot close this thread-local handle; retained errors
+        # can otherwise keep it alive through a traceback cycle until GC.
+        # Never close the Session or any other thread's stream/handle here.
+        if isinstance(session, Session) and session._use_thread_local_curl:
+            local = session._local
+            curl = getattr(local, "curl", None)
+            if curl is not None:
+                try:
+                    curl.close()
+                finally:
+                    del local.curl
+
     def send(method, url, **kwargs):
         connect = kwargs.pop("_account_request_connect_timeout_secs", None)
         timeout = kwargs.get("timeout")
@@ -982,6 +1003,7 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
                 and (path.endswith("/conversation") or path.endswith("/conversation/prepare") or path.endswith("/responses"))
                 and str(account.get("type") or "").strip().lower() == "free"):
             raise RuntimeError("Free account messages are disabled")
-        return clock.request(send, method, url, **kwargs)
+        return clock.request(send, method, url,
+                             _account_request_io_cleanup=close_read_transport, **kwargs)
 
     session.request = paced_request

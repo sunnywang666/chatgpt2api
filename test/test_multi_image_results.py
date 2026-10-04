@@ -90,6 +90,7 @@ class MultiImageResultTests(unittest.TestCase):
 
     def test_stream_asset_signal_confirms_terminal_before_reading_stalled_tail(self):
         from services.image_thread import finished_parent
+        from services.request_context import executing
         document = _conversation(["file-one"])
         document["mapping"]["request"]["message"]["id"] = "request"
         document["mapping"]["tool"]["message"].update(id="tool", status="finished_successfully")
@@ -101,7 +102,15 @@ class MultiImageResultTests(unittest.TestCase):
         backend.image_poll_terminal_check = lambda doc, cid, rid, files, sediments: bool(
             finished_parent(doc, cid, rid, expected_result_ids=files+sediments))
         backend.resolve_conversation_image_urls = mock.Mock(return_value=["https://fixture.invalid/image"])
-        backend.download_image_bytes = mock.Mock(return_value=[b"original-bytes"])
+        receipt = {"_expected_sends":1, "_send_sequence":1, "_execution_timeline":[],
+                   "_turn_reserved":True, "_upstream_terminal":False}
+        context = mock.Mock()
+        context.receipt.return_value = receipt
+        context.record_stage.side_effect = lambda stage, **kw: receipt["_execution_timeline"].append({"stage":stage, **kw})
+        def download(_urls):
+            self.assertEqual(receipt["_execution_timeline"], [{"stage":"upstream_terminal", "known":True}])
+            return [b"original-bytes"]
+        backend.download_image_bytes = mock.Mock(side_effect=download)
         closed = []
         def stream(*_args, **_kwargs):
             try:
@@ -110,12 +119,64 @@ class MultiImageResultTests(unittest.TestCase):
                 raise AssertionError("must not wait for stalled transport tail after strict final")
             finally:
                 closed.append(True)
-        with mock.patch("services.protocol.conversation.conversation_events", stream):
+        with executing(context), mock.patch("services.protocol.conversation.conversation_events", stream):
             output = list(stream_image_outputs(backend, ConversationRequest(prompt="fixture", model="gpt-image-2")))
         self.assertTrue(output)
         self.assertEqual(closed, [True])
         self.assertEqual(backend.calls, 1)
         self.assertIs(backend.resolve_conversation_image_urls.call_args.kwargs["poll"], False)
+        context.terminal.assert_not_called()
+        self.assertTrue(receipt["_turn_reserved"])
+        self.assertFalse(receipt["_upstream_terminal"])
+
+    def test_image_terminal_observation_excludes_partial_foreign_and_failed_reads(self):
+        import copy
+        from services.request_context import executing
+        from services.protocol.conversation import _stream_image_terminal_result
+        from utils.helper import UpstreamHTTPError
+        doc = _conversation(["file-one"])
+        doc["mapping"]["request"]["message"]["id"] = "request"
+        doc["mapping"]["tool"]["message"].update(id="tool", status="finished_successfully")
+        doc["mapping"]["final"] = {"parent":"tool", "message": {
+            "id":"final", "author":{"role":"assistant"}, "status":"finished_successfully",
+            "end_turn":True, "channel":"final"}}
+        doc["current_node"] = "final"
+        for case in ("partial", "tool-leaf", "wrong-parent", "429"):
+            with self.subTest(case=case):
+                current = copy.deepcopy(doc)
+                if case == "tool-leaf": current["current_node"] = "tool"
+                if case == "wrong-parent": current["mapping"]["request"]["parent"] = "foreign"
+                backend = FakeBackend([current])
+                if case == "429":
+                    backend._get_conversation = mock.Mock(side_effect=UpstreamHTTPError("GET", "/conversation", 429, {}))
+                context = mock.Mock()
+                context.receipt.return_value = {}
+                with executing(context):
+                    result = _stream_image_terminal_result(backend, {"conversation_id":"conv-1"},
+                        "request", ["file-one", "file-two"] if case=="partial" else ["file-one"], [], "prior-turn")
+                self.assertFalse(result)
+                context.record_stage.assert_not_called()
+                context.terminal.assert_not_called()
+
+    def test_image_terminal_diagnostic_failure_and_multi_send_do_not_change_completion(self):
+        from services.request_context import executing
+        from services.protocol.conversation import _observe_image_terminal
+        for expected, sequence in ((2,1), (1,2)):
+            context = mock.Mock()
+            context.receipt.return_value = {"_expected_sends":expected, "_send_sequence":sequence}
+            with executing(context): _observe_image_terminal()
+            context.record_stage.assert_not_called()
+            context.terminal.assert_not_called()
+        context = mock.Mock()
+        receipt = {"_execution_timeline":[]}
+        context.receipt.return_value = receipt
+        context.record_stage.side_effect = lambda stage, **kw: receipt["_execution_timeline"].append({"stage":stage, **kw})
+        with executing(context):
+            _observe_image_terminal(); _observe_image_terminal()
+        context.record_stage.assert_called_once_with("upstream_terminal", known=True)
+        context.terminal.assert_not_called()
+        context.receipt.side_effect = OSError("private store error")
+        with executing(context): _observe_image_terminal()  # Diagnostics cannot fail the image.
 
     def test_open_stream_tool_leaf_and_repeated_asset_events_do_not_finish_early(self):
         backend = FakeBackend([_conversation(["file-one"])])

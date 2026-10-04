@@ -986,6 +986,30 @@ def _remove_image_conversation_later(
     threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 
 
+def _observe_image_terminal():
+    """Record a verified single-send turn without releasing its work or slot."""
+    from services.request_context import current_request
+    context = current_request.get()
+    if context is None:
+        return
+    try:
+        receipt = context.receipt()
+        # A first image/turn must not terminate a multi-send task in telemetry.
+        # Retried generations retain their history; don't present its first
+        # turn's timestamp as the completion of a later send either.
+        if (int(receipt.get("_expected_sends") or 1) != 1
+                or int(receipt.get("_send_sequence") or 1) != 1):
+            return
+        if any(e.get("stage") == "upstream_terminal" and e.get("known") is True
+               for e in receipt.get("_execution_timeline", [])):
+            return
+        # terminal(True) changes admission occupancy. This is timing evidence
+        # only: downloading, publishing and work completion retain their gates.
+        context.record_stage("upstream_terminal", known=True)
+    except Exception:
+        pass  # Missing diagnostics must not retry or discard the original.
+
+
 def _stream_image_terminal_result(backend, event, request_message_id, file_ids, sediment_ids, expected_parent=""):
     """One signal-triggered read; a tool leaf cannot close an open image stream."""
     from services.request_context import AdmissionLost
@@ -1006,9 +1030,12 @@ def _stream_image_terminal_result(backend, event, request_message_id, file_ids, 
                 or {x for record in records for x in record["sediment_ids"]} != set(sediment_ids)):
             return False
         if callable(check):
-            return check(document, conversation_id, request_message_id, file_ids, sediment_ids) is True
-        finished_parent(document, conversation_id, request_message_id,
-                        expected_parent=expected_parent or None, expected_result_ids=file_ids+sediment_ids)
+            if check(document, conversation_id, request_message_id, file_ids, sediment_ids) is not True:
+                return False
+        else:
+            finished_parent(document, conversation_id, request_message_id,
+                            expected_parent=expected_parent or None, expected_result_ids=file_ids+sediment_ids)
+        _observe_image_terminal()
         return True
     except (AdmissionLost, AccountRequestDeadlineExceeded, ImageActiveDeadlineExceeded):
         raise
@@ -1573,6 +1600,7 @@ def _generate_bound_single_image(
                                     "image_thread_predecessor_message", None),
                                 predecessor_result_ids=getattr(request.progress_callback,
                                     "image_thread_predecessor_result_ids", None))
+                            _observe_image_terminal()
                             return True
                         except ImageThreadError:
                             return False
@@ -1622,6 +1650,7 @@ def _generate_bound_single_image(
                         expected_result_ids=getattr(request.progress_callback, "image_thread_result_ids", None),
                         predecessor_request_message_id=getattr(request.progress_callback, "image_thread_predecessor_message", None),
                         predecessor_result_ids=getattr(request.progress_callback, "image_thread_predecessor_result_ids", None))
+                    _observe_image_terminal()
                 else:
                     next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
                 for output in outputs:

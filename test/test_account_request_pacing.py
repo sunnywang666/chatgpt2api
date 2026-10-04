@@ -1397,9 +1397,10 @@ def test_native_partial_response_timeout_keeps_stage_snapshot(tmp_path, monkeypa
     monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
     monkeypatch.setattr(pacing, "_clocks", {})
     pacing.pace_account_session(session, {"account_id": "fixture-only"}, "fixture-token")
+    caller_curl = session.curl
     try:
         with patch("services.account_request_pacing.logger.info") as log:
-            with __import__("pytest").raises(Timeout):
+            with __import__("pytest").raises(Timeout) as caught:
                 session.get("https://chatgpt.com/backend-api/conversation/original", timeout=.2)
             attempt = next(c.args[0] for c in log.call_args_list
                            if c.args[0].get("event") == "account_http_attempt")
@@ -1412,11 +1413,56 @@ def test_native_partial_response_timeout_keeps_stage_snapshot(tmp_path, monkeypa
         assert 0 <= metrics["connect_secs"] <= metrics["starttransfer_secs"] < metrics["total_secs"]
         assert .15 <= metrics["total_secs"] < 1
         assert len(received) == 1, "diagnostics must not retry"
+        # Keep the exception/traceback/response alive: cleanup must not wait
+        # for their collection, and must not close the caller's own handle.
+        assert caught.value.response.curl._curl is None
+        assert caller_curl._curl is not None
     finally:
         release.set()
         session.close()
         server.shutdown()
         server.server_close()
+
+
+def test_native_joined_read_releases_only_worker_handle_and_keeps_buffered_result(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit
+    from curl_cffi import requests
+    import services.account_request_pacing as pacing
+    from services.config import ConfigStore
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_GET(self):
+            body = b'{"original":"saved"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    session = requests.Session(trust_env=False)
+    caller_curl = session.curl
+    raw_send = session.request
+    session.request = lambda method, url, **kw: raw_send(
+        method, f"http://127.0.0.1:{server.server_port}"+urlsplit(url).path, **kw)
+    (tmp_path/"config.json").write_text(json.dumps({"auth-key":"test-only"}))
+    settings = ConfigStore(tmp_path/"config.json")
+    settings.update({"account_request_interval_secs":0, "account_conversation_read_interval_secs":0})
+    monkeypatch.setattr(pacing, "config", settings)
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    pacing.pace_account_session(session, {"account_id":"fixture-only"}, "fixture-token")
+    try:
+        results = [session.get("https://chatgpt.com/backend-api/conversation/original", timeout=1)
+                   for _ in range(2)]
+        assert all(response.json()=={"original":"saved"} for response in results)
+        assert all(response.curl._curl is None for response in results)
+        assert caller_curl._curl is not None
+        asset = session.get("https://object.example/asset", timeout=1)
+        assert asset.json()=={"original":"saved"}
+        assert asset.curl is caller_curl and caller_curl._curl is not None
+    finally:
+        session.close(); server.shutdown(); server.server_close()
 
 
 def test_native_get_connect_cap_preserves_total_deadline(tmp_path, monkeypatch):
