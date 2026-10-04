@@ -96,3 +96,178 @@ def test_new_success_can_restore_observed_projection_without_mutating_account():
     before = deepcopy(account)
     assert owned_accounts.observed_capacity(account)["state"] == "observed"
     assert account == before
+
+
+@pytest.mark.parametrize("route", ["pool", "remote", "remote_after_401"])
+@pytest.mark.parametrize("success", [True, False])
+def test_late_capacity_observation_cannot_erase_consumption(tmp_path, monkeypatch, route, success):
+    from services.account_service import AccountService
+    from services.storage.json_storage import JSONStorageBackend
+    from services.openai_backend_api import InvalidAccessTokenError
+    from unittest.mock import Mock
+
+    account_id = "12345678-1234-5678-9234-567812345678"
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([{
+        "access_token": "fixture-old", "account_id": account_id, "user_id": "fixture-user",
+        "managed_owner": "fixture-owner", "source_type": "web", "status": "正常", "type": "Plus",
+        **snapshot(1),
+    }])
+    token = ["fixture-old"]
+    def refresh(value, **kw):
+        if kw.get("force"):
+            token[0] = service._apply_refreshed_tokens(value, {"access_token": "fixture-new"}, "fixture")
+        return token[0]
+    monkeypatch.setattr(service, "refresh_access_token", refresh)
+    remote = {"quota": 1, "status": "正常", "account_id": account_id, "user_id": "fixture-user",
+              "limits_progress": [{"feature_name": "image_gen", "remaining": 1}]}
+    applied = [False]
+    def read():
+        if not applied[0]:
+            applied[0] = True
+            service.mark_image_result(token[0], success)
+        return deepcopy(remote)
+    def backend(value):
+        obj = Mock()
+        if route == "remote_after_401" and value == "fixture-old":
+            obj.get_user_info.side_effect = InvalidAccessTokenError("fixture unauthorized")
+        else:
+            obj.get_user_info.side_effect = read
+        return obj
+    monkeypatch.setattr("services.openai_backend_api.OpenAIBackendAPI", backend)
+    # Preserve the validator normally exposed by the real constructor.
+    backend._validated_account_id = lambda value: value
+    monkeypatch.setattr(service, "_verified_chat_info", lambda value: (("fixture-user", account_id), read()))
+    ref = service.list_pool_accounts()[0]["account_ref"]
+    def observe():
+        if route == "pool":
+            service._refresh_pool_chat(ref)
+        else:
+            service.fetch_remote_info(token[0])
+    observe()
+    saved = AccountService(JSONStorageBackend(tmp_path / "accounts.json")).get_account(token[0])
+    assert saved["capacity_used_since_observation"] is True
+    assert saved["quota"] == (0 if success else 1)
+    assert saved["status"] == ("限流" if success else "正常")
+    assert (saved["success"], saved["fail"]) == ((1, 0) if success else (0, 1))
+    assert owned_accounts.observed_capacity(saved)["state"] == "stale"
+    # The following real observation begins after consumption and can restore
+    # eligibility. Rejecting the stale one must not permanently disable it.
+    observe()
+    latest = service.get_account(token[0])
+    assert latest["capacity_used_since_observation"] is False
+    assert latest["quota"] == 1 and latest["status"] == "正常"
+    assert owned_accounts.observed_capacity(latest)["state"] == "observed"
+
+
+@pytest.mark.parametrize("route", ["pool", "remote"])
+def test_late_positive_observation_keeps_newer_zero_observation(tmp_path, monkeypatch, route):
+    from services.account_service import AccountService
+    from services.storage.json_storage import JSONStorageBackend
+    from unittest.mock import Mock
+
+    account_id = "12345678-1234-5678-9234-567812345678"
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([{
+        "access_token": "fixture", "account_id": account_id, "user_id": "fixture-user",
+        "managed_owner": "fixture-owner", "source_type": "web", "status": "正常", "type": "Plus",
+        **snapshot(1, (NOW - timedelta(seconds=1)).isoformat()),
+    }])
+    monkeypatch.setattr(service, "refresh_access_token", lambda value, **kw: value)
+    def read():
+        service.update_account("fixture", {**snapshot(0), "status": "限流"}, quiet=True)
+        return {"quota": 1, "status": "正常", "account_id": account_id, "user_id": "fixture-user",
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 1}]}
+    backend = Mock()
+    backend.return_value.get_user_info.side_effect = read
+    backend._validated_account_id.side_effect = lambda value: value
+    monkeypatch.setattr("services.openai_backend_api.OpenAIBackendAPI", backend)
+    monkeypatch.setattr(service, "_verified_chat_info", lambda value: (("fixture-user", account_id), read()))
+    if route == "pool":
+        service._refresh_pool_chat(service.list_pool_accounts()[0]["account_ref"])
+    else:
+        service.fetch_remote_info("fixture")
+    saved = AccountService(JSONStorageBackend(tmp_path / "accounts.json")).get_account("fixture")
+    assert saved["quota"] == 0 and saved["status"] == "限流"
+    assert saved["limits_progress"][0]["remaining"] == 0
+    assert saved["capacity_observed_at"] == NOW.isoformat()
+    assert saved["capacity_used_since_observation"] is False
+
+
+@pytest.mark.parametrize("route", ["pool", "remote"])
+def test_newer_zero_observation_survives_older_positive_completing_first(tmp_path, monkeypatch, route):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, current_thread
+    from unittest.mock import Mock
+    from services.account_service import AccountService
+    from services.storage.json_storage import JSONStorageBackend
+
+    account_id = "12345678-1234-5678-9234-567812345678"
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([{
+        "access_token": "fixture", "account_id": account_id, "user_id": "fixture-user",
+        "managed_owner": "fixture-owner", "source_type": "web", "status": "正常", "type": "Plus",
+        **snapshot(1, (NOW - timedelta(seconds=1)).isoformat()),
+    }])
+    monkeypatch.setattr(service, "refresh_access_token", lambda value, **kw: value)
+    first_started, second_started, first_saved = Event(), Event(), Event()
+    times = {}
+    monkeypatch.setattr(owned_accounts, "utc_now", lambda: times[current_thread().name])
+    def read():
+        if times[current_thread().name] == NOW.isoformat():
+            first_started.set()
+            assert second_started.wait(5)
+            return {**snapshot(1), "status": "正常", "account_id": account_id, "user_id": "fixture-user"}
+        second_started.set()
+        assert first_saved.wait(5)
+        return {**snapshot(0), "status": "限流", "account_id": account_id, "user_id": "fixture-user"}
+    backend = Mock()
+    backend.return_value.get_user_info.side_effect = read
+    backend._validated_account_id.side_effect = lambda value: value
+    monkeypatch.setattr("services.openai_backend_api.OpenAIBackendAPI", backend)
+    monkeypatch.setattr(service, "_verified_chat_info", lambda value: (("fixture-user", account_id), read()))
+    ref = service.list_pool_accounts()[0]["account_ref"]
+    def observe(second):
+        times[current_thread().name] = (NOW + timedelta(seconds=int(second))).isoformat()
+        try:
+            if route == "pool":
+                service._refresh_pool_chat(ref)
+            else:
+                service.fetch_remote_info("fixture")
+        finally:
+            if not second:
+                first_saved.set()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(observe, False)
+        assert first_started.wait(5)
+        second = executor.submit(observe, True)
+        first.result(timeout=10)
+        second.result(timeout=10)
+    saved = AccountService(JSONStorageBackend(tmp_path / "accounts.json")).get_account("fixture")
+    assert saved["quota"] == 0 and saved["limits_progress"][0]["remaining"] == 0
+    assert saved["capacity_observed_at"] == (NOW + timedelta(seconds=1)).isoformat()
+    assert saved["capacity_used_since_observation"] is False
+
+
+def test_reimport_old_export_does_not_rewind_consumption_or_reenable_late_observation(tmp_path):
+    from services.account_service import AccountService
+    from services.storage.json_storage import JSONStorageBackend
+
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([{
+        "access_token": "fixture", "managed_owner": "fixture-owner", "source_type": "web",
+        "status": "正常", "type": "Plus", **snapshot(1),
+    }])
+    old = service.get_account("fixture")
+    expected = service._capacity_observation_revision(old)
+    service.mark_image_result("fixture", True)
+    result = service.add_account_items([{**old, "refresh_token": "fixture-replacement"}])
+    assert result["added"] == 0 and result["skipped"] == 1
+    service.update_account("fixture", {**snapshot(1), "status": "正常"},
+                           expected_credentials=("fixture", str(old.get("account_id") or "")),
+                           expected_capacity_observation=expected)
+    saved = AccountService(JSONStorageBackend(tmp_path / "accounts.json")).get_account("fixture")
+    assert saved["quota"] == 0 and saved["status"] == "限流"
+    assert saved["success"] == 1 and saved["fail"] == 0
+    assert saved["capacity_used_since_observation"] is True
+    assert saved["refresh_token"] == "fixture-replacement"

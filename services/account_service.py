@@ -784,6 +784,8 @@ class AccountService:
     def _apply_refreshed_tokens(
         self, old_access_token: str, token_data: dict, event: str, *,
         expected_revision: str | None = None, chat_info: dict | None = None,
+        expected_capacity_observation: tuple[int, int, str] | None = None,
+        capacity_observed_at: str | None = None,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
         with self._image_slot_condition:
@@ -815,19 +817,21 @@ class AccountService:
             next_item["last_refresh_error"] = None
             next_item["last_refresh_error_at"] = None
             if chat_info is not None:
-                limits = chat_info.get("limits_progress")
-                quota = chat_info.get("quota")
-                next_item["limits_progress"] = limits if isinstance(limits, list) else []
-                next_item["quota"] = quota if type(quota) is int and quota >= 0 else None
-                # A verified replacement for the same Chat principal resolves
-                # a retained invalid-authorization state. A token refresh
-                # without a protected Chat read must not do so.
-                if (next_item.get("status") == "异常" and not next_item.get("managed_disabled")
-                        and chat_info.get("status") in {"正常", "限流"}):
-                    next_item["status"] = chat_info["status"]
-                next_item["capacity_observed_at"] = now
-                next_item["capacity_used_since_observation"] = False
-                next_item["capacity_read_failed_at"] = None
+                if self._capacity_observation_can_apply(
+                        current, expected_capacity_observation, capacity_observed_at):
+                    limits = chat_info.get("limits_progress")
+                    quota = chat_info.get("quota")
+                    next_item["limits_progress"] = limits if isinstance(limits, list) else []
+                    next_item["quota"] = quota if type(quota) is int and quota >= 0 else None
+                    # A verified replacement for the same Chat principal resolves
+                    # a retained invalid-authorization state. A token refresh
+                    # without a protected Chat read must not do so.
+                    if (next_item.get("status") == "异常" and not next_item.get("managed_disabled")
+                            and chat_info.get("status") in {"正常", "限流"}):
+                        next_item["status"] = chat_info["status"]
+                    next_item["capacity_observed_at"] = capacity_observed_at or now
+                    next_item["capacity_used_since_observation"] = False
+                    next_item["capacity_read_failed_at"] = None
                 verified_user = str(chat_info.get("user_id") or "").strip()
                 verified_workspace = self._validated_workspace_id(chat_info.get("account_id"))
                 if verified_user:
@@ -2089,6 +2093,8 @@ class AccountService:
             if not self._chat_authorization_saved(account):
                 return
             expected = (token, str(account.get("account_id") or ""))
+            expected_capacity = self._capacity_observation_revision(account)
+            observed_at = utc_now()
             # /backend-api/me.id is a Chat user ID, not the OAuth JWT sub.
             # Compare each upstream identity to its own persisted namespace.
             # The credential CAS below still fences rotations of this row.
@@ -2105,6 +2111,7 @@ class AccountService:
                 {"capacity_read_failed_at": utc_now(), "managed_updated_at": utc_now()},
                 quiet=True,
                 expected_credentials=expected,
+                expected_capacity_observation=expected_capacity,
             )
             return
         updates = {
@@ -2112,7 +2119,7 @@ class AccountService:
             "account_id": observed_identity[1],
             "limits_progress": info.get("limits_progress") if isinstance(info.get("limits_progress"), list) else [],
             "quota": info.get("quota") if type(info.get("quota")) is int and info["quota"] >= 0 else None,
-            "capacity_observed_at": utc_now(),
+            "capacity_observed_at": observed_at,
             "capacity_used_since_observation": False,
             "capacity_read_failed_at": None,
             "managed_updated_at": utc_now(),
@@ -2128,7 +2135,8 @@ class AccountService:
             )
         if isinstance(info.get("email"), str):
             updates["email"] = info["email"]
-        self.update_account(token, updates, quiet=True, expected_credentials=expected)
+        self.update_account(token, updates, quiet=True, expected_credentials=expected,
+                            expected_capacity_observation=expected_capacity)
 
     def _refresh_pool_account_once(
         self, account_ref: str, routes: tuple[str, ...], stale_only: bool,
@@ -2756,6 +2764,8 @@ class AccountService:
         identity = (subject, next(iter(workspace_ids))) if subject and len(workspace_ids) == 1 else None
         related = None
         observation = None
+        expected_capacity = None
+        capacity_observed_at = None
         with self._lock:
             if account_ref:
                 target_token, target = self._pool_account_locked(account_ref)
@@ -2811,6 +2821,12 @@ class AccountService:
                     related = (old_token, self._authorization_revision(old_account), dict(old_account))
 
         if related is None and identity is None:
+            with self._lock:
+                capacity_observed_at = utc_now()
+                capacity_before_probe = {
+                    key: self._capacity_observation_revision(value)
+                    for key, value in self._accounts.items()
+                }
             chat_identity, preliminary_info = self._verified_chat_info(token)
             observation = (token, chat_identity, preliminary_info)
             identity = (subject or chat_identity[0], chat_identity[1])
@@ -2827,9 +2843,17 @@ class AccountService:
                     if old_account.get("source_type") not in {"web", "oauth_login", "password", "codex"}:
                         raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
                     related = (old_token, self._authorization_revision(old_account), dict(old_account))
+                    expected_capacity = capacity_before_probe.get(old_token)
+                    if expected_capacity is None:
+                        # The matched row appeared during identity discovery;
+                        # acquire its own capacity evidence after its snapshot.
+                        observation = None
 
         if related is not None:
             old_token, revision, previous = related
+            if expected_capacity is None:
+                expected_capacity = self._capacity_observation_revision(previous)
+                capacity_observed_at = utc_now()
             if identity is None:
                 identity, _old_info = self._verified_chat_info(old_token)
             replacement, verified_identity, info = self._verified_chat_import_material(
@@ -2852,6 +2876,8 @@ class AccountService:
                 self._apply_refreshed_tokens(
                     old_token, replacement, "workbench_chat_authorization_import",
                     expected_revision=revision, chat_info=info,
+                    expected_capacity_observation=expected_capacity,
+                    capacity_observed_at=capacity_observed_at,
                 )
             except AccountCommitUncertain:
                 return self._readback_manual_chat_import(old_token, previous, replacement, verified_identity)
@@ -3152,6 +3178,13 @@ class AccountService:
                 else:
                     skipped += 1
                 incoming = dict(payload)
+                if access_token in self._accounts:
+                    # Re-importing an old export cannot rewind server-owned
+                    # consumption/observation state; fresh reads update it.
+                    for key in ("success", "fail", "last_used_at", "quota", "limits_progress",
+                                "capacity_observed_at", "capacity_used_since_observation",
+                                "capacity_read_failed_at", "status", "restore_at"):
+                        incoming.pop(key, None)
                 if not incoming.get("created_at"):
                     incoming.pop("created_at", None)
                 account = self._normalize_account(
@@ -3194,6 +3227,31 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
+    @staticmethod
+    def _capacity_observation_revision(account: dict) -> tuple[int, int, str]:
+        # Reuse the persisted consumption counters and last observation rather
+        # than letting a slow response certify capacity from before a result.
+        return (int(account.get("success") or 0), int(account.get("fail") or 0),
+                str(account.get("capacity_observed_at") or ""))
+
+    @classmethod
+    def _capacity_observation_can_apply(
+        cls, current: dict, expected: tuple[int, int, str] | None, observed_at: str | None,
+    ) -> bool:
+        if expected is None:
+            return True
+        actual = cls._capacity_observation_revision(current)
+        if expected[:2] != actual[:2]:
+            return False
+        if expected[2] == actual[2]:
+            return True
+        # Order concurrent reads by their start, not their completion. A newer
+        # zero must survive either completion order; an old positive cannot
+        # replace it. Use the existing observation timestamp, no new counter.
+        started = cls._parse_time(observed_at)
+        saved = cls._parse_time(actual[2])
+        return started is not None and saved is not None and started > saved
+
     def update_account(
         self,
         access_token: str,
@@ -3202,6 +3260,7 @@ class AccountService:
         *,
         expected_credentials: tuple[str, str] | None = None,
         expected_codex_credentials: tuple[str, str] | None = None,
+        expected_capacity_observation: tuple[int, int, str] | None = None,
     ) -> dict | None:
         if not access_token:
             return None
@@ -3219,6 +3278,9 @@ class AccountService:
                 return dict(current)
             if (expected_codex_credentials is not None
                     and expected_codex_credentials != self.codex_authorization_fields(current)):
+                return dict(current)
+            if not self._capacity_observation_can_apply(
+                    current, expected_capacity_observation, updates.get("capacity_observed_at")):
                 return dict(current)
             account = self._normalize_account({**current, **updates, "access_token": access_token})
             if account is None:
@@ -3326,6 +3388,7 @@ class AccountService:
         if not access_token:
             raise ValueError("access_token is required")
 
+        from services.owned_accounts import utc_now
         active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
         if (self.get_account(active_token) or {}).get("source_type") == "codex":
             # Background refresh must use this authorization's actual route.
@@ -3342,6 +3405,8 @@ class AccountService:
                 active_token,
                 str(request_account.get("account_id") or ""),
             )
+            expected_capacity = self._capacity_observation_revision(request_account)
+            observed_at = utc_now()
             backend = OpenAIBackendAPI(active_token)
             try:
                 result = backend.get_user_info()
@@ -3356,6 +3421,8 @@ class AccountService:
                         refreshed_token,
                         str(request_account.get("account_id") or ""),
                     )
+                    expected_capacity = self._capacity_observation_revision(request_account)
+                    observed_at = utc_now()
                     backend = OpenAIBackendAPI(refreshed_token)
                     try:
                         result = backend.get_user_info()
@@ -3387,7 +3454,7 @@ class AccountService:
         else:
             result.pop("account_id", None)
         from services.owned_accounts import utc_now
-        result["capacity_observed_at"] = utc_now()
+        result["capacity_observed_at"] = observed_at
         result["capacity_used_since_observation"] = False
         result["capacity_read_failed_at"] = None
         result["managed_updated_at"] = utc_now()
@@ -3401,6 +3468,7 @@ class AccountService:
             active_token,
             result,
             expected_credentials=expected_credentials,
+            expected_capacity_observation=expected_capacity,
         )
 
     # ---- 刷新进度追踪 ----
