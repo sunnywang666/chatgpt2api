@@ -326,7 +326,9 @@ class WorkLifecycleService:
             with self.store.transaction() as db:
                 work = None
                 reservations = {}
-                candidates = [json.loads(raw) for (raw,) in db.execute("SELECT value FROM task_runtime WHERE name LIKE 'work:%'")]
+                candidates = [json.loads(raw) for (raw,) in db.execute(
+                    "SELECT value FROM task_runtime WHERE name LIKE 'work:%' "
+                    "AND json_extract(value,'$.archive.status') IN ('pending','unknown','running')")]
                 candidates.sort(key=lambda w: ((w.get("archive") or {}).get("requested_at", w.get("updated_at", 0)), w["key"]))
                 for candidate in candidates:
                     if target_key is not None and candidate["key"] != target_key:

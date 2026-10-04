@@ -200,10 +200,22 @@ class TaskStore:
             yield handle
 
     @staticmethod
-    def receipts(db):
-        for owner, request_id, raw in db.execute("SELECT owner,id,receipt FROM requests"):
+    def receipts(db, *, statuses=None, include_pending_completion=False):
+        # A scheduler may prefilter candidates before decoding saved image
+        # payloads. Keep full receipts and the caller's authoritative predicates;
+        # public reads, lineage and admission still use the unfiltered default.
+        conditions, values = [], []
+        if statuses is not None:
+            values = list(statuses)
+            if values:
+                conditions.append("json_extract(receipt,'$.status') IN (" + ",".join("?" for _ in values) + ")")
+        if include_pending_completion:
+            conditions.append("(json_type(receipt,'$._completion')='object' AND "
+                              "coalesce(json_extract(receipt,'$._completion.state'),'') NOT IN ('completed','result_ready'))")
+        where = " WHERE (" + " OR ".join(conditions) + ")" if conditions else " WHERE 0" if statuses is not None else ""
+        for owner, request_id, raw in db.execute("SELECT owner,id,receipt FROM requests" + where, values):
             yield "text", owner, request_id, json.loads(raw)
-        for key, raw in db.execute("SELECT task_key,receipt FROM image_requests"):
+        for key, raw in db.execute("SELECT task_key,receipt FROM image_requests" + where, values):
             receipt = json.loads(raw)
             yield "image", receipt["owner_id"], receipt["id"], receipt
 

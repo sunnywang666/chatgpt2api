@@ -574,7 +574,8 @@ class GenerationCompletionService:
         # Only newly accepted pure-generation requests opt into the automatic
         # policy. Upgrading never silently replays historical UNKNOWN receipts.
         with self.store.transaction() as db:
-            for kind, owner, rid, row in self.store.receipts(db):
+            for kind, owner, rid, row in self.store.receipts(
+                    db, statuses=("unknown", "failed", "error"), include_pending_completion=True):
                 if (row.get("_automatic_generation_recovery") and not row.get("_completion")
                         and not row.get("_completion_of") and row.get("status") in {"unknown", "failed", "error"}
                         and not row.get("_recovery_paused") and not row.get("_recovery_suppressed")):
@@ -594,7 +595,8 @@ class GenerationCompletionService:
                     if state.get("selected_id"):
                         self.store.write_receipt(db, kind, owner, rid, row)
         with self.store.connect() as db:
-            candidates = [(kind, owner, rid) for kind, owner, rid, row in self.store.receipts(db)
+            candidates = [(kind, owner, rid) for kind, owner, rid, row in self.store.receipts(
+                              db, statuses=(), include_pending_completion=True)
                           if row.get("_completion", {}).get("state") not in {None, "completed", "result_ready"}
                           and not row.get("_recovery_paused") and not row.get("_recovery_suppressed")
                           and row.get("_completion", {}).get("next_at") is not None

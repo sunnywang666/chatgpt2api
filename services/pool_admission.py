@@ -328,7 +328,7 @@ class PoolAdmission:
         if completion is not None:
             completion.process_one()
         with self.store.connect() as db:
-            rows = list(self.store.receipts(db))
+            rows = list(self.store.receipts(db, statuses=("unknown", "failed", "error")))
         # Use the existing persisted retry timestamps. A short-backoff legacy
         # scan must not monopolize recovery ahead of other overdue originals.
         # Missing/zero retry times are immediately due. Image created_at is a

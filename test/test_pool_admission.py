@@ -96,6 +96,42 @@ class AdmissionTests(unittest.TestCase):
         return self.images.submit_generation({"id": owner, "role": "user", "external_image_client": True},
                                              client_task_id=name, prompt="private image input", model="gpt-image-2", size=None)
 
+    def test_recovery_candidate_reads_preserve_terminal_payloads_and_late_completion(self):
+        large_saved = [{"b64_json": "completed-payload-must-not-be-decoded" * 10000}]
+        rows = {
+            "saved": {"status": "success", "data": large_saved},
+            "ready": {"status": "success", "data": large_saved, "_completion": {"state": "result_ready"}},
+            "closed": {"status": "success", "data": large_saved, "_completion": {"state": "completed"}},
+            "late": {"status": "success", "data": [{"b64_json": "original"}],
+                     "_completion": {"state": "needs_attention", "next_at": None}},
+            "ended-assets": {"status": "error", "error_code": "RESULT_UNRECOVERABLE",
+                             "_attempt_finished_at": 900, "_pending_image_result_ids": {"file_ids": ["original-file"]}},
+            "historical-unknown": {"status": "unknown"},
+            "paused": {"status": "unknown", "_recovery_paused": True},
+        }
+        with self.store.transaction() as db:
+            for rid, row in rows.items():
+                self.store.write_receipt(db, "image", "happy", rid, {"id": rid, "owner_id": "happy", **row})
+        loads = json.loads
+        def candidate_decode(raw):
+            self.assertNotIn("completed-payload-must-not-be-decoded", raw)
+            return loads(raw)
+        with self.store.connect() as db, patch("services.task_store.json.loads", side_effect=candidate_decode):
+            recovery = list(self.store.receipts(db, statuses=("unknown", "failed", "error")))
+            completion = list(self.store.receipts(db, statuses=("unknown", "failed", "error"),
+                                                  include_pending_completion=True))
+            pending = list(self.store.receipts(db, statuses=(), include_pending_completion=True))
+        self.assertEqual({r[2] for r in recovery}, {"ended-assets", "historical-unknown", "paused"})
+        self.assertEqual({r[2] for r in completion}, {"late", "ended-assets", "historical-unknown", "paused"})
+        self.assertEqual({r[2] for r in pending}, {"late"})
+        # Candidate selection must not erase history or change ordinary reads.
+        with self.store.connect() as db:
+            all_rows = {rid: row for _, _, rid, row in self.store.receipts(db)}
+            self.assertEqual(set(all_rows), set(rows))
+            for rid, row in rows.items():
+                self.assertEqual(all_rows[rid], {"id": rid, "owner_id": "happy", **row})
+                self.assertEqual(self.store.read_receipt(db, "image", "happy", rid), all_rows[rid])
+
     def test_independent_image_preparation_uses_capacity_before_next_send_clock(self):
         self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 2}
         self.admission.pacing = lambda account, now: {"next_at": now + 30, "cooldown_until": 0}
