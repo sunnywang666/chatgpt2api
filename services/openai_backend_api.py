@@ -3027,12 +3027,30 @@ class OpenAIBackendAPI:
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
+        from services.request_context import current_request
+        context = current_request.get()
+
+        def observe(stage, count):
+            if context is not None:
+                try:
+                    context.record_stage(stage, image_count=count)
+                except Exception:
+                    # Diagnostics cannot fail an original download or retry it.
+                    pass
+
         images = []
-        for url in urls:
-            response = self.session.get(url, **self._image_request_options(120))
+        for index, url in enumerate(urls):
+            options = self._image_request_options(120)
+            if index == 0:
+                # Local call bracket; includes recording overhead, not the
+                # remote server's receive time or socket-only transfer time.
+                observe("attachment_download_started", len(urls))
+            response = self.session.get(url, **options)
             ensure_ok(response, "image_download")
             if response.content not in images:
                 images.append(response.content)
+        if urls:
+            observe("attachment_download_finished", len(images))
         return images
 
     def stream_conversation(

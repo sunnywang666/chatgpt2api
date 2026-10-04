@@ -2141,6 +2141,12 @@ class ImageTaskService:
                         for item in items:
                             if not isinstance(item, dict) or set(item) != {"b64_json"} or not base64.b64decode(item["b64_json"], validate=True):
                                 raise ValueError("invalid private image output")
+                        context = current_request.get()
+                        if context is not None:
+                            try:
+                                context.record_stage("attachment_download_cache_reused", image_count=len(items))
+                            except Exception:
+                                pass  # Losing timing evidence must not force a download.
                         return items
                     except (OSError, ValueError, KeyError, TypeError):
                         pass  # Missing/corrupt private cache: fetch the same assets.

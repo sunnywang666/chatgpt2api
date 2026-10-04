@@ -146,6 +146,51 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
+    def test_attachment_download_observations_are_bounded_and_follow_actual_bytes(self):
+        from services.request_context import executing
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                events = []
+                context = mock.Mock()
+                context.record_stage.side_effect = lambda stage, **extra: events.append((stage, extra))
+                backend = object.__new__(OpenAIBackendAPI)
+                backend._image_request_options = mock.Mock(return_value={"timeout": 120})
+                backend.session = mock.Mock()
+
+                def download(url, **_kwargs):
+                    self.assertEqual(events, [("attachment_download_started", {"image_count": 2})])
+                    if failure:
+                        raise TimeoutError("signed URL must never enter timing evidence")
+                    return mock.Mock(status_code=200, content=b"same-original-image")
+
+                backend.session.get.side_effect = download
+                urls = ["https://storage.test/one?secret=hidden", "https://storage.test/two?secret=hidden"]
+                with executing(context):
+                    if failure:
+                        with self.assertRaises(TimeoutError):
+                            backend.download_image_bytes(urls)
+                    else:
+                        self.assertEqual(backend.download_image_bytes(urls), [b"same-original-image"])
+                expected = [("attachment_download_started", {"image_count": 2})]
+                if not failure:
+                    expected.append(("attachment_download_finished", {"image_count": 1}))
+                self.assertEqual(events, expected)
+                self.assertEqual(backend.session.get.call_count, 1 if failure else 2)
+
+    def test_attachment_observation_failure_cannot_repeat_download_or_change_result(self):
+        from services.request_context import executing
+        backend = object.__new__(OpenAIBackendAPI)
+        backend._image_request_options = mock.Mock(return_value={"timeout": 120})
+        backend.session = mock.Mock()
+        backend.session.get.return_value = mock.Mock(status_code=200, content=b"original-image")
+        context = mock.Mock()
+        context.record_stage.side_effect = RuntimeError("diagnostic storage unavailable")
+        with executing(context):
+            self.assertEqual(backend.download_image_bytes(["https://storage.test/original"]), [b"original-image"])
+            self.assertEqual(backend.download_image_bytes([]), [])
+        self.assertEqual(backend.session.get.call_count, 1)
+        self.assertEqual(context.record_stage.call_count, 2)
+
     def test_image_external_transfers_consume_deadline_without_account_clock(self):
         from services.openai_backend_api import requests
         with tempfile.TemporaryDirectory() as tmp, \
@@ -1145,6 +1190,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(DownloadBackend.reads, 0)
 
     def test_downloaded_original_is_private_and_reused_after_confirmation_failure(self):
+        from services.request_context import executing
         for alteration in ("unchanged", "asset_drift", "corrupt", "confirmation_still_fails"):
             with self.subTest(alteration=alteration), tempfile.TemporaryDirectory() as tmp_dir:
                 path = Path(tmp_dir) / "image_tasks.json"
@@ -1155,6 +1201,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 service._update_task("owner-1:policy-task", _image_thread={"id": "original-thread"})
                 calls = {"download": 0, "resolve": 0, "confirm": 0}
                 fail_confirmation = [True]
+                timing_context = mock.Mock(kind="timing-fixture")
 
                 class Backend:
                     def __init__(self, **_kwargs): pass
@@ -1176,8 +1223,9 @@ class ImageTaskServiceTests(unittest.TestCase):
                     return "verified-parent"
 
                 def resume(current):
-                    current._run_resume_poll("owner-1:policy-task", "conversation-1", 60,
-                                             "http://localhost", OWNER, "generate", "gpt-image-2", False, False)
+                    with executing(timing_context):
+                        current._run_resume_poll("owner-1:policy-task", "conversation-1", 60,
+                                                 "http://localhost", OWNER, "generate", "gpt-image-2", False, False)
 
                 with (
                     mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
@@ -1216,6 +1264,9 @@ class ImageTaskServiceTests(unittest.TestCase):
                     self.assertEqual(calls["confirm"], 3 if alteration == "confirmation_still_fails" else 2)
                     publish.assert_called_once()
                     self.assertIsNone(service._tasks["owner-1:policy-task"]["_pending_image_output"])
+                    expected_reuses = 2 if alteration == "confirmation_still_fails" else 1 if alteration == "unchanged" else 0
+                    self.assertEqual(timing_context.record_stage.call_args_list,
+                                     [mock.call("attachment_download_cache_reused", image_count=1)] * expected_reuses)
 
     def test_pending_image_ids_survive_restart_without_skipping_settle_or_releasing_capacity(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
