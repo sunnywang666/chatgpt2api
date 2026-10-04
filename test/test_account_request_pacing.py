@@ -106,7 +106,11 @@ class AccountRequestPacingTests(unittest.TestCase):
                         raise TimeoutError("earlier reader was starved")
                     now[0] = 10120
                 else:
-                    now[0] += seconds
+                    # The earlier caller may reacquire the file lock after its
+                    # response while the later caller is persisting its turn.
+                    # Yield for that OS-lock retry without moving the shared
+                    # synthetic clock beyond the two explicitly released turns.
+                    threading.Event().wait(0.001)
 
             def read(clock, name):
                 try:
@@ -136,6 +140,188 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(sent, [("earlier", 10060), ("later", 10120)])
             self.assertEqual(AccountRequestClock("account", path).ordinary_read_queue, [])
+
+    def test_original_reads_overlap_without_holding_generation_send_lock(self):
+        from services.request_context import current_request
+        entered, release = threading.Event(), threading.Event()
+        calls, errors = [], []
+        context = Context("first-read")
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+            path = Path(tmp) / "clock.json"
+            first = AccountRequestClock("account", path)
+            second = AccountRequestClock("account", path)
+            def send(method, url, **kwargs):
+                calls.append((method, url.rsplit("/", 1)[-1], current_request.get()))
+                if url.endswith("/first"):
+                    entered.set()
+                    if not release.wait(2):
+                        raise TimeoutError("concurrent read/send remained blocked")
+                return Response()
+            def read():
+                try:
+                    with executing(context):
+                        first.request(send, "GET", "https://provider/conversation/first")
+                except BaseException as exc:
+                    errors.append(exc)
+            worker = threading.Thread(target=read)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                second.request(send, "GET", "https://provider/conversation/second")
+                second.request(send, "POST", "https://provider/conversation")
+                self.assertTrue(worker.is_alive(), "first read must still be receiving")
+            finally:
+                release.set()
+                worker.join(3)
+            self.assertEqual(errors, [])
+            self.assertEqual([(m, name) for m, name, _ in calls],
+                             [("GET", "first"), ("GET", "second"), ("POST", "conversation")])
+            self.assertIs(calls[0][2], context)
+            self.assertEqual(AccountRequestClock("account", path).ordinary_read_queue, [])
+
+    def test_late_original_read_success_preserves_other_read_cooldown(self):
+        for retry_after in (None, "120"):
+            with self.subTest(retry_after=retry_after), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                 patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+                path = Path(tmp) / "clock.json"
+                first, second = AccountRequestClock("account", path), AccountRequestClock("account", path)
+                entered, release = threading.Event(), threading.Event()
+                errors = []
+                def send(method, url, **kwargs):
+                    response = Response()
+                    if url.endswith("/first"):
+                        entered.set()
+                        if not release.wait(2):
+                            raise TimeoutError("second read remained serialized")
+                    else:
+                        response.status_code = 429
+                        response.headers = {} if retry_after is None else {"Retry-After": retry_after}
+                    return response
+                def read():
+                    try:
+                        first.request(send, "GET", "https://provider/conversation/first")
+                    except BaseException as exc:
+                        errors.append(exc)
+                worker = threading.Thread(target=read)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    second.request(send, "GET", "https://provider/conversation/second")
+                    before = json.loads(path.read_text())
+                finally:
+                    release.set()
+                    worker.join(3)
+                self.assertEqual(errors, [])
+                after = json.loads(path.read_text())
+                for field in ("rate_failures", "conversation_read_rate_failures", "last_rate_limit_evidence"):
+                    self.assertEqual(after[field], before[field])
+                self.assertGreaterEqual(after["cooldown_until"], before["cooldown_until"] - 0.001)
+                self.assertGreaterEqual(after["next_conversation_read"], before["next_conversation_read"] - 0.001)
+                self.assertEqual(after["last_rate_limit_evidence"]["scope"],
+                                 "conversation_read" if retry_after is None else "account")
+
+    def test_read_transport_error_is_joined_and_preserves_newer_reservation(self):
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+            path = Path(tmp) / "clock.json"
+            first, second = AccountRequestClock("account", path), AccountRequestClock("account", path)
+            def send(method, url, **kwargs):
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError("other reader could not reserve")
+                raise ConnectionError("controlled transport failure")
+            def read():
+                try:
+                    first.request(send, "GET", "https://provider/conversation/first")
+                except BaseException as exc:
+                    errors.append(exc)
+            worker = threading.Thread(target=read)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                with second.lock:
+                    second._ordinary_read_turn("later-reader", time.monotonic(), 60)
+                    second.next_conversation_read = time.monotonic() + 60
+                    second._save()
+            finally:
+                release.set()
+                worker.join(3)
+            self.assertEqual([type(exc) for exc in errors], [ConnectionError])
+            reloaded = AccountRequestClock("account", path)
+            self.assertGreater(reloaded.next_conversation_read, time.monotonic())
+            self.assertEqual([entry["owner"] for entry in reloaded.ordinary_read_queue], ["later-reader"])
+
+    def test_failed_read_floor_save_keeps_lock_and_reconciles_received_limit(self):
+        for transport_error in (False, True):
+            with self.subTest(transport_error=transport_error), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                 patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+                path = Path(tmp) / "clock.json"
+                clock, other = AccountRequestClock("account", path), AccountRequestClock("account", path)
+                entered, release = threading.Event(), threading.Event()
+                response = Response()
+                response.status_code, response.headers = 429, {}
+                saved, started = clock._save, threading.Thread.start
+                failure_injected = False
+                lock_was_held = []
+                def send(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(2):
+                        raise TimeoutError("floor failure was not injected")
+                    acquired = other.lock.acquire(blocking=False)
+                    lock_was_held.append(not acquired)
+                    if acquired:
+                        other.lock.release()
+                    if transport_error:
+                        raise ConnectionError("controlled transport failure")
+                    return response
+                def start_and_wait(worker):
+                    started(worker)
+                    self.assertTrue(entered.wait(1))
+                def save():
+                    nonlocal failure_injected
+                    if entered.is_set() and not failure_injected:
+                        failure_injected = True
+                        release.set()
+                        raise KeyboardInterrupt("controlled caller interruption")
+                    saved()
+                with patch.object(threading.Thread, "start", start_and_wait), patch.object(clock, "_save", save):
+                    with self.assertRaises(KeyboardInterrupt) as caught:
+                        clock.request(send, "GET", "https://provider/conversation/original")
+                self.assertEqual(lock_was_held, [True])
+                self.assertFalse(clock.lock.locked())
+                if transport_error:
+                    self.assertIsInstance(caught.exception.__cause__, ConnectionError)
+                else:
+                    self.assertTrue(response.closed)
+                    self.assertEqual(AccountRequestClock("account", path).conversation_read_rate_failures, 1)
+
+    def test_read_reacquire_failure_closes_response_without_unlocked_save(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            response = Response()
+            original = clock.lock.acquire
+            acquiring = 0
+            def acquire(*args, **kwargs):
+                nonlocal acquiring
+                acquiring += 1
+                if acquiring == 2:
+                    raise OSError("controlled clock reload failure")
+                return original(*args, **kwargs)
+            with patch.object(clock.lock, "acquire", acquire):
+                with self.assertRaisesRegex(OSError, "controlled clock reload failure"):
+                    clock.request(lambda *a, **kw: response, "GET", "https://provider/conversation/original")
+            self.assertTrue(response.closed)
+            self.assertFalse(clock.lock.locked())
 
     def test_crashed_result_reader_expires_after_restart_without_blocking_post(self):
         now, sent = [10000.0], []

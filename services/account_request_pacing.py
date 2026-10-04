@@ -13,6 +13,7 @@ import os
 import threading
 import time
 import uuid
+from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -342,7 +343,7 @@ class AccountRequestClock:
         archive_observation = (current_archive_observation.get() or {}) if archive_guard is not None else {}
         request_ref = request_ref or archive_observation.get("request_ref")
 
-        def observed_send(send_method, send_url, send_phase, **send_kwargs):
+        def observed_send(send_method, send_url, send_phase, *, read_started=None, **send_kwargs):
             # Count actual transport attempts, including metadata/preflight GETs.
             # Never log URLs, request bodies/headers, response bodies or exception
             # messages: conversation URLs and signed downloads can contain secrets.
@@ -363,6 +364,8 @@ class AccountRequestClock:
                 endpoint_kind = "conversation_list"
             response = None
             try:
+                if read_started is not None:
+                    read_started(started)
                 response = send(send_method, send_url, **send_kwargs)
                 return response
             finally:
@@ -431,6 +434,8 @@ class AccountRequestClock:
                 # all deadlines under the cross-process lock after waking.
                 self.lock.release()
                 wait_for_pace(read_delay, "account request deadline elapsed during read wait")
+            clock_held = True
+            response = None
             try:
                 self._expire_backoff()
                 ready = max(self.next_request, self.cooldown_until,
@@ -517,17 +522,85 @@ class AccountRequestClock:
                     context.record_stage("send_call_started")
                 sent_at = time.monotonic()
                 try:
-                    response = observed_send(method, url, phase, **kwargs)
+                    if is_conversation_read:
+                        # Keep the durable clock through the local transport-call
+                        # edge, not through the network response. Other original
+                        # conversations may read once their own start floor is due.
+                        # The caller still joins this one timeout-limited GET;
+                        # no retry, detached task or new scheduling queue is added.
+                        entered = threading.Event()
+                        outcome = {}
+                        def read_started(at):
+                            outcome["started_at"] = at
+                            entered.set()
+                        def read_io():
+                            try:
+                                # Thread scheduling consumes the same pre-send
+                                # budget; an expired caller must not send later.
+                                cap_timeout_before_send()
+                                outcome["response"] = observed_send(method, url, phase,
+                                    read_started=read_started, **kwargs)
+                            except BaseException as exc:
+                                outcome["error"] = exc
+                            finally:
+                                entered.set()
+                        worker_context = copy_context()
+                        worker = threading.Thread(target=worker_context.run, args=(read_io,),
+                                                  name="original-conversation-read")
+                        worker.start()
+                        reservation_error = None
+                        floor_durable = False
+                        try:
+                            entered.wait()
+                            if "started_at" not in outcome:
+                                raise outcome["error"]
+                            sent_at = outcome["started_at"]
+                            self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
+                            self.next_conversation_read = max(self.next_conversation_read, sent_at + read_interval)
+                            self._save()
+                            floor_durable = True
+                        except BaseException as exc:
+                            reservation_error = exc
+                        # Reacquisition reloads the newest cross-process state.
+                        # A late 200 cannot erase another read's newer 429/queue.
+                        # On a failed correction retain the lock until the
+                        # joined response/final save; the old floor is too early.
+                        if floor_durable:
+                            self.lock.release()
+                            clock_held = False
+                        try:
+                            # Reap the transport even on caller interruption;
+                            # never leave a late GET running after this returns.
+                            while worker.is_alive():
+                                try:
+                                    worker.join()
+                                except BaseException as exc:
+                                    reservation_error = reservation_error or exc
+                        finally:
+                            response = outcome.get("response")
+                            # This is result/cooldown reconciliation, not a new
+                            # send admission. It can outlast the send budget;
+                            # discarding a received 429 would lose its cooldown.
+                            if not clock_held:
+                                self.lock.acquire()
+                                clock_held = True
+                        if "error" in outcome:
+                            if reservation_error is not None:
+                                raise reservation_error from outcome["error"]
+                            raise outcome["error"]
+                    else:
+                        response = observed_send(method, url, phase, **kwargs)
                 finally:
                     # Keep the pre-send durable reservation for crash safety,
                     # then account for its I/O delay even if transport fails.
-                    self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
-                    if is_conversation_read:
-                        self.next_conversation_read = max(self.next_conversation_read, sent_at + read_interval)
-                    if is_turn:
-                        self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
-                        self.last_turn_started = sent_at
-                    self._save()
+                    if clock_held:
+                        self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
+                        if is_conversation_read:
+                            self.next_conversation_read = max(self.next_conversation_read, sent_at + read_interval)
+                        if is_turn:
+                            self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
+                            self.last_turn_started = sent_at
+                        self._save()
                 release_pacing()
                 response_headers = getattr(response, "headers", {}) or {}
                 upstream_id = response_headers.get("x-request-id") or response_headers.get("openai-request-id")
@@ -536,11 +609,17 @@ class AccountRequestClock:
                     self.limited(retry_after_seconds(response_headers.get("Retry-After")),
                                  retry_after_present="Retry-After" in response_headers,
                                  evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id})
+                if is_conversation_read and reservation_error is not None:
+                    response.close()
+                    raise reservation_error
                 if context is not None and is_turn and hasattr(context, "record_stage"):
                     context.record_stage("response_headers_received", status_code=response.status_code,
                                          upstream_request_id=safe_id)
             finally:
-                self.lock.release()
+                if not clock_held and response is not None:
+                    response.close()
+                if clock_held:
+                    self.lock.release()
             if is_turn and kwargs.get("stream") and 200 <= response.status_code < 300:
                 close = response.close
                 def close_turn():
