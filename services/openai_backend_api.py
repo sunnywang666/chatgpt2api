@@ -3184,16 +3184,17 @@ class OpenAIBackendAPI:
 
         curl_cffi 在 stream=True + 标量 timeout 下不限制流式 body 的总读取时长，
         上游未生成图片却保持连接时，读取会一直阻塞直到边缘重置（曾观测到单条流
-        挂起约 29.5 分钟才失败）。这里复用「图片轮询超时」作为硬上限：到点后关闭
-        底层连接以解除阻塞，并抛出明确错误，让任务快速失败而非长时间挂起。
+        挂起约 29.5 分钟才失败）。这里复用「图片轮询超时」作为收取硬上限：到点
+        后请求关闭并唤醒读取方；账号传输适配层在既有总时限内回收静默连接。
+        停止本地收取不证明上游已经停止生成，原请求仍须沿原会话恢复。
         """
         deadline = time.monotonic() + hard_cap_secs
-        # 看门狗：SSE 读取可能阻塞在底层 curl 调用中，超时后关闭连接以强制解除阻塞
+        # Native close is adapted to wake the consumer without waiting for curl's Future.
         watchdog = threading.Timer(hard_cap_secs, response.close)
         watchdog.daemon = True
         watchdog.start()
         timeout_message = timeout_message or (
-            f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
+            f"图片结果收取已超过硬上限 {int(hard_cap_secs)} 秒，本次收取已停止（上游结果尚待确认）"
         )
         observation = {"sse_data_count": 0, "sse_parse_errors": 0, "sse_error_event": False} if observe_text else None
         try:

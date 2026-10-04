@@ -827,6 +827,61 @@ def reserve_account_archive_read(account, owner):
         return False
 
 
+def _send_with_bounded_stream_close(session, send, method, url, **kwargs):
+    """Bound native streaming I/O before perform; close without waiting for a tail.
+
+    curl_cffi's synchronous close waits on its streaming Future. A confirmed
+    result must not wait for a silent SSE connection, but its native handle
+    must only be freed after perform exits. The stream clone gets a hard total
+    timeout and the original finalizer runs from the completed Future.
+    """
+    from curl_cffi import CurlOpt
+    from curl_cffi.requests import Session
+    from curl_cffi.requests.models import STREAM_END
+
+    timeout = kwargs.get("timeout")
+    if (not kwargs.get("stream") or not isinstance(session, Session)
+            or not getattr(session, "_use_thread_local_curl", False)
+            or type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0
+            or any(option in session.curl_options for option in (CurlOpt.TIMEOUT, CurlOpt.TIMEOUT_MS))):
+        return send(method, url, **kwargs)
+    # Same sending thread, before the library duplicates this idle handle.
+    # Do not mutate a live stream handle or shared session options.
+    source = session.curl
+    source.setopt(CurlOpt.TIMEOUT_MS, max(1, int(timeout * 1000)))
+    try:
+        response = send(method, url, **kwargs)
+    finally:
+        source.setopt(CurlOpt.TIMEOUT_MS, 0)
+    future, quit_now, queue = response.stream_task, response.quit_now, response.queue
+    finalize = response._finalize_stream
+    lock, requested = threading.Lock(), False
+
+    def cleanup(_future):
+        try:
+            finalize()
+        except Exception as exc:
+            logger.warning({"event": "stream_cleanup_failed", "error_type": type(exc).__name__})
+        finally:
+            # A failed Future can make the library finalizer raise before close.
+            # perform has ended before this callback; releasing here is safe.
+            response.curl.close()
+
+    def request_close():
+        nonlocal requested
+        with lock:
+            if requested:
+                return
+            requested = True
+        quit_now.set()
+        queue.put_nowait(STREAM_END)
+        future.add_done_callback(cleanup)
+
+    # iter_content calls _finalize_stream directly, not through close().
+    response._finalize_stream = request_close
+    return response
+
+
 def pace_account_session(session, account: dict, access_token: str) -> None:
     if not access_token:
         return
@@ -839,7 +894,10 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
         if clock is None:
             clock = AccountRequestClock(key[:12], DATA_DIR / "account_request_clocks" / f"{key}.json")
             _clocks[key] = clock
-    send = session.request
+    raw_send = session.request
+
+    def send(method, url, **kwargs):
+        return _send_with_bounded_stream_close(session, raw_send, method, url, **kwargs)
 
     def paced_request(method, url, **kwargs):
         # Object-storage downloads are not ChatGPT account API calls.
