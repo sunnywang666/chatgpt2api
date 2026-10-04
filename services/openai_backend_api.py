@@ -1284,7 +1284,7 @@ class OpenAIBackendAPI:
         self,
         conversation_id: str,
         timeout_secs: float = 60.0,
-        *, _send=None,
+        *, _send=None, deadline_monotonic: float | None = None,
     ) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
@@ -1293,6 +1293,11 @@ class OpenAIBackendAPI:
         # Internal pacing arguments must never reach that raw HTTP transport.
         options = (self._image_request_options(timeout_secs) if _send is None
                    else {"timeout": self._image_active_timeout(timeout_secs)})
+        if _send is None and deadline_monotonic is not None:
+            existing = options.get("_account_request_deadline_monotonic")
+            options["_account_request_deadline_monotonic"] = (
+                min(existing, deadline_monotonic) if existing is not None else deadline_monotonic
+            )
         response = request(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                            **options)
         try:

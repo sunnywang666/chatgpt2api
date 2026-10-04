@@ -1620,6 +1620,43 @@ class TextResultRecoveryTests(unittest.TestCase):
         self.assertEqual(generation.call_count, 1)
         backend._get_conversation.assert_called_once_with("conversation-one")
 
+    def test_direct_read_cooldown_exits_without_lingering_send_or_clearing_cooldown(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        import time
+        from services.account_request_pacing import AccountRequestClock, AccountRequestDeadlineExceeded
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        with TemporaryDirectory() as directory:
+            clock = AccountRequestClock("fixture", Path(directory) / "clock.json")
+            clock.next_conversation_read = time.monotonic() + 900
+            clock.conversation_read_rate_failures = 6
+            clock._save()
+            raw = mock.Mock(side_effect=AssertionError("cooling read must not reach transport"))
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.base_url = "https://fixture.invalid"
+            backend._headers = lambda path, headers: headers
+            backend.session = SimpleNamespace(
+                get=lambda url, **kw: clock.request(raw, "GET", url, **kw), close=lambda: None,
+            )
+            before = clock.next_conversation_read
+            with (
+                mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
+                mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
+                mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+            ):
+                started = time.monotonic()
+                with self.assertRaises(AccountRequestDeadlineExceeded):
+                    ConversationBindingService().read_text(self.cursor)
+                self.assertLess(time.monotonic() - started, 1)
+            raw.assert_not_called()
+            self.assertEqual(clock.ordinary_read_queue, [])
+            self.assertFalse(clock.lock.locked())
+            self.assertAlmostEqual(clock.next_conversation_read, before, delta=0.001)
+            self.assertEqual(clock.conversation_read_rate_failures, 6)
+
     def test_admin_cursor_route_reads_the_same_bound_account(self):
         from fastapi import FastAPI, HTTPException
         from fastapi.testclient import TestClient
@@ -1644,7 +1681,7 @@ class TextResultRecoveryTests(unittest.TestCase):
                 self.assertEqual(wrong.status_code, 409)
                 identity.side_effect = HTTPException(status_code=401)
                 self.assertEqual(client.get("/api/conversation-bindings/text", params=self.cursor).status_code, 401)
-        backend._get_conversation.assert_called_once_with("conversation-one")
+        backend._get_conversation.assert_called_once_with("conversation-one", deadline_monotonic=mock.ANY)
 
 
 if __name__ == "__main__":

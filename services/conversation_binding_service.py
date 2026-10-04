@@ -1113,6 +1113,10 @@ class ConversationBindingService:
 
     def read_text(self, body: dict[str, Any]) -> dict[str, Any]:
         """Read an already-issued cursor on its bound account; never send a message."""
+        # This direct, non-durable GET has the same 60-second budget for
+        # queueing and HTTP. Do not leave a read queued after its caller gives
+        # up; durable request recovery uses its own persisted scheduling.
+        deadline = time.monotonic() + 60.0
         keys = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
                 "conversation_id", "parent_message_id")
         if any(not isinstance(body.get(key), str) or not body[key].strip() for key in keys):
@@ -1124,13 +1128,16 @@ class ConversationBindingService:
         with account_service.conversation_binding_lock(binding_id, body["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:
-                return self._read_text_result(backend, body)
+                return self._read_text_result(backend, body, deadline_monotonic=deadline)
             finally:
                 backend.close()
 
     @staticmethod
-    def _read_text_result(backend: OpenAIBackendAPI, cursor: dict[str, Any]) -> dict[str, Any]:
-        document = backend._get_conversation(cursor["conversation_id"])
+    def _read_text_result(
+        backend: OpenAIBackendAPI, cursor: dict[str, Any], *, deadline_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        options = {} if deadline_monotonic is None else {"deadline_monotonic": deadline_monotonic}
+        document = backend._get_conversation(cursor["conversation_id"], **options)
         if document.get("conversation_id", cursor["conversation_id"]) != cursor["conversation_id"]:
             raise ConversationBindingError("conversation identity changed", code="CONVERSATION_BINDING_MISMATCH")
         mapping = document.get("mapping") or {}
