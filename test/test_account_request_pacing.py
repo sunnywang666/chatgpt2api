@@ -1086,6 +1086,86 @@ class ReadRateLimitIsolationTests(unittest.TestCase):
             response.status_code = 429  # No provider Retry-After.
         return response
 
+    def test_parallel_read_limits_share_one_persisted_backoff_then_escalate_on_retry(self):
+        all_sent = threading.Barrier(7)
+        release = [threading.Event() for _ in range(6)]
+        errors = []
+
+        def send(method, url, **kwargs):
+            index = int(url.rsplit("/", 1)[1])
+            all_sent.wait(timeout=3)
+            if not release[index].wait(5):
+                raise TimeoutError("test response was not released")
+            response = Response()
+            response.status_code = 200 if index == 4 else 429
+            response.headers = {}
+            return response
+
+        def read(index):
+            try:
+                AccountRequestClock("account", self.path).request(
+                    send, "GET", f"https://provider/conversation/{index}")
+            except BaseException as exc:
+                errors.append(exc)
+
+        def sleep(seconds):
+            # Mutex/FIFO contention must yield to the real worker, not let six
+            # threads race to advance the shared fake clock hundreds of seconds.
+            if seconds <= 1:
+                threading.Event().wait(0.001)
+            else:
+                self.advance(seconds)
+
+        with patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)), \
+             patch("services.account_request_pacing.time.sleep", side_effect=sleep):
+            workers = [threading.Thread(target=read, args=(i,)) for i in range(6)]
+            for worker in workers:
+                worker.start()
+            try:
+                all_sent.wait(timeout=3)
+                # A slow 200 and four more 429s cannot clear, multiply or extend
+                # the first limit. Every reader uses a separately loaded clock.
+                for index in (2, 4, 0, 5, 1, 3):
+                    self.advance(1)
+                    release[index].set()
+                    workers[index].join(3)
+                    self.assertFalse(workers[index].is_alive())
+                    restored = AccountRequestClock("account", self.path)
+                    self.assertEqual(restored.conversation_read_rate_failures, 1)
+                    self.assertEqual(restored.last_conversation_read_rate_limit, 10001)
+                    self.assertEqual(restored.next_conversation_read, 10061)
+                    self.assertEqual(restored.rate_failures, 0)
+            finally:
+                for event in release:
+                    event.set()
+                for worker in workers:
+                    worker.join(3)
+            self.assertEqual(errors, [])
+            self.assertTrue(restored.last_rate_limit_evidence["same_read_incident"])
+            # A new original read after the existing cooldown is a new attempt.
+            AccountRequestClock("account", self.path).request(
+                self.send, "GET", "https://provider/conversation/original")
+            self.assertEqual(self.sent, [("GET", 10061)])
+            restored = AccountRequestClock("account", self.path)
+            self.assertEqual(restored.conversation_read_rate_failures, 2)
+            self.assertEqual(restored.next_conversation_read, 10181)
+            self.assertFalse(restored.last_rate_limit_evidence["same_read_incident"])
+
+    def test_explicit_retry_after_is_not_grouped_with_inflight_read_limit(self):
+        clock = AccountRequestClock("account", self.path)
+        with clock.lock:
+            clock.limited(evidence={"phase": "conversation_read"}, read_sent_at=9999)
+        restored = AccountRequestClock("account", self.path)
+        with restored.lock:
+            restored.limited(120, evidence={"phase": "conversation_read"},
+                             retry_after_present=True, read_sent_at=9999)
+        self.assertEqual(restored.conversation_read_rate_failures, 1)
+        self.assertEqual(restored.rate_failures, 1)
+        self.assertEqual(restored.cooldown_until, 10120)
+        self.assertEqual(restored.last_rate_limit_evidence["scope"], "account")
+        self.assertFalse(restored.last_rate_limit_evidence["same_read_incident"])
+
     def test_conversation_read_limits_do_not_delay_model_posts_after_restart(self):
         first = AccountRequestClock("account", self.path)
         other = AccountRequestClock("account", self.path)

@@ -228,7 +228,7 @@ class AccountRequestClock:
             return 0.0
         return self.last_conversation_read_rate_limit + _backoff_seconds(self.conversation_read_rate_failures)
 
-    def limited(self, retry_after=0.0, *, evidence=None, retry_after_present=False):
+    def limited(self, retry_after=0.0, *, evidence=None, retry_after_present=False, read_sent_at=None):
         # A conversation GET limit without Retry-After backs off that read lane.
         # Explicit provider waits and limits from other/unknown phases retain
         # the account-wide protection. Successful unrelated HTTP never resets it.
@@ -236,12 +236,20 @@ class AccountRequestClock:
         read_only = ((evidence or {}).get("phase") == "conversation_read"
                      and not retry_after_present and retry_after <= 0)
         now = time.monotonic()
+        same_read_incident = (read_only and read_sent_at is not None
+                              and self.conversation_read_rate_failures > 0
+                              and read_sent_at <= self.last_conversation_read_rate_limit)
         if read_only:
-            self.conversation_read_rate_failures += 1
-            self.last_conversation_read_rate_limit = now
+            # Reads already in flight when a limit was observed belong to that
+            # incident. Count every response, but do not turn one parallel burst
+            # into several exponential retries or extend its persisted deadline.
+            if not same_read_incident:
+                self.conversation_read_rate_failures += 1
+                self.last_conversation_read_rate_limit = now
+                self.next_conversation_read = max(
+                    self.next_conversation_read, now + _backoff_seconds(self.conversation_read_rate_failures))
             failures = self.conversation_read_rate_failures
-            wait = _backoff_seconds(failures)
-            self.next_conversation_read = max(self.next_conversation_read, now + wait)
+            wait = max(0.0, self._read_cooldown_until() - now)
         else:
             self.rate_failures += 1
             self.last_rate_limit = now
@@ -252,6 +260,7 @@ class AccountRequestClock:
         observed = {"layer": "upstream_chatgpt", "phase": "unknown", "origin": "http_429",
                     **(evidence or {}), "retry_after_seconds": retry_after,
                     "scope": "conversation_read" if read_only else "account",
+                    "same_read_incident": same_read_incident,
                     "cooldown_seconds": wait,
                     "cooldown_until": time.time() + wait,
                     "observed_at": time.time(), "account": self.account_key}
@@ -627,6 +636,7 @@ class AccountRequestClock:
                 if response.status_code == 429:
                     self.limited(retry_after_seconds(response_headers.get("Retry-After")),
                                  retry_after_present="Retry-After" in response_headers,
+                                 read_sent_at=sent_at if is_conversation_read else None,
                                  evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id})
                 if concurrent_io and reservation_error is not None:
                     response.close()
