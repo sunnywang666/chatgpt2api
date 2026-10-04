@@ -971,12 +971,23 @@ class PoolAdmission:
                              "accounts": details}
         return result
 
+    def _metadata_receipts(self, db, statuses):
+        # Allocation metadata is useful only for work that may dispatch.
+        # Paused/completed/restoring work must not keep probing an account just
+        # because its original receipt still says queued. Legacy rows without
+        # a work projection retain their existing allocation behavior.
+        works, _ = workflow_scheduling.state_snapshot(self.store, db)
+        for item in self.store.receipts(db, statuses=statuses):
+            work = works.get(item[3].get("_work_key")) or {}
+            if work.get("state", "active") == "active":
+                yield item
+
     def _refresh_waiting_image_capabilities(self):
         refresh = getattr(self.accounts, "refresh_image_capability", None)
         if not callable(refresh) or float(self.clock()) < self._next_image_probe:
             return
         with self.store.connect() as db:
-            waiting = [r for kind, _, _, r in self.store.receipts(db, statuses=("queued",))
+            waiting = [r for kind, _, _, r in self._metadata_receipts(db, ("queued",))
                        if (kind == "image" or r.get("_operation") == "image")
                        and r.get("status") == "queued" and not r.get("_submission_started")]
         if not waiting:
@@ -1021,7 +1032,7 @@ class PoolAdmission:
         # (including after a completion child has finished) and starve archive
         # reads on the same account's paced HTTP clock.
         with self.store.connect() as db:
-            models = {str(r.get("model") or "auto") for kind, _, _, r in self.store.receipts(db, statuses=("queued", "running", "not_started"))
+            models = {str(r.get("model") or "auto") for kind, _, _, r in self._metadata_receipts(db, ("queued", "running", "not_started"))
                       if kind == "text" and unfinished(kind, r) and not unknown_text_result(r)
                       and r.get("_route", "chat") == "chat"}
         types = {}
@@ -1032,7 +1043,7 @@ class PoolAdmission:
                 types[model] = set()
         if self.codex is not None:
             with self.store.connect() as db:
-                native_models = {r.get("model") for _, _, _, r in self.store.receipts(db, statuses=("queued",))
+                native_models = {r.get("model") for _, _, _, r in self._metadata_receipts(db, ("queued",))
                                  if r.get("status") == "queued" and r.get("_route") == "codex"}
             # Reuse the existing bounded metadata refresh, outside the claim
             # transaction. This never sends a model request.

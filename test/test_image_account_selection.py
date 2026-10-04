@@ -209,6 +209,30 @@ def test_metadata_read_recovers_same_selected_queue_without_resubmit(runtime,mon
     assert not rt.calls
 
 
+@pytest.mark.parametrize('state', ['paused', 'completed', 'restoring'])
+def test_inactive_work_does_not_probe_capacity_and_resume_keeps_original(runtime,monkeypatch,state):
+    rt=runtime;rt.update('B',status='限流',**fresh(0));submit(rt)
+    with rt.store.transaction() as db:
+        original=rt.store.read_receipt(db,'image','owner','original')
+        original['_work_key']='work:metadata-test'
+        rt.store.write_receipt(db,'image','owner','original',original)
+        rt.store.set_runtime(db,original['_work_key'],{'key':original['_work_key'],'state':state,'slot_held':False})
+    metadata=Mock(return_value=(('fixture-user',''),{**fresh(3),'quota':3,'status':'正常'}))
+    monkeypatch.setattr(rt.accounts,'_verified_chat_info',metadata)
+    monkeypatch.setattr(rt.accounts,'refresh_image_capability',rt.accounts._refresh_pool_chat)
+    assert rt.admission.claim_next() is None
+    metadata.assert_not_called()
+    assert row(rt)['_input_ref']==original['_input_ref'] and not rt.calls
+    with rt.store.transaction() as db:
+        work=rt.store.runtime(db,original['_work_key']);work['state']='active'
+        rt.store.set_runtime(db,original['_work_key'],work)
+    ctx=rt.admission.claim_next()
+    assert ctx is not None and ctx.request_id=='original'
+    assert ctx.selected_account()['provider_account_identity']=='account-B'
+    assert metadata.call_count==1 and metadata.call_args.args[0]=='fixture-B'
+    assert row(rt)['_input_ref']==original['_input_ref'] and not rt.calls
+
+
 def test_unknown_image_never_probes_or_resubmits(runtime,monkeypatch):
     rt=runtime;submit(rt)
     with rt.store.transaction() as db:

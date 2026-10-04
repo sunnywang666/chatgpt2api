@@ -96,6 +96,26 @@ class AdmissionTests(unittest.TestCase):
         return self.images.submit_generation({"id": owner, "role": "user", "external_image_client": True},
                                              client_task_id=name, prompt="private image input", model="gpt-image-2", size=None)
 
+    def test_inactive_text_work_does_not_refresh_catalog_and_resume_keeps_id(self):
+        self.submit("paused-catalog")
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "text", "happy", "paused-catalog")
+            key = "work:paused-catalog"
+            receipt["_work_key"] = key
+            self.store.write_receipt(db, "text", "happy", "paused-catalog", receipt)
+            self.store.set_runtime(db, key, {"key": key, "state": "paused", "slot_held": False})
+        with patch.object(self.admission, "_types", return_value={"Plus"}) as route:
+            self.assertIsNone(self.admission.claim_next())
+            route.assert_not_called()
+            with self.store.transaction() as db:
+                work = self.store.runtime(db, key)
+                work["state"] = "active"
+                self.store.set_runtime(db, key, work)
+            context = self.admission.claim_next()
+            self.assertEqual(context.request_id, "paused-catalog")
+            route.assert_called_once_with("fixture-text")
+        self.assertEqual(self.calls, [])
+
     def test_recovery_candidate_reads_preserve_terminal_payloads_and_late_completion(self):
         large_saved = [{"b64_json": "completed-payload-must-not-be-decoded" * 10000}]
         rows = {

@@ -356,6 +356,8 @@ GET the same `/work` path to read `protocol:work-v1`, `kind`, `request_id`, `wor
 
 POST `{"state":"paused"}` to suspend an unsent/finished-turn work without archiving. POST `{"state":"active"}` to resume or rework; an archived work remains `restoring` until original restore is confirmed. A late prior completion cannot close a new work or its slot. UNKNOWN/in-flight work rejects release. Legacy single-request protocols and native Codex without a verified upstream archive API explicitly use `archive.scope:provider_work` / `status:not_applicable`; no upstream archive is claimed.
 
+Paused, completed, and restoring work does not trigger background admission capacity or model-catalog probes from its queued receipts. Resuming the same work re-enables the normal metadata checks for its original requests. Legacy receipts without a work projection retain their existing behavior.
+
 For example, start two independent sessions under `--workflow-id product-copy --workflow-concurrency 2 --min-send-interval-seconds 12`. Each session keeps its own state files and ordered predecessor IDs. Add `--not-before`/`--wait-deadline` with actual UTC times when needed. Leave the same original ID in place while queued; the scheduler resumes it after capacity or timing constraints clear. `WAIT_DEADLINE_EXCEEDED` with `not_sent` ends only unsent waiting. The client's HTTP timeout is still separate from these server controls.
 # Bounded completion of an abnormal pure-generation step
 
