@@ -1700,7 +1700,90 @@ class TextResultRecoveryTests(unittest.TestCase):
             result = ConversationBindingService().read_text(self.cursor)
         self.assertEqual(result["content"], '{"name_ru":"Набор"}')
         self.assertEqual(backend._get_conversation.call_count, 2)
-        self.assertEqual(backend._get_conversation.call_args_list[0], backend._get_conversation.call_args_list[1])
+        first, second = backend._get_conversation.call_args_list
+        self.assertEqual(first.args, second.args)
+        self.assertEqual(first.kwargs, {k: v for k, v in second.kwargs.items() if k != "minimum_budget_secs"})
+        self.assertEqual(second.kwargs["minimum_budget_secs"], 10.0)
+        backend.stream_conversation.assert_not_called()
+        backend.close.assert_called_once()
+
+    def test_direct_read_retry_rechecks_connection_window_after_pacing(self):
+        from curl_cffi import CurlInfo
+        from curl_cffi.requests.exceptions import SSLError
+        import services.account_request_pacing as pacing
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        for initial_wait in (0., 29.):
+            with self.subTest(initial_wait=initial_wait), tempfile.TemporaryDirectory() as directory:
+                now = [100.]
+                fake_time = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1700000000 + now[0],
+                                            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+                error = SSLError("private first failure", code=35, response=SimpleNamespace(status_code=0,
+                    infos={CurlInfo.NUM_CONNECTS: 1, CurlInfo.APPCONNECT_TIME: 0., CurlInfo.SIZE_DOWNLOAD_T: 0}))
+                sends = []
+                response = SimpleNamespace(status_code=200, headers={}, json=self.document, close=lambda: None)
+                def raw(method, url, **kwargs):
+                    self.assertNotIn("_account_request_minimum_budget_secs", kwargs)
+                    sends.append((now[0], kwargs["timeout"]))
+                    if len(sends) == 1:
+                        now[0] += 10
+                        raise error
+                    return response
+                with mock.patch.object(pacing, "time", fake_time), \
+                     mock.patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                                                                       account_conversation_read_interval_secs=30)):
+                    clock = pacing.AccountRequestClock("fixture", Path(directory)/"clock.json")
+                    clock.next_conversation_read = now[0] + initial_wait
+                    clock._save()
+                    backend = object.__new__(OpenAIBackendAPI)
+                    backend.base_url = "https://fixture.invalid"
+                    backend._headers = lambda path, headers: headers
+                    closed = mock.Mock()
+                    backend.session = SimpleNamespace(
+                        get=lambda url, **kwargs: clock.request(raw, "GET", url, **kwargs), close=closed)
+                    with (
+                        mock.patch("services.conversation_binding_service.time", fake_time),
+                        mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
+                        mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
+                        mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                        mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+                    ):
+                        if initial_wait:
+                            with self.assertRaises(SSLError) as caught:
+                                ConversationBindingService().read_text(self.cursor)
+                            self.assertIs(caught.exception, error)
+                            self.assertEqual(len(sends), 1)
+                            self.assertEqual(clock.next_conversation_read, 159.)
+                        else:
+                            result = ConversationBindingService().read_text(self.cursor)
+                            self.assertEqual(result["status"], "succeeded")
+                            self.assertEqual([at for at, _ in sends], [100., 130.])
+                        self.assertLess(now[0], 160.)
+                        self.assertTrue(all(at + budget <= 160. for at, budget in sends))
+                        self.assertEqual(clock.ordinary_read_queue, [])
+                        self.assertFalse(clock.lock.locked())
+                        self.assertEqual(clock.rate_failures, 0)
+                        self.assertEqual(clock.conversation_read_rate_failures, 0)
+                        closed.assert_called_once()
+
+    def test_direct_read_preserves_first_error_when_retry_window_expires(self):
+        from curl_cffi import CurlInfo
+        from curl_cffi.requests.exceptions import SSLError
+        from services.account_request_pacing import AccountReadRetryBudgetInsufficient
+        first = SSLError("private first failure", code=35, response=SimpleNamespace(status_code=0,
+            infos={CurlInfo.NUM_CONNECTS: 1, CurlInfo.APPCONNECT_TIME: 0., CurlInfo.SIZE_DOWNLOAD_T: 0}))
+        backend = mock.Mock()
+        backend._get_conversation.side_effect = [first, AccountReadRetryBudgetInsufficient()]
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+        ):
+            with self.assertRaises(SSLError) as caught:
+                ConversationBindingService().read_text(self.cursor)
+        self.assertIs(caught.exception, first)
+        self.assertEqual(backend._get_conversation.call_count, 2)
         backend.stream_conversation.assert_not_called()
         backend.close.assert_called_once()
 

@@ -11,6 +11,7 @@ from curl_cffi import CurlInfo
 from curl_cffi.requests.exceptions import RequestException
 
 from services.account_service import account_service
+from services.account_request_pacing import AccountReadRetryBudgetInsufficient
 from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
 from services.protocol.conversation import conversation_events
 from utils.helper import UpstreamHTTPError
@@ -1130,14 +1131,21 @@ class ConversationBindingService:
         with account_service.conversation_binding_lock(binding_id, body["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:
+                first_error = None
                 for attempt in range(2):
                     try:
                         return self._read_text_result(backend, body, deadline_monotonic=deadline,
-                                                      connect_timeout_secs=10.0)
+                                                      connect_timeout_secs=10.0,
+                                                      minimum_budget_secs=10.0 if attempt else None)
+                    except AccountReadRetryBudgetInsufficient:
+                        if first_error is not None:
+                            raise first_error from None
+                        raise
                     except Exception as exc:
                         if (attempt or time.monotonic() >= deadline
                                 or not self._retryable_direct_read_connection(exc)):
                             raise
+                        first_error = exc
             finally:
                 backend.close()
 
@@ -1149,6 +1157,8 @@ class ConversationBindingService:
         A timeout after HTTP/partial data and certificate/auth/rate errors are
         not retryable here. A reused TLS connection has num_connects=0 and
         cannot be mistaken for a new handshake that hit its connection cap.
+        These observations do not prove that the server received no request;
+        retry safety comes from reading the same cursor without any mutation.
         """
         try:
             if not isinstance(exc, RequestException) or exc.code not in (28, 35):
@@ -1172,10 +1182,13 @@ class ConversationBindingService:
     def _read_text_result(
         backend: OpenAIBackendAPI, cursor: dict[str, Any], *, deadline_monotonic: float | None = None,
         connect_timeout_secs: float | None = None,
+        minimum_budget_secs: float | None = None,
     ) -> dict[str, Any]:
         options = {} if deadline_monotonic is None else {"deadline_monotonic": deadline_monotonic}
         if connect_timeout_secs is not None:
             options["connect_timeout_secs"] = connect_timeout_secs
+        if minimum_budget_secs is not None:
+            options["minimum_budget_secs"] = minimum_budget_secs
         document = backend._get_conversation(cursor["conversation_id"], **options)
         if document.get("conversation_id", cursor["conversation_id"]) != cursor["conversation_id"]:
             raise ConversationBindingError("conversation identity changed", code="CONVERSATION_BINDING_MISMATCH")

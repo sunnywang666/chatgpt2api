@@ -120,6 +120,10 @@ class AccountRequestDeadlineExceeded(TimeoutError):
     pass
 
 
+class AccountReadRetryBudgetInsufficient(AccountRequestDeadlineExceeded):
+    """An original GET retry no longer has its minimum connection window."""
+
+
 def _backoff_seconds(failures):
     return min(900.0, 60.0 * (2 ** min(max(0, failures - 1), 4)))
 
@@ -321,6 +325,9 @@ class AccountRequestClock:
     def request(self, send, method, url, **kwargs):
         io_cleanup = kwargs.pop("_account_request_io_cleanup", None)
         deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
+        minimum_budget = kwargs.pop("_account_request_minimum_budget_secs", None)
+        if type(minimum_budget) not in (int, float) or not math.isfinite(minimum_budget) or minimum_budget <= 0:
+            minimum_budget = None
         local_wait = kwargs.pop("_account_request_local_wait", None)
         before_send = kwargs.pop("_account_request_before_send", None)
         preflight = kwargs.pop("_account_request_preflight", None)
@@ -344,6 +351,8 @@ class AccountRequestClock:
             remaining = remaining_budget()
             if remaining is None:
                 return
+            if minimum_budget is not None and remaining < minimum_budget:
+                raise AccountReadRetryBudgetInsufficient("original read retry connection budget unavailable")
             if remaining <= 0:
                 raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
             timeout = kwargs.get("timeout")
@@ -613,9 +622,6 @@ class AccountRequestClock:
                 # Reserve the interval before sending. Restarting after an
                 # unknown response must not erase the account's wait period.
                 self._save()
-                remaining = remaining_budget()
-                if remaining is not None and remaining <= 0:
-                    raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
                 # Saving pacing state and the submission receipt can consume
                 # part of the declared budget; cap once more at the send edge.
                 cap_timeout_before_send()

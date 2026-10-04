@@ -48,6 +48,35 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_retry_connection_window_checked_again_in_io_worker(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import services.account_request_pacing as pacing
+        for worker_delay in (6, 15, 20):
+            with self.subTest(worker_delay=worker_delay):
+                now = [100.]
+                fake_time = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1700000000 + now[0],
+                                            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+                original_thread = threading.Thread
+                def delayed_thread(*args, **kwargs):
+                    target = kwargs.pop("target")
+                    def delayed(*target_args):
+                        now[0] += worker_delay
+                        target(*target_args)
+                    return original_thread(*args, target=delayed, **kwargs)
+                with tempfile.TemporaryDirectory() as directory, patch.object(pacing, "time", fake_time), \
+                     patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                                                                  account_conversation_read_interval_secs=30)), \
+                     patch.object(pacing.threading, "Thread", delayed_thread):
+                    clock = AccountRequestClock("fixture", Path(directory)/"clock.json")
+                    raw = Mock(side_effect=AssertionError("late worker must not start another connection"))
+                    with self.assertRaises(pacing.AccountReadRetryBudgetInsufficient):
+                        clock.request(raw, "GET", "https://fixture.invalid/conversation/original", timeout=60,
+                                      _account_request_deadline_monotonic=115., _account_request_minimum_budget_secs=10.)
+                    raw.assert_not_called()
+                    self.assertEqual(clock.ordinary_read_queue, [])
+                    self.assertFalse(clock.lock.locked())
+
     def test_zero_http_spacing_preserves_durable_message_and_429_waits(self):
         from services.config import ConfigStore
         import services.account_request_pacing as pacing
