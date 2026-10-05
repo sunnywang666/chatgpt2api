@@ -553,6 +553,26 @@ class AccountRequestClock:
                 delay = ready - time.monotonic()
                 if delay > 0:
                     wait_for_pace(delay, "account request deadline elapsed during cooldown wait")
+                refresh = (getattr(context, "image_capability_refresh", lambda: None)()
+                           if context is not None and is_turn else None)
+                if refresh is not None:
+                    # Prepared images must not loop through uploads because
+                    # their capacity observation expired during local pacing.
+                    # Metadata uses this same clock: release it before reading,
+                    # retain the original turn, then apply its new pace and all
+                    # ordinary claim/binding/capacity guards again.
+                    self.lock.release()
+                    clock_held = False
+                    refresh_deadline = time.monotonic() + 240
+                    if deadline_at is not None:
+                        refresh_deadline = min(refresh_deadline, deadline_at)
+                    refresh(refresh_deadline)
+                    acquire_with_budget(self.lock)
+                    clock_held = True
+                    self._expire_backoff()
+                    delay = max(self.next_request, self.cooldown_until, self.next_turn) - time.monotonic()
+                    if delay > 0:
+                        wait_for_pace(delay, "account request deadline elapsed after capability read")
                 if preflight is not None:
                     # A superseded original may arrive during the cooldown.
                     # This GET shares the held pacing lock and raw transport;

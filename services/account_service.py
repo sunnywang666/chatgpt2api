@@ -133,13 +133,13 @@ class AccountService:
                 raise RuntimeError("selected image account capability is unavailable")
             return dict(account)
 
-    def refresh_image_capability(self, account_ref: str) -> None:
+    def refresh_image_capability(self, account_ref: str, *, deadline=None, before_read=None) -> None:
         # Existing protected metadata readers; no model execution is a probe.
         with self._lock:
             _, account = self._pool_account_locked(account_ref)
             source = account.get("source_type")
         if source in {None, "web", "oauth_login", "password"}:
-            self._refresh_pool_chat(account_ref)
+            self._refresh_pool_chat(account_ref, deadline=deadline, before_read=before_read)
         elif source == "codex":
             self.refresh_pool_account(account_ref, routes=["codex"], stale_only=True)
 
@@ -460,14 +460,19 @@ class AccountService:
         return subject, account_id
 
     @classmethod
-    def _verified_chat_info(cls, access_token: str) -> tuple[tuple[str, str], dict]:
+    def _verified_chat_info(cls, access_token: str, *, deadline=None, before_read=None) -> tuple[tuple[str, str], dict]:
         """Read the real Chat principal without trusting submitted JWT claims."""
         from services.openai_backend_api import OpenAIBackendAPI
+        from services.request_context import AdmissionLost
 
         backend = None
         try:
             backend = OpenAIBackendAPI(access_token)
+            backend.metadata_deadline = deadline
+            backend.metadata_before_send = before_read
             info = backend.get_user_info()
+        except AdmissionLost:
+            raise
         except Exception:
             raise CodexAuthorizationAttachError("chat_authorization_upstream_unverified") from None
         finally:
@@ -2087,13 +2092,16 @@ class AccountService:
             and bool(str(account.get("access_token") or "").strip())
         )
 
-    def _refresh_pool_chat(self, account_ref: str) -> None:
+    def _refresh_pool_chat(self, account_ref: str, *, deadline=None, before_read=None) -> None:
         from services.owned_accounts import utc_now
         with self._lock:
             token, account = self._pool_account_locked(account_ref)
             if not self._chat_authorization_saved(account):
                 return
-        token = self.refresh_access_token(token, event="workbench_pool_chat_refresh") or token
+        # The bounded send-edge read uses the already selected authorization.
+        # Credential recovery remains the existing queue/account refresh path.
+        if deadline is None:
+            token = self.refresh_access_token(token, event="workbench_pool_chat_refresh") or token
         with self._lock:
             token, account = self._pool_account_locked(account_ref)
             if not self._chat_authorization_saved(account):
@@ -2107,11 +2115,15 @@ class AccountService:
             expected_user = str(account.get("user_id") or "").strip()
             expected_workspace = self._validated_workspace_id(account.get("account_id"))
         try:
-            observed_identity, info = self._verified_chat_info(token)
+            observed_identity, info = (self._verified_chat_info(token) if deadline is None and before_read is None
+                else self._verified_chat_info(token, deadline=deadline, before_read=before_read))
             if ((expected_user and observed_identity[0] != expected_user)
                     or (expected_workspace and observed_identity[1] != expected_workspace)):
                 raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
-        except Exception:
+        except Exception as exc:
+            from services.request_context import AdmissionLost
+            if isinstance(exc, AdmissionLost):
+                raise
             self.update_account(
                 token,
                 {"capacity_read_failed_at": utc_now(), "managed_updated_at": utc_now()},
@@ -2125,7 +2137,9 @@ class AccountService:
             "account_id": observed_identity[1],
             "limits_progress": info.get("limits_progress") if isinstance(info.get("limits_progress"), list) else [],
             "quota": info.get("quota") if type(info.get("quota")) is int and info["quota"] >= 0 else None,
-            "capacity_observed_at": observed_at,
+            # This is the limits request's actual paced send time, not the
+            # refresh start or its possibly much later completion time.
+            "capacity_observed_at": info.get("capacity_observed_at") or observed_at,
             "capacity_used_since_observation": False,
             "capacity_read_failed_at": None,
             "managed_updated_at": utc_now(),
