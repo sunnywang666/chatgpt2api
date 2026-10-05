@@ -727,6 +727,45 @@ class AccountRequestPacingTests(unittest.TestCase):
                 ("GET", "result"), ("GET", "archive-readback")])
             self.assertEqual([at for _, _, at in sent], [10000, 10060, 10120, 10180])
 
+    def test_archive_rechecks_released_reader_instead_of_sleeping_its_whole_lease(self):
+        from contextvars import Context as EmptyContext
+        from types import SimpleNamespace
+        from services.request_context import guarding_archive
+        now, sent, injected = [10000.0], [], [False]
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch("services.account_request_pacing.uuid.uuid4", return_value=SimpleNamespace(hex="ordinary-reader")), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: .1)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 45)):
+            path = Path(tmp) / "clock.json"
+            original = AccountRequestClock("account", path)
+            with original.lock:
+                original.last_read_was_archive = True
+                original._ordinary_read_turn("ordinary-reader", now[0], 45)
+            archive = AccountRequestClock("account", path)
+            def send(method, url, **kwargs):
+                sent.append((url.rsplit("/", 1)[-1], now[0]))
+                return Response()
+            def advance(seconds):
+                self.assertFalse(archive.lock.locked())
+                wake_at = now[0] + seconds
+                if not injected[0] and wake_at >= 10000.5:
+                    injected[0] = True
+                    now[0] = 10000.5
+                    # A separate caller finishes its already reserved GET while
+                    # the archive is asleep. Its lease would live until 10075.
+                    EmptyContext().run(AccountRequestClock("account", path).request,
+                                       send, "GET", "https://provider/conversation/result")
+                now[0] = wake_at
+            with patch("services.account_request_pacing.time.sleep", side_effect=advance):
+                with guarding_archive(lambda: None, read_owner="original-work"):
+                    archive.request(send, "GET", "https://provider/conversation/archive")
+            self.assertEqual([name for name, _ in sent], ["result", "archive"])
+            self.assertAlmostEqual(sent[0][1], 10000.5)
+            self.assertAlmostEqual(sent[1][1], 10045.5)
+            self.assertFalse(archive.lock.locked())
+
     def test_abandoned_archive_read_booking_expires_without_blocking_post(self):
         now = [10000.0]
         sent = []

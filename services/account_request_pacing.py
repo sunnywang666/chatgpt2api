@@ -524,7 +524,13 @@ class AccountRequestClock:
                         if not self._reserve_archive_read(read_owner, now):
                             other = self.archive_read_until if self.archive_read_until > now else 0.0
                             ordinary = self.ordinary_read_wait_until if self.last_read_was_archive else 0.0
-                            read_delay = max(read_delay, other - now, ordinary - now)
+                            # These leases bound abandoned readers, not the
+                            # time a live reader needs. Recheck released claims
+                            # promptly; the real HTTP/read/cooldown edge above
+                            # still determines when an upstream send is legal.
+                            retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
+                            reservation_delay = min(retry_check, max(0.0, other - now, ordinary - now))
+                            read_delay = max(read_delay, reservation_delay)
                     elif is_conversation_read:
                         if self.archive_read_owner and self.archive_read_until > now:
                             read_delay = max(read_delay, self.archive_read_until - now)
