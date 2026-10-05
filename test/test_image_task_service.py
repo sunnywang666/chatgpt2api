@@ -675,6 +675,46 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertEqual(raised.exception.conversation_id, "conversation-1")
         self.assertIn("timed out", str(raised.exception))
 
+    def test_admitted_bound_image_never_releases_another_legacy_slot(self):
+        from services.request_context import executing
+        for outcome in ("success", "stream_error", "setup_error"):
+            with self.subTest(outcome=outcome):
+                request = ConversationRequest(
+                    model="gpt-image-2", prompt="cat", provider_binding_id="binding-1",
+                    provider_account_identity="account-1", client_conversation_id="client-1",
+                    retain_conversation=True,
+                )
+                backend = mock.Mock()
+                backend.image_submission_started = True
+                backend.image_request_message_id = "message-1"
+                backend.get_conversation_parent_message_id.return_value = "answer-1"
+                output = ImageOutput(kind="result", model="gpt-image-2", index=1, total=1,
+                                     data=[{"b64_json": "image"}], conversation_id="chat-1")
+                with (
+                    executing(mock.Mock()),
+                    mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.protocol.conversation.account_service.acquire_bound_image_access_token", return_value="token") as acquire,
+                    mock.patch("services.protocol.conversation.account_service.get_account", return_value={}),
+                    mock.patch("services.protocol.conversation.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.protocol.conversation.account_service.mark_image_result") as mark,
+                    mock.patch("services.protocol.conversation.account_service.release_image_slot") as release,
+                    mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend,
+                               side_effect=RuntimeError("setup failed") if outcome == "setup_error" else None),
+                    mock.patch("services.protocol.conversation.stream_image_outputs", return_value=iter([output]),
+                               side_effect=RuntimeError("stream failed") if outcome == "stream_error" else None),
+                ):
+                    if outcome == "success":
+                        self.assertEqual(_generate_bound_single_image(request, 1, 1)[0].conversation_id, "chat-1")
+                    else:
+                        with self.assertRaises((RuntimeError, ImageGenerationError)):
+                            _generate_bound_single_image(request, 1, 1)
+                    acquire.assert_called_once_with("binding-1", image_model="gpt-image-2", reserve_slot=False)
+                    if outcome == "setup_error":
+                        mark.assert_not_called()
+                    else:
+                        mark.assert_called_once_with("token", outcome == "success", release_slot=False)
+                    release.assert_not_called()
+
     def test_bound_post_submission_timeout_remains_unknown(self):
         class Backend:
             image_submission_started = True

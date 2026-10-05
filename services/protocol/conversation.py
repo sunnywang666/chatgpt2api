@@ -1506,6 +1506,8 @@ def _generate_bound_single_image(
     token = ""
     binding_id = request.provider_binding_id
     account_identity = request.provider_account_identity
+    from services.request_context import current_request
+    pool_managed = bool(binding_id) and current_request.get() is not None
     try:
         if binding_id:
             authoritative_identity = account_service.get_bound_account_identity(binding_id)
@@ -1521,6 +1523,7 @@ def _generate_bound_single_image(
             token = account_service.acquire_bound_image_access_token(
                 binding_id,
                 image_model=request.model,
+                **({"reserve_slot": False} if pool_managed else {}),
             )
         else:
             binding_id, account_identity, token = account_service.create_conversation_binding(
@@ -1547,7 +1550,7 @@ def _generate_bound_single_image(
         }.get(str(exc))
         raise error from exc
 
-    slot_acquired = bool(token)
+    slot_acquired = bool(token) and not pool_managed
     image_result_marked = False
     account_email = ""
     backend: OpenAIBackendAPI | None = None
@@ -1705,12 +1708,12 @@ def _generate_bound_single_image(
                     output.parent_message_id = next_parent_message_id
                     output.image_thread_terminal = bool(thread)
                 image_result_marked = True
-                account_service.mark_image_result(token, True)
+                account_service.mark_image_result(token, True, **({"release_slot": False} if pool_managed else {}))
                 return outputs
             except Exception as exc:
                 if not image_result_marked:
                     image_result_marked = True
-                    account_service.mark_image_result(token, False)
+                    account_service.mark_image_result(token, False, **({"release_slot": False} if pool_managed else {}))
                 conversation_id = str(getattr(exc, "conversation_id", "") or last_conversation_id)
                 parent_message_id = str(getattr(exc, "parent_message_id", "") or "")
                 request_message_id = str(getattr(backend, "image_request_message_id", "") or "")

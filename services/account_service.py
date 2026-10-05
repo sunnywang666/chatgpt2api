@@ -1778,6 +1778,7 @@ class AccountService:
             binding_id: str,
             *,
             image_model: str,
+            reserve_slot: bool = True,
     ) -> str:
         plan_type, source_type, plan_types = self._image_route(image_model)
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
@@ -1801,6 +1802,11 @@ class AccountService:
                         else "bound_image_capability_unavailable"
                     )
                     raise error
+                # Pool admission already owns a durable generation reservation.
+                # Its result collection can outlive that reservation; counting
+                # the whole handler again here would block unrelated turns.
+                if not reserve_slot:
+                    return access_token
                 if int(self._image_inflight.get(access_token, 0)) < min(max_concurrency, self.image_account_capacity(account, image_model)):
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
@@ -3344,10 +3350,11 @@ class AccountService:
                 return False
         return True
 
-    def mark_image_result(self, access_token: str, success: bool) -> dict | None:
+    def mark_image_result(self, access_token: str, success: bool, *, release_slot: bool = True) -> dict | None:
         if not access_token:
             return None
-        self.release_image_slot(access_token)
+        if release_slot:
+            self.release_image_slot(access_token)
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)

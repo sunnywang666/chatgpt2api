@@ -229,6 +229,29 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(session.request("GET", "https://chatgpt.com/backend-api/conversation/original"), "original-result")
             self.assertEqual(send.call_count, 1)
 
+    def test_admitted_image_does_not_wait_for_or_release_legacy_collection_slot(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "fixture", "type": "Plus", "status": "正常", "quota": 10, **image_observation(10)}])
+            service.fetch_remote_info = lambda token, event="": service.get_account(token)
+            service.refresh_access_token = lambda token, event="": token
+            binding, _, token = service.create_conversation_binding(image_model="gpt-image-2")
+            # A legacy caller is still collecting its result. The admitted
+            # request owns a different, durable generation reservation.
+            with patch.object(service._image_slot_condition, "wait", side_effect=AssertionError("duplicate local wait")):
+                acquired = service.acquire_bound_image_access_token(binding, image_model="gpt-image-2", reserve_slot=False)
+            self.assertEqual(acquired, token)
+            self.assertEqual(service._image_inflight[token], 1)
+            updated = service.mark_image_result(token, True, release_slot=False)
+            self.assertTrue(updated["capacity_used_since_observation"])
+            self.assertEqual(service._image_inflight[token], 1)
+            # Freshness remains mandatory even though the duplicate slot is gone.
+            with self.assertRaises(RuntimeError) as failure:
+                service.acquire_bound_image_access_token(binding, image_model="gpt-image-2", reserve_slot=False)
+            self.assertEqual(failure.exception.binding_reason, "image_capacity_stale")
+            service.release_image_slot(token)
+            self.assertFalse(service._image_inflight)
+
     def test_conversation_binding_pins_one_account_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
