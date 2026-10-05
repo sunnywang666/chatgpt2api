@@ -945,6 +945,84 @@ class AdmissionTests(unittest.TestCase):
                 self.assertFalse(record["upstream_unfinished"])
                 self.assertEqual(sum(e["stage"] == "send_call_started" for e in record["_execution_timeline"]), 1)
 
+    def test_expired_sent_claim_records_local_reason_once_without_inventing_upstream_failure(self):
+        for kind in ("text", "image"):
+            with self.subTest(kind=kind):
+                rid = "expired-sent-" + kind
+                (self.submit if kind == "text" else self.image)(rid)
+                context = self.admission.claim_next()
+                context.before_send()
+                context.record_stage("send_call_started")
+                self.clock.now += 31
+                for _ in range(2):
+                    with self.store.transaction() as db:
+                        row = self.store.read_receipt(db, kind, "happy", rid)
+                        self.admission._recover_claims(db, [(kind, "happy", rid, row)], self.clock())
+                row = self.read(kind, "happy", rid)
+                events = [e for e in row["_execution_timeline"] if e["stage"] == "execution_interrupted"]
+                self.assertEqual(events, [{"stage": "execution_interrupted", "at": self.clock(),
+                    "source": "local_scheduler", "reason": "execution_claim_expired", "from_status": "running",
+                    "to_status": "unknown" if kind == "text" else "error", "submitted": True,
+                    "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "result_assets_observed": False}])
+                self.assertNotIn("last_recovery_failure", row)
+                self.assertEqual(sum(e["stage"] == "send_call_started" for e in row["_execution_timeline"]), 1)
+                # Close this fixture's turn without another model submission.
+                with self.store.transaction() as db:
+                    row.update(status="succeeded" if kind == "text" else "success", upstream_unfinished=False,
+                               _executing=False, _turn_reserved=False, _claim_id=None)
+                    self.store.write_receipt(db, kind, "happy", rid, row)
+
+    def test_worker_exception_after_assets_survives_original_image_recovery_and_restart(self):
+        self.image("interrupted-assets")
+        context = self.admission.claim_next()
+        def interrupted(ctx, body):
+            ctx.before_send()
+            ctx.record_stage("send_call_started")
+            self.admission.update_claim(ctx, result_file_ids=["original-file"])
+            raise RuntimeError("private URL and credential must never become evidence")
+        self.admission.register("image", interrupted)
+        self.admission.execute(context)
+        row = self.read("image", "happy", "interrupted-assets")
+        event = next(e for e in row["_execution_timeline"] if e["stage"] == "execution_interrupted")
+        self.assertEqual(event["reason"], "worker_exception")
+        self.assertEqual(event["source"], "local_scheduler")
+        self.assertTrue(event["result_assets_observed"])
+        self.assertNotIn("private URL", json.dumps(row))
+        self.images._update_task("happy:interrupted-assets", status="success", data=[{"b64_json": "cG5n"}],
+                                 error_code="", upstream_unfinished=False, upstream_outcome="generated")
+        restarted = ImageTaskService(self.root / "image_tasks.json", store=self.store)
+        with restarted.store.connect() as db:
+            final = restarted.store.read_receipt(db, "image", "happy", "interrupted-assets")
+        self.assertEqual(final["status"], "success")
+        self.assertIn(event, final["_execution_timeline"])
+        self.assertEqual(sum(e["stage"] == "send_call_started" for e in final["_execution_timeline"]), 1)
+
+    def test_late_stage_appends_without_erasing_a_concurrent_claim_interruption(self):
+        self.image("late-stage")
+        context = self.admission.claim_next()
+        context.before_send()
+        context.record_stage("send_call_started")
+        read_original = context.receipt
+        def expire_after_read():
+            observed = read_original()
+            self.clock.now += 31
+            with self.store.transaction() as db:
+                latest = self.store.read_receipt(db, "image", "happy", "late-stage")
+                self.admission._recover_claims(db, [("image", "happy", "late-stage", latest)], self.clock())
+            return observed
+        with patch.object(context, "receipt", side_effect=expire_after_read):
+            context.record_stage("stream_finished", stream_end="consumer_closed")
+        row = self.read("image", "happy", "late-stage")
+        self.assertEqual(row["status"], "error")
+        self.assertEqual([e["stage"] for e in row["_execution_timeline"]][-2:],
+                         ["execution_interrupted", "stream_finished"])
+        self.assertEqual(sum(e["stage"] == "send_call_started" for e in row["_execution_timeline"]), 1)
+        with self.store.transaction() as db:
+            row["_claim_id"] = "replacement-claim"
+            self.store.write_receipt(db, "image", "happy", "late-stage", row)
+        context.record_stage("artifact_saved", image_count=1)
+        self.assertEqual(self.read("image", "happy", "late-stage"), row)
+
     def test_account_disabled_between_claim_and_send_is_not_sent(self):
         self.submit("original")
         context = self.admission.claim_next()

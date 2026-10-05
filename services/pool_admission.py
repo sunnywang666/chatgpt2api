@@ -53,6 +53,21 @@ def record_unsent_failure(context, receipt, at, error_type=None, reason=None):
     logger.warning({"event": "pool_execution_stage", **entry})
 
 
+def record_sent_interruption(kind, receipt, at, reason):
+    """Keep the local transition even if the original result later recovers.
+
+    A lost execution claim or worker is not proof of an upstream timeout or
+    failed generation. Only fixed local reasons/flags belong in this receipt.
+    """
+    entry = {"stage": "execution_interrupted", "at": at, "source": "local_scheduler",
+             "reason": reason, "from_status": "running",
+             "to_status": "unknown" if kind == "text" else "error",
+             "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "submitted": True,
+             "result_assets_observed": bool(receipt.get("result_file_ids")
+                 or receipt.get("result_sediment_ids") or pending_image_result_ids(receipt))}
+    receipt["_execution_timeline"] = [*(receipt.get("_execution_timeline") or []), entry][-32:]
+
+
 def account_clock_key(account):
     # Use the identity already owned by AccountRequestClock. Duplicate imports
     # of that upstream identity share both its turn and image constraints.
@@ -253,10 +268,16 @@ class ExecutionContext:
                           "sse_terminal_final_channel_events", "sse_terminal_parent_events",
                           "sse_terminal_direct_parent_match_events"}},
         }
-        timeline = list(receipt.get("_execution_timeline") or [])
-        timeline.append(entry)
         try:
-            self.admission.update_claim(self, _execution_timeline=timeline[-32:])
+            with self.admission.store.transaction() as db:
+                current = self.admission.store.read_receipt(db, self.kind, self.owner, self.request_id)
+                if not current or current.get("_claim_id") != self.claim:
+                    raise AdmissionLost("original execution claim changed")
+                # A late stream callback must append to the newest timeline,
+                # not overwrite an intervening interruption/recovery event.
+                current["_execution_timeline"] = [*(current.get("_execution_timeline") or []), entry][-32:]
+                self.admission.store.write_receipt(db, self.kind, self.owner, self.request_id, current)
+            self.admission.wake()
         except AdmissionLost:
             # Telemetry must never turn an expired original into a retry.
             pass
@@ -899,6 +920,7 @@ class PoolAdmission:
             if not r.get("_claim_id") or r.get("status") != "running" or float(r.get("_claim_until") or 0) > now:
                 continue
             if r.get("_submission_started"):
+                record_sent_interruption(kind, r, now, "execution_claim_expired")
                 r.update(status="unknown" if kind == "text" else "error", error_code="CONVERSATION_OUTCOME_UNKNOWN")
                 if kind == "image":
                     r["upstream_unfinished"] = not bool(r.get("result_file_ids") or r.get("result_sediment_ids"))
@@ -1547,6 +1569,7 @@ class PoolAdmission:
                 r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
                 if r and r.get("_claim_id") == context.claim and r.get("status") == "running":
                     if r.get("_submission_started"):
+                        record_sent_interruption(context.kind, r, float(self.clock()), "worker_exception")
                         r.update(status="unknown" if context.kind == "text" else "error", error_code="CONVERSATION_OUTCOME_UNKNOWN")
                     else:
                         record_unsent_failure(context, r, float(self.clock()), type(exc).__name__)
