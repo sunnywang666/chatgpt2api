@@ -13,6 +13,9 @@ from urllib.parse import urlparse
 
 from curl_cffi import CurlECode, CurlError, CurlInfo, CurlWsFlag
 
+from services.request_context import safe_account_ref
+from utils.log import logger
+
 
 def completed_conversation_hint(envelope):
     """Return only the conversation to read, never a result or send authority."""
@@ -47,25 +50,44 @@ _hubs_lock = threading.RLock()
 
 class _ConversationHints:
     """One short-lived socket per active account, with exact local CID routing."""
-    def __init__(self):
+    def __init__(self, account_identity=None):
         self.stopped = threading.Event()
         self.signals = {}
         self.lock = threading.Lock()
         self.thread = None
+        self.account_ref = safe_account_ref(account_identity)
+        self.subscribed = False
+        self.nonfinal_reasons = {}
+        self.counts = dict(before_subscription=0, other_topic=0,
+                           unregistered_conversation=0, active_nonfinal=0, matched_hints=0)
+
+    def observe(self, stage, conversation_id=None, **details):
+        # Only call-site constants, counts, and hashed local identities enter
+        # this record. Never log the signed URL, frame, exception text or reply.
+        try:
+            logger.info({"event": "upstream_completion_listener", "stage": stage,
+                         "at": time.time(), "account_ref": self.account_ref,
+                         "conversation_ref": safe_account_ref(conversation_id), **details})
+        except Exception:
+            pass  # Measurement failure must not change result recovery.
 
     def run(self, open_transport):
         ws = cleanup = None
+        stop_reason = "last_context_released"
         try:
             if self.stopped.is_set():
                 return
+            self.observe("opening_transport")
             session, url, options, cleanup, transport_deadline = open_transport()
             parsed = urlparse(url)
             if (self.stopped.is_set() or transport_deadline <= time.monotonic()
                     or parsed.scheme != "wss" or parsed.hostname != "ws.chatgpt.com"
                     or parsed.username or parsed.password or parsed.port not in (None, 443) or parsed.fragment):
+                stop_reason = "transport_unavailable"
                 return
             ws = session.ws_connect(url, timeout=min(10, transport_deadline - time.monotonic()), headers={"Origin": "https://chatgpt.com"},
                                     allow_redirects=False, **options)
+            self.observe("socket_connected")
             if self.stopped.is_set():
                 return
             ws.send(json.dumps([
@@ -74,6 +96,7 @@ class _ConversationHints:
                 # originals, not a feed of past account activity.
                 {"id": 2, "command": {"type": "subscribe", "topic_id": "conversations"}},
             ]), flags=CurlWsFlag.TEXT)
+            self.observe("subscription_requested")
             fragments, subscribed = bytearray(), False
             # Each caller already owns its active-result budget. A fixed
             # lifetime from the first caller would cut off later concurrent
@@ -83,15 +106,19 @@ class _ConversationHints:
                     chunk, frame = ws.recv_fragment()
                 except CurlError as exc:
                     if exc.code != CurlECode.AGAIN:
+                        stop_reason = "receive_error"
+                        self.observe("transport_error", error_type=type(exc).__name__, curl_code=int(exc.code))
                         return
                     select.select([ws.curl.getinfo(CurlInfo.ACTIVESOCKET)], [], [], .25)
                     continue
                 if frame.flags & CurlWsFlag.CLOSE:
+                    stop_reason = "remote_close"
                     return
                 if frame.flags & (CurlWsFlag.PING | CurlWsFlag.PONG):
                     continue
                 fragments.extend(chunk)
                 if len(fragments) > 2 * 1024 * 1024:
+                    stop_reason = "frame_too_large"
                     return
                 if frame.bytesleft or frame.flags & CurlWsFlag.CONT:
                     continue
@@ -99,6 +126,7 @@ class _ConversationHints:
                 fragments.clear()
                 for message in frame_data if isinstance(frame_data, list) else [frame_data]:
                     if not isinstance(message, dict):
+                        stop_reason = "invalid_message"
                         return
                     if "reply" in message:
                         if message.get("id") != 2:
@@ -106,30 +134,55 @@ class _ConversationHints:
                         reply = message["reply"]
                         if (not isinstance(reply, dict) or reply.get("type") != "subscribe"
                                 or reply.get("topic_id") != "conversations"):
+                            stop_reason = "subscription_rejected"
                             return
                         subscribed = True  # recovered=false is normal without an offset.
+                        self.subscribed = True
+                        self.observe("subscribed")
                         continue
                     if not subscribed:
+                        self.counts["before_subscription"] += 1
                         continue
                     if message.get("type") == "message":
                         if message.get("topic_id") != "conversations":
+                            self.counts["other_topic"] += 1
                             continue
                         message = message.get("payload")
                     payload = message.get("payload") if isinstance(message, dict) else None
                     cid = payload.get("conversation_id") if isinstance(payload, dict) else None
                     with self.lock:
                         if not isinstance(cid, str) or cid not in self.signals:
+                            self.counts["unregistered_conversation"] += 1
                             continue
-                    cid = completed_conversation_hint(message)
-                    if cid:
+                    if completed_conversation_hint(message):
                         with self.lock:
-                            for signal in self.signals.get(cid, ()):
+                            targets = tuple(self.signals.get(cid, ()))
+                            for signal in targets:
                                 signal.set()
-        except Exception:
-            # Signed URLs and unrelated messages must never enter logs.
-            pass
+                        if targets:
+                            self.counts["matched_hints"] += 1
+                            self.observe("hint_matched", cid, waiting_contexts=len(targets))
+                        else:
+                            self.counts["unregistered_conversation"] += 1
+                    else:
+                        self.counts["active_nonfinal"] += 1
+                        reason = ("not_conversation_update" if message.get("type") != "conversation-update"
+                                  else "not_add_messages" if payload.get("update_type") != "add-messages"
+                                  else "no_final_image_tool")
+                        with self.lock:
+                            reasons = self.nonfinal_reasons.setdefault(cid, set())
+                            first = reason not in reasons
+                            reasons.add(reason)
+                        # At most one entry per fixed reason and active CID;
+                        # incremental upstream updates must not flood the log.
+                        if first:
+                            self.observe("hint_nonfinal", cid, reason=reason)
+        except Exception as exc:
+            stop_reason = "transport_exception"
+            self.observe("transport_error", error_type=type(exc).__name__)
         finally:
             self.stopped.set()
+            self.observe("stopped", reason=stop_reason, subscribed=self.subscribed, counts=dict(self.counts))
             if ws is not None:
                 try:
                     ws.close()
@@ -149,22 +202,31 @@ def image_completion_hints(account_identity, conversation_id, open_transport):
     with _hubs_lock:
         hub = _hubs.get(account_identity)
         if hub is None:
-            hub = _hubs[account_identity] = _ConversationHints()
+            hub = _hubs[account_identity] = _ConversationHints(account_identity)
         with hub.lock:
             hub.signals.setdefault(conversation_id, set()).add(signal)
+        hub.observe("registered", conversation_id, subscribed=hub.subscribed, stopped=hub.stopped.is_set())
         if hub.thread is None:
             hub.thread = threading.Thread(target=copy_context().run, args=(hub.run, open_transport), daemon=True)
             hub.thread.start()
     try:
+        fallback_observed = False
         def wait(seconds):
+            nonlocal fallback_observed
             if signal.is_set():
                 signal.clear()
+                hub.observe("hint_consumed", conversation_id)
                 return True
             if hub.stopped.is_set():
+                if not fallback_observed:
+                    hub.observe("poll_fallback", conversation_id, reason="listener_stopped")
+                    fallback_observed = True
                 time.sleep(seconds)
                 return False
             notified = signal.wait(seconds)
             signal.clear()  # Coalesce duplicate updates into one original GET.
+            if notified:
+                hub.observe("hint_consumed", conversation_id)
             return notified
         yield wait
     finally:
@@ -173,11 +235,13 @@ def image_completion_hints(account_identity, conversation_id, open_transport):
                 hub.signals[conversation_id].discard(signal)
                 if not hub.signals[conversation_id]:
                     del hub.signals[conversation_id]
+                    hub.nonfinal_reasons.pop(conversation_id, None)
                 empty = not hub.signals
             if empty:
                 hub.stopped.set()
                 if _hubs.get(account_identity) is hub:
                     del _hubs[account_identity]
+        hub.observe("released", conversation_id, last_context=empty)
         if empty:
             hub.thread.join(timeout=.5)
 

@@ -114,6 +114,64 @@ def test_active_account_shares_one_socket_and_last_release_stops_it(monkeypatch)
     assert hub.stopped.is_set() and "fixture" not in completion._hubs and not hub.thread.is_alive()
 
 
+def test_global_listener_observations_distinguish_subscription_and_routing_without_private_data(monkeypatch):
+    records = []
+    monkeypatch.setattr(completion.logger, "info", records.append)
+    reply = {"id": 2, "reply": {"type": "subscribe", "topic_id": "conversations"}}
+    session = Session([[global_image_event(), reply, global_image_event("private-foreign"),
+                        global_image_event(status="in_progress"), global_image_event(status="in_progress"),
+                        global_image_event("private-second", status="in_progress"), global_image_event()]])
+    hub = completion._ConversationHints("private-account")
+    signal = threading.Event(); hub.signals[CID] = {signal}
+    second = threading.Event(); hub.signals["private-second"] = {second}
+    hub.run(lambda: (session, URL, {}, lambda: None, time.monotonic() + 10))
+    assert signal.is_set()
+    assert [r["stage"] for r in records][:4] == [
+        "opening_transport", "socket_connected", "subscription_requested", "subscribed"]
+    matched = next(r for r in records if r["stage"] == "hint_matched")
+    assert matched["conversation_ref"] == completion.safe_account_ref(CID)
+    assert matched["waiting_contexts"] == 1
+    nonfinal = [r for r in records if r["stage"] == "hint_nonfinal"]
+    assert len(nonfinal) == 2  # Repeated updates on one CID are coalesced.
+    assert {r["conversation_ref"] for r in nonfinal} == {
+        completion.safe_account_ref(CID), completion.safe_account_ref("private-second")}
+    assert all(r["reason"] == "no_final_image_tool" for r in nonfinal)
+    assert not second.is_set()
+    stopped = records[-1]
+    assert stopped["subscribed"] is True
+    assert stopped["counts"] == dict(before_subscription=1, other_topic=0,
+                                     unregistered_conversation=1, active_nonfinal=3, matched_hints=1)
+    serialized = json.dumps(records)
+    for private in (URL, CID, "private-account", "private-foreign", "private-second", "ghostrider", "update_content"):
+        assert private not in serialized
+
+
+def test_listener_connection_exception_logs_only_fixed_class_and_preserves_fallback(monkeypatch):
+    records = []
+    monkeypatch.setattr(completion.logger, "info", records.append)
+    hub = completion._ConversationHints("private-account")
+    def fail():
+        raise RuntimeError("secret cookie and signed URL: " + URL)
+    hub.run(fail)
+    assert hub.stopped.is_set()
+    assert records[-1]["reason"] == "transport_exception"
+    assert records[-1]["subscribed"] is False
+    assert next(r for r in records if r["stage"] == "transport_error")["error_type"] == "RuntimeError"
+    assert "secret cookie" not in json.dumps(records) and URL not in json.dumps(records)
+
+
+def test_listener_logging_failure_cannot_drop_completion_hint(monkeypatch):
+    def broken_log(_record):
+        raise RuntimeError("log unavailable")
+    monkeypatch.setattr(completion.logger, "info", broken_log)
+    reply = {"id": 2, "reply": {"type": "subscribe", "topic_id": "conversations"}}
+    session = Session([[reply, global_image_event()]])
+    hub = completion._ConversationHints()
+    signal = threading.Event(); hub.signals[CID] = {signal}
+    hub.run(lambda: (session, URL, {}, lambda: None, time.monotonic() + 10))
+    assert signal.is_set() and session.ws.closed and hub.stopped.is_set()
+
+
 def test_active_shared_listener_survives_first_callers_five_minute_window(monkeypatch):
     from curl_cffi import CurlECode, CurlError
     now = [0.0]
