@@ -2431,6 +2431,87 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(restarted._tasks["owner-1:unknown-task"]["_first_qualified_image_assets_observed_at"],
                              recovered["_first_qualified_image_assets_observed_at"])
 
+    def test_missing_cursor_resume_schedules_only_with_original_identity(self):
+        for message in ("original-request", ""):
+            with self.subTest(message=bool(message)), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "tasks.json"
+                write_policy_task(path, conversation_id="", request_message_id=message,
+                                  error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_outcome="unknown")
+                service = self.make_service(path)
+                with mock.patch("services.image_task_service.threading.Thread") as thread:
+                    if message:
+                        service.resume_poll(OWNER, "policy-task")
+                        thread.return_value.start.assert_called_once()
+                        self.assertEqual(thread.call_args.kwargs["args"][1], "")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "conversation_id"):
+                            service.resume_poll(OWNER, "policy-task")
+                        thread.assert_not_called()
+
+    def test_missing_cursor_recovers_exact_message_and_persists_scan_progress(self):
+        from services.conversation_binding_service import ConversationBindingError
+        document = {"current_node": "original-request", "mapping": {
+            "original-request": {"parent": "original-parent", "message": {
+                "id": "original-request", "author": {"role": "user"}}}}}
+        for first_failure in (None, "incomplete", "absent", "limited"):
+            with self.subTest(first_failure=first_failure), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "tasks.json"
+                write_policy_task(path, conversation_id="", parent_message_id="", started_ts=123.0,
+                                  error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_outcome="unknown",
+                                  upstream_unfinished=True, _submission_started=True)
+                service = self.make_service(path)
+                backend = mock.Mock(spec=OpenAIBackendAPI)
+                backend._poll_image_results.return_value = (["original-file"], [])
+                backend.resolve_conversation_image_urls.return_value = ["https://fixture.invalid/original.png"]
+                backend.download_image_bytes.return_value = [b"original-image"]
+                backend.get_conversation_parent_message_id.return_value = "original-final"
+                backend._get_conversation.return_value = document
+                located = ({"conversation_id": "found-original", "request_parent_message_id": "original-parent"}, document)
+                progress = {"next_index": 1, "conversation_ids": ["candidate"]}
+                failure = ConversationBindingError("bounded scan", code="CONVERSATION_OUTCOME_UNKNOWN",
+                    recovery_reason="REQUEST_CONVERSATION_UNATTRIBUTABLE" if first_failure == "absent"
+                        else "REQUEST_CONVERSATION_SCAN_INCOMPLETE",
+                    recovery_scan=progress,
+                    recovery_read_error={"phase": "conversation_list", "category": "http",
+                        "http_status": 429, "retry_after_seconds": 73, "candidate_ref": None}
+                        if first_failure == "limited" else None)
+                with (
+                    mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="fixture-token"),
+                    mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", return_value=backend),
+                    mock.patch("services.conversation_binding_service.ConversationBindingService._locate_text_request_conversation",
+                               side_effect=[failure, located] if first_failure else [located]) as locate,
+                    mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"b64_json": "b3JpZ2luYWw="}]}),
+                ):
+                    service._run_resume_poll("owner-1:policy-task", "", 5, "", OWNER, "generate", "gpt-image-2", False, False)
+                    if first_failure:
+                        saved = service._tasks["owner-1:policy-task"]
+                        self.assertEqual(saved["_recovery_conversation_scan"], progress)
+                        self.assertEqual(saved["conversation_id"], "")
+                        backend._poll_image_results.assert_not_called()
+                        if first_failure == "absent":
+                            self.assertFalse(service.can_locate_original_cursor(saved))
+                            continue
+                        if first_failure == "limited":
+                            self.assertEqual(saved["recovery_error_code"], "RECOVERY_RATE_LIMITED")
+                            self.assertEqual(saved["recovery_retry_after_seconds"], 73)
+                            self.assertGreater(saved["next_poll_at"], time.time() + 71)
+                            continue
+                        service = self.make_service(path)
+                        service._run_resume_poll("owner-1:policy-task", "", 5, "", OWNER, "generate", "gpt-image-2", False, False)
+                        self.assertEqual(locate.call_args.args[1]["_recovery_conversation_scan"], progress)
+                    saved = service._tasks["owner-1:policy-task"]
+                    self.assertEqual(saved["status"], "success")
+                    self.assertEqual(saved["conversation_id"], "found-original")
+                    self.assertEqual(saved["request_message_id"], "original-request")
+                    self.assertEqual(saved["_image_thread_request_parent"], "original-parent")
+                    self.assertEqual(locate.call_args.args[1]["started_at"], 123.0)
+                    self.assertEqual(saved["_recovery_conversation_scan"], {})
+                    backend._poll_image_results.assert_called_once()
+                    self.assertEqual(backend._poll_image_results.call_args.args[0], "found-original")
+                    self.assertEqual(backend._poll_image_results.call_args.kwargs["request_message_id"], "original-request")
+
     def test_unknown_resume_keeps_404_and_empty_final_without_images_unknown(self):
         scenarios = ("conversation-404", "empty-final-and-tasks")
         for scenario in scenarios:

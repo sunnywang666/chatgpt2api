@@ -468,6 +468,8 @@ class GenerationCompletionService:
         if kind == "text":
             self.text.read(owner, request_id)
         elif (root.get("status") == "error" and unresolved(root)
+              and (root.get("conversation_id") or self.images.can_locate_original_cursor(root))
+              and now >= float(root.get("next_poll_at") or 0)
               and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS):
             self.images.resume_poll({"id": owner}, request_id, extra_timeout_secs=5,
                                     allow_unrecoverable_retry=True, completion_recheck=True)
@@ -499,6 +501,21 @@ class GenerationCompletionService:
                         self.store.write_receipt(db, kind, owner, request_id, root)
                         self.text.admission.wake()
                         return
+                    if kind == "image" and unresolved(root) and not root.get("conversation_id"):
+                        if root.get("recovery_error_code") == "RECOVERY_AUTH_REQUIRED":
+                            raise CompletionError("COMPLETION_ORIGINAL_READ_UNAVAILABLE")
+                        if self.images.can_locate_original_cursor(root):
+                            # The bounded scan may need several windows. A
+                            # missing final cursor during its own cooldown is
+                            # not permission to stop scanning or generate again.
+                            state.update(state="checking_original", reason="COMPLETION_INVESTIGATING_ORIGINAL",
+                                         next_at=max(now + self.RECHECK_SECONDS, float(root.get("next_poll_at") or 0)))
+                            self.store.write_receipt(db, kind, owner, request_id, root)
+                            return
+                        # A send can disconnect before its first cursor arrives.
+                        # resume_poll cannot query that original without a cursor;
+                        # repeating its local ValueError is not an investigation.
+                        raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNAVAILABLE")
                     ended = kind == "text" and self.text._verified_retryable_empty(root)
                     retry_authorized = state["allow_unconfirmed_retry"] or state.get("automatic_failure_retry")
                     if kind == "text" and root.get("conversation_id") and not ended and not retry_authorized:

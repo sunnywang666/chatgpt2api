@@ -1744,6 +1744,14 @@ class ImageTaskService:
             self._transaction_local.db.execute("DELETE FROM image_requests WHERE task_key=?", (key,))
         return bool(removed_keys)
 
+    @staticmethod
+    def can_locate_original_cursor(task):
+        return (all(_clean(task.get(k)) for k in (
+            "provider_binding_id", "provider_account_identity", "client_conversation_id", "request_message_id"))
+            and task.get("_image_cursor_lookup_error") not in {
+                "REQUEST_CONVERSATION_UNATTRIBUTABLE", "CONVERSATION_BINDING_MISMATCH",
+                "CONVERSATION_BINDING_CONTRACT_INVALID"})
+
     def resume_poll(
         self,
         identity: dict[str, object],
@@ -1780,7 +1788,7 @@ class ImageTaskService:
                     and not (saved_image and task.get("error_code") == "RESULT_UNRECOVERABLE")):
                 raise ValueError("task outcome is not unknown")
             conversation_id = _clean(task.get("conversation_id"))
-            if not conversation_id:
+            if not conversation_id and not self.can_locate_original_cursor(task):
                 raise ValueError("task has no conversation_id")
             if not _clean(task.get("request_message_id")):
                 # Do not rotate this legacy UNKNOWN through a zero-duration
@@ -2280,6 +2288,38 @@ class ImageTaskService:
             access_token = account_service.get_bound_text_access_token(binding_id, model="auto")
             with account_service.conversation_binding_lock(binding_id, client_conversation_id):
                 backend = OpenAIBackendAPI(access_token=access_token)
+                located_document = None
+                if not conversation_id:
+                    from services.conversation_binding_service import (
+                        ConversationBindingService, ConversationBindingError, RECOVERY_CONVERSATION_SCAN_FIELD,
+                    )
+                    # Reuse the bounded exact-message scan already used by text
+                    # and durable image forwarding. Never match titles/prompts.
+                    try:
+                        located, located_document = ConversationBindingService._locate_text_request_conversation(
+                            backend, {**task, "started_at": task.get("started_ts"),
+                                      "created_at": task.get("created_ts"),
+                                      "request_parent_message_id": expected_parent or ""})
+                    except ConversationBindingError as exc:
+                        self._update_task(key, **{
+                            RECOVERY_CONVERSATION_SCAN_FIELD: exc.recovery_scan,
+                            "_image_cursor_lookup_error": exc.recovery_reason or exc.code,
+                        })
+                        # The locator wraps read failures to retain scan progress.
+                        # Preserve their real account cooldown/auth classification.
+                        read_error = exc.recovery_read_error or {}
+                        exc.status_code = read_error.get("http_status")
+                        if read_error.get("retry_after_seconds") is not None:
+                            exc.retry_after = max(read_error["retry_after_seconds"], getattr(exc, "retry_after", 0))
+                        raise
+                    conversation_id = located["conversation_id"]
+                    expected_parent = expected_parent or located["request_parent_message_id"]
+                    self._update_task(key, conversation_id=conversation_id,
+                                      _image_thread_request_parent=expected_parent,
+                                      _image_cursor_lookup_error=None,
+                                      **{RECOVERY_CONVERSATION_SCAN_FIELD: {}})
+                    task = {**task, "conversation_id": conversation_id,
+                            "_image_thread_request_parent": expected_parent}
                 def record_pending_ids(files, sediments):
                     pending_ids.update(file_ids=files, sediment_ids=sediments)
                     self._update_task(key, _pending_image_result_ids=dict(pending_ids))
@@ -2331,7 +2371,7 @@ class ImageTaskService:
                     )
                     return
                 try:
-                    document = backend._get_conversation(conversation_id)
+                    document = located_document or backend._get_conversation(conversation_id)
                     conversation_available = True
                     from services.generation_completion import retry_cursor
                     self._update_task(key, _retry_cursor=retry_cursor(document, task, kind="image"))

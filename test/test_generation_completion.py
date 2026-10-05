@@ -663,6 +663,85 @@ def test_original_only_image_policy_survives_restart_and_prevents_successor(setu
     assert calls == []
 
 
+def test_image_send_without_cursor_stops_local_investigation_and_preserves_unknown(setup):
+    service, admission, calls = setup
+    rid = "missing-cursor-image"
+    service.images.submit_generation(IDENTITY, client_task_id=rid, prompt="retained image input",
+                                     model="gpt-image-2", size=None)
+    patch_row(service, "image", rid, status="error", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+              upstream_outcome="unknown", upstream_unfinished=True, conversation_id="",
+              request_message_id="original-user-message", _submission_started=True,
+              upstream_submission_started=True, _turn_reserved=True, _executing=False,
+              recovery_error_code="RECOVERY_READ_FAILED",
+              _execution_timeline=[{"stage": "send_call_started", "at": 10}],
+              _completion={"state": "checking_original", "allow_unconfirmed_retry": False,
+                           "automatic_failure_retry": True, "max_extra_requests": 1, "next_at": 0})
+    original = row(service, "image", rid)
+    service.images.resume_poll = Mock(side_effect=AssertionError("no original cursor to read"))
+    service._prepare = Mock(side_effect=AssertionError("must not replace unknown original"))
+    service.advance("image", "owner", rid)
+    result = service.read("image", IDENTITY, rid)
+    assert result["state"] == "needs_attention"
+    assert result["reason"] == "COMPLETION_ORIGINAL_CURSOR_UNAVAILABLE"
+    assert result["next_at"] is None and "replacement_id" not in result
+    assert result["original_status"] == "error" and not result["original_turn_ended"]
+    assert result["stop"]["confirmed"] is False
+    after = row(service, "image", rid)
+    for key in ("_input_ref", "_execution_timeline", "request_message_id", "conversation_id",
+                "provider_account_identity", "provider_binding_id", "upstream_outcome",
+                "error_code", "recovery_error_code"):
+        assert after.get(key) == original.get(key)
+    assert after["_attempt_finished_at"] and not after["_turn_reserved"]
+    assert result["local_reservation"] == "released"
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted.process_one()
+    restarted.process_one()
+    restarted.advance("image", "owner", rid)
+    service.images.resume_poll.assert_not_called()
+    service._prepare.assert_not_called()
+    with service.store.connect() as db:
+        assert db.execute("SELECT count(*) FROM image_requests").fetchone()[0] == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize("code", ["RECOVERY_READ_FAILED", "RECOVERY_RATE_LIMITED"])
+def test_image_cursor_scan_wait_survives_completion_ticks_and_restart(setup, code):
+    service, admission, calls = setup
+    rid = "cursor-scan-wait"
+    service.images.submit_generation(IDENTITY, client_task_id=rid, prompt="retained image input",
+                                     model="gpt-image-2", size=None)
+    patch_row(service, "image", rid, status="error", upstream_outcome="unknown", conversation_id="",
+              provider_binding_id="original-binding", provider_account_identity="original-account",
+              client_conversation_id="original-client-session", request_message_id="original-user-message",
+              _submission_started=True, upstream_submission_started=True, _executing=False,
+              recovery_error_code=code, next_poll_at=service.clock()+73,
+              _recovery_conversation_scan={"next_offset": 20},
+              _image_cursor_lookup_error="REQUEST_CONVERSATION_SCAN_INCOMPLETE",
+              _completion={"state": "checking_original", "allow_unconfirmed_retry": False,
+                           "automatic_failure_retry": True, "max_extra_requests": 1, "next_at": 0})
+    service.images.resume_poll = Mock()
+    service._prepare = Mock(side_effect=AssertionError("scan must not generate"))
+    service.advance("image", "owner", rid)
+    first = row(service, "image", rid)
+    assert first["_completion"]["state"] == "checking_original"
+    assert first["_completion"]["next_at"] == first["next_poll_at"]
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted._prepare = service._prepare
+    admission.clock.now += 72
+    restarted.process_one()
+    service.images.resume_poll.assert_not_called()
+    admission.clock.now += 1
+    restarted.process_one()
+    service.images.resume_poll.assert_called_once_with({"id": "owner"}, rid, extra_timeout_secs=5,
+                                                     allow_unrecoverable_retry=True, completion_recheck=True)
+    final = row(service, "image", rid)
+    assert final["_completion"]["state"] == "checking_original"
+    assert final["_recovery_conversation_scan"] == first["_recovery_conversation_scan"]
+    assert "replacement_id" not in final["_completion"]
+    service._prepare.assert_not_called()
+    assert calls == []
+
+
 def test_original_only_policy_does_not_cancel_existing_successor(failed_unsent_image):
     service = failed_unsent_image
     prior = row(service, "image", "repair-image")
