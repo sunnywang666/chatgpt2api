@@ -29,7 +29,7 @@ def reset_unsent_image_attempt(kind, receipt):
                        active_attempt_deadline_at=None, started_ts=None)
 
 
-def record_unsent_failure(context, receipt, at, error_type=None, reason=None):
+def record_unsent_failure(context, receipt, at, error_type=None, reason=None, capability_reason=None):
     """Keep why an unsent attempt returned to its original queue, without text."""
     # progress can belong to an older attempt. Only the submission fence proves
     # the phase here; do not attribute the failure to a stale detailed step.
@@ -41,6 +41,9 @@ def record_unsent_failure(context, receipt, at, error_type=None, reason=None):
                   "work_not_active", "send_guard_rejected", "account_unavailable",
                   "image_capability_unavailable", "image_binding_changed"}:
         entry["reason"] = reason
+    if capability_reason in {"disabled", "auth_required", "limited", "read_failed",
+                             "stale_consumed", "stale_expired", "unavailable"}:
+        entry["capability_reason"] = capability_reason
     code = receipt.get("error_code")
     if code in {"CONVERSATION_OUTCOME_UNKNOWN", "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}:
         entry["error_code"] = code
@@ -1351,7 +1354,8 @@ class PoolAdmission:
                                       "SCHEDULING_NOT_BEFORE": "scheduling_changed",
                                       "SCHEDULING_SEND_INTERVAL": "scheduling_changed",
                                       "WORK_NOT_ACTIVE": "work_not_active"}.get(str(exc), "send_guard_rejected")
-                        record_unsent_failure(context, r, now, "AdmissionLost", reason=diagnostic)
+                        record_unsent_failure(context, r, now, "AdmissionLost", reason=diagnostic,
+                                              capability_reason=getattr(exc, "capability_reason", None))
                         r.update(status="queued", upstream_outcome="not_sent", upstream_unfinished=False,
                                  _claim_id=None, _claim_until=0, _turn_reserved=False, _executing=False,
                                  _ready_at=now + 1, waiting={"reasons": [reason], "next_check_at": now + 1})
@@ -1467,7 +1471,15 @@ class PoolAdmission:
                 raise AdmissionLost("original account is unavailable before send")
             if context.kind == "image" or r.get("_operation") == "image":
                 if image_capacity(selected, self._settings(), r.get("model", "gpt-image-2")) <= 0:
-                    raise AdmissionLost("original image capability is unavailable before send")
+                    from services.owned_accounts import image_capability_projection
+                    reason = image_capability_projection(selected).get("reason")
+                    if reason == "stale":
+                        reason = "stale_consumed" if selected.get("capacity_used_since_observation") else "stale_expired"
+                    error = AdmissionLost("original image capability is unavailable before send")
+                    error.capability_reason = reason if reason in {
+                        "disabled", "auth_required", "limited", "read_failed", "stale_consumed", "stale_expired"
+                    } else "unavailable"
+                    raise error
                 if r.get("provider_binding_id"):
                     try:
                         bound_identity = self.accounts.get_bound_account_identity(r["provider_binding_id"])

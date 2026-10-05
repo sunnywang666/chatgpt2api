@@ -1503,6 +1503,10 @@ class AdmissionTests(unittest.TestCase):
                 self.assertFalse(receipt["_submission_started"])
                 failures = [e for e in receipt["_execution_timeline"] if e["stage"] == "pre_submit_failure"]
                 self.assertEqual(failures[-1]["reason"], reason)
+                if reason == "image_capability_unavailable":
+                    self.assertEqual(failures[-1]["capability_reason"], "stale_consumed")
+                else:
+                    self.assertNotIn("capability_reason", failures[-1])
                 self.assertNotIn("fixture-token", "\n".join(captured.output))
                 self.assertNotIn("private image input", "\n".join(captured.output))
 
@@ -1512,9 +1516,11 @@ class AdmissionTests(unittest.TestCase):
         context = self.admission.claim_next()
         with patch("services.pool_admission.logger.warning") as logged:
             receipt = {}
-            record_unsent_failure(context, receipt, self.clock(), "AdmissionLost", reason="private credential")
+            record_unsent_failure(context, receipt, self.clock(), "AdmissionLost", reason="private credential",
+                                  capability_reason="private credential")
             self.assertNotIn("private credential", str(logged.call_args_list))
             self.assertNotIn("reason", receipt["_execution_timeline"][0])
+            self.assertNotIn("capability_reason", receipt["_execution_timeline"][0])
         import sqlite3
         update = self.admission.update_claim
         failed = threading.Event()
