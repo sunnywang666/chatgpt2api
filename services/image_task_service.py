@@ -2335,11 +2335,11 @@ class ImageTaskService:
                         files = list(dict.fromkeys(x for record in records for x in record["file_ids"]))
                         sediments = list(dict.fromkeys(x for record in records for x in record["sediment_ids"]))
                         original_ids = set(persisted_file_ids + persisted_sediment_ids)
-                        observed_ids = set(files + sediments)
                         if (not set(persisted_file_ids) <= set(files)
                                 or not set(persisted_sediment_ids) <= set(sediments)):
                             raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
-                        if observed_ids > original_ids:
+                        if (set(files) > set(persisted_file_ids)
+                                or set(sediments) > set(persisted_sediment_ids)):
                             # A stream can expose one image before the same
                             # original turn produces the rest. Expand only from
                             # its complete, unbranched final snapshot; cached

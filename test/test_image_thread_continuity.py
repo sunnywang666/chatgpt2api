@@ -290,7 +290,7 @@ def test_private_image_output_cannot_escape_through_chunk_or_collection():
     assert "cHJpdmF0ZQ==" not in repr(private)
 
 
-@pytest.mark.parametrize("change", ["none", "unfinished", "sibling", "successor", "missing-original", "namespace", "nonfinal", "download-failure"])
+@pytest.mark.parametrize("change", ["none", "unfinished", "sibling", "successor", "missing-original", "namespace", "namespace-added", "nonfinal", "download-failure"])
 def test_recovery_expands_partial_assets_only_on_complete_original_branch(runtime, monkeypatch, change):
     r = runtime
     r.state.tool_leaf = r.state.fail_after_result = True
@@ -299,6 +299,9 @@ def test_recovery_expands_partial_assets_only_on_complete_original_branch(runtim
     assert original["status"] == "error"
     cid, rid = original["conversation_id"], original["request_message_id"]
     asset = original["result_file_ids"][0]
+    if change == "namespace-added":
+        r.service._update_task("happy:original", result_sediment_ids=[])
+        original = r.read("original")
     coverage = {"conversation_id": cid, "request_message_id": rid,
                 "file_ids": original["result_file_ids"], "sediment_ids": original["result_sediment_ids"]}
     r.service._store_pending_image_output("happy:original", coverage,
@@ -307,6 +310,7 @@ def test_recovery_expands_partial_assets_only_on_complete_original_branch(runtim
     doc = r.state.documents[cid]
     doc["mapping"][rid + "-image"]["message"]["content"]["parts"][0]["asset_pointer"] = "sediment://" + asset
     extra = "file_00000000" + hashlib.sha256((rid + "-extra").encode()).hexdigest()[:24]
+    if change == "namespace-added": extra = asset
     tool = copy.deepcopy(doc["mapping"][rid + "-image"])
     tool["parent"] = rid + "-image"
     tool["message"]["id"] = rid + "-extra"
@@ -340,7 +344,7 @@ def test_recovery_expands_partial_assets_only_on_complete_original_branch(runtim
     def download(_self, urls):
         downloads.append(urls)
         if change == "download-failure": raise TimeoutError("download unavailable")
-        return [OUTPUT, SOURCE]
+        return [OUTPUT] if change == "namespace-added" else [OUTPUT, SOURCE]
     monkeypatch.setattr(Backend, "download_image_bytes", download)
     monkeypatch.setattr(conversation, "format_image_result", lambda items, *_a, **_kw: {"data": items})
     restarted = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
@@ -349,16 +353,24 @@ def test_recovery_expands_partial_assets_only_on_complete_original_branch(runtim
     assert len(r.state.sends) == 1 and result["conversation_id"] == cid and result["request_message_id"] == rid
     with r.store.output_file(cached["output_ref"]) as handle:
         assert json.loads(handle.read())[0]["b64_json"] == base64.b64encode(OUTPUT).decode()
-    if change == "none":
-        assert result["status"] == "success" and len(result["data"]) == 2
+    if change in {"none", "namespace-added"}:
+        assert result["status"] == "success" and len(result["data"]) == len({asset, extra})
         assert set(result["result_file_ids"]) == {asset, extra}
+        assert set(result["result_sediment_ids"]) == {asset, extra}
         assert result["parent_message_id"] == rid + "-final" and result["_image_thread_terminal"]
-        assert downloads == [[asset, extra]]
+        assert downloads == [list(dict.fromkeys([asset, extra]))]
     else:
         assert result["status"] == "error" and not result.get("data")
         assert result["_pending_image_output"] == cached
         if change != "download-failure":
             assert not downloads and result["result_file_ids"] == original["result_file_ids"]
+        else:
+            change = "none"
+            restored = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
+            restored._run_resume_poll("happy:original", cid, 5, "", WHO, "edit", "gpt-image-2", False, False)
+            result = r.read("original")
+            assert result["status"] == "success" and len(result["data"]) == 2
+            assert set(result["result_file_ids"]) == {asset, extra} and len(r.state.sends) == 1
 
 
 @pytest.mark.parametrize("change", ["none", "unfinished", "wrong-parent", "sibling", "current", "late-drift"])
