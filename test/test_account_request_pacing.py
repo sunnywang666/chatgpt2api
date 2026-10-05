@@ -1617,3 +1617,180 @@ def test_native_get_connect_cap_preserves_total_deadline(tmp_path, monkeypatch):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoundedReadBurstTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 10000.0
+        self.interval = 60.0
+        self.capacity = 3
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.path = Path(temp.name) / "clock.json"
+        for target, kwargs in (
+            ("services.account_request_pacing.time.monotonic", {"side_effect": lambda: self.now}),
+            ("services.account_request_pacing.time.time", {"side_effect": lambda: 1700000000 + self.now}),
+            ("services.account_request_pacing.time.sleep", {"side_effect": self.advance}),
+        ):
+            mock = patch(target, **kwargs); mock.start(); self.addCleanup(mock.stop)
+        for name, get in (
+            ("account_request_interval_secs", lambda _: 0.1),
+            ("account_message_interval_secs", lambda _: 5),
+            ("account_conversation_read_interval_secs", lambda _: self.interval),
+            ("account_conversation_read_burst", lambda _: self.capacity),
+        ):
+            mock = patch.object(type(config), name, property(get)); mock.start(); self.addCleanup(mock.stop)
+        self.starts = []
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def send(self, method, url, **kwargs):
+        self.starts.append((method, self.now))
+        return Response()
+
+    def get(self, clock):
+        return clock.request(self.send, "GET", "https://fixture.invalid/conversation/original")
+
+    def test_three_read_burst_then_one_per_interval_survives_every_restart(self):
+        for _ in range(5):
+            self.get(AccountRequestClock("fixture", self.path))
+        self.assertEqual(len(self.starts), 5)
+        for actual, expected in zip([t for _, t in self.starts], [10000, 10000.1, 10000.2, 10060, 10120]):
+            self.assertAlmostEqual(actual, expected, places=5)
+        self.advance(600)
+        for _ in range(4):
+            self.get(AccountRequestClock("fixture", self.path))
+        times = [t for _, t in self.starts[-4:]]
+        self.assertLess(times[2] - times[0], 0.3)
+        self.assertAlmostEqual(times[3] - times[0], 60, places=5)
+
+    def test_legacy_future_floor_is_not_erased_by_enabling_burst(self):
+        clock = AccountRequestClock("fixture", self.path)
+        clock.next_conversation_read = self.now + 80
+        clock._save()
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[0][1], 10080)
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[1][1], 10140)
+
+    def test_policy_changes_do_not_refill_burst_or_reset_debt(self):
+        for _ in range(3): self.get(AccountRequestClock("fixture", self.path))
+        self.capacity = 10
+        self.interval = 120
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1], 10119)
+        self.capacity = 1
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1] - self.starts[-2][1], 120 - 0.001)
+        self.capacity = 10
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1] - self.starts[-2][1], 120 - 0.001)
+
+    def test_policy_enlargement_after_long_idle_inherits_only_one_read(self):
+        self.capacity = 1
+        self.get(AccountRequestClock("fixture", self.path))
+        self.advance(600)
+        self.capacity = 10
+        self.interval = 30
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertAlmostEqual(self.starts[-1][1], 10600, places=5)
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertAlmostEqual(self.starts[-1][1], 10630, places=5)
+        self.advance(120)
+        for _ in range(4): self.get(AccountRequestClock("fixture", self.path))
+        self.assertLess(self.starts[-1][1] - self.starts[-4][1], 0.4)
+
+    def test_read_429_disables_burst_and_does_not_block_generation(self):
+        clock = AccountRequestClock("fixture", self.path)
+        self.get(clock)
+        with clock.lock:
+            clock.limited(evidence={"phase": "conversation_read"}, read_sent_at=self.now)
+        clock = AccountRequestClock("fixture", self.path)
+        clock.request(self.send, "POST", "https://fixture.invalid/conversation")
+        self.assertLess(self.starts[-1][1], 10001)
+        self.get(clock)
+        first_after_limit = self.starts[-1][1]
+        self.assertGreaterEqual(first_after_limit, 10060)
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1] - first_after_limit, 120 - 0.001)
+
+    def test_retry_after_remains_account_wide_even_with_available_credit(self):
+        clock = AccountRequestClock("fixture", self.path)
+        self.get(clock)
+        with clock.lock:
+            clock.limited(125, evidence={"phase": "conversation_read"}, retry_after_present=True)
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1], 10125)
+
+    def test_unknown_transport_still_consumes_persisted_credit(self):
+        clock = AccountRequestClock("fixture", self.path)
+        def fail(*args, **kwargs):
+            raise OSError("fixture connection lost")
+        with self.assertRaises(OSError):
+            clock.request(fail, "GET", "https://fixture.invalid/conversation/original")
+        for _ in range(3): self.get(AccountRequestClock("fixture", self.path))
+        self.assertLess(self.starts[1][1], 10001)
+        self.assertGreaterEqual(self.starts[2][1], 10060)
+
+    def test_snapshot_and_archive_reservation_use_same_credit_floor(self):
+        import hashlib
+        import services.account_request_pacing as pacing
+        account = {"provider_account_identity": "fixture"}
+        root = self.path.parent
+        path = root / "account_request_clocks" / (hashlib.sha256(b"fixture").hexdigest() + ".json")
+        for _ in range(3): self.get(AccountRequestClock("fixture", path))
+        self.interval = 120
+        clock = AccountRequestClock("fixture", path)
+        with patch.object(pacing, "DATA_DIR", root):
+            snapshot = pacing.account_pacing_snapshot(account, now=1700000000+self.now,
+                                                       include_turn=False, include_conversation_read=True)
+        self.assertAlmostEqual(snapshot["next_at"] - 1700000000, clock._read_ready(self.now), places=5)
+        with clock.lock:
+            self.assertTrue(clock._reserve_archive_read("fixture-archive", self.now))
+        self.assertAlmostEqual(clock.archive_read_until - 5, clock._read_ready(self.now), places=5)
+
+    def test_zero_interval_does_not_bank_unpaced_reads_as_free_credit(self):
+        self.interval = 0
+        for _ in range(8): self.get(AccountRequestClock("fixture", self.path))
+        self.interval = 60
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1] - self.starts[-2][1], 60 - 0.001)
+
+    def test_real_overlapping_reads_preserve_newer_limit_when_old_200_arrives(self):
+        started, release = threading.Event(), threading.Event()
+        errors = []
+        def delayed(method, url, **kwargs):
+            started.set()
+            if not release.wait(3): raise TimeoutError("fixture reply not released")
+            return Response()
+        def first_read():
+            try:
+                AccountRequestClock("fixture", self.path).request(
+                    delayed, "GET", "https://fixture.invalid/conversation/first")
+            except BaseException as exc: errors.append(exc)
+        worker = threading.Thread(target=first_read)
+        worker.start()
+        try:
+            self.assertTrue(started.wait(2))
+            def limited(*args, **kwargs):
+                result = Response(); result.status_code = 429; result.headers = {}; return result
+            newer = AccountRequestClock("fixture", self.path)
+            newer.request(limited, "GET", "https://fixture.invalid/conversation/second")
+            before = json.loads(self.path.read_text())
+        finally:
+            release.set(); worker.join(3)
+        self.assertFalse(worker.is_alive()); self.assertEqual(errors, [])
+        after = json.loads(self.path.read_text())
+        self.assertEqual(after["conversation_read_bucket"], before["conversation_read_bucket"])
+        self.assertEqual(after["conversation_read_rate_failures"], 1)
+        self.assertGreaterEqual(after["next_conversation_read"], before["next_conversation_read"])
+        self.assertGreaterEqual(AccountRequestClock("fixture", self.path)._read_ready(self.now), self.now + 59)
+
+    def test_corrupt_bucket_fails_closed(self):
+        clock = AccountRequestClock("fixture", self.path)
+        self.get(clock)
+        saved = json.loads(self.path.read_text())
+        saved["conversation_read_bucket"]["credit"] = float("nan")
+        self.path.write_text(json.dumps(saved))
+        with self.assertRaises(ValueError): AccountRequestClock("fixture", self.path)

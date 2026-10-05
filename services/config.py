@@ -108,6 +108,12 @@ def _pacing_value(key: str, raw: object) -> float:
     return value
 
 
+def _read_burst_value(raw: object) -> int:
+    if type(raw) is not int or not 1 <= raw <= 100:
+        raise ValueError("account_conversation_read_burst must be an integer between 1 and 100")
+    return raw
+
+
 def _valid_temporary_chat_second_slot(value: object) -> bool:
     if not isinstance(value, dict) or set(value) != {"account_identity", "request_id", "expires_at"}:
         return False
@@ -487,6 +493,14 @@ class ConfigStore:
             return 0.0
 
     @property
+    def account_conversation_read_burst(self) -> int:
+        """Opt-in read burst; one preserves fixed spacing, not an upstream quota."""
+        try:
+            return _read_burst_value(self.data.get("account_conversation_read_burst", 1))
+        except ValueError:
+            return 1
+
+    @property
     def image_account_concurrency(self) -> int:
         try:
             return max(1, int(self._resource_data().get("image_account_concurrency", self.data.get("image_account_concurrency", 3))))
@@ -753,6 +767,7 @@ class ConfigStore:
         data["account_request_interval_secs"] = self.account_request_interval_secs
         data["account_message_interval_secs"] = self.account_message_interval_secs
         data["account_conversation_read_interval_secs"] = self.account_conversation_read_interval_secs
+        data["account_conversation_read_burst"] = self.account_conversation_read_burst
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
@@ -812,6 +827,8 @@ class ConfigStore:
         for key in _PACING_SETTINGS:
             if key in data:
                 data[key] = _pacing_value(key, data[key])
+        if "account_conversation_read_burst" in data:
+            data["account_conversation_read_burst"] = _read_burst_value(data["account_conversation_read_burst"])
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
         if "account_message_interval_secs" in data:
