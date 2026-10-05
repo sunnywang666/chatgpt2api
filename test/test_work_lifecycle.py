@@ -57,6 +57,102 @@ def test_completion_persists_original_archive_intent_and_releases_only_its_work(
     assert not service.process_one()
 
 
+def test_work_reads_do_not_decode_unrelated_saved_images(runtime, monkeypatch):
+    service, store, _, calls, _, add = runtime
+    first = add("A-1")
+    marker = "unrelated-image-payload-must-remain-on-disk"
+    unrelated = {"id": "unrelated", "owner_id": "one", "status": "success",
+                 "_work_key": "work:unrelated", "conversation_id": "another-conversation",
+                 "data": [{"b64_json": marker * 10000}]}
+    with store.transaction() as db:
+        store.write_receipt(db, "image", "one", "unrelated", unrelated)
+    loads = json.loads
+    def selected_decode(raw, *args, **kwargs):
+        assert marker not in raw
+        return loads(raw, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr("services.task_store.json.loads", selected_decode)
+        assert service.get("text", {"id": "one"}, "A-1")["state"] == "active"
+        service.update("text", {"id": "one"}, "A-1", "completed", True)
+        assert service.process_one()
+        assert service.get("text", {"id": "one"}, "A-1")["archive"]["status"] == "confirmed"
+    assert calls == [("one", "A-1", True)]
+    with store.connect() as db:
+        assert store.read_receipt(db, "image", "one", "unrelated") == unrelated
+        assert store.read_receipt(db, "text", "one", "A-1") == first
+
+
+@pytest.mark.parametrize("legacy_key", ["missing", None, "", False, [], {}])
+def test_filtered_work_members_keep_legacy_unknown_and_original_reference(runtime, legacy_key):
+    service, store, _, calls, _, add = runtime
+    first = add("A-1")
+    legacy = {**first, "request_id": "legacy", "status": "unknown", "_sequence": 0,
+              "_work_key": legacy_key, "upstream_outcome": "unknown"}
+    if legacy_key == "missing":
+        legacy.pop("_work_key")
+    with store.transaction() as db:
+        db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("one", "legacy", "legacy", json.dumps(legacy)))
+    with pytest.raises(WorkLifecycleError, match="WORK_TURN_UNFINISHED"):
+        service.update("text", {"id": "one"}, "A-1", "completed", True)
+    assert calls == []
+    with store.transaction() as db:
+        legacy["_public_session_ref"] = "different-work"
+        store.write_receipt(db, "text", "one", "legacy", legacy)
+    assert service.update("text", {"id": "one"}, "A-1", "completed", True)["state"] == "completed"
+
+
+@pytest.mark.parametrize("same_account", [True, False])
+def test_filtered_work_members_keep_cross_owner_physical_unknown(runtime, same_account):
+    service, store, _, calls, _, add = runtime
+    first = add("A-1")
+    with store.transaction() as db:
+        first.update(provider_account_identity="account-A", provider_binding_id="binding-A",
+                     conversation_id="native-conversation")
+        store.write_receipt(db, "text", "one", "A-1", first)
+        store.write_receipt(db, "image", "other-owner", "legacy-image", {
+            "id": "legacy-image", "owner_id": "other-owner", "status": "error",
+            "upstream_unfinished": True, "_work_key": "different-work",
+            "provider_account_identity": "account-A" if same_account else "account-B",
+            "provider_binding_id": "binding-other", "conversation_id": "native-conversation"})
+    if same_account:
+        with pytest.raises(WorkLifecycleError, match="WORK_TURN_UNFINISHED"):
+            service.update("text", {"id": "one"}, "A-1", "completed", True)
+    else:
+        assert service.update("text", {"id": "one"}, "A-1", "completed", True)["state"] == "completed"
+    assert calls == []
+
+
+def test_filtered_image_members_use_receipt_owner_and_keep_legacy_unknown(runtime):
+    service, store, _, calls, _, add = runtime
+    owner = "one:alias"
+    first = add("A-1", owner=owner)
+    with store.transaction() as db:
+        db.execute("DELETE FROM requests WHERE owner=? AND id=?", (owner, "A-1"))
+        first.update(id="A-1", owner_id=owner, status="success", _image_thread={"id": "A"})
+        work = store.runtime(db, first["_work_key"])
+        work["kind"] = "image"
+        store.set_runtime(db, work["key"], work)
+        store.write_receipt(db, "image", owner, "A-1", first)
+        legacy = {"id": "legacy", "owner_id": owner, "status": "error",
+                  "_image_thread": {"id": "A"}, "upstream_unfinished": True}
+        store.write_receipt(db, "image", owner, "legacy", legacy)
+    with pytest.raises(WorkLifecycleError, match="WORK_TURN_UNFINISHED"):
+        service.update("image", {"id": owner}, "A-1", "completed", True)
+    assert calls == []
+
+
+def test_filtered_members_keep_newer_child_with_changed_reference(runtime):
+    service, store, _, calls, _, add = runtime
+    first = add("A-1")
+    child = {**first, "request_id": "child", "_public_session_ref": "changed-reference",
+             "_sequence": 2, "status": "queued", "upstream_outcome": "not_sent"}
+    with store.transaction() as db:
+        db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("one", "child", "child", json.dumps(child)))
+    with pytest.raises(WorkLifecycleError, match="WORK_SUPERSEDED"):
+        service.get("text", {"id": "one"}, "A-1")
+    assert calls == []
+
+
 @pytest.mark.parametrize("background", [False, True])
 def test_waiting_archive_does_not_block_another_account_or_overlap_same_account(runtime, background):
     service, store, _, _, _, add = runtime

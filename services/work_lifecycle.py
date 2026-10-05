@@ -195,7 +195,7 @@ class WorkLifecycleService:
             raise WorkLifecycleError("WORK_SUPERSEDED")
         # Legacy sessions did not have work rows. Include their proven native
         # session members so a prior UNKNOWN is never lost during adoption.
-        rows = list(self.store.receipts(db))
+        rows = list(self.store.work_receipts(db, kind, owner, work["key"], receipt.get("conversation_id")))
         members = [r for k, o, _, r in rows if _same_conversation(r, receipt) or (k == kind and o == owner and (
             r.get("_work_key") == work["key"] or (
                 not r.get("_work_key") and _reference(k, o, r) == work["work_ref"]))) ]

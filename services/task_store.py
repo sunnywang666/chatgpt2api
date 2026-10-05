@@ -234,6 +234,36 @@ class TaskStore:
         return json.loads(row[0]) if row else None
 
     @staticmethod
+    def work_receipts(db, kind, owner, work_key, conversation_id=None):
+        """Read a superset of work members without decoding unrelated images.
+
+        Keep all physical-conversation aliases and all same-owner legacy rows;
+        the lifecycle's existing Python predicates remain authoritative.
+        This only narrows reads, never rewrites saved receipt payloads.
+        """
+        for row_kind, table, owner_column in (
+                ("text", "requests", "owner"),
+                ("image", "image_requests", "json_extract(receipt,'$.owner_id')")):
+            clauses = ["json_extract(receipt,'$._work_key')=?"]
+            values = [work_key]
+            if conversation_id:
+                clauses.append("json_extract(receipt,'$.conversation_id')=?")
+                values.append(conversation_id)
+            if row_kind == kind:
+                # A non-text/empty work key is a broad legacy candidate. Do not
+                # reproduce _reference precedence or Python truthiness in SQL.
+                clauses.append(f"({owner_column}=? AND (json_type(receipt,'$._work_key') IS NOT 'text' "
+                               "OR json_extract(receipt,'$._work_key')=''))")
+                values.append(owner)
+            columns = "owner,id,receipt" if row_kind == "text" else "task_key,receipt"
+            for row in db.execute(f"SELECT {columns} FROM {table} WHERE (" + " OR ".join(clauses) + ")", values):
+                receipt = json.loads(row[-1])
+                if row_kind == "text":
+                    yield row_kind, row[0], row[1], receipt
+                else:
+                    yield row_kind, receipt["owner_id"], receipt["id"], receipt
+
+    @staticmethod
     def write_receipt(db, kind, owner, request_id, receipt):
         raw = json.dumps(receipt, ensure_ascii=False, separators=(",", ":"))
         if kind == "text":
