@@ -266,7 +266,10 @@ class ExecutionContext:
                           "stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event", "sse_error_category",
                           "sse_message_snapshot_events", "sse_terminal_assistant_events", "sse_terminal_id_events",
                           "sse_terminal_final_channel_events", "sse_terminal_parent_events",
-                          "sse_terminal_direct_parent_match_events"}},
+                          "sse_terminal_direct_parent_match_events", "sse_chain_nodes", "sse_chain_parent_edges",
+                          "sse_chain_terminal_chains", "sse_chain_max_depth", "sse_chain_analysis_snapshots",
+                          "sse_chain_metadata_patch_events", "sse_chain_request_seen", "sse_chain_missing_parent",
+                          "sse_chain_conflict", "sse_chain_cycle", "sse_chain_overflow", "sse_chain_unqualified_node"}},
         }
         try:
             with self.admission.store.transaction() as db:

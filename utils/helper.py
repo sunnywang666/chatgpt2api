@@ -243,6 +243,109 @@ def _sse_error_category(event: dict) -> str:
     return "unknown"
 
 
+class _SSESnapshotChains:
+    """Bounded, stream-local snapshot links; diagnostics, never completion authority.
+
+    In particular, a final assistant may descend from the request through an
+    analysis/tool node. Direct-parent counts alone cannot answer whether that
+    evidence was present. Retain no text, and publish no node IDs. Metadata
+    patches are counted separately, not treated as complete message snapshots.
+    """
+    def __init__(self, observation, request_id):
+        self.out, self.root, self.nodes = observation, request_id, {}
+        for name in ("nodes", "parent_edges", "terminal_chains", "max_depth",
+                     "analysis_snapshots", "metadata_patch_events"):
+            self.out["sse_chain_" + name] = 0
+        for name in ("request_seen", "missing_parent", "conflict", "cycle", "overflow", "unqualified_node"):
+            self.out["sse_chain_" + name] = False
+
+    def observe(self, event):
+        path = event.get("p")
+        fields = {"/status", "/end_turn", "/parent", "/parent_id", "/channel", "/author/role",
+                  "/metadata/parent", "/metadata/parent_id", "/metadata/channel"}
+        if isinstance(path, str) and path.startswith("/message/") and path[len("/message"):] in fields:
+            self.out["sse_chain_metadata_patch_events"] += 1
+        elif event.get("o") == "patch" and isinstance(event.get("v"), list):
+            self.out["sse_chain_metadata_patch_events"] += sum(
+                isinstance(item, dict) and isinstance(item.get("p"), str)
+                and (item["p"].removeprefix("/message") in fields)
+                for item in event["v"][:128])
+        value = event.get("v")
+        frame = value if isinstance(value, dict) and isinstance(value.get("message"), dict) else event
+        message = frame.get("message")
+        if not isinstance(message, dict):
+            return
+        node_id = message.get("id")
+        if not isinstance(node_id, str) or not node_id or len(node_id) > 256:
+            return
+        if node_id not in self.nodes and len(self.nodes) >= 64:
+            self.out["sse_chain_overflow"] = True
+            return
+        metadata = message.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        parents = {p for container in (frame, message, metadata) for key in ("parent", "parent_id")
+                   if isinstance(p := container.get(key), str) and p and len(p) <= 256}
+        node = self.nodes.setdefault(node_id, {"parent": None, "role": None, "conflict": False, "terminal": False})
+        if len(parents) > 1 or node["parent"] and parents and parents != {node["parent"]}:
+            node["conflict"] = self.out["sse_chain_conflict"] = True
+        elif len(parents) == 1:
+            node["parent"] = next(iter(parents))
+        author = message.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        channel = message.get("channel", metadata.get("channel"))
+        if role in ("assistant", "user", "tool", "system"):
+            if node["role"] is not None and node["role"] != role:
+                node["conflict"] = self.out["sse_chain_conflict"] = True
+            node["role"] = role
+        if role == "assistant" and channel == "analysis":
+            self.out["sse_chain_analysis_snapshots"] += 1
+        if node_id == self.root and role == "user":
+            self.out["sse_chain_request_seen"] = True
+        if node["terminal"] and (
+                "status" in message and message["status"] != "finished_successfully"
+                or "end_turn" in message and message["end_turn"] is not True
+                or ("channel" in message or "channel" in metadata) and channel != "final"
+                or "recipient" in message and message["recipient"] not in (None, "", "all")):
+            node["conflict"] = self.out["sse_chain_conflict"] = True
+        # A partial snapshot cannot erase a complete snapshot already observed.
+        node["terminal"] |= (node_id != self.root and role == "assistant" and channel == "final"
+                             and message.get("status") == "finished_successfully"
+                             and message.get("end_turn") is True
+                             and message.get("recipient") in (None, "", "all"))
+        self.out["sse_chain_nodes"] = len(self.nodes)
+        self.out["sse_chain_parent_edges"] = sum(bool(n["parent"]) for n in self.nodes.values())
+        self.out["sse_chain_missing_parent"] = False
+        self.out["sse_chain_cycle"] = False
+        self.out["sse_chain_unqualified_node"] = False
+        linked, depth_max = 0, 0
+        for candidate, data in self.nodes.items():
+            if not data.get("terminal"):
+                continue
+            seen, depth, cursor = set(), 0, candidate
+            while cursor != self.root or not self.root:
+                if cursor in seen:
+                    self.out["sse_chain_cycle"] = True
+                    break
+                seen.add(cursor)
+                current = self.nodes.get(cursor)
+                if current is None or not current["parent"]:
+                    self.out["sse_chain_missing_parent"] = True
+                    break
+                if current["conflict"]:
+                    break
+                if current["role"] not in ("assistant", "tool"):
+                    # Another user message belongs to a later turn, even when
+                    # its ancestry eventually reaches our original request.
+                    self.out["sse_chain_unqualified_node"] = True
+                    break
+                cursor, depth = current["parent"], depth + 1
+            else:
+                linked += 1
+                depth_max = max(depth_max, depth)
+        self.out["sse_chain_terminal_chains"] = linked
+        self.out["sse_chain_max_depth"] = depth_max
+
+
 def _observe_sse_message(event: dict, observation: dict, request_message_id: str) -> None:
     """Count complete message snapshots, never infer completion from patches.
 
@@ -282,6 +385,7 @@ def _observe_sse_message(event: dict, observation: dict, request_message_id: str
 
 def iter_sse_payloads(response: requests.Response, *, observation: dict | None = None,
                       request_message_id: str = "") -> Iterator[str]:
+    chains = _SSESnapshotChains(observation, request_message_id) if observation is not None else None
     if observation is not None:
         for key in ("sse_message_snapshot_events", "sse_terminal_assistant_events", "sse_terminal_id_events",
                     "sse_terminal_final_channel_events", "sse_terminal_parent_events",
@@ -314,6 +418,7 @@ def iter_sse_payloads(response: requests.Response, *, observation: dict | None =
                     else:
                         if isinstance(event, dict):
                             _observe_sse_message(event, observation, request_message_id)
+                            chains.observe(event)
                         if isinstance(event, dict) and (error_event or event.get("type") == "error" or event.get("error")):
                             observation["sse_error_event"] = True
                             observation["sse_error_category"] = _sse_error_category(event)
