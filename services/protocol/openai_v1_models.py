@@ -15,11 +15,16 @@ def list_models() -> dict[str, Any]:
     seen = {str(item.get("id") or "").strip() for item in data if isinstance(item, dict)}
     dynamic_models: set[str] = set()
     accounts = account_service.list_accounts()
-    web_image_accounts = [
-        account
-        for account in accounts
-        if isinstance(account, dict)
-    ]
+    # gpt-image-2 is a provider alias. It is listed only when persisted
+    # image_gen evidence exists, rather than treating account presence as a
+    # claim that the upstream account can generate images.
+    observed_image_accounts = model_catalog_service.image_capability_rows()
+    if not observed_image_accounts:
+        data[:] = [
+            item for item in data
+            if not isinstance(item, dict) or str(item.get("id") or "").strip() != "gpt-image-2"
+        ]
+        seen = {str(item.get("id") or "").strip() for item in data if isinstance(item, dict)}
     codex_types = {
         normalized
         for account in accounts
@@ -28,7 +33,7 @@ def list_models() -> dict[str, Any]:
            and (normalized := account_service._normalize_account_type(account.get("type")))
     }
 
-    if web_image_accounts:
+    if observed_image_accounts:
         dynamic_models.add("gpt-image-2")
     if codex_types & {"Plus", "Team", "Pro"}:
         dynamic_models.add(CODEX_IMAGE_MODEL)

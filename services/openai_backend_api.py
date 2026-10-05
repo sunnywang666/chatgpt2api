@@ -23,8 +23,9 @@ from curl_cffi import requests
 from PIL import Image
 
 from services.account_service import account_service
-from services.account_request_pacing import pace_account_session
+from services.account_request_pacing import AccountRequestDeadlineExceeded, pace_account_session, retry_after_seconds
 from services.config import config
+from services.request_context import observing_archive_step
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -33,6 +34,11 @@ from utils.turnstile import solve_turnstile_token
 
 
 class InvalidAccessTokenError(RuntimeError):
+    pass
+
+
+class ConversationArchiveCursorMismatch(RuntimeError):
+    """The pre-mutation archive read found a different current conversation turn."""
     pass
 
 
@@ -271,6 +277,20 @@ class OpenAIBackendAPI:
         if remaining <= 0:
             raise ImageActiveDeadlineExceeded("image active generation deadline exhausted")
         return max(0.001, min(float(maximum_secs), remaining))
+
+    def _image_request_options(self, maximum_secs: float) -> dict[str, Any]:
+        """Bound waits by the active attempt, then cap the network operation."""
+        timeout = self._image_active_timeout(maximum_secs)
+        options = {"timeout": timeout}
+        deadline = getattr(getattr(self, "progress_callback", None), "active_deadline_at", None)
+        if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and deadline > 0:
+            # A slow account pace must not consume the entire per-HTTP timeout
+            # before transport starts. The account clock caps that timeout
+            # again at the send edge using the remaining active-attempt budget.
+            options["_account_request_deadline_monotonic"] = time.monotonic() + max(0.0, deadline - time.time())
+            if callable(getattr(self.progress_callback, "record_local_pacing_wait", None)):
+                options["_account_request_local_wait"] = self.progress_callback.record_local_pacing_wait
+        return options
 
     def close(self) -> None:
         if getattr(self, "_closed", False):
@@ -719,11 +739,16 @@ class OpenAIBackendAPI:
             "Content-Type": "application/json",
         }
 
-    def _ensure_codex_source_account(self) -> None:
+    def _ensure_codex_source_account(self, *, require_image_capacity: bool = False) -> None:
         account = account_service.get_account(self.access_token)
         source_type = str((account or {}).get("source_type") or "web").strip().lower()
         if source_type != "codex":
             raise RuntimeError("codex responses endpoint requires a codex source account")
+        if require_image_capacity:
+            # Shared selection logic includes current capacity, freshness, and
+            # disabled/rate-limited state. Do not infer Codex image support
+            # merely from a Codex source type.
+            account_service.require_image_account(self.access_token, CODEX_IMAGE_MODEL)
 
     @staticmethod
     def _codex_image_input(prompt: str, images: list[str]) -> list[Dict[str, Any]]:
@@ -966,6 +991,18 @@ class OpenAIBackendAPI:
                 if key.lower() != "authorization"
             },
         })
+        # The caller may have spent time composing the upstream payload. The
+        # admission claim must be rechecked at the actual urllib POST edge;
+        # the context also fences a retry after an uncertain original send.
+        from services.request_context import current_request
+        context = current_request.get()
+        if context is not None:
+            context.before_send()
+        else:
+            # Legacy direct callers have no original claim. They still must
+            # not send through a disabled, rate-limited, or zero-capacity
+            # Codex image account.
+            self._ensure_codex_source_account(require_image_capacity=True)
         try:
             with urllib.request.urlopen(request, timeout=1200) as raw:
                 yield from self._iter_codex_response_events(raw)
@@ -1025,7 +1062,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._image_headers(path, requirements),
             json=payload,
-            timeout=self._image_active_timeout(60),
+            **self._image_request_options(60),
         )
         ensure_ok(response, path)
         return response.json().get("conduit_token", "")
@@ -1067,7 +1104,7 @@ class OpenAIBackendAPI:
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
                   "height": height},
-            timeout=self._image_active_timeout(60),
+            **self._image_request_options(60),
         )
         ensure_ok(response, path)
         upload_meta = response.json()
@@ -1084,7 +1121,7 @@ class OpenAIBackendAPI:
                 "Accept-Language": "en-US,en;q=0.8",
             },
             data=data,
-            timeout=self._image_active_timeout(120),
+            **self._image_request_options(120),
         )
         ensure_ok(response, "image_upload")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
@@ -1092,7 +1129,7 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             data="{}",
-            timeout=self._image_active_timeout(60),
+            **self._image_request_options(60),
         )
         ensure_ok(response, path)
         return {
@@ -1187,8 +1224,14 @@ class OpenAIBackendAPI:
         )
         request_timeout = self._image_active_timeout(300)
         request_deadline = time.monotonic() + request_timeout
+        local_wait = getattr(getattr(self, "progress_callback", None), "record_local_pacing_wait", None)
 
         def record_actual_submission() -> None:
+            # Upload, bootstrap, and prepare can take long enough for local
+            # image capability evidence to become stale. Recheck immediately
+            # before the paced generation POST, while it is still known not
+            # submitted. This is deliberately not used by result readers.
+            account_service.require_image_account(self.access_token, model)
             if callable(record_submission_started):
                 # The pacing wrapper invokes this immediately before its
                 # underlying send. A deadline spent on an account lock or
@@ -1196,26 +1239,44 @@ class OpenAIBackendAPI:
                 record_submission_started()
             self.image_submission_started = True
 
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-            json=payload,
-            timeout=request_timeout,
-            stream=True,
-            _account_request_deadline_monotonic=request_deadline,
-            _account_request_before_send=record_actual_submission,
-        )
-        if response.status_code == 404:
-            response.close()
-            path = "/backend-api/conversation"
+        try:
             response = self.session.post(
                 self.base_url + path,
                 headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
                 json=payload,
-                timeout=self._image_active_timeout(300),
+                timeout=request_timeout,
                 stream=True,
                 _account_request_deadline_monotonic=request_deadline,
+                _account_request_before_send=record_actual_submission,
+                **({"_account_request_local_wait": local_wait} if callable(local_wait) else {}),
+                **({"_account_request_preflight": self.image_pre_send_check} if callable(getattr(self, "image_pre_send_check", None)) else {}),
             )
+        except AccountRequestDeadlineExceeded:
+            # This typed local exception is raised before transport. A durable
+            # send reservation is not proof that the POST actually happened.
+            self.image_submission_started = False
+            raise
+        if response.status_code == 404:
+            response.close()
+            path = "/backend-api/conversation"
+            # An explicit endpoint-not-found response did not start generation.
+            # The fallback has its own durable reservation/transport boundary.
+            self.image_submission_started = False
+            try:
+                response = self.session.post(
+                    self.base_url + path,
+                    headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+                    json=payload,
+                    timeout=self._image_active_timeout(300),
+                    stream=True,
+                    _account_request_deadline_monotonic=time.monotonic() + self._image_active_timeout(300),
+                    _account_request_before_send=record_actual_submission,
+                    **({"_account_request_local_wait": local_wait} if callable(local_wait) else {}),
+                    **({"_account_request_preflight": self.image_pre_send_check} if callable(getattr(self, "image_pre_send_check", None)) else {}),
+                )
+            except AccountRequestDeadlineExceeded:
+                self.image_submission_started = False
+                raise
         ensure_ok(response, path)
         return response
 
@@ -1223,13 +1284,30 @@ class OpenAIBackendAPI:
         self,
         conversation_id: str,
         timeout_secs: float = 60.0,
-        *, _send=None,
+        *, _send=None, deadline_monotonic: float | None = None, connect_timeout_secs: float | None = 10.0,
+        minimum_budget_secs: float | None = None,
     ) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         request = self.session.get if _send is None else lambda url, **kw: _send("GET", url, **kw)
+        # Preflight already holds the account clock and caps its raw read.
+        # Internal pacing arguments must never reach that raw HTTP transport.
+        options = (self._image_request_options(timeout_secs) if _send is None
+                   else {"timeout": self._image_active_timeout(timeout_secs)})
+        if _send is None and deadline_monotonic is not None:
+            existing = options.get("_account_request_deadline_monotonic")
+            options["_account_request_deadline_monotonic"] = (
+                min(existing, deadline_monotonic) if existing is not None else deadline_monotonic
+            )
+        # Image recovery, publication checks and archive reads share the same
+        # bounded connection setup as direct text recovery. Pacing caps this
+        # sub-budget inside the remaining total timeout, never in addition to it.
+        if _send is None and connect_timeout_secs is not None:
+            options["_account_request_connect_timeout_secs"] = connect_timeout_secs
+        if _send is None and minimum_budget_secs is not None:
+            options["_account_request_minimum_budget_secs"] = minimum_budget_secs
         response = request(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                           timeout=self._image_active_timeout(timeout_secs))
+                           **options)
         try:
             ensure_ok(response, path)
             return response.json()
@@ -1244,22 +1322,30 @@ class OpenAIBackendAPI:
             raise RuntimeError("upstream conversation has no authoritative current_node")
         return parent_message_id
 
-    def set_conversation_archived(self, conversation_id: str, parent_message_id: str, archived: bool) -> Dict[str, Any]:
+    def set_conversation_archived(self, conversation_id: str, parent_message_id: str, archived: bool,
+                                  *, validate_document=None) -> Dict[str, Any]:
         """Change visibility only after checking the original conversation and cursor."""
-        document = self._get_conversation(conversation_id)
+        with observing_archive_step("precheck"):
+            document = self._get_conversation(conversation_id)
+        if str(document.get("current_node") or "").strip() != parent_message_id:
+            raise ConversationArchiveCursorMismatch("original conversation cursor changed")
         if parent_message_id not in (document.get("mapping") or {}):
             raise RuntimeError("original product turn is missing")
-        if str(document.get("current_node") or "").strip() != parent_message_id:
-            raise RuntimeError("original conversation cursor changed")
+        if validate_document is not None:
+            # Both checks use this fresh pre-PATCH read, never a cached poll
+            # snapshot from before the result download.
+            validate_document(document)
         if document.get("is_archived") is archived:
             return {"archived": archived}
         path = f"/backend-api/conversation/{conversation_id}"
-        response = self.session.patch(self.base_url + path,
-            headers=self._headers(path, {"Accept": "application/json", "Content-Type": "application/json"}),
-            json={"is_archived": archived}, timeout=60)
+        with observing_archive_step("patch"):
+            response = self.session.patch(self.base_url + path,
+                headers=self._headers(path, {"Accept": "application/json", "Content-Type": "application/json"}),
+                json={"is_archived": archived}, timeout=60)
         ensure_ok(response, path)
         # A timeout on PATCH is safe to recover by reading this exact chat first.
-        readback = self._get_conversation(conversation_id)
+        with observing_archive_step("readback"):
+            readback = self._get_conversation(conversation_id)
         if str(readback.get("current_node") or "").strip() != parent_message_id:
             raise RuntimeError("original conversation cursor changed during archive update")
         if readback.get("is_archived") is not archived:
@@ -2453,13 +2539,13 @@ class OpenAIBackendAPI:
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
             request_message_id: str = "",
+            require_fresh_result_ids: bool = False,
+            initial_document: dict | None = None,
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
-        - Sleeps image_poll_initial_wait_secs first (default 10s, +jitter). ChatGPT
-          image generation takes ~30s; polling immediately wastes requests and trips
-          a transient 429 the upstream returns within ~200ms of the SSE stream
-          closing (the conversation document is not yet committed).
+        - The first authoritative read runs as soon as the account clock allows.
+          Stream/asset signals do not add an unconditional initial or settle wait.
         - Subsequent polls are image_poll_interval_secs apart (default 10s).
         - On upstream 429 / 5xx or network errors, backs off exponentially
           (capped at 16s, +jitter) honoring Retry-After when present.
@@ -2470,22 +2556,23 @@ class OpenAIBackendAPI:
         if not request_message_id:
             raise RuntimeError("image result boundary unavailable: submitted message id missing")
         start = time.time()
+        initial_pacing_wait = float(getattr(getattr(self, "progress_callback", None), "local_pacing_wait_secs", 0))
         attempt = 0
         interval = float(config.image_poll_interval_secs)
-        initial_wait = float(config.image_poll_initial_wait_secs)
         file_ids: list[str] = []
         sediment_ids: list[str] = []
         self._add_unique(file_ids, initial_file_ids or [])
         self._add_unique(sediment_ids, initial_sediment_ids or [])
         has_initial_ids = bool(file_ids or sediment_ids)
+        single_snapshot = initial_document is not None
         last_hit_key: tuple[tuple[str, ...], tuple[str, ...]] | None = (
-            (tuple(file_ids), tuple(sediment_ids)) if has_initial_ids else None
+            (tuple(file_ids), tuple(sediment_ids)) if has_initial_ids and single_snapshot else None
         )
         logger.info({
             "event": "image_poll_start",
             "conversation_id": conversation_id,
             "timeout_secs": timeout_secs,
-            "initial_wait_secs": initial_wait,
+            "initial_wait_secs": 0,
             "interval_secs": interval,
             "initial_file_ids": file_ids,
             "initial_sediment_ids": sediment_ids,
@@ -2493,17 +2580,14 @@ class OpenAIBackendAPI:
         })
 
         def _remaining() -> float:
-            return timeout_secs - (time.time() - start)
+            pacing_wait = float(getattr(getattr(self, "progress_callback", None), "local_pacing_wait_secs", 0)) - initial_pacing_wait
+            return timeout_secs - (time.time() - start - pacing_wait)
 
-        if has_initial_ids and config.image_settle_enabled:
-            settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
-            if settle_for > 0:
-                time.sleep(settle_for)
-        elif initial_wait > 0:
-            jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
-            sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
-            if sleep_for > 0:
-                time.sleep(sleep_for)
+        # Recovery has already read this exact conversation under the account
+        # clock. Consume that fresh observation once; a second immediate GET
+        # cannot fit a short recovery budget when the read interval is longer.
+        # The recovery caller already enforced any pending-observation settle
+        # window. Live streams instead get a first read before any fallback wait.
 
         def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
             # retry_after=0 means "retry immediately" — must not be coerced via falsy check.
@@ -2534,33 +2618,11 @@ class OpenAIBackendAPI:
         last_read_was_transport = False
         while _remaining() > 0:
             attempt += 1
-            # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
-            # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
-            last_task_error = ""
-            try:
-                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
-                for task in tasks:
-                    is_error, error_msg, metadata = self.check_task_error(task)
-                    if is_error and error_msg:
-                        last_task_error = error_msg
-                        logger.info({
-                            "event": "image_poll_task_error_not_blocking",
-                            "conversation_id": conversation_id,
-                            "attempt": attempt,
-                            "error_msg": error_msg,
-                            "metadata": metadata,
-                        })
-            except Exception as exc:
-                # tasks 查询失败不影响正常轮询流程
-                logger.debug({
-                    "event": "image_poll_task_check_failed",
-                    "conversation_id": conversation_id,
-                    "attempt": attempt,
-                    "error": str(exc),
-                })
+            supplied_snapshot = initial_document is not None
 
             try:
-                conversation = self._get_conversation(conversation_id)
+                conversation = initial_document if supplied_snapshot else self._get_conversation(conversation_id)
+                initial_document = None
             except UpstreamHTTPError as exc:
                 last_read_status = exc.status_code
                 last_retry_after = exc.retry_after
@@ -2585,13 +2647,51 @@ class OpenAIBackendAPI:
                 last_retry_after = None
                 last_read_was_transport = False
 
+            previous_ids = (tuple(file_ids), tuple(sediment_ids))
+            current_file_ids: set[str] = set()
+            current_sediment_ids: set[str] = set()
             for record in self._extract_image_tool_records(conversation, request_message_id):
                 for file_id in record["file_ids"]:
+                    current_file_ids.add(file_id)
                     if file_id not in file_ids:
                         file_ids.append(file_id)
                 for sediment_id in record["sediment_ids"]:
+                    current_sediment_ids.add(sediment_id)
                     if sediment_id not in sediment_ids:
                         sediment_ids.append(sediment_id)
+
+            # Preserve request-scoped observations before another paced read
+            # can exhaust the budget. They are not settled/downloadable yet.
+            if previous_ids != (tuple(file_ids), tuple(sediment_ids)):
+                record_pending = getattr(getattr(self, "progress_callback", None), "record_pending_result_ids", None)
+                if callable(record_pending):
+                    record_pending(list(file_ids), list(sediment_ids))
+
+            if not file_ids and not sediment_ids:
+                # Successful asset reads need no separate task-list query. Only
+                # diagnose a missing result after the authoritative conversation read.
+                last_task_error = ""
+                try:
+                    tasks = [] if supplied_snapshot else self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                    for task in tasks:
+                        is_error, error_msg, metadata = self.check_task_error(task)
+                        if is_error and error_msg:
+                            last_task_error = error_msg
+                            logger.info({
+                                "event": "image_poll_task_error_not_blocking",
+                                "conversation_id": conversation_id,
+                                "attempt": attempt,
+                                "error_msg": error_msg,
+                                "metadata": metadata,
+                            })
+                except Exception as exc:
+                    # tasks 查询失败不影响正常轮询流程
+                    logger.debug({
+                        "event": "image_poll_task_check_failed",
+                        "conversation_id": conversation_id,
+                        "attempt": attempt,
+                        "error": str(exc),
+                    })
 
             # 检查对话文本中是否包含内容政策违规错误
             # 当上游拒绝生成图片时，错误消息会出现在对话文档的 assistant 消息中，
@@ -2611,6 +2711,17 @@ class OpenAIBackendAPI:
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
             if file_ids or sediment_ids:
+                if (require_fresh_result_ids or supplied_snapshot) and (
+                    not set(file_ids).issubset(current_file_ids)
+                    or not set(sediment_ids).issubset(current_sediment_ids)
+                ):
+                    # A saved observation cannot confirm itself after restart.
+                    if supplied_snapshot:
+                        break
+                    wait = min(interval, max(0.0, _remaining()))
+                    if wait > 0:
+                        time.sleep(wait)
+                    continue
                 if not config.image_check_before_hit_enabled:
                     # 先check再hit 机制关闭：直接返回首次发现的 file_ids
                     logger.info({"event": "image_poll_hit_no_settle", "conversation_id": conversation_id,
@@ -2621,6 +2732,14 @@ class OpenAIBackendAPI:
                     logger.info({"event": "image_poll_hit", "conversation_id": conversation_id, "file_ids": file_ids,
                                  "sediment_ids": sediment_ids})
                     return file_ids, sediment_ids
+                terminal_check = getattr(self, "image_poll_terminal_check", None)
+                if (config.image_settle_enabled and not supplied_snapshot
+                        and not require_fresh_result_ids and callable(terminal_check)
+                        and set(file_ids) == current_file_ids and set(sediment_ids) == current_sediment_ids
+                        and terminal_check(conversation, conversation_id, request_message_id,
+                                           list(file_ids), list(sediment_ids)) is True):
+                    logger.info({"event": "image_poll_strict_terminal_hit", "conversation_id": conversation_id})
+                    return file_ids, sediment_ids
                 last_hit_key = hit_key
                 if not config.image_settle_enabled:
                     # 二次确认机制关闭：直接返回首次发现的 file_ids
@@ -2630,11 +2749,17 @@ class OpenAIBackendAPI:
                 logger.info({"event": "image_poll_hit_pending_settle", "conversation_id": conversation_id,
                              "file_ids": file_ids, "sediment_ids": sediment_ids,
                              "settle_secs": config.image_settle_secs})
+                if supplied_snapshot:
+                    # The durable pending IDs become the first observation for
+                    # the next original read, never a generated result now.
+                    break
                 wait = min(config.image_settle_secs, max(0.0, _remaining()))
                 if wait > 0:
                     time.sleep(wait)
                     continue
                 return file_ids, sediment_ids
+            if supplied_snapshot:
+                break
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
                           "elapsed_secs": round(time.time() - start, 1)})
             wait = min(interval, max(0.0, _remaining()))
@@ -2645,14 +2770,15 @@ class OpenAIBackendAPI:
             "conversation_id": conversation_id,
             "timeout_secs": timeout_secs,
             "attempts_made": attempt,
-            # attempts_made == 0 means the initial_wait consumed the entire budget — no HTTP attempted.
-            "initial_wait_exhausted_budget": attempt == 0,
+            # No read was attempted if the active budget was already exhausted.
+            "budget_exhausted_before_first_read": attempt == 0,
             "last_task_error": last_task_error if last_task_error else None,
         })
         exc = ImagePollTimeoutError(
-            f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
-            f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
-            f"也可能是账号被限流或生图队列拥堵导致。",
+            ("本次原会话读取尚未确认稳定图片结果，等待下一次原请求读取。" if single_snapshot else
+             f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
+             f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
+             f"也可能是账号被限流或生图队列拥堵导致。"),
             conversation_id or "",
         )
         if last_task_error:
@@ -2669,7 +2795,7 @@ class OpenAIBackendAPI:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    **self._image_request_options(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2678,7 +2804,7 @@ class OpenAIBackendAPI:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+                                    **self._image_request_options(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2705,7 +2831,7 @@ class OpenAIBackendAPI:
         response = self.session.get(
             self.base_url + path,
             headers=self._headers(path, {"Accept": "application/json"}),
-            timeout=timeout_secs,
+            **self._image_request_options(timeout_secs),
         )
         ensure_ok(response, path)
         data = response.json()
@@ -2766,6 +2892,7 @@ class OpenAIBackendAPI:
     def _resolve_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
         urls = []
+        first_error = None
         skip_patterns = {"file_upload"}
         for file_id in file_ids:
             if file_id in skip_patterns:
@@ -2779,6 +2906,8 @@ class OpenAIBackendAPI:
             try:
                 url = self._get_file_download_url(file_id)
             except Exception as exc:
+                if first_error is None:
+                    first_error = exc
                 logger.debug({
                     "event": "image_download_url_failed",
                     "source": "file",
@@ -2805,11 +2934,15 @@ class OpenAIBackendAPI:
                 "sediment_ids": sediment_ids,
                 "urls": urls,
             })
+            if not urls and first_error is not None:
+                raise first_error
             return urls
         for sediment_id in sediment_ids:
             try:
                 url = self._get_attachment_download_url(conversation_id, sediment_id)
             except Exception as exc:
+                if first_error is None:
+                    first_error = exc
                 logger.debug({
                     "event": "image_download_url_failed",
                     "source": "sediment",
@@ -2835,6 +2968,8 @@ class OpenAIBackendAPI:
             "sediment_ids": sediment_ids,
             "urls": urls,
         })
+        if not urls and first_error is not None:
+            raise first_error
         return urls
 
     def resolve_conversation_image_urls(
@@ -2846,6 +2981,7 @@ class OpenAIBackendAPI:
             poll_timeout_secs: float | None = None,
             request_message_id: str = "",
     ) -> list[str]:
+        caller_file_ids, caller_sediment_ids = file_ids, sediment_ids
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
         timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
@@ -2903,15 +3039,39 @@ class OpenAIBackendAPI:
             else:
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
+                # The stream may finish before its image tool. Return the
+                # request-scoped, settled poll IDs to the protocol too, so it
+                # persists them before download and exact-turn confirmation.
+                # Pending observations from a failed poll are not promoted.
+                caller_file_ids[:] = file_ids
+                caller_sediment_ids[:] = sediment_ids
         return self._resolve_image_urls(conversation_id, file_ids, sediment_ids)
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
+        from services.request_context import current_request
+        context = current_request.get()
+
+        def observe(stage, count):
+            if context is not None:
+                try:
+                    context.record_stage(stage, image_count=count)
+                except Exception:
+                    # Diagnostics cannot fail an original download or retry it.
+                    pass
+
         images = []
-        for url in urls:
-            response = self.session.get(url, timeout=120)
+        for index, url in enumerate(urls):
+            options = self._image_request_options(120)
+            if index == 0:
+                # Local call bracket; includes recording overhead, not the
+                # remote server's receive time or socket-only transfer time.
+                observe("attachment_download_started", len(urls))
+            response = self.session.get(url, **options)
             ensure_ok(response, "image_download")
             if response.content not in images:
                 images.append(response.content)
+        if urls:
+            observe("attachment_download_finished", len(images))
         return images
 
     def stream_conversation(
@@ -2970,6 +3130,8 @@ class OpenAIBackendAPI:
                 timeout_message=(
                     f"conversation stream exceeded hard limit of {int(TEXT_STREAM_HARD_CAP_SECS)} seconds"
                 ),
+                observe_text=True,
+                request_message_id=str(getattr(self, "text_request_message_id", "") or ""),
             )
         finally:
             response.close()
@@ -3021,6 +3183,8 @@ class OpenAIBackendAPI:
         yield from self._iter_sse_payloads_capped(
             response,
             self._image_active_timeout(float(config.image_poll_timeout_secs)),
+            observe_text=True,
+            request_message_id=str(getattr(self, "image_request_message_id", "") or ""),
         )
 
     def _iter_sse_payloads_capped(
@@ -3030,35 +3194,53 @@ class OpenAIBackendAPI:
             *,
             timeout_error_type: type[StreamHardTimeoutError] = ImageStreamHardTimeoutError,
             timeout_message: str | None = None,
+            observe_text: bool = False,
+            request_message_id: str = "",
     ) -> Iterator[str]:
         """按墙钟硬上限消费图片 SSE 流，避免上游异常时长连接被无限挂起。
 
         curl_cffi 在 stream=True + 标量 timeout 下不限制流式 body 的总读取时长，
         上游未生成图片却保持连接时，读取会一直阻塞直到边缘重置（曾观测到单条流
-        挂起约 29.5 分钟才失败）。这里复用「图片轮询超时」作为硬上限：到点后关闭
-        底层连接以解除阻塞，并抛出明确错误，让任务快速失败而非长时间挂起。
+        挂起约 29.5 分钟才失败）。这里复用「图片轮询超时」作为收取硬上限：到点
+        后请求关闭并唤醒读取方；账号传输适配层在既有总时限内回收静默连接。
+        停止本地收取不证明上游已经停止生成，原请求仍须沿原会话恢复。
         """
         deadline = time.monotonic() + hard_cap_secs
-        # 看门狗：SSE 读取可能阻塞在底层 curl 调用中，超时后关闭连接以强制解除阻塞
+        # Native close is adapted to wake the consumer without waiting for curl's Future.
         watchdog = threading.Timer(hard_cap_secs, response.close)
         watchdog.daemon = True
         watchdog.start()
         timeout_message = timeout_message or (
-            f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
+            f"图片结果收取已超过硬上限 {int(hard_cap_secs)} 秒，本次收取已停止（上游结果尚待确认）"
         )
+        observation = {"sse_data_count": 0, "sse_parse_errors": 0, "sse_error_event": False} if observe_text else None
         try:
-            for payload in iter_sse_payloads(response):
+            payloads = (iter_sse_payloads(response, observation=observation, request_message_id=request_message_id)
+                        if observe_text else iter_sse_payloads(response))
+            for payload in payloads:
                 yield payload
                 if time.monotonic() >= deadline:
                     raise timeout_error_type(timeout_message)
             if time.monotonic() >= deadline:
                 raise timeout_error_type(timeout_message)
+            if observation is not None:
+                observation.setdefault("stream_end", "eof")
+        except GeneratorExit:
+            if observation is not None:
+                observation.setdefault("stream_end", "consumer_closed")
+            raise
         except StreamHardTimeoutError:
+            if observation is not None:
+                observation["stream_end"] = "hard_timeout"
             raise
         except Exception as exc:
             # 看门狗关闭连接后，底层读取会抛出 curl 错误，这里统一转成明确的硬上限错误
             if time.monotonic() >= deadline:
+                if observation is not None:
+                    observation["stream_end"] = "hard_timeout"
                 raise timeout_error_type(timeout_message) from exc
+            if observation is not None:
+                observation["stream_end"] = "transport_error"
             raise
         finally:
             watchdog.cancel()
@@ -3066,17 +3248,26 @@ class OpenAIBackendAPI:
                 response.close()
             except Exception:
                 pass
+            if observation is not None:
+                # Only fixed enums/counts are retained, never SSE body, error
+                # text, tool/reasoning content, headers or credentials.
+                from services.request_context import current_request
+                context = current_request.get()
+                if context is not None:
+                    try:
+                        context.record_stage("stream_finished", **observation)
+                    except Exception:
+                        # Losing diagnostic storage must not mask the original
+                        # transport outcome or cause another model submission.
+                        pass
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
-            timeout=(
-                self._image_active_timeout(30)
-                if self.image_submission_started is False
-                else 30
-            ),
+            **(self._image_request_options(30)
+               if self.image_submission_started is False else {"timeout": 30}),
         )
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
@@ -3093,7 +3284,7 @@ class OpenAIBackendAPI:
             self.base_url + prepare_path,
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
             json={"p": p_token},
-            timeout=self._image_active_timeout(30),
+            **self._image_request_options(30),
         )
         ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
@@ -3126,7 +3317,7 @@ class OpenAIBackendAPI:
                 "proof_token": proof_token,
                 "turnstile_token": turnstile_token,
             },
-            timeout=self._image_active_timeout(30),
+            **self._image_request_options(30),
         )
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()
@@ -3162,7 +3353,19 @@ class OpenAIBackendAPI:
             headers=self._headers(route),
             timeout=30,
         )
-        ensure_ok(response, context)
+        try:
+            ensure_ok(response, context)
+        except UpstreamHTTPError as exc:
+            # ensure_ok intentionally has a small generic parser.  Catalog
+            # reads also accept the HTTP-date form of Retry-After, including
+            # anonymous reads that have no account pacing wrapper.
+            if exc.status_code == 429:
+                retry_after = retry_after_seconds(
+                    str((getattr(response, "headers", {}) or {}).get("Retry-After") or "")
+                )
+                if math.isfinite(retry_after) and retry_after > 0:
+                    exc.retry_after = retry_after
+            raise
         data = []
         seen = set()
         for item in response.json().get("models", []):

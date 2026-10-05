@@ -26,16 +26,22 @@ def allowed_route(method: str, path: str) -> bool:
     if method == "GET":
         return path in {"/session", "/v1/models", "/api/image-tasks"} or bool(
             re.fullmatch(rf"/api/chat-requests/{_ID}", path)
+            or re.fullmatch(rf"/api/chat-requests/{_ID}/work", path)
             or re.fullmatch(rf"/api/image-tasks/{_ID}/images/[0-9]+", path)
+            or re.fullmatch(rf"/api/image-tasks/{_ID}/work", path)
+            or re.fullmatch(rf"/api/image-tasks/{_ID}/completion", path)
         )
     return method == "POST" and (
         path in {"/api/chat-requests", "/api/image-tasks/generations", "/api/image-tasks/edits"}
         or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/recover", path))
         or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/archive-conversation", path))
         or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/restore-conversation", path))
+        or bool(re.fullmatch(rf"/api/chat-requests/{_ID}/(?:work|recovery-control)", path))
         or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/resume-poll", path))
         or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/archive-thread", path))
         or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/restore-thread", path))
+        or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/(?:work|recovery-control)", path))
+        or bool(re.fullmatch(rf"/api/image-tasks/{_ID}/completion", path))
     )
 
 

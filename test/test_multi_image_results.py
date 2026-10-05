@@ -71,6 +71,341 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_first_image_confirmation_has_no_fixed_wait_or_task_list_read(self):
+        for with_ids in (False, True):
+            with self.subTest(with_ids=with_ids):
+                backend = FakeBackend([_conversation(["file-one"])])
+                backend.image_poll_terminal_check = mock.Mock(return_value=True)
+                backend._query_backend_tasks = mock.Mock(side_effect=AssertionError("result already present"))
+                with mock.patch.dict(config.data, {
+                    "image_poll_initial_wait_secs": 10, "image_settle_secs": 2,
+                    "image_settle_enabled": True, "image_check_before_hit_enabled": True,
+                }), mock.patch("services.openai_backend_api.time.sleep") as sleep:
+                    self.assertEqual(backend._poll_image_results("conv-1", 5,
+                        initial_file_ids=["file-one"] if with_ids else [], request_message_id="request"),
+                        (["file-one"], []))
+                self.assertEqual(backend.calls, 1)
+                sleep.assert_not_called()
+                backend._query_backend_tasks.assert_not_called()
+
+    def test_stream_asset_signal_confirms_terminal_before_reading_stalled_tail(self):
+        from services.image_thread import finished_parent
+        from services.request_context import executing
+        document = _conversation(["file-one"])
+        document["mapping"]["request"]["message"]["id"] = "request"
+        document["mapping"]["tool"]["message"].update(id="tool", status="finished_successfully")
+        document["mapping"]["final"] = {"parent": "tool", "message": {
+            "id": "final", "author": {"role": "assistant"}, "status": "finished_successfully",
+            "end_turn": True, "channel": "final"}}
+        document["current_node"] = "final"
+        backend = FakeBackend([document]); backend.image_request_message_id = "request"
+        backend.image_poll_terminal_check = lambda doc, cid, rid, files, sediments: bool(
+            finished_parent(doc, cid, rid, expected_result_ids=files+sediments))
+        backend.resolve_conversation_image_urls = mock.Mock(return_value=["https://fixture.invalid/image"])
+        receipt = {"_expected_sends":1, "_send_sequence":1, "_execution_timeline":[],
+                   "_turn_reserved":True, "_upstream_terminal":False}
+        context = mock.Mock()
+        context.receipt.return_value = receipt
+        context.record_stage.side_effect = lambda stage, **kw: receipt["_execution_timeline"].append({"stage":stage, **kw})
+        def download(_urls):
+            self.assertEqual(receipt["_execution_timeline"], [{"stage":"upstream_terminal", "known":True}])
+            return [b"original-bytes"]
+        backend.download_image_bytes = mock.Mock(side_effect=download)
+        closed = []
+        def stream(*_args, **_kwargs):
+            try:
+                yield {"type": "conversation.event", "conversation_id": "conv-1",
+                       "file_ids": ["file-one"], "sediment_ids": []}
+                raise AssertionError("must not wait for stalled transport tail after strict final")
+            finally:
+                closed.append(True)
+        with executing(context), mock.patch("services.protocol.conversation.conversation_events", stream):
+            output = list(stream_image_outputs(backend, ConversationRequest(prompt="fixture", model="gpt-image-2")))
+        self.assertTrue(output)
+        self.assertEqual(closed, [True])
+        self.assertEqual(backend.calls, 1)
+        self.assertIs(backend.resolve_conversation_image_urls.call_args.kwargs["poll"], False)
+        context.terminal.assert_not_called()
+        self.assertTrue(receipt["_turn_reserved"])
+        self.assertFalse(receipt["_upstream_terminal"])
+
+    def test_image_terminal_observation_excludes_partial_foreign_and_failed_reads(self):
+        import copy
+        from services.request_context import executing
+        from services.protocol.conversation import _stream_image_terminal_result
+        from utils.helper import UpstreamHTTPError
+        doc = _conversation(["file-one"])
+        doc["mapping"]["request"]["message"]["id"] = "request"
+        doc["mapping"]["tool"]["message"].update(id="tool", status="finished_successfully")
+        doc["mapping"]["final"] = {"parent":"tool", "message": {
+            "id":"final", "author":{"role":"assistant"}, "status":"finished_successfully",
+            "end_turn":True, "channel":"final"}}
+        doc["current_node"] = "final"
+        for case in ("partial", "tool-leaf", "wrong-parent", "429"):
+            with self.subTest(case=case):
+                current = copy.deepcopy(doc)
+                if case == "tool-leaf": current["current_node"] = "tool"
+                if case == "wrong-parent": current["mapping"]["request"]["parent"] = "foreign"
+                backend = FakeBackend([current])
+                if case == "429":
+                    backend._get_conversation = mock.Mock(side_effect=UpstreamHTTPError("GET", "/conversation", 429, {}))
+                context = mock.Mock()
+                context.receipt.return_value = {}
+                with executing(context):
+                    result = _stream_image_terminal_result(backend, {"conversation_id":"conv-1"},
+                        "request", ["file-one", "file-two"] if case=="partial" else ["file-one"], [], "prior-turn")
+                self.assertFalse(result)
+                context.record_stage.assert_not_called()
+                context.terminal.assert_not_called()
+
+    def test_image_terminal_diagnostic_failure_and_multi_send_do_not_change_completion(self):
+        from services.request_context import executing
+        from services.protocol.conversation import _observe_image_terminal
+        for expected, sequence in ((2,1), (1,2)):
+            context = mock.Mock()
+            context.receipt.return_value = {"_expected_sends":expected, "_send_sequence":sequence}
+            with executing(context): _observe_image_terminal()
+            context.record_stage.assert_not_called()
+            context.terminal.assert_not_called()
+        context = mock.Mock()
+        receipt = {"_execution_timeline":[]}
+        context.receipt.return_value = receipt
+        context.record_stage.side_effect = lambda stage, **kw: receipt["_execution_timeline"].append({"stage":stage, **kw})
+        with executing(context):
+            _observe_image_terminal(); _observe_image_terminal()
+        context.record_stage.assert_called_once_with("upstream_terminal", known=True)
+        context.terminal.assert_not_called()
+        context.receipt.side_effect = OSError("private store error")
+        with executing(context): _observe_image_terminal()  # Diagnostics cannot fail the image.
+
+    def test_open_stream_tool_leaf_and_repeated_asset_events_do_not_finish_early(self):
+        backend = FakeBackend([_conversation(["file-one"])])
+        backend.image_request_message_id = "request"
+        backend.image_poll_terminal_check = mock.Mock(return_value=True)
+        backend.resolve_conversation_image_urls = mock.Mock(return_value=["https://fixture.invalid/image"])
+        backend.download_image_bytes = mock.Mock(return_value=[b"one", b"two"])
+        consumed = []
+        def stream(*_args, **_kwargs):
+            for files in (["file-one"], ["file-one"], ["file-one", "file-two"]):
+                consumed.append(files)
+                yield {"type": "conversation.event", "conversation_id": "conv-1", "file_ids": files}
+        with mock.patch("services.protocol.conversation.conversation_events", stream):
+            list(stream_image_outputs(backend, ConversationRequest(prompt="fixture", model="gpt-image-2")))
+        self.assertEqual(len(consumed), 3)
+        self.assertEqual(backend.calls, 2, "only changed asset sets trigger reads")
+        self.assertNotIn("poll", backend.resolve_conversation_image_urls.call_args.kwargs)
+        self.assertEqual(backend.resolve_conversation_image_urls.call_args.args[1], ["file-one", "file-two"])
+
+    def test_final_signal_rechecks_unchanged_assets_after_unfinished_or_failed_read(self):
+        from utils.helper import UpstreamHTTPError
+        final = _conversation(["file-one"])
+        final["mapping"]["request"]["message"]["id"] = "request"
+        final["mapping"]["tool"]["message"].update(id="tool", status="finished_successfully")
+        final["mapping"]["final"] = {"parent": "tool", "message": {
+            "id": "final", "author": {"role": "assistant"}, "status": "finished_successfully",
+            "end_turn": True, "channel": "final"}}
+        final["current_node"] = "final"
+        for first in (_conversation(["file-one"]), UpstreamHTTPError("original-read", 429, "private", 30)):
+            with self.subTest(first=type(first).__name__):
+                backend = FakeBackend(); backend.image_request_message_id = "request"
+                backend._get_conversation = mock.Mock(side_effect=[first, final])
+                backend.resolve_conversation_image_urls = mock.Mock(return_value=["https://fixture.invalid/image"])
+                backend.download_image_bytes = mock.Mock(return_value=[b"one"])
+                closed = []
+                def stream(*_args, **_kwargs):
+                    event = {"type": "conversation.event", "conversation_id": "conv-1", "file_ids": ["file-one"]}
+                    try:
+                        yield event
+                        yield event
+                        yield {**event, "raw": {"message": final["mapping"]["final"]["message"]}}
+                        raise AssertionError("confirmed final must close transport")
+                    finally:
+                        closed.append(True)
+                with mock.patch("services.protocol.conversation.conversation_events", stream):
+                    list(stream_image_outputs(backend, ConversationRequest(prompt="fixture", model="gpt-image-2")))
+                self.assertEqual(backend._get_conversation.call_count, 2)
+                self.assertEqual(closed, [True])
+                self.assertIs(backend.resolve_conversation_image_urls.call_args.kwargs["poll"], False)
+
+    def test_early_signal_read_does_not_swallow_pause_or_deadline(self):
+        from services.protocol.conversation import _stream_image_terminal_result
+        from services.request_context import AdmissionLost
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        from services.openai_backend_api import ImageActiveDeadlineExceeded
+        for error in (AdmissionLost("paused"), AccountRequestDeadlineExceeded("deadline"),
+                      ImageActiveDeadlineExceeded("active deadline")):
+            with self.subTest(error=type(error).__name__):
+                backend = FakeBackend(); backend._get_conversation = mock.Mock(side_effect=error)
+                with self.assertRaises(type(error)):
+                    _stream_image_terminal_result(backend, {"conversation_id": "conv-1"}, "request", ["file-one"], [])
+
+    def test_closing_conversation_events_closes_owned_upstream_stream(self):
+        from services.protocol.conversation import conversation_events
+        closed = []
+        def upstream(**_kwargs):
+            try:
+                yield json.dumps({"conversation_id": "conv-1"})
+                raise AssertionError("must not consume the remaining stream")
+            finally:
+                closed.append(True)
+        backend = FakeBackend(); backend.stream_conversation = upstream
+        events = conversation_events(backend, model="gpt-image-2", prompt="fixture")
+        next(events); events.close()
+        self.assertEqual(closed, [True])
+
+    def test_polled_only_result_reaches_exact_tool_turn_confirmation(self) -> None:
+        from services.image_thread import finished_parent
+        asset = "file_00000000" + "a" * 24
+        document = _conversation([asset], [asset])
+        document["conversation_id"] = "conv-1"
+        document["mapping"]["code"] = {
+            "parent": "request", "message": {"id": "code", "author": {"role": "assistant"},
+                "status": "finished_successfully", "end_turn": False}}
+        document["mapping"]["tool"]["parent"] = "code"
+        for mid in ("request", "tool"):
+            document["mapping"][mid]["message"].update(id=mid, status="finished_successfully")
+        backend = FakeBackend([document])
+        backend.file_urls[asset] = backend.sediment_urls[asset] = "https://files.test/result.png"
+        backend._query_backend_tasks = mock.Mock(side_effect=AssertionError("result already present"))
+        backend.image_poll_terminal_check = lambda doc, cid, rid, files, sediments: bool(
+            finished_parent(doc, cid, rid, expected_result_ids=files+sediments))
+        backend.stream_conversation = mock.Mock(return_value=iter([
+            json.dumps({"conversation_id": "conv-1"}), "[DONE]"]))
+        saved = []
+        callback = lambda _step: None
+        callback.request_message_id = "request"
+        callback.record_result_ids = lambda files, sediments: saved.append((files, sediments))
+        backend.progress_callback = callback
+        backend.download_image_bytes = mock.Mock(return_value=[b"original-image-bytes"])
+        with (
+            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 10, "image_settle_secs": 2,
+                                         "image_settle_enabled": True, "image_check_before_hit_enabled": True}),
+            mock.patch("services.protocol.conversation._get_detailed_error_from_tasks") as task_diagnostic,
+            mock.patch("services.openai_backend_api.time.sleep") as sleep,
+        ):
+            outputs = list(stream_image_outputs(backend, ConversationRequest(
+                prompt="Change the handle to green", model="gpt-image-2", images=["fixture"],
+                progress_callback=callback)))
+        self.assertEqual(backend.calls, 1)
+        backend._query_backend_tasks.assert_not_called()
+        task_diagnostic.assert_not_called()
+        sleep.assert_not_called()
+        self.assertEqual(saved, [([asset], [asset])])
+        self.assertEqual(finished_parent(document, "conv-1", "request", expected_parent="prior-turn",
+            expected_result_ids=saved[0][0] + saved[0][1]), "tool")
+        self.assertEqual(len([x for x in outputs if x.kind == "result"]), 1)
+        backend.stream_conversation.assert_called_once()
+        backend.download_image_bytes.assert_called_once_with(["https://files.test/result.png"])
+
+    def test_generated_ids_are_saved_before_stream_or_url_resolution_can_fail(self) -> None:
+        for failure_phase in ("stream", "resolve"):
+            with self.subTest(failure_phase=failure_phase):
+                saved = []
+                callback = lambda _step: None
+                callback.record_result_ids = lambda files, sediments: saved.append((files, sediments))
+                class Backend:
+                    def stream_conversation(self, **_kwargs):
+                        yield json.dumps({"conversation_id": "original", "message": {
+                            "author": {"role": "user"}, "content": {"parts": ["file-service://uploaded-input"]},
+                        }})
+                        yield json.dumps({"conversation_id": "original", "message": {
+                            "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
+                            "content": {"parts": ["file-service://generated-image sediment://generated-sediment"]},
+                        }})
+                        if failure_phase == "stream":
+                            raise ConnectionError("stream ended after image tool result")
+                        yield "[DONE]"
+
+                    def resolve_conversation_image_urls(self, *_args, **_kwargs):
+                        if saved != [(["generated-image"], ["generated-sediment"])]:
+                            raise AssertionError("result IDs were not durable before URL resolution")
+                        raise ConnectionError("URL resolution failed")
+
+                with self.assertRaises(ConnectionError):
+                    list(stream_image_outputs(Backend(), ConversationRequest(
+                        prompt="circle", model="gpt-image-2", progress_callback=callback,
+                    )))
+                self.assertEqual(saved, [(["generated-image"], ["generated-sediment"])])
+
+    def test_confirmed_assets_with_unavailable_urls_do_not_wait_for_generation_again(self):
+        from utils.helper import UpstreamHTTPError
+        for text in ("", "Here is your image.", '{"referenced_image_ids": ["image"]}'):
+            for failure in ("empty", "429"):
+                with self.subTest(text=text, failure=failure):
+                    doc = _conversation(["file-one"], ["sed-one"])
+                    doc["mapping"]["request"]["message"]["id"] = "request"
+                    doc["mapping"]["tool"]["message"].update(id="tool", status="finished_successfully")
+                    doc["mapping"]["final"] = {"parent": "tool", "message": {
+                        "id": "final", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True, "channel": "final"}}
+                    doc["current_node"] = "final"
+                    backend = FakeBackend([doc]); backend.image_request_message_id = "request"
+                    backend._poll_image_results = mock.Mock(side_effect=AssertionError("already terminal"))
+                    backend.download_image_bytes = mock.Mock()
+                    upstream_error = UpstreamHTTPError("download URL", 429, {}, retry_after=123)
+                    if failure == "429":
+                        backend._get_file_download_url = mock.Mock(side_effect=upstream_error)
+                        backend._get_attachment_download_url = mock.Mock(side_effect=upstream_error)
+                    saved = []
+                    callback = lambda _step: None
+                    callback.record_result_ids = lambda files, sediments: saved.append((files, sediments))
+                    event = {"type": "conversation.event", "conversation_id": "conv-1",
+                             "file_ids": ["file-one"], "sediment_ids": ["sed-one"],
+                             "text": text, "turn_use_case": "image gen"}
+                    with mock.patch("services.protocol.conversation.conversation_events",
+                                    return_value=(item for item in [event])) as stream, \
+                         mock.patch("services.protocol.conversation.time.sleep") as sleep:
+                        with self.assertRaises(RuntimeError) as raised:
+                            list(stream_image_outputs(backend, ConversationRequest(
+                                prompt="fixture", model="gpt-image-2", progress_callback=callback)))
+                    if failure == "429":
+                        self.assertIs(raised.exception, upstream_error)
+                        self.assertEqual(raised.exception.retry_after, 123)
+                    else:
+                        self.assertIn("download URLs", str(raised.exception))
+                    self.assertEqual(saved, [(["file-one"], ["sed-one"])])
+                    self.assertEqual(backend.calls, 1)  # Only the strict original-turn check.
+                    stream.assert_called_once()
+                    backend._poll_image_results.assert_not_called()
+                    backend.download_image_bytes.assert_not_called()
+                    sleep.assert_not_called()
+
+    def test_url_resolution_preserves_failure_without_losing_successful_alternate(self):
+        from utils.helper import UpstreamHTTPError
+        backend = FakeBackend()
+        error = UpstreamHTTPError("file URL", 429, {}, retry_after=123)
+        backend._get_file_download_url = mock.Mock(side_effect=error)
+        with self.assertRaises(UpstreamHTTPError) as raised:
+            backend._resolve_image_urls("conv-1", ["file-one"], [])
+        self.assertIs(raised.exception, error)
+        backend.sediment_urls["sed-one"] = "https://files.test/original.png"
+        self.assertEqual(backend._resolve_image_urls("conv-1", ["file-one"], ["sed-one"]),
+                         ["https://files.test/original.png"])
+
+    def test_unbound_url_transport_failure_after_submission_never_regenerates(self):
+        from services.protocol.conversation import _generate_single_image
+        for detail in ("curl: (35) SSL connect error", "curl: (28) Connection timed out"):
+            with self.subTest(detail=detail):
+                backend = mock.Mock(image_submission_started=True)
+                def failed_output(*_args):
+                    raise ConnectionError(detail)
+                    yield  # The failure occurs before the first yielded chunk.
+                with mock.patch("services.protocol.conversation.account_service") as accounts, \
+                     mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend) as create, \
+                     mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=failed_output) as stream, \
+                     mock.patch("services.protocol.conversation.time.sleep") as sleep:
+                    accounts.get_available_access_token.return_value = "fixture-token"
+                    accounts.get_account.return_value = {}
+                    with self.assertRaises(ImageGenerationError) as raised:
+                        _generate_single_image(ConversationRequest(prompt="fixture", model="gpt-image-2"), 1, 1)
+                self.assertIs(raised.exception.upstream_submitted, True)
+                accounts.get_available_access_token.assert_called_once()
+                accounts.refresh_access_token.assert_not_called()
+                stream.assert_called_once()
+                create.assert_called_once()
+                sleep.assert_not_called()
+                backend.close.assert_called_once()
+
     def test_stream_id_extractor_keeps_full_file_ids(self) -> None:
         payload = (
             '{"conversation_id":"conv-1"} '
@@ -141,6 +476,9 @@ class MultiImageResultTests(unittest.TestCase):
             _conversation(["file-one", "file-two"], ["sed-one"]),
             _conversation(["file-one", "file-two"], ["sed-one"]),
         ])
+        observed = []
+        backend.progress_callback = lambda _step: None
+        backend.progress_callback.record_pending_result_ids = lambda files, sediments: observed.append((files, sediments))
 
         with (
             mock.patch.dict(config.data, {
@@ -159,6 +497,134 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual(file_ids, ["file-one", "file-two"])
         self.assertEqual(sediment_ids, ["sed-one"])
         self.assertEqual(backend.calls, 3)
+        self.assertEqual(observed, [(["file-one"], []), (["file-one", "file-two"], ["sed-one"])])
+
+    def test_strict_terminal_shortcut_does_not_change_recovery_or_legacy_polling(self) -> None:
+        for mode in ("initial-ids", "initial-document", "fresh-recovery", "check-disabled",
+                     "settle-disabled", "asset-drift", "legacy"):
+            with self.subTest(mode=mode):
+                docs = [_conversation(["file-one"])]
+                if mode == "asset-drift":
+                    docs += [_conversation(["file-two"]), _conversation(["file-two"])]
+                backend = FakeBackend(docs)
+                check = mock.Mock(return_value=True)
+                if mode != "legacy": backend.image_poll_terminal_check = check
+                # First changed observation is not confirmed; accumulated stale
+                # IDs must never be passed to the shortcut on a later snapshot.
+                if mode == "asset-drift": check.return_value = False
+                kwargs = {"request_message_id": "request"}
+                if mode == "initial-ids": kwargs["initial_file_ids"] = ["file-one"]
+                if mode == "initial-document": kwargs["initial_document"] = docs[0]
+                if mode == "fresh-recovery": kwargs["require_fresh_result_ids"] = True
+                with mock.patch.dict(config.data, {
+                    "image_poll_initial_wait_secs": 0, "image_poll_interval_secs": .01,
+                    "image_check_before_hit_enabled": mode != "check-disabled",
+                    "image_settle_enabled": mode != "settle-disabled", "image_settle_secs": .01,
+                }):
+                    if mode == "initial-document":
+                        with self.assertRaises(ImagePollTimeoutError):
+                            backend._poll_image_results("conv-1", 1, **kwargs)
+                    else:
+                        backend._poll_image_results("conv-1", 10, **kwargs)
+                self.assertEqual(check.call_count, 1 if mode in {"asset-drift", "initial-ids"} else 0)
+                if mode in {"fresh-recovery", "legacy"}: self.assertEqual(backend.calls, 2)
+                if mode == "initial-document": self.assertEqual(backend.calls, 0)
+
+    def test_poll_keeps_request_scoped_ids_when_settle_exhausts_budget(self) -> None:
+        document = _conversation(["file-original"])
+        document["mapping"].update({
+            "later-user": {"parent": "tool", "message": {"author": {"role": "user"}}},
+            "later-image": {"parent": "later-user", "message": {
+                "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
+                "content": {"parts": ["file-service://file-later"]},
+            }},
+        })
+        document["current_node"] = "later-image"
+        backend = FakeBackend([document])
+        backend._query_backend_tasks = mock.Mock(return_value=[])
+        observed = []
+        backend.progress_callback = lambda _step: None
+        backend.progress_callback.record_pending_result_ids = lambda files, sediments: observed.append((files, sediments))
+        clock = [100.0]
+        def advance(seconds):
+            clock[0] += seconds
+        with (
+            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0,
+                "image_check_before_hit_enabled": True, "image_settle_enabled": True, "image_settle_secs": 2}),
+            mock.patch("services.openai_backend_api.time.time", lambda: clock[0]),
+            mock.patch("services.openai_backend_api.time.sleep", advance),
+        ):
+            with self.assertRaises(ImagePollTimeoutError):
+                backend._poll_image_results("conv-1", timeout_secs=1, request_message_id="request")
+        self.assertEqual(backend.calls, 1)
+        self.assertEqual(observed, [(["file-original"], [])])
+
+    def test_pending_ids_require_a_fresh_matching_request_branch(self) -> None:
+        backend = FakeBackend([_conversation([])])
+        backend._query_backend_tasks = mock.Mock(return_value=[])
+        clock = [100.0]
+        def advance(seconds):
+            clock[0] += seconds
+        with (
+            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0,
+                "image_poll_interval_secs": 0.1, "image_check_before_hit_enabled": True,
+                "image_settle_enabled": True, "image_settle_secs": 0.1}),
+            mock.patch("services.openai_backend_api.time.time", lambda: clock[0]),
+            mock.patch("services.openai_backend_api.time.sleep", advance),
+        ):
+            with self.assertRaises(ImagePollTimeoutError):
+                backend._poll_image_results("conv-1", timeout_secs=1, request_message_id="request",
+                    initial_file_ids=["pending-file"], require_fresh_result_ids=True)
+        self.assertGreaterEqual(backend.calls, 1)
+
+    def test_recovery_reuses_one_fresh_read_across_short_poll_windows(self) -> None:
+        backend = FakeBackend()
+        backend._get_conversation = mock.Mock(side_effect=AssertionError("second GET would wait read60"))
+        backend._query_backend_tasks = mock.Mock(side_effect=AssertionError("snapshot already read"))
+        observed = []
+        backend.progress_callback = lambda _step: None
+        backend.progress_callback.record_pending_result_ids = lambda files, sediments: observed.append((files, sediments))
+        with mock.patch.dict(config.data, {
+            "image_poll_initial_wait_secs": 10, "image_check_before_hit_enabled": True,
+            "image_settle_enabled": True, "image_settle_secs": 2,
+        }), mock.patch("services.openai_backend_api.time.sleep") as sleep:
+            with self.assertRaisesRegex(ImagePollTimeoutError, "尚未确认稳定图片结果"):
+                backend._poll_image_results("conv-1", 5, request_message_id="request",
+                    initial_document=_conversation(["one"]))
+            self.assertEqual(observed, [(["one"], [])])
+            with self.assertRaises(ImagePollTimeoutError):
+                backend._poll_image_results("conv-1", 5, request_message_id="request",
+                    initial_file_ids=["one"], require_fresh_result_ids=True,
+                    initial_document=_conversation(["one", "two"]))
+            self.assertEqual(observed[-1], (["one", "two"], []))
+            self.assertEqual(backend._poll_image_results("conv-1", 5,
+                request_message_id="request", initial_file_ids=["one", "two"],
+                require_fresh_result_ids=True, initial_document=_conversation(["two", "one"])),
+                (["one", "two"], []))
+            sleep.assert_not_called()
+        backend._get_conversation.assert_not_called()
+        backend._query_backend_tasks.assert_not_called()
+
+    def test_fresh_recovery_snapshot_cannot_confirm_missing_or_later_turn_ids(self) -> None:
+        later = _conversation([])
+        later["mapping"].update({
+            "later-user": {"parent": "tool", "message": {"author": {"role": "user"}}},
+            "later-image": {"parent": "later-user", "message": {
+                "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
+                "content": {"parts": ["file-service://one"]}}},
+        })
+        later["current_node"] = "later-image"
+        with mock.patch.dict(config.data, {"image_check_before_hit_enabled": True,
+                "image_settle_enabled": True}), mock.patch("services.openai_backend_api.time.sleep"):
+            for document in (_conversation([]), later):
+                with self.subTest(document=document):
+                    backend = FakeBackend()
+                    backend._get_conversation = mock.Mock(side_effect=AssertionError("unexpected GET"))
+                    with self.assertRaises(ImagePollTimeoutError):
+                        backend._poll_image_results("conv-1", 5, request_message_id="request",
+                            initial_file_ids=["one"], require_fresh_result_ids=True,
+                            initial_document=document)
+                    backend._get_conversation.assert_not_called()
 
     def test_resolver_uses_file_and_sediment_urls(self) -> None:
         backend = FakeBackend()
@@ -187,6 +653,22 @@ class MultiImageResultTests(unittest.TestCase):
             )
 
         self.assertEqual(urls, ["https://files.test/one.png"])
+
+    def test_failed_poll_does_not_promote_pending_ids_to_caller(self) -> None:
+        backend = FakeBackend()
+        files, sediments, pending = [], [], []
+        def interrupted_poll(*args, **kwargs):
+            self.assertEqual(kwargs["request_message_id"], "request")
+            pending.append((["unsettled-file"], ["unsettled-sediment"]))
+            raise ImagePollTimeoutError("not settled", "conv-1")
+        backend._poll_image_results = interrupted_poll
+        with mock.patch.object(type(config), "image_check_before_hit_enabled", property(lambda _: False)), \
+             mock.patch("services.openai_backend_api.OpenAIBackendAPI._query_backend_tasks", return_value=[]):
+            with self.assertRaises(ImagePollTimeoutError):
+                backend.resolve_conversation_image_urls("conv-1", files, sediments,
+                    request_message_id="request")
+        self.assertTrue(pending)
+        self.assertEqual((files, sediments), ([], []))
 
     def test_policy_detection_requires_an_explicit_refusal(self) -> None:
         self.assertFalse(_is_content_policy_error('{"reason":"delivery_return_policy"}'))

@@ -252,7 +252,7 @@ class ChatLoginService:
             raise ChatLoginError(422, "chat_login_invalid_request_id") from None
         if scope not in {"owned", "pool"}:
             raise ChatLoginError(404, "chat_login_not_found")
-        if mode not in {"import", "attach"} or (scope == "pool" and mode != "attach"):
+        if mode not in {"import", "attach"}:
             raise ChatLoginError(422, "chat_login_invalid_mode")
         if (mode == "attach") != bool(account_ref):
             code = "chat_login_account_ref_required" if mode == "attach" else "chat_login_account_ref_not_allowed"
@@ -266,6 +266,10 @@ class ChatLoginService:
                         raise ChatLoginError(409, "chat_login_idempotency_conflict")
                     self._expire_locked(item)
                     return self._public(item)
+            # Original scope/ID/hash lookup above is retained for old sessions.
+            # Only a new legacy start is rejected, before any upstream I/O.
+            if scope == "owned":
+                raise ChatLoginError(409, "COMPANY_ACCOUNT_ENTRY_REQUIRED")
             for previous in list(self._sessions.values()):
                 self._expire_locked(previous)
             target_revision = None

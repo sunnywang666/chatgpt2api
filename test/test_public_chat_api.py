@@ -65,8 +65,12 @@ def public_chat(tmp_path, monkeypatch):
             allow_anonymous=False,
         ),
     )
+    monkeypatch.setattr("services.public_chat_service.model_catalog_service.catalog_is_unknown", lambda: False)
     monkeypatch.setattr("services.log_service.log_service.add", lambda *_args, **_kwargs: None)
     app = FastAPI()
+    @app.get("/health")
+    async def health():
+        return {"ok": True}
     app.middleware("http")(external_image_boundary)
     app.include_router(chat_requests.create_router())
     app.include_router(ai.create_router())
@@ -92,6 +96,7 @@ def public_chat(tmp_path, monkeypatch):
         queue=queue,
         upstream=upstream,
         tasks=tasks,
+        app=app,
     )
 
 
@@ -226,7 +231,7 @@ def test_durable_public_chat_submit_query_reuse_conflict_and_owner_isolation(pub
     assert first.json()["status"] == "queued"
     assert set(first.json()) <= {
         "request_id", "route", "model", "status", "content", "error_code",
-        "created_at", "updated_at", "started_at", "finished_at", "recovery",
+        "created_at", "updated_at", "started_at", "finished_at", "recovery", "execution",
     }
     assert "secret" not in first.text
     assert len(public_chat.queue.calls) == 1
@@ -670,3 +675,151 @@ def test_public_model_discovery_describes_text_image_input_and_generation(public
 
     internal = public_chat.client.get("/v1/models", headers=public_chat.headers(public=False))
     assert internal.json() == catalogue
+
+
+def test_slow_model_discovery_does_not_block_the_async_request_loop(public_chat, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    response = []
+
+    def slow_require(_model):
+        entered.set()
+        assert release.wait(2)
+
+    monkeypatch.setattr(chat_requests, "require_public_text_model", slow_require)
+    worker = threading.Thread(
+        target=lambda: response.append(public_chat.client.post(
+            "/api/chat-requests", headers=public_chat.headers(), json=request_body(request_id="slow-catalog"),
+        )),
+        daemon=True,
+    )
+    # One TestClient portal exercises the same event loop.  The health call
+    # must complete while the catalog work waits in the thread pool.
+    with public_chat.client:
+        worker.start()
+        try:
+            assert entered.wait(1)
+            health = public_chat.client.get("/health")
+            assert health.status_code == 200
+            assert health.json() == {"ok": True}
+        finally:
+            release.set()
+            worker.join(2)
+    assert response and response[0].status_code == 202
+
+
+def test_known_stale_model_is_durably_accepted_while_new_model_is_retryable(public_chat, monkeypatch):
+    from services.model_service import ModelRoute
+
+    catalog = SimpleNamespace(
+        known_account_types_for_model=lambda model: frozenset({"Plus"}) if model in {"gpt-text", "gpt-healthy"} else frozenset(),
+        route_for_model=lambda model: ModelRoute(
+            frozenset({"Plus"}) if model in {"gpt-text", "gpt-healthy"} else frozenset(),
+            False,
+            frozenset({"account-history" if model == "gpt-text" else "account-healthy"}),
+        ),
+        public_accounts_for_model=lambda model, capabilities: [{
+            "account_ref": "car_history" if model == "gpt-text" else "car_healthy",
+            "state": "unavailable" if model == "gpt-text" else "unknown",
+            "reason": "read_failed" if model == "gpt-text" else "model_catalog_observed",
+            "capabilities": capabilities,
+            "observed_at": 1000.0,
+            "observation_state": "read_failed" if model == "gpt-text" else "observed",
+        }],
+        catalog_is_unknown=lambda: True,
+    )
+    monkeypatch.setattr("services.public_chat_service.model_catalog_service", catalog)
+    monkeypatch.setattr(ai.openai_v1_models, "list_models", lambda: {
+        "object": "list", "data": [{"id": "gpt-text"}, {"id": "gpt-healthy"}],
+    })
+
+    directory = public_chat.client.get("/v1/models", headers=public_chat.headers())
+    assert directory.status_code == 200, directory.text
+    assert directory.json()["model_catalog"] == {"state": "partial"}
+    assert {item["id"] for item in directory.json()["data"]} == {"gpt-text", "gpt-healthy"}
+
+    known = public_chat.client.post(
+        "/api/chat-requests", headers=public_chat.headers(), json=request_body(request_id="stale-known"),
+    )
+    assert known.status_code == 202, known.text
+    assert known.json()["request_id"] == "stale-known"
+    assert len(public_chat.queue.calls) == 1
+
+    unknown = public_chat.client.post(
+        "/api/chat-requests", headers=public_chat.headers(),
+        json=request_body(request_id="unknown-catalog", model="newly-requested-model"),
+    )
+    assert unknown.status_code == 503
+    assert unknown.json()["detail"]["code"] == "MODEL_DISCOVERY_UNAVAILABLE"
+    assert len(public_chat.queue.calls) == 1
+
+
+def test_public_model_directory_reports_unknown_paid_catalog(public_chat, monkeypatch):
+    catalog = SimpleNamespace(catalog_is_unknown=lambda: True)
+    monkeypatch.setattr("services.public_chat_service.model_catalog_service", catalog)
+    monkeypatch.setattr(ai.openai_v1_models, "list_models", lambda: {"object": "list", "data": []})
+
+    response = public_chat.client.get("/v1/models", headers=public_chat.headers())
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "MODEL_DISCOVERY_UNAVAILABLE"
+
+
+def test_public_model_discovery_exposes_only_safe_observed_account_capability(public_chat, monkeypatch):
+    from services.model_service import ModelRoute
+
+    account_ref = "car_" + "a" * 43
+    catalog = Mock()
+    catalog.route_for_model.side_effect = lambda model: ModelRoute(
+        account_types=frozenset({"Plus"}) if model == "gpt-text" else frozenset(),
+        allow_anonymous=False,
+        account_identities=frozenset({"account-safe"}) if model == "gpt-text" else frozenset(),
+    )
+    catalog.public_accounts_for_model.return_value = [{
+        "account_ref": account_ref, "state": "unknown", "reason": "model_catalog_observed",
+        "capabilities": ["text", "image_input"],
+    }]
+    monkeypatch.setattr("services.public_chat_service.model_catalog_service", catalog)
+    monkeypatch.setattr(ai.openai_v1_models, "list_models", lambda: {
+        "object": "list", "data": [{
+            "id": "gpt-text", "access_token": "must-not-leak", "label": "private",
+            "permission": [{"account_id": "must-not-leak"}],
+            "owned_by": {"account_id": "must-not-leak"},
+            "root": {"private": "must-not-leak"},
+            "parent": ["must-not-leak"],
+        }],
+    })
+
+    response = public_chat.client.get("/v1/models", headers=public_chat.headers())
+
+    assert response.status_code == 200, response.text
+    item = response.json()["data"][0]
+    assert item["accounts"] == [{
+        "account_ref": account_ref, "state": "unknown", "reason": "model_catalog_observed",
+        "capabilities": ["text", "image_input"],
+    }]
+    assert "must-not-leak" not in response.text
+    assert "account-safe" not in response.text
+    assert "permission" not in item
+    assert "owned_by" not in item
+    assert "root" not in item
+    assert "parent" not in item
+
+
+def test_public_chat_scheduling_persists_normalized_receipt_and_original_input(public_chat):
+    class Admission:
+        def wake(self):
+            pass
+
+    public_chat.tasks.admission = Admission()
+    submitted = public_chat.client.post(
+        "/api/chat-requests", headers=public_chat.headers(),
+        json={**request_body("scheduled-native"), "scheduling": {"workflow_id": "catalog-refresh"}},
+    )
+    assert submitted.status_code == 202, submitted.text
+    assert submitted.json()["scheduling"] == {"workflow_id": "catalog-refresh", "workflow_concurrency": 1}
+    receipt = public_chat.tasks.read(public_chat.key_a["id"], "scheduled-native")
+    assert receipt["scheduling"] == {"workflow_id": "catalog-refresh", "workflow_concurrency": 1}
+    with public_chat.tasks._db() as db:
+        raw = public_chat.tasks.store.read_receipt(db, "text", public_chat.key_a["id"], "scheduled-native")
+    saved = public_chat.tasks.store.load_input(raw["_input_ref"])
+    assert saved["_scheduling"] == {"workflow_id": "catalog-refresh", "workflow_concurrency": 1}

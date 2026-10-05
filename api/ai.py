@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from api.recovery_control import RecoveryControlRequest, update_recovery_control
+
 from services.request_context import trusted_source
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from api.external_images import client_sync_result, validate_external_input, is_external, synchronous_external_task
 from api.image_inputs import parse_image_edit_request, read_image_sources
@@ -42,6 +44,15 @@ class ImageGenerationRequest(BaseModel):
     response_format: str = "b64_json"
     history_disabled: bool = True
     stream: bool | None = None
+    account_ref: str | None = Field(default=None, strict=True, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+    scheduling: object | None = None
+
+    @field_validator("account_ref", mode="before")
+    @classmethod
+    def reject_null_account_ref(cls, value):
+        if value is None:
+            raise ValueError("account_ref must be omitted or an advertised account reference")
+        return value
 
 
 class ChatCompletionRequest(BaseModel):
@@ -52,6 +63,14 @@ class ChatCompletionRequest(BaseModel):
     stream: bool | None = None
     modalities: list[str] | None = None
     messages: list[dict[str, object]] | None = None
+    account_ref: str | None = Field(default=None, strict=True, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+
+    @field_validator("account_ref", mode="before")
+    @classmethod
+    def reject_null_account_ref(cls, value):
+        if value is None:
+            raise ValueError("account_ref must be omitted or an advertised account reference")
+        return value
 
 
 class ResponseCreateRequest(BaseModel):
@@ -61,6 +80,14 @@ class ResponseCreateRequest(BaseModel):
     tools: list[dict[str, object]] | None = None
     tool_choice: object | None = None
     stream: bool | None = None
+    account_ref: str | None = Field(default=None, strict=True, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+
+    @field_validator("account_ref", mode="before")
+    @classmethod
+    def reject_null_account_ref(cls, value):
+        if value is None:
+            raise ValueError("account_ref must be omitted or an advertised account reference")
+        return value
 
 
 class ConversationBindingTextRequest(BaseModel):
@@ -108,10 +135,27 @@ class AnthropicMessageRequest(BaseModel):
     messages: list[dict[str, object]] | None = None
     system: object | None = None
     stream: bool | None = None
+    account_ref: str | None = Field(default=None, strict=True, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+
+    @field_validator("account_ref", mode="before")
+    @classmethod
+    def reject_null_account_ref(cls, value):
+        if value is None:
+            raise ValueError("account_ref must be omitted or an advertised account reference")
+        return value
 
 
 class SearchRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
+    account_ref: str | None = Field(default=None, strict=True, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+    scheduling: object | None = None
+
+    @field_validator("account_ref", mode="before")
+    @classmethod
+    def reject_null_account_ref(cls, value):
+        if value is None:
+            raise ValueError("account_ref must be omitted or an advertised account reference")
+        return value
 
 
 class EditableFileTaskRequest(BaseModel):
@@ -126,6 +170,43 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
     except HTTPException as exc:
         call.log("调用失败", status="failed", error=str(exc.detail))
         raise
+
+
+def _compatibility_payload(body: BaseModel) -> dict:
+    """Keep caller-only directives in the durable envelope, never upstream."""
+    payload = body.model_dump(mode="python")
+    # These names are private receipt fields. A permissive compatibility model
+    # must never let a caller inject them directly.
+    payload.pop("_scheduling", None)
+    if payload.get("account_ref") is None:
+        payload.pop("account_ref", None)
+    if "scheduling" in body.model_fields_set:
+        try:
+            if payload.get("scheduling") is None:
+                raise ValueError("SCHEDULING_INVALID: scheduling must be an object")
+            from services.workflow_scheduling import normalize_scheduling
+            scheduling = normalize_scheduling(payload.pop("scheduling", None))
+        except ValueError as exc:
+            if str(exc).startswith("SCHEDULING_INVALID"):
+                raise HTTPException(400, detail={"code": "SCHEDULING_INVALID"}) from None
+            raise
+        if scheduling is not None:
+            payload["_scheduling"] = scheduling
+    else:
+        payload.pop("scheduling", None)
+    return payload
+
+
+def _require_selected_compatibility_admission(request: Request, payload: dict) -> None:
+    """Caller directives are meaningful only on a stable durable receipt."""
+    selected = "account_ref" in payload
+    scheduled = "_scheduling" in payload
+    if not selected and not scheduled:
+        return
+    if not str(request.headers.get("x-client-request-id") or "").strip():
+        raise HTTPException(400, detail={"code": "ACCOUNT_SELECTION_REQUEST_ID_REQUIRED" if selected else "SCHEDULING_REQUEST_ID_REQUIRED"})
+    if text_task_service.admission is None:
+        raise HTTPException(503, detail={"code": "ACCOUNT_SELECTION_REQUIRES_DURABLE_ADMISSION" if selected else "SCHEDULING_REQUIRES_DURABLE_ADMISSION"})
 
 
 def create_router() -> APIRouter:
@@ -157,12 +238,13 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        payload = body.model_dump(mode="python")
+        payload = _compatibility_payload(body)
         raw = await request.json()
         # This compatibility endpoint has no thread contract. Reject rather
         # than silently ignore thread fields; keep ordinary legacy hashes.
         thread_fields = {k: raw[k] for k in ("image_thread_id", "edit_source_task_id", "edit_source_index") if k in raw}
         validate_external_input(request, {**payload, **thread_fields}, synchronous=True)
+        _require_selected_compatibility_admission(request, payload)
         require_image_policy(identity, payload.get("model"))
         payload["base_url"] = resolve_image_base_url(request)
         call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
@@ -182,6 +264,7 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         validate_external_input(request, payload, synchronous=True)
+        _require_selected_compatibility_admission(request, payload)
         require_image_policy(identity, payload.get("model"))
         prompt = str(payload["prompt"])
         model = str(payload["model"])
@@ -201,7 +284,8 @@ def create_router() -> APIRouter:
     @router.post("/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
-        payload = body.model_dump(mode="python")
+        payload = _compatibility_payload(body)
+        _require_selected_compatibility_admission(request, payload)
         if is_image_chat_request(payload):
             require_image_policy(identity, payload.get("model"))
         else:
@@ -225,7 +309,8 @@ def create_router() -> APIRouter:
     @router.post("/v1/responses")
     async def create_response(body: ResponseCreateRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
-        payload = body.model_dump(mode="python")
+        payload = _compatibility_payload(body)
+        _require_selected_compatibility_admission(request, payload)
         if has_response_image_generation_tool(payload):
             require_image_policy(identity, payload.get("model"))
         else:
@@ -288,6 +373,14 @@ def create_router() -> APIRouter:
     async def read_bound_text_request(request_id: str, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         return await run_in_threadpool(text_task_service.read, str(identity.get("id") or "anonymous"), request_id)
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/recovery-control")
+    async def control_bound_text_recovery(request_id: str, body: RecoveryControlRequest, response: Response,
+                                          authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        response.headers["Cache-Control"] = "private, no-store"
+        return await update_recovery_control(text_task_service, "text", str(identity.get("id") or "anonymous"),
+                                             request_id, body)
 
     @router.post("/api/conversation-bindings/text-requests/{request_id}/recover")
     async def recover_bound_text_request(
@@ -385,7 +478,8 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization or (f"Bearer {x_api_key}" if x_api_key else None))
         require_chat_text_policy(identity)
-        payload = body.model_dump(mode="python")
+        payload = _compatibility_payload(body)
+        _require_selected_compatibility_admission(request, payload)
         model = str(payload.get("model") or "auto")
         request_preview = request_text(payload.get("system"), payload.get("messages"), payload.get("tools"))
         call = LoggedCall(identity, "/v1/messages", model, "Messages", request_text=request_preview)
@@ -399,12 +493,14 @@ def create_router() -> APIRouter:
     async def search(body: SearchRequest, request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
         require_chat_text_policy(identity)
+        payload = _compatibility_payload(body)
+        _require_selected_compatibility_admission(request, payload)
         call = LoggedCall(identity, "/v1/search", openai_search.MODEL, "搜索", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
         if text_task_service.admission is not None:
             from services.durable_forward import respond
-            return await respond(identity, {**body.model_dump(mode="python"), "model": openai_search.MODEL}, request, "openai_search")
-        return await call.run(openai_search.handle, body.model_dump(mode="python"))
+            return await respond(identity, {**payload, "model": openai_search.MODEL}, request, "openai_search")
+        return await call.run(openai_search.handle, payload)
 
     @router.get("/v1/editable-file-tasks")
     async def list_editable_file_tasks(ids: str = "", authorization: str | None = Header(default=None)):

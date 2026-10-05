@@ -19,6 +19,7 @@ from fastapi.concurrency import run_in_threadpool
 from api.support import require_identity
 from services.image_storage_service import image_storage_service
 from services.image_thread import input_fields, ImageThreadError
+from services.work_lifecycle import WorkLifecycleError
 
 MAX_PUBLIC_CHAT_BODY_BYTES = 140 * 1024 * 1024
 MAX_CONCURRENT_PUBLIC_CHAT_BODY_READERS = 2
@@ -58,10 +59,10 @@ def _release_public_chat_body_reader() -> None:
         _public_chat_body_readers -= 1
 
 
-def _ordinary_chat_identity(request: Request):
+def _ordinary_chat_identity(request: Request, *, ordinary_only=True):
     try:
         identity = require_identity(request.headers.get("authorization"), request=request)
-        if identity.get("role") != "user":
+        if ordinary_only and identity.get("role") != "user":
             raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
         return identity, None
     except HTTPException as exc:
@@ -75,6 +76,9 @@ async def external_image_boundary(request: Request, call_next):
     if request.method == "POST" and path == "/api/chat-requests":
         chat_body_limit = MAX_PUBLIC_CHAT_BODY_BYTES
         chat_body_error = "CHAT_REQUEST_TOO_LARGE"
+    elif request.method == "POST" and re.fullmatch(r"/api/(chat-requests|image-tasks)/[^/]+/completion", path):
+        chat_body_limit = 1024
+        chat_body_error = "COMPLETION_BODY_TOO_LARGE"
     elif request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/recover", path):
         chat_body_limit = 1024
         chat_body_error = "CHAT_RECOVERY_BODY_TOO_LARGE"
@@ -84,18 +88,29 @@ async def external_image_boundary(request: Request, call_next):
     elif request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/restore-conversation", path):
         chat_body_limit = 1024
         chat_body_error = "CHAT_RESTORE_BODY_TOO_LARGE"
+    elif request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/work", path):
+        chat_body_limit = 1024
+        chat_body_error = "CHAT_WORK_BODY_TOO_LARGE"
     elif request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/archive-thread", path):
         chat_body_limit = 1024
         chat_body_error = "IMAGE_ARCHIVE_BODY_TOO_LARGE"
     elif request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/restore-thread", path):
         chat_body_limit = 1024
         chat_body_error = "IMAGE_RESTORE_BODY_TOO_LARGE"
+    elif request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/work", path):
+        chat_body_limit = 1024
+        chat_body_error = "IMAGE_WORK_BODY_TOO_LARGE"
+    if request.method == "POST" and re.fullmatch(r"/api/(?:chat-requests|image-tasks|conversation-bindings/text-requests)/[^/]+/recovery-control", path):
+        chat_body_limit = 1024
+        chat_body_error = "RECOVERY_CONTROL_BODY_TOO_LARGE"
     if chat_body_limit is not None:
         # Authenticate before inspecting Content-Length or consuming one byte.
         # This also protects direct Provider calls where the proxy marker is
         # absent. Hold the slot through downstream JSON parsing so a caller
         # cannot multiply the bounded body allocation with concurrent reads.
-        _, rejected = _ordinary_chat_identity(request)
+        legacy_control = (not is_external(request) and bool(re.fullmatch(
+            r"/api/(?:image-tasks|conversation-bindings/text-requests)/[^/]+/recovery-control", path)))
+        _, rejected = _ordinary_chat_identity(request, ordinary_only=not legacy_control)
         if rejected is not None:
             return rejected
         if not _try_acquire_public_chat_body_reader():
@@ -129,12 +144,18 @@ async def external_image_boundary(request: Request, call_next):
             "/api/image-tasks/generations", "/api/image-tasks/edits", "/api/chat-requests",
         }
         or request.method == "GET" and re.fullmatch(r"/api/chat-requests/[^/]+", path)
+        or request.method == "GET" and re.fullmatch(r"/api/(chat-requests|image-tasks)/[^/]+/events", path)
+        or request.method in {"GET", "POST"} and re.fullmatch(r"/api/(chat-requests|image-tasks)/[^/]+/completion", path)
+        or request.method == "GET" and re.fullmatch(r"/api/chat-requests/[^/]+/work", path)
         or request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/recover", path)
         or request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/archive-conversation", path)
         or request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/restore-conversation", path)
+        or request.method == "POST" and re.fullmatch(r"/api/chat-requests/[^/]+/work", path)
         or request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/resume-poll", path)
         or request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/archive-thread", path)
         or request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/restore-thread", path)
+        or request.method == "GET" and re.fullmatch(r"/api/image-tasks/[^/]+/work", path)
+        or request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/work", path)
         or request.method == "POST" and re.fullmatch(
             r"/api/image-tasks/[^/]+/adopt-latest-conversation-image", path
         )
@@ -239,6 +260,10 @@ async def synchronous_external_task(identity: dict, payload: dict, *, edit: bool
     from services.image_task_service import image_task_service
     task_id = payload["client_task_id"]
     arguments = {key: payload.get(key) for key in ("prompt", "model", "size", "quality", "base_url")}
+    if "account_ref" in payload:
+        arguments["account_ref"] = payload["account_ref"]
+    if "_scheduling" in payload:
+        arguments["scheduling"] = payload["_scheduling"]
     arguments["client_task_id"] = task_id
     if edit:
         arguments.update(images=payload["images"], masks=payload.get("mask"))
@@ -246,6 +271,10 @@ async def synchronous_external_task(identity: dict, payload: dict, *, edit: bool
         task = await run_in_threadpool(
             image_task_service.submit_edit if edit else image_task_service.submit_generation,
             {**identity, "external_image_client": True}, **arguments)
+    except ImageThreadError as exc:
+        raise HTTPException(exc.status, detail={"code": exc.code}) from None
+    except WorkLifecycleError as exc:
+        raise HTTPException(exc.status, detail={"code": exc.code}) from None
     except ValueError:
         raise HTTPException(409, detail={"error": "client_task_id conflicts with original input"}) from None
     deadline = time.monotonic() + 30

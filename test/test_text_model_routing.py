@@ -8,6 +8,7 @@ from unittest import mock
 
 from services.account_service import AccountService
 from services.model_service import ModelRoute, ModelUnavailableError
+from services.request_context import AdmissionLost, executing
 from services.protocol import (
     anthropic_v1_messages,
     conversation,
@@ -74,6 +75,64 @@ class TextAccountRoutingTests(unittest.TestCase):
             return_value=route,
         ), self.assertRaisesRegex(ModelUnavailableError, "team-only"):
             self.service.get_text_access_token(model="team-only")
+
+    def test_same_plan_unobserved_account_is_never_selected(self) -> None:
+        self.service.add_account_items([
+            {"access_token": "pro-observed", "type": "Pro", "status": "正常"},
+        ])
+        identities = {
+            str(account["access_token"]): self.service._stable_account_identity(account)
+            for account in self.service.list_accounts()
+        }
+        route = ModelRoute(
+            account_types=frozenset({"Pro"}),
+            allow_anonymous=False,
+            account_identities=frozenset({identities["pro-observed"]}),
+        )
+        with mock.patch("services.model_service.model_catalog_service.route_for_model", return_value=route):
+            self.assertEqual(self.service.get_text_access_token(model="observed-pro"), "pro-observed")
+            binding, identity = self.service.create_text_conversation_binding(text_model="observed-pro")
+
+        self.assertTrue(binding.startswith("cb_"))
+        self.assertEqual(identity, identities["pro-observed"])
+
+    def test_explicit_route_rechecks_disabled_managed_and_rate_limited_accounts(self) -> None:
+        identity = next(
+            self.service._stable_account_identity(account)
+            for account in self.service.list_accounts()
+            if account["access_token"] == "pro"
+        )
+        route = ModelRoute(account_types=frozenset({"Pro"}), account_identities=frozenset({identity}))
+        with mock.patch("services.model_service.model_catalog_service.route_for_model", return_value=route):
+            self.service.update_account("pro", {"managed_disabled": True})
+            with self.assertRaisesRegex(ModelUnavailableError, "observed-pro"):
+                self.service.get_text_access_token(model="observed-pro")
+            self.service.update_account("pro", {"managed_disabled": False, "status": "限流"})
+            with self.assertRaisesRegex(ModelUnavailableError, "observed-pro"):
+                self.service.get_text_access_token(model="observed-pro")
+            with self.assertRaisesRegex(RuntimeError, "no paid account supports text model"):
+                self.service.create_text_conversation_binding(text_model="observed-pro")
+
+    def test_admitted_send_rechecks_current_managed_and_rate_limited_state(self) -> None:
+        identity = next(
+            self.service._stable_account_identity(account)
+            for account in self.service.list_accounts()
+            if account["access_token"] == "pro"
+        )
+        route = ModelRoute(account_types=frozenset({"Pro"}), account_identities=frozenset({identity}))
+
+        class Context:
+            @staticmethod
+            def selected_account():
+                return {"access_token": "pro"}
+
+        with mock.patch("services.model_service.model_catalog_service.route_for_model", return_value=route):
+            self.service.update_account("pro", {"managed_disabled": True})
+            with executing(Context()), self.assertRaisesRegex(AdmissionLost, "unavailable"):
+                self.service.get_text_access_token(model="observed-pro")
+            self.service.update_account("pro", {"managed_disabled": False, "status": "限流"})
+            with executing(Context()), self.assertRaisesRegex(AdmissionLost, "unavailable"):
+                self.service.get_text_access_token(model="observed-pro")
 
 
 class TextProtocolRoutingTests(unittest.TestCase):

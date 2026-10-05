@@ -226,15 +226,97 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
+def _sse_error_category(event: dict) -> str:
+    # Interpret only fixed structured codes. Never retain error text, body,
+    # headers or an arbitrary upstream code in diagnostics.
+    error = event.get("error")
+    error = error if isinstance(error, dict) else event
+    codes = {value for key in ("code", "type") if isinstance(value := error.get(key), str)}
+    for category, allowed in (
+        ("quota", {"insufficient_quota", "quota_exceeded", "usage_limit_reached"}),
+        ("rate_limit", {"rate_limit_exceeded", "rate_limit_error", "too_many_requests"}),
+        ("auth", {"invalid_api_key", "authentication_error", "unauthorized", "invalid_token"}),
+        ("upstream", {"server_error", "internal_error", "internal_server_error", "overloaded_error"}),
+    ):
+        if codes & allowed:
+            return category
+    return "unknown"
+
+
+def _observe_sse_message(event: dict, observation: dict, request_message_id: str) -> None:
+    """Count complete message snapshots, never infer completion from patches.
+
+    These are event counts, not unique messages or authority to skip the
+    original-branch GET. No message IDs, text, URLs or field values are saved.
+    """
+    def count(key):
+        observation[key] = min(observation.get(key, 0) + 1, 2147483647)
+
+    value = event.get("v")
+    frame = value if isinstance(value, dict) and isinstance(value.get("message"), dict) else event
+    message = frame.get("message")
+    if not isinstance(message, dict):
+        return
+    count("sse_message_snapshot_events")
+    author = message.get("author")
+    if not isinstance(author, dict) or author.get("role") != "assistant":
+        return
+    if message.get("status") != "finished_successfully" or message.get("end_turn") is not True:
+        return
+    count("sse_terminal_assistant_events")
+    has_id = isinstance(message.get("id"), str) and bool(message["id"])
+    if has_id:
+        count("sse_terminal_id_events")
+    metadata = message.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if message.get("channel") == "final" or metadata.get("channel") == "final":
+        count("sse_terminal_final_channel_events")
+    parents = {parent for container in (frame, message, metadata)
+               for key in ("parent", "parent_id")
+               if isinstance(parent := container.get(key), str) and parent}
+    if parents:
+        count("sse_terminal_parent_events")
+    if has_id and request_message_id and parents == {request_message_id}:
+        count("sse_terminal_direct_parent_match_events")
+
+
+def iter_sse_payloads(response: requests.Response, *, observation: dict | None = None,
+                      request_message_id: str = "") -> Iterator[str]:
+    if observation is not None:
+        for key in ("sse_message_snapshot_events", "sse_terminal_assistant_events", "sse_terminal_id_events",
+                    "sse_terminal_final_channel_events", "sse_terminal_parent_events",
+                    "sse_terminal_direct_parent_match_events"):
+            observation.setdefault(key, 0)
+    error_event = False
     for raw_line in response.iter_lines():
         if not raw_line:
+            error_event = False
             continue
         line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
+        if line.startswith("event:"):
+            error_event = line[6:].strip() == "error"
+        if observation is not None and error_event:
+            observation["sse_error_event"] = True
+            observation.setdefault("sse_error_category", "unknown")
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
         if payload:
+            if observation is not None:
+                observation["sse_data_count"] = min(observation.get("sse_data_count", 0) + 1, 2147483647)
+                if payload == "[DONE]":
+                    observation["stream_end"] = "done"
+                else:
+                    try:
+                        event = json.loads(payload)
+                    except (ValueError, TypeError):
+                        observation["sse_parse_errors"] = min(observation.get("sse_parse_errors", 0) + 1, 2147483647)
+                    else:
+                        if isinstance(event, dict):
+                            _observe_sse_message(event, observation, request_message_id)
+                        if isinstance(event, dict) and (error_event or event.get("type") == "error" or event.get("error")):
+                            observation["sse_error_event"] = True
+                            observation["sse_error_category"] = _sse_error_category(event)
             yield payload
 
 

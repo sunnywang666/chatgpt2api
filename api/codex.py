@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from starlette.background import BackgroundTask
@@ -26,6 +27,25 @@ def _error(exc: CodexServiceError) -> HTTPException:
         status_code=exc.status_code,
         detail={"error": {"code": exc.code, "message": str(exc)}, "rate_limit": exc.rate_limit},
     )
+
+
+def _require_selected_durable_request(request: Request, payload: dict) -> None:
+    """Reject caller directives that a legacy synchronous Codex call would ignore."""
+    selected = "account_ref" in payload
+    scheduled = "_scheduling" in payload
+    if not selected and not scheduled:
+        return
+    if selected:
+        account_ref = payload["account_ref"]
+        if not isinstance(account_ref, str) or not re.fullmatch(r"car_[A-Za-z0-9_-]{43}", account_ref):
+            raise HTTPException(400, detail={"error": {"code": "CHAT_ACCOUNT_REF_INVALID", "message": "account_ref must be an advertised account reference"}})
+    if not str(request.headers.get("x-client-request-id") or "").strip():
+        code = "ACCOUNT_SELECTION_REQUEST_ID_REQUIRED" if selected else "SCHEDULING_REQUEST_ID_REQUIRED"
+        raise HTTPException(400, detail={"error": {"code": code, "message": "caller directives require X-Client-Request-ID"}})
+    from services.text_task_service import text_task_service
+    if text_task_service.admission is None:
+        code = "ACCOUNT_SELECTION_REQUIRES_DURABLE_ADMISSION" if selected else "SCHEDULING_REQUIRES_DURABLE_ADMISSION"
+        raise HTTPException(503, detail={"error": {"code": code, "message": "caller directives require durable admission"}})
 
 
 def _as_response(result: CodexHTTPResponse):
@@ -84,6 +104,21 @@ async def _payload(request: Request) -> dict:
             status_code=400,
             detail={"error": {"code": "invalid_codex_request", "message": "A JSON object is required"}},
         )
+    # Preserve only a validated scheduling directive in the durable receipt;
+    # never permit clients to write its private representation directly.
+    payload.pop("_scheduling", None)
+    if "scheduling" in payload:
+        try:
+            if payload.get("scheduling") is None:
+                raise ValueError("SCHEDULING_INVALID: scheduling must be an object")
+            from services.workflow_scheduling import normalize_scheduling
+            scheduling = normalize_scheduling(payload.pop("scheduling"))
+        except ValueError as exc:
+            if str(exc).startswith("SCHEDULING_INVALID"):
+                raise HTTPException(400, detail={"error": {"code": "SCHEDULING_INVALID", "message": "invalid scheduling"}}) from None
+            raise
+        if scheduling is not None:
+            payload["_scheduling"] = scheduling
     return payload
 
 
@@ -111,6 +146,7 @@ def create_router() -> APIRouter:
     async def submit(request: Request, authorization: str | None, *, compact: bool):
         identity = _ordinary_identity(authorization)
         payload = await _payload(request)
+        _require_selected_durable_request(request, payload)
         require_codex_policy(identity, payload)
         from services.durable_forward import respond
         from services.text_task_service import text_task_service

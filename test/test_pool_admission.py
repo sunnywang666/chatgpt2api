@@ -8,8 +8,11 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
+from datetime import datetime, timezone
 
 from services.account_service import AccountService
+from services.model_service import ModelRoute
 from services.storage.json_storage import JSONStorageBackend
 from services.task_store import TaskStore
 from services.pool_admission import PoolAdmission
@@ -28,6 +31,7 @@ class Clock:
 def build(root, clock=None):
     root = Path(root)
     accounts = AccountService(JSONStorageBackend(root / "accounts.json"))
+    accounts.refresh_image_capability = lambda account_ref: None  # metadata is fixture-controlled
     store = TaskStore(root / "text_tasks.sqlite3")
     admission = PoolAdmission(store, accounts, clock=clock or (lambda: 1000.0),
                               settings=lambda: {"image_account_concurrency": 4, "codex_max_concurrency": 4},
@@ -77,7 +81,9 @@ class AdmissionTests(unittest.TestCase):
     def write_accounts(self, count):
         self.rows = [{"access_token": "fixture-token-" + str(i), "account_id": "upstream-" + str(i),
                       "provider_account_identity": "account-" + str(i), "type": "Plus", "status": "正常",
-                      "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-" + str(i)]}
+                      "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-" + str(i)],
+                      "limits_progress": [{"feature_name": "image_gen", "remaining": 999}],
+                      "capacity_observed_at": datetime.now(timezone.utc).isoformat()}
                      for i in range(count)]
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
 
@@ -89,6 +95,130 @@ class AdmissionTests(unittest.TestCase):
     def image(self, name, owner="happy"):
         return self.images.submit_generation({"id": owner, "role": "user", "external_image_client": True},
                                              client_task_id=name, prompt="private image input", model="gpt-image-2", size=None)
+
+    def test_inactive_text_work_does_not_refresh_catalog_and_resume_keeps_id(self):
+        self.submit("paused-catalog")
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "text", "happy", "paused-catalog")
+            key = "work:paused-catalog"
+            receipt["_work_key"] = key
+            self.store.write_receipt(db, "text", "happy", "paused-catalog", receipt)
+            self.store.set_runtime(db, key, {"key": key, "state": "paused", "slot_held": False})
+        with patch.object(self.admission, "_types", return_value={"Plus"}) as route:
+            self.assertIsNone(self.admission.claim_next())
+            route.assert_not_called()
+            with self.store.transaction() as db:
+                work = self.store.runtime(db, key)
+                work["state"] = "active"
+                self.store.set_runtime(db, key, work)
+            context = self.admission.claim_next()
+            self.assertEqual(context.request_id, "paused-catalog")
+            route.assert_called_once_with("fixture-text")
+        self.assertEqual(self.calls, [])
+
+    def test_recovery_candidate_reads_preserve_terminal_payloads_and_late_completion(self):
+        large_saved = [{"b64_json": "completed-payload-must-not-be-decoded" * 10000}]
+        rows = {
+            "saved": {"status": "success", "data": large_saved},
+            "ready": {"status": "success", "data": large_saved, "_completion": {"state": "result_ready"}},
+            "closed": {"status": "success", "data": large_saved, "_completion": {"state": "completed"}},
+            "late": {"status": "success", "data": [{"b64_json": "original"}],
+                     "_completion": {"state": "needs_attention", "next_at": None}},
+            "ended-assets": {"status": "error", "error_code": "RESULT_UNRECOVERABLE",
+                             "_attempt_finished_at": 900, "_pending_image_result_ids": {"file_ids": ["original-file"]}},
+            "historical-unknown": {"status": "unknown"},
+            "paused": {"status": "unknown", "_recovery_paused": True},
+        }
+        with self.store.transaction() as db:
+            for rid, row in rows.items():
+                self.store.write_receipt(db, "image", "happy", rid, {"id": rid, "owner_id": "happy", **row})
+        loads = json.loads
+        def candidate_decode(raw):
+            self.assertNotIn("completed-payload-must-not-be-decoded", raw)
+            return loads(raw)
+        with self.store.connect() as db, patch("services.task_store.json.loads", side_effect=candidate_decode):
+            recovery = list(self.store.receipts(db, statuses=("unknown", "failed", "error")))
+            completion = list(self.store.receipts(db, statuses=("unknown", "failed", "error"),
+                                                  include_pending_completion=True))
+            pending = list(self.store.receipts(db, statuses=(), include_pending_completion=True))
+        self.assertEqual({r[2] for r in recovery}, {"ended-assets", "historical-unknown", "paused"})
+        self.assertEqual({r[2] for r in completion}, {"late", "ended-assets", "historical-unknown", "paused"})
+        self.assertEqual({r[2] for r in pending}, {"late"})
+        # Candidate selection must not erase history or change ordinary reads.
+        with self.store.connect() as db:
+            all_rows = {rid: row for _, _, rid, row in self.store.receipts(db)}
+            self.assertEqual(set(all_rows), set(rows))
+            for rid, row in rows.items():
+                self.assertEqual(all_rows[rid], {"id": rid, "owner_id": "happy", **row})
+                self.assertEqual(self.store.read_receipt(db, "image", "happy", rid), all_rows[rid])
+
+    def test_send_guard_does_not_decode_unrelated_saved_images(self):
+        self.image("new-independent")
+        context = self.admission.claim_next()
+        self.admission.update_claim(context, _image_thread={"protocol": "image-thread-v1", "id": "new-thread"})
+        marker = "unrelated-saved-image-must-stay-on-disk"
+        saved = {"id": "old-saved", "owner_id": "happy", "status": "success",
+                 "data": [{"b64_json": marker * 10000}], "upstream_unfinished": False}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "happy", "old-saved", saved)
+        loads = json.loads
+        def guarded_decode(raw):
+            self.assertNotIn(marker, raw)
+            return loads(raw)
+        with patch("services.task_store.json.loads", side_effect=guarded_decode):
+            context.before_send()
+        self.assertTrue(self.read("image", "happy", "new-independent")["_submission_started"])
+        self.assertEqual(self.read("image", "happy", "old-saved"), saved)
+
+    def test_send_guard_preserves_legacy_unfinished_image_capacity(self):
+        self.image("new-image")
+        context = self.admission.claim_next()
+        current = self.read("image", "happy", "new-image")
+        self.admission.settings = lambda: {"image_account_concurrency": 1}
+        legacy = {"id": "legacy", "owner_id": "happy", "status": "success",
+                  "upstream_unfinished": True, "_account_resource": current["_account_resource"]}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "happy", "legacy", legacy)
+        with self.assertRaisesRegex(AdmissionLost, "capacity decreased"):
+            context.before_send()
+        self.assertFalse(self.read("image", "happy", "new-image")["_submission_started"])
+        self.assertEqual(self.read("image", "happy", "legacy"), legacy)
+
+    def test_send_guard_preserves_cross_protocol_legacy_conversation_occupancy(self):
+        self.submit("text-next")
+        context = self.admission.claim_next()
+        self.admission.update_claim(context, conversation_id="original-conversation")
+        legacy = {"id": "legacy-image", "owner_id": "other-owner", "status": "success",
+                  "upstream_unfinished": True, "provider_account_identity": "account-0",
+                  "conversation_id": "original-conversation", "_sequence": 0}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "other-owner", "legacy-image", legacy)
+        with self.assertRaisesRegex(AdmissionLost, "physical conversation is occupied"):
+            context.before_send()
+        self.assertFalse(self.read("text", "happy", "text-next")["_submission_started"])
+        self.assertEqual(self.read("image", "other-owner", "legacy-image"), legacy)
+
+    def test_independent_image_preparation_uses_capacity_before_next_send_clock(self):
+        self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 2}
+        self.admission.pacing = lambda account, now: {"next_at": now + 30, "cooldown_until": 0}
+        for name in ("first", "second", "third"):
+            self.image(name)
+        first = self.admission.claim_next()
+        self.assertIsNotNone(first)
+        second = self.admission.claim_next()
+        self.assertIsNotNone(second)
+        self.assertEqual({first.request_id, second.request_id}, {"first", "second"})
+        self.assertIsNone(self.admission.claim_next())
+        self.assertEqual(self.calls, [])  # Claiming prepares work; it never sends.
+
+    def test_preparation_still_waits_for_cooldown_or_unreadable_account_clock(self):
+        self.image("original")
+        self.admission.pacing = lambda account, now: {"next_at": now + 30, "cooldown_until": now + 20}
+        self.assertIsNone(self.admission.claim_next())
+        self.admission.pacing = lambda account, now: {"next_at": None, "cooldown_until": None}
+        self.assertIsNone(self.admission.claim_next())
+        self.admission.pacing = lambda account, now: {"next_at": now + 30, "cooldown_until": now - 1}
+        self.assertEqual(self.admission.claim_next().request_id, "original")
 
     def test_legacy_explicitly_unsent_retry_retains_real_input_for_restart(self):
         body = {"client_request_id": "legacy", "client_conversation_id": "legacy-session",
@@ -108,6 +238,38 @@ class AdmissionTests(unittest.TestCase):
     def read(self, kind, owner, name):
         with self.store.connect() as db:
             return self.store.read_receipt(db, kind, owner, name)
+
+    def test_pending_public_successor_claims_immediately_and_rechecks_original_before_send(self):
+        session = {"client_conversation_id": "public-chain", "_public_route": "chat", "_public_session_ref": "public-chain"}
+        self.submit("first", **session)
+        self.submit("next", **session, _previous_request_id="first")
+        with self.store.transaction() as db:
+            original = self.store.read_receipt(db, "text", "happy", "first")
+            original.update(status="succeeded", upstream_outcome="completed", provider_binding_id="binding-0",
+                            provider_account_identity="account-0", conversation_id="chat-0", parent_message_id="answer-0")
+            self.store.write_receipt(db, "text", "happy", "first", original)
+        claim = self.admission.claim_next()
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.request_id, "next")
+        self.assertIsNone(self.admission.claim_next())
+        for key, changed in (("status", "unknown"), ("upstream_outcome", "unknown"),
+                             ("parent_message_id", "drift"), ("provider_account_identity", "other")):
+            with self.subTest(key=key):
+                with self.store.transaction() as db:
+                    self.store.write_receipt(db, "text", "happy", "first", {**original, key: changed})
+                with self.assertRaises(AdmissionLost):
+                    claim.before_send()
+                self.assertEqual(self.calls, [])
+                with self.store.transaction() as db:
+                    self.store.write_receipt(db, "text", "happy", "first", original)
+                self.clock.now += 2
+                claim = self.admission.claim_next()
+                self.assertIsNotNone(claim)
+        self.admission.execute(claim)
+        self.assertEqual(len(self.calls), 1)
+        sent = self.calls[0][2]
+        self.assertEqual(sent["parent_message_id"], "answer-0")
+        self.assertEqual(sent["conversation_id"], "chat-0")
 
     def test_completed_image_with_iso_creation_time_cannot_stop_text_recovery(self):
         self.image("saved-image")
@@ -285,10 +447,11 @@ class AdmissionTests(unittest.TestCase):
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         self.image("image")
         self.assertIsNone(self.admission.claim_next())
-        self.rows[0].update(managed_disabled=False, quota=0)
+        self.rows[0].update(managed_disabled=False, quota=0, limits_progress=[{"feature_name": "image_gen", "remaining": 0}])
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         self.assertIsNone(self.admission.claim_next())
         self.rows[0]["quota"] = 999
+        self.rows[0]["limits_progress"] = [{"feature_name": "image_gen", "remaining": 999}]
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         self.assertEqual(self.admission.claim_next().request_id, "image")
 
@@ -322,6 +485,7 @@ class AdmissionTests(unittest.TestCase):
         self.image("reserved")
         ctx = self.admission.claim_next()
         self.rows[0]["quota"] = 0
+        self.rows[0]["limits_progress"] = [{"feature_name": "image_gen", "remaining": 0}]
         (self.root / "accounts.json").write_text(json.dumps(self.rows))
         with self.assertRaises(AdmissionLost):
             ctx.before_send()
@@ -439,6 +603,23 @@ class AdmissionTests(unittest.TestCase):
         self.submit("other", owner="wb")
         self.assertEqual(self.admission.claim_next().request_id, "other")
         self.assertIsNone(self.admission.claim_next())
+
+    def test_durable_model_route_never_claims_same_plan_unobserved_account(self):
+        self.accounts.add_account_items([{
+            "access_token": "fixture-token-observed", "account_id": "upstream-observed",
+            "provider_account_identity": "account-observed", "type": "Plus", "status": "正常",
+            "quota": 999, "source_type": "web", "conversation_binding_ids": ["binding-observed"],
+        }])
+        self.admission.model_types = lambda _model: ModelRoute(
+            account_types=frozenset({"Plus"}), account_identities=frozenset({"account-observed"}),
+        )
+        self.submit("observed-only")
+
+        context = self.admission.claim_next()
+
+        self.assertIsNotNone(context)
+        receipt = self.read("text", "happy", "observed-only")
+        self.assertEqual(receipt["provider_account_identity"], "account-observed")
 
     def terminal_empty_correction_pair(self):
         session = "same-public-session"
@@ -631,6 +812,138 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.read("text", "happy", "original")["status"], "unknown")
         self.write_accounts(2)
         self.assertIsNone(self.admission.claim_next())
+
+    def test_catalog_prefilter_retains_live_text_but_planner_keeps_saved_image_data(self):
+        expected_models = set()
+        for status in ("queued", "running", "not_started"):
+            self.submit("catalog-" + status)
+            with self.store.transaction() as db:
+                receipt = self.store.read_receipt(db, "text", "happy", "catalog-" + status)
+                receipt.update(status=status, model="catalog-" + status)
+                self.store.write_receipt(db, "text", "happy", "catalog-" + status, receipt)
+            expected_models.add("catalog-" + status)
+        self.image("saved-catalog-image")
+        data = [{"b64_json": "saved-source-preserved" * 1000}]
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "image", "happy", "saved-catalog-image")
+            receipt.update(status="success", data=data, upstream_unfinished=False)
+            self.store.write_receipt(db, "image", "happy", "saved-catalog-image", receipt)
+        catalog_calls, reads = [], []
+        self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
+        original = self.store.receipts
+        def observed(db, **kwargs):
+            rows = list(original(db, **kwargs))
+            reads.append((kwargs, rows))
+            return iter(rows)
+        with patch.object(self.store, "receipts", side_effect=observed):
+            self.admission.claim_next()
+        self.assertTrue(expected_models <= set(catalog_calls))
+        filtered = [rows for args, rows in reads if args.get("statuses") == ("queued", "running", "not_started")]
+        self.assertEqual(len(filtered), 1)
+        self.assertNotIn("saved-catalog-image", [rid for _, _, rid, _ in filtered[0]])
+        complete = [r for args, rows in reads if not args for _, _, rid, r in rows if rid == "saved-catalog-image"]
+        self.assertTrue(complete)
+        self.assertTrue(all(r["data"] == data for r in complete))
+
+    def test_unknown_originals_do_not_probe_catalog_but_keep_order_fence(self):
+        from services.pool_admission import unfinished
+        catalog_calls = []
+        self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
+        for name, values in [
+            ("unknown", {"status": "unknown"}),
+            ("failed-unknown", {"status": "failed", "error_code": "RESULT_UNRECOVERABLE",
+                                "upstream_outcome": "unknown"}),
+            ("completed-original", {"status": "failed", "error_code": "RESULT_UNRECOVERABLE",
+                                    "upstream_outcome": "unknown", "_attempt_finished_at": 999,
+                                    "_completion": {"state": "completed", "selected_id": "saved-child"}}),
+        ]:
+            self.submit(name, provider_binding_id="binding-0", provider_account_identity="account-0")
+            with self.store.transaction() as db:
+                receipt = self.store.read_receipt(db, "text", "happy", name)
+                receipt.update(values)
+                self.store.write_receipt(db, "text", "happy", name, receipt)
+            self.assertIsNone(self.admission.claim_next())
+            saved = self.read("text", "happy", name)
+            self.assertTrue(unfinished("text", saved))
+            for key, value in values.items():
+                self.assertEqual(saved[key], value)
+        self.assertEqual(catalog_calls, [])
+
+    def test_expired_unsent_worker_releases_execution_marker_for_work_pause(self):
+        from services.work_lifecycle import WorkLifecycleService
+        self.submit("stopped-unsent", _public_session_ref="session-stopped-unsent")
+        old = self.admission.claim_next()
+        self.clock.now += 31
+        with self.store.transaction() as db:
+            self.admission._recover_claims(db, list(self.store.receipts(db)), self.clock())
+        receipt = self.read("text", "happy", "stopped-unsent")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(receipt["_executing"])
+        self.assertIsNone(receipt["_claim_until"])
+        with self.assertRaises(AdmissionLost):
+            old.before_send()
+        lifecycle = WorkLifecycleService(self.text, self.images, clock=self.clock)
+        work = lifecycle.update("text", {"id": "happy"}, "stopped-unsent", "paused")
+        self.assertEqual(work["state"], "paused")
+        self.assertFalse(work["slot_held"])
+        self.assertIsNone(self.admission.claim_next())
+        self.assertEqual(self.calls, [])
+
+    def test_new_queued_text_still_discovers_models_for_admission(self):
+        catalog_calls = []
+        self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
+        self.submit("new-work")
+        self.assertEqual(self.admission.claim_next().request_id, "new-work")
+        self.assertEqual(catalog_calls, ["fixture-text"])
+
+    def test_legacy_fenced_unsent_marker_is_cleared_without_changing_original_input(self):
+        self.submit("legacy-unsent")
+        with self.store.transaction() as db:
+            row = self.store.read_receipt(db, "text", "happy", "legacy-unsent")
+            row.update(_executing=True, _claim_id=None, _claim_until=999, _submission_started=False)
+            self.store.write_receipt(db, "text", "happy", "legacy-unsent", row)
+            self.admission._recover_claims(db, list(self.store.receipts(db)), self.clock())
+        saved = self.read("text", "happy", "legacy-unsent")
+        self.assertEqual(saved, {**row, "_executing": False, "_claim_until": None})
+        self.assertEqual(self.calls, [])
+
+    def test_legacy_marker_cleanup_does_not_change_sent_or_owned_work(self):
+        for index, change in enumerate((
+                {"status": "unknown"}, {"_claim_id": "live", "_claim_until": 2000},
+                {"_submission_started": True}, {"_executing": False})):
+            with self.subTest(change=change):
+                rid = "preserved-" + str(index)
+                self.submit(rid)
+                with self.store.transaction() as db:
+                    row = self.store.read_receipt(db, "text", "happy", rid)
+                    row.update(_executing=True, _claim_id=None, _claim_until=999,
+                               _submission_started=False)
+                    row.update(change)
+                    self.store.write_receipt(db, "text", "happy", rid, row)
+                    self.admission._recover_claims(db, [("text", "happy", rid, row.copy())], self.clock())
+                self.assertEqual(self.read("text", "happy", rid), row)
+        self.assertEqual(self.calls, [])
+
+    def test_expired_captured_image_claim_preserves_real_failure_or_uses_neutral_state(self):
+        for prior_code in (None, "RECOVERY_TIMED_OUT"):
+            with self.subTest(prior_code=prior_code):
+                rid = "captured-" + str(prior_code)
+                self.image(rid)
+                context = self.admission.claim_next()
+                context.before_send()
+                context.record_stage("send_call_started")
+                detail = {"phase": "collect_image_result", "type": "TimeoutError", "at": 1000}
+                self.admission.update_claim(context, result_file_ids=["original-file"],
+                    recovery_error_code=prior_code, last_recovery_failure=detail)
+                self.clock.now += 31
+                self.assertIsNone(self.admission.claim_next())
+                record = self.read("image", "happy", rid)
+                self.assertEqual(record["recovery_error_code"], prior_code or "RECOVERY_RESULT_INCOMPLETE")
+                self.assertEqual(record["last_recovery_failure"], detail)
+                self.assertEqual(record["recovery_phase"], "download_image_result")
+                self.assertEqual(record["result_file_ids"], ["original-file"])
+                self.assertFalse(record["upstream_unfinished"])
+                self.assertEqual(sum(e["stage"] == "send_call_started" for e in record["_execution_timeline"]), 1)
 
     def test_account_disabled_between_claim_and_send_is_not_sent(self):
         self.submit("original")
@@ -826,7 +1139,14 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(snapshot["image"]["inflight"], 0)
         self.assertEqual(snapshot["queue"]["saving_images"], 1)
         self.assertGreater(snapshot["execution"]["active_input_bytes"], 0)
-        self.assertEqual(self.admission.claim_next().request_id, "next")
+        next_context = self.admission.claim_next()
+        self.assertEqual(next_context.request_id, "next")
+        next_context.before_send()
+        for context in (first, next_context):
+            event = next(e for e in context.receipt()["_execution_timeline"] if e["stage"] == "send_guard_passed")
+            self.assertEqual(event["image_capacity_at_send"], 1)
+            self.assertEqual(event["image_occupied_at_send_including_current"], 1)
+            self.assertNotIn("original-file", json.dumps(event))
         self.assertEqual(first.receipt(), before)
 
     def test_unknown_or_multi_send_image_keeps_generation_capacity(self):
@@ -904,6 +1224,47 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(finished[0]["queue_wait_seconds"], 0)
         self.assertEqual(len(self.calls), 1)
 
+    def test_image_artifact_stage_follows_commit_and_does_not_repeat_on_read(self):
+        from services.request_context import executing
+        self.image("saved-image")
+        context = self.admission.claim_next()
+        original_record = context.record_stage
+        observed = []
+        def record(stage, **extra):
+            saved = context.receipt()
+            self.assertEqual(saved["status"], "success")
+            self.assertEqual(saved["data"], [{"b64_json": "cG5n"}])
+            observed.append(stage)
+            return original_record(stage, **extra)
+        context.record_stage = record
+        with executing(context):
+            self.images._update_task("happy:saved-image", status="success", data=[{"b64_json": "cG5n"}])
+            self.images._update_task("happy:saved-image", status="success", data=[{"b64_json": "cG5n"}])
+        self.assertEqual(observed, ["artifact_saved"])
+        saved = context.receipt()
+        event = next(e for e in saved["_execution_timeline"] if e["stage"] == "artifact_saved")
+        self.assertEqual(event["image_count"], 1)
+        self.assertFalse(any(e["stage"] == "send_call_started" for e in saved["_execution_timeline"]))
+
+    def test_image_artifact_observation_failure_cannot_undo_saved_result(self):
+        from services.request_context import executing
+        self.image("saved-image")
+        context = self.admission.claim_next()
+        with patch.object(context, "record_stage", side_effect=RuntimeError("observation unavailable")), executing(context):
+            self.images._update_task("happy:saved-image", status="success", data=[{"b64_json": "cG5n"}])
+        self.assertEqual(context.receipt()["status"], "success")
+
+    def test_image_artifact_is_not_announced_when_persistence_fails(self):
+        from services.request_context import executing
+        self.image("saved-image")
+        context = self.admission.claim_next()
+        with patch.object(context, "record_stage") as record, \
+                patch.object(self.images, "_save_locked", side_effect=RuntimeError("storage unavailable")), \
+                executing(context), self.assertRaisesRegex(RuntimeError, "storage unavailable"):
+            self.images._update_task("happy:saved-image", status="success", data=[{"b64_json": "cG5n"}])
+        record.assert_not_called()
+        self.assertNotEqual(context.receipt()["status"], "success")
+
     def test_unsent_capacity_wait_is_not_logged_as_terminal_failure(self):
         self.image("unsent")
         context = self.admission.claim_next()
@@ -914,6 +1275,174 @@ class AdmissionTests(unittest.TestCase):
         receipt = self.read("image", "happy", "unsent")
         self.assertEqual(receipt["status"], "queued")
         self.assertFalse(any(item["stage"] == "task_finished" for item in receipt["_execution_timeline"]))
+        failure = receipt["_execution_timeline"][-1]
+        self.assertEqual(failure["stage"], "pre_submit_failure")
+        self.assertEqual(failure["error_code"], "IMAGE_RESOURCE_UNAVAILABLE")
+
+    def test_unsent_binding_reason_is_preserved_in_timeline_on_requeue(self):
+        self.image("binding-unavailable")
+        context = self.admission.claim_next()
+        def unavailable(ctx, body):
+            self.admission.update_claim(ctx, status="error", error_code="CONVERSATION_BINDING_UNAVAILABLE",
+                                        last_recovery_failure={"binding_reason": "image_capacity_stale"})
+        self.admission.register("image", unavailable)
+        self.admission.execute(context)
+        receipt = self.read("image", "happy", "binding-unavailable")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(receipt["_submission_started"])
+        self.assertEqual(receipt["_execution_timeline"][-1]["binding_reason"], "image_capacity_stale")
+
+    def test_unsent_exception_retains_reason_and_retries_only_original_once(self):
+        self.image("prepare-failed")
+        context = self.admission.claim_next()
+        def fail_before_send(ctx, body):
+            self.admission.update_claim(ctx, progress="starting_generation")
+            raise RuntimeError("private request body and credential must not be logged")
+        self.admission.register("image", fail_before_send)
+        with self.assertLogs("chatgpt2api", level="WARNING") as captured:
+            self.admission.execute(context)
+        receipt = self.read("image", "happy", "prepare-failed")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(receipt["_submission_started"])
+        failure = receipt["_execution_timeline"][-1]
+        self.assertEqual(failure["stage"], "pre_submit_failure")
+        self.assertEqual(failure["phase"], "before_submit")
+        self.assertEqual(failure["error_type"], "RuntimeError")
+        self.assertNotIn("private request body", json.dumps(receipt))
+        self.assertNotIn("private request body", "\n".join(captured.output))
+        self.assertFalse(any(item["stage"] == "send_call_started" for item in receipt["_execution_timeline"]))
+        self.clock.now += 2
+        next_context = self.admission.claim_next()
+        self.assertEqual(next_context.request_id, "prepare-failed")
+        sends = []
+        def succeed(ctx, body):
+            ctx.before_send()
+            ctx.record_stage("send_call_started")
+            sends.append(ctx.request_id)
+            self.admission.update_claim(ctx, status="success", upstream_unfinished=False)
+        self.admission.register("image", succeed)
+        self.admission.execute(next_context)
+        final = self.read("image", "happy", "prepare-failed")
+        self.assertEqual(final["status"], "success")
+        self.assertEqual(sends, ["prepare-failed"])
+        self.assertEqual(sum(item["stage"] == "pre_submit_failure" for item in final["_execution_timeline"]), 1)
+        self.assertEqual(sum(item["stage"] == "send_call_started" for item in final["_execution_timeline"]), 1)
+
+    def test_guard_rejection_after_preparation_records_reason_and_reclaims_original_once(self):
+        self.image("prepared-expired")
+        context = self.admission.claim_next()
+        sends = []
+        def expired_after_prepare(ctx, body):
+            self.clock.now += self.admission.CLAIM_SECONDS + 1
+            ctx.before_send()
+            sends.append(ctx.request_id)
+        self.admission.register("image", expired_after_prepare)
+        with self.assertLogs("chatgpt2api", level="WARNING") as captured:
+            self.admission.execute(context)
+        receipt = self.read("image", "happy", "prepared-expired")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(receipt["_submission_started"])
+        self.assertEqual(sends, [])
+        failures = [e for e in receipt["_execution_timeline"] if e["stage"] == "pre_submit_failure"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["reason"], "claim_expired")
+        self.assertEqual(failures[0]["error_type"], "AdmissionLost")
+        self.assertNotIn("private image input", "\n".join(captured.output))
+        self.clock.now += 2
+        renewed = self.admission.claim_next()
+        self.assertEqual(renewed.request_id, context.request_id)
+        def succeed(ctx, body):
+            ctx.before_send()
+            ctx.record_stage("send_call_started")
+            sends.append(ctx.request_id)
+            self.admission.update_claim(ctx, status="success", upstream_unfinished=False)
+        self.admission.register("image", succeed)
+        self.admission.execute(renewed)
+        final = self.read("image", "happy", "prepared-expired")
+        self.assertEqual(sends, ["prepared-expired"])
+        self.assertEqual(final["status"], "success")
+        self.assertEqual(sum(e["stage"] == "send_call_started" for e in final["_execution_timeline"]), 1)
+        self.assertEqual(sum(e["stage"] == "pre_submit_failure" for e in final["_execution_timeline"]), 1)
+
+    def test_guard_distinguishes_account_capability_and_binding_rejections(self):
+        cases = (
+            ({"managed_disabled": True}, "account_unavailable"),
+            ({"capacity_used_since_observation": True}, "image_capability_unavailable"),
+            ({"conversation_binding_ids": []}, "image_binding_changed"),
+        )
+        original = dict(self.rows[0])
+        for index, (changes, reason) in enumerate(cases):
+            with self.subTest(reason=reason):
+                self.rows[0] = dict(original)
+                (self.root / "accounts.json").write_text(json.dumps(self.rows))
+                request_id = "guard-" + str(index)
+                self.image(request_id)
+                context = self.admission.claim_next()
+                self.assertEqual(context.request_id, request_id)
+                self.rows[0].update(changes)
+                (self.root / "accounts.json").write_text(json.dumps(self.rows))
+                with self.assertLogs("chatgpt2api", level="WARNING") as captured:
+                    with self.assertRaises(AdmissionLost):
+                        context.before_send()
+                receipt = self.read("image", "happy", request_id)
+                self.assertEqual(receipt["status"], "queued")
+                self.assertFalse(receipt["_submission_started"])
+                failures = [e for e in receipt["_execution_timeline"] if e["stage"] == "pre_submit_failure"]
+                self.assertEqual(failures[-1]["reason"], reason)
+                self.assertNotIn("fixture-token", "\n".join(captured.output))
+                self.assertNotIn("private image input", "\n".join(captured.output))
+
+    def test_guard_reason_and_heartbeat_diagnostics_do_not_log_exception_text(self):
+        from services.pool_admission import record_unsent_failure
+        self.image("heartbeat")
+        context = self.admission.claim_next()
+        with patch("services.pool_admission.logger.warning") as logged:
+            receipt = {}
+            record_unsent_failure(context, receipt, self.clock(), "AdmissionLost", reason="private credential")
+            self.assertNotIn("private credential", str(logged.call_args_list))
+            self.assertNotIn("reason", receipt["_execution_timeline"][0])
+        import sqlite3
+        update = self.admission.update_claim
+        failed = threading.Event()
+        def fail_renewal(ctx, **changes):
+            if set(changes) == {"_claim_until"}:
+                raise sqlite3.OperationalError("private credential and database path")
+            return update(ctx, **changes)
+        def capture(entry):
+            if entry.get("stage") == "claim_heartbeat_failed":
+                failed.set()
+        def succeed(ctx, body):
+            self.assertTrue(failed.wait(2), "heartbeat failure was not observed")
+            ctx.before_send()
+            ctx.record_stage("send_call_started")
+            update(ctx, status="success", upstream_unfinished=False)
+        self.admission.register("image", succeed)
+        with patch.object(self.admission, "CLAIM_SECONDS", .03), \
+                patch.object(self.admission, "update_claim", side_effect=fail_renewal), \
+                patch("services.pool_admission.logger.warning", side_effect=capture) as logged:
+            self.admission.execute(context)
+        entries = [call.args[0] for call in logged.call_args_list
+                   if call.args[0].get("stage") == "claim_heartbeat_failed"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["error_type"], "OperationalError")
+        self.assertEqual(entries[0]["request_ref"], hashlib.sha256(b"happy:heartbeat").hexdigest()[:24])
+        self.assertNotIn("private credential", str(logged.call_args_list))
+        self.assertEqual(self.read("image", "happy", "heartbeat")["status"], "success")
+
+    def test_unsent_diagnostic_does_not_attribute_old_attempt_progress(self):
+        self.image("stale-progress")
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "image", "happy", "stale-progress")
+            receipt["progress"] = "starting_generation"
+            self.store.write_receipt(db, "image", "happy", "stale-progress", receipt)
+        context = self.admission.claim_next()
+        self.admission.register("image", lambda *args: self.fail("handler must not start"))
+        with patch.object(self.store, "load_input", side_effect=RuntimeError("before handler")):
+            self.admission.execute(context)
+        receipt = self.read("image", "happy", "stale-progress")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertEqual(receipt["_execution_timeline"][-1]["phase"], "before_submit")
+        self.assertFalse(receipt["_submission_started"])
 
 
 if __name__ == "__main__":

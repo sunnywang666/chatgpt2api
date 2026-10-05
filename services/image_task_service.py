@@ -3,7 +3,9 @@ from __future__ import annotations
 from services.image_thread import (PROTOCOL as IMAGE_THREAD_PROTOCOL, ImageThreadError, input_fields, accept_thread, public_thread, finished_parent, saved_image_bytes, source_fingerprint)
 
 import json
+import math
 import hashlib
+import os
 import threading
 import time
 import uuid
@@ -13,9 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from services.config import DATA_DIR, config
-from services.task_store import TaskStore
+from services.task_store import TaskStore, recovery_control, pending_image_result_ids
+from services.pool_admission import image_result_stage
 from contextlib import contextmanager
 from services.request_context import current_request, AdmissionLost
+from utils.log import logger
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
@@ -43,6 +47,8 @@ class ConversationImageAdoptionError(ValueError):
 
 
 def _holds_upstream_slot(task: dict[str, Any]) -> bool:
+    if task.get("_attempt_finished_at") and not task.get("_executing"):
+        return False
     if "upstream_unfinished" in task:
         return task["upstream_unfinished"] is True
     # Old receipts did not distinguish local execution from upstream work.
@@ -116,7 +122,7 @@ def _retry_after_seconds(exc: BaseException) -> int | None:
     return None
 
 
-def _recovery_failure_code(exc: BaseException, phase: str) -> str:
+def _recovery_failure_code(exc: BaseException, phase: str, *, result_captured: bool = False) -> str:
     status = _upstream_status_code(exc)
     if status == 429:
         return "RECOVERY_RATE_LIMITED"
@@ -124,8 +130,9 @@ def _recovery_failure_code(exc: BaseException, phase: str) -> str:
         return "RECOVERY_AUTH_REQUIRED"
     if isinstance(exc, ImageThreadError):
         return "RECOVERY_THREAD_UNCONFIRMED"
-    if phase == "download_image_result":
-        return "RECOVERY_DOWNLOAD_FAILED"
+    from services.openai_backend_api import ImageActiveDeadlineExceeded, ImagePollTimeoutError
+    if isinstance(exc, (TimeoutError, ImageActiveDeadlineExceeded, ImagePollTimeoutError)):
+        return "RECOVERY_TIMED_OUT"
     exc_type = type(exc)
     type_name = f"{exc_type.__module__}.{exc_type.__name__}".lower()
     if (
@@ -135,7 +142,67 @@ def _recovery_failure_code(exc: BaseException, phase: str) -> str:
         or any(marker in type_name for marker in ("curl_cffi", "connection", "network"))
     ):
         return "RECOVERY_TRANSPORT_FAILED"
+    if phase == "download_image_result":
+        return "RECOVERY_DOWNLOAD_FAILED"
+    if result_captured:
+        return "RECOVERY_RESULT_INCOMPLETE"
     return "RECOVERY_READ_FAILED"
+
+
+_IMAGE_THREAD_FAILURE_CODES = frozenset({
+    "IMAGE_THREAD_UPSTREAM_CHANGED", "IMAGE_THREAD_TURN_UNCONFIRMED",
+})
+_BINDING_FAILURE_REASONS = frozenset({
+    "binding_id_required", "bound_account_missing", "bound_image_capability_unavailable",
+    "image_capacity_disabled", "image_capacity_auth_required", "image_capacity_limited",
+    "image_capacity_read_failed", "image_capacity_stale",
+})
+
+
+def _failure_details(exc: BaseException, phase: str) -> dict[str, Any]:
+    # Persist diagnosis without exception text, response bodies, URLs or headers.
+    details = {
+        "phase": phase,
+        "type": type(exc).__name__[:80],
+        "status_code": _upstream_status_code(exc),
+        "at": time.time(),
+    }
+    if isinstance(exc, ImageThreadError) and isinstance(exc.code, str) and exc.code in _IMAGE_THREAD_FAILURE_CODES:
+        details["code"] = exc.code
+    reason = getattr(exc, "binding_reason", None)
+    if (getattr(exc, "code", None) == "CONVERSATION_BINDING_UNAVAILABLE"
+            and getattr(exc, "upstream_submitted", None) is False
+            and isinstance(reason, str) and reason in _BINDING_FAILURE_REASONS):
+        details["binding_reason"] = reason
+    return details
+
+
+def _public_failure_details(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    phases = {
+        "collect_image_result", "validate_image_result", "read_image_request",
+        "resolve_image_result", "download_image_result", "confirm_image_turn", "save_image_result",
+        "handler_operation", "select_image_account", "upload_image_reference", "bootstrap",
+        "chat_requirements", "prepare_conversation", "start_image_generation",
+        "stream_image_generation", "receive_image_result",
+    }
+    phase = value.get("phase")
+    name = value.get("type")
+    status = value.get("status_code")
+    at = value.get("at")
+    details = {
+        "phase": phase if isinstance(phase, str) and phase in phases else "unknown",
+        "type": name if isinstance(name, str) and len(name) <= 80 and name.isidentifier() else "Error",
+        "status_code": status if type(status) is int and 100 <= status <= 599 else None,
+        "at": at if type(at) in (int, float) and math.isfinite(at) and at >= 0 else None,
+    }
+    if name == "ImageThreadError" and isinstance(value.get("code"), str) and value["code"] in _IMAGE_THREAD_FAILURE_CODES:
+        details["code"] = value["code"]
+    reason = value.get("binding_reason")
+    if isinstance(reason, str) and reason in _BINDING_FAILURE_REASONS:
+        details["binding_reason"] = reason
+    return details
 
 
 def _safe_recovery_error(code: str, phase: str) -> str:
@@ -146,6 +213,8 @@ def _safe_recovery_error(code: str, phase: str) -> str:
             "RECOVERY_TRANSPORT_FAILED": "the provider could not be reached",
             "RECOVERY_READ_FAILED": "the provider response could not be read",
             "RECOVERY_THREAD_UNCONFIRMED": "the original image turn could not be confirmed",
+            "RECOVERY_TIMED_OUT": "result retrieval or confirmation timed out",
+            "RECOVERY_RESULT_INCOMPLETE": "result retrieval or confirmation did not complete",
         }.get(code, "the result download did not complete")
         return (
             f"Generated image is preserved; {reason}. "
@@ -156,6 +225,7 @@ def _safe_recovery_error(code: str, phase: str) -> str:
         "RECOVERY_AUTH_REQUIRED": "Image result lookup requires the bound account connection to be restored.",
         "RECOVERY_TRANSPORT_FAILED": "Image result lookup could not reach the provider; retry when connectivity returns.",
         "RECOVERY_READ_FAILED": "Image result lookup returned an unreadable response; retry the same request lookup.",
+        "RECOVERY_TIMED_OUT": "Image result lookup timed out; retry the same request lookup.",
     }.get(code, "Image result lookup did not complete; retry the same request lookup.")
 
 
@@ -365,6 +435,10 @@ def _request_hash(mode: str, payload: dict[str, Any]) -> str:
     # Keep old task fingerprints unchanged when the caller has no override.
     if _clean(payload.get("upstream_model")):
         contract["upstream_model"] = _clean(payload.get("upstream_model"))
+    if "_requested_account_ref" in payload:
+        contract["_requested_account_ref"] = payload["_requested_account_ref"]
+    if "_scheduling" in payload:
+        contract["_scheduling"] = payload["_scheduling"]
     contract.update(input_fields(payload))
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -428,8 +502,11 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
+        "recovery_control": recovery_control(task),
+        "attempt_state": "succeeded" if task.get("status") == TASK_STATUS_SUCCESS else "ended" if task.get("_attempt_finished_at") else "active",
         "id": task.get("id"),
         "status": task.get("status"),
+        "result_stage": image_result_stage(task),
         "mode": task.get("mode"),
         "model": task.get("model"),
         "size": task.get("size"),
@@ -437,6 +514,14 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
+    if task.get("_scheduling") is not None:
+        item["scheduling"] = task["_scheduling"]
+    if isinstance(task.get("_completion"), dict):
+        item["completion"] = {k: task["_completion"][k] for k in (
+            "state", "reason", "replacement_id", "selected_id", "conversation_mode", "max_extra_requests")
+            if k in task["_completion"]}
+    if task.get("_requested_account_ref"):
+        item["account_ref"] = task["_requested_account_ref"]
     if public_thread(task):
         item["image_thread"] = public_thread(task)
     if task.get("conversation_id"):
@@ -459,13 +544,15 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "recovery_retryable",
         "recovery_error_code",
         "recovery_phase",
+        "last_recovery_failure",
         "adopted_source_request_message_id",
         "adopted_source_image_message_id",
         "adopted_from_error_code",
         "adopted_at",
     ):
         if task.get(field):
-            item[field] = task.get(field)
+            item[field] = (_public_failure_details(task[field])
+                           if field == "last_recovery_failure" else task.get(field))
     retry_after = task.get("recovery_retry_after_seconds")
     if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and retry_after >= 0:
         item["recovery_retry_after_seconds"] = retry_after
@@ -553,7 +640,7 @@ class ImageTaskService:
                 self._save_locked()
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, *, task_key: str | None = None):
         with self._lock:
             if getattr(self._transaction_local, "db", None) is not None:
                 yield self._transaction_local.db
@@ -561,7 +648,16 @@ class ImageTaskService:
             with self.store.transaction() as db:
                 self._transaction_local.db = db
                 try:
-                    self._tasks = {key: json.loads(raw) for key, raw in db.execute("SELECT task_key,receipt FROM image_requests")}
+                    if task_key is None:
+                        self._tasks = {key: json.loads(raw) for key, raw in db.execute("SELECT task_key,receipt FROM image_requests")}
+                    else:
+                        # A progress update needs only its current durable
+                        # receipt, not every historical image's base64 bytes.
+                        row = db.execute("SELECT receipt FROM image_requests WHERE task_key=?", (task_key,)).fetchone()
+                        if row is None:
+                            self._tasks.pop(task_key, None)
+                        else:
+                            self._tasks[task_key] = json.loads(row[0])
                     yield db
                 finally:
                     self._transaction_local.db = None
@@ -601,9 +697,13 @@ class ImageTaskService:
         image_thread_id: str = "",
         edit_source_task_id: str = "",
         edit_source_index: int = 0,
+        account_ref: str | None = None,
+        scheduling: dict | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
+            **({"_requested_account_ref": account_ref} if account_ref is not None else {}),
+            **({"_scheduling": scheduling} if scheduling is not None else {}),
             "model": model,
             "n": 1,
             "size": size,
@@ -644,9 +744,13 @@ class ImageTaskService:
         image_thread_id: str = "",
         edit_source_task_id: str = "",
         edit_source_index: int = 0,
+        account_ref: str | None = None,
+        scheduling: dict | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
+            **({"_requested_account_ref": account_ref} if account_ref is not None else {}),
+            **({"_scheduling": scheduling} if scheduling is not None else {}),
             "images": images or [],
             "mask": masks or [],
             "model": model,
@@ -719,8 +823,15 @@ class ImageTaskService:
                 thread = (task or {}).get("_image_thread") or {}
                 members = [item for item in self._tasks.values()
                     if item.get("owner_id") == owner and (item.get("_image_thread") or {}).get("id") == thread.get("id")]
+                from services.image_thread import selected_thread_result
+                owned = {item["id"]: item for item in members}
+                # The original failed attempt stays in history. An explicitly
+                # selected terminal result resolves only that attempt, not any
+                # newer task, active generation, or unrelated unknown branch.
+                resolved = [selected_thread_result(item, owned) for item in members]
+                task = selected_thread_result(task, owned)
                 if (not thread or not members or max(members, key=lambda item: item.get("_sequence", 0)) is not task
-                        or any(item.get("status") != TASK_STATUS_SUCCESS or not item.get("_image_thread_terminal") for item in members)):
+                        or any(item.get("status") != TASK_STATUS_SUCCESS or not item.get("_image_thread_terminal") for item in resolved)):
                     raise ImageThreadError("IMAGE_THREAD_NOT_TERMINAL")
                 conversation_id = _clean(task.get("conversation_id"))
                 parent_id = _clean(task.get("parent_message_id"))
@@ -730,11 +841,13 @@ class ImageTaskService:
             backend = OpenAIBackendAPI(access_token=token)
             try:
                 result_ids = (task.get("result_file_ids") or []) + (task.get("result_sediment_ids") or [])
-                actual_parent = finished_parent(backend._get_conversation(conversation_id), conversation_id,
-                    request_id, expected_result_ids=result_ids)
-                if actual_parent != parent_id:
-                    raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
-                backend.set_conversation_archived(conversation_id, parent_id, archived)
+                def validate_terminal(document):
+                    actual_parent = finished_parent(document, conversation_id,
+                        request_id, expected_result_ids=result_ids)
+                    if actual_parent != parent_id:
+                        raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                backend.set_conversation_archived(conversation_id, parent_id, archived,
+                                                 validate_document=validate_terminal)
             finally:
                 backend.close()
         return {"image_thread": public_thread(task), "archived": archived, "task_id": task_id}
@@ -753,6 +866,11 @@ class ImageTaskService:
         mode: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        from services.workflow_scheduling import normalize_scheduling
+        if "_scheduling" in payload:
+            payload = {**payload, "_scheduling": normalize_scheduling(payload["_scheduling"])}
+        if payload.get("_scheduling") is not None and self.admission is None:
+            raise ValueError("SCHEDULING_UNAVAILABLE")
         task_id = _clean(client_task_id)
         if not task_id:
             raise ValueError("client_task_id is required")
@@ -771,6 +889,11 @@ class ImageTaskService:
             with self.store.connect() as db:
                 duplicate = self.store.read_receipt(db, "image", owner, task_id)
                 source_snapshot = self.store.read_receipt(db, "image", owner, thread_fields["edit_source_task_id"])
+                if source_snapshot and (source_snapshot.get("_completion") or {}).get("selected_id"):
+                    from services.image_thread import selected_thread_result
+                    selected_id = source_snapshot["_completion"]["selected_id"]
+                    selected = self.store.read_receipt(db, "image", owner, selected_id)
+                    source_snapshot = selected_thread_result(source_snapshot, {selected_id: selected})
             if duplicate is None:
                 if source_snapshot is None:
                     raise ImageThreadError("IMAGE_THREAD_SOURCE_UNAVAILABLE")
@@ -819,7 +942,39 @@ class ImageTaskService:
                 "_turn_reserved": False,
                 "_execution_timeline": [{"stage": "accepted", "at": time.time()}],
             }
+            if is_codex_image_model(task["model"]):
+                task["_route"] = "codex"
+                if any(payload.get(k) for k in ("provider_binding_id", "conversation_id", "parent_message_id", "retain_conversation")):
+                    raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
+            if "_requested_account_ref" in payload:
+                from services.account_service import account_service
+                accounts = self.admission.accounts if self.admission is not None else account_service
+                requested_identity = accounts.resolve_image_account(payload["_requested_account_ref"])
+                if (task.get("provider_account_identity") and task["provider_account_identity"] != requested_identity):
+                    raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
+                if task.get("provider_binding_id"):
+                    try:
+                        bound_identity = accounts.get_bound_account_identity(task["provider_binding_id"])
+                    except RuntimeError:
+                        raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT") from None
+                    if bound_identity != requested_identity:
+                        raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
+                task.update(_requested_account_ref=payload["_requested_account_ref"],
+                            _requested_account_identity=requested_identity)
             accept_thread(task, self._tasks.values(), payload, mode, output_reader=read_source)
+            from services.generation_completion import attach_replacement
+            attach_replacement(self.store, self._transaction_local.db, "image", owner, task_id, payload, task)
+            if task.get("_same_session_retry_of"):
+                root_id = task["_same_session_retry_of"]
+                self._tasks[owner + ":" + root_id] = self.store.read_receipt(
+                    self._transaction_local.db, "image", owner, root_id)
+            if task.get("retain_receipt") and not task.get("_completion_of") and task.get("_route", "chat") == "chat":
+                task["_automatic_generation_recovery"] = True
+            from services.workflow_scheduling import prepare_receipt
+            from services.work_lifecycle import ensure_work
+            prepare_receipt(task, payload.get("_scheduling"), task["_source"])
+            ensure_work(self.store, self._transaction_local.db, "image", owner, task_id, task,
+                        source=task["_source"], scheduling=task.get("_scheduling"))
             task["_input_ref"] = self.store.save_input({"payload": payload, "identity": {k: identity[k] for k in ("id", "name", "role", "external_image_client", "_trusted_source") if k in identity}, "mode": mode})
             self._tasks[key] = task
             self._save_locked()
@@ -845,7 +1000,10 @@ class ImageTaskService:
         identity: dict[str, object],
         model: str,
     ) -> None:
-        if identity.get("external_image_client") and not payload.get("_admission_claim"):
+        with self._transaction():
+            original = self._tasks.get(key) or {}
+            payload = {**payload, **{k: original[k] for k in ("_requested_account_ref", "_requested_account_identity") if original.get(k)}}
+        if (identity.get("external_image_client") or payload.get("_requested_account_ref")) and not payload.get("_admission_claim"):
             # Allocate once for this newly persisted task, before any generation.
             # Duplicate submissions never enter this thread. Account selection
             # only performs readiness reads; a failure here is NOT submitted.
@@ -853,7 +1011,7 @@ class ImageTaskService:
             token = ""
             try:
                 capacities = {str(item.get("provider_account_identity") or ""): min(
-                    max(1, int(config.image_account_concurrency)), max(0, int(item.get("quota") or 0)))
+                    max(1, int(config.image_account_concurrency)), account_service.image_account_capacity(item, model))
                     for item in account_service.list_accounts()}
                 with self._transaction():
                     held = {}
@@ -864,7 +1022,8 @@ class ImageTaskService:
                     unavailable = {identity_id for identity_id, count in held.items()
                                    if count >= capacities.get(identity_id, max(1, int(config.image_account_concurrency)))}
                 binding, account_identity, token = account_service.create_conversation_binding(
-                    image_model=model, excluded_account_identities=unavailable)
+                    image_model=model, excluded_account_identities=unavailable,
+                    **({"requested_account_identity": payload["_requested_account_identity"]} if payload.get("_requested_account_identity") else {}))
                 payload = {**payload, "provider_binding_id": binding,
                            "provider_account_identity": account_identity,
                            "client_conversation_id": "image-task-" + uuid.uuid4().hex,
@@ -874,7 +1033,7 @@ class ImageTaskService:
                 # durable occupancy before releasing the temporary slot.
                 selected = account_service.get_account(token) or {}
                 capacity = min(max(1, int(config.image_account_concurrency)),
-                               max(0, int(selected.get("quota") or 0)))
+                               account_service.image_account_capacity(selected, model))
                 with self._transaction():
                     occupied = sum(1 for other_key, other in self._tasks.items()
                                    if other_key != key and other.get("provider_account_identity") == account_identity
@@ -934,8 +1093,23 @@ class ImageTaskService:
         if not request_message_id:
             request_message_id = str(uuid.uuid4())
             self._update_task(key, request_message_id=request_message_id)
+        # Keep the last reported operation separate from the recovery action.
+        # Capturing a file ID alone does not prove that downloading started.
+        handler_failure_phase = "handler_operation"
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
+            nonlocal handler_failure_phase
+            handler_failure_phase = {
+                "getting_account": "select_image_account",
+                "uploading": "upload_image_reference",
+                "bootstrapping": "bootstrap",
+                "getting_token": "chat_requirements",
+                "preparing_conversation": "prepare_conversation",
+                "starting_generation": "start_image_generation",
+                "generating": "stream_image_generation",
+                "image_stream_resolve_start": "resolve_image_result",
+                "receiving_image": "receive_image_result",
+            }.get(step, "handler_operation")
             self._update_task(key, progress=step)
         progress_callback.request_message_id = request_message_id
         progress_callback.active_deadline_at = (
@@ -977,6 +1151,23 @@ class ImageTaskService:
 
         progress_callback.start_active_attempt = start_active_attempt
 
+        def record_local_pacing_wait(seconds: float) -> None:
+            nonlocal active_deadline_at
+            if seconds <= 0 or active_deadline_at is None:
+                return
+            with self._transaction():
+                current = self._tasks.get(key) or {}
+                deadline = current.get("active_attempt_deadline_at")
+                if not isinstance(deadline, (int, float)) or deadline <= 0:
+                    return
+                active_deadline_at = float(deadline) + seconds
+                self._update_task(key, active_attempt_deadline_at=active_deadline_at,
+                                  active_local_pacing_wait_secs=float(current.get("active_local_pacing_wait_secs") or 0) + seconds)
+            progress_callback.active_deadline_at = active_deadline_at
+            progress_callback.local_pacing_wait_secs = float(getattr(progress_callback, "local_pacing_wait_secs", 0)) + seconds
+
+        progress_callback.record_local_pacing_wait = record_local_pacing_wait
+
         def record_conversation_id(conversation_id: str) -> None:
             conversation_id = _clean(conversation_id)
             if conversation_id:
@@ -984,7 +1175,13 @@ class ImageTaskService:
         progress_callback.record_conversation_id = record_conversation_id
 
         def record_submission_started() -> None:
-            self._update_task(key, upstream_submission_started=True)
+            # A previously deferred request may still carry a proven-unsent
+            # outcome. Once the POST begins, only a later result can settle it.
+            self._update_task(
+                key, upstream_submission_started=True, upstream_outcome="unknown",
+                error_code="", waiting={}, recovery_retryable=False,
+                recovery_requires_new_conversation=False,
+            )
         progress_callback.record_submission_started = record_submission_started
 
         def record_result_ids(file_ids: list[str], sediment_ids: list[str]) -> None:
@@ -993,20 +1190,33 @@ class ImageTaskService:
                 key,
                 result_file_ids=list(dict.fromkeys(str(item) for item in file_ids if item)),
                 result_sediment_ids=list(dict.fromkeys(str(item) for item in sediment_ids if item)),
+                _pending_image_result_ids=None,
+                _pending_image_output=None,
                 progress="receiving_image",
                 upstream_outcome="generated",
                 upstream_unfinished=False,
             )
             progress_callback.image_thread_result_ids = result_ids
         progress_callback.record_result_ids = record_result_ids
+        progress_callback.record_downloaded_image_items = lambda coverage, items: self._store_pending_image_output(
+            key, coverage, items,
+        )
+        progress_callback.record_pending_result_ids = lambda files, sediments: self._update_task(
+            key, _pending_image_result_ids={"file_ids": files, "sediment_ids": sediments},
+        )
         progress_callback.image_thread = payload.get("_image_thread")
+        progress_callback.failed_retry_original = payload.get("_failed_retry_original")
+        progress_callback.failed_retry_predecessor = payload.get("_failed_retry_predecessor")
+        progress_callback.failed_retry_required = bool(payload.get("_continue_after_failed_attempt"))
         progress_callback.image_thread_predecessor_message = payload.get("_image_thread_predecessor_message")
         progress_callback.image_thread_predecessor_result_ids = payload.get("_image_thread_predecessor_result_ids")
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
+        failure_phase = "handler_operation"
         try:
             handler = self.edit_handler if mode == "edit" else self.generation_handler
             result = handler(payload_with_progress)
+            failure_phase = "validate_image_result"
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
@@ -1044,6 +1254,8 @@ class ImageTaskService:
             self._update_task(
                 key,
                 status=TASK_STATUS_SUCCESS,
+                _pending_image_result_ids=None,
+                _pending_image_output=None,
                 data=data,
                 usage=usage,
                 error="",
@@ -1075,6 +1287,8 @@ class ImageTaskService:
                 account_email=account_email,
             )
         except Exception as exc:
+            if failure_phase == "handler_operation":
+                failure_phase = handler_failure_phase
             error_message = str(exc) or "image task failed"
             with self._transaction():
                 current = dict(self._tasks.get(key) or {})
@@ -1142,12 +1356,13 @@ class ImageTaskService:
             recovery_phase = (
                 "download_image_result" if result_captured else "read_image_request"
             )
-            recovery_error_code = _recovery_failure_code(exc, recovery_phase)
+            recovery_error_code = _recovery_failure_code(exc, failure_phase, result_captured=result_captured)
             retry_after = _retry_after_seconds(exc)
             if error_code == "CONVERSATION_OUTCOME_UNKNOWN":
                 error_message = _safe_recovery_error(recovery_error_code, recovery_phase)
             duration_ms = int((time.time() - started) * 1000)
             self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
+                              last_recovery_failure=_failure_details(exc, failure_phase),
                               duration_ms=duration_ms,
                               upstream_unfinished=bool(account) and not terminal and not result_captured,
                               **(
@@ -1170,6 +1385,7 @@ class ImageTaskService:
                               **(
                                   {
                                       "upstream_submission_started": False,
+                                      "_submission_started": False,
                                       "upstream_outcome": "not_submitted",
                                       **(
                                           {
@@ -1255,7 +1471,9 @@ class ImageTaskService:
             pass
 
     def _update_task(self, key: str, **updates: Any) -> None:
-        with self._transaction():
+        saved_count = None
+        nested = getattr(self._transaction_local, "db", None) is not None
+        with self._transaction(task_key=key):
             task = self._tasks.get(key)
             if task is None:
                 return
@@ -1264,11 +1482,43 @@ class ImageTaskService:
                 raise AdmissionLost("original image claim changed")
             if task.get("status") == TASK_STATUS_SUCCESS and updates.get("status") not in (None, TASK_STATUS_SUCCESS):
                 return
+            if (task.get("status") != TASK_STATUS_SUCCESS and updates.get("status") == TASK_STATUS_SUCCESS
+                    and isinstance(updates.get("data"), list) and updates["data"]):
+                saved_count = len(updates["data"])
             task.update(updates)
+            # Record the first newly observed qualified IDs atomically. An old
+            # receipt or an unrelated status update must not invent this time.
+            observed_ids = any(updates.get(field) for field in ("result_file_ids", "result_sediment_ids"))
+            first_observation = task.get("_first_qualified_image_assets_observed_at")
+            if (observed_ids and task.get("upstream_unfinished") is False and task.get("request_message_id")
+                    and not (type(first_observation) in (int, float)
+                             and math.isfinite(first_observation) and first_observation > 0)):
+                asset_ids = {item for field in ("result_file_ids", "result_sediment_ids")
+                             for item in (task.get(field) if isinstance(task.get(field), list) else [])
+                             if isinstance(item, str) and item}
+                if asset_ids:
+                    observed_at = time.time()
+                    task["_first_qualified_image_assets_observed_at"] = observed_at
+                    task["_first_qualified_image_asset_id_count"] = len(asset_ids)
+                    task["_execution_timeline"] = [*(task.get("_execution_timeline") or []),
+                        {"stage": "qualified_image_assets_observed", "at": observed_at,
+                         "image_count": len(asset_ids)}][-32:]
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
-            self._save_locked()
+            # Existing nested callers may have changed other receipts in their
+            # outer transaction; preserve that transaction's save behavior.
+            self._save_locked(task_key=None if nested else key)
             self._slot_condition.notify_all()
+        # Normal dispatch and original-result recovery both persist here. Emit
+        # after commit, never on merely receiving an ID or downloading bytes.
+        if (saved_count is not None and getattr(self._transaction_local, "db", None) is None
+                and context is not None and context.kind == "image"
+                and key == _task_key(context.owner, context.request_id)):
+            try:
+                context.record_stage("artifact_saved", image_count=saved_count)
+            except Exception:
+                # Observability must not turn a committed result into a retry.
+                logger.warning({"event": "pool_artifact_observation_unavailable", "layer": "provider"})
 
     def _load_locked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -1334,6 +1584,8 @@ class ImageTaskService:
                 "recovery_requires_new_conversation": item.get("recovery_requires_new_conversation") is True,
                 "recovery_error_code": _clean(item.get("recovery_error_code")),
                 "recovery_phase": _clean(item.get("recovery_phase")),
+                "last_recovery_failure": _public_failure_details(item.get("last_recovery_failure")),
+                "_pending_image_result_ids": pending_image_result_ids(item) or None,
                 "recovery_retry_after_seconds": item.get("recovery_retry_after_seconds"),
                 "deadline_recovery_started": item.get("deadline_recovery_started") is True,
                 "result_file_ids": [
@@ -1375,15 +1627,16 @@ class ImageTaskService:
             tasks[_task_key(owner, task_id)] = task
         return tasks
 
-    def _save_locked(self) -> None:
+    def _save_locked(self, *, task_key: str | None = None) -> None:
+        tasks = self._tasks.values() if task_key is None else (self._tasks[task_key],)
         db = getattr(self._transaction_local, "db", None)
         if db is None:
             # Compatibility for existing maintenance/tests using the local lock.
             with self.store.transaction() as db:
-                for task in self._tasks.values():
+                for task in tasks:
                     self.store.write_receipt(db, "image", task["owner_id"], task["id"], task)
             return
-        for task in self._tasks.values():
+        for task in tasks:
             self.store.write_receipt(db, "image", task["owner_id"], task["id"], task)
 
     def _recover_unfinished_locked(self) -> bool:
@@ -1403,6 +1656,7 @@ class ImageTaskService:
                 not_started = (task.get("status") == TASK_STATUS_QUEUED
                                and task.get("admission_recorded") is True
                                and task.get("upstream_unfinished") is False)
+                previous_poll_at = task.get("next_poll_at")
                 task["status"] = TASK_STATUS_ERROR
                 task["error"] = "服务已重启，未完成的图片任务已中断"
                 task["error_code"] = (
@@ -1418,7 +1672,7 @@ class ImageTaskService:
                 elif result_captured:
                     task["upstream_unfinished"] = False
                     task["upstream_outcome"] = "generated"
-                    task["recovery_error_code"] = "RECOVERY_DOWNLOAD_FAILED"
+                    task["recovery_error_code"] = task.get("recovery_error_code") or "RECOVERY_RESULT_INCOMPLETE"
                     task["recovery_phase"] = "download_image_result"
                     task["next_poll_at"] = 0
                 elif task["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN":
@@ -1441,6 +1695,8 @@ class ImageTaskService:
                         if known_not_submitted and task.get("conversation_id") and task.get("parent_message_id")
                         else "unavailable" if not_started or known_not_submitted else "unknown"
                     )
+                if task.get("_recovery_paused") is True:
+                    task["next_poll_at"] = previous_poll_at
                 task["updated_at"] = _now_iso()
                 changed = True
         return changed
@@ -1456,6 +1712,7 @@ class ImageTaskService:
             for key, task in self._tasks.items()
             if task.get("status") in TERMINAL_STATUSES and not _holds_upstream_slot(task)
             and not task.get("retain_receipt")
+            and not task.get("_recovery_paused")
             and task.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
             and _timestamp(task.get("updated_at")) < cutoff
         ]
@@ -1471,6 +1728,7 @@ class ImageTaskService:
         extra_timeout_secs: float = 30.0,
         base_url: str = "",
         allow_unrecoverable_retry: bool = False,
+        completion_recheck: bool = False,
     ) -> dict[str, Any]:
         """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
         owner = _owner_id(identity)
@@ -1479,7 +1737,12 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 raise ValueError("task not found")
-            if task.get("_recovery_suppressed") is True:
+            saved_image = bool(task.get("result_file_ids") or task.get("result_sediment_ids"))
+            # Pending evidence permits another original read, never direct download.
+            saved_image = saved_image or bool(pending_image_result_ids(task))
+            from services.generation_completion import ended_image_edit_recheck
+            explicit_ended_recheck = completion_recheck and ended_image_edit_recheck(task)
+            if task.get("_recovery_suppressed") is True or task.get("_recovery_paused") is True or task.get("_attempt_finished_at") and not saved_image and not explicit_ended_recheck:
                 # Keep this endpoint observational while an operator has
                 # explicitly stopped the old recovery path.
                 return _public_task(task)
@@ -1487,9 +1750,11 @@ class ImageTaskService:
                 return _public_task(task)
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ValueError("task is not in error state")
-            if _clean(task.get("error_code")) == "RESULT_UNRECOVERABLE":
+            recheck = completion_recheck and bool(task.get("_completion")) and task.get("upstream_outcome") == "unknown"
+            if _clean(task.get("error_code")) == "RESULT_UNRECOVERABLE" and not recheck and not saved_image:
                 return _public_task(task)
-            if _clean(task.get("error_code")) != "CONVERSATION_OUTCOME_UNKNOWN":
+            if (_clean(task.get("error_code")) != "CONVERSATION_OUTCOME_UNKNOWN" and not recheck
+                    and not (saved_image and task.get("error_code") == "RESULT_UNRECOVERABLE")):
                 raise ValueError("task outcome is not unknown")
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
@@ -1825,6 +2090,7 @@ class ImageTaskService:
                 try:
                     current.update({
                         "status": TASK_STATUS_SUCCESS,
+                        "_pending_image_result_ids": None,
                         "data": data,
                         "error": "",
                         "error_code": "",
@@ -1857,6 +2123,33 @@ class ImageTaskService:
             if backend is not None:
                 backend.close()
 
+    def _store_pending_image_output(self, key, coverage, items):
+        """Keep downloaded originals private until exact-turn confirmation."""
+        import base64
+        from services.durable_forward import MAX_OUTPUT_BYTES
+        if not isinstance(items, list) or not items:
+            raise ValueError("private image output empty")
+        for item in items:
+            if not isinstance(item, dict) or set(item) != {"b64_json"} or not base64.b64decode(item["b64_json"], validate=True):
+                raise ValueError("invalid private image output")
+        encoded = json.dumps(items).encode()
+        if len(encoded) > MAX_OUTPUT_BYTES:
+            raise ValueError("private image output limit")
+        ref = self.store.create_output()
+        with self.store.output_file(ref, append=True) as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with self._transaction():
+            current = self._tasks.get(key) or {}
+            actual = {"conversation_id": _clean(current.get("conversation_id")),
+                      "request_message_id": _clean(current.get("request_message_id")),
+                      "file_ids": list(current.get("result_file_ids") or []),
+                      "sediment_ids": list(current.get("result_sediment_ids") or [])}
+            if actual != coverage:
+                raise AdmissionLost("original image output coverage changed")
+            self._update_task(key, _pending_image_output={"output_ref": ref, "coverage": coverage})
+
     def _run_resume_poll(
         self,
         key: str,
@@ -1875,10 +2168,11 @@ class ImageTaskService:
         account_service = None
         access_token = ""
         conversation_available = False
+        failure_phase = "read_image_request"
         try:
             from services.account_service import account_service
-            from services.openai_backend_api import ImageContentPolicyError, OpenAIBackendAPI
-            from services.protocol.conversation import format_image_result
+            from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
+            from services.protocol.conversation import format_image_result, _validate_image_download_count
 
             with self._transaction():
                 task = self._tasks.get(key)
@@ -1888,14 +2182,68 @@ class ImageTaskService:
                 request_message_id = _clean(task.get("request_message_id")) if task else ""
                 persisted_file_ids = list(task.get("result_file_ids") or []) if task else []
                 persisted_sediment_ids = list(task.get("result_sediment_ids") or []) if task else []
+                pending_ids = pending_image_result_ids(task) if task else {}
                 image_thread = (task or {}).get("_image_thread")
                 expected_parent = (task or {}).get("_image_thread_request_parent")
+                predecessor_message = (task or {}).get("_image_thread_predecessor_message")
+                predecessor_ids = (task or {}).get("_image_thread_predecessor_result_ids")
+                retry_predecessor = self._tasks.get(_task_key(_owner_id(identity),
+                    (image_thread or {}).get("previous_task_id") or ""))
             def recovered_parent(backend, result_file_ids, result_sediment_ids):
                 if image_thread:
                     return finished_parent(backend._get_conversation(conversation_id), conversation_id,
                         request_message_id, expected_parent=expected_parent,
-                        expected_result_ids=result_file_ids + result_sediment_ids)
+                        expected_result_ids=result_file_ids + result_sediment_ids,
+                        predecessor_request_message_id=predecessor_message,
+                        predecessor_result_ids=predecessor_ids)
                 return backend.get_conversation_parent_message_id(conversation_id)
+            def downloaded_items(backend, files, sediments):
+                # A final conversation read may fail after download. Keep bytes
+                # private until that read succeeds, and reuse them on recovery.
+                import base64
+                from services.durable_forward import MAX_OUTPUT_BYTES
+                nonlocal failure_phase
+                coverage = {"conversation_id": conversation_id, "request_message_id": request_message_id,
+                            "file_ids": list(files), "sediment_ids": list(sediments)}
+                cached = (task or {}).get("_pending_image_output") or {}
+                if isinstance(cached, dict) and cached.get("coverage") == coverage:
+                    try:
+                        with self.store.output_file(cached["output_ref"]) as handle:
+                            encoded = handle.read(MAX_OUTPUT_BYTES + 1)
+                        if len(encoded) > MAX_OUTPUT_BYTES:
+                            raise ValueError("private image output limit")
+                        items = json.loads(encoded)
+                        if not isinstance(items, list) or not items:
+                            raise ValueError("private image output empty")
+                        for item in items:
+                            if not isinstance(item, dict) or set(item) != {"b64_json"} or not base64.b64decode(item["b64_json"], validate=True):
+                                raise ValueError("invalid private image output")
+                        _validate_image_download_count(items, files, sediments)
+                        context = current_request.get()
+                        if context is not None:
+                            try:
+                                context.record_stage("attachment_download_cache_reused", image_count=len(items))
+                            except Exception:
+                                pass  # Losing timing evidence must not force a download.
+                        return items
+                    except (OSError, ValueError, KeyError, TypeError):
+                        pass  # Missing/corrupt private cache: fetch the same assets.
+                failure_phase = "resolve_image_result"
+                image_urls = backend.resolve_conversation_image_urls(
+                    conversation_id, files, sediments, poll=False, request_message_id=request_message_id)
+                if not image_urls:
+                    raise RuntimeError("generated image URL could not be resolved")
+                failure_phase = "download_image_result"
+                downloaded = backend.download_image_bytes(image_urls)
+                if not downloaded:
+                    raise RuntimeError("generated image could not be downloaded")
+                items = [{"b64_json": base64.b64encode(value).decode("ascii")} for value in downloaded]
+                encoded = json.dumps(items).encode()
+                if len(encoded) > MAX_OUTPUT_BYTES:
+                    raise ValueError("private image output limit")
+                self._store_pending_image_output(key, coverage, items)
+                _validate_image_download_count(items, files, sediments)
+                return items
             if not binding_id or not account_identity or not client_conversation_id:
                 error = RuntimeError("conversation binding unavailable: task authority missing")
                 error.status_code = 403
@@ -1909,25 +2257,17 @@ class ImageTaskService:
             access_token = account_service.get_bound_text_access_token(binding_id, model="auto")
             with account_service.conversation_binding_lock(binding_id, client_conversation_id):
                 backend = OpenAIBackendAPI(access_token=access_token)
+                def record_pending_ids(files, sediments):
+                    pending_ids.update(file_ids=files, sediment_ids=sediments)
+                    self._update_task(key, _pending_image_result_ids=dict(pending_ids))
+                backend.progress_callback = lambda _step: None
+                backend.progress_callback.record_pending_result_ids = record_pending_ids
                 if persisted_file_ids or persisted_sediment_ids:
                     self._update_task(key, progress="receiving_image", recovery_phase="download_image_result")
-                    image_urls = backend.resolve_conversation_image_urls(
-                        conversation_id,
-                        persisted_file_ids,
-                        persisted_sediment_ids,
-                        poll=False,
-                        request_message_id=request_message_id,
-                    )
-                    if not image_urls:
-                        raise RuntimeError("generated image URL could not be resolved")
-                    downloaded = backend.download_image_bytes(image_urls)
-                    if not downloaded:
-                        raise RuntimeError("generated image could not be downloaded")
-                    image_items = [
-                        {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
-                        for image_data in downloaded
-                    ]
+                    image_items = downloaded_items(backend, persisted_file_ids, persisted_sediment_ids)
+                    failure_phase = "confirm_image_turn"
                     parent_message_id = recovered_parent(backend, persisted_file_ids, persisted_sediment_ids)
+                    failure_phase = "save_image_result"
                     data = format_image_result(
                         image_items,
                         "",
@@ -1938,6 +2278,8 @@ class ImageTaskService:
                     self._update_task(
                         key,
                         status=TASK_STATUS_SUCCESS,
+                        _pending_image_result_ids=None,
+                        _pending_image_output=None,
                         data=data,
                         error="",
                         error_code="",
@@ -1968,6 +2310,8 @@ class ImageTaskService:
                 try:
                     document = backend._get_conversation(conversation_id)
                     conversation_available = True
+                    from services.generation_completion import retry_cursor
+                    self._update_task(key, _retry_cursor=retry_cursor(document, task, kind="image"))
                 except Exception as exc:
                     if _upstream_status_code(exc) != 404:
                         raise
@@ -1993,6 +2337,8 @@ class ImageTaskService:
                         requires_new_conversation=False,
                     )
                 branch_state = _branch_read_state(document, request_message_id)
+                if branch_state in {"running", "terminal_without_result", "no_result"}:
+                    self._update_task(key, _completion_read_at=time.time())
                 authoritative_failure = _authoritative_image_failure(document, request_message_id)
                 if authoritative_failure:
                     raise AuthoritativeImageTaskFailure(authoritative_failure)
@@ -2037,17 +2383,79 @@ class ImageTaskService:
                         for record in extract_records(latest_document, request_message_id):
                             if record.get("file_ids") or record.get("sediment_ids"):
                                 return None
+                    # Only a qualified inactive snapshot can authorize an
+                    # absent edit continuation. A failed query cannot do so.
+                    proof = retry_cursor(latest_document, task, kind="image", predecessor=retry_predecessor)
+                    qualified = (not proof or proof.get("source") != "absent_image_thread_request"
+                                 or int(task.get("recovery_no_result_reads") or 0) + 1 >= UNRECOVERABLE_QUALIFIED_READS)
+                    self._update_task(key, _retry_cursor=proof,
+                        **({"_completion_read_at": time.time()} if proof and qualified else {}))
                     return False
 
                 try:
-                    file_ids, sediment_ids = backend._poll_image_results(
+                    strict_ids = None
+                    confirmed_final_parent = None
+                    extract_records = getattr(backend, "_extract_image_tool_records", None)
+                    if image_thread and callable(extract_records):
+                        records = extract_records(document, request_message_id)
+                        files = list(dict.fromkeys(x for record in records for x in record["file_ids"]))
+                        sediments = list(dict.fromkeys(x for record in records for x in record["sediment_ids"]))
+                        if ((files or sediments)
+                                and set(pending_ids.get("file_ids", [])) <= set(files)
+                                and set(pending_ids.get("sediment_ids", [])) <= set(sediments)):
+                            try:
+                                # Only this recovery's just-read original may
+                                # bypass another asset settle cycle.
+                                finished_parent(document, conversation_id, request_message_id,
+                                    expected_parent=expected_parent,
+                                    expected_result_ids=files + sediments,
+                                    predecessor_request_message_id=predecessor_message,
+                                    predecessor_result_ids=predecessor_ids)
+                            except ImageThreadError:
+                                pass
+                            else:
+                                from services.protocol.conversation import _observe_image_terminal
+                                _observe_image_terminal()
+                                strict_ids = (files, sediments)
+                                try:
+                                    confirmed_final_parent = finished_parent(document, conversation_id, request_message_id,
+                                        expected_parent=expected_parent, expected_result_ids=files + sediments,
+                                        predecessor_request_message_id=predecessor_message,
+                                        predecessor_result_ids=predecessor_ids, require_final=True)
+                                except ImageThreadError:
+                                    pass  # A tool leaf may still acquire later assets.
+                    if strict_ids is None and pending_ids and config.image_settle_enabled:
+                        # Query before sleeping so a strictly finished original
+                        # can proceed immediately. A fallback settle still needs
+                        # a NEW observation after the wait, never the pre-wait doc.
+                        settle_wait = min(max(0.0, float(config.image_settle_secs)),
+                                          max(0.0, float(extra_timeout_secs)))
+                        if settle_wait:
+                            time.sleep(settle_wait)
+                        extra_timeout_secs = max(0.0, float(extra_timeout_secs) - settle_wait)
+                        if extra_timeout_secs <= 0:
+                            raise ImagePollTimeoutError("原会话结果仍待稳定确认，保留原请求继续读取。", conversation_id)
+                        document = backend._get_conversation(conversation_id)
+                        self._update_task(key, _retry_cursor=retry_cursor(document, task, kind="image"))
+                        authoritative_failure = _authoritative_image_failure(document, request_message_id)
+                        if authoritative_failure:
+                            raise AuthoritativeImageTaskFailure(authoritative_failure)
+                    pending_options = (
+                        {"initial_file_ids": pending_ids.get("file_ids", []),
+                         "initial_sediment_ids": pending_ids.get("sediment_ids", []),
+                         "require_fresh_result_ids": True}
+                        if pending_ids else {}
+                    )
+                    file_ids, sediment_ids = strict_ids if strict_ids is not None else backend._poll_image_results(
                         conversation_id,
                         extra_timeout_secs,
                         request_message_id=request_message_id,
+                        initial_document=document,
+                        **pending_options,
                     )
                 except Exception as exc:
                     if (
-                        no_active_task
+                        not pending_ids and no_active_task
                         and branch_state in {"terminal_without_result", "unattributable", "no_result"}
                         and exc.__class__.__name__ == "ImagePollTimeoutError"
                     ):
@@ -2060,7 +2468,7 @@ class ImageTaskService:
                     raise
                 if not file_ids and not sediment_ids:
                     if (
-                        no_active_task
+                        not pending_ids and no_active_task
                         and branch_state in {"terminal_without_result", "unattributable", "no_result"}
                     ):
                         latest_requirement = latest_unrecoverable_requirement()
@@ -2077,24 +2485,25 @@ class ImageTaskService:
                     key,
                     result_file_ids=list(dict.fromkeys(file_ids)),
                     result_sediment_ids=list(dict.fromkeys(sediment_ids)),
+                    _pending_image_result_ids=None,
                     progress="receiving_image",
                     upstream_outcome="generated",
                     upstream_unfinished=False,
                     recovery_phase="download_image_result",
                 )
 
-                image_urls = backend.resolve_conversation_image_urls(
-                    conversation_id, file_ids, sediment_ids, poll=False,
-                    request_message_id=request_message_id,
-                )
-                if not image_urls:
-                    raise RuntimeError("图片 URL 解析失败")
-
-                image_items = [
-                    {"b64_json": __import__("base64").b64encode(image_data).decode("ascii")}
-                    for image_data in backend.download_image_bytes(image_urls)
-                ]
-                parent_message_id = recovered_parent(backend, file_ids, sediment_ids)
+                image_items = downloaded_items(backend, file_ids, sediment_ids)
+                failure_phase = "confirm_image_turn"
+                # A later external branch cannot invalidate a complete original
+                # result. Continue/archive still recheck the current cursor.
+                # Persisted IDs or cached bytes alone never supply this proof.
+                parent_message_id = (confirmed_final_parent
+                    if confirmed_final_parent and len(image_items) == len(set(file_ids + sediment_ids))
+                    else recovered_parent(backend, file_ids, sediment_ids))
+                if confirmed_final_parent and len(image_items) == len(set(file_ids + sediment_ids)):
+                    logger.info({"event": "image_complete_final_reused", "conversation_id": conversation_id,
+                                 "image_count": len(image_items)})
+            failure_phase = "save_image_result"
             data = format_image_result(
                 image_items,
                 "",  # prompt 已不重要，结果已经拿到了
@@ -2105,6 +2514,8 @@ class ImageTaskService:
             self._update_task(
                 key,
                 status=TASK_STATUS_SUCCESS,
+                _pending_image_result_ids=None,
+                _pending_image_output=None,
                 data=data,
                 error="",
                 error_code="",
@@ -2154,11 +2565,13 @@ class ImageTaskService:
             if isinstance(exc, ImageContentPolicyError):
                 error_code = "content_policy_violation"
             terminal = error_code in {"NO_IMAGE_GENERATED", "content_policy_violation"}
-            unrecoverable = qualified_reads >= UNRECOVERABLE_QUALIFIED_READS
+            # A captured image is a download obligation, even if earlier reads
+            # exhausted the no-result budget. Keep its retry/cooldown evidence.
+            unrecoverable = qualified_reads >= UNRECOVERABLE_QUALIFIED_READS and not result_captured
             recovery_phase = (
                 "download_image_result" if result_captured else "read_image_request"
             )
-            recovery_error_code = _recovery_failure_code(exc, recovery_phase)
+            recovery_error_code = _recovery_failure_code(exc, failure_phase, result_captured=result_captured)
             retry_after = _retry_after_seconds(exc)
             final_error_code = (
                 "RESULT_UNRECOVERABLE" if unrecoverable
@@ -2171,6 +2584,7 @@ class ImageTaskService:
                 status=TASK_STATUS_ERROR,
                 error=error_message,
                 error_code=final_error_code,
+                last_recovery_failure=_failure_details(exc, failure_phase),
                 binding_status=("unavailable" if unrecoverable and requires_new_conversation
                                 else "bound" if terminal or unrecoverable else "unknown"),
                 data=[],

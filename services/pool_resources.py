@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 
 from services.config import config
-from services.owned_accounts import chat_projection, observed_capacity
+from services.owned_accounts import chat_projection, observed_capacity, image_dispatch_capacity
 
 
 def resource_snapshot(accounts, image_tasks, codex) -> dict:
@@ -36,8 +36,10 @@ def resource_snapshot(accounts, image_tasks, codex) -> dict:
         process_inflight += live_count
         if (account.get("managed_disabled") or not accounts._is_image_account_available(account)):
             continue
+        slots = min(settings["image_account_concurrency"], image_dispatch_capacity(account))
+        if not slots:
+            continue
         eligible += 1
-        slots = min(settings["image_account_concurrency"], max(0, int(account.get("quota") or 0)))
         total_slots += slots
         # The legacy synchronous counter does not carry task IDs. It can
         # overlap a durable receipt. Report bounds, never sum as exact usage.

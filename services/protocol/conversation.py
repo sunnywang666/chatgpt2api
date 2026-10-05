@@ -4,11 +4,13 @@ from services.image_thread import finished_parent, ImageThreadError
 
 import base64
 import json
+import math
 import re
 import threading
 import time
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Iterator
 
 import tiktoken
@@ -17,6 +19,7 @@ from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import (
+    ImageActiveDeadlineExceeded,
     ImageContentPolicyError,
     ImagePollTimeoutError,
     OpenAIBackendAPI,
@@ -331,6 +334,7 @@ class ConversationRequest:
     parent_message_id: str = ""
     retain_conversation: bool = False
     upstream_model: str = ""
+    _defer_image_publication: bool = field(default=False, init=False, repr=False)
 
 
 @dataclass
@@ -361,6 +365,7 @@ class ImageOutput:
     provider_account_identity: str = ""
     parent_message_id: str = ""
     image_thread_terminal: bool = False
+    _pending_image_items: list[dict[str, Any]] = field(default_factory=list, repr=False)
 
     def to_chunk(self) -> dict[str, Any]:
         chunk: dict[str, Any] = {
@@ -449,6 +454,35 @@ def _record_result_ids(
     callback = getattr(request.progress_callback, "record_result_ids", None)
     if callable(callback) and (file_ids or sediment_ids):
         callback(list(dict.fromkeys(file_ids)), list(dict.fromkeys(sediment_ids)))
+
+
+def _validate_image_download_count(items, file_ids, sediment_ids):
+    # Distinct IDs in one namespace denote distinct immutable assets. Mixed
+    # namespaces may offer alternate addresses for the same image; do not infer
+    # their image count by adding the two lists.
+    if bool(file_ids) != bool(sediment_ids) and len(items) != len(set(file_ids or sediment_ids)):
+        raise ValueError("original image downloads are incomplete")
+
+
+def _downloaded_image_output(request, items, *, conversation_id, request_message_id,
+                             file_ids, sediment_ids, index, total):
+    output = ImageOutput(kind="result", model=request.model, index=index, total=total,
+                         conversation_id=conversation_id)
+    if request._defer_image_publication:
+        callback = getattr(request.progress_callback, "record_downloaded_image_items", None)
+        if callable(callback):
+            callback({"conversation_id": conversation_id, "request_message_id": request_message_id,
+                      "file_ids": list(dict.fromkeys(file_ids)),
+                      "sediment_ids": list(dict.fromkeys(sediment_ids))}, items)
+        _validate_image_download_count(items, file_ids, sediment_ids)
+        # Bound generation collects this internally and verifies the exact turn
+        # before formatting it. Neither to_chunk nor collection exposes this field.
+        output._pending_image_items = items
+    else:
+        _validate_image_download_count(items, file_ids, sediment_ids)
+        output.data = format_image_result(items, request.prompt, request.response_format,
+                                          request.base_url, output.created)["data"]
+    return output
 
 
 def _start_active_attempt(request: ConversationRequest) -> None:
@@ -777,7 +811,12 @@ def conversation_events(
         conversation_id=conversation_id,
         parent_message_id=parent_message_id,
     )
-    yield from iter_conversation_payloads(payloads, history_text, history_messages)
+    try:
+        yield from iter_conversation_payloads(payloads, history_text, history_messages)
+    finally:
+        close = getattr(payloads, "close", None)
+        if callable(close):
+            close()
 
 
 def text_backend(model: str = "auto") -> OpenAIBackendAPI:
@@ -792,6 +831,7 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
+    emitted_text = ""
     while True:
         if token and token in attempted_tokens:
             raise RuntimeError("no available text account")
@@ -802,7 +842,6 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             active_backend = OpenAIBackendAPI(access_token=token)
             if recoverable:
                 active_backend.retain_bound_conversation = True
-            done = False
             for event in conversation_events(
                 active_backend,
                 messages=request.messages,
@@ -817,20 +856,43 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                         if receipt.get("conversation_id"):
                             raise RuntimeError("original conversation identity changed")
                         context.admission.update_claim(context, conversation_id=conversation_id)
-                    if event.get("type") == "conversation.done":
-                        done = True
-                        context.terminal(True)
                 if event.get("type") != "conversation.delta":
                     continue
                 delta = str(event.get("delta") or "")
                 if delta:
                     emitted = True
+                    emitted_text += delta
                     yield delta
-            if recoverable and not done:
-                # A transport EOF cannot authorize the formatter's final event.
-                from services.conversation_binding_service import ConversationBindingError
-                raise ConversationBindingError("original stream ended without its terminal event",
-                                               code="CONVERSATION_OUTCOME_UNKNOWN")
+            if recoverable:
+                # [DONE] and EOF describe the transport, not our model turn.
+                # Verify the exact persisted user branch before emitting a
+                # successful wire terminator or releasing its account turn.
+                from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
+                receipt = context.receipt()
+                try:
+                    if not receipt.get("conversation_id") or not receipt.get("request_message_id"):
+                        raise ValueError("original cursor is unavailable")
+                    recovered = ConversationBindingService._read_text_request_result(active_backend, receipt)
+                except Exception as exc:
+                    raise ConversationBindingError("original stream result could not be verified",
+                                                   code="CONVERSATION_OUTCOME_UNKNOWN") from exc
+                if recovered.get("status") != "succeeded":
+                    raise ConversationBindingError("original stream result is not complete",
+                                                   code="CONVERSATION_OUTCOME_UNKNOWN")
+                context.terminal(True)
+                final_text = sanitize_output_text(recovered["content"])
+                # The saved-result reader strips outer whitespace. Preserve
+                # whitespace already delivered without treating it as drift.
+                delivered = emitted_text.lstrip()
+                if final_text == delivered.rstrip():
+                    remaining = ""
+                elif final_text.startswith(delivered):
+                    remaining = final_text[len(delivered):]
+                else:
+                    raise ConversationBindingError("original stream prefix does not match its saved result",
+                                                   code="CONVERSATION_OUTCOME_UNKNOWN")
+                if remaining:
+                    yield remaining
             account_service.mark_text_used(token)
             return
         except Exception as exc:
@@ -935,6 +997,66 @@ def _remove_image_conversation_later(
     threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 
 
+def _observe_image_terminal():
+    """Record a verified single-send turn without releasing its work or slot."""
+    from services.request_context import current_request
+    context = current_request.get()
+    if context is None:
+        return
+    try:
+        receipt = context.receipt()
+        # A first image/turn must not terminate a multi-send task in telemetry.
+        # Retried generations retain their history; don't present its first
+        # turn's timestamp as the completion of a later send either.
+        if (int(receipt.get("_expected_sends") or 1) != 1
+                or int(receipt.get("_send_sequence") or 1) != 1):
+            return
+        if any(e.get("stage") == "upstream_terminal" and e.get("known") is True
+               for e in receipt.get("_execution_timeline", [])):
+            return
+        # terminal(True) changes admission occupancy. This is timing evidence
+        # only: downloading, publishing and work completion retain their gates.
+        context.record_stage("upstream_terminal", known=True)
+    except Exception:
+        pass  # Missing diagnostics must not retry or discard the original.
+
+
+def _stream_image_terminal_result(backend, event, request_message_id, file_ids, sediment_ids, expected_parent=""):
+    """One signal-triggered read; a tool leaf cannot close an open image stream."""
+    from services.request_context import AdmissionLost
+    from services.account_request_pacing import AccountRequestDeadlineExceeded
+    check = getattr(backend, "image_poll_terminal_check", None)
+    conversation_id = str(event.get("conversation_id") or "")
+    if not conversation_id or not request_message_id or not (file_ids or sediment_ids):
+        return False
+    try:
+        document = backend._get_conversation(conversation_id)
+        current = (document.get("mapping", {}).get(document.get("current_node")) or {}).get("message") or {}
+        if (current.get("author", {}).get("role") != "assistant"
+                or current.get("status") != "finished_successfully"
+                or current.get("end_turn") is not True or current.get("channel") not in (None, "final")):
+            return False
+        records = backend._extract_image_tool_records(document, request_message_id)
+        if ({x for record in records for x in record["file_ids"]} != set(file_ids)
+                or {x for record in records for x in record["sediment_ids"]} != set(sediment_ids)):
+            return False
+        if callable(check):
+            if check(document, conversation_id, request_message_id, file_ids, sediment_ids) is not True:
+                return False
+        else:
+            finished_parent(document, conversation_id, request_message_id,
+                            expected_parent=expected_parent or None, expected_result_ids=file_ids+sediment_ids)
+        _observe_image_terminal()
+        return True
+    except (AdmissionLost, AccountRequestDeadlineExceeded, ImageActiveDeadlineExceeded):
+        raise
+    except Exception:
+        # The paced transport has already persisted any 429 cooldown. Continue
+        # this original stream/recovery; never submit another generation here.
+        logger.info({"event": "image_stream_result_check_deferred", "conversation_id": conversation_id})
+        return False
+
+
 def stream_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -948,7 +1070,10 @@ def stream_image_outputs(
         backend.image_request_message_id = request_message_id
     record_conversation_id = getattr(request.progress_callback, "record_conversation_id", None)
     last: dict[str, Any] = {}
-    for event in conversation_events(
+    recorded_result_ids = ([], [])
+    checked_signals = set()
+    stream_result_confirmed = False
+    events = conversation_events(
             backend,
             prompt=request.prompt,
             model=request.model,
@@ -957,34 +1082,57 @@ def stream_image_outputs(
             quality=request.quality,
             conversation_id=request.conversation_id,
             parent_message_id=request.parent_message_id,
-    ):
-        last = event
-        event_conversation_id = str(event.get("conversation_id") or "")
-        if event_conversation_id and callable(record_conversation_id):
-            record_conversation_id(event_conversation_id)
-        if event.get("type") == "conversation.delta":
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                text=str(event.get("delta") or ""),
-                upstream_event_type="conversation.delta",
-                conversation_id=str(event.get("conversation_id") or ""),
-            )
-            continue
-        if event.get("type") == "conversation.event":
-            raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
-            yield ImageOutput(
-                kind="progress",
-                model=request.model,
-                index=index,
-                total=total,
-                upstream_event_type=raw_type,
-                conversation_id=str(event.get("conversation_id") or ""),
-            )
-
+    )
+    with closing(events):
+        for event in events:
+            last = event
+            event_conversation_id = str(event.get("conversation_id") or "")
+            if event_conversation_id and callable(record_conversation_id):
+                record_conversation_id(event_conversation_id)
+            result_ids = (list(event.get("file_ids") or []), list(event.get("sediment_ids") or []))
+            if result_ids != recorded_result_ids:
+                # These IDs have already passed the image-tool output filter.
+                # Persist before another stream read or URL lookup can fail/wait.
+                _record_result_ids(request, *result_ids)
+                recorded_result_ids = result_ids
+            raw = event.get("raw") or {}
+            value = raw.get("v") if isinstance(raw, dict) else None
+            message = (raw.get("message") or (value.get("message") if isinstance(value, dict) else None)) if isinstance(raw, dict) else None
+            terminal_signal = (isinstance(message, dict) and message.get("end_turn") is True
+                               and message.get("status") == "finished_successfully"
+                               and (message.get("author") or {}).get("role") == "assistant")
+            signal = (tuple(result_ids[0]), tuple(result_ids[1]),
+                      str(message.get("id") or "final") if terminal_signal else "assets")
+            if (result_ids[0] or result_ids[1]) and signal not in checked_signals:
+                checked_signals.add(signal)
+                original_message_id = str(getattr(backend, "image_request_message_id", "") or request_message_id)
+                if _stream_image_terminal_result(backend, event, original_message_id, *result_ids,
+                                                 expected_parent=request.parent_message_id):
+                    stream_result_confirmed = True
+                    logger.info({"event": "image_stream_result_confirmed", "conversation_id": event_conversation_id})
+                    break
+            if event.get("type") == "conversation.delta":
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    text=str(event.get("delta") or ""),
+                    upstream_event_type="conversation.delta",
+                    conversation_id=str(event.get("conversation_id") or ""),
+                )
+                continue
+            if event.get("type") == "conversation.event":
+                raw = event.get("raw")
+                raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+                yield ImageOutput(
+                    kind="progress",
+                    model=request.model,
+                    index=index,
+                    total=total,
+                    upstream_event_type=raw_type,
+                    conversation_id=str(event.get("conversation_id") or ""),
+                )
     submitted_request_message_id = str(
         getattr(backend, "image_request_message_id", "") or "",
     ).strip()
@@ -1008,7 +1156,7 @@ def stream_image_outputs(
         request.progress_callback("image_stream_resolve_start")
     if message and not file_ids and not sediment_ids and last.get("blocked"):
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
-        detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
+        detailed_error = _get_detailed_error_from_tasks(backend, conversation_id, wait_secs=0)
         error_text = detailed_error or message or "Image generation was rejected by upstream policy."
         raise ImageContentPolicyError(error_text, conversation_id)
     should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
@@ -1027,29 +1175,8 @@ def stream_image_outputs(
             "message_preview": message[:200],
         })
 
-    # 在轮询图片之前，先检查 /backend-api/tasks/ 是否有 moderation 拦截
-    # 这样可以避免不必要的长时间轮询超时
-    # 注意：当 should_poll_for_image 为 True 或检测到文本回复时，
-    # 即使 tasks 报告了"错误"，也不能直接返回——因为上游可能将工具调用的 JSON 参数
-    # （如 {"size":"1792x1024","n":1}）标记为 is_error，而实际上图片正在异步生成中。
-    # 此时应继续轮询图片。
-    detailed_error = ""
-    if not file_ids and not sediment_ids and conversation_id:
-        detailed_error = _get_detailed_error_from_tasks(backend, conversation_id, timeout_secs=5.0, wait_secs=1.0)
-        if detailed_error and not should_poll_for_image and not is_text_reply:
-            logger.info({
-                "event": "image_task_error_before_poll",
-                "conversation_id": conversation_id,
-                "error": detailed_error,
-            })
-            yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=detailed_error, conversation_id=conversation_id)
-            return
-        if detailed_error and (should_poll_for_image or is_text_reply):
-            logger.info({
-                "event": "image_task_error_skipped_for_poll",
-                "conversation_id": conversation_id,
-                "error": detailed_error,
-            })
+    # Read the original conversation first. The poller diagnoses task errors
+    # only when that authoritative read has no result assets.
 
     # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
     # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
@@ -1070,8 +1197,11 @@ def stream_image_outputs(
         image_urls = backend.resolve_conversation_image_urls(
             conversation_id, file_ids, sediment_ids, poll_timeout_secs=poll_timeout,
             request_message_id=request_message_id,
+            **({"poll": False} if stream_result_confirmed else {}),
         )
     except (ImageContentPolicyError, ImagePollTimeoutError) as exc:
+        if stream_result_confirmed:
+            raise
         # 当检测到文本回复时，task error 不应直接判定为内容策略违规，
         # 因为图片可能仍在后台异步生成中
         if is_text_reply and isinstance(exc, ImageContentPolicyError):
@@ -1084,6 +1214,8 @@ def stream_image_outputs(
         else:
             raise
     except Exception as exc:
+        if stream_result_confirmed:
+            raise
         # 当检测到文本回复时，首次轮询的临时网络错误不应直接中断，
         # 因为图片可能仍在后台异步生成中，后续 retry poll 会继续尝试。
         if is_text_reply and conversation_id:
@@ -1104,16 +1236,18 @@ def stream_image_outputs(
             {"b64_json": base64.b64encode(image_data).decode("ascii")}
             for image_data in backend.download_image_bytes(image_urls)
         ]
-        data = format_image_result(
-            image_items,
-            request.prompt,
-            request.response_format,
-            request.base_url,
-            int(time.time()),
-        )["data"]
-        if data:
-            yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+        output = _downloaded_image_output(request, image_items,
+            conversation_id=conversation_id, request_message_id=request_message_id,
+            file_ids=file_ids, sediment_ids=sediment_ids, index=index, total=total)
+        if output.data or output._pending_image_items:
+            yield output
         return
+
+    if stream_result_confirmed:
+        # The exact original turn already ended with these durable asset IDs.
+        # Missing download URLs are a retrieval failure, not another generation
+        # wait or a text-only answer. The task resumes its original assets.
+        raise RuntimeError("generated image download URLs are not available")
 
     if message:
         # 检测模型是否返回了文本描述（含 referenced_image_ids）而非实际生成图片
@@ -1171,15 +1305,11 @@ def stream_image_outputs(
                         {"b64_json": base64.b64encode(image_data).decode("ascii")}
                         for image_data in backend.download_image_bytes(image_urls)
                     ]
-                    data = format_image_result(
-                        image_items,
-                        request.prompt,
-                        request.response_format,
-                        request.base_url,
-                        int(time.time()),
-                    )["data"]
-                    if data:
-                        yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+                    output = _downloaded_image_output(request, image_items,
+                        conversation_id=conversation_id, request_message_id=request_message_id,
+                        file_ids=file_ids, sediment_ids=sediment_ids, index=index, total=total)
+                    if output.data or output._pending_image_items:
+                        yield output
                         return
             if active_budget_configured:
                 raise ImagePollTimeoutError(
@@ -1262,15 +1392,11 @@ def stream_image_outputs(
                     {"b64_json": base64.b64encode(image_data).decode("ascii")}
                     for image_data in backend.download_image_bytes(image_urls)
                 ]
-                data = format_image_result(
-                    image_items,
-                    request.prompt,
-                    request.response_format,
-                    request.base_url,
-                    int(time.time()),
-                )["data"]
-                if data:
-                    yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
+                output = _downloaded_image_output(request, image_items,
+                    conversation_id=conversation_id, request_message_id=request_message_id,
+                    file_ids=file_ids, sediment_ids=sediment_ids, index=index, total=total)
+                if output.data or output._pending_image_items:
+                    yield output
                     return
         
         if active_budget_configured:
@@ -1380,6 +1506,8 @@ def _generate_bound_single_image(
     token = ""
     binding_id = request.provider_binding_id
     account_identity = request.provider_account_identity
+    from services.request_context import current_request
+    pool_managed = bool(binding_id) and current_request.get() is not None
     try:
         if binding_id:
             authoritative_identity = account_service.get_bound_account_identity(binding_id)
@@ -1395,6 +1523,7 @@ def _generate_bound_single_image(
             token = account_service.acquire_bound_image_access_token(
                 binding_id,
                 image_model=request.model,
+                **({"reserve_slot": False} if pool_managed else {}),
             )
         else:
             binding_id, account_identity, token = account_service.create_conversation_binding(
@@ -1414,9 +1543,14 @@ def _generate_bound_single_image(
         # This block ends before any backend/stream is created. Preserve that
         # positive evidence; the same error code elsewhere can be uncertain.
         error.upstream_submitted = False
+        error.binding_reason = getattr(exc, "binding_reason", None) or {
+            "conversation binding unavailable: binding id is required": "binding_id_required",
+            "conversation binding unavailable: bound account missing": "bound_account_missing",
+            "conversation binding unavailable: bound account cannot generate images": "bound_image_capability_unavailable",
+        }.get(str(exc))
         raise error from exc
 
-    slot_acquired = bool(token)
+    slot_acquired = bool(token) and not pool_managed
     image_result_marked = False
     account_email = ""
     backend: OpenAIBackendAPI | None = None
@@ -1437,8 +1571,31 @@ def _generate_bound_single_image(
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             thread = getattr(request.progress_callback, "image_thread", None)
+            failed_original = getattr(request.progress_callback, "failed_retry_original", None)
             try:
-                if thread and request.conversation_id:
+                if failed_original or getattr(request.progress_callback, "failed_retry_required", False):
+                    def check_retry(send=None):
+                        from services.generation_completion import retry_cursor, retry_evidence
+                        if (not isinstance(failed_original, dict) or failed_original.get("result_file_ids")
+                                or failed_original.get("result_sediment_ids") or failed_original.get("data")
+                                or failed_original.get("recovery_phase") == "download_image_result"):
+                            raise ImageGenerationError("original retry evidence unavailable",
+                                code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED", upstream_submitted=False)
+                        try:
+                            document = backend._get_conversation(request.conversation_id, **({"_send": send} if send else {}))
+                        except Exception as exc:
+                            raise ImageGenerationError("original retry branch read unavailable",
+                                code="COMPLETION_ORIGINAL_READ_UNAVAILABLE", upstream_submitted=False) from exc
+                        current = retry_cursor(document, failed_original, kind="image",
+                            predecessor=getattr(request.progress_callback, "failed_retry_predecessor", None))
+                        saved = retry_evidence(failed_original)
+                        if not current or not saved or any(current.get(k) != saved.get(k) for k in (
+                                "conversation_id", "request_message_id", "retry_parent_message_id", "source")):
+                            raise ImageGenerationError("original retry branch changed",
+                                code="COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED", upstream_submitted=False)
+                    check_retry()
+                    backend.image_pre_send_check = check_retry
+                elif thread and request.conversation_id:
                     try:
                         prior_message = getattr(request.progress_callback, "image_thread_predecessor_message", None)
                         document = backend._get_conversation(request.conversation_id)
@@ -1455,6 +1612,37 @@ def _generate_bound_single_image(
                     except Exception as exc:
                         raise ImageGenerationError("Original image conversation cannot yet be continued",
                             code=getattr(exc, "code", "IMAGE_THREAD_PREVIOUS_UNCONFIRMED"), upstream_submitted=False) from exc
+                request = replace(request)
+                request._defer_image_publication = True
+                confirmed_result = None
+                if thread:
+                    def poll_terminal(document, conversation_id, request_message_id, files, sediments):
+                        nonlocal confirmed_result
+                        confirmed_result = None
+                        try:
+                            checks = dict(expected_parent=request.parent_message_id or None,
+                                expected_result_ids=files + sediments,
+                                predecessor_request_message_id=getattr(request.progress_callback,
+                                    "image_thread_predecessor_message", None),
+                                predecessor_result_ids=getattr(request.progress_callback,
+                                    "image_thread_predecessor_result_ids", None))
+                            try:
+                                parent = finished_parent(document, conversation_id, request_message_id,
+                                    require_final=True, **checks)
+                            except ImageThreadError:
+                                finished_parent(document, conversation_id, request_message_id, **checks)
+                            else:
+                                # Call-local proof for these immutable original
+                                # assets; never restore it from telemetry/cache.
+                                confirmed_result = (conversation_id, request_message_id,
+                                                    frozenset(files + sediments), parent)
+                            _observe_image_terminal()
+                            return True
+                        except ImageThreadError:
+                            return False
+                    # Tool leaves still need the post-download fence. A complete
+                    # assistant final can already prove this original result.
+                    backend.image_poll_terminal_check = poll_terminal
                 for output in stream_image_outputs(backend, request, index, total):
                     last_conversation_id = output.conversation_id or last_conversation_id
                     output.account_email = output.account_email or account_email
@@ -1491,29 +1679,51 @@ def _generate_bound_single_image(
                         conversation_id=last_conversation_id,
                     )
                 if thread:
-                    next_parent_message_id = finished_parent(backend._get_conversation(last_conversation_id),
-                        last_conversation_id, str(getattr(backend, "image_request_message_id", "")),
-                        expected_parent=request.parent_message_id or None,
-                        expected_result_ids=getattr(request.progress_callback, "image_thread_result_ids", None))
+                    original_message = str(getattr(backend, "image_request_message_id", ""))
+                    result_ids = frozenset(getattr(request.progress_callback, "image_thread_result_ids", None) or [])
+                    downloaded_count = sum(len(output._pending_image_items) for output in outputs if output.kind == "result")
+                    if (confirmed_result and confirmed_result[:3] == (last_conversation_id, original_message, result_ids)
+                            and downloaded_count == len(result_ids)):
+                        next_parent_message_id = confirmed_result[3]
+                        logger.info({"event": "image_complete_final_reused", "conversation_id": last_conversation_id,
+                                     "image_count": downloaded_count})
+                    else:
+                        next_parent_message_id = finished_parent(backend._get_conversation(last_conversation_id),
+                            last_conversation_id, original_message,
+                            expected_parent=request.parent_message_id or None,
+                            expected_result_ids=result_ids,
+                            predecessor_request_message_id=getattr(request.progress_callback, "image_thread_predecessor_message", None),
+                            predecessor_result_ids=getattr(request.progress_callback, "image_thread_predecessor_result_ids", None))
+                    _observe_image_terminal()
                 else:
                     next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
                 for output in outputs:
+                    if output._pending_image_items:
+                        output.data = format_image_result(output._pending_image_items, request.prompt,
+                            request.response_format, request.base_url, output.created)["data"]
+                        output._pending_image_items = []
                     output.provider_binding_id = binding_id
                     output.provider_account_identity = account_identity
                     output.conversation_id = last_conversation_id
                     output.parent_message_id = next_parent_message_id
                     output.image_thread_terminal = bool(thread)
                 image_result_marked = True
-                account_service.mark_image_result(token, True)
+                account_service.mark_image_result(token, True, **({"release_slot": False} if pool_managed else {}))
                 return outputs
             except Exception as exc:
-                if not image_result_marked:
+                from services.request_context import AdmissionLost
+                upstream_submitted = getattr(backend, "image_submission_started", None)
+                # A local guard rejection before the generation POST consumes
+                # no image capacity. Do not invalidate a fresh observation or
+                # count it as an upstream image failure. Unknown/submitted
+                # attempts retain the existing accounting and recovery path.
+                unsent_guard_rejection = isinstance(exc, AdmissionLost) and upstream_submitted is False
+                if not image_result_marked and not unsent_guard_rejection:
                     image_result_marked = True
-                    account_service.mark_image_result(token, False)
+                    account_service.mark_image_result(token, False, **({"release_slot": False} if pool_managed else {}))
                 conversation_id = str(getattr(exc, "conversation_id", "") or last_conversation_id)
                 parent_message_id = str(getattr(exc, "parent_message_id", "") or "")
                 request_message_id = str(getattr(backend, "image_request_message_id", "") or "")
-                upstream_submitted = getattr(backend, "image_submission_started", None)
                 if not thread and conversation_id and backend is not None and not parent_message_id:
                     try:
                         parent_message_id = backend.get_conversation_parent_message_id(conversation_id)
@@ -1563,6 +1773,13 @@ def _generate_bound_single_image(
                         upstream_submitted if isinstance(upstream_submitted, bool) else None
                     ),
                 )
+                upstream_status = getattr(exc, "status_code", None)
+                if type(upstream_status) is int and 400 <= upstream_status <= 599:
+                    error.status_code = upstream_status
+                retry_after = getattr(exc, "retry_after", None)
+                if (type(retry_after) in (int, float) and math.isfinite(retry_after)
+                        and retry_after >= 0):
+                    error.retry_after = retry_after
                 raise error from exc
     finally:
         try:
@@ -1680,7 +1897,7 @@ def _generate_single_image(
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
-            if not emitted_for_token:
+            if not emitted_for_token and getattr(backend, "image_submission_started", None) is not True:
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
                     logger.warning({
@@ -1724,7 +1941,8 @@ def _generate_single_image(
                 exc.account_email = account_email
             error_text = str(exc)
             # 如果是模型返回文本而非图片，尝试换账号重试
-            if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+            if (is_model_text_reply_instead_of_image(error_text) and not emitted_for_token
+                    and getattr(backend, "image_submission_started", None) is not True):
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
                     logger.warning({
@@ -1770,6 +1988,13 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            if getattr(backend, "image_submission_started", None) is True:
+                # No yielded chunk is not proof that no generation was sent.
+                # In particular, a confirmed asset's URL failure must never
+                # re-enter generation or switch the selected account.
+                raise ImageGenerationError(image_stream_error_message(last_error),
+                    account_email=account_email, conversation_id=last_conversation_id,
+                    upstream_submitted=True) from exc
             if not emitted_for_token and is_token_invalid_error(last_error):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:

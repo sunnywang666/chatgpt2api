@@ -66,10 +66,10 @@ def test_official_callback_matches_each_existing_row_and_preserves_other_route(t
     incoming = material(index, marker="fresh")
     http = FakeHttp([FakeResponse(200, incoming)])
     service = ChatLoginService(tmp_path / "sessions.json", accounts, http.factory)
-    started = service.start(OWNER, "owned", "import", str(uuid.uuid4()))
+    started = service.start(OWNER, "pool", "import", str(uuid.uuid4()))
     with patch.object(accounts, "_verified_chat_info", return_value=observation(index)) as protected_read, \
             patch.object(accounts, "_request_access_token_refresh", side_effect=AssertionError("no second exchange")):
-        result = service.submit_callback(OWNER, "owned", started["id"], callback_for(started))
+        result = service.submit_callback(OWNER, "pool", started["id"], callback_for(started))
     assert result["state"] == "succeeded"
     assert result["import_status"] == "updated"
     assert result["account_ref"] == refs[index]
@@ -92,7 +92,7 @@ def test_official_callback_matches_each_existing_row_and_preserves_other_route(t
     restarted = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
     receipt = restarted.chat_login_committed_receipt(incoming)
     assert receipt["authorization_ref"] == refs[index]
-    assert service.get(OWNER, "owned", started["id"])["state"] == "succeeded"
+    assert service.get(OWNER, "pool", started["id"])["state"] == "succeeded"
     assert len(http.calls) == 1
     assert "pending_credentials" not in (tmp_path / "sessions.json").read_text()
 
@@ -207,3 +207,36 @@ def test_untrusted_id_token_cannot_attach_an_opaque_bearer_to_another_codex_user
                 "id_token": token("auth0|person-0", "user-attacker", identity[1]),
             })
     assert accounts.storage.file_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("explicit_target", [True, False])
+@pytest.mark.parametrize("success", [True, False])
+def test_reauthorization_keeps_capacity_used_during_its_observation(tmp_path, explicit_target, success):
+    accounts = pool(tmp_path)
+    previous = next(row for row in accounts.list_accounts() if row["managed_account_id"] == "original-row-2")
+    old_token = previous["access_token"]
+    accounts.update_account(old_token, {
+        "quota": 1, "status": "正常", "capacity_used_since_observation": False,
+        "limits_progress": [{"feature_name": "image_gen", "remaining": 1}],
+    }, quiet=True)
+    ref = accounts.pool_account_ref(previous)
+    incoming = material(2, marker="fresh")
+    identity, info = observation(2)
+    def read(_token):
+        accounts.mark_image_result(old_token, success)
+        return identity, info
+    with patch.object(accounts, "_verified_chat_info", side_effect=read) as verify:
+        receipt = accounts._import_verified_chat_account(
+            OWNER, incoming, "oauth_login", ref if explicit_target else None, verified_oauth=True,
+        )
+    verify.assert_called_once_with(incoming["access_token"])
+    saved = AccountService(JSONStorageBackend(tmp_path / "accounts.json")).get_account(incoming["access_token"])
+    assert receipt["import_status"] == "updated"
+    assert receipt["authorization_ref"] == ref
+    assert saved["capacity_used_since_observation"] is True
+    assert saved["quota"] == (0 if success else 1)
+    assert saved["status"] == ("限流" if success else "正常")
+    assert (saved["success"], saved["fail"]) == ((1, 0) if success else (0, 1))
+    assert saved["codex_credentials"] == previous["codex_credentials"]
+    assert saved["task_receipts"] == previous["task_receipts"]
+    assert saved["conversation_binding_ids"] == previous["conversation_binding_ids"]

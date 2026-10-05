@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from api.recovery_control import RecoveryControlRequest, update_recovery_control
+
+from typing import Literal
+
 from services.request_context import trusted_source
 from services.image_thread import ImageThreadError
 
@@ -8,7 +12,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
 from api.external_images import client_task, task_image_bytes, validate_external_input, is_external
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
@@ -16,6 +20,7 @@ from api.key_policy import require_image_policy
 from services.content_filter import check_request
 from services.image_task_service import image_task_service
 from services.log_service import LoggedCall
+from services.work_lifecycle import WorkLifecycleError, get_work_lifecycle_service
 
 
 class ImageGenerationTaskRequest(BaseModel):
@@ -25,6 +30,8 @@ class ImageGenerationTaskRequest(BaseModel):
     n: int = Field(default=1, ge=1, le=4)
     size: str | None = None
     quality: str = "auto"
+    account_ref: str | None = Field(default=None, strict=True, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+    scheduling: object | None = None
     provider_binding_id: str = ""
     provider_account_identity: str = ""
     client_conversation_id: str = ""
@@ -36,6 +43,20 @@ class ImageGenerationTaskRequest(BaseModel):
     edit_source_task_id: str = ""
     edit_source_index: int = Field(default=0, ge=0, le=15)
 
+    @field_validator("account_ref", mode="before")
+    @classmethod
+    def reject_null_account_ref(cls, value):
+        if value is None:
+            raise ValueError("account_ref must be omitted or an advertised account reference")
+        return value
+
+    @field_validator("scheduling", mode="before")
+    @classmethod
+    def reject_null_scheduling(cls, value):
+        if value is None:
+            raise ValueError("scheduling must be omitted or an object")
+        return value
+
 
 class ResumePollRequest(BaseModel):
     extra_timeout_secs: float = Field(default=30.0, ge=5.0, le=120.0)
@@ -44,6 +65,21 @@ class ResumePollRequest(BaseModel):
 
 class ArchiveImageThreadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class WorkLifecycleUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["active", "paused", "completed"]
+    results_saved: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def completed_requires_saved_results(self):
+        if self.state == "completed" and self.results_saved is not True:
+            raise ValueError("results_saved=true is required when state is completed")
+        if self.state != "completed" and self.results_saved:
+            raise ValueError("results_saved applies only when state is completed")
+        return self
 
 
 class AdoptLatestConversationImageRequest(BaseModel):
@@ -79,6 +115,18 @@ async def filter_or_log(call: LoggedCall, text: str) -> None:
 
 def create_router() -> APIRouter:
     router = APIRouter()
+    from api.generation_completion import create_router as completion_router
+    router.include_router(completion_router("image"))
+    from api.task_events import create_router as events_router
+    router.include_router(events_router("image", lambda: image_task_service))
+
+    async def require_work_policy(identity: dict[str, object], task_id: str) -> dict[str, object]:
+        result = await run_in_threadpool(image_task_service.list_tasks, identity, [task_id])
+        if result.get("missing_ids"):
+            raise HTTPException(404, detail={"code": "IMAGE_TASK_NOT_FOUND"})
+        item = (result.get("items") or [{}])[0]
+        require_image_policy(identity, item.get("model"))
+        return item
 
     @router.get("/api/image-tasks")
     async def list_image_tasks(
@@ -103,6 +151,13 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization, request=request)
         validate_external_input(request, body.model_dump())
+        try:
+            from services.workflow_scheduling import normalize_scheduling
+            scheduling = normalize_scheduling(body.scheduling)
+        except ValueError as exc:
+            if str(exc).startswith("SCHEDULING_INVALID"):
+                raise HTTPException(400, detail={"code": "SCHEDULING_INVALID"}) from None
+            raise
         require_image_policy(identity, body.model)
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/generations", body.model, "文生图任务", request_text=body.prompt), body.prompt)
         try:
@@ -114,6 +169,8 @@ def create_router() -> APIRouter:
                 model=body.model,
                 size=body.size,
                 quality=body.quality,
+                **({"account_ref": body.account_ref} if body.account_ref is not None else {}),
+                **({"scheduling": scheduling} if scheduling is not None else {}),
                 base_url=resolve_image_base_url(request),
                 provider_binding_id=body.provider_binding_id,
                 provider_account_identity=body.provider_account_identity,
@@ -129,7 +186,11 @@ def create_router() -> APIRouter:
             return client_task(result, request)
         except ImageThreadError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except ValueError as exc:
+            if str(exc) == "SCHEDULING_UNAVAILABLE":
+                raise HTTPException(status_code=503, detail={"code": "SCHEDULING_UNAVAILABLE"}) from None
             status = 409 if "different immutable request" in str(exc) else 400
             raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
 
@@ -159,6 +220,8 @@ def create_router() -> APIRouter:
                 model=model,
                 size=payload["size"],
                 quality=payload["quality"],
+                **({"account_ref": payload["account_ref"]} if "account_ref" in payload else {}),
+                **({"scheduling": payload["scheduling"]} if "scheduling" in payload else {}),
                 base_url=resolve_image_base_url(request),
                 images=images,
                 masks=masks,
@@ -176,9 +239,21 @@ def create_router() -> APIRouter:
             return client_task(result, request)
         except ImageThreadError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except ValueError as exc:
+            if str(exc) == "SCHEDULING_UNAVAILABLE":
+                raise HTTPException(status_code=503, detail={"code": "SCHEDULING_UNAVAILABLE"}) from None
             status = 409 if "different immutable request" in str(exc) else 400
             raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-tasks/{task_id}/recovery-control")
+    async def control_image_recovery(task_id: str, body: RecoveryControlRequest, request: Request,
+                                     response: Response, authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization, request=request)
+        response.headers["Cache-Control"] = "private, no-store"
+        return await update_recovery_control(image_task_service, "image", str(identity.get("id") or "anonymous"),
+                                             task_id, body)
 
     @router.post("/api/image-tasks/{task_id}/resume-poll")
     async def resume_image_poll(
@@ -208,12 +283,61 @@ def create_router() -> APIRouter:
             status = 409 if "different immutable request" in str(exc) else 400
             raise HTTPException(status_code=status, detail={"error": str(exc)}) from exc
 
+    @router.get("/api/image-tasks/{task_id}/work")
+    async def read_image_work(
+        task_id: str,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization, request=request)
+        await require_work_policy(identity, task_id)
+        try:
+            return await run_in_threadpool(
+                get_work_lifecycle_service().get, "image", identity, task_id,
+            )
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+
+    @router.post("/api/image-tasks/{task_id}/work")
+    async def update_image_work(
+        task_id: str,
+        body: WorkLifecycleUpdateRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization, request=request)
+        await require_work_policy(identity, task_id)
+        try:
+            return await run_in_threadpool(
+                get_work_lifecycle_service().update,
+                "image", identity, task_id, body.state, body.results_saved,
+            )
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+
     @router.post("/api/image-tasks/{task_id}/archive-thread")
     async def archive_image_thread(task_id: str, body: ArchiveImageThreadRequest, request: Request,
                                    authorization: str | None = Header(default=None)):
         identity = require_identity(authorization, request=request)
         try:
+            if image_task_service.admission is not None:
+                item = await require_work_policy(identity, task_id)
+                try:
+                    return await run_in_threadpool(
+                        get_work_lifecycle_service().set_archived, "image", identity, task_id, True,
+                    )
+                except WorkLifecycleError as exc:
+                    # Isolated legacy image services can carry a local test
+                    # admission without the configured shared durable service.
+                    # Their old archive path remains valid; real configured
+                    # admission propagates every lifecycle outcome exactly.
+                    if exc.code != "WORK_REQUIRES_DURABLE_ADMISSION" or item.get("scheduling") is not None:
+                        raise
             return await run_in_threadpool(image_task_service.archive_thread, identity, task_id)
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except HTTPException:
+            raise
         except ImageThreadError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except Exception as exc:
@@ -224,7 +348,20 @@ def create_router() -> APIRouter:
                                    authorization: str | None = Header(default=None)):
         identity = require_identity(authorization, request=request)
         try:
+            if image_task_service.admission is not None:
+                item = await require_work_policy(identity, task_id)
+                try:
+                    return await run_in_threadpool(
+                        get_work_lifecycle_service().set_archived, "image", identity, task_id, False,
+                    )
+                except WorkLifecycleError as exc:
+                    if exc.code != "WORK_REQUIRES_DURABLE_ADMISSION" or item.get("scheduling") is not None:
+                        raise
             return await run_in_threadpool(image_task_service.restore_thread, identity, task_id)
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except HTTPException:
+            raise
         except ImageThreadError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except Exception as exc:

@@ -27,6 +27,41 @@ TOKEN = "fixture-bearer-secret"
 PNG = b"\x89PNG\r\n\x1a\nfixture"
 
 
+def test_unsent_repair_preserves_failure_stamp_after_lost_response(tmp_path):
+    state_path = tmp_path / "original.json"
+    image_client._atomic_write_state(state_path, {
+        "schema_version": image_client.STATE_SCHEMA_VERSION,
+        "client_task_id": "original-image", "input_fingerprint": "retained", "phase": "accepted",
+    })
+    calls = []
+
+    class Api:
+        def json(self, method, endpoint, payload=None):
+            calls.append((method, payload))
+            if method == "GET":
+                return {"missing_ids": [], "items": [{"id": "original-image", "upstream_outcome": "not_submitted",
+                                   "upstream_submission_started": False, "recovery_retryable": True,
+                                   "last_recovery_failure": {"at": 1234.5}}]}
+            saved = json.loads(state_path.read_text())
+            assert saved["not_sent_retry"] == {"failure_at": 1234.5, "acknowledged": False}
+            if len(calls) == 2:
+                raise image_client.ClientError("response lost after acceptance")
+            return {"protocol": "generation-completion-v1", "kind": "image",
+                    "original_id": "original-image", "state": "checking_original"}
+
+    args = image_client._parser().parse_args([
+        "completion-recover", "--state", str(state_path), "--retry-not-sent",
+    ])
+    with unittest.TestCase().assertRaisesRegex(image_client.ClientError, "response lost after acceptance"):
+        image_client._command_completion(Api(), args)
+    with mock.patch.object(image_client, "_emit"):
+        image_client._command_completion(Api(), args)
+    assert len(calls) == 3 and calls[1] == calls[2]
+    saved = json.loads(state_path.read_text())
+    assert saved["client_task_id"] == "original-image" and saved["input_fingerprint"] == "retained"
+    assert saved["not_sent_retry"]["acknowledged"] is True
+
+
 class FixtureState:
     def __init__(self) -> None:
         self.tasks: dict[str, dict[str, object]] = {}
@@ -34,6 +69,7 @@ class FixtureState:
         self.expected_state_path: Path | None = None
         self.prepared_state_seen = False
         self.download_redirect = ""
+        self.download_truncated = False
 
 
 def fixture_handler(state: FixtureState):
@@ -92,9 +128,13 @@ def fixture_handler(state: FixtureState):
                 body = PNG
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
-                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Length", str(len(body) + (5 if state.download_truncated else 0)))
+                if state.download_truncated:
+                    self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
+                if state.download_truncated:
+                    self.close_connection = True
                 return
             self._json(404, {"detail": {"error": "not found"}})
 
@@ -105,7 +145,7 @@ def fixture_handler(state: FixtureState):
             if parsed.path in {"/ai/api/image-tasks/generations", "/ai/api/image-tasks/edits"}:
                 if state.expected_state_path is not None and state.expected_state_path.exists():
                     durable = json.loads(state.expected_state_path.read_text(encoding="utf-8"))
-                    state.prepared_state_seen = durable.get("phase") == "prepared"
+                    state.prepared_state_seen = durable.get("phase") == "unknown"
                 if parsed.path.endswith("generations"):
                     payload = json.loads(body)
                     task_id = payload["client_task_id"]
@@ -119,12 +159,21 @@ def fixture_handler(state: FixtureState):
                     self.server.multipart_boundary = boundary  # type: ignore[attr-defined]
                     mode = "edit"
                 task = {"id": task_id, "status": "queued", "mode": mode, "data": []}
+                if mode == "generate" and payload.get("image_thread_id"):
+                    task["image_thread"] = {"protocol": "image-thread-v1", "id": payload["image_thread_id"],
+                                            "previous_task_id": None, "edit_source_task_id": None}
                 state.tasks[task_id] = task
                 if prompt == "timeout-after-admission":
                     time.sleep(0.25)
                 self._json(200, task)
                 return
             prefix = "/ai/api/image-tasks/"
+            if parsed.path.startswith(prefix) and parsed.path.endswith(("/archive-thread", "/restore-thread")):
+                task_id, operation = parsed.path[len(prefix):].split("/")
+                task = state.tasks[task_id]
+                self._json(200, {"task_id": task_id, "image_thread": task["image_thread"],
+                                 "archived": operation == "archive-thread"})
+                return
             suffix = "/resume-poll"
             if parsed.path.startswith(prefix) and parsed.path.endswith(suffix):
                 encoded = parsed.path[len(prefix):-len(suffix)]
@@ -272,6 +321,132 @@ class ExternalImageClientTests(unittest.TestCase):
         posts = [item for item in self.fixture.requests if item["method"] == "POST"]
         self.assertEqual(len(posts), 1)
 
+    def test_selected_generation_and_edit_persist_choice_and_read_waiting_result(self) -> None:
+        account_ref = "car_" + "A" * 43
+        image = self.work / "selected.png"
+        image.write_bytes(PNG)
+        for mode in ("generation", "edit"):
+            with self.subTest(mode=mode):
+                task_id = f"selected-{mode}"
+                state_path = self.work / f"{task_id}.json"
+                self.fixture.expected_state_path = state_path
+                command = ["submit", "--state", str(state_path), "--client-task-id", task_id,
+                           "--prompt", "fixture", "--model", "fixture-image-model",
+                           "--account-ref", account_ref, "--workflow-id", "batch", "--workflow-concurrency", "2",
+                           "--min-send-interval-seconds", "12"]
+                if mode == "edit":
+                    command += ["--image", str(image)]
+                before = len(self.fixture.requests)
+                code, stdout, stderr = self.run_client(*command)
+                self.assertEqual((code, stderr), (0, ""))
+                self.assertEqual(json.loads(stdout)["status"], "queued")
+                self.assertTrue(self.fixture.prepared_state_seen)
+                saved = json.loads(state_path.read_text())
+                self.assertEqual(saved["input"]["account_ref"], account_ref)
+                self.assertEqual(saved["input"]["scheduling"], {"workflow_id": "batch", "workflow_concurrency": 2,
+                                                              "min_send_interval_seconds": 12.0})
+                body = bytes(self.fixture.requests[-1]["body"])
+                if mode == "edit":
+                    self.assertIn(b'name="account_ref"\r\n\r\n' + account_ref.encode(), body)
+                    self.assertIn(b'name="scheduling"\r\n\r\n', body)
+                else:
+                    self.assertEqual(json.loads(body)["account_ref"], account_ref)
+                    self.assertEqual(json.loads(body)["scheduling"], saved["input"]["scheduling"])
+                self.fixture.tasks[task_id]["waiting"] = {"reasons": ["account_unavailable"]}
+                code, stdout, stderr = self.run_client(*command)
+                self.assertEqual((code, stderr), (0, ""))
+                self.assertEqual(json.loads(stdout)["waiting"]["reasons"], ["account_unavailable"])
+                self.fixture.tasks[task_id].update(status="success", data=[{"index": 0}])
+                code, stdout, stderr = self.run_client("status", "--state", str(state_path))
+                self.assertEqual((code, stderr), (0, ""))
+                self.assertEqual(json.loads(stdout)["status"], "success")
+                for changed in ([arg.replace(account_ref, "car_" + "B" * 43) for arg in command],
+                                [arg for arg in command if arg not in {"--account-ref", account_ref}]):
+                    code, stdout, stderr = self.run_client(*changed)
+                    self.assertEqual((code, stdout), (1, ""))
+                    self.assertIn("different immutable input", stderr)
+                self.assertEqual(sum(r["method"] == "POST" for r in self.fixture.requests[before:]), 1)
+
+    def test_invalid_account_selection_fails_before_state_or_network(self) -> None:
+        state_path = self.work / "invalid-choice.json"
+        code, stdout, stderr = self.run_client(
+            "submit", "--state", str(state_path), "--model", "fixture-image-model",
+            "--prompt", "fixture", "--account-ref", "private-account-id")
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertIn("opaque car_ reference", stderr)
+        self.assertFalse(state_path.exists())
+        self.assertEqual(self.fixture.requests, [])
+
+    def test_work_complete_archives_and_rework_restores_original_image_thread(self) -> None:
+        state = self.work / "work-image.json"
+        code, _, stderr = self.run_client("submit", "--state", str(state), "--client-task-id", "image-work",
+            "--model", "gpt-image-2", "--prompt", "fixture", "--thread-id", "product-work")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(self.fixture.requests[-1]["body"])["image_thread_id"], "product-work")
+        code, _, stderr = self.run_client("complete", "--state", str(state))
+        self.assertEqual(code, 1)
+        self.assertIn("not complete", stderr)
+        self.assertFalse(any(str(r["path"]).endswith("archive-thread") for r in self.fixture.requests))
+        self.fixture.tasks["image-work"].update(status="success", data=[{"index": 0}])
+        for command, archived in (("complete", True), ("rework", False)):
+            code, stdout, stderr = self.run_client(command, "--state", str(state))
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertIs(json.loads(stdout)["archived"], archived)
+            saved = json.loads(state.read_text())
+            self.assertEqual(saved["lifecycle"]["status"], "confirmed")
+            self.assertIs(saved["lifecycle"]["archived"], archived)
+        self.assertEqual(sum(str(r["path"]).endswith("generations") for r in self.fixture.requests), 1)
+        self.assertTrue(str(self.fixture.requests[-1]["path"]).endswith("/image-work/restore-thread"))
+
+    def test_rework_edit_carries_original_source_bytes_and_immutable_work_fields(self) -> None:
+        source = self.work / "saved-original.png"
+        source.write_bytes(PNG)
+        state = self.work / "edit-work.json"
+        command = ["submit", "--state", str(state), "--client-task-id", "edit-work",
+                   "--model", "gpt-image-2", "--prompt", "fixture", "--thread-id", "product-work",
+                   "--source-task-id", "original-result", "--image", str(source)]
+        code, _, stderr = self.run_client(*command)
+        self.assertEqual((code, stderr), (0, ""))
+        body = bytes(self.fixture.requests[-1]["body"])
+        for name, value in (("image_thread_id", "product-work"), ("edit_source_task_id", "original-result"),
+                            ("edit_source_index", "0")):
+            self.assertIn(f'name="{name}"\r\n\r\n{value}\r\n'.encode(), body)
+        self.assertIn(PNG, body)
+        for old, replacement in (("product-work", "other-work"), ("original-result", "other-result")):
+            changed = [replacement if arg == old else arg for arg in command]
+            code, _, stderr = self.run_client(*changed)
+            self.assertEqual(code, 1)
+            self.assertIn("different immutable input", stderr)
+        self.assertEqual(sum(r["method"] == "POST" for r in self.fixture.requests), 1)
+
+    def test_failed_download_cleans_only_its_own_partial_file_and_preserves_original_receipt(self) -> None:
+        self.fixture.tasks["saved-result"] = {"id": "saved-result", "status": "success", "data": [{"index": 0}]}
+        state = self.work / "absent.json"
+        output = self.work / "download.png"
+        command = ["download", "--state", str(state), "--task-id", "saved-result", "--output", str(output)]
+        self.fixture.download_truncated = True
+        code, _, stderr = self.run_client(*command)
+        self.assertEqual(code, 1)
+        self.assertIn("incomplete", stderr)
+        self.assertFalse(output.exists())
+        self.fixture.download_truncated = False
+        with mock.patch.object(image_client.os, "fsync", side_effect=OSError("fixture save failure")):
+            code, _, stderr = self.run_client(*command)
+        self.assertEqual(code, 1)
+        self.assertIn("save failed", stderr)
+        self.assertFalse(output.exists())
+        original_open = image_client.os.open
+        def raced_open(path, flags, mode=0o777):
+            if Path(path) == output.resolve():
+                output.write_bytes(b"another writer's result")
+            return original_open(path, flags, mode)
+        with mock.patch.object(image_client.os, "open", side_effect=raced_open):
+            code, _, stderr = self.run_client(*command)
+        self.assertEqual(code, 1)
+        self.assertEqual(output.read_bytes(), b"another writer's result")
+        self.assertEqual(self.fixture.tasks["saved-result"]["status"], "success")
+        self.assertFalse(any(r["method"] == "POST" for r in self.fixture.requests))
+
     def test_status_and_resume_use_the_exact_original_client_id(self) -> None:
         task_id = "original.task:1"
         self.fixture.tasks[task_id] = {
@@ -360,3 +535,148 @@ class ExternalImageClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_result_notification_reconnect_preserves_original_chat_state(tmp_path):
+    path = tmp_path / 'chat.json'
+    original = {'schema': 'chatgpt2api.chat-request.v1', 'request_id': 'original-chat',
+                'phase': 'accepted', 'input_fingerprint': 'unchanged'}
+    path.write_text(json.dumps(original))
+    calls = []
+    class Response(io.BytesIO):
+        headers = {'Content-Type': 'text/event-stream; charset=utf-8'}
+    class Api:
+        def open(self, method, endpoint):
+            calls.append((method, endpoint))
+            if len(calls) == 1:
+                return Response(b'event: reconnect\ndata: {"request_id":"original-chat"}\n\n')
+            return Response(b'event: result_ready\ndata: {"protocol":"task-notification-v1","kind":"text","request_id":"original-chat","result_ready":true,"result_count":1}\n\n')
+    args = image_client._parser().parse_args(['chat-wait', '--state', str(path), '--max-wait-seconds', '5'])
+    with mock.patch.object(image_client.time, 'sleep'), mock.patch.object(image_client, '_emit') as emit:
+        assert image_client._command_wait(Api(), args) == 0
+    assert calls == [('GET', '/api/chat-requests/original-chat/events')] * 2
+    assert json.loads(path.read_text()) == original
+    assert emit.call_args.args[0]['result_ready'] is True
+
+
+def test_result_notification_rejects_wrong_original_and_never_submits(tmp_path):
+    class Response(io.BytesIO):
+        headers = {'Content-Type': 'text/event-stream'}
+    class Api:
+        def open(self, method, endpoint):
+            assert method == 'GET' and endpoint == '/api/image-tasks/original/events'
+            return Response(b'event: result_ready\ndata: {"request_id":"different","result_ready":true}\n\n')
+    args = image_client._parser().parse_args(['wait', '--state', str(tmp_path / 'absent.json'), '--task-id', 'original'])
+    with unittest.TestCase().assertRaisesRegex(image_client.ClientError, 'original request identity'):
+        image_client._command_wait(Api(), args)
+
+
+def test_complete_preserves_original_work_during_cleanup_and_archive_pending(tmp_path):
+    for status, detail, work_state, lifecycle in [
+        (409, "WORK_TURN_UNFINISHED", "active", "waiting_turn"),
+        (503, "WORK_ARCHIVE_UNCONFIRMED", "completed", "pending"),
+    ]:
+        path = tmp_path / (str(status) + ".json")
+        image_client._atomic_write_state(path, {"schema_version": 1, "client_task_id": "original",
+            "input_fingerprint": "immutable", "phase": "accepted", "input": {"image_thread_id": "thread"}})
+        calls = []
+        class Api:
+            def json(self, method, endpoint, payload=None):
+                calls.append((method, endpoint))
+                if method == "POST":
+                    raise image_client.HttpFailure(status, detail)
+                return {"protocol": "work-v1", "kind": "image", "request_id": "original",
+                        "work_ref": "thread", "state": work_state, "archive": {"status": "pending", "desired": True}}
+        args = image_client._parser().parse_args(["complete", "--state", str(path)])
+        with mock.patch.object(image_client, "_lookup_task", return_value={"status": "success",
+                "image_thread": {"protocol": "image-thread-v1", "id": "thread"}}), mock.patch.object(image_client, "_emit") as emit:
+            assert image_client._command_work_lifecycle(Api(), args) == 2
+            assert emit.call_args.args[0]["waiting"] is True
+        saved = json.loads(path.read_text())
+        assert saved["lifecycle"]["status"] == lifecycle
+        assert saved["client_task_id"] == "original" and saved["input_fingerprint"] == "immutable"
+        assert calls == [("POST", "/api/image-tasks/original/archive-thread"), ("GET", "/api/image-tasks/original/work")]
+
+
+def test_complete_rejects_other_work_on_pending_readback(tmp_path):
+    path = tmp_path / "original.json"
+    image_client._atomic_write_state(path, {"schema_version": 1, "client_task_id": "original",
+        "input_fingerprint": "immutable", "phase": "accepted", "input": {"image_thread_id": "thread"}})
+    class Api:
+        def json(self, method, endpoint, payload=None):
+            if method == "POST":
+                raise image_client.HttpFailure(409, "WORK_TURN_UNFINISHED")
+            return {"protocol": "work-v1", "kind": "image", "request_id": "other",
+                    "work_ref": "thread", "state": "active"}
+    args = image_client._parser().parse_args(["complete", "--state", str(path)])
+    with mock.patch.object(image_client, "_lookup_task", return_value={"status": "success",
+            "image_thread": {"protocol": "image-thread-v1", "id": "thread"}}):
+        with unittest.TestCase().assertRaisesRegex(image_client.ClientError, "changed the original work"):
+            image_client._command_work_lifecycle(Api(), args)
+    assert json.loads(path.read_text())["lifecycle"]["status"] == "unknown"
+
+
+def test_chat_complete_preserves_original_work_while_turn_is_finishing(tmp_path):
+    path = tmp_path / "chat.json"
+    conversation = {"protocol": "sequential-v1", "client_conversation_id": "session"}
+    image_client._atomic_write_state(path, {"schema": "chatgpt2api.chat-request.v1",
+        "request_id": "original-chat", "input_fingerprint": "immutable", "phase": "accepted",
+        "conversation": conversation})
+    calls = []
+    class Api:
+        def json(self, method, endpoint, payload=None):
+            calls.append((method, endpoint))
+            if method == "POST":
+                raise image_client.HttpFailure(409, "WORK_TURN_UNFINISHED")
+            return {"protocol": "work-v1", "kind": "text", "request_id": "original-chat",
+                    "work_ref": "session", "state": "active"}
+    args = image_client._parser().parse_args(["chat-complete", "--state", str(path)])
+    with mock.patch.object(image_client, "_chat_receipt", return_value={"status": "succeeded"}), mock.patch.object(image_client, "_emit"):
+        assert image_client._command_work_lifecycle(Api(), args) == 2
+    saved = json.loads(path.read_text())
+    assert saved["lifecycle"]["status"] == "waiting_turn"
+    assert saved["conversation"] == conversation
+    assert calls == [("POST", "/api/chat-requests/original-chat/archive-conversation"),
+                     ("GET", "/api/chat-requests/original-chat/work")]
+
+
+def test_complete_classifies_archive_readback_without_hiding_unknown_or_confirmation(tmp_path):
+    for chat in (False, True):
+        for index, (archive, code, lifecycle) in enumerate([
+            ({"status": "running", "desired": True}, 2, "pending"),
+            ({"status": "confirmed", "desired": True, "archived": True}, 0, "confirmed"),
+            ({"status": "unknown", "desired": True, "error_code": "UPSTREAM_AUTH_REQUIRED"}, None, "unknown"),
+            ({"status": "pending", "desired": True, "error_code": "UPSTREAM_RATE_LIMITED"}, None, "unknown"),
+            ({"status": "confirmed", "desired": False, "archived": False}, None, "unknown"),
+            (["malformed"], None, "unknown"),
+        ]):
+            path = tmp_path / (str(chat) + str(index) + ".json")
+            conversation = {"protocol": "sequential-v1", "client_conversation_id": "work"}
+            state = ({"schema": "chatgpt2api.chat-request.v1", "request_id": "original", "conversation": conversation}
+                     if chat else {"schema_version": 1, "client_task_id": "original", "input": {"image_thread_id": "work"}})
+            state.update(input_fingerprint="immutable", phase="accepted")
+            image_client._atomic_write_state(path, state)
+            calls = []
+            class Api:
+                def json(self, method, endpoint, payload=None):
+                    calls.append((method, endpoint))
+                    if method == "POST":
+                        raise image_client.HttpFailure(503, "WORK_ARCHIVE_UNCONFIRMED")
+                    return {"protocol": "work-v1", "kind": "text" if chat else "image", "request_id": "original",
+                            "work_ref": "work", "state": "completed", "archive": archive}
+            args = image_client._parser().parse_args(["chat-complete" if chat else "complete", "--state", str(path)])
+            with mock.patch.object(image_client, "_lookup_task", return_value={"status": "success",
+                    "image_thread": {"protocol": "image-thread-v1", "id": "work"}}), \
+                    mock.patch.object(image_client, "_chat_receipt", return_value={"status": "succeeded"}), \
+                    mock.patch.object(image_client, "_emit") as emit:
+                if code is None:
+                    with unittest.TestCase().assertRaisesRegex(image_client.ClientError, "not confirmed or safely pending"):
+                        image_client._command_work_lifecycle(Api(), args)
+                    emit.assert_not_called()
+                else:
+                    assert image_client._command_work_lifecycle(Api(), args) == code
+                    assert emit.call_args.args[0]["waiting"] is (code == 2)
+            saved = json.loads(path.read_text())
+            assert saved["lifecycle"]["status"] == lifecycle
+            assert saved["work"]["archive"] == archive
+            assert [method for method, _ in calls] == ["POST", "GET"]

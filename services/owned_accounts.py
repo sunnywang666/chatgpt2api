@@ -14,19 +14,20 @@ def _parse_observed_at(value: object) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def observation_is_fresh(value: object) -> bool:
     observed_at = _parse_observed_at(value)
-    return bool(
-        observed_at
-        and (datetime.now(timezone.utc) - observed_at).total_seconds() <= OBSERVATION_MAX_AGE_SECONDS
-    )
+    if observed_at is None:
+        return False
+    age = (datetime.now(timezone.utc) - observed_at).total_seconds()
+    # Future timestamps are not proof of a current successful observation.
+    return 0 <= age <= OBSERVATION_MAX_AGE_SECONDS
 
 
 def _mask_email(value: object) -> str | None:
@@ -155,17 +156,91 @@ def observed_capacity(account: dict) -> dict:
         isinstance(remaining, float) and math.isfinite(remaining)
         and remaining >= 0 and remaining.is_integer()
     )
+    if account.get("capacity_read_failed_at"):
+        state = "read_failed"
+    elif not valid:
+        state = "unknown"
+    elif (account.get("capacity_used_since_observation")
+          or not observation_is_fresh(account.get("capacity_observed_at"))):
+        state = "stale"
+    else:
+        state = "observed"
+    # Retain the last observed value (including zero) as historical evidence.
+    # Staleness is not zero quota, a new failure, or permission to resend work.
     return {
         "route": "chatgpt_image_gen",
         "source": "limits_progress.image_gen.remaining",
         "unit": "upstream_image_gen",
-        "state": "read_failed" if account.get("capacity_read_failed_at") else "stale" if valid and account.get("capacity_used_since_observation") else "observed" if valid else "unknown",
+        "state": state,
         "remaining": int(remaining) if valid else None,
         "observed_at": account.get("capacity_observed_at"),
         "failed_at": account.get("capacity_read_failed_at"),
         "reset_after": image_limit.get("reset_after") if image_limit else None,
         "codex_capacity": None,
     }
+
+
+def image_capability_projection(account: dict) -> dict:
+    """Project persisted upstream image_gen evidence without claiming a slot."""
+    capacity = observed_capacity(account)
+    observed_at = _parse_observed_at(capacity.get("observed_at"))
+    remaining = capacity.get("remaining")
+    observed = remaining is not None and observed_at is not None
+    observation_state = str(capacity.get("state") or "unknown")
+    status = str(account.get("status") or "")
+
+    if account.get("managed_disabled") or status == "禁用":
+        state, reason = "unavailable", "disabled"
+    elif status == "异常":
+        state, reason = "unavailable", "auth_required"
+    elif status == "限流":
+        state, reason = "unavailable", "limited"
+    # The retained counter is historical evidence after a metadata failure or
+    # expiry. Do not present a previous zero as current rate limiting.
+    elif observation_state == "read_failed":
+        state, reason = "unavailable", "read_failed"
+    elif observation_state == "stale":
+        state, reason = "unknown", "stale"
+    elif observed and remaining == 0:
+        state, reason = "unavailable", "limited"
+    elif observation_state == "observed":
+        # A positive image_gen counter is capability evidence, not an offer
+        # for immediate dispatch; pool admission still owns that decision.
+        state, reason = "unknown", "image_capability_observed"
+    else:
+        state, reason = "unknown", None
+    return {
+        "capable": observed,
+        "state": state,
+        "reason": reason,
+        "observation_state": observation_state,
+        "observed_at": observed_at.timestamp() if observed_at is not None else None,
+    }
+
+
+
+def image_dispatch_capacity(account: dict, model: str = "gpt-image-2") -> int:
+    """Fresh image-specific evidence, not the generic quota or a text slot.
+
+    Codex models/usage currently prove Responses capacity only. Until that
+    route provides verified image-tool evidence it cannot yield image slots.
+    """
+    from utils.helper import is_codex_image_model, split_image_model
+    plan, base = split_image_model(model)
+    source = str(account.get("source_type") or "web").lower()
+    if base is None or is_codex_image_model(model) or source not in {"web", "oauth_login", "password"}:
+        return 0
+    from services.account_service import AccountService
+    account_type = AccountService._normalize_account_type(account.get("type"))
+    if (account_type not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
+            or (plan and account_type != AccountService._normalize_account_type(plan))
+            or account.get("managed_disabled") or account.get("status") in {"禁用", "异常", "限流"}
+            or not account.get("access_token")):
+        return 0
+    capacity = observed_capacity(account)
+    if capacity["state"] != "observed" or capacity["remaining"] is None:
+        return 0
+    return capacity["remaining"]
 
 
 def public_owned_account(account: dict) -> dict:

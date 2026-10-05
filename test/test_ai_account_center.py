@@ -421,7 +421,7 @@ class _CatalogBackend:
 
 
 class ManagementModelTests(unittest.TestCase):
-    def test_type_catalog_keeps_account_observation_pending(self) -> None:
+    def test_account_catalog_keeps_capability_bound_to_the_observed_account(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             accounts = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
             accounts.add_account_items([{"access_token": "chat-token", "source_type": "web", "type": "Plus", "status": "正常"}])
@@ -432,7 +432,45 @@ class ManagementModelTests(unittest.TestCase):
             self.assertIsNone(item["available_accounts"])
             self.assertEqual(item["pending_accounts"], 1)
             self.assertEqual(item["accounts"][0]["state"], "unknown")
-            self.assertEqual(item["accounts"][0]["reason"], "account_type_catalog_only")
+            row = item["accounts"][0]
+            self.assertEqual(row["account_ref"], accounts.list_pool_accounts()[0]["account_ref"])
+            self.assertEqual(row["reason"], "model_catalog_observed")
+            self.assertEqual(row["capabilities"], ["text", "image_input"])
+            self.assertEqual(row["observation_state"], "observed")
+            self.assertIsInstance(row["observed_at"], float)
+
+    def test_image_alias_uses_persisted_image_gen_evidence_not_model_catalog_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            accounts = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
+            accounts.add_account_items([{
+                "access_token": "image-token", "source_type": "web", "type": "Plus", "status": "正常",
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 2}],
+                "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+            }])
+            accounts.refresh_access_token = lambda token, **_kwargs: token
+            catalog = ModelCatalogService(accounts, backend_factory=lambda access_token="": _CatalogBackend(access_token))
+
+            item = next(item for item in catalog.management_models() if item["id"] == "gpt-image-2")
+            row = item["accounts"][0]
+            self.assertEqual(item["route"], "chat")
+            self.assertEqual(item["available_accounts"], None)
+            self.assertEqual(row["state"], "unknown")
+            self.assertEqual(row["reason"], "image_capability_observed")
+            self.assertEqual(row["capabilities"], ["image_generation", "image_edit"])
+            self.assertEqual(row["observation_state"], "observed")
+            self.assertIsInstance(row["observed_at"], float)
+            self.assertEqual(row["account_ref"], accounts.list_pool_accounts()[0]["account_ref"])
+
+            public = catalog.public_accounts_for_model("gpt-image-2", ["ignored"])
+            self.assertEqual(public[0], {key: value for key, value in row.items() if key != "label"})
+            self.assertNotIn("label", public[0])
+
+            accounts.update_account("image-token", {
+                "limits_progress": [{"feature_name": "image_gen", "remaining": 0}],
+                "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+            })
+            zero = catalog.public_accounts_for_model("gpt-image-2", ["ignored"])[0]
+            self.assertEqual((zero["state"], zero["reason"], zero["observation_state"]), ("unavailable", "limited", "observed"))
 
     def test_chat_catalog_never_uses_codex_only_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

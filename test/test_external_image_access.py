@@ -1,4 +1,5 @@
 import tempfile
+from datetime import datetime, timezone
 import io
 import time
 import threading
@@ -19,6 +20,19 @@ from services.storage.json_storage import JSONStorageBackend
 
 
 class ExternalImageAccessTests(unittest.TestCase):
+    @staticmethod
+    def image_account(remaining=2, *, token="internal-token"):
+        """Fresh upstream image_gen evidence; quota alone is not dispatch proof."""
+        return {
+            "access_token": token,
+            "type": "Pro",
+            "source_type": "web",
+            "status": "正常",
+            "quota": remaining,
+            "limits_progress": [{"feature_name": "image_gen", "remaining": remaining}],
+            "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -35,7 +49,7 @@ class ExternalImageAccessTests(unittest.TestCase):
         for target, value in [
             ("services.account_service.account_service.create_conversation_binding", lambda **_: ("binding", "account", "internal-token")),
             ("services.account_service.account_service.release_image_slot", lambda *_: None),
-            ("services.account_service.account_service.get_account", lambda *_: {"quota": 2}),
+            ("services.account_service.account_service.get_account", lambda *_: self.image_account()),
             ("api.support.auth_service", self.auth),
             ("api.image_tasks.image_task_service", self.tasks),
             ("services.image_task_service.image_task_service", self.tasks),
@@ -55,6 +69,21 @@ class ExternalImageAccessTests(unittest.TestCase):
 
     def headers(self, secret=None):
         return {"Authorization": "Bearer " + (secret or self.secret_a), "X-Workbench-Image-Client": "1", "X-Forwarded-Prefix": "/ai"}
+
+    def test_public_notification_is_owner_scoped_and_revoked_key_is_rejected(self):
+        with self.tasks.store.transaction() as db:
+            self.tasks.store.write_receipt(db, "image", self.key_a["id"], "saved", {
+                "id": "saved", "model": "gpt-image-2", "status": "success",
+                "data": [{"url": "private-result-url"}],
+            })
+        response = self.client.get("/api/image-tasks/saved/events", headers=self.headers())
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("event: result_ready", response.text)
+        self.assertNotIn("private-result-url", response.text)
+        self.assertEqual(self.client.get("/api/image-tasks/saved/events", headers=self.headers(self.secret_b)).status_code, 404)
+        self.assertTrue(self.auth.revoke_owned_key("workbench:org:a", self.key_a["id"]))
+        self.assertEqual(self.client.get("/api/image-tasks/saved/events", headers=self.headers()).status_code, 401)
+        self.assertFalse(self.calls)
 
     def test_narrowed_policy_preserves_own_old_receipt_download_and_read_only_resume(self):
         body = {"client_task_id": "policy-history", "prompt": "sample", "model": "gpt-image-2"}
@@ -290,8 +319,8 @@ class ExternalImageAccessTests(unittest.TestCase):
 
     def test_admission_cannot_use_the_same_last_capacity_twice(self):
         self.account.add_account_items([
-            {"access_token": "last-slot", "type": "Pro", "status": "正常", "quota": 1},
-            {"access_token": "other-slot", "type": "Pro", "status": "正常", "quota": 2},
+            self.image_account(1, token="last-slot"),
+            self.image_account(2, token="other-slot"),
         ])
         from services.config import config
         with patch.object(type(config), "image_account_concurrency", new_callable=lambda: property(lambda _: 4)):
@@ -317,7 +346,7 @@ class ExternalImageAccessTests(unittest.TestCase):
             records = self.tasks.list_tasks(self.key_a, ["held"])["items"]
             released_with_durable_slot.append(bool(records and records[0].get("upstream_unfinished")))
         body = {"client_task_id": "held", "prompt": "sample"}
-        with patch("services.account_service.account_service.get_account", return_value={"quota": 1}), patch("services.account_service.account_service.release_image_slot", side_effect=release):
+        with patch("services.account_service.account_service.get_account", return_value=self.image_account(1)), patch("services.account_service.account_service.release_image_slot", side_effect=release):
             try:
                 self.client.post("/api/image-tasks/generations", headers=self.headers(), json=body)
                 self.assertTrue(entered.wait(2))
@@ -342,7 +371,7 @@ class ExternalImageAccessTests(unittest.TestCase):
     def test_capacity_zero_missing_invalid_and_stale_are_distinct(self):
         for remaining in (None, "", "unknown", True, -1, float("inf")):
             self.assertIsNone(observed_capacity({"limits_progress": [{"feature_name": "image_gen", "remaining": remaining}]})["remaining"])
-        observed = {"limits_progress": [{"feature_name": "image_gen", "remaining": 0, "reset_after": 3600}], "capacity_observed_at": "2026-09-16T00:00:00Z"}
+        observed = {"limits_progress": [{"feature_name": "image_gen", "remaining": 0, "reset_after": 3600}], "capacity_observed_at": datetime.now(timezone.utc).isoformat()}
         self.assertEqual(observed_capacity(observed)["remaining"], 0)
         self.assertEqual(observed_capacity(observed)["state"], "observed")
         self.assertEqual(observed_capacity({**observed, "capacity_used_since_observation": True})["state"], "stale")
