@@ -201,7 +201,10 @@ def image_completion_hints(account_identity, conversation_id, open_transport):
     signal = threading.Event()
     with _hubs_lock:
         hub = _hubs.get(account_identity)
-        if hub is None:
+        if hub is None or hub.stopped.is_set():
+            # New work must not inherit a dead socket merely because older
+            # callers are still draining their original-result reads. Those
+            # callers retain their fallback and cannot release this new hub.
             hub = _hubs[account_identity] = _ConversationHints(account_identity)
         with hub.lock:
             hub.signals.setdefault(conversation_id, set()).add(signal)

@@ -210,6 +210,38 @@ def test_disconnected_shared_listener_preserves_fallback_interval(monkeypatch):
     assert sleeps == [10] and "disconnected-fixture" not in completion._hubs
 
 
+def test_new_conversation_replaces_dead_listener_without_old_release_stopping_it(monkeypatch):
+    runs = []
+    def run(hub, _factory):
+        runs.append(hub)
+        if len(runs) == 1:
+            hub.stopped.set()
+        else:
+            hub.stopped.wait(2)
+    monkeypatch.setattr(completion._ConversationHints, "run", run)
+    account = "reconnect-fixture"
+    old_context = completion.image_completion_hints(account, CID, lambda: None)
+    old_wait = old_context.__enter__()
+    old_hub = completion._hubs[account]; old_hub.thread.join(1)
+    old_released = False
+    try:
+        assert old_hub.stopped.is_set()
+        with completion.image_completion_hints(account, "new-conversation", lambda: None) as new_wait:
+            new_hub = completion._hubs[account]
+            assert new_hub is not old_hub and not new_hub.stopped.is_set()
+            assert old_wait(.001) is False
+            old_context.__exit__(None, None, None); old_released = True
+            assert completion._hubs[account] is new_hub and not new_hub.stopped.is_set()
+            with new_hub.lock:
+                for signal in new_hub.signals["new-conversation"]: signal.set()
+            assert new_wait(.01) is True
+        assert new_hub.stopped.is_set() and account not in completion._hubs
+        assert len(runs) == 2  # No automatic retry loop or generation replay.
+    finally:
+        if not old_released:
+            old_context.__exit__(None, None, None)
+
+
 def test_last_real_context_closes_idle_socket(monkeypatch):
     from curl_cffi import CurlECode, CurlError
     idle, cleanup = threading.Event(), []
