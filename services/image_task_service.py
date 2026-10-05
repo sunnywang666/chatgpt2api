@@ -2326,10 +2326,49 @@ class ImageTaskService:
                 backend.progress_callback = lambda _step: None
                 backend.progress_callback.record_pending_result_ids = record_pending_ids
                 if persisted_file_ids or persisted_sediment_ids:
+                    confirmed_parent = None
+                    extract_records = getattr(backend, "_extract_image_tool_records", None)
+                    if image_thread and callable(extract_records):
+                        failure_phase = "confirm_image_turn"
+                        document = backend._get_conversation(conversation_id)
+                        records = extract_records(document, request_message_id)
+                        files = list(dict.fromkeys(x for record in records for x in record["file_ids"]))
+                        sediments = list(dict.fromkeys(x for record in records for x in record["sediment_ids"]))
+                        original_ids = set(persisted_file_ids + persisted_sediment_ids)
+                        observed_ids = set(files + sediments)
+                        if (not set(persisted_file_ids) <= set(files)
+                                or not set(persisted_sediment_ids) <= set(sediments)):
+                            raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                        if observed_ids > original_ids:
+                            # A stream can expose one image before the same
+                            # original turn produces the rest. Expand only from
+                            # its complete, unbranched final snapshot; cached
+                            # partial bytes must not trap recovery forever.
+                            confirmed_parent = finished_parent(document, conversation_id, request_message_id,
+                                expected_parent=expected_parent, expected_result_ids=files + sediments,
+                                predecessor_request_message_id=predecessor_message,
+                                predecessor_result_ids=predecessor_ids, require_final=True)
+                            persisted_file_ids, persisted_sediment_ids = files, sediments
+                            self._update_task(key, result_file_ids=files, result_sediment_ids=sediments,
+                                              _pending_image_result_ids=None)
+                        else:
+                            # No permission to replace vanished assets or
+                            # adopt another branch, even if it has a final.
+                            finished_parent(document, conversation_id, request_message_id,
+                                expected_parent=expected_parent, expected_result_ids=list(original_ids),
+                                predecessor_request_message_id=predecessor_message,
+                                predecessor_result_ids=predecessor_ids)
+                            try:
+                                confirmed_parent = finished_parent(document, conversation_id, request_message_id,
+                                    expected_parent=expected_parent, expected_result_ids=list(original_ids),
+                                    predecessor_request_message_id=predecessor_message,
+                                    predecessor_result_ids=predecessor_ids, require_final=True)
+                            except ImageThreadError:
+                                pass  # Tool leaves still need a later final read.
                     self._update_task(key, progress="receiving_image", recovery_phase="download_image_result")
                     image_items = downloaded_items(backend, persisted_file_ids, persisted_sediment_ids)
                     failure_phase = "confirm_image_turn"
-                    parent_message_id = recovered_parent(backend, persisted_file_ids, persisted_sediment_ids)
+                    parent_message_id = confirmed_parent or recovered_parent(backend, persisted_file_ids, persisted_sediment_ids)
                     failure_phase = "save_image_result"
                     data = format_image_result(
                         image_items,

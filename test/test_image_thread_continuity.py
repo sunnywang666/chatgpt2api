@@ -290,6 +290,77 @@ def test_private_image_output_cannot_escape_through_chunk_or_collection():
     assert "cHJpdmF0ZQ==" not in repr(private)
 
 
+@pytest.mark.parametrize("change", ["none", "unfinished", "sibling", "successor", "missing-original", "namespace", "nonfinal", "download-failure"])
+def test_recovery_expands_partial_assets_only_on_complete_original_branch(runtime, monkeypatch, change):
+    r = runtime
+    r.state.tool_leaf = r.state.fail_after_result = True
+    r.submit("original"); r.admission.execute(r.admission.claim_next())
+    original = r.read("original")
+    assert original["status"] == "error"
+    cid, rid = original["conversation_id"], original["request_message_id"]
+    asset = original["result_file_ids"][0]
+    coverage = {"conversation_id": cid, "request_message_id": rid,
+                "file_ids": original["result_file_ids"], "sediment_ids": original["result_sediment_ids"]}
+    r.service._store_pending_image_output("happy:original", coverage,
+        [{"b64_json": base64.b64encode(OUTPUT).decode()}])
+    cached = r.read("original")["_pending_image_output"]
+    doc = r.state.documents[cid]
+    doc["mapping"][rid + "-image"]["message"]["content"]["parts"][0]["asset_pointer"] = "sediment://" + asset
+    extra = "file_00000000" + hashlib.sha256((rid + "-extra").encode()).hexdigest()[:24]
+    tool = copy.deepcopy(doc["mapping"][rid + "-image"])
+    tool["parent"] = rid + "-image"
+    tool["message"]["id"] = rid + "-extra"
+    tool["message"]["content"]["parts"][0]["asset_pointer"] = "sediment://" + extra
+    doc["mapping"][rid + "-extra"] = tool
+    doc["mapping"][rid + "-final"] = node(rid + "-final", "assistant", rid + "-extra", end=True)
+    doc["current_node"] = rid + "-final"
+    if change == "unfinished": tool["message"]["status"] = "in_progress"
+    if change == "nonfinal": doc["mapping"][rid + "-final"]["message"]["channel"] = "commentary"
+    if change == "sibling": doc["mapping"]["sibling"] = node("sibling", "assistant", rid)
+    if change == "successor":
+        doc["mapping"]["foreign"] = node("foreign", "user", doc["current_node"])
+        doc["current_node"] = "foreign"
+    if change == "missing-original":
+        doc["mapping"][rid + "-image"]["message"]["content"]["parts"] = []
+    Backend = conversation.OpenAIBackendAPI
+    for name, value in {
+        "_current_message_branch_ids": staticmethod(RealOpenAIBackendAPI._current_message_branch_ids),
+        "_extract_image_reference_ids": staticmethod(RealOpenAIBackendAPI._extract_image_reference_ids),
+        "_extract_image_tool_records": RealOpenAIBackendAPI._extract_image_tool_records,
+    }.items(): monkeypatch.setattr(Backend, name, value, raising=False)
+    if change == "namespace":
+        def records(self, document, request_id):
+            results = RealOpenAIBackendAPI._extract_image_tool_records(self, document, request_id)
+            for record in results: record["sediment_ids"] = []
+            return results
+        monkeypatch.setattr(Backend, "_extract_image_tool_records", records)
+    downloads = []
+    monkeypatch.setattr(Backend, "resolve_conversation_image_urls",
+        lambda _self, _cid, files, _sediments, **_kw: files)
+    def download(_self, urls):
+        downloads.append(urls)
+        if change == "download-failure": raise TimeoutError("download unavailable")
+        return [OUTPUT, SOURCE]
+    monkeypatch.setattr(Backend, "download_image_bytes", download)
+    monkeypatch.setattr(conversation, "format_image_result", lambda items, *_a, **_kw: {"data": items})
+    restarted = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
+    restarted._run_resume_poll("happy:original", cid, 5, "", WHO, "edit", "gpt-image-2", False, False)
+    result = r.read("original")
+    assert len(r.state.sends) == 1 and result["conversation_id"] == cid and result["request_message_id"] == rid
+    with r.store.output_file(cached["output_ref"]) as handle:
+        assert json.loads(handle.read())[0]["b64_json"] == base64.b64encode(OUTPUT).decode()
+    if change == "none":
+        assert result["status"] == "success" and len(result["data"]) == 2
+        assert set(result["result_file_ids"]) == {asset, extra}
+        assert result["parent_message_id"] == rid + "-final" and result["_image_thread_terminal"]
+        assert downloads == [[asset, extra]]
+    else:
+        assert result["status"] == "error" and not result.get("data")
+        assert result["_pending_image_output"] == cached
+        if change != "download-failure":
+            assert not downloads and result["result_file_ids"] == original["result_file_ids"]
+
+
 @pytest.mark.parametrize("change", ["none", "unfinished", "wrong-parent", "sibling", "current", "late-drift"])
 def test_strict_terminal_poll_saves_settle_read_but_keeps_post_download_fence(runtime, monkeypatch, change):
     from services.config import config
