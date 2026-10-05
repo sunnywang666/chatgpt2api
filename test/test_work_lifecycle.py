@@ -82,6 +82,38 @@ def test_work_reads_do_not_decode_unrelated_saved_images(runtime, monkeypatch):
         assert store.read_receipt(db, "text", "one", "A-1") == first
 
 
+def test_existing_work_read_uses_committed_snapshot_while_writer_is_active(runtime, monkeypatch):
+    service, store, _, _, _, add = runtime
+    receipt = add("A-1")
+    before = service.get("text", {"id": "one"}, "A-1")
+    with store.connect() as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        work = store.runtime(writer, receipt["_work_key"])
+        work.update(state="completed", slot_held=False, version=work["version"] + 1)
+        store.set_runtime(writer, receipt["_work_key"], work)
+        with monkeypatch.context() as patch:
+            def no_writer():
+                raise AssertionError("work GET attempted a write transaction")
+            patch.setattr(store, "transaction", no_writer)
+            assert service.get("text", {"id": "one"}, "A-1") == before
+        writer.rollback()
+    assert service.get("text", {"id": "one"}, "A-1") == before
+
+
+def test_legacy_work_read_still_adopts_under_write_transaction(runtime):
+    service, store, _, _, _, add = runtime
+    receipt = add("A-1")
+    with store.transaction() as db:
+        db.execute("DELETE FROM task_runtime WHERE name=?", (receipt.pop("_work_key"),))
+        store.write_receipt(db, "text", "one", "A-1", receipt)
+    result = service.get("text", {"id": "one"}, "A-1")
+    assert result["state"] == "active"
+    with store.connect() as db:
+        adopted = store.read_receipt(db, "text", "one", "A-1")
+        assert adopted["_work_key"]
+        assert read_work(store, db, "text", "one", adopted)["work_ref"] == result["work_ref"]
+
+
 @pytest.mark.parametrize("legacy_key", ["missing", None, "", False, [], {}])
 def test_filtered_work_members_keep_legacy_unknown_and_original_reference(runtime, legacy_key):
     service, store, _, calls, _, add = runtime

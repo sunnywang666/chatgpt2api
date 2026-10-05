@@ -207,6 +207,17 @@ class WorkLifecycleService:
         return receipt, work, members
 
     def get(self, kind, identity, request_id):
+        # An existing work is an observation, not a writer. Keep its receipt,
+        # work version and member checks in one committed SQLite snapshot so a
+        # concurrent archive/update does not make the read compete for its lock.
+        with self.store.connect() as db:
+            db.execute("BEGIN")
+            receipt = self.store.read_receipt(db, kind, str(identity["id"]), request_id)
+            if receipt and read_work(self.store, db, kind, str(identity["id"]), receipt):
+                _, work, _ = self._load(db, kind, identity, request_id)
+                return _projection(work)
+        # Legacy adoption still needs the original write transaction and full
+        # recheck; never upgrade a potentially stale read snapshot to a writer.
         with self.store.transaction() as db:
             _, work, _ = self._load(db, kind, identity, request_id)
             return _projection(work)

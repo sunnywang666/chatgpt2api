@@ -774,6 +774,23 @@ class ImageTaskService:
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
+        if requested_ids and getattr(self._transaction_local, "db", None) is None:
+            # Original-result and work-policy reads need only these receipts.
+            # Do not acquire the writer lock or decode every saved image merely
+            # to authorize/poll one ID. Expired receipts stay absent publicly;
+            # startup and the existing full-list/write paths still clean them.
+            cutoff = self._retention_cutoff()
+            items, missing_ids = [], []
+            with self.store.connect() as db:
+                db.execute("BEGIN")
+                for task_id in requested_ids:
+                    task = self.store.read_receipt(db, "image", owner, task_id)
+                    if (task is None or task.get("owner_id") != owner
+                            or self._receipt_expired(task, cutoff)):
+                        missing_ids.append(task_id)
+                    else:
+                        items.append(_public_task(task))
+            return {"items": items, "missing_ids": missing_ids}
         with self._transaction():
             if self._cleanup_locked():
                 self._save_locked()
@@ -1701,20 +1718,26 @@ class ImageTaskService:
                 changed = True
         return changed
 
-    def _cleanup_locked(self) -> bool:
+    def _retention_cutoff(self) -> float:
         try:
             retention_days = max(1, int(self.retention_days_getter()))
         except Exception:
             retention_days = 30
-        cutoff = time.time() - retention_days * 86400
+        return time.time() - retention_days * 86400
+
+    @staticmethod
+    def _receipt_expired(task: dict, cutoff: float) -> bool:
+        return (task.get("status") in TERMINAL_STATUSES and not _holds_upstream_slot(task)
+                and not task.get("retain_receipt") and not task.get("_recovery_paused")
+                and task.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
+                and _timestamp(task.get("updated_at")) < cutoff)
+
+    def _cleanup_locked(self) -> bool:
+        cutoff = self._retention_cutoff()
         removed_keys = [
             key
             for key, task in self._tasks.items()
-            if task.get("status") in TERMINAL_STATUSES and not _holds_upstream_slot(task)
-            and not task.get("retain_receipt")
-            and not task.get("_recovery_paused")
-            and task.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
-            and _timestamp(task.get("updated_at")) < cutoff
+            if self._receipt_expired(task, cutoff)
         ]
         for key in removed_keys:
             self._tasks.pop(key, None)

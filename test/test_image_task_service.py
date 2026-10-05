@@ -1043,6 +1043,58 @@ class ImageTaskServiceTests(unittest.TestCase):
             retention_days_getter=lambda: 30,
         )
 
+    def test_selected_reads_do_not_decode_history_or_wait_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "images.json")
+            original = {"id": "selected", "owner_id": OWNER["id"], "status": "success",
+                        "model": "gpt-image-2", "updated_at": "2099-01-01 00:00:00",
+                        "data": [{"url": "http://example.test/original.png"}]}
+            history = {**original, "id": "unrelated", "data": [{"b64_json": "unrelated-large-output" * 1000}]}
+            with service.store.transaction() as db:
+                service.store.write_receipt(db, "image", OWNER["id"], "selected", original)
+                service.store.write_receipt(db, "image", OWNER["id"], "unrelated", history)
+            decode = json.loads
+            def scoped_decode(raw, *args, **kwargs):
+                self.assertNotIn("unrelated-large-output", raw)
+                return decode(raw, *args, **kwargs)
+            # A different writer may be updating an original. Read its last
+            # committed receipt without trying to acquire BEGIN IMMEDIATE.
+            with service.store.connect() as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                service.store.write_receipt(writer, "image", OWNER["id"], "selected", {**original, "quality": "pending"})
+                with mock.patch.object(service.store, "transaction", side_effect=AssertionError("read acquired writer")), \
+                        mock.patch("services.task_store.json.loads", side_effect=scoped_decode):
+                    result = service.list_tasks(OWNER, ["selected", "missing", "selected"])
+                writer.rollback()
+            self.assertEqual(result["missing_ids"], ["missing"])
+            self.assertEqual([item["id"] for item in result["items"]], ["selected", "selected"])
+            self.assertTrue(all(item["quality"] is None for item in result["items"]))
+            self.assertEqual(result["items"][0]["data"], original["data"])
+            self.assertEqual(service.list_tasks(OTHER_OWNER, ["selected"]), {"items": [], "missing_ids": ["selected"]})
+            with service.store.connect() as db:
+                self.assertEqual(service.store.read_receipt(db, "image", OWNER["id"], "selected"), original)
+                self.assertEqual(service.store.read_receipt(db, "image", OWNER["id"], "unrelated"), history)
+
+    def test_selected_reads_keep_retention_visibility_and_protected_originals(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "images.json")
+            protections = {"expired": {}, "retained": {"retain_receipt": True},
+                           "paused": {"_recovery_paused": True},
+                           "unknown": {"error_code": "CONVERSATION_OUTCOME_UNKNOWN"},
+                           "unfinished": {"upstream_unfinished": True}}
+            with service.store.transaction() as db:
+                for rid, flags in protections.items():
+                    row = {"id": rid, "owner_id": OWNER["id"], "status": "error",
+                           "model": "gpt-image-2", "updated_at": "2000-01-01 00:00:00", **flags}
+                    service.store.write_receipt(db, "image", OWNER["id"], rid, row)
+            selected = service.list_tasks(OWNER, list(protections))
+            self.assertEqual(selected["missing_ids"], ["expired"])
+            self.assertEqual([item["id"] for item in selected["items"]], list(protections)[1:])
+            # Full listing still performs the established retention cleanup.
+            self.assertEqual({item["id"] for item in service.list_tasks(OWNER, [])["items"]}, set(protections) - {"expired"})
+            with service.store.connect() as db:
+                self.assertIsNone(service.store.read_receipt(db, "image", OWNER["id"], "expired"))
+
     def test_public_result_stage_never_publishes_private_assets_or_hides_stops(self):
         cached = {"output_ref": "private-output-ref", "coverage": {"file_ids": ["private-asset-id"]}}
         recovering = {"status": "error", "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
