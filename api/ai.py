@@ -15,6 +15,7 @@ from api.support import require_identity, resolve_image_base_url
 from api.key_policy import require_image_policy, require_chat_text_policy
 from utils.helper import is_image_chat_request, has_response_image_generation_tool
 from services.content_filter import check_request, request_shape, request_text
+from services.account_request_pacing import AccountReadRetryBudgetInsufficient
 from services.conversation_binding_service import (
     ConversationBindingError,
     conversation_binding_service,
@@ -366,6 +367,13 @@ def create_router() -> APIRouter:
             })
         except ConversationBindingError as exc:
             raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
+        except AccountReadRetryBudgetInsufficient as exc:
+            # read_text preserves the original connection error after a failed
+            # first attempt; this exception therefore means no GET was sent.
+            raise HTTPException(status_code=503, detail={
+                "code": "CONVERSATION_READ_DEFERRED", "reason": "read_budget_insufficient",
+                "read_sent": False, "retryable": True,
+            }) from exc
         except Exception as exc:
             raise HTTPException(status_code=503, detail={"code": "CONVERSATION_READ_UNAVAILABLE"}) from exc
 

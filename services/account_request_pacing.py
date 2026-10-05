@@ -121,7 +121,7 @@ class AccountRequestDeadlineExceeded(TimeoutError):
 
 
 class AccountReadRetryBudgetInsufficient(AccountRequestDeadlineExceeded):
-    """An original GET retry no longer has its minimum connection window."""
+    """An original GET attempt no longer has its minimum connection window."""
 
 
 def _backoff_seconds(failures):
@@ -352,7 +352,7 @@ class AccountRequestClock:
             if remaining is None:
                 return
             if minimum_budget is not None and remaining < minimum_budget:
-                raise AccountReadRetryBudgetInsufficient("original read retry connection budget unavailable")
+                raise AccountReadRetryBudgetInsufficient("original read connection budget unavailable")
             if remaining <= 0:
                 raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
             timeout = kwargs.get("timeout")

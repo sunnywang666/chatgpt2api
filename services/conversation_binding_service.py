@@ -1136,7 +1136,7 @@ class ConversationBindingService:
                     try:
                         return self._read_text_result(backend, body, deadline_monotonic=deadline,
                                                       connect_timeout_secs=10.0,
-                                                      minimum_budget_secs=10.0 if attempt else None)
+                                                      minimum_budget_secs=10.0)
                     except AccountReadRetryBudgetInsufficient:
                         if first_error is not None:
                             raise first_error from None

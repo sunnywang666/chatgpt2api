@@ -1657,6 +1657,60 @@ class TextResultRecoveryTests(unittest.TestCase):
             self.assertAlmostEqual(clock.next_conversation_read, before, delta=0.001)
             self.assertEqual(clock.conversation_read_rate_failures, 6)
 
+    def test_direct_first_read_requires_network_budget_after_queueing(self):
+        import services.account_request_pacing as pacing
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        with tempfile.TemporaryDirectory() as directory:
+            now = [100.]
+            fake_time = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1700000000 + now[0],
+                                        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+            with mock.patch.object(pacing, "time", fake_time), mock.patch.object(
+                pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                                                  account_conversation_read_interval_secs=60)
+            ):
+                clock = pacing.AccountRequestClock("fixture", Path(directory) / "clock.json")
+                clock.next_conversation_read = 159.
+                clock._save()
+                raw = mock.Mock(return_value=SimpleNamespace(status_code=200, headers={},
+                    json=self.document, close=lambda: None))
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.base_url = "https://fixture.invalid"
+                backend._headers = lambda path, headers: headers
+                backend.session = SimpleNamespace(
+                    get=lambda url, **kw: clock.request(raw, "GET", url, **kw), close=lambda: None)
+                with (
+                    mock.patch("services.conversation_binding_service.time", fake_time),
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
+                    mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+                ):
+                    with self.assertRaises(pacing.AccountReadRetryBudgetInsufficient):
+                        ConversationBindingService().read_text(self.cursor)
+                raw.assert_not_called()
+                self.assertEqual(clock.ordinary_read_queue, [])
+                self.assertFalse(clock.lock.locked())
+                self.assertEqual(clock.next_conversation_read, 159.)
+
+    def test_admin_cursor_route_reports_first_read_budget_deferral(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        from services.account_request_pacing import AccountReadRetryBudgetInsufficient
+
+        app = FastAPI()
+        app.include_router(create_router())
+        with mock.patch("api.ai.require_identity", return_value={"id": "admin", "role": "admin"}), \
+             mock.patch("api.ai.conversation_binding_service.read_text", side_effect=AccountReadRetryBudgetInsufficient()):
+            with TestClient(app) as client:
+                result = client.get("/api/conversation-bindings/text", params=self.cursor)
+        self.assertEqual(result.status_code, 503)
+        self.assertEqual(result.json()["detail"], {
+            "code": "CONVERSATION_READ_DEFERRED", "reason": "read_budget_insufficient",
+            "read_sent": False, "retryable": True,
+        })
+
     def test_admin_cursor_route_reads_the_same_bound_account(self):
         from fastapi import FastAPI, HTTPException
         from fastapi.testclient import TestClient
@@ -1682,7 +1736,7 @@ class TextResultRecoveryTests(unittest.TestCase):
                 identity.side_effect = HTTPException(status_code=401)
                 self.assertEqual(client.get("/api/conversation-bindings/text", params=self.cursor).status_code, 401)
         backend._get_conversation.assert_called_once_with("conversation-one", deadline_monotonic=mock.ANY,
-                                                         connect_timeout_secs=10.0)
+                                                         connect_timeout_secs=10.0, minimum_budget_secs=10.0)
 
     def test_direct_read_reconnects_once_with_same_cursor_and_deadline(self):
         from curl_cffi.requests.exceptions import SSLError
@@ -1702,7 +1756,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         self.assertEqual(backend._get_conversation.call_count, 2)
         first, second = backend._get_conversation.call_args_list
         self.assertEqual(first.args, second.args)
-        self.assertEqual(first.kwargs, {k: v for k, v in second.kwargs.items() if k != "minimum_budget_secs"})
+        self.assertEqual(first.kwargs, second.kwargs)
         self.assertEqual(second.kwargs["minimum_budget_secs"], 10.0)
         backend.stream_conversation.assert_not_called()
         backend.close.assert_called_once()
