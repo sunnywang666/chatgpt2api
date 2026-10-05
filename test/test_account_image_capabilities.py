@@ -25,6 +25,13 @@ def image_observation(remaining):
 
 
 class AccountCapabilityTests(unittest.TestCase):
+    def test_unavailable_image_precheck_is_a_known_local_admission_rejection(self):
+        from services.request_context import AdmissionLost
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            with self.assertRaises(AdmissionLost):
+                service.require_image_account("absent-fixture", "gpt-image-2")
+
     def test_image_capability_projection_retains_evidence_without_claiming_dispatch(self) -> None:
         now = datetime.now(timezone.utc)
         account = {

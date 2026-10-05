@@ -114,6 +114,83 @@ def test_active_account_shares_one_socket_and_last_release_stops_it(monkeypatch)
     assert hub.stopped.is_set() and "fixture" not in completion._hubs and not hub.thread.is_alive()
 
 
+def test_active_shared_listener_survives_first_callers_five_minute_window(monkeypatch):
+    from curl_cffi import CurlECode, CurlError
+    now = [0.0]
+    monkeypatch.setattr(completion.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(completion.select, "select", lambda *_args: ([], [], []))
+    hub = completion._ConversationHints()
+    original, later = threading.Event(), threading.Event()
+    hub.signals[CID] = {original}
+    reply = {"id": 2, "reply": {"type": "subscribe", "topic_id": "conversations"}}
+    session = Session([[reply], [global_image_event("later")]])
+    recv = session.ws.recv_fragment
+    calls = [0]
+    def receive():
+        calls[0] += 1
+        if calls[0] == 2:
+            now[0] = 301
+            hub.signals["later"] = {later}
+            raise CurlError("try again", CurlECode.AGAIN)
+        return recv()
+    session.ws.curl = SimpleNamespace(getinfo=lambda _info: 0)
+    session.ws.recv_fragment = receive
+    hub.run(lambda: (session, URL, {}, lambda: None, 10))
+    assert later.is_set() and not original.is_set()
+    assert len(session.connected) == 1 and session.ws.closed
+
+
+def test_disconnected_shared_listener_preserves_fallback_interval(monkeypatch):
+    def disconnect(hub, _factory):
+        hub.stopped.set()
+    monkeypatch.setattr(completion._ConversationHints, "run", disconnect)
+    sleeps = []
+    monkeypatch.setattr(completion.time, "sleep", sleeps.append)
+    with completion.image_completion_hints("disconnected-fixture", CID, lambda: None) as wait:
+        completion._hubs["disconnected-fixture"].thread.join(1)
+        assert wait(10) is False
+    assert sleeps == [10] and "disconnected-fixture" not in completion._hubs
+
+
+def test_last_real_context_closes_idle_socket(monkeypatch):
+    from curl_cffi import CurlECode, CurlError
+    idle, cleanup = threading.Event(), []
+    session = Session([])
+    session.ws.curl = SimpleNamespace(getinfo=lambda _info: 0)
+    def receive():
+        raise CurlError("try again", CurlECode.AGAIN)
+    def wait_readable(*_args):
+        idle.set()
+        completion._hubs["idle-fixture"].stopped.wait(.01)
+        return [], [], []
+    session.ws.recv_fragment = receive
+    monkeypatch.setattr(completion.select, "select", wait_readable)
+    opener = lambda: (session, URL, {}, lambda: cleanup.append(True), time.monotonic() + 10)
+    with completion.image_completion_hints("idle-fixture", CID, opener):
+        hub = completion._hubs["idle-fixture"]
+        assert idle.wait(1)
+    assert session.ws.closed and cleanup == [True] and not hub.thread.is_alive()
+    assert "idle-fixture" not in completion._hubs
+
+
+def test_cancel_during_handshake_does_not_subscribe_after_last_release():
+    connecting, finish_connect, cleanup = threading.Event(), threading.Event(), []
+    session = Session([])
+    def connect(*_args, **_kwargs):
+        connecting.set()
+        assert finish_connect.wait(2)
+        return session.ws
+    session.ws_connect = connect
+    opener = lambda: (session, URL, {}, lambda: cleanup.append(True), time.monotonic() + 10)
+    with completion.image_completion_hints("connecting-fixture", CID, opener):
+        hub = completion._hubs["connecting-fixture"]
+        assert connecting.wait(1)
+    finish_connect.set()
+    hub.thread.join(1)
+    assert not hub.thread.is_alive() and session.ws.sent == []
+    assert session.ws.closed and cleanup == [True]
+
+
 def test_expired_image_never_starts_notification_transport():
     backend = object.__new__(OpenAIBackendAPI)
     backend.account = {"provider_account_identity": "expired-fixture"}

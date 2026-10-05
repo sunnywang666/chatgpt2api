@@ -3207,10 +3207,15 @@ class OpenAIBackendAPI:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
         self.image_submission_started = False
+        # Admission may have waited while another result consumed the last
+        # capacity observation. Avoid uploads/bootstrap for an unsendable turn;
+        # the paced POST still performs the authoritative final check.
+        account_service.require_image_account(self.access_token, model)
         self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         self._report_progress("bootstrapping")
         self._bootstrap()
+        account_service.require_image_account(self.access_token, model)
         self._report_progress("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")

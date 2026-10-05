@@ -123,6 +123,7 @@ class AccountService:
 
     def require_image_account(self, access_token: str, model: str, *, expected_identity: str | None = None) -> dict:
         """Recheck the exact account before execution; never select another one."""
+        from services.request_context import AdmissionLost
         with self._lock:
             token = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(token) or {}
@@ -130,7 +131,7 @@ class AccountService:
             if (expected_identity and identity != expected_identity
                     or sum(self._stable_account_identity(a) == identity for a in self._accounts.values()) != 1
                     or self.image_account_capacity(account, model) <= 0):
-                raise RuntimeError("selected image account capability is unavailable")
+                raise AdmissionLost("selected image account capability is unavailable")
             return dict(account)
 
     def refresh_image_capability(self, account_ref: str) -> None:

@@ -405,6 +405,76 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(clock.cooldown_until, 160)
 
     @mock.patch("services.openai_backend_api.account_service.require_image_account")
+    def test_stale_image_capacity_skips_preparation_without_marking_submitted(self, capability):
+        from services.request_context import AdmissionLost
+        for stale_at in (1, 2, 3):
+            with self.subTest(stale_at=stale_at):
+                capability.reset_mock()
+                capability.side_effect = ([{}] * (stale_at - 1)
+                                          + [AdmissionLost("selected image account capability is unavailable")])
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.access_token = "synthetic-fixture"
+                backend.base_url = "https://provider.test"
+                backend.image_request_message_id = "original-message"
+                backend.retain_bound_conversation = True
+                callback = lambda _step: None
+                callback.record_submission_started = mock.Mock()
+                backend.progress_callback = callback
+                backend._upload_image = mock.Mock(return_value={
+                    "file_id": "fixture-file", "width": 1, "height": 1, "file_size": 1,
+                    "mime_type": "image/png", "file_name": "fixture.png",
+                })
+                backend._bootstrap = mock.Mock()
+                backend._get_chat_requirements = mock.Mock(return_value=ChatRequirements(token="fixture"))
+                backend._prepare_image_conversation = mock.Mock(return_value="conduit")
+                backend._image_model_settings = lambda _model: ("gpt-image", "")
+                backend._image_headers = lambda *_args: {}
+                backend._image_active_timeout = lambda _timeout: 30
+                transport = mock.Mock()
+                def post(_url, **kwargs):
+                    kwargs['_account_request_before_send']()
+                    return transport()
+                backend.session = mock.Mock()
+                backend.session.post.side_effect = post
+                backend.close = mock.Mock()
+                request = ConversationRequest(model="gpt-image-2", prompt="mug",
+                    provider_binding_id="binding-1", provider_account_identity="account-1",
+                    client_conversation_id="original-client", retain_conversation=True,
+                    progress_callback=callback)
+                with (
+                    mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.protocol.conversation.account_service.acquire_bound_image_access_token", return_value="synthetic-fixture"),
+                    mock.patch("services.protocol.conversation.account_service.get_account", return_value={}),
+                    mock.patch("services.protocol.conversation.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.protocol.conversation.account_service.mark_image_result") as mark,
+                    mock.patch("services.protocol.conversation.account_service.release_image_slot") as release,
+                    mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend),
+                    mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=lambda *_args:
+                        backend._stream_picture_conversation("mug", "gpt-image-2", ["fixture"])),
+                ):
+                    with self.assertRaises(ImageGenerationError) as raised:
+                        _generate_bound_single_image(request, 1, 1)
+                    self.assertEqual(raised.exception.code, "IMAGE_GENERATION_NOT_SUBMITTED")
+                    self.assertIs(raised.exception.upstream_submitted, False)
+                    self.assertEqual(raised.exception.request_message_id, "original-message")
+                    mark.assert_not_called()
+                    release.assert_called_once_with("synthetic-fixture")
+                self.assertFalse(backend.image_submission_started)
+                self.assertEqual(backend.image_request_message_id, "original-message")
+                callback.record_submission_started.assert_not_called()
+                transport.assert_not_called()
+                if stale_at == 1:
+                    backend._upload_image.assert_not_called()
+                    backend._bootstrap.assert_not_called()
+                if stale_at <= 2:
+                    backend._get_chat_requirements.assert_not_called()
+                    backend._prepare_image_conversation.assert_not_called()
+                    backend.session.post.assert_not_called()
+                else:
+                    backend._prepare_image_conversation.assert_called_once()
+                    backend.session.post.assert_called_once()
+
+    @mock.patch("services.openai_backend_api.account_service.require_image_account")
     def test_final_local_deadline_after_reservation_remains_known_unsent(self, _capability):
         from services.request_context import executing
         now = [100.0]

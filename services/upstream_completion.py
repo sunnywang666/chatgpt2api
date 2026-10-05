@@ -66,6 +66,8 @@ class _ConversationHints:
                 return
             ws = session.ws_connect(url, timeout=min(10, transport_deadline - time.monotonic()), headers={"Origin": "https://chatgpt.com"},
                                     allow_redirects=False, **options)
+            if self.stopped.is_set():
+                return
             ws.send(json.dumps([
                 {"id": 1, "command": {"type": "connect", "presence": {"type": "presence", "state": "background"}}},
                 # No history replay: these are wakeups for currently running
@@ -73,8 +75,10 @@ class _ConversationHints:
                 {"id": 2, "command": {"type": "subscribe", "topic_id": "conversations"}},
             ]), flags=CurlWsFlag.TEXT)
             fragments, subscribed = bytearray(), False
-            deadline = time.monotonic() + 300
-            while not self.stopped.is_set() and time.monotonic() < deadline:
+            # Each caller already owns its active-result budget. A fixed
+            # lifetime from the first caller would cut off later concurrent
+            # turns; the last context release stops this shared listener.
+            while not self.stopped.is_set():
                 try:
                     chunk, frame = ws.recv_fragment()
                 except CurlError as exc:
