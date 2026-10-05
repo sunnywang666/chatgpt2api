@@ -106,8 +106,10 @@ async def external_image_boundary(request: Request, call_next):
     if chat_body_limit is not None:
         # Authenticate before inspecting Content-Length or consuming one byte.
         # This also protects direct Provider calls where the proxy marker is
-        # absent. Hold the slot through downstream JSON parsing so a caller
-        # cannot multiply the bounded body allocation with concurrent reads.
+        # absent. Large chat bodies retain the slot through downstream parsing
+        # so concurrent requests cannot multiply the 140 MiB allocation.
+        # Small controls release it after their bounded read: waiting for task
+        # state must not consume the capacity needed to read another control.
         legacy_control = (not is_external(request) and bool(re.fullmatch(
             r"/api/(?:image-tasks|conversation-bindings/text-requests)/[^/]+/recovery-control", path)))
         _, rejected = _ordinary_chat_identity(request, ordinary_only=not legacy_control)
@@ -122,17 +124,22 @@ async def external_image_boundary(request: Request, call_next):
                 status_code=429,
                 headers={"Retry-After": "1"},
             )
+        body_reader_held = True
         try:
             rejected = await _buffer_bounded_body(
                 request, chat_body_limit, chat_body_error,
             )
             if rejected is not None:
                 return rejected
+            if path != "/api/chat-requests":
+                _release_public_chat_body_reader()
+                body_reader_held = False
             response = await call_next(request)
             response.headers["Cache-Control"] = "private, no-store"
             return response
         finally:
-            _release_public_chat_body_reader()
+            if body_reader_held:
+                _release_public_chat_body_reader()
     if not is_external(request):
         return await call_next(request)
     if request.method == "OPTIONS":
