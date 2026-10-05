@@ -1305,6 +1305,90 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(DownloadBackend.reads, 0)
             self.assertEqual(service._tasks["owner-1:download-task"]["_first_qualified_image_assets_observed_at"], first_assets_observed)
 
+    def test_fresh_original_terminal_recovery_skips_settle_but_keeps_publication_check(self):
+        from copy import deepcopy
+        for case in ("complete", "new_second_image", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "tasks.json"
+                write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", error="",
+                    upstream_unfinished=True, _image_thread={"protocol": "image-thread-v1"},
+                    _image_thread_request_parent="anchor",
+                    **({"_pending_image_result_ids": {"file_ids": ["missing" if case == "pending_missing" else "original-image"], "sediment_ids": []}}
+                       if case in ("pending_missing", "new_second_image") else {}))
+                service = self.make_service(path)
+                service._update_task("owner-1:policy-task", _image_thread={"id": "original-thread"},
+                                     _image_thread_request_parent="anchor")
+                document = {"conversation_id": "conversation-1", "current_node": "final", "mapping": {
+                    "original-request": {"parent": "anchor", "message": {
+                        "id": "original-request", "author": {"role": "user"}}},
+                    "image": {"parent": "original-request", "message": {
+                        "id": "image", "author": {"role": "tool"}, "status": "finished_successfully",
+                        "metadata": {"async_task_type": "image_gen"},
+                        "content": {"parts": ["file-service://original-image"]}}},
+                    "final": {"parent": "image", "message": {"id": "final", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True}}}}
+                if case == "parent_changed": document["mapping"]["original-request"]["parent"] = "other"
+                if case == "running": document["mapping"]["final"]["message"]["status"] = "in_progress"
+                expected_files = ["original-image"]
+                if case == "new_second_image":
+                    expected_files.append("second-image")
+                    document["mapping"]["image"]["message"]["content"]["parts"].append("file-service://second-image")
+                calls = {"read": 0, "poll": 0, "download": 0}
+                class Backend(OpenAIBackendAPI):
+                    def __init__(self, **kwargs): pass
+                    def _get_conversation(self, cid):
+                        self_test.assertEqual(cid, "conversation-1")
+                        calls["read"] += 1
+                        if case == "read_429":
+                            error = RuntimeError("rate limited")
+                            error.status_code = 429
+                            raise error
+                        result = deepcopy(document)
+                        if case == "post_download_changed" and calls["read"] > 1:
+                            result["mapping"]["original-request"]["parent"] = "other"
+                        return result
+                    def _poll_image_results(self, cid, timeout, **kwargs):
+                        calls["poll"] += 1
+                        self_test.assertEqual(kwargs["initial_document"], document)
+                        raise ImagePollTimeoutError("not confirmed", cid)
+                    def resolve_conversation_image_urls(self, cid, files, sediments, **kwargs):
+                        self_test.assertEqual((cid, files, sediments), ("conversation-1", expected_files, []))
+                        return ["https://original.test/" + f + ".png" for f in files]
+                    def download_image_bytes(self, urls):
+                        calls["download"] += 1
+                        return [f.encode() for f in expected_files]
+                    def close(self): pass
+                self_test = self
+                with (
+                    mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="token"),
+                    mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", Backend),
+                    mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "saved"}]}) as publish,
+                    mock.patch("services.protocol.conversation._observe_image_terminal") as observe,
+                    mock.patch("services.image_task_service.time.sleep"),
+                ):
+                    service._run_resume_poll("owner-1:policy-task", "conversation-1", 60,
+                        "http://localhost", OWNER, "generate", "gpt-image-2", False, False)
+                row = service._tasks["owner-1:policy-task"]
+                if case in ("complete", "new_second_image", "post_download_changed"):
+                    self.assertEqual(calls, {"read": 2, "poll": 0, "download": 1})
+                    observe.assert_called_once_with()
+                else:
+                    self.assertEqual(calls, {"read": 1, "poll": 0 if case == "read_429" else 1, "download": 0})
+                    observe.assert_not_called()
+                if case in ("complete", "new_second_image"):
+                    self.assertEqual(row["status"], "success")
+                    self.assertEqual(row["parent_message_id"], "final")
+                    self.assertEqual(row["result_file_ids"], expected_files)
+                    publish.assert_called_once()
+                    self.assertEqual(len(publish.call_args.args[0]), len(expected_files))
+                else:
+                    self.assertEqual(row["status"], "error")
+                    publish.assert_not_called()
+                    self.assertFalse(row.get("data"))
+                    if case == "post_download_changed": self.assertTrue(row["_pending_image_output"])
+
     def test_downloaded_original_is_private_and_reused_after_confirmation_failure(self):
         from services.request_context import executing
         for alteration in ("unchanged", "asset_drift", "corrupt", "confirmation_still_fails"):

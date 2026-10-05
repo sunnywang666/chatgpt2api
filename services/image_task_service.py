@@ -2402,13 +2402,37 @@ class ImageTaskService:
                     return False
 
                 try:
+                    strict_ids = None
+                    extract_records = getattr(backend, "_extract_image_tool_records", None)
+                    if image_thread and callable(extract_records):
+                        records = extract_records(document, request_message_id)
+                        files = list(dict.fromkeys(x for record in records for x in record["file_ids"]))
+                        sediments = list(dict.fromkeys(x for record in records for x in record["sediment_ids"]))
+                        if ((files or sediments)
+                                and set(pending_ids.get("file_ids", [])) <= set(files)
+                                and set(pending_ids.get("sediment_ids", [])) <= set(sediments)):
+                            try:
+                                # Only this recovery's just-read original may
+                                # bypass another asset settle cycle. The fresh
+                                # post-download branch check remains mandatory.
+                                finished_parent(document, conversation_id, request_message_id,
+                                    expected_parent=expected_parent,
+                                    expected_result_ids=files + sediments,
+                                    predecessor_request_message_id=predecessor_message,
+                                    predecessor_result_ids=predecessor_ids)
+                            except ImageThreadError:
+                                pass
+                            else:
+                                from services.protocol.conversation import _observe_image_terminal
+                                _observe_image_terminal()
+                                strict_ids = (files, sediments)
                     pending_options = (
                         {"initial_file_ids": pending_ids.get("file_ids", []),
                          "initial_sediment_ids": pending_ids.get("sediment_ids", []),
                          "require_fresh_result_ids": True}
                         if pending_ids else {}
                     )
-                    file_ids, sediment_ids = backend._poll_image_results(
+                    file_ids, sediment_ids = strict_ids if strict_ids is not None else backend._poll_image_results(
                         conversation_id,
                         extra_timeout_secs,
                         request_message_id=request_message_id,

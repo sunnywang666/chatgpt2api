@@ -120,6 +120,13 @@ def image_result_stage(receipt):
     cached = receipt.get("_pending_image_output")
     if isinstance(cached, dict) and cached.get("output_ref") and isinstance(cached.get("coverage"), dict):
         return "downloaded_waiting_original_confirmation"
+    if (int(receipt.get("_expected_sends") or 1) == 1
+            and int(receipt.get("_send_sequence") or 1) == 1
+            and any(isinstance(e, dict) and e.get("stage") == "upstream_terminal" and e.get("known") is True
+                    for e in receipt.get("_execution_timeline", []))):
+        # An observed terminal turn is progress, not a saved/downloadable result
+        # and not permission to release the work slot or submit another turn.
+        return "upstream_finished"
     if (receipt.get("result_file_ids") or receipt.get("result_sediment_ids")
             or pending_image_result_ids(receipt)):
         return "assets_discovered"

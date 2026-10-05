@@ -86,6 +86,8 @@ def test_image_stages_emit_state_changes_without_exposing_assets(runtime, monkey
         {'status': 'running', 'upstream_submission_started': False},
         {'status': 'running', 'upstream_submission_started': True},
         {'status': 'running', 'result_file_ids': ['private-asset']},
+        {'status': 'running', 'result_file_ids': ['private-asset'],
+         '_execution_timeline': [{'stage': 'upstream_terminal', 'known': True}]},
         {'status': 'running', '_pending_image_output': {'output_ref': 'private-ref', 'coverage': {}}},
         {'status': 'success', 'data': [{'url': 'private-result'}]},
     ])
@@ -100,8 +102,9 @@ def test_image_stages_emit_state_changes_without_exposing_assets(runtime, monkey
     response = client.get('/api/image-tasks/original/events')
     payloads = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ')]
     assert [p['result_stage'] for p in payloads] == ['submission_unconfirmed', 'preparing', 'submitted', 'assets_discovered',
-        'downloaded_waiting_original_confirmation', 'result_ready']
-    assert response.text.count('event: state\n') == 5
+        'upstream_finished', 'downloaded_waiting_original_confirmation', 'result_ready']
+    assert all(p['result_ready'] is False for p in payloads[:-1])
+    assert response.text.count('event: state\n') == 6
     assert response.text.count('event: result_ready\n') == 1
     assert 'private-' not in response.text
 
@@ -114,6 +117,27 @@ def test_policy_change_and_bounded_wait(runtime, monkeypatch):
     assert 'event: reconnect' in result.text and 'event: result_ready' not in result.text
     identity['policy'] = make_policy(['codex'], revision=2).to_record()
     assert client.get('/api/image-tasks/original/events').status_code == 403
+
+
+@pytest.mark.parametrize('fields,expected', [
+    ({}, 'upstream_finished'),
+    ({'_send_sequence': 2}, 'assets_discovered'),
+    ({'_expected_sends': 2}, 'assets_discovered'),
+    ({'_recovery_paused': True}, 'needs_attention'),
+    ({'_recovery_suppressed': True}, 'needs_attention'),
+    ({'_execution_timeline': [{'stage': 'upstream_terminal', 'known': False}]}, 'assets_discovered'),
+])
+def test_terminal_observation_is_current_progress_only(runtime, fields, expected):
+    _, put, identity, store = runtime
+    row = {'status': 'running', 'result_file_ids': ['private-asset'],
+           '_execution_timeline': [{'stage': 'upstream_terminal', 'known': True}], **fields}
+    put(**row)
+    snapshot = events._snapshot('image', SimpleNamespace(store=store), identity, 'original')
+    assert snapshot['result_stage'] == expected
+    assert snapshot['result_ready'] is False and snapshot['result_count'] == 0
+    with store.connect() as db:
+        unchanged = store.read_receipt(db, 'image', identity['id'], 'original')
+    assert unchanged == {'model': 'gpt-image-2', **row}
 
 
 @pytest.mark.parametrize('kind,status,body', [('image', 'success', {'data': []}),
