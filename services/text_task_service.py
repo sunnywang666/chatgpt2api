@@ -341,6 +341,8 @@ class TextTaskService:
             result["correction_of_request_id"] = receipt["_terminal_empty_correction_of"]
         if receipt.get("_supersedes_request_id"):
             result["supersedes_request_id"] = receipt["_supersedes_request_id"]
+        if receipt.get("_derived_input"):
+            result["derived_input"] = receipt["_derived_input"]
         completion = receipt.get("_completion")
         if isinstance(completion, dict):
             result["completion"] = {key: completion[key] for key in (
@@ -1306,6 +1308,8 @@ class TextTaskService:
     def submission_input(self, owner, body):
         """Resolve an explicit internal reference; callers cannot replace original content."""
         if "supersedes_request_id" not in body:
+            if "derived_input" in body:
+                raise ConversationBindingError("derived input requires original request", code="CHAT_DERIVED_INPUT_INVALID")
             return body
         request_id = body.get("client_request_id")
         with self._db() as db:
@@ -1313,8 +1317,9 @@ class TextTaskService:
             conflict = "CONVERSATION_REQUEST_CONFLICT" if existing else "CHAT_SUPERSEDE_INVALID"
             def reject():
                 raise ConversationBindingError("original successor input cannot be changed", code=conflict)
-            if (set(body) != self.SUPERSEDE_FIELDS or not owner
-                    or any(not isinstance(v, str) or not v.strip() or v != v.strip() for v in body.values())
+            derived = "derived_input" in body
+            if (set(body) != self.SUPERSEDE_FIELDS | ({"derived_input"} if derived else set()) or not owner
+                    or any(not isinstance(body.get(k), str) or not body[k].strip() or body[k] != body[k].strip() for k in self.SUPERSEDE_FIELDS)
                     or len(request_id) > 200 or len(body["supersedes_request_id"]) > 200
                     or request_id == body["supersedes_request_id"]):
                 reject()
@@ -1330,7 +1335,12 @@ class TextTaskService:
             except (OSError, ValueError, TypeError, KeyError):
                 reject()
             expected = {**retained, "client_request_id": request_id, "supersedes_request_id": body["supersedes_request_id"]}
+            if derived and not existing:
+                from services.category_directory_derivation import derive_category_parent_input
+                expected, _ = derive_category_parent_input(retained, request_id, body["supersedes_request_id"], body["derived_input"])
             if existing and retained.get("supersedes_request_id") != body["supersedes_request_id"]:
+                reject()
+            if existing and ("derived_input" in retained) != derived:
                 reject()
             if any(expected.get(k) != v for k, v in body.items()):
                 reject()
@@ -1390,6 +1400,21 @@ class TextTaskService:
             reject("CHAT_SUPERSEDE_INVALID")
         if identity != (previous_id, row[0]):
             reject("CHAT_SUPERSEDE_INVALID")
+        if successor.get("_derived_input"):
+            if (previous.get("original_http_status") != 413
+                    or previous.get("original_failure_phase") != "stream_open"
+                    or previous.get("original_upstream_request_stage") != "conversation"
+                    or previous.get("original_exception_category") != "http"
+                    or previous.get("_submission_started") is not True):
+                reject("CHAT_DERIVED_INPUT_INVALID")
+            from services.category_directory_derivation import derive_category_parent_input
+            derived_body, audit = derive_category_parent_input(original_body, successor["request_id"], previous_id,
+                                                               {"kind": successor["_derived_input"].get("kind")})
+            if successor["_derived_input"] != {**audit, "original_input_hash": row[0]}:
+                reject("CHAT_DERIVED_INPUT_INVALID")
+            saved = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, successor["request_id"])).fetchone()
+            if saved and TextTaskService._submission_identity(owner, derived_body)[1] != saved[0]:
+                reject("CHAT_DERIVED_INPUT_INVALID")
         # The submission root is stable even when a result advances the live cursor.
         if any(original_body.get(k) != successor.get(k) for k in (
                 "provider_binding_id", "provider_account_identity", "conversation_id", "client_conversation_id")):
@@ -1418,10 +1443,21 @@ class TextTaskService:
         if not row:
             reject("CHAT_SUPERSEDE_INVALID")
         original = json.loads(row[1])
-        comparison = {k: v for k, v in body.items() if k != "supersedes_request_id"}
-        comparison["client_request_id"] = previous_id
-        if self._submission_identity(owner, comparison) != (previous_id, row[0]):
-            reject("CHAT_SUPERSEDE_INVALID")
+        if "derived_input" in body:
+            from services.category_directory_derivation import derive_category_parent_input
+            try:
+                retained = self.store.load_input(original["_input_ref"])
+                expected, audit = derive_category_parent_input(retained, body["client_request_id"], previous_id, body["derived_input"])
+            except (OSError, ValueError, TypeError, KeyError):
+                reject("CHAT_DERIVED_INPUT_INVALID")
+            if self._submission_identity(owner, expected) != self._submission_identity(owner, body):
+                reject("CHAT_DERIVED_INPUT_INVALID")
+            receipt["_derived_input"] = {**audit, "original_input_hash": row[0]}
+        else:
+            comparison = {k: v for k, v in body.items() if k != "supersedes_request_id"}
+            comparison["client_request_id"] = previous_id
+            if self._submission_identity(owner, comparison) != (previous_id, row[0]):
+                reject("CHAT_SUPERSEDE_INVALID")
         receipt.update({k: body.get(k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id")})
         receipt.update(_supersedes_request_id=previous_id, _supersedes_input_hash=row[0],
                        _supersedes_request_message_id=original.get("request_message_id"),
