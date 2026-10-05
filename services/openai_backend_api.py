@@ -2892,6 +2892,7 @@ class OpenAIBackendAPI:
     def _resolve_image_urls(self, conversation_id: str, file_ids: list[str], sediment_ids: list[str]) -> list[str]:
         """把图片结果 id 解析成可下载 URL。"""
         urls = []
+        first_error = None
         skip_patterns = {"file_upload"}
         for file_id in file_ids:
             if file_id in skip_patterns:
@@ -2905,6 +2906,8 @@ class OpenAIBackendAPI:
             try:
                 url = self._get_file_download_url(file_id)
             except Exception as exc:
+                if first_error is None:
+                    first_error = exc
                 logger.debug({
                     "event": "image_download_url_failed",
                     "source": "file",
@@ -2931,11 +2934,15 @@ class OpenAIBackendAPI:
                 "sediment_ids": sediment_ids,
                 "urls": urls,
             })
+            if not urls and first_error is not None:
+                raise first_error
             return urls
         for sediment_id in sediment_ids:
             try:
                 url = self._get_attachment_download_url(conversation_id, sediment_id)
             except Exception as exc:
+                if first_error is None:
+                    first_error = exc
                 logger.debug({
                     "event": "image_download_url_failed",
                     "source": "sediment",
@@ -2961,6 +2968,8 @@ class OpenAIBackendAPI:
             "sediment_ids": sediment_ids,
             "urls": urls,
         })
+        if not urls and first_error is not None:
+            raise first_error
         return urls
 
     def resolve_conversation_image_urls(

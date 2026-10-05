@@ -327,6 +327,85 @@ class MultiImageResultTests(unittest.TestCase):
                     )))
                 self.assertEqual(saved, [(["generated-image"], ["generated-sediment"])])
 
+    def test_confirmed_assets_with_unavailable_urls_do_not_wait_for_generation_again(self):
+        from utils.helper import UpstreamHTTPError
+        for text in ("", "Here is your image.", '{"referenced_image_ids": ["image"]}'):
+            for failure in ("empty", "429"):
+                with self.subTest(text=text, failure=failure):
+                    doc = _conversation(["file-one"], ["sed-one"])
+                    doc["mapping"]["request"]["message"]["id"] = "request"
+                    doc["mapping"]["tool"]["message"].update(id="tool", status="finished_successfully")
+                    doc["mapping"]["final"] = {"parent": "tool", "message": {
+                        "id": "final", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True, "channel": "final"}}
+                    doc["current_node"] = "final"
+                    backend = FakeBackend([doc]); backend.image_request_message_id = "request"
+                    backend._poll_image_results = mock.Mock(side_effect=AssertionError("already terminal"))
+                    backend.download_image_bytes = mock.Mock()
+                    upstream_error = UpstreamHTTPError("download URL", 429, {}, retry_after=123)
+                    if failure == "429":
+                        backend._get_file_download_url = mock.Mock(side_effect=upstream_error)
+                        backend._get_attachment_download_url = mock.Mock(side_effect=upstream_error)
+                    saved = []
+                    callback = lambda _step: None
+                    callback.record_result_ids = lambda files, sediments: saved.append((files, sediments))
+                    event = {"type": "conversation.event", "conversation_id": "conv-1",
+                             "file_ids": ["file-one"], "sediment_ids": ["sed-one"],
+                             "text": text, "turn_use_case": "image gen"}
+                    with mock.patch("services.protocol.conversation.conversation_events",
+                                    return_value=(item for item in [event])) as stream, \
+                         mock.patch("services.protocol.conversation.time.sleep") as sleep:
+                        with self.assertRaises(RuntimeError) as raised:
+                            list(stream_image_outputs(backend, ConversationRequest(
+                                prompt="fixture", model="gpt-image-2", progress_callback=callback)))
+                    if failure == "429":
+                        self.assertIs(raised.exception, upstream_error)
+                        self.assertEqual(raised.exception.retry_after, 123)
+                    else:
+                        self.assertIn("download URLs", str(raised.exception))
+                    self.assertEqual(saved, [(["file-one"], ["sed-one"])])
+                    self.assertEqual(backend.calls, 1)  # Only the strict original-turn check.
+                    stream.assert_called_once()
+                    backend._poll_image_results.assert_not_called()
+                    backend.download_image_bytes.assert_not_called()
+                    sleep.assert_not_called()
+
+    def test_url_resolution_preserves_failure_without_losing_successful_alternate(self):
+        from utils.helper import UpstreamHTTPError
+        backend = FakeBackend()
+        error = UpstreamHTTPError("file URL", 429, {}, retry_after=123)
+        backend._get_file_download_url = mock.Mock(side_effect=error)
+        with self.assertRaises(UpstreamHTTPError) as raised:
+            backend._resolve_image_urls("conv-1", ["file-one"], [])
+        self.assertIs(raised.exception, error)
+        backend.sediment_urls["sed-one"] = "https://files.test/original.png"
+        self.assertEqual(backend._resolve_image_urls("conv-1", ["file-one"], ["sed-one"]),
+                         ["https://files.test/original.png"])
+
+    def test_unbound_url_transport_failure_after_submission_never_regenerates(self):
+        from services.protocol.conversation import _generate_single_image
+        for detail in ("curl: (35) SSL connect error", "curl: (28) Connection timed out"):
+            with self.subTest(detail=detail):
+                backend = mock.Mock(image_submission_started=True)
+                def failed_output(*_args):
+                    raise ConnectionError(detail)
+                    yield  # The failure occurs before the first yielded chunk.
+                with mock.patch("services.protocol.conversation.account_service") as accounts, \
+                     mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend) as create, \
+                     mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=failed_output) as stream, \
+                     mock.patch("services.protocol.conversation.time.sleep") as sleep:
+                    accounts.get_available_access_token.return_value = "fixture-token"
+                    accounts.get_account.return_value = {}
+                    with self.assertRaises(ImageGenerationError) as raised:
+                        _generate_single_image(ConversationRequest(prompt="fixture", model="gpt-image-2"), 1, 1)
+                self.assertIs(raised.exception.upstream_submitted, True)
+                accounts.get_available_access_token.assert_called_once()
+                accounts.refresh_access_token.assert_not_called()
+                stream.assert_called_once()
+                create.assert_called_once()
+                sleep.assert_not_called()
+                backend.close.assert_called_once()
+
     def test_stream_id_extractor_keeps_full_file_ids(self) -> None:
         payload = (
             '{"conversation_id":"conv-1"} '

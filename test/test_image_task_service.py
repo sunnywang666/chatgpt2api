@@ -1838,6 +1838,52 @@ class ImageTaskServiceTests(unittest.TestCase):
                         failed["next_poll_at"] - time.time(), retry_after, delta=2,
                     )
 
+    def test_bound_wrapper_preserves_download_http_failure_in_durable_task(self):
+        from utils.helper import UpstreamHTTPError
+        for status, code in ((429, "RECOVERY_RATE_LIMITED"), (401, "RECOVERY_AUTH_REQUIRED"),
+                             (403, "RECOVERY_AUTH_REQUIRED")):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp_dir:
+                backend = mock.Mock(image_submission_started=True, image_request_message_id="request-1")
+                backend.get_conversation_parent_message_id.return_value = ""
+                def stream(_backend, request, *_args):
+                    callback = request.progress_callback
+                    callback.record_conversation_id("conversation-1")
+                    callback.record_submission_started()
+                    callback.record_result_ids(["file-generated"], [])
+                    raise UpstreamHTTPError("download URL", status, {"private": "secret"},
+                                            retry_after=123 if status == 429 else None)
+                    yield
+                def handler(payload):
+                    request = ConversationRequest(prompt="fixture", model="gpt-image-2",
+                        progress_callback=payload["progress_callback"], provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-1",
+                        retain_conversation=True)
+                    return _generate_bound_single_image(request, 1, 1)
+                path = Path(tmp_dir) / "image_tasks.json"
+                service = self.make_service(path, handler)
+                with mock.patch("services.protocol.conversation.account_service") as accounts, \
+                     mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend), \
+                     mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream) as generate:
+                    accounts.get_bound_account_identity.return_value = "account-1"
+                    accounts.acquire_bound_image_access_token.return_value = "fixture-token"
+                    accounts.get_account.return_value = {}
+                    accounts.conversation_binding_lock.return_value = nullcontext()
+                    service.submit_generation(OWNER, client_task_id="download-task", prompt="cat",
+                        model="gpt-image-2", size=None, provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-1",
+                        retain_conversation=True)
+                    failed = wait_for_task(service, OWNER, "download-task", "error")
+                self.assertEqual(failed["recovery_phase"], "download_image_result")
+                self.assertEqual(failed["recovery_error_code"], code)
+                self.assertEqual(failed["last_recovery_failure"]["status_code"], status)
+                self.assertEqual(failed["upstream_outcome"], "generated")
+                self.assertFalse(failed["upstream_unfinished"])
+                self.assertEqual(service._tasks["owner-1:download-task"]["result_file_ids"], ["file-generated"])
+                self.assertNotIn("secret", json.dumps(failed))
+                if status == 429:
+                    self.assertEqual(failed["recovery_retry_after_seconds"], 123)
+                generate.assert_called_once()
+
     def test_expired_active_deadline_bypasses_old_schedule_and_bounds_empty_reads(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             error = RuntimeError("image outcome unknown")

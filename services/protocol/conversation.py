@@ -4,6 +4,7 @@ from services.image_thread import finished_parent, ImageThreadError
 
 import base64
 import json
+import math
 import re
 import threading
 import time
@@ -1189,6 +1190,8 @@ def stream_image_outputs(
             **({"poll": False} if stream_result_confirmed else {}),
         )
     except (ImageContentPolicyError, ImagePollTimeoutError) as exc:
+        if stream_result_confirmed:
+            raise
         # 当检测到文本回复时，task error 不应直接判定为内容策略违规，
         # 因为图片可能仍在后台异步生成中
         if is_text_reply and isinstance(exc, ImageContentPolicyError):
@@ -1201,6 +1204,8 @@ def stream_image_outputs(
         else:
             raise
     except Exception as exc:
+        if stream_result_confirmed:
+            raise
         # 当检测到文本回复时，首次轮询的临时网络错误不应直接中断，
         # 因为图片可能仍在后台异步生成中，后续 retry poll 会继续尝试。
         if is_text_reply and conversation_id:
@@ -1227,6 +1232,12 @@ def stream_image_outputs(
         if output.data or output._pending_image_items:
             yield output
         return
+
+    if stream_result_confirmed:
+        # The exact original turn already ended with these durable asset IDs.
+        # Missing download URLs are a retrieval failure, not another generation
+        # wait or a text-only answer. The task resumes its original assets.
+        raise RuntimeError("generated image download URLs are not available")
 
     if message:
         # 检测模型是否返回了文本描述（含 referenced_image_ids）而非实际生成图片
@@ -1723,6 +1734,13 @@ def _generate_bound_single_image(
                         upstream_submitted if isinstance(upstream_submitted, bool) else None
                     ),
                 )
+                upstream_status = getattr(exc, "status_code", None)
+                if type(upstream_status) is int and 400 <= upstream_status <= 599:
+                    error.status_code = upstream_status
+                retry_after = getattr(exc, "retry_after", None)
+                if (type(retry_after) in (int, float) and math.isfinite(retry_after)
+                        and retry_after >= 0):
+                    error.retry_after = retry_after
                 raise error from exc
     finally:
         try:
@@ -1840,7 +1858,7 @@ def _generate_single_image(
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
-            if not emitted_for_token:
+            if not emitted_for_token and getattr(backend, "image_submission_started", None) is not True:
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
                     logger.warning({
@@ -1884,7 +1902,8 @@ def _generate_single_image(
                 exc.account_email = account_email
             error_text = str(exc)
             # 如果是模型返回文本而非图片，尝试换账号重试
-            if is_model_text_reply_instead_of_image(error_text) and not emitted_for_token:
+            if (is_model_text_reply_instead_of_image(error_text) and not emitted_for_token
+                    and getattr(backend, "image_submission_started", None) is not True):
                 text_reply_retry_count += 1
                 if text_reply_retry_count <= MAX_TEXT_REPLY_RETRIES:
                     logger.warning({
@@ -1930,6 +1949,13 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            if getattr(backend, "image_submission_started", None) is True:
+                # No yielded chunk is not proof that no generation was sent.
+                # In particular, a confirmed asset's URL failure must never
+                # re-enter generation or switch the selected account.
+                raise ImageGenerationError(image_stream_error_message(last_error),
+                    account_email=account_email, conversation_id=last_conversation_id,
+                    upstream_submitted=True) from exc
             if not emitted_for_token and is_token_invalid_error(last_error):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
