@@ -268,6 +268,29 @@ class TextTaskService:
             yield db
 
     @staticmethod
+    def _public_not_submitted(receipt):
+        """Whether this terminal receipt proves the upstream text turn was not sent.
+
+        This is deliberately narrower than a false private flag: a claim can be
+        queued or in flight before its send guard runs, and a previously sent
+        request retains its send sequence. Only the terminal parent-mismatch
+        failure that occurred before that guard may be published as known not
+        submitted.
+        """
+        required_identity = (
+            "request_id", "client_conversation_id", "provider_binding_id",
+            "provider_account_identity", "conversation_id", "parent_message_id",
+        )
+        return (
+            receipt.get("status") == "failed"
+            and receipt.get("error_code") == "CONVERSATION_BINDING_MISMATCH"
+            and receipt.get("_submission_started") is False
+            and receipt.get("_executing") is False
+            and "_last_sent_sequence" not in receipt
+            and all(isinstance(receipt.get(field), str) and receipt[field].strip() for field in required_identity)
+        )
+
+    @staticmethod
     def _public(receipt):
         from services.public_chat_service import project_text_execution
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
@@ -280,6 +303,11 @@ class TextTaskService:
         if (receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
                 and not receipt.get("_forward_protocol")):
             result["execution"] = project_text_execution(receipt)
+        # Do not trust an arbitrary persisted public projection. This field is
+        # emitted only from the exact internal terminal-state predicate above.
+        result.pop("upstream_submission_started", None)
+        if TextTaskService._public_not_submitted(receipt):
+            result["upstream_submission_started"] = False
         # Derive diagnostics only from validated private records. Never trust a
         # stored projection or arbitrary exception content at the public edge.
         if receipt.get("_scheduling") is not None:
