@@ -16,9 +16,35 @@ from fastapi.responses import StreamingResponse
 from api.key_policy import require_chat_text_policy, require_codex_endpoint, require_image_policy
 from api.support import require_identity
 from services.pool_admission import image_original_recovery_pending, image_result_stage
+from services.task_store import pending_image_result_ids
 
 STREAM_SECONDS = 30
 CHECK_SECONDS = 1
+
+
+def _automatic_unsent_image_retry(service, receipt, work_active):
+    # Completion schedules a proven-unsent original in a later transaction.
+    # Both the no-claim/no-completion gap and checking_original are pending;
+    # neither may terminate a subscription before that same-ID retry runs.
+    if (getattr(getattr(service, "admission", None), "generation_completion", None) is None
+            or not work_active or receipt.get("status") != "error"
+            or receipt.get("error_code") != "RESULT_UNRECOVERABLE"
+            or receipt.get("_automatic_generation_recovery") is not True
+            or receipt.get("recovery_retryable") is not True
+            or receipt.get("_submission_started") is not False
+            or receipt.get("upstream_submission_started") is not False
+            or receipt.get("upstream_unfinished") is not False
+            or receipt.get("upstream_outcome") not in {"not_sent", "not_submitted"}
+            or receipt.get("_recovery_paused") is True or receipt.get("_recovery_suppressed") is True
+            or receipt.get("_attempt_finished_at") or receipt.get("_completion_of")
+            or receipt.get("data") or receipt.get("result_file_ids") or receipt.get("result_sediment_ids")
+            or pending_image_result_ids(receipt) or receipt.get("_pending_image_output")):
+        return False
+    state = receipt.get("_completion")
+    return not state or bool(isinstance(state, dict)
+        and state.get("state") == "checking_original" and state.get("automatic_failure_retry") is True
+        and not state.get("same_request_retry") and not state.get("replacement_id") and not state.get("selected_id")
+        and isinstance(state.get("next_at"), (int, float)))
 
 
 def _retrying_unsent(receipt):
@@ -40,6 +66,9 @@ def _retrying_unsent(receipt):
 def _snapshot(kind, service, identity, request_id):
     with service.store.connect() as db:
         receipt = service.store.read_receipt(db, kind, str(identity["id"]), request_id)
+        work = (service.store.runtime(db, receipt["_work_key"])
+                if kind == "image" and receipt and receipt.get("status") == "error"
+                and receipt.get("error_code") == "RESULT_UNRECOVERABLE" and receipt.get("_work_key") else None)
     if receipt is None:
         raise HTTPException(404, detail={"code": "ORIGINAL_REQUEST_NOT_FOUND"})
     if kind == "image":
@@ -56,10 +85,12 @@ def _snapshot(kind, service, identity, request_id):
     status = receipt.get("status")
     if status not in {"queued", "not_started", "running", "success", "succeeded", "failed", "error", "unknown"}:
         status = "unknown"
+    retrying_unsent = (_retrying_unsent(receipt) or kind == "image" and _automatic_unsent_image_retry(
+        service, receipt, not receipt.get("_work_key") or bool(work and work.get("state") == "active")))
     return {"protocol": "task-notification-v1", "kind": kind, "request_id": request_id,
             "status": status, "result_ready": ready, "result_count": result_count,
-            **({"result_stage": image_result_stage(receipt)} if kind == "image" else {}),
-            "retrying_unsent": _retrying_unsent(receipt),
+            **({"result_stage": "preparing" if retrying_unsent else image_result_stage(receipt)} if kind == "image" else {}),
+            "retrying_unsent": retrying_unsent,
             "recovering_original": kind == "image" and image_original_recovery_pending(receipt)}
 
 

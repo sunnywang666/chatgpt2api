@@ -19,8 +19,10 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(events, 'require_identity', lambda *a, **k: identity.copy())
     monkeypatch.setattr(events, 'CHECK_SECONDS', 0.001)
     app = FastAPI()
+    service = SimpleNamespace(store=store, admission=None)
+    app.state.event_service = service
     for kind in ('image', 'text'):
-        app.include_router(events.create_router(kind, lambda: SimpleNamespace(store=store)))
+        app.include_router(events.create_router(kind, lambda: service))
     def put(kind='image', rid='original', owner='one', **fields):
         row = {'model': 'gpt-image-2' if kind == 'image' else 'gpt-5-6-thinking', **fields}
         with store.transaction() as db:
@@ -256,3 +258,87 @@ def test_unsent_wait_never_hides_finished_or_paused_failure(runtime, extra):
     response = client.get("/api/image-tasks/original/events")
     assert "event: needs_attention" in response.text
     assert "event: result_ready" not in response.text
+
+
+def unsent_automatic_image():
+    return {'status': 'error', 'error_code': 'RESULT_UNRECOVERABLE',
+        '_automatic_generation_recovery': True, 'recovery_retryable': True,
+        '_submission_started': False, 'upstream_submission_started': False,
+        'upstream_unfinished': False, 'upstream_outcome': 'not_submitted'}
+
+
+@pytest.mark.parametrize('initial', [{}, {'_executing': True, '_claim_id': 'claim', '_claim_until': 9999999999},
+    {'_completion': {'state': 'checking_original', 'automatic_failure_retry': True, 'next_at': 1}}])
+def test_automatic_unsent_notification_survives_all_same_id_handoff_windows(runtime, monkeypatch, initial):
+    client, put, identity, _ = runtime
+    client.app.state.event_service.admission = SimpleNamespace(generation_completion=object())
+    original = unsent_automatic_image()
+    put(**{**original, **initial})
+    changes = iter([
+        original,
+        {**original, '_completion': {'state': 'checking_original', 'automatic_failure_retry': True, 'next_at': 1}},
+        {'status': 'queued', '_completion': {'same_request_retry': True}},
+        {'status': 'success', 'data': [{'url': 'private-result'}]},
+    ])
+    calls = 0
+    def authenticate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1: put(**next(changes))
+        return identity.copy()
+    monkeypatch.setattr(events, 'require_identity', authenticate)
+    result = client.get('/api/image-tasks/original/events')
+    assert 'event: needs_attention' not in result.text
+    assert '"retrying_unsent":true' in result.text
+    assert 'event: result_ready' in result.text
+    assert 'private-result' not in result.text
+    payloads = [json.loads(line[6:]) for line in result.text.splitlines() if line.startswith('data: ')]
+    assert all(p['result_stage'] == 'preparing' for p in payloads if p['retrying_unsent'])
+
+
+@pytest.mark.parametrize('extra', [
+    {'_automatic_generation_recovery': None}, {'recovery_retryable': False},
+    {'_submission_started': True}, {'_submission_started': None},
+    {'upstream_submission_started': True}, {'upstream_submission_started': None},
+    {'upstream_outcome': 'unknown'}, {'upstream_unfinished': True},
+    {'_recovery_paused': True}, {'_recovery_suppressed': True}, {'_attempt_finished_at': 1},
+    {'_completion_of': 'original-parent'}, {'result_file_ids': ['private-asset']},
+    {'_pending_image_result_ids': {'file_ids': ['private-asset']}},
+    {'_completion': {'state': 'needs_attention'}},
+    {'_completion': {'state': 'checking_original', 'automatic_failure_retry': True, 'next_at': 1, 'same_request_retry': True}},
+    {'_completion': {'state': 'checking_original', 'automatic_failure_retry': False, 'next_at': 1}},
+    {'_completion': {'state': 'checking_original', 'automatic_failure_retry': True}},
+    {'_completion': {'state': 'checking_original', 'automatic_failure_retry': True, 'next_at': 1, 'replacement_id': 'other'}},
+    {'_work_key': 'missing-work'},
+])
+def test_automatic_unsent_wait_does_not_hide_terminal_or_ambiguous_result(runtime, extra):
+    client, put, _, _ = runtime
+    client.app.state.event_service.admission = SimpleNamespace(generation_completion=object())
+    put(**{**unsent_automatic_image(), **extra})
+    result = client.get('/api/image-tasks/original/events')
+    assert 'event: needs_attention' in result.text
+    assert '"retrying_unsent":true' not in result.text
+    assert 'event: result_ready' not in result.text
+    assert '"result_stage":"needs_attention"' in result.text
+
+
+def test_no_completion_scheduler_does_not_promise_automatic_unsent_retry(runtime):
+    client, put, _, _ = runtime
+    put(**unsent_automatic_image())
+    result = client.get('/api/image-tasks/original/events')
+    assert 'event: needs_attention' in result.text
+    assert '"retrying_unsent":true' not in result.text
+
+
+@pytest.mark.parametrize('state,waiting', [('active', True), ('paused', False), ('completed', False)])
+def test_automatic_unsent_wait_respects_original_work_state(runtime, monkeypatch, state, waiting):
+    client, put, _, store = runtime
+    client.app.state.event_service.admission = SimpleNamespace(generation_completion=object())
+    put(**{**unsent_automatic_image(), '_work_key': 'original-work'})
+    with store.transaction() as db:
+        store.set_runtime(db, 'original-work', {'state': state})
+    monkeypatch.setattr(events, 'STREAM_SECONDS', 0)
+    result = client.get('/api/image-tasks/original/events')
+    assert ('event: needs_attention' in result.text) is not waiting
+    assert ('"retrying_unsent":true' in result.text) is waiting
+    assert 'event: result_ready' not in result.text
