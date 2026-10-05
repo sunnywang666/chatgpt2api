@@ -269,7 +269,9 @@ class ExecutionContext:
                           "sse_terminal_direct_parent_match_events", "sse_chain_nodes", "sse_chain_parent_edges",
                           "sse_chain_terminal_chains", "sse_chain_max_depth", "sse_chain_analysis_snapshots",
                           "sse_chain_metadata_patch_events", "sse_chain_request_seen", "sse_chain_missing_parent",
-                          "sse_chain_conflict", "sse_chain_cycle", "sse_chain_overflow", "sse_chain_unqualified_node"}},
+                          "sse_chain_conflict", "sse_chain_cycle", "sse_chain_overflow", "sse_chain_unqualified_node",
+                          "sse_chain_terminal_nodes", "sse_chain_blocked_user", "sse_chain_blocked_system",
+                          "sse_chain_blocked_unknown_role", "sse_chain_blocked_parent_is_request"}},
         }
         try:
             with self.admission.store.transaction() as db:

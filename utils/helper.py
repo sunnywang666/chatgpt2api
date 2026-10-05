@@ -253,10 +253,11 @@ class _SSESnapshotChains:
     """
     def __init__(self, observation, request_id):
         self.out, self.root, self.nodes = observation, request_id, {}
-        for name in ("nodes", "parent_edges", "terminal_chains", "max_depth",
+        for name in ("nodes", "parent_edges", "terminal_nodes", "terminal_chains", "max_depth",
+                     "blocked_user", "blocked_system", "blocked_unknown_role",
                      "analysis_snapshots", "metadata_patch_events"):
             self.out["sse_chain_" + name] = 0
-        for name in ("request_seen", "missing_parent", "conflict", "cycle", "overflow", "unqualified_node"):
+        for name in ("request_seen", "missing_parent", "conflict", "cycle", "overflow", "unqualified_node", "blocked_parent_is_request"):
             self.out["sse_chain_" + name] = False
 
     def observe(self, event):
@@ -317,6 +318,9 @@ class _SSESnapshotChains:
         self.out["sse_chain_missing_parent"] = False
         self.out["sse_chain_cycle"] = False
         self.out["sse_chain_unqualified_node"] = False
+        self.out["sse_chain_blocked_parent_is_request"] = False
+        self.out["sse_chain_terminal_nodes"] = sum(bool(n["terminal"]) for n in self.nodes.values())
+        blocked = {"user": set(), "system": set(), "unknown_role": set()}
         linked, depth_max = 0, 0
         for candidate, data in self.nodes.items():
             if not data.get("terminal"):
@@ -337,6 +341,9 @@ class _SSESnapshotChains:
                     # Another user message belongs to a later turn, even when
                     # its ancestry eventually reaches our original request.
                     self.out["sse_chain_unqualified_node"] = True
+                    category = current["role"] if current["role"] in ("user", "system") else "unknown_role"
+                    blocked[category].add(cursor)
+                    self.out["sse_chain_blocked_parent_is_request"] |= bool(self.root and current["parent"] == self.root)
                     break
                 cursor, depth = current["parent"], depth + 1
             else:
@@ -344,6 +351,8 @@ class _SSESnapshotChains:
                 depth_max = max(depth_max, depth)
         self.out["sse_chain_terminal_chains"] = linked
         self.out["sse_chain_max_depth"] = depth_max
+        for category, nodes in blocked.items():
+            self.out["sse_chain_blocked_" + category] = len(nodes)
 
 
 def _observe_sse_message(event: dict, observation: dict, request_message_id: str) -> None:

@@ -219,6 +219,7 @@ def test_snapshot_chain_observes_indirect_final_without_claiming_direct_parent_o
     ])
     assert observation["sse_terminal_direct_parent_match_events"] == 0
     assert observation["sse_chain_terminal_chains"] == 1  # unique nodes, not snapshots
+    assert observation["sse_chain_terminal_nodes"] == 1
     assert observation["sse_chain_max_depth"] == 2
     assert observation["sse_chain_nodes"] == observation["sse_chain_parent_edges"] == 2
     assert observation["sse_chain_analysis_snapshots"] == 1
@@ -269,8 +270,23 @@ def test_snapshot_chain_does_not_cross_later_user_and_preserves_partial_final_sn
         later_user, _snapshot("PRIVATE_FINAL", "PRIVATE_LATER_USER", channel="final", terminal=True)])
     assert observation["sse_chain_terminal_chains"] == 0
     assert observation["sse_chain_unqualified_node"] is True
+    assert observation["sse_chain_blocked_user"] == 1
+    assert observation["sse_chain_blocked_parent_is_request"] is True
     observation = _snapshot_chain([final, {"message": {"id": "PRIVATE_FINAL", "end_turn": False}}])
     assert observation["sse_chain_terminal_chains"] == 0 and observation["sse_chain_conflict"] is True
+
+
+@pytest.mark.parametrize("role,category", [("system", "system"), (None, "unknown_role"), ("unrecognised-private-role", "unknown_role")])
+def test_snapshot_chain_counts_unique_blocked_roles_without_persisting_role_values(role, category):
+    middle = {"message": {"id": "PRIVATE_MIDDLE", "parent_id": "PRIVATE_USER", "author": {"role": role}}}
+    observation = _snapshot_chain([middle,
+        _snapshot("PRIVATE_FINAL_A", "PRIVATE_MIDDLE", channel="final", terminal=True),
+        _snapshot("PRIVATE_FINAL_B", "PRIVATE_MIDDLE", channel="final", terminal=True)])
+    assert observation["sse_chain_terminal_nodes"] == 2
+    assert observation["sse_chain_terminal_chains"] == 0
+    assert observation["sse_chain_blocked_" + category] == 1
+    assert observation["sse_chain_blocked_parent_is_request"] is True
+    assert "unrecognised-private-role" not in json.dumps(observation)
 
 
 def test_image_stream_passes_original_node_to_safe_observation(monkeypatch):
