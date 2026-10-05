@@ -889,6 +889,42 @@ class AdmissionTests(unittest.TestCase):
         self.assertIsNone(self.admission.claim_next())
         self.assertEqual(self.calls, [])
 
+    def test_saved_text_can_complete_before_worker_finally_without_closing_another_turn(self):
+        from services.work_lifecycle import WorkLifecycleError, WorkLifecycleService
+        self.admission.settings = lambda: {"chat_account_concurrency": 2,
+                                            "image_account_concurrency": 4, "codex_max_concurrency": 4}
+        self.submit("saved", _public_session_ref="session-saved")
+        self.submit("still-running", _public_session_ref="session-still-running")
+        context = self.admission.claim_next()
+        other = self.admission.claim_next()
+        self.assertEqual(context.request_id, "saved")
+        self.assertEqual(other.request_id, "still-running")
+        lifecycle = WorkLifecycleService(self.text, self.images, clock=self.clock)
+        stages = []
+        original_stage = context.record_stage
+
+        def observe(stage, **fields):
+            if stage == "artifact_saved":
+                receipt = self.read("text", "happy", "saved")
+                self.assertEqual(receipt["status"], "succeeded")
+                self.assertEqual(receipt["content"], "done")
+                self.assertFalse(receipt["_executing"])
+                self.assertEqual(receipt["_claim_id"], context.claim)
+                work = lifecycle.update("text", {"id": "happy"}, "saved", "completed", True)
+                self.assertEqual(work["state"], "completed")
+                self.assertFalse(work["slot_held"])
+                with self.assertRaisesRegex(WorkLifecycleError, "WORK_TURN_UNFINISHED"):
+                    lifecycle.update("text", {"id": "happy"}, "still-running", "completed", True)
+                stages.append(stage)
+            return original_stage(stage, **fields)
+
+        with patch.object(context, "record_stage", side_effect=observe):
+            self.admission.execute(context)
+        self.assertEqual(stages, ["artifact_saved"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(lifecycle.get("text", {"id": "happy"}, "saved")["state"], "completed")
+        self.assertTrue(self.read("text", "happy", "still-running")["_executing"])
+
     def test_new_queued_text_still_discovers_models_for_admission(self):
         catalog_calls = []
         self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}

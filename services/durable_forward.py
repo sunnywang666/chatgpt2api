@@ -451,7 +451,10 @@ def run(service, owner, request_id, body):
         failed = bool(current.get("_upstream_failed"))
         service._update(owner, request_id, status="failed" if failed and terminal else "succeeded" if terminal else "unknown",
                         error_code="codex_response_failed" if failed and terminal else None if terminal else "codex_upstream_outcome_unknown",
-                        _wire_head=head, _turn_reserved=not terminal, finished_at=service._now())
+                        _wire_head=head, _turn_reserved=not terminal, finished_at=service._now(),
+                        # All output bytes and stream cleanup are complete here.
+                        # A successful public result can immediately finish its work.
+                        **({"_executing": False} if terminal and not failed else {}))
     except Exception as exc:
         current = raw_receipt(service, owner, request_id)
         code = getattr(exc, "code", None)

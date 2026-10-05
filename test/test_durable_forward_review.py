@@ -134,6 +134,34 @@ def test_first_stream_event_rejection_keeps_http_400(runtime, monkeypatch):
     assert runtime.admission.claim_next() is None
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_success_releases_execution_with_saved_wire_before_worker_finally(runtime, monkeypatch, stream):
+    closed, successes = [], []
+    result = {"choices": [{"message": {"content": "original answer"}}]}
+    def events():
+        try:
+            yield result
+        finally:
+            closed.append(True)
+    def handler(payload):
+        current_request.get().before_send()
+        return events() if stream else result
+    monkeypatch.setattr(importlib.import_module("services.protocol.openai_v1_chat_complete"), "handle", handler)
+    update = runtime.service._update
+    def observe_update(owner, request_id, **changes):
+        update(owner, request_id, **changes)
+        if changes.get("status") == "succeeded":
+            saved = durable_forward.raw_receipt(runtime.service, owner, request_id)
+            assert saved["status"] == "succeeded" and saved["_executing"] is False
+            assert saved["_wire_size"] > 0
+            assert saved["_claim_id"] == current_request.get().claim
+            assert closed == ([True] if stream else [])
+            successes.append(True)
+    monkeypatch.setattr(runtime.service, "_update", observe_update)
+    runtime.admission.execute(submit(runtime, {"model": "fixture-text", "stream": stream}))
+    assert successes == [True]
+
+
 def test_failed_stream_keeps_prefix_and_logs_once_without_claiming_upstream_recovery(runtime, monkeypatch):
     calls, closed = [], []
     def incomplete(payload):

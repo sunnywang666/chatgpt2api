@@ -1840,7 +1840,11 @@ class TextTaskService:
                 result = self.runner(body, on_cursor=progress)
             if receipt.get("_supersedes_request_id"):
                 result = {**result, "upstream_outcome": "completed", "error_code": None, "waiting": None}
-            self._update(owner, request_id, **{**result, "status": "succeeded", "finished_at": self._now()})
+            # The runner has finished its upstream work. Publish the saved result
+            # and release this execution marker together: a client may complete
+            # its work as soon as it reads success, before telemetry/finally run.
+            self._update(owner, request_id, **{**result, "status": "succeeded",
+                                              "_executing": False, "finished_at": self._now()})
             context = current_request.get()
             if context is not None and hasattr(context, "record_stage"):
                 context.record_stage("artifact_saved")
