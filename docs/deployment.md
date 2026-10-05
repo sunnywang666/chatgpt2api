@@ -116,7 +116,7 @@
 }
 ```
 
-此分支禁止携带 `messages`、`model`、`image_model`、`thinking_effort` 或其他字段；包括传入默认值也会拒绝。服务在同 owner 下读取原 `_input_ref` 并核对原请求 hash、绑定和提交父消息，复用完整原输入，仅替换新请求 ID、附旧引用，并在受理前持久保存新请求的完整输入。不会向客户端返回提示词或私密文件引用。普通请求省略新字段时，原默认值及 request hash 语义不变。
+此分支禁止携带 `messages`、`model`、`image_model`、`thinking_effort` 或其他字段（下述受限目录派生参数除外）；包括传入默认值也会拒绝。服务在同 owner 下读取原 `_input_ref` 并核对原请求 hash、绑定和提交父消息，复用完整原输入，仅替换新请求 ID、附旧引用，并在受理前持久保存新请求的完整输入。不会向客户端返回提示词或私密文件引用。普通请求省略新字段时，原默认值及 request hash 语义不变。
 
 前提是原请求为内部 Chat 文本、`failed/RESULT_UNRECOVERABLE`、`upstream_outcome=unknown`、本地执行等待已结束、原消息缺失，且无有效执行/恢复领取或停止标记。原 SQLite `BEGIN IMMEDIATE` 中复核，一个原请求最多一个后继；原记录、消息 ID 和发送次数不修改。不允许借此跳过同会话的其他未完成请求，也不支持递归替换后继 UNKNOWN。
 
@@ -136,6 +136,16 @@
 **这仍然是新执行，不是取回旧结果。** 最后一次 GET 后仍须遵守账号请求间隔，上游也没有原子“确认旧请求不存在并提交新请求”的接口；GET 与 POST 之间仍可能出现旧结果。工程只能阻止已观察到的迟到结果和本地重复派发，不能承诺上游 exactly-once。本候选测试不授权历史请求生产重发；业务执行必须另核对应旧对象及重复风险决策。
 
 无数据库迁移、新服务或配置变化。发布需先 Provider、后使用此字段的内部消费者。接受后继之前可回退旧镜像；一旦已受理后继，**不得直接降级为不识别此合同的版本**：应保留识别此合同的运行版本处理在途/等待及原 ID 读回，或由发布负责人核定只暂停新提交的回退方案，保留原数据库和输入。不能删除后继或清空 UNKNOWN 来回退。
+
+#### 413 类目目录的受限派生输入
+
+上述七字段可额外带 `derived_input: {"kind":"category_directory_parent_v1"}`。仍禁止客户端提供替换 messages。除普通后继的全部前提外，原回执必须保留 `stream_open/http/conversation`、HTTP 413 和已开始提交的证据；413 本身不证明未发送，原 UNKNOWN 不变。
+
+Provider 只识别保留的 Workbench 类目专用提示词：单 user 消息、空 schema、明确类目推荐指令，目录为 `compact_directory` 五元组或 `directory_candidates` 对象数组，所有叶必须有完整非空路径。未知格式、属性任务、缺层级拒绝为 `CHAT_DERIVED_INPUT_UNSUPPORTED`；参数或413证据不符为 `CHAT_DERIVED_INPUT_INVALID`。转换保留全部 SOURCE 字段、图片及 image_ref，以原顺序和重复叶计算每个真实根节点的类别数量，不做语义筛选。完整序列化文本（含消息封装和 image_ref，图片数据沿独立上传路径）UTF-8 超过 65536 字节时拒绝为 `CHAT_DERIVED_INPUT_TOO_LARGE`。
+
+派生结果仅允许类目导航：`{"determined":true,"selection":{"kind":"branch","path":["真实根名称"],"scope":"subtree"},"attributes":[]}`，或 `{"determined":false,"attributes":[]}`。消费者必须验证该分支确实在原完整目录中；分支不是最终类目，不能直接用于发布。后续子目录沿该后继成功的实际游标继续。原请求若恢复成功，优先处理原结果，不再发送派生请求。
+
+新回执的 `derived_input` 返回 `kind`、`original_input_hash`、`directory_sha256`、`category_count` 和 `text_utf8_bytes`。原 hash 由 Provider 从原 DB 记录绑定，无须客户端提供。目录指纹为 SHA256(UTF8(JSON.stringify(rows)))，其中 rows 按原序列保留全部重复叶，每行为 `[descriptionCategoryId,typeId,name,descriptionCategoryName ?? null,categoryPath]`；消费者可从冻结 recovery_request 重算并对照。派生请求保存自己的输入和 hash，并复用普通后继的唯一性、幂等及发送前原分支检查；旧输入及 hash 不改写。
 
 
 ### 429 分层
