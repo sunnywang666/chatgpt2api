@@ -62,6 +62,106 @@ def wait(session, **kwargs):
                                          remaining=lambda: 60, **kwargs)
 
 
+def global_image_event(cid=CID, **updates):
+    message = {"author": {"role": "tool"}, "status": "finished_successfully", "channel": "final",
+               "content": {"content_type": "multimodal_text"}, "metadata": {"ghostrider": {"status": "final"}}}
+    message.update(updates)
+    return {"type": "conversation-update", "payload": {"conversation_id": cid,
+        "update_type": "add-messages", "update_content": {"messages": [None, message]}}}
+
+
+@pytest.mark.parametrize("update", [
+    {"status": "in_progress"}, {"metadata": {"ghostrider": {"status": "intermediate"}}},
+    {"author": {"role": "assistant"}, "end_turn": True}, {"content": {"content_type": "text"}},
+    {"channel": "commentary"}, {"metadata": None},
+])
+def test_global_hint_requires_final_image_tool_not_transport_or_assistant_end(update):
+    assert completion.completed_conversation_hint(global_image_event(**update)) is None
+    assert completion.completed_conversation_hint({"type": "conversation-turn-complete", "payload": {"conversation_id": CID}}) is None
+    assert completion.completed_conversation_hint(global_image_event()) == CID
+
+
+@pytest.mark.parametrize("wrong", ["none", "cid", "topic", "before-ack"])
+def test_global_socket_routes_only_current_conversation_and_closes(wrong):
+    reply = {"id": 2, "reply": {"type": "subscribe", "topic_id": "conversations", "recovered": False}}
+    message = {"type": "message", "topic_id": "foreign" if wrong == "topic" else "conversations",
+               "payload": global_image_event("foreign" if wrong == "cid" else CID)}
+    session = Session([[message, reply] if wrong == "before-ack" else [reply, message]])
+    hub = completion._ConversationHints()
+    signal = threading.Event(); hub.signals[CID] = {signal}
+    cleanup = []
+    hub.run(lambda: (session, URL, {}, lambda: cleanup.append(True), time.monotonic() + 10))
+    assert signal.is_set() is (wrong == "none")
+    assert session.ws.sent[1]["command"] == {"type": "subscribe", "topic_id": "conversations"}
+    assert session.ws.closed and cleanup == [True] and hub.stopped.is_set()
+
+
+def test_active_account_shares_one_socket_and_last_release_stops_it(monkeypatch):
+    started, runs = threading.Event(), []
+    def run(hub, factory):
+        runs.append(factory); started.set(); hub.stopped.wait(2)
+    monkeypatch.setattr(completion._ConversationHints, "run", run)
+    opener = lambda: None
+    with completion.image_completion_hints("fixture", CID, opener) as first:
+        assert started.wait(1)
+        hub = completion._hubs["fixture"]
+        with completion.image_completion_hints("fixture", "second", opener) as second:
+            assert len(runs) == 1
+            with hub.lock:
+                for signal in hub.signals[CID]: signal.set()
+            assert first(.01) is True and second(.01) is False
+        assert not hub.stopped.is_set()
+    assert hub.stopped.is_set() and "fixture" not in completion._hubs and not hub.thread.is_alive()
+
+
+def test_expired_image_never_starts_notification_transport():
+    backend = object.__new__(OpenAIBackendAPI)
+    backend.account = {"provider_account_identity": "expired-fixture"}
+    backend.progress_callback = SimpleNamespace(active_deadline_at=time.time() - 1)
+    opened = []
+    backend._open_image_notification_transport = lambda deadline: opened.append(deadline)
+    with pytest.raises(ImageActiveDeadlineExceeded):
+        backend._poll_image_results(CID, 5, request_message_id="request")
+    assert not opened and "expired-fixture" not in completion._hubs
+
+
+@pytest.mark.parametrize("stopped", [True, False])
+def test_notification_does_not_connect_after_last_release_or_transport_deadline(stopped):
+    hub = completion._ConversationHints()
+    session, cleanup = Session([]), []
+    if stopped: hub.stopped.set()
+    hub.run(lambda: (session, URL, {}, lambda: cleanup.append(True), time.monotonic() + (10 if stopped else -1)))
+    assert session.connected == [] and cleanup == ([] if stopped else [True])
+
+
+def test_image_notification_wakes_original_poll_without_result_or_retry_authority(monkeypatch):
+    from services.config import config
+    from services.request_context import current_request
+    backend = object.__new__(OpenAIBackendAPI)
+    reads, waits, observed = [], [], []
+    asset = "file_000000001234567890abcdef12345678"
+    empty = {"conversation_id": CID, "current_node": "request", "mapping": {"request": {
+        "parent": None, "message": {"id": "request", "author": {"role": "user"}}}}}
+    full = {**empty, "current_node": "image", "mapping": {**empty["mapping"], "image": {
+        "parent": "request", "message": {"id": "image", "author": {"role": "tool"},
+            "content": {"parts": [{"asset_pointer": "sediment://" + asset}]}}}}}
+    backend._get_conversation = lambda cid: reads.append(cid) or (empty if len(reads) == 1 else full)
+    backend._query_backend_tasks = lambda **kw: []
+    def wake(seconds):
+        waits.append(seconds)
+        assert len(reads) == 1, "notification never reads or promotes results itself"
+        return True
+    monkeypatch.setitem(config.data, "image_poll_interval_secs", 10)
+    monkeypatch.setitem(config.data, "image_check_before_hit_enabled", False)
+    context = current_request.set(SimpleNamespace(record_stage=lambda stage: observed.append(stage)))
+    try:
+        files, sediments = backend._poll_image_results_inner(CID, 5, request_message_id="request", _completion_wait=wake)
+    finally:
+        current_request.reset(context)
+    assert reads == [CID, CID] and len(waits) == 1 and files == sediments == [asset]
+    assert observed == ["upstream_image_completion_signal"]
+
+
 @pytest.mark.parametrize("typed_reply", [False, True])
 def test_catchup_done_accepts_both_live_reply_shapes(typed_reply):
     reply = ack(catchups=[event("heartbeat"), event("stream-item"), event()])

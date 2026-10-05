@@ -2532,7 +2532,44 @@ class OpenAIBackendAPI:
                 return msg_text[:500]
         return ""
 
-    def _poll_image_results(
+    def _open_image_notification_transport(self, deadline):
+        # Use a separate read-only client: the first subscribing image may
+        # finish before the account's other conversations release the socket.
+        backend = OpenAIBackendAPI(access_token=self.access_token)
+        try:
+            remaining = min(10, deadline - time.monotonic())
+            if remaining <= 0:
+                raise ImageActiveDeadlineExceeded("image notification deadline elapsed")
+            path = "/backend-api/celsius/ws/user"
+            response = backend.session.get(backend.base_url + path, headers=backend._headers(path),
+                timeout=remaining, allow_redirects=False,
+                _account_request_deadline_monotonic=min(deadline, time.monotonic() + 10))
+            try:
+                ensure_ok(response, path)
+                url = response.json()["websocket_url"]
+            finally:
+                response.close()
+            return (backend.session, url, proxy_settings.build_session_kwargs(
+                account=backend.account, impersonate=backend.fp["impersonate"], verify=True), backend.close, deadline)
+        except Exception:
+            backend.close()
+            raise
+
+    def _poll_image_results(self, *args, **kwargs):
+        account = getattr(self, "account", None) or {}
+        identity = account.get("provider_account_identity")
+        cid = args[0] if args else kwargs.get("conversation_id")
+        # Recovery's single already-read snapshot never waits; it needs no
+        # socket. Unauthenticated/controlled transports retain their old path.
+        if not identity or not cid or kwargs.get("initial_document") is not None:
+            return self._poll_image_results_inner(*args, **kwargs)
+        budget = self._image_active_timeout(args[1] if len(args) > 1 else kwargs.get("timeout_secs", 120.0))
+        deadline = time.monotonic() + budget
+        from services.upstream_completion import image_completion_hints
+        with image_completion_hints(identity, cid, lambda: self._open_image_notification_transport(deadline)) as wait:
+            return self._poll_image_results_inner(*args, **kwargs, _completion_wait=wait)
+
+    def _poll_image_results_inner(
             self,
             conversation_id: str,
             timeout_secs: float = 120.0,
@@ -2541,6 +2578,7 @@ class OpenAIBackendAPI:
             request_message_id: str = "",
             require_fresh_result_ids: bool = False,
             initial_document: dict | None = None,
+            _completion_wait=None,
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
@@ -2582,6 +2620,18 @@ class OpenAIBackendAPI:
         def _remaining() -> float:
             pacing_wait = float(getattr(getattr(self, "progress_callback", None), "local_pacing_wait_secs", 0)) - initial_pacing_wait
             return timeout_secs - (time.time() - start - pacing_wait)
+
+        def wait_for_original(seconds):
+            if _completion_wait is None:
+                time.sleep(seconds)
+            elif _completion_wait(seconds):
+                from services.request_context import current_request
+                context = current_request.get()
+                if context is not None:
+                    try:
+                        context.record_stage("upstream_image_completion_signal")
+                    except Exception:
+                        pass  # Timing evidence cannot change image recovery.
 
         # Recovery has already read this exact conversation under the account
         # clock. Consume that fresh observation once; a second immediate GET
@@ -2720,7 +2770,7 @@ class OpenAIBackendAPI:
                         break
                     wait = min(interval, max(0.0, _remaining()))
                     if wait > 0:
-                        time.sleep(wait)
+                        wait_for_original(wait)
                     continue
                 if not config.image_check_before_hit_enabled:
                     # 先check再hit 机制关闭：直接返回首次发现的 file_ids
@@ -2755,7 +2805,7 @@ class OpenAIBackendAPI:
                     break
                 wait = min(config.image_settle_secs, max(0.0, _remaining()))
                 if wait > 0:
-                    time.sleep(wait)
+                    wait_for_original(wait)
                     continue
                 return file_ids, sediment_ids
             if supplied_snapshot:
@@ -2764,7 +2814,7 @@ class OpenAIBackendAPI:
                           "elapsed_secs": round(time.time() - start, 1)})
             wait = min(interval, max(0.0, _remaining()))
             if wait > 0:
-                time.sleep(wait)
+                wait_for_original(wait)
         logger.info({
             "event": "image_poll_timeout",
             "conversation_id": conversation_id,
