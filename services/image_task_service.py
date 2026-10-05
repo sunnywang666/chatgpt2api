@@ -859,10 +859,13 @@ class ImageTaskService:
             try:
                 result_ids = (task.get("result_file_ids") or []) + (task.get("result_sediment_ids") or [])
                 def validate_terminal(document):
-                    actual_parent = finished_parent(document, conversation_id,
-                        request_id, expected_result_ids=result_ids)
-                    if actual_parent != parent_id:
-                        raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                    from services.image_thread import archive_parent
+                    return archive_parent(document, conversation_id, request_id, parent_id, result_ids,
+                        expected_parent=task.get("_image_thread_request_parent"),
+                        predecessor_request_message_id=task.get("_image_thread_predecessor_message"),
+                        predecessor_result_ids=task.get("_image_thread_predecessor_result_ids"),
+                        expected_file_ids=task.get("result_file_ids") or [],
+                        expected_sediment_ids=task.get("result_sediment_ids") or [])
                 backend.set_conversation_archived(conversation_id, parent_id, archived,
                                                  validate_document=validate_terminal)
             finally:
@@ -1227,6 +1230,17 @@ class ImageTaskService:
         progress_callback.failed_retry_required = bool(payload.get("_continue_after_failed_attempt"))
         progress_callback.image_thread_predecessor_message = payload.get("_image_thread_predecessor_message")
         progress_callback.image_thread_predecessor_result_ids = payload.get("_image_thread_predecessor_result_ids")
+        prior_id = (payload.get("_image_thread") or {}).get("previous_task_id")
+        if prior_id:
+            with self._transaction():
+                from services.image_thread import selected_thread_result
+                owned = {item["id"]: item for item in self._tasks.values() if item.get("owner_id") == _owner_id(identity)}
+                prior = selected_thread_result(owned.get(prior_id), owned) or {}
+                # Call-local proof only; do not rewrite a successful source receipt
+                # or invalidate an already accepted edit's source fingerprint.
+                progress_callback.image_thread_predecessor_cursor_proof = {
+                    k: prior.get(k) for k in ("_image_thread_request_parent", "_image_thread_predecessor_message",
+                        "_image_thread_predecessor_result_ids", "result_file_ids", "result_sediment_ids")}
         # 将进度回调添加到 payload 中（handler 会提取并传递给 ConversationRequest）
         payload_with_progress = {**payload, "progress_callback": progress_callback}
         failure_phase = "handler_operation"

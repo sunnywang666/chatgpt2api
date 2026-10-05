@@ -432,3 +432,40 @@ def finished_parent(document, conversation_id, request_message_id, *, expected_p
                 and _image_result_ids(msg) and observed == expected):
             return current
     raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED")
+
+
+def archive_parent(document, conversation_id, request_message_id, saved_parent, result_ids, *,
+                   expected_parent=None, predecessor_request_message_id=None,
+                   predecessor_result_ids=None, expected_file_ids=None, expected_sediment_ids=None):
+    """Allow only the saved image tool's own late terminal tail before archive."""
+    changed = document.get("current_node") != saved_parent
+    actual = finished_parent(document, conversation_id, request_message_id,
+                             expected_result_ids=result_ids, require_final=changed,
+                             expected_parent=expected_parent,
+                             predecessor_request_message_id=predecessor_request_message_id,
+                             predecessor_result_ids=predecessor_result_ids)
+    if actual == saved_parent:
+        return actual
+    mapping = document["mapping"]
+    saved = (mapping.get(saved_parent) or {}).get("message") or {}
+    expected = set(result_ids)
+    if ((saved.get("author") or {}).get("role") != "tool"
+            or saved.get("status") != "finished_successfully"
+            or not expected or _image_result_ids(saved) != expected):
+        raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+    files, sediments = OpenAIBackendAPI._extract_image_reference_ids(
+        {"content": saved.get("content"), "metadata": saved.get("metadata")})
+    if ((expected_file_ids is not None and set(files) != set(expected_file_ids))
+            or (expected_sediment_ids is not None and set(sediments) != set(expected_sediment_ids))):
+        raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+    # finished_parent proved a unique completed branch with exactly these
+    # assets. The saved cursor must also be on that same submitted turn.
+    cursor, seen = actual, set()
+    while cursor != request_message_id and cursor in mapping and cursor not in seen:
+        if cursor == saved_parent:
+            return actual
+        if _image_result_ids(mapping[cursor].get("message") or {}):
+            raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+        seen.add(cursor)
+        cursor = mapping[cursor].get("parent")
+    raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")

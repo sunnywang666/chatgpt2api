@@ -1598,12 +1598,27 @@ def _generate_bound_single_image(
                 elif thread and request.conversation_id:
                     try:
                         prior_message = getattr(request.progress_callback, "image_thread_predecessor_message", None)
+                        proof = getattr(request.progress_callback, "image_thread_predecessor_cursor_proof", None) or {}
                         document = backend._get_conversation(request.conversation_id)
                         parent = finished_parent(document, request.conversation_id, prior_message,
                             expected_result_ids=getattr(request.progress_callback,
-                                "image_thread_predecessor_result_ids", None))
+                                "image_thread_predecessor_result_ids", None),
+                            expected_parent=proof.get("_image_thread_request_parent"),
+                            predecessor_request_message_id=proof.get("_image_thread_predecessor_message"),
+                            predecessor_result_ids=proof.get("_image_thread_predecessor_result_ids"))
                         if parent != request.parent_message_id:
-                            raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                            from services.image_thread import archive_parent
+                            if not proof or proof.get("result_file_ids") is None or proof.get("result_sediment_ids") is None:
+                                raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                            parent = archive_parent(document, request.conversation_id, prior_message,
+                                request.parent_message_id, getattr(request.progress_callback,
+                                    "image_thread_predecessor_result_ids", None) or [],
+                                expected_parent=proof.get("_image_thread_request_parent"),
+                                predecessor_request_message_id=proof.get("_image_thread_predecessor_message"),
+                                predecessor_result_ids=proof.get("_image_thread_predecessor_result_ids"),
+                                expected_file_ids=proof["result_file_ids"],
+                                expected_sediment_ids=proof["result_sediment_ids"])
+                            request = replace(request, parent_message_id=parent)
                         # A later review reversal continues this exact conversation.
                         # Restore it before any image POST; failure leaves the original
                         # request unsubmitted and available for exact-ID recovery.

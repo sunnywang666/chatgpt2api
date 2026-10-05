@@ -1327,14 +1327,16 @@ class OpenAIBackendAPI:
         """Change visibility only after checking the original conversation and cursor."""
         with observing_archive_step("precheck"):
             document = self._get_conversation(conversation_id)
+        if validate_document is not None:
+            # A caller may prove an appended terminal tail of this exact turn
+            # using this same fresh read. Text callers keep exact cursor checks.
+            resolved_parent = validate_document(document)
+            if isinstance(resolved_parent, str) and resolved_parent:
+                parent_message_id = resolved_parent
         if str(document.get("current_node") or "").strip() != parent_message_id:
             raise ConversationArchiveCursorMismatch("original conversation cursor changed")
         if parent_message_id not in (document.get("mapping") or {}):
             raise RuntimeError("original product turn is missing")
-        if validate_document is not None:
-            # Both checks use this fresh pre-PATCH read, never a cached poll
-            # snapshot from before the result download.
-            validate_document(document)
         if document.get("is_archived") is archived:
             return {"archived": archived}
         path = f"/backend-api/conversation/{conversation_id}"

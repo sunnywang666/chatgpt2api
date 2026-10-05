@@ -105,8 +105,10 @@ def runtime(tmp_path, monkeypatch):
             state.naive_reads += 1
             raise AssertionError("new thread may not accept arbitrary current_node")
         def set_conversation_archived(self, cid, parent, archived, *, validate_document=None):
+            doc = self._get_conversation(cid)
             if validate_document is not None:
-                validate_document(self._get_conversation(cid))
+                parent = validate_document(doc) or parent
+            assert doc['current_node'] == parent
             assert parent in state.documents[cid]["mapping"]
             state.documents[cid]["is_archived"] = archived
             state.archive_actions.append((cid, archived))
@@ -971,6 +973,92 @@ def test_completed_tool_leaf_continues_and_archives_same_image_thread(runtime):
     assert r.state.archive_actions == [(first["conversation_id"], True)]
 
 
+def test_late_image_terminal_tail_archives_and_reworks_without_changing_source(runtime):
+    r = runtime
+    r.state.tool_leaf = True
+    r.submit("a1")
+    first = run_next(r, "a1")
+    doc = r.state.documents[first['conversation_id']]
+    old = first['parent_message_id']
+    # This fixture's stream reports the same asset in both namespaces.
+    doc['mapping'][old]['message']['content']['parts'].append({
+        'content_type':'image_asset_pointer', 'asset_pointer':'sediment://'+first['result_sediment_ids'][0]})
+    doc['mapping']['late-note'] = node('late-note', 'tool', old)
+    doc['mapping']['late-final'] = node('late-final', 'assistant', 'late-note', end=True)
+    doc['current_node'] = 'late-final'
+    assert r.service.archive_thread(WHO, 'a1')['archived'] is True
+    after = r.read('a1')
+    assert after['parent_message_id'] == old
+    assert after['data'] == first['data'] and after['request_hash'] == first['request_hash']
+    restarted = ImageTaskService(r.root / 'images.json', store=TaskStore(r.store.path), admission=r.admission)
+    assert restarted.restore_thread(WHO, 'a1')['archived'] is False
+    r.submit('a2', source='a1')
+    second = run_next(r, 'a2')
+    assert r.state.sends[1]['parent'] == 'late-final'
+    assert second['conversation_id'] == first['conversation_id']
+    assert len(r.state.sends) == 2
+    assert r.read('a1')['parent_message_id'] == old
+
+
+@pytest.mark.parametrize('change', ['new-user', 'sibling', 'new-asset', 'repeated-asset-tail', 'missing-old', 'unfinished', 'wrong-cursor', 'non-final', 'request-parent', 'namespace'])
+def test_archive_tail_advance_rejects_changed_original(change):
+    from services.image_thread import archive_parent
+    doc, asset = tool_document()
+    old = doc['current_node']
+    doc['mapping']['late-final'] = node('late-final', 'assistant', old, end=True)
+    doc['current_node'] = 'late-final'
+    assert archive_parent(doc, 'conversation-a', 'request-a', old, [asset]) == 'late-final'
+    if change == 'new-user':
+        doc['mapping']['late-final']['message']['author']['role'] = 'user'
+    elif change == 'sibling':
+        doc['mapping']['sibling'] = node('sibling', 'assistant', old, end=True)
+    elif change == 'new-asset':
+        doc['mapping']['late-final']['message']['content'] = {'content_type':'multimodal_text', 'parts':[
+            {'content_type':'image_asset_pointer', 'asset_pointer':'file-service://file_00000000'+'f'*24}]}
+    elif change == 'repeated-asset-tail':
+        doc['mapping']['late-final']['message']['content'] = copy.deepcopy(doc['mapping'][old]['message']['content'])
+    elif change == 'missing-old':
+        del doc['mapping'][old]
+    elif change == 'unfinished':
+        doc['mapping']['late-final']['message']['status'] = 'in_progress'
+    elif change == 'wrong-cursor':
+        old = 'request-a-code'
+    elif change == 'request-parent':
+        doc['mapping']['request-a']['parent'] = 'foreign-parent'
+    elif change == 'namespace':
+        doc['mapping'][old]['message']['content']['parts'][0]['asset_pointer'] = 'sediment://'+asset
+    else:
+        doc['mapping']['late-final']['message']['end_turn'] = False
+    with pytest.raises(ImageThreadError):
+        archive_parent(doc, 'conversation-a', 'request-a', old, [asset], expected_parent='root',
+                       expected_file_ids=[asset], expected_sediment_ids=[])
+
+
+def test_archive_late_tail_does_not_invalidate_edit_accepted_during_readback(runtime, monkeypatch):
+    from services.image_thread import source_fingerprint
+    r = runtime
+    r.state.tool_leaf = True
+    r.submit('a1')
+    first = run_next(r, 'a1')
+    doc = r.state.documents[first['conversation_id']]
+    old = first['parent_message_id']
+    doc['mapping'][old]['message']['content']['parts'].append({
+        'content_type':'image_asset_pointer', 'asset_pointer':'sediment://'+first['result_sediment_ids'][0]})
+    doc['mapping']['late-final'] = node('late-final', 'assistant', old, end=True)
+    doc['current_node'] = 'late-final'
+    original = conversation.OpenAIBackendAPI.set_conversation_archived
+    def accept_during_readback(self, cid, parent, archived, **kwargs):
+        result = original(self, cid, parent, archived, **kwargs)
+        if archived:
+            r.submit('a2', source='a1')
+        return result
+    monkeypatch.setattr(conversation.OpenAIBackendAPI, 'set_conversation_archived', accept_during_readback)
+    r.service.archive_thread(WHO, 'a1')
+    assert source_fingerprint(r.read('a1')) == source_fingerprint(first)
+    assert run_next(r, 'a2')['status'] == 'success'
+    assert r.state.sends[1]['parent'] == 'late-final'
+
+
 def test_mismatched_tool_leaf_keeps_original_generated_result_unclaimed(runtime):
     r = runtime
     r.state.tool_leaf = True
@@ -1464,3 +1552,24 @@ def test_archive_uses_same_fresh_precheck_for_validator_and_keeps_readback():
     backend.set_conversation_archived('original', 'parent', True, validate_document=lambda doc: validated.append(doc))
     assert len(reads) == 2 and len(patches) == 1 and len(validated) == 1
     assert validated[0]['is_archived'] is False
+
+
+def test_archive_resolved_cursor_still_requires_exact_post_patch_readback():
+    from services.openai_backend_api import ConversationArchiveCursorMismatch
+    backend = object.__new__(RealOpenAIBackendAPI)
+    backend.base_url = 'https://fixture.invalid'
+    backend._headers = lambda *a, **k: {}
+    doc = {'current_node':'new-final','mapping':{'old-tool':{},'new-final':{}},'is_archived':False}
+    patches = []
+    backend._get_conversation = lambda cid: dict(doc)
+    def patch(*a, **kwargs):
+        patches.append(kwargs)
+        doc.update(is_archived=True, current_node='foreign')
+        return SimpleNamespace(status_code=200, raise_for_status=lambda:None)
+    backend.session = SimpleNamespace(patch=patch)
+    with pytest.raises(ConversationArchiveCursorMismatch):
+        backend.set_conversation_archived('original','old-tool',True)
+    assert not patches
+    with pytest.raises(RuntimeError, match='cursor changed during'):
+        backend.set_conversation_archived('original','old-tool',True,validate_document=lambda d:'new-final')
+    assert len(patches) == 1
