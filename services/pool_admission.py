@@ -29,7 +29,7 @@ def reset_unsent_image_attempt(kind, receipt):
                        active_attempt_deadline_at=None, started_ts=None)
 
 
-def record_unsent_failure(context, receipt, at, error_type=None):
+def record_unsent_failure(context, receipt, at, error_type=None, reason=None):
     """Keep why an unsent attempt returned to its original queue, without text."""
     # progress can belong to an older attempt. Only the submission fence proves
     # the phase here; do not attribute the failure to a stale detailed step.
@@ -37,6 +37,9 @@ def record_unsent_failure(context, receipt, at, error_type=None):
              "request_ref": hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24]}
     if error_type:
         entry["error_type"] = error_type
+    if reason in {"claim_expired", "image_capacity_changed", "scheduling_changed",
+                  "work_not_active", "send_guard_rejected"}:
+        entry["reason"] = reason
     code = receipt.get("error_code")
     if code in {"CONVERSATION_OUTCOME_UNKNOWN", "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}:
         entry["error_code"] = code
@@ -1312,6 +1315,12 @@ class PoolAdmission:
                         reason = reasons.get(str(exc), "send_constraints_changed")
                         from services.generation_completion import replacement_send_allowed
                         cancelled = not replacement_send_allowed(self.store, db, context.kind, context.owner, context.request_id, r)
+                        diagnostic = {"original task claim expired": "claim_expired",
+                                      "original image capacity decreased before send": "image_capacity_changed",
+                                      "SCHEDULING_NOT_BEFORE": "scheduling_changed",
+                                      "SCHEDULING_SEND_INTERVAL": "scheduling_changed",
+                                      "WORK_NOT_ACTIVE": "work_not_active"}.get(str(exc), "send_guard_rejected")
+                        record_unsent_failure(context, r, now, "AdmissionLost", reason=diagnostic)
                         r.update(status="queued", upstream_outcome="not_sent", upstream_unfinished=False,
                                  _claim_id=None, _claim_until=0, _turn_reserved=False, _executing=False,
                                  _ready_at=now + 1, waiting={"reasons": [reason], "next_check_at": now + 1})
@@ -1329,7 +1338,8 @@ class PoolAdmission:
         with self.store.connect() as db:
             observed = self.store.read_receipt(db, context.kind, context.owner, context.request_id) or {}
         with self.store.transaction() as db:
-            workflow_scheduling.expire_unsent(self.store, db, list(self.store.receipts(db)), float(self.clock()))
+            workflow_scheduling.expire_unsent(self.store, db, list(self.store.receipts(
+                db, statuses=("queued", "not_started", "running"))), float(self.clock()))
         selected_route = None
         if (observed.get("_requested_account_identity") and context.kind == "text"
                 and observed.get("_operation", "text") != "image" and observed.get("_route", "chat") == "chat"):
@@ -1369,7 +1379,22 @@ class PoolAdmission:
                         or now >= marker.get("expires_at", 0)):
                     raise AdmissionLost("temporary second Chat turn was stopped or expired before send")
             if context.kind == "image" and r.get("_image_thread"):
-                owned = {task_id: task for kind, owner, task_id, task in self.store.receipts(db) if kind == "image" and owner == context.owner}
+                # Only these exact same-owner originals participate in the
+                # predecessor check. Keep full source bytes for its fingerprint,
+                # without decoding every unrelated historical image payload.
+                thread = r["_image_thread"]
+                owned = {}
+                for task_id in (thread.get("previous_task_id"), thread.get("edit_source_task_id")):
+                    if task_id and task_id not in owned:
+                        task = self.store.read_receipt(db, "image", context.owner, task_id)
+                        if task:
+                            owned[task_id] = task
+                source = owned.get(thread.get("edit_source_task_id")) or {}
+                selected_id = (source.get("_completion") or {}).get("selected_id")
+                if selected_id and selected_id not in owned:
+                    selected = self.store.read_receipt(db, "image", context.owner, selected_id)
+                    if selected:
+                        owned[selected_id] = selected
                 binding, blocked = predecessor_state(r, owned)
                 if blocked or any(r.get(k) != v for k, v in binding.items()):
                     raise AdmissionLost("original image thread predecessor changed before send")
@@ -1384,8 +1409,13 @@ class PoolAdmission:
                         or r.get("_submission_parent_message_id") != previous.get("parent_message_id")):
                     raise AdmissionLost("original Chat predecessor is not confirmed before send")
             physical = physical_conversation_key(r)
+            needs_image_capacity = (r.get("_route") != "codex"
+                                    and (context.kind == "image" or r.get("_operation") == "image"))
+            occupancy = list(self.store.receipts(db,
+                statuses=("queued", "not_started", "running", "unknown", "failed", "error"),
+                include_upstream_unfinished=True)) if physical or needs_image_capacity else ()
             if physical:
-                for other_kind, _, _, other in self.store.receipts(db):
+                for other_kind, _, _, other in occupancy:
                     if (other_kind != context.kind and physical_conversation_key(other) == physical
                             and unfinished(other_kind, other)
                             and (other.get("status") == "running" or unresolved_result(other_kind, other)
@@ -1420,7 +1450,7 @@ class PoolAdmission:
             else:
                 if context.kind == "image" or r.get("_operation") == "image":
                     capacity = image_capacity(selected, self._settings(), r.get("model", "gpt-image-2"))
-                    occupied = sum(1 for kind, _, _, other in self.store.receipts(db)
+                    occupied = sum(1 for kind, _, _, other in occupancy
                                    if (kind == "image" or other.get("_operation") == "image")
                                    and other.get("_account_resource") == r.get("_account_resource")
                                    and image_generation_active(kind, other, other.get("status") == "running" or unresolved_result(kind, other)))
@@ -1446,7 +1476,17 @@ class PoolAdmission:
             while not done.wait(self.CLAIM_SECONDS / 3):
                 try:
                     self.update_claim(context, _claim_until=float(self.clock()) + self.CLAIM_SECONDS)
-                except Exception:
+                except Exception as exc:
+                    # No exception message, input, credential or raw identity.
+                    # Failure to renew is otherwise lost before the send guard
+                    # rejects and safely requeues this original request.
+                    logger.warning({"event": "pool_execution_stage", "stage": "claim_heartbeat_failed",
+                                    "at": float(self.clock()),
+                                    "request_ref": hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24],
+                                    "error_type": ("AdmissionLost" if isinstance(exc, AdmissionLost)
+                                                   else type(exc).__name__ if type(exc).__name__ in
+                                                   {"OperationalError", "DatabaseError", "TimeoutError", "OSError"}
+                                                   else "ClaimRefreshError")})
                     return
         heart = threading.Thread(target=heartbeat, name="original-task-heartbeat", daemon=True)
         heart.start()

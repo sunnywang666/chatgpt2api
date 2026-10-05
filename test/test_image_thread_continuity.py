@@ -1102,7 +1102,7 @@ def test_predecessor_diagnostics_are_specific_and_read_only(previous, reason):
     assert predecessor_state(task, owned) == ({}, reason)
     assert owned == before
 
-@pytest.mark.parametrize('case', ['success', 'late_original_success', 'drift', 'late_result', 'missing_root'])
+@pytest.mark.parametrize('case', ['success', 'late_original_success', 'selected_source_changed', 'drift', 'late_result', 'missing_root'])
 def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runtime, case):
     import time
     from services.generation_completion import GenerationCompletionService, retry_cursor
@@ -1157,7 +1157,7 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
                 root['_completion'] = {}
             r.store.write_receipt(db, 'image', WHO['id'], 'empty-original', root)
     r.admission.execute(ctx)
-    if case not in {'success', 'late_original_success'}:
+    if case not in {'success', 'late_original_success', 'selected_source_changed'}:
         assert len(r.state.sends) == 1
         assert r.read(child_id)['upstream_outcome'] in {'not_sent', 'not_submitted'}
         return
@@ -1191,7 +1191,20 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
     r.submit('after-recovery', source='empty-original')
     with pytest.raises(ImageThreadError, match='IMAGE_THREAD_NOT_TERMINAL'):
         r.service.archive_thread(WHO, child_id)
-    r.admission.execute(r.admission.claim_next())
+    next_context = r.admission.claim_next()
+    assert next_context.request_id == 'after-recovery'
+    if case == 'selected_source_changed':
+        with r.store.transaction() as db:
+            changed = r.store.read_receipt(db, 'image', WHO['id'], child_id)
+            changed['data'] = [{'b64_json': base64.b64encode(SOURCE).decode()}]
+            r.store.write_receipt(db, 'image', WHO['id'], child_id, changed)
+        from services.request_context import AdmissionLost
+        with pytest.raises(AdmissionLost, match='predecessor changed'):
+            next_context.before_send()
+        assert len(r.state.sends) == 2
+        assert r.read('after-recovery')['_submission_started'] is False
+        return
+    r.admission.execute(next_context)
     assert r.read('after-recovery')['status'] == 'success'
     assert r.read('after-recovery')['conversation_id'] == cid
     assert r.read('empty-original')['status'] == ('success' if case == 'late_original_success' else 'error')

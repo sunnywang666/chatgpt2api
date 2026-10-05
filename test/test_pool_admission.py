@@ -152,6 +152,52 @@ class AdmissionTests(unittest.TestCase):
                 self.assertEqual(all_rows[rid], {"id": rid, "owner_id": "happy", **row})
                 self.assertEqual(self.store.read_receipt(db, "image", "happy", rid), all_rows[rid])
 
+    def test_send_guard_does_not_decode_unrelated_saved_images(self):
+        self.image("new-independent")
+        context = self.admission.claim_next()
+        self.admission.update_claim(context, _image_thread={"protocol": "image-thread-v1", "id": "new-thread"})
+        marker = "unrelated-saved-image-must-stay-on-disk"
+        saved = {"id": "old-saved", "owner_id": "happy", "status": "success",
+                 "data": [{"b64_json": marker * 10000}], "upstream_unfinished": False}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "happy", "old-saved", saved)
+        loads = json.loads
+        def guarded_decode(raw):
+            self.assertNotIn(marker, raw)
+            return loads(raw)
+        with patch("services.task_store.json.loads", side_effect=guarded_decode):
+            context.before_send()
+        self.assertTrue(self.read("image", "happy", "new-independent")["_submission_started"])
+        self.assertEqual(self.read("image", "happy", "old-saved"), saved)
+
+    def test_send_guard_preserves_legacy_unfinished_image_capacity(self):
+        self.image("new-image")
+        context = self.admission.claim_next()
+        current = self.read("image", "happy", "new-image")
+        self.admission.settings = lambda: {"image_account_concurrency": 1}
+        legacy = {"id": "legacy", "owner_id": "happy", "status": "success",
+                  "upstream_unfinished": True, "_account_resource": current["_account_resource"]}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "happy", "legacy", legacy)
+        with self.assertRaisesRegex(AdmissionLost, "capacity decreased"):
+            context.before_send()
+        self.assertFalse(self.read("image", "happy", "new-image")["_submission_started"])
+        self.assertEqual(self.read("image", "happy", "legacy"), legacy)
+
+    def test_send_guard_preserves_cross_protocol_legacy_conversation_occupancy(self):
+        self.submit("text-next")
+        context = self.admission.claim_next()
+        self.admission.update_claim(context, conversation_id="original-conversation")
+        legacy = {"id": "legacy-image", "owner_id": "other-owner", "status": "success",
+                  "upstream_unfinished": True, "provider_account_identity": "account-0",
+                  "conversation_id": "original-conversation", "_sequence": 0}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "other-owner", "legacy-image", legacy)
+        with self.assertRaisesRegex(AdmissionLost, "physical conversation is occupied"):
+            context.before_send()
+        self.assertFalse(self.read("text", "happy", "text-next")["_submission_started"])
+        self.assertEqual(self.read("image", "other-owner", "legacy-image"), legacy)
+
     def test_independent_image_preparation_uses_capacity_before_next_send_clock(self):
         self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 2}
         self.admission.pacing = lambda account, now: {"next_at": now + 30, "cooldown_until": 0}
@@ -1281,6 +1327,79 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(sends, ["prepare-failed"])
         self.assertEqual(sum(item["stage"] == "pre_submit_failure" for item in final["_execution_timeline"]), 1)
         self.assertEqual(sum(item["stage"] == "send_call_started" for item in final["_execution_timeline"]), 1)
+
+    def test_guard_rejection_after_preparation_records_reason_and_reclaims_original_once(self):
+        self.image("prepared-expired")
+        context = self.admission.claim_next()
+        sends = []
+        def expired_after_prepare(ctx, body):
+            self.clock.now += self.admission.CLAIM_SECONDS + 1
+            ctx.before_send()
+            sends.append(ctx.request_id)
+        self.admission.register("image", expired_after_prepare)
+        with self.assertLogs("chatgpt2api", level="WARNING") as captured:
+            self.admission.execute(context)
+        receipt = self.read("image", "happy", "prepared-expired")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(receipt["_submission_started"])
+        self.assertEqual(sends, [])
+        failures = [e for e in receipt["_execution_timeline"] if e["stage"] == "pre_submit_failure"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["reason"], "claim_expired")
+        self.assertEqual(failures[0]["error_type"], "AdmissionLost")
+        self.assertNotIn("private image input", "\n".join(captured.output))
+        self.clock.now += 2
+        renewed = self.admission.claim_next()
+        self.assertEqual(renewed.request_id, context.request_id)
+        def succeed(ctx, body):
+            ctx.before_send()
+            ctx.record_stage("send_call_started")
+            sends.append(ctx.request_id)
+            self.admission.update_claim(ctx, status="success", upstream_unfinished=False)
+        self.admission.register("image", succeed)
+        self.admission.execute(renewed)
+        final = self.read("image", "happy", "prepared-expired")
+        self.assertEqual(sends, ["prepared-expired"])
+        self.assertEqual(final["status"], "success")
+        self.assertEqual(sum(e["stage"] == "send_call_started" for e in final["_execution_timeline"]), 1)
+        self.assertEqual(sum(e["stage"] == "pre_submit_failure" for e in final["_execution_timeline"]), 1)
+
+    def test_guard_reason_and_heartbeat_diagnostics_do_not_log_exception_text(self):
+        from services.pool_admission import record_unsent_failure
+        self.image("heartbeat")
+        context = self.admission.claim_next()
+        with patch("services.pool_admission.logger.warning") as logged:
+            receipt = {}
+            record_unsent_failure(context, receipt, self.clock(), "AdmissionLost", reason="private credential")
+            self.assertNotIn("private credential", str(logged.call_args_list))
+            self.assertNotIn("reason", receipt["_execution_timeline"][0])
+        import sqlite3
+        update = self.admission.update_claim
+        failed = threading.Event()
+        def fail_renewal(ctx, **changes):
+            if set(changes) == {"_claim_until"}:
+                raise sqlite3.OperationalError("private credential and database path")
+            return update(ctx, **changes)
+        def capture(entry):
+            if entry.get("stage") == "claim_heartbeat_failed":
+                failed.set()
+        def succeed(ctx, body):
+            self.assertTrue(failed.wait(2), "heartbeat failure was not observed")
+            ctx.before_send()
+            ctx.record_stage("send_call_started")
+            update(ctx, status="success", upstream_unfinished=False)
+        self.admission.register("image", succeed)
+        with patch.object(self.admission, "CLAIM_SECONDS", .03), \
+                patch.object(self.admission, "update_claim", side_effect=fail_renewal), \
+                patch("services.pool_admission.logger.warning", side_effect=capture) as logged:
+            self.admission.execute(context)
+        entries = [call.args[0] for call in logged.call_args_list
+                   if call.args[0].get("stage") == "claim_heartbeat_failed"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["error_type"], "OperationalError")
+        self.assertEqual(entries[0]["request_ref"], hashlib.sha256(b"happy:heartbeat").hexdigest()[:24])
+        self.assertNotIn("private credential", str(logged.call_args_list))
+        self.assertEqual(self.read("image", "happy", "heartbeat")["status"], "success")
 
     def test_unsent_diagnostic_does_not_attribute_old_attempt_progress(self):
         self.image("stale-progress")
