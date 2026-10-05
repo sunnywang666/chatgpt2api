@@ -1307,14 +1307,15 @@ class ImageTaskServiceTests(unittest.TestCase):
 
     def test_fresh_original_terminal_recovery_skips_settle_but_keeps_publication_check(self):
         from copy import deepcopy
-        for case in ("complete", "new_second_image", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed"):
+        from services.config import config
+        for case in ("complete", "new_second_image", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed", "settle_failure"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp_dir:
                 path = Path(tmp_dir) / "tasks.json"
                 write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", error="",
                     upstream_unfinished=True, _image_thread={"protocol": "image-thread-v1"},
                     _image_thread_request_parent="anchor",
                     **({"_pending_image_result_ids": {"file_ids": ["missing" if case == "pending_missing" else "original-image"], "sediment_ids": []}}
-                       if case in ("pending_missing", "new_second_image") else {}))
+                       if case in ("pending_missing", "new_second_image", "settle_failure") else {}))
                 service = self.make_service(path)
                 service._update_task("owner-1:policy-task", _image_thread={"id": "original-thread"},
                                      _image_thread_request_parent="anchor")
@@ -1328,7 +1329,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                     "final": {"parent": "image", "message": {"id": "final", "author": {"role": "assistant"},
                         "status": "finished_successfully", "end_turn": True}}}}
                 if case == "parent_changed": document["mapping"]["original-request"]["parent"] = "other"
-                if case == "running": document["mapping"]["final"]["message"]["status"] = "in_progress"
+                if case in ("running", "settle_failure"): document["mapping"]["final"]["message"]["status"] = "in_progress"
                 expected_files = ["original-image"]
                 if case == "new_second_image":
                     expected_files.append("second-image")
@@ -1346,6 +1347,9 @@ class ImageTaskServiceTests(unittest.TestCase):
                         result = deepcopy(document)
                         if case == "post_download_changed" and calls["read"] > 1:
                             result["mapping"]["original-request"]["parent"] = "other"
+                        if case == "settle_failure" and calls["read"] > 1:
+                            result["mapping"]["final"]["message"].update(status="finished_successfully",
+                                content={"content_type": "text", "parts": ["Something went wrong while generating your image."]})
                         return result
                     def _poll_image_results(self, cid, timeout, **kwargs):
                         calls["poll"] += 1
@@ -1366,7 +1370,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                     mock.patch("services.openai_backend_api.OpenAIBackendAPI", Backend),
                     mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"url": "saved"}]}) as publish,
                     mock.patch("services.protocol.conversation._observe_image_terminal") as observe,
-                    mock.patch("services.image_task_service.time.sleep"),
+                    mock.patch("services.image_task_service.time.sleep") as sleep,
+                    mock.patch.dict(config.data, {"image_settle_enabled": True, "image_settle_secs": 30}),
                 ):
                     service._run_resume_poll("owner-1:policy-task", "conversation-1", 60,
                         "http://localhost", OWNER, "generate", "gpt-image-2", False, False)
@@ -1374,8 +1379,11 @@ class ImageTaskServiceTests(unittest.TestCase):
                 if case in ("complete", "new_second_image", "post_download_changed"):
                     self.assertEqual(calls, {"read": 2, "poll": 0, "download": 1})
                     observe.assert_called_once_with()
+                    sleep.assert_not_called()
                 else:
-                    self.assertEqual(calls, {"read": 1, "poll": 0 if case == "read_429" else 1, "download": 0})
+                    self.assertEqual(calls, {"read": 2 if case in ("pending_missing", "settle_failure") else 1, "poll": 0 if case in ("read_429", "settle_failure") else 1, "download": 0})
+                    if case in ("pending_missing", "settle_failure"): sleep.assert_called_once_with(30)
+                    else: sleep.assert_not_called()
                     observe.assert_not_called()
                 if case in ("complete", "new_second_image"):
                     self.assertEqual(row["status"], "success")
@@ -1498,13 +1506,15 @@ class ImageTaskServiceTests(unittest.TestCase):
             from services.openai_backend_api import OpenAIBackendAPI as RealBackend
             from services.config import config
             original_message = service._tasks["owner-1:pending-task"]["request_message_id"]
+            observations = []
             class PendingBackend(RealBackend):
                 reads = 0
                 def __init__(self, access_token=None, proxy_url=None):
                     pass
                 def _get_conversation(self, _conversation_id):
                     PendingBackend.reads += 1
-                    return {"current_node": "image", "mapping": {
+                    observations.append("read")
+                    return {"observation": PendingBackend.reads, "current_node": "image", "mapping": {
                         original_message: {"message": {"author": {"role": "user"}}},
                         "image": {"parent": original_message, "message": {
                             "author": {"role": "tool"}, "metadata": {"async_task_type": "image_gen"},
@@ -1514,6 +1524,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                         raise AssertionError("pending IDs must be observed again")
                     if not kwargs.get("initial_document"):
                         raise AssertionError("reuse this recovery attempt's fresh snapshot")
+                    self_test.assertEqual(kwargs["initial_document"]["observation"], PendingBackend.reads)
+                    self_test.assertEqual(observations[-2:], ["sleep", "read"])
                     calls.append(("poll", kwargs["initial_file_ids"]))
                     return super()._poll_image_results(_conversation_id, _timeout, **kwargs)
                 def resolve_conversation_image_urls(self, _conversation_id, files, sediments, **kwargs):
@@ -1526,7 +1538,14 @@ class ImageTaskServiceTests(unittest.TestCase):
                     return "result-parent"
                 def close(self):
                     pass
+            self_test = self
+            original_sleep = time.sleep
+            def record_sleep(seconds):
+                if threading.current_thread().name.startswith("image-resume-"):
+                    observations.append("sleep")
+                original_sleep(seconds)
             with (
+                mock.patch("services.image_task_service.time.sleep", side_effect=record_sleep),
                 mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
                 mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="token"),
                 mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
@@ -1535,12 +1554,13 @@ class ImageTaskServiceTests(unittest.TestCase):
                     "image_check_before_hit_enabled": True, "image_poll_initial_wait_secs": 10}),
             ):
                 with mock.patch.dict(config.data, {"image_settle_secs": 30}), mock.patch(
-                    "services.image_task_service.time.sleep"
+                    "services.image_task_service.time.sleep", side_effect=lambda seconds: observations.append("sleep")
                 ) as sleep:
                     service._run_resume_poll("owner-1:pending-task", "conversation-1", 5,
                                              "http://provider", OWNER, "generate", "gpt-image-2", False, False)
                     sleep.assert_called_once_with(5)
-                    self.assertEqual(PendingBackend.reads, 0)
+                    self.assertEqual(PendingBackend.reads, 1)
+                    self.assertEqual(observations, ["read", "sleep"])
                     self.assertEqual(calls, [])
                     self.assertEqual(service._tasks["owner-1:pending-task"]["status"], "error")
                     self.assertEqual(service._tasks["owner-1:pending-task"]["_pending_image_result_ids"],
@@ -1553,7 +1573,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                         worker.join(timeout=2)
                         self.assertFalse(worker.is_alive())
                 self.assertEqual(calls, [("poll", ["pending-file"])])
-                self.assertEqual(PendingBackend.reads, 1)
+                self.assertEqual(PendingBackend.reads, 3)
                 self.assertTrue(still_pending["upstream_unfinished"])
                 service = self.make_service(path)
                 service._update_task("owner-1:pending-task", next_poll_at=0,
@@ -1573,7 +1593,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(calls[1], ("poll", ["pending-file", "second-file"]))
             self.assertEqual(calls[2][0], "resolve")
             self.assertEqual(calls[3][0], "download")
-            self.assertEqual(PendingBackend.reads, 2)
+            self.assertEqual(PendingBackend.reads, 5)
             self.assertIsNone(service._tasks["owner-1:pending-task"].get("_pending_image_result_ids"))
             self.assertEqual(succeeded["image_session_parent_id"], "result-parent")
 

@@ -2306,17 +2306,6 @@ class ImageTaskService:
                     )
                     return
                 try:
-                    # Pending IDs came from a previous authoritative read.
-                    # Wait before the new snapshot, not after it, so the next
-                    # matching observation retains the existing settle delay.
-                    if pending_ids and config.image_settle_enabled:
-                        settle_wait = min(max(0.0, float(config.image_settle_secs)),
-                                          max(0.0, float(extra_timeout_secs)))
-                        if settle_wait:
-                            time.sleep(settle_wait)
-                        extra_timeout_secs = max(0.0, float(extra_timeout_secs) - settle_wait)
-                        if extra_timeout_secs <= 0:
-                            raise ImagePollTimeoutError("原会话结果仍待稳定确认，保留原请求继续读取。", conversation_id)
                     document = backend._get_conversation(conversation_id)
                     conversation_available = True
                     from services.generation_completion import retry_cursor
@@ -2426,6 +2415,22 @@ class ImageTaskService:
                                 from services.protocol.conversation import _observe_image_terminal
                                 _observe_image_terminal()
                                 strict_ids = (files, sediments)
+                    if strict_ids is None and pending_ids and config.image_settle_enabled:
+                        # Query before sleeping so a strictly finished original
+                        # can proceed immediately. A fallback settle still needs
+                        # a NEW observation after the wait, never the pre-wait doc.
+                        settle_wait = min(max(0.0, float(config.image_settle_secs)),
+                                          max(0.0, float(extra_timeout_secs)))
+                        if settle_wait:
+                            time.sleep(settle_wait)
+                        extra_timeout_secs = max(0.0, float(extra_timeout_secs) - settle_wait)
+                        if extra_timeout_secs <= 0:
+                            raise ImagePollTimeoutError("原会话结果仍待稳定确认，保留原请求继续读取。", conversation_id)
+                        document = backend._get_conversation(conversation_id)
+                        self._update_task(key, _retry_cursor=retry_cursor(document, task, kind="image"))
+                        authoritative_failure = _authoritative_image_failure(document, request_message_id)
+                        if authoritative_failure:
+                            raise AuthoritativeImageTaskFailure(authoritative_failure)
                     pending_options = (
                         {"initial_file_ids": pending_ids.get("file_ids", []),
                          "initial_sediment_ids": pending_ids.get("sediment_ids", []),
