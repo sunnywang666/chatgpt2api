@@ -53,6 +53,7 @@ class _ConversationHints:
     def __init__(self, account_identity=None):
         self.stopped = threading.Event()
         self.signals = {}
+        self.activity = {}
         self.lock = threading.Lock()
         self.changed = threading.Condition(self.lock)
         self.thread = None
@@ -167,11 +168,30 @@ class _ConversationHints:
                         else:
                             self.counts["unregistered_conversation"] += 1
                     else:
-                        self.counts["active_nonfinal"] += 1
                         reason = ("not_conversation_update" if message.get("type") != "conversation-update"
                                   else "not_add_messages" if payload.get("update_type") != "add-messages"
                                   else "no_final_image_tool")
                         with self.lock:
+                            # A context can be released after the first routing
+                            # check. A late frame must not resurrect its state.
+                            if cid not in self.signals:
+                                self.counts["unregistered_conversation"] += 1
+                                continue
+                            self.counts["active_nonfinal"] += 1
+                            # Only generation messages in this active CID keep
+                            # its first-read watchdog alive. Other conversations,
+                            # title updates and user messages cannot delay it.
+                            update = payload.get("update_content")
+                            messages = update.get("messages") if isinstance(update, dict) else None
+                            if (message.get("type") == "conversation-update"
+                                    and payload.get("update_type") == "add-messages"
+                                    and isinstance(messages, list)
+                                    and any(isinstance(item, dict)
+                                            and isinstance(item.get("author"), dict)
+                                            and item["author"].get("role") in {"assistant", "tool"}
+                                            for item in messages)):
+                                self.activity[cid] = time.monotonic()
+                                self.changed.notify_all()
                             reasons = self.nonfinal_reasons.setdefault(cid, set())
                             first = reason not in reasons
                             reasons.add(reason)
@@ -218,7 +238,7 @@ def image_completion_hints(account_identity, conversation_id, open_transport):
             hub.thread.start()
     try:
         fallback_observed = False
-        def wait(seconds, *, before_first_read=False):
+        def wait(seconds, *, before_first_read=False, max_wait_seconds=None):
             nonlocal fallback_observed
             if signal.is_set():
                 signal.clear()
@@ -235,9 +255,14 @@ def image_completion_hints(account_identity, conversation_id, open_transport):
                 # Prefer the completion event before spending a read on an
                 # empty turn. A disconnect wakes this first-read wait too;
                 # fallback must not pay an extra polling interval.
-                until = time.monotonic() + seconds
+                started = time.monotonic()
+                budget_until = started + (seconds if max_wait_seconds is None else max_wait_seconds)
                 with hub.changed:
                     while not signal.is_set() and not hub.stopped.is_set():
+                        # A quiet watchdog is a fallback for missing events,
+                        # not a fixed timer to query a still-progressing turn.
+                        # Progress never extends the caller's active budget.
+                        until = min(budget_until, max(started, hub.activity.get(conversation_id, started)) + seconds)
                         remaining = until - time.monotonic()
                         if remaining <= 0:
                             break
@@ -257,6 +282,7 @@ def image_completion_hints(account_identity, conversation_id, open_transport):
                 if not hub.signals[conversation_id]:
                     del hub.signals[conversation_id]
                     hub.nonfinal_reasons.pop(conversation_id, None)
+                    hub.activity.pop(conversation_id, None)
                 empty = not hub.signals
             if empty:
                 hub.stopped.set()

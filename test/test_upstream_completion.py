@@ -315,9 +315,10 @@ def test_image_notification_wakes_original_poll_without_result_or_retry_authorit
             "content": {"parts": [{"asset_pointer": "sediment://" + asset}]}}}}}
     backend._get_conversation = lambda cid: reads.append(cid) or full
     backend._query_backend_tasks = lambda **kw: []
-    def wake(seconds, *, before_first_read=False):
+    def wake(seconds, *, before_first_read=False, max_wait_seconds=None):
         waits.append(seconds)
         assert before_first_read and not reads, "wait for the hint before reading an empty turn"
+        assert 19 <= max_wait_seconds <= 20, "preserve the fallback network budget"
         return True
     monkeypatch.setitem(config.data, "image_poll_interval_secs", 10)
     monkeypatch.setitem(config.data, "image_check_before_hit_enabled", False)
@@ -411,6 +412,87 @@ def test_short_active_budget_preserves_first_read_instead_of_only_waiting(monkey
     result = backend._poll_image_results_inner(CID, 5, request_message_id="request",
         _completion_wait=lambda *_args, **_kw: pytest.fail("must retain first read budget"))
     assert reads == [CID] and result == ([asset], [])
+
+
+@pytest.mark.parametrize("mode,ended,notified", [
+    ("same_conversation", 33, True),
+    ("foreign_conversation", 30, False),
+    ("continuous_progress", 40, False),
+])
+def test_first_read_watchdog_tracks_local_progress_but_cannot_extend_active_budget(monkeypatch, mode, ended, notified):
+    # Reproduce a 30-second watchdog expiring three seconds before the final
+    # hint, despite a real progress message five seconds before that expiry.
+    now, waits = [0.0], []
+    monkeypatch.setattr(completion.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(completion._ConversationHints, "run", lambda *_: None)
+    with completion.image_completion_hints("progress-fixture", CID, lambda: None) as wait:
+        hub = completion._hubs["progress-fixture"]
+        hub.subscribed = True
+        signal = next(iter(hub.signals[CID]))
+        def tick(seconds):
+            waits.append(seconds)
+            if len(waits) == 1:
+                now[0] = 25
+                hub.activity["foreign" if mode == "foreign_conversation" else CID] = 25
+            elif mode == "same_conversation":
+                now[0] = 33
+                signal.set()
+            elif mode == "foreign_conversation":
+                now[0] += seconds
+            elif len(waits) == 2:
+                now[0] = 37
+                hub.activity[CID] = 37
+            else:
+                now[0] += seconds
+        monkeypatch.setattr(hub.changed, "wait", tick)
+        assert wait(30, before_first_read=True, max_wait_seconds=40) is notified
+        assert now[0] == ended
+        assert waits[0] == 30
+    assert CID not in hub.activity, "released contexts must not retain conversation activity"
+
+
+@pytest.mark.parametrize("role,update_type,recorded", [
+    ("tool", "add-messages", True), ("assistant", "add-messages", True),
+    ("user", "add-messages", False), ("tool", "title", False),
+])
+def test_only_active_conversation_generation_messages_extend_first_read_watchdog(monkeypatch, role, update_type, recorded):
+    monkeypatch.setattr(completion.time, "monotonic", lambda: 25.0)
+    reply = {"id": 2, "reply": {"type": "subscribe", "topic_id": "conversations"}}
+    progress = global_image_event(status="in_progress", author={"role": role})
+    progress["payload"]["update_type"] = update_type
+    session = Session([[reply, global_image_event("foreign", status="in_progress"), progress]])
+    hub = completion._ConversationHints()
+    signal = threading.Event(); hub.signals[CID] = {signal}
+    hub.run(lambda: (session, URL, {}, lambda: None, 35))
+    assert hub.activity == ({CID: 25.0} if recorded else {})
+    assert not signal.is_set(), "progress is not a completion hint or a result"
+
+
+def test_progress_frame_cannot_restore_activity_after_concurrent_context_release():
+    reply = {"id": 2, "reply": {"type": "subscribe", "topic_id": "conversations"}}
+    session = Session([[reply, global_image_event(status="in_progress"),
+                        global_image_event("later", status="in_progress"), global_image_event("later")]])
+    hub = completion._ConversationHints()
+    later = threading.Event()
+    hub.signals = {CID: {threading.Event()}, "later": {later}}
+    lock = hub.lock
+    class ReleaseBetweenRoutingAndProgress:
+        entries = 0
+        def __enter__(self):
+            lock.acquire()
+            self.entries += 1
+            if self.entries == 2:
+                hub.signals.pop(CID)
+                hub.activity.pop(CID, None)
+                hub.nonfinal_reasons.pop(CID, None)
+        def __exit__(self, *_):
+            lock.release()
+    hub.lock = ReleaseBetweenRoutingAndProgress()
+    hub.run(lambda: (session, URL, {}, lambda: None, time.monotonic() + 10))
+    assert CID not in hub.activity and CID not in hub.nonfinal_reasons
+    assert "later" in hub.activity and later.is_set()
+    assert hub.counts["unregistered_conversation"] == 1
+    assert hub.counts["active_nonfinal"] == 1
 
 
 @pytest.mark.parametrize("typed_reply", [False, True])

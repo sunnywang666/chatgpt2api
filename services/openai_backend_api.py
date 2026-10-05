@@ -2628,7 +2628,8 @@ class OpenAIBackendAPI:
         def wait_for_original(seconds, *, before_first_read=False):
             if _completion_wait is None:
                 time.sleep(seconds)
-            elif (_completion_wait(seconds, before_first_read=True) if before_first_read
+            elif (_completion_wait(seconds, before_first_read=True,
+                                   max_wait_seconds=max(0.0, _remaining() - 10.0)) if before_first_read
                   else _completion_wait(seconds)):
                 from services.request_context import current_request
                 context = current_request.get()
@@ -2643,7 +2644,9 @@ class OpenAIBackendAPI:
         # cannot fit a short recovery budget when the read interval is longer.
         # The recovery caller already enforced any pending-observation settle
         # window. Live turns with no assets prefer a notification, bounded by
-        # the same polling watchdog so a lost event cannot strand the original.
+        # a quiet polling watchdog so a lost event cannot strand the original.
+        # Same-conversation progress may defer that first read, within the
+        # active budget; completion/disconnect still wakes it immediately.
         if _completion_wait is not None and not has_initial_ids and not single_snapshot:
             # Retain network time for the fallback instead of spending the
             # entire active budget waiting on a notification that may be lost.
