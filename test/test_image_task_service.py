@@ -266,7 +266,49 @@ class ImageTaskServiceTests(unittest.TestCase):
             backend.session.get.side_effect = lambda url, **kwargs: clock.request(transport, "GET", url, **kwargs)
             self.assertEqual(backend._get_conversation("original"), {"current_node": "original"})
             self.assertEqual(transport.call_args.kwargs["timeout"], 6)
+            # This fixture stops at the clock; the real paced Session consumes
+            # the connection option downstream (covered by the native tests).
+            self.assertEqual(transport.call_args.kwargs.pop("_account_request_connect_timeout_secs"), 10)
             self.assertFalse(any(key.startswith("_account_request") for key in transport.call_args.kwargs))
+
+    def test_image_original_reads_default_to_ten_second_connection_sub_budget(self):
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://provider.test"
+        backend._headers = lambda *_args: {}
+        backend.session = mock.Mock()
+        backend.session.get.return_value = mock.Mock(status_code=200)
+        backend.session.get.return_value.json.return_value = {"current_node": "original"}
+        for total in (60, 6):
+            self.assertEqual(backend._get_conversation("original", timeout_secs=total), {"current_node": "original"})
+            options = backend.session.get.call_args.kwargs
+            self.assertEqual(options["timeout"], total)
+            self.assertEqual(options["_account_request_connect_timeout_secs"], 10)
+
+    def test_image_original_read_paced_session_caps_connection_inside_total(self):
+        from curl_cffi import requests
+        from services.config import config
+        from services.account_request_pacing import pace_account_session
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch("services.account_request_pacing.DATA_DIR", Path(tmp)), \
+             mock.patch("services.account_request_pacing._clocks", {}), \
+             mock.patch.dict(config.data, {"account_request_interval_secs": 0,
+                                           "account_conversation_read_interval_secs": 0}), \
+             mock.patch.object(requests.Session, "request", autospec=True) as transport:
+            transport.return_value = mock.Mock(status_code=200, headers={}, content=b'{}')
+            transport.return_value.json.return_value = {"current_node": "original"}
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.base_url = "https://chatgpt.com"
+            backend._headers = lambda *_args: {}
+            backend.session = requests.Session()
+            pace_account_session(backend.session, {"account_id": "fixture"}, "fixture-token")
+            try:
+                for total in (60, 6):
+                    backend._get_conversation("original", timeout_secs=total)
+                    timeout = transport.call_args.kwargs["timeout"]
+                    self.assertEqual(timeout, (min(10, total), max(0, total - 10)))
+                    self.assertFalse(any(k.startswith("_account_request") for k in transport.call_args.kwargs))
+            finally:
+                backend.close()
 
     def test_image_preflight_raw_read_does_not_receive_pacing_kwargs(self):
         backend = object.__new__(OpenAIBackendAPI)
@@ -333,6 +375,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             response = mock.Mock(status_code=200, headers={})
             response.json.return_value = {"current_node": "original"}
             def transport(*args, **kwargs):
+                self.assertEqual(kwargs.pop("_account_request_connect_timeout_secs"), 10)
                 self.assertFalse(any(k.startswith('_account_request') for k in kwargs))
                 now[0] += 1
                 return response

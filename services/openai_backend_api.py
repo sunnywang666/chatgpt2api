@@ -1284,7 +1284,7 @@ class OpenAIBackendAPI:
         self,
         conversation_id: str,
         timeout_secs: float = 60.0,
-        *, _send=None, deadline_monotonic: float | None = None, connect_timeout_secs: float | None = None,
+        *, _send=None, deadline_monotonic: float | None = None, connect_timeout_secs: float | None = 10.0,
         minimum_budget_secs: float | None = None,
     ) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
@@ -1299,6 +1299,9 @@ class OpenAIBackendAPI:
             options["_account_request_deadline_monotonic"] = (
                 min(existing, deadline_monotonic) if existing is not None else deadline_monotonic
             )
+        # Image recovery, publication checks and archive reads share the same
+        # bounded connection setup as direct text recovery. Pacing caps this
+        # sub-budget inside the remaining total timeout, never in addition to it.
         if _send is None and connect_timeout_secs is not None:
             options["_account_request_connect_timeout_secs"] = connect_timeout_secs
         if _send is None and minimum_budget_secs is not None:
