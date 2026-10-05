@@ -54,6 +54,7 @@ class _ConversationHints:
         self.stopped = threading.Event()
         self.signals = {}
         self.lock = threading.Lock()
+        self.changed = threading.Condition(self.lock)
         self.thread = None
         self.account_ref = safe_account_ref(account_identity)
         self.subscribed = False
@@ -159,6 +160,7 @@ class _ConversationHints:
                             targets = tuple(self.signals.get(cid, ()))
                             for signal in targets:
                                 signal.set()
+                            self.changed.notify_all()
                         if targets:
                             self.counts["matched_hints"] += 1
                             self.observe("hint_matched", cid, waiting_contexts=len(targets))
@@ -182,6 +184,8 @@ class _ConversationHints:
             self.observe("transport_error", error_type=type(exc).__name__)
         finally:
             self.stopped.set()
+            with self.changed:
+                self.changed.notify_all()
             self.observe("stopped", reason=stop_reason, subscribed=self.subscribed, counts=dict(self.counts))
             if ws is not None:
                 try:
@@ -214,7 +218,7 @@ def image_completion_hints(account_identity, conversation_id, open_transport):
             hub.thread.start()
     try:
         fallback_observed = False
-        def wait(seconds):
+        def wait(seconds, *, before_first_read=False):
             nonlocal fallback_observed
             if signal.is_set():
                 signal.clear()
@@ -224,9 +228,23 @@ def image_completion_hints(account_identity, conversation_id, open_transport):
                 if not fallback_observed:
                     hub.observe("poll_fallback", conversation_id, reason="listener_stopped")
                     fallback_observed = True
-                time.sleep(seconds)
+                if not before_first_read:
+                    time.sleep(seconds)
                 return False
-            notified = signal.wait(seconds)
+            if before_first_read:
+                # Prefer the completion event before spending a read on an
+                # empty turn. A disconnect wakes this first-read wait too;
+                # fallback must not pay an extra polling interval.
+                until = time.monotonic() + seconds
+                with hub.changed:
+                    while not signal.is_set() and not hub.stopped.is_set():
+                        remaining = until - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        hub.changed.wait(remaining)
+                    notified = signal.is_set()
+            else:
+                notified = signal.wait(seconds)
             signal.clear()  # Coalesce duplicate updates into one original GET.
             if notified:
                 hub.observe("hint_consumed", conversation_id)

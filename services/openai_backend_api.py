@@ -2584,8 +2584,9 @@ class OpenAIBackendAPI:
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
-        - The first authoritative read runs as soon as the account clock allows.
-          Stream/asset signals do not add an unconditional initial or settle wait.
+        - With no observed assets, prefer a completion notification before the
+          first read, bounded by the existing polling watchdog. Observed assets
+          and recovery snapshots require no initial wait.
         - Subsequent polls are image_poll_interval_secs apart (default 10s).
         - On upstream 429 / 5xx or network errors, backs off exponentially
           (capped at 16s, +jitter) honoring Retry-After when present.
@@ -2613,6 +2614,7 @@ class OpenAIBackendAPI:
             "conversation_id": conversation_id,
             "timeout_secs": timeout_secs,
             "initial_wait_secs": 0,
+            "completion_first_read_watchdog_secs": interval if _completion_wait is not None and not has_initial_ids and not single_snapshot else 0,
             "interval_secs": interval,
             "initial_file_ids": file_ids,
             "initial_sediment_ids": sediment_ids,
@@ -2623,10 +2625,11 @@ class OpenAIBackendAPI:
             pacing_wait = float(getattr(getattr(self, "progress_callback", None), "local_pacing_wait_secs", 0)) - initial_pacing_wait
             return timeout_secs - (time.time() - start - pacing_wait)
 
-        def wait_for_original(seconds):
+        def wait_for_original(seconds, *, before_first_read=False):
             if _completion_wait is None:
                 time.sleep(seconds)
-            elif _completion_wait(seconds):
+            elif (_completion_wait(seconds, before_first_read=True) if before_first_read
+                  else _completion_wait(seconds)):
                 from services.request_context import current_request
                 context = current_request.get()
                 if context is not None:
@@ -2639,7 +2642,14 @@ class OpenAIBackendAPI:
         # clock. Consume that fresh observation once; a second immediate GET
         # cannot fit a short recovery budget when the read interval is longer.
         # The recovery caller already enforced any pending-observation settle
-        # window. Live streams instead get a first read before any fallback wait.
+        # window. Live turns with no assets prefer a notification, bounded by
+        # the same polling watchdog so a lost event cannot strand the original.
+        if _completion_wait is not None and not has_initial_ids and not single_snapshot:
+            # Retain network time for the fallback instead of spending the
+            # entire active budget waiting on a notification that may be lost.
+            first_wait = min(interval, max(0.0, _remaining() - 10.0))
+            if first_wait > 0:
+                wait_for_original(first_wait, before_first_read=True)
 
         def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
             # retry_after=0 means "retry immediately" — must not be coerced via falsy check.
@@ -2661,10 +2671,16 @@ class OpenAIBackendAPI:
             if error is not None:
                 log_payload["error"] = error
             logger.warning(log_payload)
-            time.sleep(sleep_for)
+            # A completion hint can end optional transport/server backoff,
+            # but never an explicit upstream delay or rate-limit cooldown.
+            if status_code != 429 and retry_after is None:
+                wait_for_original(sleep_for)
+            else:
+                time.sleep(sleep_for)
             return True
 
         last_task_error = ""
+        notification_task_diagnosed = False
         last_read_status: int | None = None
         last_retry_after: int | None = None
         last_read_was_transport = False
@@ -2720,11 +2736,17 @@ class OpenAIBackendAPI:
                     record_pending(list(file_ids), list(sediment_ids))
 
             if not file_ids and not sediment_ids:
-                # Successful asset reads need no separate task-list query. Only
-                # diagnose a missing result after the authoritative conversation read.
-                last_task_error = ""
+                # The task list is a diagnostic, not a completion signal. With
+                # a listener installed, reserve it for the final active-budget
+                # window instead of adding a second GET to each empty poll.
+                diagnose = (_completion_wait is None or
+                            (not notification_task_diagnosed and _remaining() <= interval))
                 try:
-                    tasks = [] if supplied_snapshot else self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                    tasks = []
+                    if not supplied_snapshot and diagnose:
+                        notification_task_diagnosed = True
+                        last_task_error = ""
+                        tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
                     for task in tasks:
                         is_error, error_msg, metadata = self.check_task_error(task)
                         if is_error and error_msg:

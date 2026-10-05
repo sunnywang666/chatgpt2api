@@ -206,6 +206,7 @@ def test_disconnected_shared_listener_preserves_fallback_interval(monkeypatch):
     monkeypatch.setattr(completion.time, "sleep", sleeps.append)
     with completion.image_completion_hints("disconnected-fixture", CID, lambda: None) as wait:
         completion._hubs["disconnected-fixture"].thread.join(1)
+        assert wait(10, before_first_read=True) is False
         assert wait(10) is False
     assert sleeps == [10] and "disconnected-fixture" not in completion._hubs
 
@@ -312,21 +313,104 @@ def test_image_notification_wakes_original_poll_without_result_or_retry_authorit
     full = {**empty, "current_node": "image", "mapping": {**empty["mapping"], "image": {
         "parent": "request", "message": {"id": "image", "author": {"role": "tool"},
             "content": {"parts": [{"asset_pointer": "sediment://" + asset}]}}}}}
-    backend._get_conversation = lambda cid: reads.append(cid) or (empty if len(reads) == 1 else full)
+    backend._get_conversation = lambda cid: reads.append(cid) or full
     backend._query_backend_tasks = lambda **kw: []
-    def wake(seconds):
+    def wake(seconds, *, before_first_read=False):
         waits.append(seconds)
-        assert len(reads) == 1, "notification never reads or promotes results itself"
+        assert before_first_read and not reads, "wait for the hint before reading an empty turn"
         return True
     monkeypatch.setitem(config.data, "image_poll_interval_secs", 10)
     monkeypatch.setitem(config.data, "image_check_before_hit_enabled", False)
     context = current_request.set(SimpleNamespace(record_stage=lambda stage: observed.append(stage)))
     try:
-        files, sediments = backend._poll_image_results_inner(CID, 5, request_message_id="request", _completion_wait=wake)
+        files, sediments = backend._poll_image_results_inner(CID, 30, request_message_id="request", _completion_wait=wake)
     finally:
         current_request.reset(context)
-    assert reads == [CID, CID] and len(waits) == 1 and files == sediments == [asset]
+    assert reads == [CID] and len(waits) == 1 and files == sediments == [asset]
     assert observed == ["upstream_image_completion_signal"]
+
+
+@pytest.mark.parametrize("status,retry_after,wakes", [
+    (None, None, True), (503, None, True), (429, None, False),
+    (503, 3, False), (503, 0, False),
+])
+def test_completion_hint_interrupts_only_optional_error_backoff(monkeypatch, status, retry_after, wakes):
+    from services.config import config
+    from services import openai_backend_api as module
+    from utils.helper import UpstreamHTTPError
+    backend = object.__new__(OpenAIBackendAPI)
+    reads, waits, sleeps = [], [], []
+    asset = "file_000000001234567890abcdef12345678"
+    def read(cid):
+        reads.append(cid)
+        if len(reads) == 1:
+            if status is None:
+                raise module.requests.exceptions.RequestException("controlled connection failure")
+            raise UpstreamHTTPError("controlled read", status, {}, retry_after=retry_after)
+        return {"fixture": "original"}
+    backend._get_conversation = read
+    backend._extract_image_tool_records = lambda doc, rid: [{"file_ids": [asset], "sediment_ids": []}]
+    backend._query_backend_tasks = lambda **kw: pytest.fail("completed result needs no task diagnosis")
+    monkeypatch.setattr(module.time, "sleep", sleeps.append)
+    monkeypatch.setitem(config.data, "image_check_before_hit_enabled", False)
+    result = backend._poll_image_results_inner(CID, 20, request_message_id="request",
+                                               initial_file_ids=[asset],
+                                               _completion_wait=lambda seconds: waits.append(seconds) or True)
+    assert reads == [CID, CID] and result == ([asset], [])
+    assert bool(waits) is wakes and bool(sleeps) is not wakes
+
+
+def test_notification_poll_defers_task_diagnosis_to_final_budget_window(monkeypatch):
+    from services.config import config
+    from services import openai_backend_api as module
+    backend = object.__new__(OpenAIBackendAPI)
+    now, reads, diagnostics = [0.0], [], []
+    monkeypatch.setattr(module.time, "time", lambda: now[0])
+    monkeypatch.setitem(config.data, "image_poll_interval_secs", 10)
+    backend._get_conversation = lambda cid: reads.append((cid, now[0])) or {}
+    backend._extract_image_tool_records = lambda *_: []
+    backend._find_content_policy_error_in_conversation = lambda *_: None
+    backend._query_backend_tasks = lambda **kw: diagnostics.append(now[0]) or []
+    def no_hint(seconds, **kwargs):
+        now[0] += seconds
+        return False
+    with pytest.raises(module.ImagePollTimeoutError):
+        backend._poll_image_results_inner(CID, 35, request_message_id="request", _completion_wait=no_hint)
+    assert [at for _, at in reads] == [10, 20, 30]
+    assert diagnostics == [30], "tasks is diagnostic, not a second generation poll"
+
+
+def test_first_notification_wait_wakes_on_disconnect_without_full_interval(monkeypatch):
+    started, disconnect = threading.Event(), threading.Event()
+    def run(hub, _factory):
+        started.set()
+        disconnect.wait(1)
+        hub.stopped.set()
+        with hub.changed:
+            hub.changed.notify_all()
+    monkeypatch.setattr(completion._ConversationHints, "run", run)
+    with completion.image_completion_hints("first-read-disconnect", CID, lambda: None) as wait:
+        assert started.wait(1)
+        returned = threading.Event()
+        worker = threading.Thread(target=lambda: (wait(30, before_first_read=True), returned.set()))
+        worker.start()
+        disconnect.set()
+        assert returned.wait(1), "a disconnected listener must fall back immediately"
+        worker.join(1)
+
+
+def test_short_active_budget_preserves_first_read_instead_of_only_waiting(monkeypatch):
+    from services.config import config
+    backend = object.__new__(OpenAIBackendAPI)
+    reads = []
+    asset = "file_000000001234567890abcdef12345678"
+    backend._get_conversation = lambda cid: reads.append(cid) or {}
+    backend._extract_image_tool_records = lambda *_: [{"file_ids": [asset], "sediment_ids": []}]
+    monkeypatch.setitem(config.data, "image_poll_interval_secs", 30)
+    monkeypatch.setitem(config.data, "image_check_before_hit_enabled", False)
+    result = backend._poll_image_results_inner(CID, 5, request_message_id="request",
+        _completion_wait=lambda *_args, **_kw: pytest.fail("must retain first read budget"))
+    assert reads == [CID] and result == ([asset], [])
 
 
 @pytest.mark.parametrize("typed_reply", [False, True])
