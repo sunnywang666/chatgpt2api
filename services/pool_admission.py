@@ -38,7 +38,8 @@ def record_unsent_failure(context, receipt, at, error_type=None, reason=None):
     if error_type:
         entry["error_type"] = error_type
     if reason in {"claim_expired", "image_capacity_changed", "scheduling_changed",
-                  "work_not_active", "send_guard_rejected"}:
+                  "work_not_active", "send_guard_rejected", "account_unavailable",
+                  "image_capability_unavailable", "image_binding_changed"}:
         entry["reason"] = reason
     code = receipt.get("error_code")
     if code in {"CONVERSATION_OUTCOME_UNKNOWN", "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}:
@@ -1317,6 +1318,9 @@ class PoolAdmission:
                         cancelled = not replacement_send_allowed(self.store, db, context.kind, context.owner, context.request_id, r)
                         diagnostic = {"original task claim expired": "claim_expired",
                                       "original image capacity decreased before send": "image_capacity_changed",
+                                      "original account is unavailable before send": "account_unavailable",
+                                      "original image capability is unavailable before send": "image_capability_unavailable",
+                                      "original image binding changed before send": "image_binding_changed",
                                       "SCHEDULING_NOT_BEFORE": "scheduling_changed",
                                       "SCHEDULING_SEND_INTERVAL": "scheduling_changed",
                                       "WORK_NOT_ACTIVE": "work_not_active"}.get(str(exc), "send_guard_rejected")
@@ -1437,9 +1441,13 @@ class PoolAdmission:
             if context.kind == "image" or r.get("_operation") == "image":
                 if image_capacity(selected, self._settings(), r.get("model", "gpt-image-2")) <= 0:
                     raise AdmissionLost("original image capability is unavailable before send")
-                if (r.get("provider_binding_id")
-                        and self.accounts.get_bound_account_identity(r["provider_binding_id"]) != r.get("provider_account_identity")):
-                    raise AdmissionLost("original image binding changed before send")
+                if r.get("provider_binding_id"):
+                    try:
+                        bound_identity = self.accounts.get_bound_account_identity(r["provider_binding_id"])
+                    except RuntimeError:
+                        raise AdmissionLost("original image binding changed before send") from None
+                    if bound_identity != r.get("provider_account_identity"):
+                        raise AdmissionLost("original image binding changed before send")
             send_observation = {}
             if r.get("_route") == "codex":
                 if self.codex is None or self.codex._eligible_account(selected, "" if context.kind == "image" or r.get("_operation") == "image" else r.get("model", ""), allow_probe=False) is None:

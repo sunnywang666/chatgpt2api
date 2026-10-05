@@ -715,6 +715,43 @@ class ImageTaskServiceTests(unittest.TestCase):
                         mark.assert_called_once_with("token", outcome == "success", release_slot=False)
                     release.assert_not_called()
 
+    def test_unsent_admission_rejection_does_not_consume_image_capacity(self):
+        from services.request_context import AdmissionLost, executing
+        for pool_managed in (False, True):
+            for submitted in (False, True, None):
+                with self.subTest(pool_managed=pool_managed, submitted=submitted):
+                    request = ConversationRequest(
+                        model="gpt-image-2", prompt="cat", provider_binding_id="binding-1",
+                        provider_account_identity="account-1", client_conversation_id="client-1",
+                        retain_conversation=True,
+                    )
+                    backend = mock.Mock(image_submission_started=submitted, image_request_message_id="message-1")
+                    with (
+                        executing(mock.Mock() if pool_managed else None),
+                        mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", return_value="account-1"),
+                        mock.patch("services.protocol.conversation.account_service.acquire_bound_image_access_token", return_value="token"),
+                        mock.patch("services.protocol.conversation.account_service.get_account", return_value={}),
+                        mock.patch("services.protocol.conversation.account_service.conversation_binding_lock", return_value=nullcontext()),
+                        mock.patch("services.protocol.conversation.account_service.mark_image_result") as mark,
+                        mock.patch("services.protocol.conversation.account_service.release_image_slot") as release,
+                        mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend),
+                        mock.patch("services.protocol.conversation.stream_image_outputs",
+                                   side_effect=AdmissionLost("original image capability is unavailable before send")),
+                    ):
+                        with self.assertRaises(ImageGenerationError) as raised:
+                            _generate_bound_single_image(request, 1, 1)
+                        self.assertIs(raised.exception.upstream_submitted, submitted)
+                        if submitted is False:
+                            mark.assert_not_called()
+                            if pool_managed:
+                                release.assert_not_called()
+                            else:
+                                release.assert_called_once_with("token")
+                        else:
+                            mark.assert_called_once_with("token", False, **({"release_slot": False} if pool_managed else {}))
+                            release.assert_not_called()
+                        backend.close.assert_called_once()
+
     def test_bound_post_submission_timeout_remains_unknown(self):
         class Backend:
             image_submission_started = True

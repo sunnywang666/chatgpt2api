@@ -1711,13 +1711,19 @@ def _generate_bound_single_image(
                 account_service.mark_image_result(token, True, **({"release_slot": False} if pool_managed else {}))
                 return outputs
             except Exception as exc:
-                if not image_result_marked:
+                from services.request_context import AdmissionLost
+                upstream_submitted = getattr(backend, "image_submission_started", None)
+                # A local guard rejection before the generation POST consumes
+                # no image capacity. Do not invalidate a fresh observation or
+                # count it as an upstream image failure. Unknown/submitted
+                # attempts retain the existing accounting and recovery path.
+                unsent_guard_rejection = isinstance(exc, AdmissionLost) and upstream_submitted is False
+                if not image_result_marked and not unsent_guard_rejection:
                     image_result_marked = True
                     account_service.mark_image_result(token, False, **({"release_slot": False} if pool_managed else {}))
                 conversation_id = str(getattr(exc, "conversation_id", "") or last_conversation_id)
                 parent_message_id = str(getattr(exc, "parent_message_id", "") or "")
                 request_message_id = str(getattr(backend, "image_request_message_id", "") or "")
-                upstream_submitted = getattr(backend, "image_submission_started", None)
                 if not thread and conversation_id and backend is not None and not parent_message_id:
                     try:
                         parent_message_id = backend.get_conversation_parent_message_id(conversation_id)

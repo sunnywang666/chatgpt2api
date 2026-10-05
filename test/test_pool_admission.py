@@ -1364,6 +1364,34 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(sum(e["stage"] == "send_call_started" for e in final["_execution_timeline"]), 1)
         self.assertEqual(sum(e["stage"] == "pre_submit_failure" for e in final["_execution_timeline"]), 1)
 
+    def test_guard_distinguishes_account_capability_and_binding_rejections(self):
+        cases = (
+            ({"managed_disabled": True}, "account_unavailable"),
+            ({"capacity_used_since_observation": True}, "image_capability_unavailable"),
+            ({"conversation_binding_ids": []}, "image_binding_changed"),
+        )
+        original = dict(self.rows[0])
+        for index, (changes, reason) in enumerate(cases):
+            with self.subTest(reason=reason):
+                self.rows[0] = dict(original)
+                (self.root / "accounts.json").write_text(json.dumps(self.rows))
+                request_id = "guard-" + str(index)
+                self.image(request_id)
+                context = self.admission.claim_next()
+                self.assertEqual(context.request_id, request_id)
+                self.rows[0].update(changes)
+                (self.root / "accounts.json").write_text(json.dumps(self.rows))
+                with self.assertLogs("chatgpt2api", level="WARNING") as captured:
+                    with self.assertRaises(AdmissionLost):
+                        context.before_send()
+                receipt = self.read("image", "happy", request_id)
+                self.assertEqual(receipt["status"], "queued")
+                self.assertFalse(receipt["_submission_started"])
+                failures = [e for e in receipt["_execution_timeline"] if e["stage"] == "pre_submit_failure"]
+                self.assertEqual(failures[-1]["reason"], reason)
+                self.assertNotIn("fixture-token", "\n".join(captured.output))
+                self.assertNotIn("private image input", "\n".join(captured.output))
+
     def test_guard_reason_and_heartbeat_diagnostics_do_not_log_exception_text(self):
         from services.pool_admission import record_unsent_failure
         self.image("heartbeat")
