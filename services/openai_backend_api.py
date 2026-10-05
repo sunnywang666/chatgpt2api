@@ -3180,12 +3180,135 @@ class OpenAIBackendAPI:
             parent_message_id=parent_message_id,
         )
         self._report_progress("generating")
-        yield from self._iter_sse_payloads_capped(
+        timeout = self._image_active_timeout(float(config.image_poll_timeout_secs))
+        payloads = self._iter_sse_payloads_capped(
             response,
-            self._image_active_timeout(float(config.image_poll_timeout_secs)),
+            timeout,
             observe_text=True,
             request_message_id=str(getattr(self, "image_request_message_id", "") or ""),
         )
+        yield from self._iter_image_completion_payloads(payloads, conversation_id, time.monotonic() + timeout, response.close)
+
+    def _iter_image_completion_payloads(self, payloads, conversation_id, deadline, close_stream=lambda: None):
+        """Listen to an offered topic alongside SSE; always validate actual images.
+
+        A matching done only ends transport waiting. The existing protocol still
+        verifies the original request branch and downloads/persists its assets.
+        This per-attempt listener never submits generation or releases a slot.
+        """
+        from contextvars import copy_context
+        from services.upstream_completion import handoff_topic, wait_for_turn_done
+        from services.request_context import current_request
+
+        stopped = threading.Event()
+        finished = threading.Event()
+        outcome = {}
+        listener = None
+        conversation_changed = False
+        sse_done = False
+        terminal_message = False
+
+        def observe(stage):
+            context = current_request.get()
+            if context is not None:
+                context.record_stage(stage)
+
+        def listen(topic, cid):
+            listen_deadline = min(deadline, time.monotonic() + 60)
+
+            def remaining():
+                if stopped.is_set():
+                    return 0.0
+                return self._image_active_timeout(max(0.0, listen_deadline - time.monotonic()))
+
+            try:
+                if remaining() <= 0:
+                    return
+                path = "/backend-api/celsius/ws/user"
+                options = self._image_request_options(min(10, remaining()))
+                options["_account_request_deadline_monotonic"] = min(listen_deadline, time.monotonic() + 10)
+                response = self.session.get(self.base_url + path, headers=self._headers(path),
+                                            allow_redirects=False, **options)
+                try:
+                    ensure_ok(response, path)
+                    url = response.json().get("websocket_url")
+                finally:
+                    response.close()
+                if not isinstance(url, str) or remaining() <= 0:
+                    return
+                result = wait_for_turn_done(
+                    self.session, url, topic, cid, listen_deadline, remaining=remaining,
+                    connect_options=proxy_settings.build_session_kwargs(
+                        account=self.account, impersonate=self.fp["impersonate"], verify=True),
+                )
+                outcome["result"] = result
+                if result == "done" and not stopped.is_set():
+                    # Native SSE close is adapted to wake its reader. Do this
+                    # only after done, never just because handoff was offered.
+                    close_stream()
+            except Exception:
+                # Exceptions can contain signed URLs. Keep only a fixed enum;
+                # the original active deadline and any HTTP cooldown survive.
+                outcome.setdefault("result", "unavailable")
+            finally:
+                finished.set()
+
+        try:
+            try:
+                for payload in payloads:
+                    if payload == "[DONE]":
+                        sse_done = True
+                        break
+                    try:
+                        event = json.loads(payload)
+                    except (TypeError, ValueError):
+                        event = None
+                    if isinstance(event, dict):
+                        value = event.get("v")
+                        candidate = event.get("conversation_id") or (value.get("conversation_id") if isinstance(value, dict) else None)
+                        if isinstance(candidate, str) and candidate:
+                            if conversation_id and candidate != conversation_id:
+                                conversation_changed = True
+                                stopped.set()
+                            else:
+                                conversation_id = candidate
+                        message = event.get("message") or (value.get("message") if isinstance(value, dict) else None)
+                        terminal_message |= (isinstance(message, dict) and message.get("end_turn") is True
+                                             and message.get("status") == "finished_successfully"
+                                             and (message.get("author") or {}).get("role") == "assistant")
+                    yield payload
+                    topic = handoff_topic(event)
+                    if topic and conversation_id and listener is None and not conversation_changed and not terminal_message:
+                        observe("upstream_completion_handoff")
+                        listener = threading.Thread(target=copy_context().run, args=(listen, topic, conversation_id),
+                                                    name="image-completion-listener", daemon=True)
+                        listener.start()
+                    if terminal_message:
+                        stopped.set()
+            except Exception:
+                if outcome.get("result") != "done" or stopped.is_set():
+                    raise
+            if listener is not None and not stopped.is_set():
+                # If SSE handed off then closed naturally, wait for the same
+                # listener. This is event waiting, not repeated upstream GETs.
+                while not finished.wait(0.5):
+                    self._image_active_timeout(max(0.001, deadline - time.monotonic()))
+                    if time.monotonic() >= deadline:
+                        break
+                if outcome.get("result") == "done":
+                    observe("upstream_completion_signal")
+                    sse_done = True
+                else:
+                    observe("upstream_completion_fallback")
+            if sse_done:
+                yield "[DONE]"
+        finally:
+            stopped.set()
+            close = getattr(payloads, "close", None)
+            if callable(close):
+                close()
+            if listener is not None:
+                listener.join(timeout=1)
 
     def _iter_sse_payloads_capped(
             self,
