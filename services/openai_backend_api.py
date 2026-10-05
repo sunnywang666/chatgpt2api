@@ -381,9 +381,25 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
+    def _metadata_request_options(self, *, capacity=False) -> dict:
+        options = {"timeout": 20}
+        deadline = getattr(self, "metadata_deadline", None)
+        if deadline is not None:
+            options["_account_request_deadline_monotonic"] = deadline
+        guard = getattr(self, "metadata_before_send", None)
+        if capacity or callable(guard):
+            def before_read():
+                if callable(guard):
+                    guard()
+                if capacity:
+                    from datetime import datetime, timezone
+                    self._capacity_observed_at = datetime.now(timezone.utc).isoformat()
+            options["_account_request_before_send"] = before_read
+        return options
+
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = self.session.get(self.base_url + path, headers=self._headers(path), **self._metadata_request_options())
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
@@ -399,7 +415,7 @@ class OpenAIBackendAPI:
                 "conversation_id": None,
                 "timezone_offset_min": -480,
             },
-            timeout=20,
+            **self._metadata_request_options(capacity=True),
         )
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -408,7 +424,7 @@ class OpenAIBackendAPI:
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
         response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
+                                    **self._metadata_request_options())
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
@@ -458,6 +474,8 @@ class OpenAIBackendAPI:
             "restore_at": restore_at,
             "status": "限流" if quota == 0 else "正常",
         }
+        if getattr(self, "_capacity_observed_at", None):
+            result["capacity_observed_at"] = self._capacity_observed_at
         account_id = self._validated_account_id(default_account.get("account_id"))
         if account_id:
             result["account_id"] = account_id
