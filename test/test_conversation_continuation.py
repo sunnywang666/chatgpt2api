@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import unittest
 import threading
 import tempfile
@@ -11,7 +13,7 @@ from types import SimpleNamespace
 
 from services import account_request_pacing as pacing
 
-from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, StreamHardTimeoutError
+from services.openai_backend_api import ChatRequirements, ConversationArchiveCursorMismatch, OpenAIBackendAPI, StreamHardTimeoutError
 from services.conversation_binding_service import (
     ConversationBindingError,
     ConversationBindingService,
@@ -278,6 +280,165 @@ class AccountRequestPacingTests(unittest.TestCase):
             with self.assertRaises(StreamHardTimeoutError):
                 next(backend.stream_conversation(prompt="hello"))
         self.assertTrue(closed.is_set())
+
+    def test_text_stream_uses_utf8_postfields_without_losing_pacing_model_or_input(self):
+        from curl_cffi import CurlOpt
+        from curl_cffi.requests.session import set_curl_options
+
+        class CapturingCurl:
+            def __init__(self):
+                self.options = []
+
+            def setopt(self, option, value):
+                self.options.append((option, value))
+
+        class Response:
+            status_code = 200
+            headers = {}
+
+            def close(self):
+                pass
+
+            def iter_lines(self):
+                return iter([b"data: [DONE]"])
+
+        class OfflineSession:
+            def __init__(self):
+                self.calls = []
+                self.postfields = []
+                self.request = self._raw_request
+
+            def post(self, url, **kwargs):
+                return self.request("POST", url, **kwargs)
+
+            def _raw_request(self, method, url, **kwargs):
+                self.calls.append((method, url, kwargs))
+                if method == "POST":
+                    curl = CapturingCurl()
+                    set_curl_options(
+                        curl,
+                        method,
+                        url,
+                        data=kwargs.get("data"),
+                        json=kwargs.get("json"),
+                        params_list=[None, None],
+                        headers_list=[None, kwargs.get("headers")],
+                        cookies_list=[None, None],
+                        proxies_list=[None, None],
+                        verify_list=[None, None],
+                        stream=False,
+                    )
+                    self.postfields.append(next(value for option, value in curl.options if option == CurlOpt.POSTFIELDS))
+                return Response()
+
+        payload = {
+            "model": "gpt-5-6-instant",
+            "messages": [{"id": "original-user", "content": {"parts": ["中文🌟"]}}],
+            "parent_message_id": "frozen-parent",
+            "nested": {"text": "保留原输入"},
+        }
+        canonical_before = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        payload_before = json.loads(json.dumps(payload, ensure_ascii=False))
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.com"
+        backend._bootstrap = mock.Mock()
+        backend._get_chat_requirements = mock.Mock(return_value=ChatRequirements(token="requirements"))
+        backend._chat_target = mock.Mock(return_value=("/backend-api/conversation", "UTC"))
+        backend._conversation_headers = mock.Mock(return_value={"Content-Type": "application/json"})
+        backend._conversation_payload = mock.Mock(return_value=payload)
+        backend.text_pre_send_check = lambda read: read("GET", "https://chatgpt.com/backend-api/conversation/original")
+        backend.session = OfflineSession()
+        pacing.pace_account_session(backend.session, {"account_id": "utf8-fixture"}, "fixture-token")
+
+        with mock.patch.object(pacing.logger, "info") as log:
+            self.assertEqual(list(backend.stream_conversation(messages=[{"role": "user", "content": "unused"}],
+                                                              model="gpt-5-6-instant")), ["[DONE]"])
+
+        self.assertEqual(payload, payload_before)
+        self.assertEqual(
+            hashlib.sha256(json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")).digest(),
+            hashlib.sha256(canonical_before).digest(),
+        )
+        body = backend.session.postfields[0]
+        self.assertEqual(json.loads(body.decode("utf-8")), payload)
+        self.assertIn("中文🌟".encode("utf-8"), body)
+        self.assertNotIn("\\u4e2d".encode(), body)
+        self.assertLess(len(body), len(canonical_before))
+        post = next(kwargs for method, _, kwargs in backend.session.calls if method == "POST")
+        self.assertNotIn("json", post)
+        self.assertNotIn("_account_request_model", post)
+        starts = [entry.args[0] for entry in log.call_args_list
+                  if entry.args and entry.args[0].get("event") == "account_message_start"]
+        self.assertEqual([entry["model"] for entry in starts], ["gpt-5-6-instant"])
+        self.assertEqual([method for method, _, _ in backend.session.calls], ["GET", "POST"])
+
+    def test_text_stream_preflight_rejection_does_not_reach_utf8_transport(self):
+        class OfflineSession:
+            def __init__(self):
+                self.calls = []
+                self.request = self._raw_request
+
+            def post(self, url, **kwargs):
+                return self.request("POST", url, **kwargs)
+
+            def _raw_request(self, method, url, **kwargs):
+                self.calls.append((method, url, kwargs))
+                raise AssertionError("preflight rejection must stop before any transport send")
+
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.com"
+        backend._bootstrap = mock.Mock()
+        backend._get_chat_requirements = mock.Mock(return_value=ChatRequirements(token="requirements"))
+        backend._chat_target = mock.Mock(return_value=("/backend-api/conversation", "UTC"))
+        backend._conversation_headers = mock.Mock(return_value={"Content-Type": "application/json"})
+        backend._conversation_payload = mock.Mock(return_value={"model": "gpt-5-6-instant", "messages": []})
+        backend.text_pre_send_check = mock.Mock(side_effect=ConversationArchiveCursorMismatch("newer original"))
+        backend.session = OfflineSession()
+        pacing.pace_account_session(backend.session, {"account_id": "utf8-preflight"}, "fixture-token")
+
+        with self.assertRaises(ConversationArchiveCursorMismatch):
+            list(backend.stream_conversation(model="gpt-5-6-instant"))
+        backend.text_pre_send_check.assert_called_once()
+        self.assertEqual(backend.session.calls, [])
+
+    def test_json_model_keeps_precedence_over_transport_model_hint(self):
+        clock = pacing.AccountRequestClock("model-precedence")
+        sent = mock.Mock(return_value=SimpleNamespace(status_code=200, headers={}))
+        with mock.patch.object(pacing.logger, "info") as log:
+            clock.request(sent, "POST", "https://chatgpt.com/backend-api/conversation",
+                          json={"model": "json-model"}, _account_request_model="transport-model")
+        self.assertNotIn("_account_request_model", sent.call_args.kwargs)
+        starts = [entry.args[0] for entry in log.call_args_list
+                  if entry.args and entry.args[0].get("event") == "account_message_start"]
+        self.assertEqual([entry["model"] for entry in starts], ["json-model"])
+
+    def test_transport_model_hint_is_retained_on_429_attribution(self):
+        clock = pacing.AccountRequestClock("utf8-429-model")
+        sent = mock.Mock(return_value=SimpleNamespace(status_code=429, headers={}))
+        with mock.patch.object(pacing.logger, "warning") as log:
+            response = clock.request(
+                sent,
+                "POST",
+                "https://chatgpt.com/backend-api/conversation",
+                data="{}",
+                _account_request_model="gpt-5-6-instant",
+            )
+        self.assertEqual(response.status_code, 429)
+        self.assertNotIn("_account_request_model", sent.call_args.kwargs)
+        limited = [entry.args[0] for entry in log.call_args_list
+                   if entry.args and entry.args[0].get("event") == "account_rate_limited"]
+        self.assertEqual([entry["model"] for entry in limited], ["gpt-5-6-instant"])
+
+    def test_non_chat_transport_strips_private_model_hint(self):
+        class Session:
+            def __init__(self):
+                self.raw_request = mock.Mock(return_value=SimpleNamespace(status_code=200, headers={}))
+                self.request = self.raw_request
+
+        session = Session()
+        pacing.pace_account_session(session, {"account_id": "non-chat-model-hint"}, "fixture-token")
+        session.request("POST", "https://proxy.example/conversation", data="{}", _account_request_model="fixture-model")
+        self.assertNotIn("_account_request_model", session.raw_request.call_args.kwargs)
 
 
 class ConversationContinuationPayloadTests(unittest.TestCase):

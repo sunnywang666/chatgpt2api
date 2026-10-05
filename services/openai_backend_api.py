@@ -3126,15 +3126,22 @@ class OpenAIBackendAPI:
             conversation_id=conversation_id,
             parent_message_id=parent_message_id,
         )
+        # curl_cffi's json= path serializes non-ASCII text with its default
+        # ASCII escapes. Keep the constructed payload object intact, but give
+        # this one final conversation transport a compact UTF-8 JSON string.
+        # The explicit model side-channel is consumed by account pacing only;
+        # it never reaches curl as a transport option.
+        transport_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         # The paced transport checks after any cooldown, before marking a send.
         pre_send_check = getattr(self, "text_pre_send_check", None)
         request_deadline = time.monotonic() + TEXT_STREAM_HARD_CAP_SECS
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),
-            json=payload,
+            data=transport_body,
             timeout=300,
             stream=True,
+            _account_request_model=model,
             _account_request_deadline_monotonic=request_deadline,
             **({"_account_request_preflight": pre_send_check} if pre_send_check is not None else {}),
         )
