@@ -1593,8 +1593,14 @@ class PoolAdmission:
                         r.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
                                  _turn_reserved=False, upstream_unfinished=False,
                                  _ready_at=float(self.clock()) + 1)
+                        if isinstance(exc, AdmissionLost):
+                            r.update(upstream_outcome="not_sent", upstream_submission_started=False,
+                                     error_code="", waiting={"reasons": ["send_constraints_changed"],
+                                     "next_check_at": r["_ready_at"]})
                         reset_unsent_image_attempt(context.kind, r)
                     self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
+                    if isinstance(exc, AdmissionLost) and not r.get("_submission_started"):
+                        workflow_scheduling.release_provisional_slot(self.store, db, r)
         finally:
             done.set()
             with self.store.transaction() as db:

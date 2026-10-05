@@ -1393,6 +1393,83 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(failure["stage"], "pre_submit_failure")
         self.assertEqual(failure["error_code"], "IMAGE_RESOURCE_UNAVAILABLE")
 
+    def test_wrapped_image_admission_rejection_requeues_original_without_retry_exhaustion(self):
+        from services.protocol.conversation import ImageGenerationError
+        self.images.submit_generation({"id": "happy", "role": "user", "external_image_client": True},
+            client_task_id="capacity-wait", prompt="private image input", model="gpt-image-2", size=None,
+            image_thread_id="capacity-work")
+        initial = self.read("image", "happy", "capacity-wait")
+        calls = []
+        def handler(payload):
+            ctx = current_request.get()
+            calls.append(ctx.request_id)
+            if len(calls) <= 2:
+                # The bound protocol preserves its public error contract and
+                # chains the exact local guard exception through the handler.
+                try:
+                    raise AdmissionLost("selected image account capability is unavailable")
+                except AdmissionLost as rejected:
+                    raise ImageGenerationError("capacity changed",
+                        code="IMAGE_GENERATION_NOT_SUBMITTED", upstream_submitted=False) from rejected
+            ctx.before_send()
+            payload["progress_callback"].record_submission_started()
+            ctx.record_stage("send_call_started")
+            return {"data": [{"b64_json": "cG5n"}],
+                    "_provider_binding_id": payload["provider_binding_id"],
+                    "_provider_account_identity": payload["provider_account_identity"],
+                    "_conversation_id": "original-conversation", "_parent_message_id": "original-result",
+                    "_image_thread_terminal": True}
+        self.images.generation_handler = handler
+        self.admission.register("image", lambda ctx, body: self.images._run_task(
+            ctx.owner + ":" + ctx.request_id, body["mode"], body["payload"], body["identity"], "gpt-image-2"))
+        for _ in range(2):
+            ctx = self.admission.claim_next()
+            self.assertEqual(ctx.request_id, "capacity-wait")
+            self.admission.execute(ctx)
+            receipt = self.read("image", "happy", "capacity-wait")
+            self.assertEqual(receipt["status"], "queued")
+            self.assertEqual(receipt["upstream_outcome"], "not_sent")
+            self.assertIs(receipt["_submission_started"], False)
+            self.assertIs(receipt["upstream_submission_started"], False)
+            self.assertFalse(receipt.get("_claim_id"))
+            self.assertFalse(receipt.get("_executing"))
+            self.assertIsNone(receipt.get("active_attempt_deadline_at"))
+            self.assertFalse(receipt.get("_completion"))
+            self.assertEqual(receipt["_input_ref"], initial["_input_ref"])
+            self.assertFalse(any(e["stage"] in {"task_finished", "send_call_started"}
+                                 for e in receipt["_execution_timeline"]))
+            with self.store.connect() as db:
+                self.assertIs(self.store.runtime(db, receipt["_work_key"])["slot_held"], False)
+            self.clock.now += 2
+        self.admission.execute(self.admission.claim_next())
+        result = self.read("image", "happy", "capacity-wait")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls, ["capacity-wait"] * 3)
+        self.assertEqual(sum(e["stage"] == "send_call_started" for e in result["_execution_timeline"]), 1)
+
+    def test_image_guard_exception_after_submission_does_not_requeue(self):
+        from services.protocol.conversation import ImageGenerationError
+        self.image("sent-guard")
+        def handler(payload):
+            ctx = current_request.get()
+            ctx.before_send()
+            payload["progress_callback"].record_submission_started()
+            ctx.record_stage("send_call_started")
+            try:
+                raise AdmissionLost("claim changed after send")
+            except AdmissionLost as rejected:
+                raise ImageGenerationError("unknown result", code="CONVERSATION_OUTCOME_UNKNOWN",
+                                           upstream_submitted=True) from rejected
+        self.images.generation_handler = handler
+        self.admission.register("image", lambda ctx, body: self.images._run_task(
+            ctx.owner + ":" + ctx.request_id, body["mode"], body["payload"], body["identity"], "gpt-image-2"))
+        self.admission.execute(self.admission.claim_next())
+        receipt = self.read("image", "happy", "sent-guard")
+        self.assertEqual(receipt["status"], "error")
+        self.assertTrue(receipt["_submission_started"])
+        self.assertEqual(receipt["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+        self.assertFalse(any(e["stage"] == "pre_submit_failure" for e in receipt["_execution_timeline"]))
+
     def test_unsent_binding_reason_is_preserved_in_timeline_on_requeue(self):
         self.image("binding-unavailable")
         context = self.admission.claim_next()

@@ -1323,6 +1323,18 @@ class ImageTaskService:
             error_message = str(exc) or "image task failed"
             with self._transaction():
                 current = dict(self._tasks.get(key) or {})
+            admission_rejection = (exc if isinstance(exc, AdmissionLost)
+                                   else exc.__cause__ if getattr(exc, "code", None) == "IMAGE_GENERATION_NOT_SUBMITTED"
+                                   and getattr(exc, "upstream_submitted", None) is False
+                                   and isinstance(exc.__cause__, AdmissionLost) else None)
+            if (admission_rejection is not None and self.admission is not None
+                    and payload.get("_admission_claim")
+                    and current.get("_claim_id") == payload["_admission_claim"]
+                    and current.get("_submission_started") is False):
+                # A local capacity/claim change is still admission, not a
+                # failed generation. Let the scheduler requeue this original
+                # without consuming its bounded upstream-failure retry.
+                raise admission_rejection
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(
                 getattr(exc, "conversation_id", "") or current.get("conversation_id")
