@@ -2172,7 +2172,7 @@ class ImageTaskService:
         try:
             from services.account_service import account_service
             from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
-            from services.protocol.conversation import format_image_result
+            from services.protocol.conversation import format_image_result, _validate_image_download_count
 
             with self._transaction():
                 task = self._tasks.get(key)
@@ -2218,6 +2218,7 @@ class ImageTaskService:
                         for item in items:
                             if not isinstance(item, dict) or set(item) != {"b64_json"} or not base64.b64decode(item["b64_json"], validate=True):
                                 raise ValueError("invalid private image output")
+                        _validate_image_download_count(items, files, sediments)
                         context = current_request.get()
                         if context is not None:
                             try:
@@ -2241,6 +2242,7 @@ class ImageTaskService:
                 if len(encoded) > MAX_OUTPUT_BYTES:
                     raise ValueError("private image output limit")
                 self._store_pending_image_output(key, coverage, items)
+                _validate_image_download_count(items, files, sediments)
                 return items
             if not binding_id or not account_identity or not client_conversation_id:
                 error = RuntimeError("conversation binding unavailable: task authority missing")
@@ -2392,6 +2394,7 @@ class ImageTaskService:
 
                 try:
                     strict_ids = None
+                    confirmed_final_parent = None
                     extract_records = getattr(backend, "_extract_image_tool_records", None)
                     if image_thread and callable(extract_records):
                         records = extract_records(document, request_message_id)
@@ -2402,8 +2405,7 @@ class ImageTaskService:
                                 and set(pending_ids.get("sediment_ids", [])) <= set(sediments)):
                             try:
                                 # Only this recovery's just-read original may
-                                # bypass another asset settle cycle. The fresh
-                                # post-download branch check remains mandatory.
+                                # bypass another asset settle cycle.
                                 finished_parent(document, conversation_id, request_message_id,
                                     expected_parent=expected_parent,
                                     expected_result_ids=files + sediments,
@@ -2415,6 +2417,13 @@ class ImageTaskService:
                                 from services.protocol.conversation import _observe_image_terminal
                                 _observe_image_terminal()
                                 strict_ids = (files, sediments)
+                                try:
+                                    confirmed_final_parent = finished_parent(document, conversation_id, request_message_id,
+                                        expected_parent=expected_parent, expected_result_ids=files + sediments,
+                                        predecessor_request_message_id=predecessor_message,
+                                        predecessor_result_ids=predecessor_ids, require_final=True)
+                                except ImageThreadError:
+                                    pass  # A tool leaf may still acquire later assets.
                     if strict_ids is None and pending_ids and config.image_settle_enabled:
                         # Query before sleeping so a strictly finished original
                         # can proceed immediately. A fallback settle still needs
@@ -2485,7 +2494,15 @@ class ImageTaskService:
 
                 image_items = downloaded_items(backend, file_ids, sediment_ids)
                 failure_phase = "confirm_image_turn"
-                parent_message_id = recovered_parent(backend, file_ids, sediment_ids)
+                # A later external branch cannot invalidate a complete original
+                # result. Continue/archive still recheck the current cursor.
+                # Persisted IDs or cached bytes alone never supply this proof.
+                parent_message_id = (confirmed_final_parent
+                    if confirmed_final_parent and len(image_items) == len(set(file_ids + sediment_ids))
+                    else recovered_parent(backend, file_ids, sediment_ids))
+                if confirmed_final_parent and len(image_items) == len(set(file_ids + sediment_ids)):
+                    logger.info({"event": "image_complete_final_reused", "conversation_id": conversation_id,
+                                 "image_count": len(image_items)})
             failure_phase = "save_image_result"
             data = format_image_result(
                 image_items,

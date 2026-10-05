@@ -1348,10 +1348,10 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(DownloadBackend.reads, 0)
             self.assertEqual(service._tasks["owner-1:download-task"]["_first_qualified_image_assets_observed_at"], first_assets_observed)
 
-    def test_fresh_original_terminal_recovery_skips_settle_but_keeps_publication_check(self):
+    def test_complete_final_recovery_reuses_proof_but_tool_leaf_keeps_publication_check(self):
         from copy import deepcopy
         from services.config import config
-        for case in ("complete", "new_second_image", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed", "settle_failure"):
+        for case in ("complete", "new_second_image", "partial_download", "final_external_successor", "download_failure", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed", "settle_failure"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp_dir:
                 path = Path(tmp_dir) / "tasks.json"
                 write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", error="",
@@ -1368,15 +1368,24 @@ class ImageTaskServiceTests(unittest.TestCase):
                     "image": {"parent": "original-request", "message": {
                         "id": "image", "author": {"role": "tool"}, "status": "finished_successfully",
                         "metadata": {"async_task_type": "image_gen"},
-                        "content": {"parts": ["file-service://original-image"]}}},
+                        "content": {"parts": [{"content_type": "image_asset_pointer", "asset_pointer": "file-service://original-image"}]}}},
                     "final": {"parent": "image", "message": {"id": "final", "author": {"role": "assistant"},
                         "status": "finished_successfully", "end_turn": True}}}}
                 if case == "parent_changed": document["mapping"]["original-request"]["parent"] = "other"
                 if case in ("running", "settle_failure"): document["mapping"]["final"]["message"]["status"] = "in_progress"
+                if case == "post_download_changed":
+                    # A finished tool leaf is weaker than a complete assistant
+                    # final: keep the original late-drift rejection regression.
+                    document['mapping']['code'] = {'parent': 'original-request', 'message': {
+                        'id': 'code', 'author': {'role': 'assistant'}, 'status': 'finished_successfully'}}
+                    document['mapping']['image']['parent'] = 'code'
+                    del document['mapping']['final']
+                    document['current_node'] = 'image'
                 expected_files = ["original-image"]
-                if case == "new_second_image":
+                if case in ("new_second_image", "partial_download"):
                     expected_files.append("second-image")
-                    document["mapping"]["image"]["message"]["content"]["parts"].append("file-service://second-image")
+                    document["mapping"]["image"]["message"]["content"]["parts"].append(
+                        {"content_type": "image_asset_pointer", "asset_pointer": "file-service://second-image"})
                 calls = {"read": 0, "poll": 0, "download": 0}
                 class Backend(OpenAIBackendAPI):
                     def __init__(self, **kwargs): pass
@@ -1400,10 +1409,16 @@ class ImageTaskServiceTests(unittest.TestCase):
                         raise ImagePollTimeoutError("not confirmed", cid)
                     def resolve_conversation_image_urls(self, cid, files, sediments, **kwargs):
                         self_test.assertEqual((cid, files, sediments), ("conversation-1", expected_files, []))
+                        if case == 'partial_download' and calls['download'] == 0: files = files[:1]
                         return ["https://original.test/" + f + ".png" for f in files]
                     def download_image_bytes(self, urls):
                         calls["download"] += 1
-                        return [f.encode() for f in expected_files]
+                        if case == 'download_failure': raise TimeoutError('original attachment unavailable')
+                        if case == 'final_external_successor':
+                            document['mapping']['external'] = {'parent': 'final', 'message': {
+                                'id': 'external', 'author': {'role': 'user'}}}
+                            document['current_node'] = 'external'
+                        return [f.encode() for f in expected_files[:len(urls)]]
                     def close(self): pass
                 self_test = self
                 with (
@@ -1418,9 +1433,24 @@ class ImageTaskServiceTests(unittest.TestCase):
                 ):
                     service._run_resume_poll("owner-1:policy-task", "conversation-1", 60,
                         "http://localhost", OWNER, "generate", "gpt-image-2", False, False)
+                    if case == 'partial_download':
+                        incomplete = service._tasks['owner-1:policy-task']
+                        self.assertEqual(incomplete['status'], 'error')
+                        self.assertFalse(incomplete.get('data'))
+                        self.assertEqual(incomplete['result_file_ids'], expected_files)
+                        self.assertTrue(incomplete.get('_pending_image_output'))
+                        publish.assert_not_called()
+                        # Same original receipt, same assets. The incomplete
+                        # private cache cannot masquerade as a complete result.
+                        service._run_resume_poll('owner-1:policy-task', 'conversation-1', 60,
+                            'http://localhost', OWNER, 'generate', 'gpt-image-2', False, False)
                 row = service._tasks["owner-1:policy-task"]
-                if case in ("complete", "new_second_image", "post_download_changed"):
-                    self.assertEqual(calls, {"read": 2, "poll": 0, "download": 1})
+                if case == 'partial_download':
+                    self.assertEqual(calls, {'read': 2, 'poll': 0, 'download': 2})
+                    observe.assert_called_once_with()
+                    sleep.assert_not_called()
+                elif case in ("complete", "new_second_image", "final_external_successor", "download_failure", "post_download_changed"):
+                    self.assertEqual(calls, {"read": 2 if case == 'post_download_changed' else 1, "poll": 0, "download": 1})
                     observe.assert_called_once_with()
                     sleep.assert_not_called()
                 else:
@@ -1428,7 +1458,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                     if case in ("pending_missing", "settle_failure"): sleep.assert_called_once_with(30)
                     else: sleep.assert_not_called()
                     observe.assert_not_called()
-                if case in ("complete", "new_second_image"):
+                if case in ("complete", "new_second_image", "partial_download", "final_external_successor"):
                     self.assertEqual(row["status"], "success")
                     self.assertEqual(row["parent_message_id"], "final")
                     self.assertEqual(row["result_file_ids"], expected_files)
@@ -1573,10 +1603,10 @@ class ImageTaskServiceTests(unittest.TestCase):
                     return super()._poll_image_results(_conversation_id, _timeout, **kwargs)
                 def resolve_conversation_image_urls(self, _conversation_id, files, sediments, **kwargs):
                     calls.append(("resolve", files))
-                    return ["https://provider.test/result.png"]
+                    return ["https://provider.test/" + file + ".png" for file in files]
                 def download_image_bytes(self, _urls):
                     calls.append(("download", []))
-                    return [b"image-result"]
+                    return [b"image-result" for _ in _urls]
                 def get_conversation_parent_message_id(self, _conversation_id):
                     return "result-parent"
                 def close(self):

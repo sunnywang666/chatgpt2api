@@ -371,7 +371,7 @@ def absent_request_parent(document, task, previous):
 
 def finished_parent(document, conversation_id, request_message_id, *, expected_parent=None,
                     expected_result_ids=None, predecessor_request_message_id=None,
-                    predecessor_result_ids=None):
+                    predecessor_result_ids=None, require_final=False):
     """Prove one exact completed turn, not the newest arbitrary current_node.
 
     User/manual successors, siblings, missing nodes and unfinished tools are
@@ -424,8 +424,10 @@ def finished_parent(document, conversation_id, request_message_id, *, expected_p
         if role == "assistant" and msg.get("end_turn") is True:
             if msg.get("channel") not in {None, "final"} or document.get("current_node") != current or children.get(current):
                 raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+            if require_final and (not expected or observed != expected):
+                raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED")
             return current
-        if (role == "tool" and saw_assistant and expected
+        if (not require_final and role == "tool" and saw_assistant and expected
                 and document.get("current_node") == current and not children.get(current)
                 and _image_result_ids(msg) and observed == expected):
             return current

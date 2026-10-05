@@ -380,6 +380,101 @@ def test_strict_terminal_poll_saves_settle_read_but_keeps_post_download_fence(ru
         assert result["conversation_id"] == r.read("prior")["conversation_id"]
 
 
+@pytest.mark.parametrize('change', ['none', 'external_successor', 'download_failure', 'partial_download'])
+def test_complete_original_final_publishes_without_second_get_but_mutations_recheck(runtime, monkeypatch, change):
+    r = runtime
+    Backend = conversation.OpenAIBackendAPI
+    calls = {'read': 0, 'download': 0, 'publish': 0}
+    for name, value in {
+        '_current_message_branch_ids': staticmethod(RealOpenAIBackendAPI._current_message_branch_ids),
+        '_extract_image_reference_ids': staticmethod(RealOpenAIBackendAPI._extract_image_reference_ids),
+        '_extract_image_tool_records': RealOpenAIBackendAPI._extract_image_tool_records,
+    }.items():
+        monkeypatch.setattr(Backend, name, value, raising=False)
+
+    def events(backend, **kwargs):
+        callback = backend.progress_callback
+        rid, cid = callback.request_message_id, 'complete-original'
+        current_request.get().before_send()
+        backend.image_request_message_id = rid
+        backend.image_submission_started = True
+        callback.record_submission_started(); callback.record_conversation_id(cid)
+        doc, asset = tool_document(cid, rid)
+        assets = [asset]
+        if change == 'partial_download':
+            assets.append(asset + 'b')
+            doc['mapping'][rid + '-image']['message']['content']['parts'].append(
+                {'content_type': 'image_asset_pointer', 'asset_pointer': 'file-service://' + assets[-1]})
+        doc['mapping'][rid + '-final'] = node(rid + '-final', 'assistant', rid + '-image', end=True)
+        doc['current_node'] = rid + '-final'
+        r.state.documents[cid] = doc
+        r.state.sends.append({'conversation': cid, 'message': rid})
+        yield {'conversation_id': cid, 'file_ids': assets, 'sediment_ids': [], 'turn_use_case': 'image gen'}
+        raise AssertionError('complete original signal must close this stream')
+
+    def read(_backend, cid, **kwargs):
+        calls['read'] += 1
+        return copy.deepcopy(r.state.documents[cid])
+
+    def download(_backend, urls):
+        calls['download'] += 1
+        assert len(urls) == 1
+        if change == 'download_failure': raise TimeoutError('attachment unavailable')
+        if change == 'external_successor':
+            doc = r.state.documents['complete-original']
+            doc['mapping']['external'] = node('external', 'user', doc['current_node'])
+            doc['current_node'] = 'external'
+        return [OUTPUT]
+
+    def publish(items, *_args, **_kwargs):
+        calls['publish'] += 1
+        assert calls['read'] == 1
+        assert [base64.b64decode(i['b64_json']) for i in items] == [OUTPUT]
+        return {'data': items}
+
+    monkeypatch.setattr(conversation, 'conversation_events', events)
+    monkeypatch.setattr(conversation, 'stream_image_outputs', REAL_IMAGE_STREAM)
+    monkeypatch.setattr(conversation, 'format_image_result', publish)
+    monkeypatch.setattr(Backend, '_get_conversation', read)
+    monkeypatch.setattr(Backend, 'download_image_bytes', download)
+    monkeypatch.setattr(Backend, 'resolve_conversation_image_urls',
+        lambda _self, _cid, files, _sediments, **_kw: ['https://fixture.invalid/' + f for f in files[:1]])
+    r.submit('original'); r.admission.execute(r.admission.claim_next())
+    original = r.read('original')
+    assert len(r.state.sends) == 1 and calls['download'] == calls['read'] == 1
+    if change in {'download_failure', 'partial_download'}:
+        assert original['status'] == 'error' and not original.get('data') and calls['publish'] == 0
+        if change == 'partial_download':
+            assert len(original['result_file_ids']) == 2 and original.get('_pending_image_output')
+        return
+    assert original['status'] == 'success' and calls['publish'] == 1
+    assert len(original['data']) == len(original['result_file_ids']) == 1
+    assert original['parent_message_id'] == original['request_message_id'] + '-final'
+    if change == 'external_successor':
+        # Saving immutable original results grants no authority to mutate a
+        # conversation whose current cursor has subsequently changed.
+        with pytest.raises(ImageThreadError): r.service.archive_thread(WHO, 'original')
+        assert calls['read'] == 2 and not r.state.archive_actions
+        r.submit('next', source='original'); r.admission.execute(r.admission.claim_next())
+        assert calls['read'] == 3 and len(r.state.sends) == 1
+        assert r.read('next').get('upstream_outcome') in ('not_sent', 'not_submitted')
+
+
+def test_complete_image_proof_rejects_tool_leaf_missing_assets_and_nonfinal_channel():
+    doc, asset = tool_document()
+    with pytest.raises(ImageThreadError):
+        finished_parent(doc, 'conversation-a', 'request-a', expected_result_ids=[asset], require_final=True)
+    doc['mapping']['request-a-final'] = node('request-a-final', 'assistant', 'request-a-image', end=True)
+    doc['current_node'] = 'request-a-final'
+    assert finished_parent(doc, 'conversation-a', 'request-a', expected_result_ids=[asset], require_final=True) == 'request-a-final'
+    for expected in ([], [asset, 'missing-asset']):
+        with pytest.raises(ImageThreadError):
+            finished_parent(doc, 'conversation-a', 'request-a', expected_result_ids=expected, require_final=True)
+    doc['mapping']['request-a-final']['message']['channel'] = 'analysis'
+    with pytest.raises(ImageThreadError):
+        finished_parent(doc, 'conversation-a', 'request-a', expected_result_ids=[asset], require_final=True)
+
+
 def test_advanced_selector_reaches_actual_bound_protocol_and_thread(runtime):
     r = runtime
     selected = r.admission.accounts.list_accounts()[0]

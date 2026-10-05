@@ -456,6 +456,14 @@ def _record_result_ids(
         callback(list(dict.fromkeys(file_ids)), list(dict.fromkeys(sediment_ids)))
 
 
+def _validate_image_download_count(items, file_ids, sediment_ids):
+    # Distinct IDs in one namespace denote distinct immutable assets. Mixed
+    # namespaces may offer alternate addresses for the same image; do not infer
+    # their image count by adding the two lists.
+    if bool(file_ids) != bool(sediment_ids) and len(items) != len(set(file_ids or sediment_ids)):
+        raise ValueError("original image downloads are incomplete")
+
+
 def _downloaded_image_output(request, items, *, conversation_id, request_message_id,
                              file_ids, sediment_ids, index, total):
     output = ImageOutput(kind="result", model=request.model, index=index, total=total,
@@ -466,10 +474,12 @@ def _downloaded_image_output(request, items, *, conversation_id, request_message
             callback({"conversation_id": conversation_id, "request_message_id": request_message_id,
                       "file_ids": list(dict.fromkeys(file_ids)),
                       "sediment_ids": list(dict.fromkeys(sediment_ids))}, items)
+        _validate_image_download_count(items, file_ids, sediment_ids)
         # Bound generation collects this internally and verifies the exact turn
         # before formatting it. Neither to_chunk nor collection exposes this field.
         output._pending_image_items = items
     else:
+        _validate_image_download_count(items, file_ids, sediment_ids)
         output.data = format_image_result(items, request.prompt, request.response_format,
                                           request.base_url, output.created)["data"]
     return output
@@ -1601,23 +1611,34 @@ def _generate_bound_single_image(
                             code=getattr(exc, "code", "IMAGE_THREAD_PREVIOUS_UNCONFIRMED"), upstream_submitted=False) from exc
                 request = replace(request)
                 request._defer_image_publication = True
+                confirmed_result = None
                 if thread:
                     def poll_terminal(document, conversation_id, request_message_id, files, sediments):
+                        nonlocal confirmed_result
+                        confirmed_result = None
                         try:
-                            finished_parent(document, conversation_id, request_message_id,
-                                expected_parent=request.parent_message_id or None,
+                            checks = dict(expected_parent=request.parent_message_id or None,
                                 expected_result_ids=files + sediments,
                                 predecessor_request_message_id=getattr(request.progress_callback,
                                     "image_thread_predecessor_message", None),
                                 predecessor_result_ids=getattr(request.progress_callback,
                                     "image_thread_predecessor_result_ids", None))
+                            try:
+                                parent = finished_parent(document, conversation_id, request_message_id,
+                                    require_final=True, **checks)
+                            except ImageThreadError:
+                                finished_parent(document, conversation_id, request_message_id, **checks)
+                            else:
+                                # Call-local proof for these immutable original
+                                # assets; never restore it from telemetry/cache.
+                                confirmed_result = (conversation_id, request_message_id,
+                                                    frozenset(files + sediments), parent)
                             _observe_image_terminal()
                             return True
                         except ImageThreadError:
                             return False
-                    # A strictly finished first observation needs no repeated
-                    # asset-ID settle read. The post-download fresh fence below
-                    # remains mandatory before publishing any saved result.
+                    # Tool leaves still need the post-download fence. A complete
+                    # assistant final can already prove this original result.
                     backend.image_poll_terminal_check = poll_terminal
                 for output in stream_image_outputs(backend, request, index, total):
                     last_conversation_id = output.conversation_id or last_conversation_id
@@ -1655,12 +1676,21 @@ def _generate_bound_single_image(
                         conversation_id=last_conversation_id,
                     )
                 if thread:
-                    next_parent_message_id = finished_parent(backend._get_conversation(last_conversation_id),
-                        last_conversation_id, str(getattr(backend, "image_request_message_id", "")),
-                        expected_parent=request.parent_message_id or None,
-                        expected_result_ids=getattr(request.progress_callback, "image_thread_result_ids", None),
-                        predecessor_request_message_id=getattr(request.progress_callback, "image_thread_predecessor_message", None),
-                        predecessor_result_ids=getattr(request.progress_callback, "image_thread_predecessor_result_ids", None))
+                    original_message = str(getattr(backend, "image_request_message_id", ""))
+                    result_ids = frozenset(getattr(request.progress_callback, "image_thread_result_ids", None) or [])
+                    downloaded_count = sum(len(output._pending_image_items) for output in outputs if output.kind == "result")
+                    if (confirmed_result and confirmed_result[:3] == (last_conversation_id, original_message, result_ids)
+                            and downloaded_count == len(result_ids)):
+                        next_parent_message_id = confirmed_result[3]
+                        logger.info({"event": "image_complete_final_reused", "conversation_id": last_conversation_id,
+                                     "image_count": downloaded_count})
+                    else:
+                        next_parent_message_id = finished_parent(backend._get_conversation(last_conversation_id),
+                            last_conversation_id, original_message,
+                            expected_parent=request.parent_message_id or None,
+                            expected_result_ids=result_ids,
+                            predecessor_request_message_id=getattr(request.progress_callback, "image_thread_predecessor_message", None),
+                            predecessor_result_ids=getattr(request.progress_callback, "image_thread_predecessor_result_ids", None))
                     _observe_image_terminal()
                 else:
                     next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
