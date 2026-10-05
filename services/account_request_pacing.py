@@ -331,6 +331,7 @@ class AccountRequestClock:
         local_wait = kwargs.pop("_account_request_local_wait", None)
         before_send = kwargs.pop("_account_request_before_send", None)
         preflight = kwargs.pop("_account_request_preflight", None)
+        transport_model = kwargs.pop("_account_request_model", None)
         if not isinstance(deadline_at, (int, float)) or isinstance(deadline_at, bool):
             deadline_at = None
 
@@ -415,6 +416,8 @@ class AccountRequestClock:
             archive_deadline = time.monotonic() + 240
             deadline_at = min(deadline_at, archive_deadline) if deadline_at is not None else archive_deadline
         raw_model = (kwargs.get("json") or {}).get("model") if isinstance(kwargs.get("json"), dict) else None
+        if not isinstance(raw_model, str) or len(raw_model) > 160:
+            raw_model = transport_model
         model = raw_model if isinstance(raw_model, str) and len(raw_model) <= 160 else None
         request_ref = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24] if context else None
         archive_observation = (current_archive_observation.get() or {}) if archive_guard is not None else {}
@@ -996,6 +999,7 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
             # account-clock wait. Consume our private option before requests.
             deadline = kwargs.pop("_account_request_deadline_monotonic", None)
             kwargs.pop("_account_request_local_wait", None)
+            kwargs.pop("_account_request_model", None)
             if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
