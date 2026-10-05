@@ -1023,6 +1023,40 @@ class AccountRequestPacingTests(unittest.TestCase):
                 "os_errno": 0, "downloaded_bytes": 5, "http_connect_code": 200})
             self.assertNotIn("secret-", repr(attempt))
 
+    def test_explicit_fast_message_spacing_keeps_http_floor_and_persisted_cooldown(self):
+        from services.config import ConfigStore
+        for http, message in ((1, 0), (0, .1), (.1, .1)):
+            with self.subTest(http=http, message=message), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "config.json").write_text('{"auth-key":"test-only-pacing-config"}')
+                settings = ConfigStore(Path(tmp) / "config.json")
+                settings.update({"account_request_interval_secs": http,
+                                 "account_message_interval_secs": message})
+                settings = ConfigStore(Path(tmp) / "config.json")
+                now = [10000.0]
+                def advance(seconds): now[0] += seconds
+                sent = []
+                def send(*_args, **_kwargs):
+                    sent.append(now[0])
+                    return Response()
+                with patch("services.account_request_pacing.config", settings), \
+                     patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+                     patch("services.account_request_pacing.time.sleep", side_effect=advance):
+                    path = Path(tmp) / "clock.json"
+                    clock = AccountRequestClock("account", path)
+                    clock.request(send, "POST", "https://provider/backend-api/conversation")
+                    clock = AccountRequestClock("account", path)
+                    clock.request(send, "POST", "https://provider/backend-api/conversation")
+                    self.assertGreaterEqual(sent[1] - sent[0] + .000001, max(http, message))
+                    class Limited(Response):
+                        status_code = 429
+                        headers = {"Retry-After": "123"}
+                    clock.request(lambda *_args, **_kwargs: Limited(), "POST", "https://provider/backend-api/conversation")
+                    limited_at = now[0]
+                    clock = AccountRequestClock("account", path)
+                    clock.request(send, "POST", "https://provider/backend-api/conversation")
+                    self.assertGreaterEqual(sent[-1] - limited_at, 123)
+
     def test_actual_send_gap_includes_slow_fence_and_durable_clock_write(self):
         for method, message_interval, fail_first in (("GET", 0, False), ("POST", 5, False), ("GET", 0, True), ("POST", 5, True)):
             with self.subTest(method=method, fail_first=fail_first), tempfile.TemporaryDirectory() as tmp:

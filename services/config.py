@@ -81,10 +81,14 @@ DEFAULT_PROXY_RUNTIME = {
 
 _KEEP_CHAT_TRIAL = object()
 
+# A private config migration bit distinguishes formerly invalid stored M<5
+# from an administrator explicitly selecting the newly supported range.
+_EXPLICIT_MESSAGE_SPACING = "_explicit_message_spacing"
+
 # Local pacing limits, not upstream rate-limit guarantees.
 _PACING_SETTINGS = {
     "account_request_interval_secs": (0.1, 60.0, 5.0),
-    "account_message_interval_secs": (5.0, 300.0, 30.0),
+    "account_message_interval_secs": (0.1, 300.0, 30.0),
     "account_conversation_read_interval_secs": (0.0, 300.0, 0.0),
 }
 
@@ -95,11 +99,11 @@ def _pacing_value(key: str, raw: object) -> float:
         value = float(raw)
     except (TypeError, ValueError, OverflowError):
         value = float("nan")
-    # Explicit zero removes only the HTTP start-spacing floor. Message pacing,
-    # conversation-read pacing and persisted upstream cooldowns remain separate.
-    zero_http_spacing = key == "account_request_interval_secs" and value == 0
-    if isinstance(raw, bool) or not math.isfinite(value) or not (zero_http_spacing or minimum <= value <= maximum):
-        allowed = f"0 or between {minimum:g} and {maximum:g}" if key == "account_request_interval_secs" else f"between {minimum:g} and {maximum:g}"
+    # Explicit zero removes only that configured spacing floor. Independent
+    # HTTP/message/read clocks, conversation ordering and cooldowns still apply.
+    permits_zero = key in {"account_request_interval_secs", "account_message_interval_secs"}
+    if isinstance(raw, bool) or not math.isfinite(value) or not (permits_zero and value == 0 or minimum <= value <= maximum):
+        allowed = f"0 or between {minimum:g} and {maximum:g}" if permits_zero else f"between {minimum:g} and {maximum:g}"
         raise ValueError(f"{key} must be {allowed} seconds")
     return value
 
@@ -467,7 +471,10 @@ class ConfigStore:
     @property
     def account_message_interval_secs(self) -> float:
         try:
-            return _pacing_value("account_message_interval_secs", self.data.get("account_message_interval_secs", 30.0))
+            value = _pacing_value("account_message_interval_secs", self.data.get("account_message_interval_secs", 30.0))
+            if value < 5 and self.data.get(_EXPLICIT_MESSAGE_SPACING) is not True:
+                return 30.0
+            return value
         except ValueError:
             return 30.0
 
@@ -742,6 +749,7 @@ class ConfigStore:
 
     def get(self) -> dict[str, object]:
         data = dict(self.data)
+        data.pop(_EXPLICIT_MESSAGE_SPACING, None)
         data["account_request_interval_secs"] = self.account_request_interval_secs
         data["account_message_interval_secs"] = self.account_message_interval_secs
         data["account_conversation_read_interval_secs"] = self.account_conversation_read_interval_secs
@@ -798,6 +806,7 @@ class ConfigStore:
 
     def _update_locked(self, data: dict[str, object]) -> dict[str, object]:
         data = dict(data or {})
+        data.pop(_EXPLICIT_MESSAGE_SPACING, None)
         # Reject the whole update before changing any setting. Legacy invalid
         # stored values remain readable through their effective defaults.
         for key in _PACING_SETTINGS:
@@ -805,6 +814,8 @@ class ConfigStore:
                 data[key] = _pacing_value(key, data[key])
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
+        if "account_message_interval_secs" in data:
+            next_data[_EXPLICIT_MESSAGE_SPACING] = True
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
         if "image_storage" in next_data:

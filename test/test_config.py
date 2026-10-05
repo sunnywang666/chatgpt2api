@@ -72,7 +72,7 @@ class PacingSettingsTests(unittest.TestCase):
     def test_invalid_pacing_rejects_entire_update_without_saving(self):
         for key, bad in [
             ("account_request_interval_secs", [-1, .05, .09, 61, True, False, None, "bad", float("nan"), float("inf")]),
-            ("account_message_interval_secs", [1, 2, 4.99, 301, False, None, "-inf"]),
+            ("account_message_interval_secs", [-1, .01, .05, .09, 301, True, False, None, "-inf", float("nan")]),
             ("account_conversation_read_interval_secs", [-1, 301, False, None, "bad", float("nan")]),
         ]:
             for value in bad:
@@ -87,13 +87,13 @@ class PacingSettingsTests(unittest.TestCase):
         before = self.path.read_bytes()
         with self.assertRaises(ValueError):
             self.store.update({"account_request_interval_secs": 1,
-                               "account_message_interval_secs": 2, "proxy": "must-not-save"})
+                               "account_message_interval_secs": .05, "proxy": "must-not-save"})
         self.assertEqual(self.path.read_bytes(), before)
         self.assertNotIn("account_request_interval_secs", self.store.data)
 
     def test_valid_boundaries_persist_and_match_runtime_after_reopen(self):
         from services.config import ConfigStore
-        for http, message in [(0, 5), ("0", 5), (.1, 5), (.5, 5), (1, 5), (60, 300), ("2.5", "7.5")]:
+        for http, message in [(0, 0), (.1, .1), (1, 2), (.1, "0"), (.1, .75), (0, 5), ("0", 5), (.1, 5), (.5, 5), (1, 5), (60, 300), ("2.5", "7.5")]:
             with self.subTest(http=http, message=message):
                 settings = self.store.update({"account_request_interval_secs": http,
                                               "account_message_interval_secs": message})
@@ -119,6 +119,25 @@ class PacingSettingsTests(unittest.TestCase):
         self.assertEqual(self.store.data["account_message_interval_secs"], 2)
         self.assertEqual(self.store.get()["account_message_interval_secs"], 30)
 
+    def test_old_below_five_setting_keeps_legacy_default_until_explicit_update(self):
+        from services.config import ConfigStore, _EXPLICIT_MESSAGE_SPACING
+        for value in (0, .1, 2, 4.99):
+            with self.subTest(value=value):
+                self.path.write_text(json.dumps({"auth-key": "test-pacing-settings-secret",
+                                                "account_message_interval_secs": value}))
+                store = ConfigStore(self.path)
+                before = self.path.read_bytes()
+                self.assertEqual(store.account_message_interval_secs, 30)
+                self.assertEqual(store.get()["account_message_interval_secs"], 30)
+                self.assertEqual(self.path.read_bytes(), before)
+                # A caller cannot enable a legacy raw value by echoing the private bit.
+                store.update({_EXPLICIT_MESSAGE_SPACING: True, "proxy": "unchanged"})
+                self.assertEqual(ConfigStore(self.path).account_message_interval_secs, 30)
+                store.update({"account_message_interval_secs": value})
+                reopened = ConfigStore(self.path)
+                self.assertEqual(reopened.account_message_interval_secs, value)
+                self.assertNotIn(_EXPLICIT_MESSAGE_SPACING, reopened.get())
+
     def test_conversation_read_setting_is_independent_and_defaults_to_no_extra_floor(self):
         from services.config import ConfigStore
         self.assertEqual(self.store.get()["account_conversation_read_interval_secs"], 0)
@@ -138,7 +157,7 @@ class PacingSettingsTests(unittest.TestCase):
         app.include_router(system.create_router("test"))
         with patch.object(system, "config", self.store), patch.object(system, "require_admin"):
             with TestClient(app) as client:
-                response = client.post("/api/settings", json={"account_message_interval_secs": 2,
+                response = client.post("/api/settings", json={"account_message_interval_secs": .05,
                                                               "proxy": "must-not-save"})
                 self.assertEqual(response.status_code, 400)
                 self.assertEqual(self.store.data["proxy"], "original")
@@ -158,6 +177,12 @@ class PacingSettingsTests(unittest.TestCase):
                 self.assertEqual(reopened.account_request_interval_secs, 0)
                 self.assertEqual(reopened.account_message_interval_secs, 5)
                 self.assertEqual(reopened.account_conversation_read_interval_secs, 0)
+                for message in (0, .1, 2):
+                    response = client.post("/api/settings", json={"account_message_interval_secs": message})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["config"]["account_message_interval_secs"], message)
+                    self.assertEqual(client.get("/api/settings").json()["config"]["account_message_interval_secs"], message)
+                    self.assertEqual(ConfigStore(self.path).account_message_interval_secs, message)
 
 
 if __name__ == "__main__":
