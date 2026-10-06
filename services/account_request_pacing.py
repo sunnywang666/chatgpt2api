@@ -488,6 +488,12 @@ class AccountRequestClock:
             credit = callable(local_wait) and provider_wait <= time.monotonic()
             if remaining is not None and (remaining <= 0 or (not credit and delay >= remaining)):
                 raise AccountRequestDeadlineExceeded(message)
+            if (remaining is not None and minimum_budget is not None and not credit
+                    and remaining - delay < minimum_budget):
+                # No upstream attempt can fit after this known pacing wait.
+                # Return the existing not-sent deferral now, preserving the
+                # clock and leaving the caller to retry the same original read.
+                raise AccountReadRetryBudgetInsufficient("original read connection budget unavailable")
             started_wait = time.monotonic()
             time.sleep(delay)
             elapsed = max(0.0, time.monotonic() - started_wait)

@@ -48,6 +48,52 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_read_defers_before_wait_that_cannot_leave_connection_budget(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import services.account_request_pacing as pacing
+        for reason, delay, credit_local, may_send in (
+                ("read_rate", 59., False, False),
+                ("read_rate", 45., False, True),
+                ("read_rate", 59., True, True),
+                ("provider_cooldown", 59., True, False)):
+            with self.subTest(reason=reason, delay=delay, credit_local=credit_local):
+                now, credited = [100.], []
+                sleep = Mock(side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds))
+                fake_time = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1700000000 + now[0], sleep=sleep)
+                with tempfile.TemporaryDirectory() as directory, patch.object(pacing, "time", fake_time), \
+                     patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                                                                   account_conversation_read_interval_secs=0)):
+                    clock = AccountRequestClock("fixture", Path(directory)/"clock.json")
+                    with clock.lock:
+                        if reason == "provider_cooldown":
+                            clock.cooldown_until = now[0] + delay
+                        else:
+                            clock.next_conversation_read = now[0] + delay
+                        clock._save()
+                    raw = Mock(return_value=Response())
+                    options = {"_account_request_deadline_monotonic": 160.,
+                               "_account_request_minimum_budget_secs": 10.}
+                    if credit_local:
+                        options["_account_request_local_wait"] = credited.append
+                    if may_send:
+                        clock.request(raw, "GET", "https://fixture.invalid/conversation/original", timeout=60, **options)
+                        raw.assert_called_once()
+                        self.assertEqual(now[0], 100. + delay)
+                    else:
+                        with self.assertRaises(pacing.AccountReadRetryBudgetInsufficient):
+                            clock.request(raw, "GET", "https://fixture.invalid/conversation/original", timeout=60, **options)
+                        raw.assert_not_called()
+                        sleep.assert_not_called()
+                        restored = AccountRequestClock("fixture", Path(directory)/"clock.json")
+                        with restored.lock:
+                            waiting_until = (restored.cooldown_until if reason == "provider_cooldown"
+                                             else restored.next_conversation_read)
+                            self.assertEqual(waiting_until, 100. + delay)
+                    self.assertEqual(credited, [delay] if credit_local and may_send else [])
+                    self.assertEqual(clock.ordinary_read_queue, [])
+                    self.assertFalse(clock.lock.locked())
+
     def test_retry_connection_window_checked_again_in_io_worker(self):
         from types import SimpleNamespace
         from unittest.mock import Mock
