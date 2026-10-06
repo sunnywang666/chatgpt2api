@@ -2543,9 +2543,14 @@ class OpenAIBackendAPI:
             if remaining <= 0:
                 raise ImageActiveDeadlineExceeded("image notification deadline elapsed")
             path = "/backend-api/celsius/ws/user"
+            # Allow up to ten seconds for the account's send queue, then a
+            # full ten-second HTTP attempt. Never send with the sub-second
+            # remainder of the old combined setup budget; retain the original
+            # active deadline and fall back to polling if no window remains.
             response = backend.session.get(backend.base_url + path, headers=backend._headers(path),
                 timeout=remaining, allow_redirects=False,
-                _account_request_deadline_monotonic=min(deadline, time.monotonic() + 10))
+                _account_request_deadline_monotonic=min(deadline, time.monotonic() + 20),
+                _account_request_minimum_budget_secs=10.0)
             try:
                 ensure_ok(response, path)
                 url = response.json()["websocket_url"]

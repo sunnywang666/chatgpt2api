@@ -293,6 +293,50 @@ def test_expired_image_never_starts_notification_transport():
     assert not opened and "expired-fixture" not in completion._hubs
 
 
+@pytest.mark.parametrize("queue_seconds,active_seconds,expected_send", [
+    (9.13, 120, True), (11, 120, False), (9.13, 10, False),
+])
+def test_notification_setup_keeps_a_full_http_budget_after_account_wait(
+        monkeypatch, queue_seconds, active_seconds, expected_send):
+    from services import account_request_pacing as pacing
+    from services import openai_backend_api as backend_module
+    now = [100.0]
+    clock_time = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1700000000 + now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(pacing, "time", clock_time)
+    monkeypatch.setattr(backend_module, "time", clock_time)
+    monkeypatch.setattr(pacing, "config", SimpleNamespace(account_request_interval_secs=0.1,
+        account_conversation_read_interval_secs=60, account_message_interval_secs=0))
+    clock = pacing.AccountRequestClock("notification-fixture")
+    clock.next_request = now[0] + queue_seconds
+    sent, closed, response_closed = [], [], []
+    response = SimpleNamespace(status_code=200, headers={}, json=lambda: {"websocket_url": URL},
+                               close=lambda: response_closed.append(True))
+    def raw(method, url, **options):
+        sent.append((now[0], options))
+        return response
+    session = SimpleNamespace(get=lambda url, **options: clock.request(raw, "GET", url, **options))
+    client = SimpleNamespace(session=session, base_url="https://chatgpt.com", _headers=lambda path: {},
+        account={}, fp={"impersonate": "fixture"}, close=lambda: closed.append(True))
+    backend = object.__new__(OpenAIBackendAPI)
+    backend.access_token = "fixture-token"
+    monkeypatch.setattr(backend_module, "OpenAIBackendAPI", lambda **options: client)
+    monkeypatch.setattr(backend_module.proxy_settings, "build_session_kwargs", lambda **options: {})
+    deadline = 100 + active_seconds
+    if expected_send:
+        transport = backend._open_image_notification_transport(deadline)
+        assert len(sent) == 1 and sent[0][0] == pytest.approx(109.13)
+        assert sent[0][1]["timeout"] == 10
+        assert transport[-1] == deadline and response_closed == [True]
+        assert not closed
+        transport[3]()
+    else:
+        with pytest.raises(pacing.AccountReadRetryBudgetInsufficient):
+            backend._open_image_notification_transport(deadline)
+        assert not sent and not response_closed
+    assert closed == [True] and not clock.lock.locked()
+
+
 @pytest.mark.parametrize("stopped", [True, False])
 def test_notification_does_not_connect_after_last_release_or_transport_deadline(stopped):
     hub = completion._ConversationHints()

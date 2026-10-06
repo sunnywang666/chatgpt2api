@@ -509,6 +509,8 @@ class AccountRequestClock:
                 endpoint_kind = "requirements"
             elif endpoint.endswith("/conversations"):
                 endpoint_kind = "conversation_list"
+            elif endpoint == "/backend-api/celsius/ws/user":
+                endpoint_kind = "completion_subscription"
             response = None
             transport_error = None
             transport_code = None
