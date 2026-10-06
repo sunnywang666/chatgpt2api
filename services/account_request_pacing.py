@@ -406,9 +406,11 @@ class AccountRequestClock:
         read_only = ((evidence or {}).get("phase") == "conversation_read"
                      and not retry_after_present and retry_after <= 0)
         now = time.monotonic()
-        same_read_incident = (read_only and read_sent_at is not None
-                              and self.conversation_read_rate_failures > 0
-                              and read_sent_at <= self.last_conversation_read_rate_limit)
+        incident_failures = self.conversation_read_rate_failures if read_only else self.rate_failures
+        incident_at = self.last_conversation_read_rate_limit if read_only else self.last_rate_limit
+        same_read_incident = ((evidence or {}).get("phase") == "conversation_read"
+                              and type(read_sent_at) in (int, float) and math.isfinite(read_sent_at)
+                              and incident_failures > 0 and read_sent_at <= incident_at)
         if read_only:
             # Reads already in flight when a limit was observed belong to that
             # incident. Count every response, but do not turn one parallel burst
@@ -421,11 +423,17 @@ class AccountRequestClock:
             failures = self.conversation_read_rate_failures
             wait = max(0.0, self._read_cooldown_until() - now)
         else:
-            self.rate_failures += 1
-            self.last_rate_limit = now
+            # Retry-After still protects the entire account. Reads sent before
+            # this incident was observed are not successive retries, however:
+            # retain one backoff level and honor the longest explicit wait.
+            if not same_read_incident:
+                self.rate_failures += 1
+                self.last_rate_limit = now
             failures = self.rate_failures
-            wait = max(_backoff_seconds(failures), retry_after)
-            self.cooldown_until = max(self.cooldown_until, now + wait)
+            self.cooldown_until = max(self.cooldown_until,
+                                      self.last_rate_limit + _backoff_seconds(failures),
+                                      now + retry_after)
+            wait = max(0.0, self.cooldown_until - now)
         context = current_request.get()
         observed = {"layer": "upstream_chatgpt", "phase": "unknown", "origin": "http_429",
                     **(evidence or {}), "retry_after_seconds": retry_after,
