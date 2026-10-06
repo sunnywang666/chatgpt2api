@@ -1465,7 +1465,10 @@ class AdmissionTests(unittest.TestCase):
                 # The bound protocol preserves its public error contract and
                 # chains the exact local guard exception through the handler.
                 try:
-                    raise AdmissionLost("selected image account capability is unavailable")
+                    rejected = AdmissionLost("selected image account capability is unavailable")
+                    rejected.reason = "image_capability_unavailable"
+                    rejected.capability_reason = "stale_consumed"
+                    raise rejected
                 except AdmissionLost as rejected:
                     raise ImageGenerationError("capacity changed",
                         code="IMAGE_GENERATION_NOT_SUBMITTED", upstream_submitted=False) from rejected
@@ -1494,6 +1497,9 @@ class AdmissionTests(unittest.TestCase):
             self.assertIsNone(receipt.get("active_attempt_deadline_at"))
             self.assertFalse(receipt.get("_completion"))
             self.assertEqual(receipt["_input_ref"], initial["_input_ref"])
+            failure = receipt["_execution_timeline"][-1]
+            self.assertEqual(failure["reason"], "image_capability_unavailable")
+            self.assertEqual(failure["capability_reason"], "stale_consumed")
             self.assertFalse(any(e["stage"] in {"task_finished", "send_call_started"}
                                  for e in receipt["_execution_timeline"]))
             with self.store.connect() as db:

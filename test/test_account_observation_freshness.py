@@ -275,7 +275,9 @@ def test_reimport_old_export_does_not_rewind_consumption_or_reenable_late_observ
 
 @pytest.mark.parametrize("download_success", [True, False])
 @pytest.mark.parametrize("remaining", [0, 4])
-def test_download_settlement_keeps_observation_after_asset_consumption(tmp_path, download_success, remaining):
+@pytest.mark.parametrize("settlement_first", [False, True])
+def test_download_settlement_keeps_observation_after_asset_consumption(
+        tmp_path, download_success, remaining, settlement_first):
     from services.account_service import AccountService
     from services.storage.json_storage import JSONStorageBackend
 
@@ -293,13 +295,18 @@ def test_download_settlement_keeps_observation_after_asset_consumption(tmp_path,
     service.update_account("fixture", snapshot(5), quiet=True, expected_capacity_observation=before)
     assert service.get_account("fixture")["capacity_used_since_observation"] is True
     current = service._capacity_observation_revision(service.get_account("fixture"))
+    # The metadata read started after the generation consumed capacity. Merely
+    # settling its download while that read is in flight cannot make it stale.
+    if settlement_first:
+        service.mark_image_result("fixture", download_success, release_slot=False, capacity_consumed=True)
     service.update_account("fixture", {**snapshot(remaining), "status": "限流" if remaining == 0 else "正常"},
         quiet=True, expected_capacity_observation=current)
     fresh = service.get_account("fixture")
     assert fresh["capacity_used_since_observation"] is False
     # A late save/failure must neither subtract the same generation again nor
     # invalidate the newer real observation (including a real zero).
-    service.mark_image_result("fixture", download_success, release_slot=False, capacity_consumed=True)
+    if not settlement_first:
+        service.mark_image_result("fixture", download_success, release_slot=False, capacity_consumed=True)
     saved = AccountService(JSONStorageBackend(tmp_path / "accounts.json")).get_account("fixture")
     assert saved["quota"] == remaining and saved["status"] == fresh["status"]
     assert saved["capacity_used_since_observation"] is False
@@ -319,6 +326,22 @@ def test_two_asset_consumptions_before_download_invalidate_interleaved_observati
     service.update_account("fixture", snapshot(4), quiet=True, expected_capacity_observation=between)
     saved = service.get_account("fixture")
     assert saved["quota"] == 3 and saved["capacity_used_since_observation"] is True
+
+
+def test_final_image_recheck_reports_consumed_observation_without_exposing_identity(tmp_path):
+    from services.account_service import AccountService
+    from services.request_context import AdmissionLost
+    from services.storage.json_storage import JSONStorageBackend
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([{"access_token": "private-fixture", "managed_owner": "fixture-owner",
+        "source_type": "web", "status": "正常", "type": "Plus", **snapshot(5)}])
+    service.require_image_account("private-fixture", "gpt-image-2")
+    service.mark_image_capacity_consumed("private-fixture")
+    with pytest.raises(AdmissionLost) as rejected:
+        service.require_image_account("private-fixture", "gpt-image-2")
+    assert rejected.value.reason == "image_capability_unavailable"
+    assert rejected.value.capability_reason == "stale_consumed"
+    assert "private-fixture" not in str(rejected.value)
 
 
 @pytest.mark.parametrize("after_image_consumption", [False, True])

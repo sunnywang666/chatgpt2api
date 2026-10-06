@@ -129,9 +129,21 @@ class AccountService:
             account = self._accounts.get(token) or {}
             identity = self._stable_account_identity(account)
             if (expected_identity and identity != expected_identity
-                    or sum(self._stable_account_identity(a) == identity for a in self._accounts.values()) != 1
-                    or self.image_account_capacity(account, model) <= 0):
-                raise AdmissionLost("selected image account capability is unavailable")
+                    or sum(self._stable_account_identity(a) == identity for a in self._accounts.values()) != 1):
+                error = AdmissionLost("selected image account capability is unavailable")
+                error.reason = "image_binding_changed"
+                raise error
+            if self.image_account_capacity(account, model) <= 0:
+                from services.owned_accounts import image_capability_projection
+                reason = image_capability_projection(account).get("reason")
+                if reason == "stale":
+                    reason = "stale_consumed" if account.get("capacity_used_since_observation") else "stale_expired"
+                error = AdmissionLost("selected image account capability is unavailable")
+                error.reason = "image_capability_unavailable"
+                error.capability_reason = reason if reason in {
+                    "disabled", "auth_required", "limited", "read_failed", "stale_consumed", "stale_expired"
+                } else "unavailable"
+                raise error
             return dict(account)
 
     def refresh_image_capability(self, account_ref: str) -> None:
@@ -787,7 +799,7 @@ class AccountService:
     def _apply_refreshed_tokens(
         self, old_access_token: str, token_data: dict, event: str, *,
         expected_revision: str | None = None, chat_info: dict | None = None,
-        expected_capacity_observation: tuple[int, int, str, int] | None = None,
+        expected_capacity_observation: tuple[str, int] | None = None,
         capacity_observed_at: str | None = None,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
@@ -3237,29 +3249,29 @@ class AccountService:
         return {"removed": removed, "items": items}
 
     @staticmethod
-    def _capacity_observation_revision(account: dict) -> tuple[int, int, str, int]:
-        # A generated asset consumes capacity before download outcome counters
-        # change. Track that transition separately from last_used_at, which is
-        # also updated by text requests and cannot invalidate image metadata.
-        return (int(account.get("success") or 0), int(account.get("fail") or 0),
-                str(account.get("capacity_observed_at") or ""), int(account.get("capacity_consumption_count") or 0))
+    def _capacity_observation_revision(account: dict) -> tuple[str, int]:
+        # Only new image consumption invalidates an in-flight quota read.
+        # Download outcome counters and unrelated text usage do not consume
+        # again and must not discard a read started after asset production.
+        return (str(account.get("capacity_observed_at") or ""),
+                int(account.get("capacity_consumption_count") or 0))
 
     @classmethod
     def _capacity_observation_can_apply(
-        cls, current: dict, expected: tuple[int, int, str, int] | None, observed_at: str | None,
+        cls, current: dict, expected: tuple[str, int] | None, observed_at: str | None,
     ) -> bool:
         if expected is None:
             return True
         actual = cls._capacity_observation_revision(current)
-        if expected[:2] != actual[:2] or expected[3:] != actual[3:]:
+        if expected[1] != actual[1]:
             return False
-        if expected[2] == actual[2]:
+        if expected[0] == actual[0]:
             return True
         # Order concurrent reads by their start, not their completion. A newer
         # zero must survive either completion order; an old positive cannot
         # replace it. Use the existing observation timestamp, no new counter.
         started = cls._parse_time(observed_at)
-        saved = cls._parse_time(actual[2])
+        saved = cls._parse_time(actual[0])
         return started is not None and saved is not None and started > saved
 
     def update_account(
@@ -3270,7 +3282,7 @@ class AccountService:
         *,
         expected_credentials: tuple[str, str] | None = None,
         expected_codex_credentials: tuple[str, str] | None = None,
-        expected_capacity_observation: tuple[int, int, str, int] | None = None,
+        expected_capacity_observation: tuple[str, int] | None = None,
     ) -> dict | None:
         if not access_token:
             return None
@@ -3398,6 +3410,9 @@ class AccountService:
             if not capacity_consumed:
                 next_item["capacity_used_since_observation"] = True
                 next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # Legacy callers have not recorded asset consumption early.
+                # Preserve their invalidation of an older in-flight read.
+                next_item["capacity_consumption_count"] = int(next_item.get("capacity_consumption_count") or 0) + 1
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
                 if not capacity_consumed:

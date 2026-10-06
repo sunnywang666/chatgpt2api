@@ -1619,7 +1619,9 @@ class PoolAdmission:
                         record_sent_interruption(context.kind, r, float(self.clock()), "worker_exception")
                         r.update(status="unknown" if context.kind == "text" else "error", error_code="CONVERSATION_OUTCOME_UNKNOWN")
                     else:
-                        record_unsent_failure(context, r, float(self.clock()), type(exc).__name__)
+                        record_unsent_failure(context, r, float(self.clock()), type(exc).__name__,
+                                              reason=getattr(exc, "reason", None),
+                                              capability_reason=getattr(exc, "capability_reason", None))
                         r.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
                                  _turn_reserved=False, upstream_unfinished=False,
                                  _ready_at=float(self.clock()) + 1)
