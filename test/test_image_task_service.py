@@ -3385,6 +3385,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 self.assertEqual(slot["inflight"], 1)
 
     def test_unknown_resume_maps_authoritative_finished_failure_to_terminal_code(self):
+        from services.openai_backend_api import OpenAIBackendAPI as RealBackend
         with tempfile.TemporaryDirectory() as tmp_dir:
             error = RuntimeError("ChatGPT 生图超时")
             error.code = "CONVERSATION_OUTCOME_UNKNOWN"
@@ -3409,11 +3410,13 @@ class ImageTaskServiceTests(unittest.TestCase):
             wait_for_task(service, OWNER, "terminal-no-image-task", "error")
 
             class FakeBackend:
+                _has_image_asset_pointer = staticmethod(RealBackend._has_image_asset_pointer)
                 def __init__(self, access_token=None, proxy_url=None):
                     self.access_token = access_token
 
                 def _get_conversation(self, _conversation_id):
                     return {
+                        "is_archived": False,
                         "current_node": "assistant-1",
                         "mapping": {
                             "request-1": {
@@ -3448,8 +3451,16 @@ class ImageTaskServiceTests(unittest.TestCase):
                 resumed = service.resume_poll(OWNER, "terminal-no-image-task", 30, "http://content-provider")
                 self.assertIn(resumed["status"], {"running", "error"}, resumed)
                 task = wait_for_task(service, OWNER, "terminal-no-image-task", "error")
+                deadline = time.time() + 2
+                while task["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN" and time.time() < deadline:
+                    time.sleep(0.02)
+                    task = service.list_tasks(OWNER, ["terminal-no-image-task"])["items"][0]
 
-            self.assertEqual(task["error_code"], "NO_IMAGE_GENERATED")
+            self.assertEqual(task["error_code"], "NO_IMAGE_GENERATED", task)
+            with service.store.connect() as db:
+                receipt = service.store.read_receipt(db, "image", str(OWNER["id"]), "terminal-no-image-task")
+            self.assertEqual(receipt["_retry_cursor"]["source"], "terminal_image_failure")
+            self.assertEqual(receipt["_retry_cursor"]["retry_parent_message_id"], "assistant-1")
 
     def test_different_owner_cannot_query_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

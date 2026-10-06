@@ -342,3 +342,103 @@ def test_automatic_unsent_wait_respects_original_work_state(runtime, monkeypatch
     assert ('event: needs_attention' in result.text) is not waiting
     assert ('"retrying_unsent":true' in result.text) is waiting
     assert 'event: result_ready' not in result.text
+
+
+def completion_rows():
+    root = {'id': 'original', 'status': 'error', 'error_code': 'NO_IMAGE_GENERATED',
+            'upstream_outcome': 'unknown', 'upstream_unfinished': False,
+            'provider_binding_id': 'binding', 'provider_account_identity': 'account',
+            'client_conversation_id': 'client', 'conversation_id': 'conversation',
+            'request_message_id': 'message', '_work_key': 'work',
+            '_image_thread': {'protocol': 'image-thread-v1', 'id': 'thread'},
+            '_retry_cursor': {'conversation_id': 'conversation', 'request_message_id': 'message',
+                              'retry_parent_message_id': 'parent', 'observed_at': events.time.time(),
+                              'source': 'terminal_image_failure'},
+            '_completion': {'state': 'checking_original', 'automatic_failure_retry': True, 'next_at': 9999999999}}
+    child = {k: root[k] for k in ('provider_binding_id', 'provider_account_identity',
+             'client_conversation_id', 'conversation_id', '_work_key', '_image_thread')}
+    child.update(id='child', status='queued', _completion_of='original', _same_session_retry_of='original',
+                 _submission_parent_message_id='parent')
+    return root, child
+
+
+def test_automatic_completion_notifies_selected_result_without_ending_wait_early(runtime, monkeypatch):
+    client, put, identity, store = runtime
+    client.app.state.event_service.admission = SimpleNamespace(generation_completion=object())
+    root, child = completion_rows()
+    put(**root)
+    with store.transaction() as db:
+        store.set_runtime(db, 'work', {'state': 'active'})
+    calls = 0
+    def authenticate(*a, **k):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            root['_completion'].update(state='replacement_pending', replacement_id='child')
+            put(**root); put(rid='child', **child)
+        elif calls == 3:
+            root['_completion'].update(state='result_ready', selected_id='child', next_at=None)
+            child.update(status='success', data=[{'url': 'private-result'}], _image_thread_terminal=True)
+            put(**root); put(rid='child', **child)
+        return identity.copy()
+    monkeypatch.setattr(events, 'require_identity', authenticate)
+    response = client.get('/api/image-tasks/original/events')
+    assert 'event: needs_attention' not in response.text
+    assert response.text.count('event: result_ready\n') == 1
+    payloads = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ')]
+    assert all(p['request_id'] == 'original' and p['status'] == 'error' for p in payloads)
+    assert [p['result_ready'] for p in payloads] == [False, False, True]
+    assert payloads[-1]['selected_result_id'] == 'child' and payloads[-1]['result_count'] == 1
+    assert 'private-result' not in response.text and 'binding' not in response.text
+
+
+def test_verified_no_image_failure_waits_across_completion_creation_transaction(runtime, monkeypatch):
+    client, put, _, store = runtime
+    client.app.state.event_service.admission = SimpleNamespace(generation_completion=object())
+    root, _ = completion_rows()
+    root.pop('_completion')
+    root['_automatic_generation_recovery'] = True
+    root['_retry_cursor'].update(source='terminal_image_failure', observed_at=events.time.time())
+    put(**root)
+    with store.transaction() as db:
+        store.set_runtime(db, 'work', {'state': 'active'})
+    monkeypatch.setattr(events, 'STREAM_SECONDS', 0)
+    response = client.get('/api/image-tasks/original/events')
+    assert 'event: needs_attention' not in response.text
+    assert 'event: reconnect' in response.text
+    assert '"recovering_original":true' in response.text
+    assert 'event: result_ready' not in response.text
+
+
+@pytest.mark.parametrize('change', ['paused', 'work_paused', 'scheduler_missing', 'no_next_at', 'nan_next_at',
+                                    'no_auto_retry', 'proof_missing_source', 'proof_stale', 'proof_wrong_binding',
+                                    'result_asset', 'upstream_unfinished',
+                                    'selected_wrong_binding', 'selected_wrong_thread', 'selected_not_terminal'])
+def test_invalid_or_stopped_completion_does_not_promise_a_result(runtime, monkeypatch, change):
+    client, put, _, store = runtime
+    client.app.state.event_service.admission = SimpleNamespace(generation_completion=object())
+    root, child = completion_rows()
+    if change == 'paused': root['_recovery_paused'] = True
+    if change == 'scheduler_missing': client.app.state.event_service.admission = None
+    if change == 'no_next_at': root['_completion']['next_at'] = None
+    if change == 'nan_next_at': root['_completion']['next_at'] = float('nan')
+    if change == 'no_auto_retry': root['_completion']['automatic_failure_retry'] = False
+    if change == 'proof_missing_source': root['_retry_cursor'].pop('source')
+    if change == 'proof_stale': root['_retry_cursor']['observed_at'] -= 301
+    if change == 'proof_wrong_binding': root['_retry_cursor']['conversation_id'] = 'other'
+    if change == 'result_asset': root['result_file_ids'] = ['existing-asset']
+    if change == 'upstream_unfinished': root['upstream_unfinished'] = True
+    if change.startswith('selected_'):
+        root['_completion'].update(state='result_ready', selected_id='child', replacement_id='child', next_at=None)
+        child.update(status='success', data=[{'url': 'private-result'}], _image_thread_terminal=True)
+        if change == 'selected_wrong_binding': child['provider_binding_id'] = 'different'
+        if change == 'selected_wrong_thread': child['_image_thread'] = {'protocol': 'image-thread-v1', 'id': 'different'}
+        if change == 'selected_not_terminal': child['_image_thread_terminal'] = False
+        put(rid='child', **child)
+    with store.transaction() as db:
+        store.set_runtime(db, 'work', {'state': 'paused' if change == 'work_paused' else 'active'})
+    put(**root)
+    monkeypatch.setattr(events, 'STREAM_SECONDS', 0)
+    response = client.get('/api/image-tasks/original/events')
+    assert 'event: needs_attention' in response.text
+    assert 'event: result_ready' not in response.text

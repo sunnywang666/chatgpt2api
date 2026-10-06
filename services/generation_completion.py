@@ -106,14 +106,19 @@ def retry_cursor(document, receipt, *, kind="text", now=None, predecessor=None):
         pending.extend(descendants)
     if head not in seen or children.get(head):
         return None
-    return {"conversation_id": conversation, "request_message_id": message,
-            "retry_parent_message_id": head, "observed_at": time.time() if now is None else now}
+    proof = {"conversation_id": conversation, "request_message_id": message,
+             "retry_parent_message_id": head, "observed_at": time.time() if now is None else now}
+    if kind == "image":
+        from services.image_task_service import _authoritative_image_failure
+        if _authoritative_image_failure(document, message):
+            proof["source"] = "terminal_image_failure"
+    return proof
 
 
 def retry_evidence(receipt):
     proof = receipt.get("_retry_cursor")
     fields = {"conversation_id", "request_message_id", "retry_parent_message_id", "observed_at"}
-    if isinstance(proof, dict) and proof.get("source") == "absent_image_thread_request":
+    if isinstance(proof, dict) and proof.get("source") in {"absent_image_thread_request", "terminal_image_failure"}:
         fields.add("source")
     if (not isinstance(proof, dict) or set(proof) != fields
             or any(not isinstance(proof.get(k), str) or not 1 <= len(proof[k]) <= 200 for k in (
@@ -125,6 +130,17 @@ def retry_evidence(receipt):
             or any(not receipt.get(k) for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))):
         return None
     return proof
+
+
+def verified_image_failure(receipt, now, maximum_age):
+    """A fresh strict no-image terminal read, not an error-string guess."""
+    proof = retry_evidence(receipt)
+    return bool(proof and proof.get("source") == "terminal_image_failure"
+                and 0 <= now - proof["observed_at"] <= maximum_age
+                and receipt.get("status") == "error" and receipt.get("error_code") == "NO_IMAGE_GENERATED"
+                and receipt.get("upstream_unfinished") is False
+                and not any(receipt.get(k) for k in ("data", "result_file_ids", "result_sediment_ids",
+                    "_pending_image_result_ids", "_pending_image_output", "_recovery_paused", "_recovery_suppressed")))
 
 
 def same_session_retry(root, child):
@@ -516,7 +532,8 @@ class GenerationCompletionService:
                         # resume_poll cannot query that original without a cursor;
                         # repeating its local ValueError is not an investigation.
                         raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNAVAILABLE")
-                    ended = kind == "text" and self.text._verified_retryable_empty(root)
+                    ended = (self.text._verified_retryable_empty(root) if kind == "text"
+                             else verified_image_failure(root, now, self.INVESTIGATION_SECONDS))
                     retry_authorized = state["allow_unconfirmed_retry"] or state.get("automatic_failure_retry")
                     if kind == "text" and root.get("conversation_id") and not ended and not retry_authorized:
                         raise CompletionError("COMPLETION_ORIGINAL_END_UNCONFIRMED")

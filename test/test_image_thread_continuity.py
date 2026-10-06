@@ -1274,7 +1274,7 @@ def test_predecessor_diagnostics_are_specific_and_read_only(previous, reason):
     assert predecessor_state(task, owned) == ({}, reason)
     assert owned == before
 
-@pytest.mark.parametrize('case', ['success', 'late_original_success', 'selected_source_changed', 'drift', 'late_result', 'missing_root'])
+@pytest.mark.parametrize('case', ['success', 'terminal_failure', 'late_original_success', 'selected_source_changed', 'drift', 'late_result', 'missing_root'])
 def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runtime, case):
     import time
     from services.generation_completion import GenerationCompletionService, retry_cursor
@@ -1293,13 +1293,21 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
         if key != mid:
             value['message']['content']['parts'] = []
             value['message'].update(status='in_progress', end_turn=None)
+    if case == 'terminal_failure':
+        final = doc['mapping'][doc['current_node']]['message']
+        final.update(status='finished_successfully', end_turn=True)
+        final['content'] = {'content_type': 'text', 'parts': ['Something went wrong while generating your image. Sorry about that.']}
     now = time.time()
     r.admission.clock = lambda: now
     with r.store.transaction() as db:
         saved = r.store.read_receipt(db, 'image', WHO['id'], 'empty-original')
-        saved.update(_completion_read_at=now, _retry_cursor=retry_cursor(doc, original, kind='image'),
+        saved.update(_completion_read_at=now, _retry_cursor=retry_cursor(doc, original, kind='image', now=now),
                      _execution_timeline=[{'stage': 'send_call_started', 'at': now-1300}],
                      _executing=False, _claim_id=None, _claim_until=0)
+        if case == 'terminal_failure':
+            assert saved['_retry_cursor']['source'] == 'terminal_image_failure'
+            saved.update(error_code='NO_IMAGE_GENERATED', upstream_unfinished=False,
+                         _execution_timeline=[{'stage': 'send_call_started', 'at': now-20}])
         r.store.write_receipt(db, 'image', WHO['id'], 'empty-original', saved)
     text = TextTaskService(r.store.path, admission=r.admission, clock=r.admission.clock)
     lifecycle = WorkLifecycleService(text, r.service, clock=r.admission.clock)
@@ -1308,6 +1316,9 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
     result = completion.start('image', WHO, 'empty-original', allow_unconfirmed_retry=True)
     assert result.get('replacement_id'), result
     child_id = result['replacement_id']; child = r.read(child_id)
+    if case == 'terminal_failure':
+        completion.advance('image', WHO['id'], 'empty-original')
+        assert completion.read('image', WHO, 'empty-original')['replacement_id'] == child_id
     for key in ('provider_account_identity','provider_binding_id','conversation_id','client_conversation_id','_work_key'):
         assert child[key] == original[key]
     assert child['_image_thread']['id'] == original['_image_thread']['id']
@@ -1329,7 +1340,7 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
                 root['_completion'] = {}
             r.store.write_receipt(db, 'image', WHO['id'], 'empty-original', root)
     r.admission.execute(ctx)
-    if case not in {'success', 'late_original_success', 'selected_source_changed'}:
+    if case not in {'success', 'terminal_failure', 'late_original_success', 'selected_source_changed'}:
         assert len(r.state.sends) == 1
         assert r.read(child_id)['upstream_outcome'] in {'not_sent', 'not_submitted'}
         return

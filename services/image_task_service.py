@@ -2707,6 +2707,12 @@ class ImageTaskService:
             )
             if final_error_code == "CONVERSATION_OUTCOME_UNKNOWN":
                 error_message = _safe_recovery_error(recovery_error_code, recovery_phase)
+            terminal_retry_cursor = None
+            if isinstance(exc, AuthoritativeImageTaskFailure) and not result_captured:
+                # Reuse the existing cursor proof from this exact authoritative
+                # document. A failed error code alone cannot end an UNKNOWN.
+                from services.generation_completion import retry_cursor
+                terminal_retry_cursor = retry_cursor(document, current, kind="image")
             self._update_task(
                 key,
                 status=TASK_STATUS_ERROR,
@@ -2718,6 +2724,7 @@ class ImageTaskService:
                 data=[],
                 duration_ms=duration_ms,
                 upstream_unfinished=not (terminal or unrecoverable or result_captured),
+                **({"_retry_cursor": terminal_retry_cursor} if terminal_retry_cursor else {}),
                 poll_failures=failures,
                 recovery_no_result_reads=qualified_reads,
                 recovery_requires_new_conversation=requires_new_conversation,

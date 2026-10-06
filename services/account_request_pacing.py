@@ -67,6 +67,52 @@ def _transport_snapshot(response):
     return result
 
 
+def _rate_limit_response_features(response):
+    """Classify a 429 without retaining body, URL or raw header values.
+
+    Markers are evidence, not an attribution to the application or its edge.
+    This projection must never change retry/cooldown decisions.
+    """
+    result = {"content_type_class": "missing", "retry_after_kind": "absent",
+              "request_id_header": "none", "cf_ray_present": False, "via_present": False,
+              "response_origin_evidence": "no_marker"}
+    try:
+        allowed = {"content-type", "retry-after", "x-request-id", "openai-request-id", "cf-ray", "via"}
+        headers = {k.lower(): v for k, v in (getattr(response, "headers", {}) or {}).items()
+                   if isinstance(k, str) and k.lower() in allowed}
+        if "content-type" in headers:
+            value = headers["content-type"]
+            mime = value.split(";", 1)[0].strip().lower() if isinstance(value, str) else ""
+            result["content_type_class"] = {"application/json": "application_json",
+                "text/html": "text_html", "text/plain": "text_plain"}.get(mime, "other")
+        if "retry-after" in headers:
+            result["retry_after_kind"] = "invalid"
+            value = headers["retry-after"]
+            try:
+                seconds = float(value)
+                if math.isfinite(seconds) and seconds >= 0:
+                    result["retry_after_kind"] = "seconds"
+            except (TypeError, ValueError, OverflowError):
+                if isinstance(value, str):
+                    try:
+                        parsedate_to_datetime(value)
+                        result["retry_after_kind"] = "http_date"
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+        for name in ("x-request-id", "openai-request-id"):
+            if name in headers:
+                result["request_id_header"] = name.replace("-", "_")
+                break
+        result.update(cf_ray_present="cf-ray" in headers, via_present="via" in headers)
+        request_marker = result["request_id_header"] != "none"
+        edge_marker = result["cf_ray_present"] or result["via_present"]
+        result["response_origin_evidence"] = ("mixed_markers" if request_marker and edge_marker
+            else "request_id_marker" if request_marker else "edge_marker" if edge_marker else "no_marker")
+    except Exception:
+        pass  # Diagnostics must not hide the original 429.
+    return result
+
+
 class ProcessMutex:
     """The existing pacing clock/turn lock, shared by workers on this data root."""
     def __init__(self, path=None, on_acquire=None):
@@ -565,6 +611,7 @@ class AccountRequestClock:
                              "outcome": "response" if response is not None else "transport_error",
                              "transport_error_type": transport_error, "transport_error_code": transport_code,
                              **(transport_snapshot if response is None else _transport_snapshot(response)),
+                             **({"response_features": _rate_limit_response_features(response)} if status == 429 else {}),
                              "request_timeout_secs": timeout,
                              "stream": bool(send_kwargs.get("stream"))})
         # Serialize only the send edge. The account activity reservation lives
@@ -665,7 +712,8 @@ class AccountRequestClock:
                             safe_id = request_id if isinstance(request_id, str) and len(request_id) <= 160 and request_id.isascii() and not any(c.isspace() for c in request_id) else None
                             self.limited(retry_after_seconds(response.headers.get("Retry-After")),
                                          retry_after_present="Retry-After" in response.headers,
-                                         evidence={"phase": "conversation_preflight", "model": model, "origin": "http_429", "upstream_request_id": safe_id})
+                                         evidence={"phase": "conversation_preflight", "model": model, "origin": "http_429", "upstream_request_id": safe_id,
+                                                   "response_features": _rate_limit_response_features(response)})
                         return response
                     preflight(read_original)
                     # The metadata GET does not bypass the account request pace.
@@ -813,7 +861,8 @@ class AccountRequestClock:
                     self.limited(retry_after_seconds(response_headers.get("Retry-After")),
                                  retry_after_present="Retry-After" in response_headers,
                                  read_sent_at=sent_at if is_conversation_read else None,
-                                 evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id})
+                                 evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id,
+                                           "response_features": _rate_limit_response_features(response)})
                 if concurrent_io and reservation_error is not None:
                     response.close()
                     raise reservation_error

@@ -19,6 +19,41 @@ from test.test_stalled_text_diagnostics import incomplete_reader
 IDENTITY = {"id": "owner", "role": "user", "external_image_client": True}
 
 
+@pytest.mark.parametrize('change', ['none', 'active', 'similar_text', 'later_user', 'branch', 'asset',
+                                  'archived', 'wrong_conversation', 'stale', 'future', 'saved_asset', 'paused',
+                                  'cursor_before_error', 'cursor_before_error_code', 'cursor_before_finished'])
+def test_terminal_image_failure_requires_fresh_closed_asset_free_original(change):
+    from services.generation_completion import retry_cursor, verified_image_failure
+    root = {'status': 'error', 'error_code': 'NO_IMAGE_GENERATED', 'upstream_outcome': 'unknown',
+            'upstream_unfinished': False, 'conversation_id': 'conversation', 'request_message_id': 'request',
+            'provider_binding_id': 'binding', 'provider_account_identity': 'account', 'client_conversation_id': 'client'}
+    document = {'conversation_id': 'conversation', 'is_archived': False, 'current_node': 'answer', 'mapping': {
+        'request': {'parent': 'old', 'message': {'author': {'role': 'user'}}},
+        'answer': {'parent': 'request', 'message': {'author': {'role': 'assistant'}, 'status': 'finished_successfully',
+                   'end_turn': True, 'content': {'content_type': 'text',
+                   'parts': ['Something went wrong while generating your image. Sorry about that.']}}}}}
+    message = document['mapping']['answer']['message']
+    if change == 'active': message.update(status='in_progress', end_turn=False)
+    if change == 'similar_text': message['content']['parts'] = ['Maybe something went wrong.']
+    if change == 'later_user':
+        document['mapping']['later'] = {'parent': 'answer', 'message': {'author': {'role': 'user'}}}
+        document['current_node'] = 'later'
+    if change == 'branch': document['mapping']['branch'] = {'parent': 'request', 'message': {'author': {'role': 'assistant'}}}
+    if change == 'asset': message['content']['parts'].append({'asset_pointer': 'file-service://saved-file'})
+    if change == 'archived': document['is_archived'] = True
+    if change == 'wrong_conversation': document['conversation_id'] = 'other'
+    root['_retry_cursor'] = retry_cursor(document, root, kind='image', now=100)
+    if change == 'saved_asset': root['result_file_ids'] = ['already-generated']
+    if change == 'paused': root['_recovery_paused'] = True
+    # The cursor may be persisted before the authoritative terminal update.
+    # A crash in that interval must not make the observation alone retryable.
+    if change == 'cursor_before_error': root['status'] = 'running'
+    if change == 'cursor_before_error_code': root['error_code'] = 'CONVERSATION_OUTCOME_UNKNOWN'
+    if change == 'cursor_before_finished': root['upstream_unfinished'] = True
+    now = 401 if change == 'stale' else 99 if change == 'future' else 100
+    assert verified_image_failure(root, now, 300) is (change == 'none')
+
+
 def row(service, kind="text", request_id="old-0"):
     with service.store.connect() as db:
         return service.store.read_receipt(db, kind, "owner", request_id)

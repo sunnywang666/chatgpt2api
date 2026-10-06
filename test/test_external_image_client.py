@@ -571,6 +571,22 @@ def test_result_notification_rejects_wrong_original_and_never_submits(tmp_path):
         image_client._command_wait(Api(), args)
 
 
+def test_selected_image_notification_keeps_original_identity_and_only_wakes_client(tmp_path):
+    class Response(io.BytesIO):
+        headers = {'Content-Type': 'text/event-stream'}
+    class Api:
+        def open(self, method, endpoint):
+            assert (method, endpoint) == ('GET', '/api/image-tasks/original/events')
+            return Response(b'event: result_ready\ndata: {"protocol":"task-notification-v1","kind":"image","request_id":"original","selected_result_id":"child","status":"error","result_ready":true,"result_count":1}\n\n')
+    path = tmp_path / 'absent.json'
+    args = image_client._parser().parse_args(['wait', '--state', str(path), '--task-id', 'original'])
+    with mock.patch.object(image_client, '_emit') as emit:
+        assert image_client._command_wait(Api(), args) == 0
+    assert emit.call_args.args[0]['request_id'] == 'original'
+    assert emit.call_args.args[0]['selected_result_id'] == 'child'
+    assert not path.exists()  # Notification is not a save or a new request.
+
+
 def test_complete_preserves_original_work_during_cleanup_and_archive_pending(tmp_path):
     for status, detail, work_state, lifecycle in [
         (409, "WORK_TURN_UNFINISHED", "active", "waiting_turn"),

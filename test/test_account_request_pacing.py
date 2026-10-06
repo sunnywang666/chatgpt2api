@@ -1200,6 +1200,65 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertEqual(saved["upstream_request_id"], "fixture-request")
             self.assertNotIn("private-conversation-id", str(saved))
 
+    def test_429_response_features_survive_restart_without_raw_headers_or_body(self):
+        cases = (
+            ({"Content-Type": "application/json; private-header-value", "openai-request-id": "fixture-request",
+              "Retry-After": "0"}, "application_json", "seconds", "openai_request_id", "request_id_marker"),
+            ({"content-type": "text/html; private-header-value", "cf-ray": "private-header-value",
+              "via": "private-header-value", "Retry-After": "bad-private-header-value"},
+             "text_html", "invalid", "none", "edge_marker"),
+            ({"Content-Type": "text/plain", "x-request-id": "fixture-request", "CF-Ray": "private-header-value",
+              "Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"},
+             "text_plain", "http_date", "x_request_id", "mixed_markers"),
+            ({}, "missing", "absent", "none", "no_marker"),
+            ({"Content-Type": "private-header-value", "Retry-After": "NaN"},
+             "other", "invalid", "none", "no_marker"),
+        )
+        for headers, content, retry, request_id, origin in cases:
+            with self.subTest(content=content, retry=retry), tempfile.TemporaryDirectory() as tmp, \
+                 patch("services.account_request_pacing.logger.info") as logged:
+                path = Path(tmp) / "clock.json"
+                response = Response()
+                response.status_code = 429
+                response.headers = {**headers, "Set-Cookie": "private-header-value"}
+                response.text = "private-response-body"
+                clock = AccountRequestClock("account", path)
+                self.assertIs(clock.request(lambda *a, **kw: response, "GET",
+                    "https://provider/conversation/private-conversation-id"), response)
+                saved = AccountRequestClock("account", path).last_rate_limit_evidence
+                attempt = next(c.args[0] for c in logged.call_args_list
+                               if c.args[0].get("event") == "account_http_attempt")
+                for evidence in (saved, attempt):
+                    features = evidence["response_features"]
+                    self.assertEqual(features["content_type_class"], content)
+                    self.assertEqual(features["retry_after_kind"], retry)
+                    self.assertEqual(features["request_id_header"], request_id)
+                    self.assertEqual(features["response_origin_evidence"], origin)
+                serialized = json.dumps([saved, attempt, json.loads(path.read_text())])
+                for secret in ("private-header-value", "private-response-body", "private-conversation-id", "Set-Cookie"):
+                    self.assertNotIn(secret, serialized)
+
+    def test_preflight_429_keeps_the_same_response_features_as_its_http_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("services.account_request_pacing.logger.info") as logged:
+            path = Path(tmp) / "clock.json"
+            clock = AccountRequestClock("account", path)
+            response = Response()
+            response.status_code = 429
+            response.headers = {"Content-Type": "text/html", "CF-Ray": "private-header-value"}
+            def preflight(read):
+                self.assertIs(read("GET", "https://provider/conversation/original"), response)
+                raise RuntimeError("stop before any model send")
+            with self.assertRaisesRegex(RuntimeError, "stop before any model send"):
+                clock.request(lambda *a, **kw: response, "POST", "https://provider/conversation",
+                              _account_request_preflight=preflight)
+            saved = AccountRequestClock("account", path).last_rate_limit_evidence
+            attempts = [c.args[0] for c in logged.call_args_list if c.args[0].get("event") == "account_http_attempt"]
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(saved["phase"], "conversation_preflight")
+            self.assertEqual(saved["response_features"], attempts[0]["response_features"])
+            self.assertEqual(saved["response_features"]["response_origin_evidence"], "edge_marker")
+            self.assertNotIn("private-header-value", json.dumps([saved, attempts, json.loads(path.read_text())]))
+
     def test_stream_lock_is_released_at_headers_not_stream_terminal(self):
         with tempfile.TemporaryDirectory() as tmp:
             clock = AccountRequestClock("account", Path(tmp) / "clock.json")
