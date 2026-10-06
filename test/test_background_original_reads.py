@@ -116,10 +116,10 @@ def test_unlocated_same_client_conversation_does_not_fill_all_workers(recovery):
 
 
 @pytest.mark.parametrize("completion_first", [False, True])
-def test_async_images_keep_one_dispatch_per_scan_and_do_not_block_text(recovery, completion_first):
+def test_blocked_image_recoveries_overlap_and_leave_capacity_for_text(recovery, completion_first):
     r = recovery
     with r.store.transaction() as db:
-        for i in range(5):
+        for i in range(2):
             rid = f"image-{i}"
             r.store.write_receipt(db, "image", "owner", rid, {
                 "id": rid, "owner_id": "owner", "status": "error", "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
@@ -127,11 +127,12 @@ def test_async_images_keep_one_dispatch_per_scan_and_do_not_block_text(recovery,
                 "request_message_id": f"message-{i}", "next_poll_at": 0})
     r.original("text")
     text_started = threading.Event()
-    image_started = threading.Event()
+    image_started = [threading.Event(), threading.Event()]
     image_calls = []
     def image(owner, rid):
         image_calls.append(rid)
-        image_started.set()  # Existing image handler returns after scheduling.
+        image_started[int(rid.rsplit("-", 1)[1])].set()
+        assert r.release.wait(3)  # The configured handler owns the actual I/O.
     if completion_first:
         with r.store.connect() as db:
             receipt = r.store.read_receipt(db, "image", "owner", "image-0")
@@ -139,8 +140,11 @@ def test_async_images_keep_one_dispatch_per_scan_and_do_not_block_text(recovery,
             dispatch("image", "owner", "image-0", image, receipt))
     r.admission.recoveries.update(image=image, text=lambda owner, rid: text_started.set())
     r.admission.recover_one(background=True)
-    assert image_started.wait(1) and text_started.wait(1)
-    assert len(image_calls) == 1
+    assert all(event.wait(1) for event in image_started) and text_started.wait(1)
+    r.admission.recover_one(background=True)
+    assert sorted(image_calls) == ["image-0", "image-1"]
+    assert all(("image", "owner", rid) in r.admission._original_reads.values()
+               for rid in ("image-0", "image-1"))
 
 
 def test_worker_bound_and_start_failure_release_permit(recovery):
@@ -364,7 +368,8 @@ def test_archive_dispatch_and_other_original_continue_during_completion_read(rec
     r.admission.recover_one(background=True)
     assert started["completion"].wait(1)
     assert started["ordinary"].wait(1)
-    r.admission.work_lifecycle.process_one.assert_called_once_with(background=True)
+    assert r.admission.work_lifecycle.process_one.call_count == 4
+    assert all(call.kwargs == {"background": True} for call in r.admission.work_lifecycle.process_one.call_args_list)
 
 
 def test_slow_read_renews_same_durable_claim_and_preserves_pause(recovery):
