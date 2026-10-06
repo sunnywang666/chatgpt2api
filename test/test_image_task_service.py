@@ -32,6 +32,22 @@ OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
 OTHER_OWNER = {"id": "owner-2", "name": "Other", "role": "user"}
 
 
+def bound_terminal_reply_document(conversation_id: str, parent_message_id: str) -> dict:
+    return {
+        "conversation_id": conversation_id,
+        "current_node": parent_message_id,
+        "mapping": {
+            parent_message_id: {"children": [], "message": {
+                "id": parent_message_id,
+                "author": {"role": "assistant"},
+                "status": "finished_successfully",
+                "end_turn": True,
+                "channel": "final",
+            }},
+        },
+    }
+
+
 def write_policy_task(path: Path, **overrides):
     task = {
         "id": "policy-task", "owner_id": "owner-1", "status": "error",
@@ -818,6 +834,9 @@ class ImageTaskServiceTests(unittest.TestCase):
             def stream_conversation(self, **_kwargs):
                 raise RuntimeError("bootstrap connection timed out")
 
+            def _get_conversation(self, conversation_id, **_kwargs):
+                return bound_terminal_reply_document(conversation_id, "parent-before-request")
+
             def get_conversation_parent_message_id(self, _conversation_id):
                 return "parent-before-request"
 
@@ -935,6 +954,9 @@ class ImageTaskServiceTests(unittest.TestCase):
             def stream_conversation(self, **_kwargs):
                 raise RuntimeError("generation POST response timed out")
 
+            def _get_conversation(self, conversation_id, **_kwargs):
+                return bound_terminal_reply_document(conversation_id, "parent-before-request")
+
             def get_conversation_parent_message_id(self, _conversation_id):
                 return "parent-before-request"
 
@@ -972,6 +994,9 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             def stream_conversation(self, **_kwargs):
                 raise ImageActiveDeadlineExceeded("active preparation deadline exhausted")
+
+            def _get_conversation(self, conversation_id, **_kwargs):
+                return bound_terminal_reply_document(conversation_id, "parent-before-request")
 
             def get_conversation_parent_message_id(self, _conversation_id):
                 return "parent-before-request"
@@ -1048,6 +1073,41 @@ class ImageTaskServiceTests(unittest.TestCase):
                 )
             self.assertEqual(resumed, task)
             thread.assert_not_called()
+
+    def test_stale_bound_parent_is_terminal_not_submitted_in_public_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+
+            def handler(_payload):
+                raise ImageGenerationError(
+                    "bound image conversation cursor changed before submission",
+                    code="CONVERSATION_BINDING_MISMATCH",
+                    provider_binding_id="cb_account_a",
+                    provider_account_identity="account_opaque_a",
+                    conversation_id="conversation-1",
+                    parent_message_id="completed-revision-reply",
+                    upstream_submitted=False,
+                )
+
+            service = self.make_service(path, handler)
+            service.submit_generation(
+                OWNER, client_task_id="stale-parent-task", prompt="cat",
+                model="gpt-image-2", size=None, provider_binding_id="cb_account_a",
+                provider_account_identity="account_opaque_a",
+                client_conversation_id="workbench-conversation-1",
+                conversation_id="conversation-1", parent_message_id="completed-revision-reply",
+                retain_conversation=True,
+            )
+            task = wait_for_task(service, OWNER, "stale-parent-task", "error")
+
+        self.assertEqual(task["error_code"], "CONVERSATION_BINDING_MISMATCH")
+        self.assertFalse(task["upstream_submission_started"])
+        self.assertFalse(task["upstream_unfinished"])
+        self.assertEqual(task["upstream_outcome"], "not_submitted")
+        self.assertEqual(task["binding_status"], "bound")
+        self.assertEqual(task["image_session_id"], "conversation-1")
+        self.assertEqual(task["image_session_parent_id"], "completed-revision-reply")
+        self.assertNotIn("recovery_retryable", task)
 
     def test_restart_does_not_infer_non_submission_for_an_alternate_image_route(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3329,6 +3389,9 @@ class ImageTaskServiceTests(unittest.TestCase):
             def get_conversation_parent_message_id(self, _conversation_id):
                 return "message-after-rejection"
 
+            def _get_conversation(self, conversation_id, **_kwargs):
+                return bound_terminal_reply_document(conversation_id, "message-before-request")
+
             def close(self):
                 return None
 
@@ -3371,6 +3434,9 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             def get_conversation_parent_message_id(self, _conversation_id):
                 return "message-after-result"
+
+            def _get_conversation(self, conversation_id, **_kwargs):
+                return bound_terminal_reply_document(conversation_id, "message-before-request")
 
             def close(self):
                 return None
