@@ -819,7 +819,10 @@ class ImageTaskService:
                     "content_policy_violation", "no_image_generated",
                 }
                 or task.get("upstream_unfinished") is not False
-                or _clean(task.get("upstream_outcome")).lower() in {"unknown", "generated"}
+                # A send initially records UNKNOWN. A later terminal policy
+                # refusal can leave that historical marker behind; only the
+                # exact fresh conversation read below may prove it ended.
+                or _clean(task.get("upstream_outcome")).lower() == "generated"
                 or _clean(task.get("binding_status")).lower() != "bound"
                 or task.get("_recovery_paused") is True
                 or task.get("_recovery_suppressed") is True

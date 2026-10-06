@@ -202,12 +202,14 @@ class ImageTaskServiceTests(unittest.TestCase):
         cases = (
             (None, {}, True),
             (None, {"error_code": "NO_IMAGE_GENERATED"}, True),
-            ("later_user", {}, False),
-            ("branch", {}, False),
+            (None, {"upstream_outcome": "unknown"}, True),
+            ("later_user", {"upstream_outcome": "unknown"}, False),
+            ("branch", {"upstream_outcome": "unknown"}, False),
             ("wrongchat", {}, False),
-            ("imageasset", {}, False),
+            ("imageasset", {"upstream_outcome": "unknown"}, False),
             ("running", {}, False),
-            (None, {"error_code": "CONVERSATION_OUTCOME_UNKNOWN", "upstream_unfinished": True}, False),
+            (None, {"upstream_outcome": "unknown", "upstream_unfinished": True}, False),
+            (None, {"error_code": "CONVERSATION_OUTCOME_UNKNOWN", "upstream_unfinished": False}, False),
             (None, {"request_message_id": ""}, False),
         )
         for change, overrides, eligible in cases:
