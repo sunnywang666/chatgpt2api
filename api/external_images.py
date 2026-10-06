@@ -111,7 +111,8 @@ async def external_image_boundary(request: Request, call_next):
         # Small controls release it after their bounded read: waiting for task
         # state must not consume the capacity needed to read another control.
         legacy_control = (not is_external(request) and bool(re.fullmatch(
-            r"/api/(?:image-tasks|conversation-bindings/text-requests)/[^/]+/recovery-control", path)))
+            r"/api/(?:image-tasks|conversation-bindings/text-requests)/[^/]+/recovery-control"
+            r"|/api/image-tasks/[^/]+/completion", path)))
         _, rejected = _ordinary_chat_identity(request, ordinary_only=not legacy_control)
         if rejected is not None:
             return rejected

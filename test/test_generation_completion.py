@@ -2,13 +2,16 @@
 import copy
 import json
 import threading
+import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from api.external_images import external_image_boundary
 from services.generation_completion import GenerationCompletionService, CompletionError
 from services.image_task_service import ImageTaskService
 from services.request_context import current_request, AdmissionLost, executing
@@ -738,11 +741,14 @@ def test_explicit_unsent_repair_rejects_missing_original_input(failed_unsent_ima
 
 def test_image_repair_api_owner_and_exact_failure_contract(failed_unsent_image, monkeypatch):
     import api.generation_completion as api
+    import api.external_images as external_images
     service = failed_unsent_image
     monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
     monkeypatch.setattr(api, "require_identity", lambda authorization, request: {**IDENTITY, "id": authorization or "other"})
+    monkeypatch.setattr(external_images, "require_identity", lambda authorization, request: {**IDENTITY, "id": authorization or "other"})
     monkeypatch.setattr(api, "require_image_policy", lambda *a, **kw: None)
     app = FastAPI()
+    app.middleware("http")(external_image_boundary)
     app.include_router(api.create_router("image"))
     client = TestClient(app)
     endpoint = "/api/image-tasks/repair-image/completion"
@@ -753,6 +759,374 @@ def test_image_repair_api_owner_and_exact_failure_contract(failed_unsent_image, 
     response = client.post(endpoint, headers={"Authorization": "owner"}, json=payload)
     assert response.status_code == 200 and response.json()["original_id"] == "repair-image"
     assert row(service, "image", "repair-image")["status"] == "queued"
+
+
+def test_admin_image_completion_only_reads_its_legacy_original(failed_unsent_image, monkeypatch):
+    import api.generation_completion as api
+    import api.external_images as external_images
+
+    service = failed_unsent_image
+    admin_identity = {"id": "admin", "role": "admin", "external_image_client": True}
+    with service.store.transaction() as db:
+        legacy = service.store.read_receipt(db, "image", "owner", "repair-image")
+        source = service.store.load_input(legacy["_input_ref"])
+        source["identity"] = admin_identity
+        legacy.update(
+            owner_id="admin",
+            _input_ref=service.store.save_input(source),
+            status="error",
+            error_code="RESULT_UNRECOVERABLE",
+            upstream_outcome="unknown",
+            upstream_unfinished=False,
+            recovery_no_result_reads=3,
+            next_poll_at=0,
+            conversation_id="legacy-conversation",
+            request_message_id="legacy-request",
+            provider_binding_id="legacy-binding",
+            provider_account_identity="legacy-account",
+            client_conversation_id="legacy-client",
+            _submission_started=True,
+            upstream_submission_started=True,
+        )
+        for key in ("_completion", "_attempt_finished_at", "_attempt_reason", "_image_thread",
+                    "_recovery_paused", "_recovery_suppressed", "recovery_claim_id"):
+            legacy.pop(key, None)
+        service.store.write_receipt(db, "image", "admin", "repair-image", legacy)
+        db.execute("DELETE FROM image_requests WHERE task_key=?", ("owner:repair-image",))
+
+    monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
+    monkeypatch.setattr(
+        api, "require_identity",
+        lambda authorization, request: admin_identity if authorization == "admin" else {**IDENTITY, "id": authorization or "other"},
+    )
+    monkeypatch.setattr(
+        external_images, "require_identity",
+        lambda authorization, request: admin_identity if authorization == "admin" else {**IDENTITY, "id": authorization or "other"},
+    )
+    monkeypatch.setattr(api, "require_image_policy", lambda *a, **kw: None)
+    original_read = Mock()
+    service.images.resume_poll = original_read
+    app = FastAPI()
+    app.middleware("http")(external_image_boundary)
+    app.include_router(api.create_router("image"))
+    app.include_router(api.create_router("text"))
+    client = TestClient(app)
+    image_endpoint = "/api/image-tasks/repair-image/completion"
+
+    public_rejected = client.post(
+        image_endpoint,
+        headers={"Authorization": "admin", "X-Workbench-Image-Client": "1"},
+        json={"action": "recover", "allow_unconfirmed_retry": False},
+    )
+    assert public_rejected.status_code == 403, public_rejected.text
+    original_read.assert_not_called()
+
+    oversized = client.post(
+        image_endpoint, headers={"Authorization": "admin"},
+        json={"action": "recover", "padding": "x" * 1024},
+    )
+    assert oversized.status_code == 413, oversized.text
+    assert oversized.json()["detail"]["code"] == "COMPLETION_BODY_TOO_LARGE"
+    original_read.assert_not_called()
+
+    response = client.post(
+        image_endpoint, headers={"Authorization": "admin"},
+        json={"action": "recover", "allow_unconfirmed_retry": False},
+    )
+    assert response.status_code == 200, response.text
+    original_read.assert_called_once_with(
+        {"id": "admin"}, "repair-image", extra_timeout_secs=5,
+        allow_unrecoverable_retry=True, completion_recheck=True,
+    )
+    with service.store.connect() as db:
+        current = service.store.read_receipt(db, "image", "admin", "repair-image")
+        assert current["recovery_no_result_reads"] == 3
+        assert current["_completion"]["max_extra_requests"] == 0
+        assert "replacement_id" not in current["_completion"]
+        assert db.execute("SELECT count(*) FROM image_requests WHERE task_key LIKE 'admin:%'").fetchone()[0] == 1
+    assert "replacement_id" not in response.json()
+    assert service.text.admission.claim_next() is None
+
+    before = copy.deepcopy(current)
+    assert client.get(image_endpoint, headers={"Authorization": "admin"}).status_code == 403
+    for body in (
+        {"action": "complete", "selected_id": "repair-image", "results_saved": True, "reviewed": True},
+        {"action": "rework", "selected_id": "repair-image"},
+        {"action": "recover", "allow_unconfirmed_retry": True},
+        {"action": "recover", "retry_not_sent_failure_at": 2900.0},
+        {"action": "recover", "reviewed": False},
+    ):
+        rejected = client.post(image_endpoint, headers={"Authorization": "admin"}, json=body)
+        assert rejected.status_code == 403, rejected.text
+        with service.store.connect() as db:
+            assert service.store.read_receipt(db, "image", "admin", "repair-image") == before
+
+    text_rejected = client.post("/api/chat-requests/old-0/completion", headers={"Authorization": "admin"},
+                                json={"action": "recover"})
+    assert text_rejected.status_code == 403
+
+
+def test_full_app_legacy_admin_original_receipt_stays_read_only_and_can_offer_terminal_cursor(
+        failed_unsent_image, monkeypatch, tmp_path):
+    import api.app as app_module
+    import api.generation_completion as api
+    import api.support as support
+    from api.company_requests import PREFIX, company_identity
+    from services.auth_service import AuthService
+    from services.storage.json_storage import JSONStorageBackend
+
+    service = failed_unsent_image
+    admin_identity = {"id": "admin", "role": "admin"}
+    auth = AuthService(JSONStorageBackend(tmp_path / "keys.json"))
+    user_key, user_secret = auth.create_key(role="user", name="ordinary")
+    monkeypatch.setattr(support, "auth_service", auth)
+    monkeypatch.setattr(
+        support, "_legacy_admin_identity",
+        lambda token: admin_identity if token == "legacy-admin" else None,
+    )
+    completion_service = Mock(return_value=service)
+    monkeypatch.setattr(api, "get_generation_completion_service", completion_service)
+    monkeypatch.setattr(api, "require_image_policy", lambda *args, **kwargs: None)
+    wake = Mock()
+    monkeypatch.setattr(service.text.admission, "wake", wake)
+    generation = Mock()
+    service.images.generation_handler = generation
+
+    def legacy_receipt(owner, request_id, *, retain=False, **changes):
+        with service.store.transaction() as db:
+            original = service.store.read_receipt(db, "image", "owner", "repair-image")
+            receipt = copy.deepcopy(original)
+            receipt.pop("_completion", None)
+            receipt.pop("_completion_of", None)
+            receipt.pop("_route", None)
+            values = {
+                "id": request_id,
+                "owner_id": owner,
+                "retain_receipt": retain,
+                "mode": "edit",
+                "model": "gpt-image-2",
+                "status": "error",
+                "error_code": "RESULT_UNRECOVERABLE",
+                "upstream_outcome": "unknown",
+                "upstream_unfinished": False,
+                "recovery_no_result_reads": 3,
+                "provider_binding_id": "binding-legacy",
+                "provider_account_identity": "account-legacy",
+                "client_conversation_id": "client-legacy",
+                "conversation_id": "conversation-legacy",
+                "request_message_id": "request-legacy",
+                "binding_status": "bound",
+            }
+            values.update(changes)
+            receipt.update(values)
+            if retain is None:
+                receipt.pop("retain_receipt", None)
+            service.store.write_receipt(db, "image", owner, request_id, receipt)
+        service.images._tasks[f"{owner}:{request_id}"] = receipt
+        return receipt
+
+    legacy_receipt("admin", "legacy-false")
+    legacy_receipt("admin", "legacy-missing", retain=None)
+    legacy_receipt(user_key["id"], "ordinary-false")
+    connector = "1f084f01-d4b2-4080-8bce-b926f31cc454"
+    company_owner = company_identity("company", "worker", connector)["id"]
+    legacy_receipt(company_owner, "company-false")
+    legacy_receipt("admin", "wrong-owner", owner_id="other")
+    legacy_receipt("admin", "wrong-model", model="gpt-image-1")
+    legacy_receipt("admin", "codex-route", _route="codex")
+    legacy_receipt("admin", "missing-binding", provider_binding_id="")
+
+    reads = []
+    def settle_original(identity, request_id, **_kwargs):
+        reads.append((identity, request_id))
+        service.images._update_task(
+            f"admin:{request_id}", status="running", error_code="RESULT_UNRECOVERABLE",
+            upstream_outcome="unknown", upstream_unfinished=True,
+        )
+    service.images.resume_poll = settle_original
+
+    app = app_module.create_app()
+    client = TestClient(app)
+    endpoint = "/api/image-tasks/legacy-false/completion"
+    admin_headers = {"Authorization": "Bearer legacy-admin"}
+    with service.store.connect() as db:
+        service._root(db, "image", "admin", "legacy-false", read_only_original=True)
+    response = client.post(endpoint, headers=admin_headers, json={"action": "recover", "allow_unconfirmed_retry": False})
+    assert completion_service.called
+    assert response.status_code == 200, response.text
+    assert reads == [({"id": "admin"}, "legacy-false")]
+    assert response.json()["state"] == "checking_original"
+    assert generation.call_count == 0 and wake.call_count == 0
+    service.images._update_task(
+        "admin:legacy-false", status="error", error_code="NO_IMAGE_GENERATED", upstream_outcome="failed",
+        upstream_unfinished=False, _completion_read_at=service.clock(),
+    )
+    with service.store.transaction() as db:
+        current = service.store.read_receipt(db, "image", "admin", "legacy-false")
+        current["_completion"]["next_at"] = 0
+        service.store.write_receipt(db, "image", "admin", "legacy-false", current)
+    service.images._tasks["admin:legacy-false"] = current
+    service.images.resume_poll = Mock(side_effect=AssertionError("terminal original must not be reread"))
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted.advance("image", "admin", "legacy-false")
+    with service.store.connect() as db:
+        current = service.store.read_receipt(db, "image", "admin", "legacy-false")
+    assert current["retain_receipt"] is False
+    assert current["error_code"] == "NO_IMAGE_GENERATED"
+    assert current["_completion"].get("state") == "needs_attention"
+    assert current["_completion"].get("reason") == "COMPLETION_ORIGINAL_ONLY"
+    assert current["_completion"].get("next_at") is None
+    assert current["_completion"].get("read_only_original") is True
+    assert current["_completion"].get("max_extra_requests") == 0
+    assert current["_completion"].get("allow_unconfirmed_retry") is False
+    assert not current["_completion"].get("replacement_id")
+    assert not current["_completion"].get("prepared_input")
+    assert generation.call_count == 0 and wake.call_count == 0
+    assert service.text.admission.claim_next() is None
+
+    assert restarted.read("image", admin_identity, "legacy-false")["reason"] == "COMPLETION_ORIGINAL_ONLY"
+    before_upgrade = copy.deepcopy(current["_completion"])
+    with pytest.raises(CompletionError, match="COMPLETION_POLICY_CONFLICT"):
+        restarted.start("image", admin_identity, "legacy-false", allow_unconfirmed_retry=True)
+    with service.store.connect() as db:
+        assert service.store.read_receipt(db, "image", "admin", "legacy-false")["_completion"] == before_upgrade
+    assert generation.call_count == 0 and wake.call_count == 0
+    assert service.text.admission.claim_next() is None
+
+    service.images._update_task("admin:legacy-false", _claim_id="read-lease", _claim_until=time.time() + 30)
+
+    class TerminalCursorBackend:
+        def __init__(self, **_kwargs):
+            pass
+
+        @staticmethod
+        def _has_image_asset_pointer(_payload):
+            return False
+
+        def _get_conversation(self, _conversation_id):
+            return {
+                "conversation_id": "conversation-legacy", "is_archived": False, "current_node": "terminal",
+                "mapping": {
+                    "request-legacy": {"parent": "anchor", "message": {
+                        "id": "request-legacy", "author": {"role": "user"},
+                    }},
+                    "terminal": {"parent": "request-legacy", "message": {
+                        "id": "terminal", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True,
+                    }},
+                },
+            }
+
+        def close(self):
+            pass
+
+    with (
+        patch("services.account_service.account_service.get_bound_account_identity", return_value="account-legacy"),
+        patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+        patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+        patch("services.openai_backend_api.OpenAIBackendAPI", TerminalCursorBackend),
+    ):
+        assert service.images.failure_continuation(admin_identity, "legacy-false") is None
+        service.images._update_task("admin:legacy-false", _claim_until=time.time() - 1)
+        assert service.images.failure_continuation(admin_identity, "legacy-false") == {
+            "source_task_id": "legacy-false", "source_request_message_id": "request-legacy",
+            "provider_binding_id": "binding-legacy", "provider_account_identity": "account-legacy",
+            "client_conversation_id": "client-legacy", "conversation_id": "conversation-legacy",
+            "parent_message_id": "terminal",
+        }
+    assert generation.call_count == 0 and wake.call_count == 0
+
+    legacy_receipt(
+        "admin", "legacy-success", status="success", error_code="", upstream_outcome="completed",
+        data=[{"b64_json": "c2F2ZWQ="}],
+    )
+    with service.store.transaction() as db:
+        succeeded = service.store.read_receipt(db, "image", "admin", "legacy-success")
+        succeeded["_completion"] = {
+            "state": "checking_original", "next_at": 0,
+            "read_only_original": True, "max_extra_requests": 0, "allow_unconfirmed_retry": False,
+        }
+        service.store.write_receipt(db, "image", "admin", "legacy-success", succeeded)
+    restarted.advance("image", "admin", "legacy-success")
+    selected = restarted.read("image", admin_identity, "legacy-success")
+    assert selected["state"] == "result_ready"
+    assert selected["selected_id"] == "legacy-success"
+    assert selected["result"] == {"id": "legacy-success", "status": "success", "image_count": 1}
+    after_success_restart = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    assert after_success_restart.read("image", admin_identity, "legacy-success")["selected_id"] == "legacy-success"
+    assert generation.call_count == 0 and wake.call_count == 0
+    assert service.text.admission.claim_next() is None
+
+    service.images.resume_poll = settle_original
+    missing = client.post(
+        "/api/image-tasks/legacy-missing/completion", headers=admin_headers,
+        json={"action": "recover", "allow_unconfirmed_retry": False},
+    )
+    assert missing.status_code == 200, missing.text
+    public = client.post(endpoint, headers={**admin_headers, "X-Workbench-Image-Client": "1"}, json={"action": "recover"})
+    assert public.status_code == 403
+    oversized = client.post(endpoint, headers=admin_headers, json={"action": "recover", "padding": "x" * 1024})
+    assert oversized.status_code == 413
+    for body in (
+        {"action": "recover", "allow_unconfirmed_retry": True},
+        {"action": "complete", "selected_id": "legacy-false", "results_saved": True, "reviewed": True},
+        {"action": "rework", "selected_id": "legacy-false"},
+    ):
+        assert client.post(endpoint, headers=admin_headers, json=body).status_code == 403
+    assert client.post(
+        "/api/image-tasks/ordinary-false/completion", headers={"Authorization": "Bearer " + user_secret}, json={"action": "recover"},
+    ).status_code == 409
+    company_headers = {
+        "Authorization": "Bearer legacy-admin", "X-Workbench-Company-Org": "company",
+        "X-Workbench-Company-User": "worker", "X-Workbench-Company-Connector": connector,
+        "X-Workbench-Expected-User": "worker",
+    }
+    assert client.post(PREFIX + "/api/image-tasks/company-false/completion", headers=company_headers,
+                       json={"action": "recover"}).status_code == 409
+    for request_id in ("wrong-owner", "wrong-model", "codex-route", "missing-binding"):
+        assert client.post(f"/api/image-tasks/{request_id}/completion", headers=admin_headers,
+                           json={"action": "recover"}).status_code == 409
+
+
+def test_admin_image_completion_does_not_queue_a_proven_not_sent_original(failed_unsent_image, monkeypatch):
+    import api.generation_completion as api
+
+    service = failed_unsent_image
+    admin_identity = {"id": "admin", "role": "admin", "external_image_client": True}
+    with service.store.transaction() as db:
+        receipt = service.store.read_receipt(db, "image", "owner", "repair-image")
+        source = service.store.load_input(receipt["_input_ref"])
+        source["identity"] = admin_identity
+        receipt.update(owner_id="admin", _input_ref=service.store.save_input(source))
+        receipt.pop("_completion", None)
+        service.store.write_receipt(db, "image", "admin", "repair-image", receipt)
+        db.execute("DELETE FROM image_requests WHERE task_key=?", ("owner:repair-image",))
+
+    monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
+    monkeypatch.setattr(api, "require_identity", lambda _authorization, request: admin_identity)
+    monkeypatch.setattr(api, "require_image_policy", lambda *a, **kw: None)
+    wake = Mock()
+    monkeypatch.setattr(service.text.admission, "wake", wake)
+    original_read = Mock()
+    service.images.resume_poll = original_read
+    app = FastAPI()
+    app.include_router(api.create_router("image"))
+    client = TestClient(app)
+
+    response = client.post("/api/image-tasks/repair-image/completion", headers={"Authorization": "admin"},
+                           json={"action": "recover", "allow_unconfirmed_retry": False})
+    assert response.status_code == 200, response.text
+    original_read.assert_not_called()
+    wake.assert_not_called()
+    with service.store.connect() as db:
+        current = service.store.read_receipt(db, "image", "admin", "repair-image")
+        assert current["status"] == "error"
+        assert current["upstream_outcome"] == "not_submitted"
+        assert current["_completion"]["reason"] == "COMPLETION_ORIGINAL_ONLY"
+        assert current["_completion"]["max_extra_requests"] == 0
+        assert "replacement_id" not in current["_completion"]
+        assert db.execute("SELECT count(*) FROM image_requests WHERE task_key LIKE 'admin:%'").fetchone()[0] == 1
+    assert service.text.admission.claim_next() is None
 
 
 def test_api_owner_isolation_and_explicit_saved_reviewed_ack(setup, monkeypatch):

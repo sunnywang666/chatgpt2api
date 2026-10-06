@@ -19,6 +19,48 @@ class CompletionError(WorkLifecycleError):
     pass
 
 
+def read_only_original_state(state):
+    """The common no-successor boundary for a legacy original receipt."""
+    return bool(
+        isinstance(state, dict)
+        and state.get("read_only_original") is True
+        and state.get("max_extra_requests") == 0
+        and state.get("allow_unconfirmed_retry") is False
+        and not state.get("replacement_id")
+        and not state.get("prepared_input")
+    )
+
+
+def read_only_original_completion(state):
+    """The closed no-result boundary accepted by failure continuation."""
+    return bool(
+        read_only_original_state(state)
+        and not state.get("selected_id")
+        and state.get("state") == "needs_attention"
+        and state.get("reason") == "COMPLETION_ORIGINAL_ONLY"
+        and state.get("next_at") is None
+    )
+
+
+def read_only_original_recovery(state):
+    """Persisted no-successor state that may finish an authenticated read."""
+    return bool(
+        read_only_original_state(state)
+        and not state.get("selected_id")
+        and state.get("state") in {"checking_original", "needs_attention"}
+    )
+
+
+def read_only_original_selected(state, request_id):
+    """Allow only the legacy original itself to remain readable after success."""
+    return bool(
+        read_only_original_state(state)
+        and state.get("selected_id") == request_id
+        and state.get("state") == "result_ready"
+        and state.get("next_at") is None
+    )
+
+
 def successful(kind, receipt):
     return bool(receipt and receipt.get("status") == ("succeeded" if kind == "text" else "success")
                 and (receipt.get("content") if kind == "text" else receipt.get("data")))
@@ -233,7 +275,7 @@ class GenerationCompletionService:
         self.text, self.images, self.lifecycle = text_service, image_service, lifecycle
         self.store, self.clock = text_service.store, clock
 
-    def _root(self, db, kind, owner, request_id):
+    def _root(self, db, kind, owner, request_id, *, read_only_original=False):
         row = self.store.read_receipt(db, kind, owner, request_id)
         if not row:
             raise CompletionError("COMPLETION_REQUEST_NOT_FOUND", 404)
@@ -245,20 +287,43 @@ class GenerationCompletionService:
         else:
             pure = (row.get("retain_receipt") and row.get("model") == "gpt-image-2"
                     and row.get("mode") in {"generate", "edit"} and row.get("_route", "chat") != "codex")
+            legacy_admin_original = (
+                owner == "admin"
+                and row.get("owner_id") == owner
+                and row.get("id") == request_id
+                and row.get("retain_receipt") is not True
+                and row.get("model") == "gpt-image-2"
+                and row.get("mode") in {"generate", "edit"}
+                and row.get("_route", "chat") != "codex"
+                and all(row.get(field) for field in (
+                    "request_message_id", "conversation_id", "provider_binding_id",
+                    "provider_account_identity", "client_conversation_id",
+                ))
+            )
+            pure = pure or legacy_admin_original and (
+                (read_only_original and row.get("status") == "error"
+                 and row.get("error_code") == "RESULT_UNRECOVERABLE")
+                or read_only_original_recovery(row.get("_completion"))
+                or (read_only_original_selected(row.get("_completion"), request_id)
+                    and successful(kind, row))
+            )
         if not pure:
             raise CompletionError("COMPLETION_PURE_GENERATION_REQUIRED")
         return row
 
     def start(self, kind, identity, request_id, *, allow_unconfirmed_retry=False,
-              retry_not_sent_failure_at=None, original_only=False):
+              retry_not_sent_failure_at=None, original_only=False, read_only_original=False):
         owner, now = str(identity["id"]), float(self.clock())
         if getattr(self.text, "admission", None) is None:
             raise CompletionError("COMPLETION_SCHEDULER_REQUIRED", 503)
         with self.store.transaction() as db:
-            root = self._root(db, kind, owner, request_id)
+            root = self._root(db, kind, owner, request_id, read_only_original=read_only_original)
             state = root.get("_completion")
-            if original_only and (kind != "image" or allow_unconfirmed_retry
-                                  or state and state.get("replacement_id")):
+            if ((read_only_original and (not original_only or retry_not_sent_failure_at is not None)) or (
+                    original_only and (kind != "image" or allow_unconfirmed_retry
+                                      or state and state.get("replacement_id")))):
+                raise CompletionError("COMPLETION_POLICY_CONFLICT")
+            if state and read_only_original_state(state) and allow_unconfirmed_retry:
                 raise CompletionError("COMPLETION_POLICY_CONFLICT")
             if state and state["allow_unconfirmed_retry"] != allow_unconfirmed_retry:
                 if allow_unconfirmed_retry and not state.get("replacement_id") and not state.get("selected_id"):
@@ -272,6 +337,7 @@ class GenerationCompletionService:
                     "allow_unconfirmed_retry": allow_unconfirmed_retry,
                     "max_extra_requests": 1, "next_at": now,
                 }
+                state = root["_completion"]
                 self.store.write_receipt(db, kind, owner, request_id, root)
             elif kind == "image" and allow_unconfirmed_retry and ended_image_edit_recheck(root):
                 # An explicit recover may gather fresh evidence after a repair.
@@ -284,6 +350,8 @@ class GenerationCompletionService:
                 # Persist the existing request budget so background/restart
                 # recovery observes the same boundary as this HTTP call.
                 root["_completion"]["max_extra_requests"] = 0
+                if read_only_original:
+                    root["_completion"]["read_only_original"] = True
                 self.store.write_receipt(db, kind, owner, request_id, root)
             if retry_not_sent_failure_at is not None:
                 state = root["_completion"]
@@ -316,7 +384,8 @@ class GenerationCompletionService:
                     state["retried_not_sent_failure_at"] = stamp
                     self.store.write_receipt(db, kind, owner, request_id, root)
         self.advance(kind, owner, request_id)
-        self.text.admission.wake()
+        if not read_only_original:
+            self.text.admission.wake()
         return self.read(kind, identity, request_id)
 
     def _queue_not_sent(self, root, state, now, kind):
@@ -514,6 +583,8 @@ class GenerationCompletionService:
                                 and root.get("_submission_started") is not True
                                 and root.get("upstream_submission_started") is not True)
                     if not_sent:
+                        if state.get("read_only_original") is True:
+                            raise CompletionError("COMPLETION_ORIGINAL_ONLY")
                         if (state.get("same_request_retry") or not (root.get("error_code") in {
                                 "TEXT_TASK_CAPACITY_EXCEEDED", "IMAGE_GENERATION_NOT_SUBMITTED",
                                 "CONVERSATION_BINDING_UNAVAILABLE", "CHAT_ARCHIVE_RESTORE_UNCONFIRMED"}

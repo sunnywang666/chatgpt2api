@@ -382,9 +382,28 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
+    def _metadata_request_options(self, *, capacity=False) -> dict:
+        options = {"timeout": 20}
+        deadline = getattr(self, "metadata_deadline", None)
+        if deadline is not None:
+            options["_account_request_deadline_monotonic"] = deadline
+        local_wait = getattr(self, "metadata_local_wait", None)
+        if callable(local_wait):
+            options["_account_request_local_wait"] = local_wait
+        guard = getattr(self, "metadata_before_send", None)
+        if capacity or callable(guard):
+            def before_read():
+                if callable(guard):
+                    guard()
+                if capacity:
+                    from datetime import datetime, timezone
+                    self._capacity_observed_at = datetime.now(timezone.utc).isoformat()
+            options["_account_request_before_send"] = before_read
+        return options
+
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = self.session.get(self.base_url + path, headers=self._headers(path), **self._metadata_request_options())
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
@@ -400,7 +419,7 @@ class OpenAIBackendAPI:
                 "conversation_id": None,
                 "timezone_offset_min": -480,
             },
-            timeout=20,
+            **self._metadata_request_options(capacity=True),
         )
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -409,7 +428,7 @@ class OpenAIBackendAPI:
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
         response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
+                                    **self._metadata_request_options())
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
@@ -459,6 +478,8 @@ class OpenAIBackendAPI:
             "restore_at": restore_at,
             "status": "限流" if quota == 0 else "正常",
         }
+        if getattr(self, "_capacity_observed_at", None):
+            result["capacity_observed_at"] = self._capacity_observed_at
         account_id = self._validated_account_id(default_account.get("account_id"))
         if account_id:
             result["account_id"] = account_id
@@ -3265,15 +3286,22 @@ class OpenAIBackendAPI:
             conversation_id=conversation_id,
             parent_message_id=parent_message_id,
         )
+        # curl_cffi's json= path serializes non-ASCII text with its default
+        # ASCII escapes. Keep the constructed payload object intact, but give
+        # this one final conversation transport a compact UTF-8 JSON string.
+        # The explicit model side-channel is consumed by account pacing only;
+        # it never reaches curl as a transport option.
+        transport_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         # The paced transport checks after any cooldown, before marking a send.
         pre_send_check = getattr(self, "text_pre_send_check", None)
         request_deadline = time.monotonic() + TEXT_STREAM_HARD_CAP_SECS
         response = self.session.post(
             self.base_url + path,
             headers=self._conversation_headers(path, requirements),
-            json=payload,
+            data=transport_body,
             timeout=300,
             stream=True,
+            _account_request_model=model,
             _account_request_deadline_monotonic=request_deadline,
             **({"_account_request_preflight": pre_send_check} if pre_send_check is not None else {}),
         )

@@ -1434,6 +1434,51 @@ class ConversationBindingService:
         }
 
     @staticmethod
+    def _completed_image_tool_parent(mapping, node_id):
+        """Recognize the complete user -> image call -> completed image branch.
+
+        A generic tool response or a null end_turn is never terminal evidence.
+        Match both declared and reverse edges, including the tool recipient.
+        """
+        def message_at(key):
+            node = mapping.get(key)
+            message = node.get("message") if isinstance(node, dict) else None
+            return message if (isinstance(message, dict) and message.get("id") == key
+                and isinstance(message.get("author"), dict)
+                and message.get("status") == "finished_successfully") else None
+
+        def only_child(parent_id, child_id):
+            return (mapping[parent_id].get("children") == [child_id]
+                and [key for key, node in mapping.items() if node.get("parent") == parent_id] == [child_id])
+
+        tool = message_at(node_id)
+        if (not tool or tool["author"].get("role") != "tool" or tool.get("recipient") != "all"
+                or mapping[node_id].get("children") != []
+                or tool.get("end_turn") is not None and tool.get("end_turn") is not True):
+            return False
+        content = tool.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(content, dict) or content.get("content_type") != "multimodal_text" or not isinstance(parts, list):
+            return False
+        pointers = [part for part in parts if isinstance(part, dict)]
+        if (not pointers or any(not isinstance(part, (str, dict)) for part in parts)
+                or any(part.get("content_type") != "image_asset_pointer"
+                    or not is_recovery_image_pointer(part.get("asset_pointer")) for part in pointers)):
+            return False
+        call_id = mapping[node_id].get("parent")
+        call = message_at(call_id) if isinstance(call_id, str) else None
+        if (not call or call_id == node_id or call["author"].get("role") != "assistant"
+                or call.get("end_turn") is not False or not isinstance(call.get("content"), dict)
+                or call["content"].get("content_type") != "code"
+                or not isinstance(tool["author"].get("name"), str) or not tool["author"]["name"].strip()
+                or call.get("recipient") != tool["author"]["name"] or not only_child(call_id, node_id)):
+            return False
+        user_id = mapping[call_id].get("parent")
+        user = message_at(user_id) if isinstance(user_id, str) else None
+        return bool(user and user_id not in {node_id, call_id}
+            and user["author"].get("role") == "user" and only_child(user_id, call_id))
+
+    @staticmethod
     def _check_superseded_original(document, conversation_id, parent_message_id, original_user):
         def reject(code):
             raise ConversationBindingError("original request cannot be superseded before send", code=code)
@@ -1451,9 +1496,10 @@ class ConversationBindingService:
         message = parent.get("message") or {}
         if (not isinstance(message, dict) or not isinstance(message.get("author"), dict)):
             reject("CHAT_SUPERSEDE_READ_UNAVAILABLE")
-        if (document.get("current_node") != parent_message_id or not isinstance(message, dict)
-                or message.get("id") != parent_message_id or (message.get("author") or {}).get("role") != "assistant"
-                or message.get("status") != "finished_successfully" or message.get("end_turn") is not True
+        terminal = ((message.get("author") or {}).get("role") == "assistant"
+            and message.get("status") == "finished_successfully" and message.get("end_turn") is True)
+        if (document.get("current_node") != parent_message_id or message.get("id") != parent_message_id
+                or not (terminal or ConversationBindingService._completed_image_tool_parent(mapping, parent_message_id))
                 or parent.get("children") or any(node.get("parent") == parent_message_id for node in mapping.values())):
             reject("CHAT_SUPERSEDE_CURSOR_CHANGED")
 

@@ -217,10 +217,11 @@ def test_newer_zero_observation_survives_older_positive_completing_first(tmp_pat
         if times[current_thread().name] == NOW.isoformat():
             first_started.set()
             assert second_started.wait(5)
-            return {**snapshot(1), "status": "正常", "account_id": account_id, "user_id": "fixture-user"}
+            # The capacity response carries its actual send observation time.
+            return {**snapshot(1, times[current_thread().name]), "status": "正常", "account_id": account_id, "user_id": "fixture-user"}
         second_started.set()
         assert first_saved.wait(5)
-        return {**snapshot(0), "status": "限流", "account_id": account_id, "user_id": "fixture-user"}
+        return {**snapshot(0, times[current_thread().name]), "status": "限流", "account_id": account_id, "user_id": "fixture-user"}
     backend = Mock()
     backend.return_value.get_user_info.side_effect = read
     backend._validated_account_id.side_effect = lambda value: value

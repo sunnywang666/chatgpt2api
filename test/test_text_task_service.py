@@ -139,6 +139,74 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(len(self.queue.calls), 0)
         self.assertEqual(restarted.read("other-owner", "attempt-1")["status"], "not_found")
 
+    def test_owner_get_projects_only_terminal_pre_send_binding_mismatch_as_not_submitted(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+
+        service = TextTaskService(self.path, executor=self.queue)
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1",
+            status="failed",
+            error_code="CONVERSATION_BINDING_MISMATCH",
+            provider_binding_id="binding-a",
+            provider_account_identity="account-a",
+            conversation_id="chat-a",
+            parent_message_id="parent-a",
+            _submission_started=False,
+            _executing=False,
+        )
+        app = FastAPI()
+        app.include_router(create_router())
+        with (
+            mock.patch("api.ai.text_task_service", service),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
+            TestClient(app) as client,
+        ):
+            owner = client.get("/api/conversation-bindings/text-requests/attempt-1", headers={"Authorization": "owner"})
+            other = client.get("/api/conversation-bindings/text-requests/attempt-1", headers={"Authorization": "other"})
+
+        self.assertEqual(owner.status_code, 200, owner.text)
+        self.assertEqual(owner.json()["upstream_submission_started"], False)
+        self.assertEqual(owner.json()["provider_binding_id"], "binding-a")
+        self.assertEqual(owner.json()["provider_account_identity"], "account-a")
+        self.assertEqual(owner.json()["conversation_id"], "chat-a")
+        self.assertEqual(owner.json()["parent_message_id"], "parent-a")
+        self.assertEqual(other.status_code, 200, other.text)
+        self.assertEqual(other.json(), {"request_id": "attempt-1", "status": "not_found"})
+
+    def test_public_not_submitted_projection_rejects_inflight_sent_unknown_and_unproven_receipts(self):
+        base = {
+            "request_id": "attempt-1",
+            "client_conversation_id": "product-gallery",
+            "provider_binding_id": "binding-a",
+            "provider_account_identity": "account-a",
+            "conversation_id": "chat-a",
+            "parent_message_id": "parent-a",
+            "status": "failed",
+            "error_code": "CONVERSATION_BINDING_MISMATCH",
+            "_submission_started": False,
+            "_executing": False,
+        }
+        self.assertIs(TextTaskService._public(base)["upstream_submission_started"], False)
+        for change in (
+            {"_submission_started": True},
+            {"_executing": True},
+            {"_last_sent_sequence": 0},
+            {"status": "queued"},
+            {"status": "running"},
+            {"status": "unknown"},
+            {"error_code": "CONVERSATION_OUTCOME_UNKNOWN"},
+            {"_submission_started": None},
+            {"provider_account_identity": ""},
+            {"status": "running", "upstream_submission_started": False},
+            {"_submission_started": True, "upstream_submission_started": False},
+        ):
+            with self.subTest(change=change):
+                receipt = TextTaskService._public({**base, **change})
+                self.assertNotIn("upstream_submission_started", receipt)
+
     def test_original_http_failure_diagnostic_is_bounded_and_survives_id_read(self):
         from contextlib import nullcontext
         from services.conversation_binding_service import ConversationBindingService
@@ -402,7 +470,8 @@ class TextTaskTests(unittest.TestCase):
                 self.assertEqual(backend.session.get.call_count, 1)
                 self.assertEqual(backend.session.post.call_count, failed_at)
                 if stage == "conversation":
-                    self.assertEqual(backend.session.post.call_args.kwargs["json"]["thinking_effort"], "extended")
+                    payload = json.loads(backend.session.post.call_args.kwargs["data"])
+                    self.assertEqual(payload["thinking_effort"], "extended")
 
                 restarted = TextTaskService(self.path, executor=self.queue,
                                             recovery_reader=lambda _receipt: {"status": "running"})

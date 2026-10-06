@@ -216,6 +216,9 @@ class ExecutionContext:
     def before_send(self):
         self.admission.before_send(self)
 
+    def image_capability_refresh(self):
+        return self.admission.image_capability_refresh(self)
+
     def release_turn(self):
         if int(self.receipt().get("_expected_sends") or 1) > 1:
             return  # Bounded legacy multi-image request runs its slots serially.
@@ -1343,6 +1346,60 @@ class PoolAdmission:
             r.update(changes)
             self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
         self.wake()
+
+    def image_capability_refresh(self, context):
+        """Return one exact-account metadata read, never while send locks are held."""
+        refresh = getattr(self.accounts, "refresh_image_capability", None)
+        if not callable(refresh):
+            return None
+        with self.store.connect() as db:
+            receipt = self.store.read_receipt(db, context.kind, context.owner, context.request_id) or {}
+        if (receipt.get("_route") == "codex" or receipt.get("_submission_started")
+                or not (context.kind == "image" or receipt.get("_operation") == "image")
+                or receipt.get("_claim_id") != context.claim or receipt.get("status") != "running"
+                or float(receipt.get("_claim_until") or 0) <= float(self.clock())):
+            return None
+        from services.owned_accounts import observed_capacity
+        with self._account_guard():
+            matches = [a for a in self._rows() if a.get("provider_account_identity") == receipt.get("provider_account_identity")]
+            if len(matches) != 1:
+                return None
+            account = matches[0]
+            capacity = observed_capacity(account)
+            if (account.get("managed_disabled") or account.get("status") in {"禁用", "异常", "限流"}
+                    or capacity["state"] != "stale" or not capacity["remaining"]
+                    or account.get("source_type") not in {None, "web", "oauth_login", "password"}):
+                return None
+            account_ref = self.accounts.pool_account_ref(account)
+        identity, binding = receipt.get("provider_account_identity"), receipt.get("provider_binding_id")
+
+        def still_original():
+            with self.store.connect() as db:
+                current = self.store.read_receipt(db, context.kind, context.owner, context.request_id) or {}
+                from services.generation_completion import replacement_send_allowed
+                allowed = replacement_send_allowed(self.store, db, context.kind, context.owner, context.request_id, current)
+                work = self.store.runtime(db, current.get("_work_key", ""), {})
+                if work and (work.get("state", "active") != "active" or not work.get("slot_held")):
+                    raise AdmissionLost("WORK_NOT_ACTIVE")
+                if current.get("_completion_of"):
+                    original = self.store.read_receipt(db, context.kind, context.owner, current["_completion_of"]) or {}
+                    original_work = self.store.runtime(db, original.get("_work_key", ""), {})
+                    if original_work and original_work.get("state") != "active":
+                        raise AdmissionLost("WORK_NOT_ACTIVE")
+            if (current.get("_claim_id") != context.claim or current.get("status") != "running"
+                    or float(current.get("_claim_until") or 0) <= float(self.clock())
+                    or current.get("_submission_started") or not allowed
+                    or current.get("provider_account_identity") != identity or current.get("provider_binding_id") != binding):
+                raise AdmissionLost("original task changed during capability read")
+            if binding and self.accounts.get_bound_account_identity(binding) != identity:
+                raise AdmissionLost("original image binding changed before send")
+
+        def run(deadline, *, local_wait=None):
+            still_original()
+            refresh(account_ref, deadline=deadline, before_read=still_original,
+                    **({"local_wait": local_wait} if callable(local_wait) else {}))
+            still_original()
+        return run
 
     def before_send(self, context):
         while True:

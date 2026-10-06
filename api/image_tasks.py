@@ -132,16 +132,47 @@ def create_router() -> APIRouter:
     async def list_image_tasks(
         request: Request,
         ids: str = Query(default=""),
+        include_failure_continuation: bool = Query(default=False),
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization, request=request)
         task_ids = _parse_task_ids(ids)
+        if include_failure_continuation and len(task_ids) != 1:
+            raise HTTPException(400, detail={"code": "EXACTLY_ONE_IMAGE_TASK_ID_REQUIRED"})
         if getattr(request.state, "company_identity", None) and not task_ids:
             raise HTTPException(400, detail={"code": "ORIGINAL_TASK_IDS_REQUIRED"})
         result = await run_in_threadpool(image_task_service.list_tasks, identity, task_ids)
         if getattr(request.state, "company_identity", None) and result.get("missing_ids"):
             raise HTTPException(404, detail={"code": "IMAGE_TASK_NOT_FOUND"})
-        return {**result, "items": [client_task(item, request) for item in result["items"]]}
+        response = {**result, "items": [client_task(item, request) for item in result["items"]]}
+        if include_failure_continuation and not result.get("missing_ids"):
+            try:
+                continuation = await run_in_threadpool(
+                    image_task_service.failure_continuation, identity, task_ids[0]
+                )
+            except ImageThreadError as exc:
+                if exc.code == "RECOVERY_RATE_LIMITED":
+                    retry_after = getattr(exc, "retry_after", None)
+                    raise HTTPException(
+                        429,
+                        detail={
+                            "code": exc.code,
+                            "rate_limit": {
+                                "layer": "chatgpt_upstream",
+                                "phase": "failure_continuation_read",
+                                "retry_after_seconds": retry_after,
+                            },
+                        },
+                        headers={"Retry-After": str(retry_after)} if retry_after is not None else None,
+                    ) from None
+                raise HTTPException(exc.status, detail={"code": exc.code}) from None
+            if continuation is not None:
+                # Keep the proof attached to its sole requested receipt.  The
+                # response remains the established task-list shape and the
+                # old image_session_parent_id remains the stored receipt's
+                # parent rather than this fresh continuation parent.
+                response["items"][0]["failure_continuation"] = continuation
+        return response
 
     @router.post("/api/image-tasks/generations")
     async def create_generation_task(

@@ -102,6 +102,7 @@ class ConversationBindingTextRequest(BaseModel):
     client_conversation_id: str
     client_request_id: str | None = Field(default=None, min_length=1, max_length=200)
     supersedes_request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    derived_input: dict[str, object] | None = Field(default=None, exclude_if=lambda value: value is None)
     conversation_id: str | None = None
     parent_message_id: str | None = None
 
@@ -109,9 +110,11 @@ class ConversationBindingTextRequest(BaseModel):
     @model_validator(mode="after")
     def original_or_successor(self):
         if self.supersedes_request_id is None:
+            if self.derived_input is not None:
+                raise ValueError("derived input requires an original request")
             if self.messages is None:
                 raise ValueError("messages are required")
-        elif self.model_fields_set != TextTaskService.SUPERSEDE_FIELDS:
+        elif self.model_fields_set != (TextTaskService.SUPERSEDE_FIELDS | ({"derived_input"} if self.derived_input is not None else set())):
             raise ValueError("explicit successor requires only original binding and request identities")
         return self
 
@@ -417,6 +420,19 @@ def create_router() -> APIRouter:
             request_id,
             body.allow_unrecoverable_retry,
         )
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/resume-unsent-successor")
+    async def resume_unsent_bound_successor(request_id: str, body: ConversationBindingTextRequest,
+                                            authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        if identity.get("role") != "admin":
+            raise HTTPException(501, detail={"code": "SERVICE_OPERATION_UNAVAILABLE"})
+        require_chat_text_policy(identity)
+        try:
+            return await run_in_threadpool(text_task_service.resume_unsent_successor,
+                str(identity.get("id") or "anonymous"), request_id, body.model_dump(mode="python", exclude_unset=True))
+        except ConversationBindingError as exc:
+            raise HTTPException(409, detail={"code": exc.code, "error": str(exc)}) from exc
 
     @router.post("/api/conversation-bindings/text")
     async def continue_bound_text(
