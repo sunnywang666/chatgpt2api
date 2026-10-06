@@ -647,6 +647,7 @@ class ImageTaskService:
                 return
             with self.store.transaction() as db:
                 self._transaction_local.db = db
+                self._transaction_local.task_key = task_key
                 try:
                     if task_key is None:
                         self._tasks = {key: json.loads(raw) for key, raw in db.execute("SELECT task_key,receipt FROM image_requests")}
@@ -661,6 +662,7 @@ class ImageTaskService:
                     yield db
                 finally:
                     self._transaction_local.db = None
+                    self._transaction_local.task_key = None
 
     def resource_occupancy(self) -> dict:
         """Internal aggregate only: keep unfinished original receipts after restart."""
@@ -1097,7 +1099,7 @@ class ImageTaskService:
                 with self._slot_condition:
                     self._slot_condition.wait(timeout=0.1)
         started = time.time()
-        with self._transaction():
+        with self._transaction(task_key=key):
             current = self._tasks.get(key) or {}
             active_started_at = current.get("active_attempt_started_at")
             active_deadline_at = current.get("active_attempt_deadline_at")
@@ -1115,7 +1117,7 @@ class ImageTaskService:
         if submission_boundary_covered:
             self._update_task(key, upstream_submission_started=False)
         self._update_task(key, status=TASK_STATUS_RUNNING, error="")
-        with self._transaction():
+        with self._transaction(task_key=key):
             task = self._tasks.get(key) or {}
             request_message_id = _clean(task.get("request_message_id"))
         if not request_message_id:
@@ -1150,7 +1152,7 @@ class ImageTaskService:
 
         def start_active_attempt() -> float:
             nonlocal active_started_at, active_deadline_at
-            with self._transaction():
+            with self._transaction(task_key=key):
                 current = self._tasks.get(key) or {}
                 saved_start = current.get("active_attempt_started_at")
                 saved_deadline = current.get("active_attempt_deadline_at")
@@ -1183,7 +1185,7 @@ class ImageTaskService:
             nonlocal active_deadline_at
             if seconds <= 0 or active_deadline_at is None:
                 return
-            with self._transaction():
+            with self._transaction(task_key=key):
                 current = self._tasks.get(key) or {}
                 deadline = current.get("active_attempt_deadline_at")
                 if not isinstance(deadline, (int, float)) or deadline <= 0:
@@ -1329,7 +1331,7 @@ class ImageTaskService:
             if failure_phase == "handler_operation":
                 failure_phase = handler_failure_phase
             error_message = str(exc) or "image task failed"
-            with self._transaction():
+            with self._transaction(task_key=key):
                 current = dict(self._tasks.get(key) or {})
             admission_rejection = (exc if isinstance(exc, AdmissionLost)
                                    else exc.__cause__ if getattr(exc, "code", None) == "IMAGE_GENERATION_NOT_SUBMITTED"
@@ -1556,9 +1558,11 @@ class ImageTaskService:
                          "image_count": len(asset_ids)}][-32:]
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
-            # Existing nested callers may have changed other receipts in their
-            # outer transaction; preserve that transaction's save behavior.
-            self._save_locked(task_key=None if nested else key)
+            # Aggregate callers may have changed other receipts. A scoped
+            # caller, however, must not rewrite unrelated cached history (which
+            # another worker may already have updated in durable storage).
+            aggregate = nested and getattr(self._transaction_local, "task_key", None) != key
+            self._save_locked(task_key=None if aggregate else key)
             self._slot_condition.notify_all()
         # Normal dispatch and original-result recovery both persist here. Emit
         # after commit, never on merely receiving an ID or downloading bytes.
@@ -2205,7 +2209,7 @@ class ImageTaskService:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
-        with self._transaction():
+        with self._transaction(task_key=key):
             current = self._tasks.get(key) or {}
             actual = {"conversation_id": _clean(current.get("conversation_id")),
                       "request_message_id": _clean(current.get("request_message_id")),
@@ -2682,7 +2686,7 @@ class ImageTaskService:
             error_message = str(exc) or "resume poll failed"
             duration_ms = int((time.time() - started) * 1000)
             error_code = _clean(getattr(exc, "code", ""))
-            with self._transaction():
+            with self._transaction(task_key=key):
                 current = self._tasks.get(key, {})
                 failures = int(current.get("poll_failures") or 0) + 1
                 qualified_reads = int(current.get("recovery_no_result_reads") or 0)

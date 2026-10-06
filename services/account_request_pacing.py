@@ -10,6 +10,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -574,7 +575,17 @@ class AccountRequestClock:
         # another conversation. Keep the durable send edge, not its response,
         # under the account clock. Other PATCH operations remain unchanged.
         concurrent_archive = archive_guard is not None and phase in {"conversation_archive", "conversation_restore"}
-        concurrent_io = is_conversation_read or metadata_kind is not None or concurrent_turn or concurrent_preparation or concurrent_archive
+        # Independent completion subscriptions and signed-URL lookups need
+        # only a paced send edge. Waiting for their headers must not lock out
+        # another conversation's generation/read. Keep the allowlist exact:
+        # uploads, file mutations and arbitrary attachment routes stay fenced.
+        concurrent_result_metadata = str(method).upper() == "GET" and not urlparse(str(url)).query and (
+            path == "/backend-api/celsius/ws/user"
+            or re.fullmatch(r"/backend-api/files/[^/]+/download", path) is not None
+            or re.fullmatch(r"/backend-api/conversation/[^/]+/attachment/[^/]+/download", path) is not None
+        )
+        concurrent_io = (is_conversation_read or metadata_kind is not None or concurrent_turn
+                         or concurrent_preparation or concurrent_archive or concurrent_result_metadata)
         pooled_preparation = concurrent_preparation and callable(preparation_submit) and not kwargs.get("stream")
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
         ordinary_owner = None

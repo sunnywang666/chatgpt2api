@@ -48,6 +48,48 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_independent_notification_and_download_lookups_overlap_without_read_credit(self):
+        endpoints = ("/backend-api/celsius/ws/user", "/backend-api/files/file-1/download",
+                     "/backend-api/conversation/c/attachment/a/download")
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: .05)):
+                path = Path(tmp) / "clock.json"
+                clock = AccountRequestClock("fixture", path)
+                original_read_at = time.monotonic() + 300
+                clock.next_conversation_read = original_read_at
+                clock._save()
+                entered = [threading.Event(), threading.Event()]
+                release = threading.Event()
+                sends, errors = {}, []
+                def run(index):
+                    def send(*args, **kwargs):
+                        sends[index] = time.monotonic()
+                        entered[index].set()
+                        if not release.wait(2):
+                            raise TimeoutError("independent response remained serialized")
+                        return Response()
+                    try:
+                        AccountRequestClock("fixture", path).request(send, "GET", "https://provider" + endpoint,
+                            _account_request_deadline_monotonic=time.monotonic()+1)
+                    except BaseException as exc:
+                        errors.append(exc)
+                workers = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+                try:
+                    workers[0].start()
+                    self.assertTrue(entered[0].wait(1))
+                    workers[1].start()
+                    self.assertTrue(entered[1].wait(.5), "lookup held account lock until response")
+                    self.assertGreaterEqual(sends[1] - sends[0], .045, "send pace was bypassed")
+                finally:
+                    release.set()
+                    for worker in workers:
+                        if worker.ident is not None: worker.join(2)
+                self.assertEqual(errors, [])
+                restored = AccountRequestClock("fixture", path)
+                self.assertAlmostEqual(restored.next_conversation_read, original_read_at, delta=.001)
+                self.assertEqual(restored.ordinary_read_queue, [])
+
     def test_pooled_preparation_interruption_joins_transport_and_keeps_limit(self):
         from concurrent.futures import ThreadPoolExecutor
         for transport_error in (False, True):
@@ -601,6 +643,12 @@ class AccountRequestPacingTests(unittest.TestCase):
             ("/backend-api/me", "/conversation/original", "conversation_read"),
             ("/conversation/original", "/backend-api/me", "account"),
             ("/backend-api/accounts/check/v4-2023-04-27", "/backend-api/me", "account"),
+            ("/backend-api/celsius/ws/user", "/backend-api/me", "account"),
+            ("/backend-api/files/file-1/download", "/backend-api/me", "account"),
+            ("/backend-api/conversation/c/attachment/a/download", "/backend-api/me", "account"),
+            ("/backend-api/me", "/backend-api/celsius/ws/user", "account"),
+            ("/backend-api/me", "/backend-api/files/file-1/download", "account"),
+            ("/backend-api/me", "/backend-api/conversation/c/attachment/a/download", "account"),
         ):
             with self.subTest(slow_path=slow_path, limited_path=limited_path), tempfile.TemporaryDirectory() as tmp, \
                  patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
@@ -643,12 +691,16 @@ class AccountRequestPacingTests(unittest.TestCase):
 
     def test_non_metadata_init_or_write_retains_send_fence(self):
         from services.account_request_pacing import AccountRequestDeadlineExceeded
-        for endpoint, body in (
-            ("/backend-api/conversation/init", {"conversation_id": "existing"}),
-            ("/backend-api/conversation/init", {"gizmo_id": None, "requested_default_model": None,
+        for method, endpoint, body in (
+            ("POST", "/backend-api/conversation/init", {"conversation_id": "existing"}),
+            ("POST", "/backend-api/conversation/init", {"gizmo_id": None, "requested_default_model": None,
                                               "conversation_id": None, "timezone_offset_min": -480,
                                               "prompt": "an actual operation"}),
-            ("/backend-api/files", {}),
+            ("POST", "/backend-api/files", {}),
+            ("POST", "/backend-api/files/file-1/download", {}),
+            ("GET", "/backend-api/files/file-1", {}),
+            ("GET", "/backend-api/celsius/ws/user?scope=other", {}),
+            ("GET", "/backend-api/conversation/c/attachment/a/unknown", {}),
         ):
             with self.subTest(endpoint=endpoint, body=body), tempfile.TemporaryDirectory() as tmp, \
                  patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
@@ -664,7 +716,7 @@ class AccountRequestPacingTests(unittest.TestCase):
                     return Response()
                 def write():
                     try:
-                        AccountRequestClock("account", path).request(send, "POST", "https://provider" + endpoint, json=body)
+                        AccountRequestClock("account", path).request(send, method, "https://provider" + endpoint, json=body)
                     except BaseException as exc:
                         errors.append(exc)
                 read_errors, deadline_set = [], threading.Event()
@@ -687,7 +739,7 @@ class AccountRequestPacingTests(unittest.TestCase):
                     # lock owner controlled here, rather than waiting for the
                     # reader to finish before releasing that same owner.
                     time.sleep(max(0, deadline[0] - time.monotonic()) + .05)
-                    self.assertEqual(sent, ["POST"])
+                    self.assertEqual(sent, [method])
                 finally:
                     release.set()
                     worker.join(4)
@@ -697,7 +749,7 @@ class AccountRequestPacingTests(unittest.TestCase):
                 self.assertEqual(errors, [])
                 self.assertEqual(len(read_errors), 1)
                 self.assertIsInstance(read_errors[0], AccountRequestDeadlineExceeded)
-                self.assertEqual(sent, ["POST"])
+                self.assertEqual(sent, [method])
 
     def test_fractional_http_floor_preserves_model_floor_and_retry_after(self):
         now = [10000.0]

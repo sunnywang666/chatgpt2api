@@ -1302,6 +1302,37 @@ class ImageTaskServiceTests(unittest.TestCase):
             with service.store.connect() as db:
                 self.assertIsNone(service.store.read_receipt(db, "image", "owner-1", "policy-task"))
 
+    def test_pending_download_save_does_not_load_or_overwrite_another_workers_history(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path, result_file_ids=["file-1"])
+            service = self.make_service(path)
+            key = "owner-1:policy-task"
+            history = {"id": "history", "owner_id": "owner-1", "status": "success",
+                       "data": [{"b64_json": "unrelated-historical-image" + "a" * 1000000}]}
+            # Simulate a stale cache and a newer durable write from another worker.
+            service._tasks["owner-1:history"] = {**history, "revision": "stale"}
+            with service.store.transaction() as db:
+                service.store.write_receipt(db, "image", "owner-1", "history", {**history, "revision": "newer"})
+                raw_history = db.execute("SELECT receipt FROM image_requests WHERE task_key='owner-1:history'").fetchone()[0]
+            coverage = {"conversation_id": "conversation-1", "request_message_id": "original-request",
+                        "file_ids": ["file-1"], "sediment_ids": []}
+            items = [{"b64_json": "c2F2ZWQ="}]
+            loads = json.loads
+            def bounded_load(raw, *args, **kwargs):
+                self.assertNotIn("unrelated-historical-image", raw)
+                return loads(raw, *args, **kwargs)
+            with mock.patch("services.image_task_service.json.loads", side_effect=bounded_load), \
+                    mock.patch.object(service.store, "write_receipt", wraps=service.store.write_receipt) as writes:
+                service._store_pending_image_output(key, coverage, items)
+                self.assertEqual(writes.call_count, 1)
+            with service.store.connect() as db:
+                saved = service.store.read_receipt(db, "image", "owner-1", "policy-task")
+                self.assertEqual(db.execute("SELECT receipt FROM image_requests WHERE task_key='owner-1:history'").fetchone()[0], raw_history)
+            self.assertEqual(saved["_pending_image_output"]["coverage"], coverage)
+            with service.store.output_file(saved["_pending_image_output"]["output_ref"]) as output:
+                self.assertEqual(json.load(output), items)
+
     def test_nested_progress_update_preserves_outer_transaction_changes(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
