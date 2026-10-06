@@ -354,7 +354,7 @@ class PoolAdmission:
         # originals stay in the existing store, never in an executor queue.
         self._original_read_slots = threading.BoundedSemaphore(4)
         self._original_read_lock = threading.Lock()
-        self._original_reads = set()
+        self._original_reads = {}
         self._event = threading.Event()
         self._stop = threading.Event()
         self._thread = None
@@ -404,32 +404,36 @@ class PoolAdmission:
     def _dispatch_original_read(self, kind, owner, request_id, function, receipt):
         if self._stop.is_set():
             return False
-        # Do not fill the local workers with known pacing waits. The transport
-        # still checks the same persisted clock immediately before its GET.
         with self._account_guard():
             account = next((a for a in self._rows()
                             if a.get("provider_account_identity") == receipt.get("provider_account_identity")), None)
-        if account is not None:
-            if account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
-                return False
-            now = float(self.clock())
-            if self.pacing:
-                pacing = self.pacing(account, now)
-            else:
-                from services.account_request_pacing import account_pacing_snapshot
-                pacing = account_pacing_snapshot(account, now, include_turn=False, include_conversation_read=True)
-            if pacing.get("next_at") is None or pacing["next_at"] > now:
-                return False
+        def cancel_reservation():
+            if kind == "image" and account is not None and self.pacing is None:
+                from services.account_request_pacing import release_account_image_recovery_read
+                release_account_image_recovery_read(account, owner, request_id)
+
         key = physical_conversation_key(receipt)
         if key is None:
             account_key = receipt.get("provider_account_identity") or receipt.get("provider_binding_id")
             client_conversation = receipt.get("client_conversation_id")
             key = ((account_key, client_conversation) if account_key and client_conversation
                    else (kind, owner, request_id))
+        identity = (kind, owner, request_id)
         with self._original_read_lock:
-            if key in self._original_reads or not self._original_read_slots.acquire(blocking=False):
-                return False
-            self._original_reads.add(key)
+            active = self._original_reads.get(key)
+            denied = active is not None or not self._original_read_slots.acquire(blocking=False)
+            if not denied:
+                self._original_reads[key] = identity
+        if denied:
+            # A duplicate scan must not cancel the active original's GET.
+            if active != identity:
+                cancel_reservation()
+            return False
+
+        def release_worker():
+            with self._original_read_lock:
+                self._original_reads.pop(key, None)
+                self._original_read_slots.release()
 
         def run():
             try:
@@ -437,18 +441,44 @@ class PoolAdmission:
             except Exception:
                 pass  # The original handler persists the bounded failure.
             finally:
-                with self._original_read_lock:
-                    self._original_reads.discard(key)
-                    self._original_read_slots.release()
+                release_worker()
                 self.wake()
+
+        started = keep_reservation = False
         try:
+            if recovery_suppressed(receipt) or receipt.get("_recovery_paused") is True:
+                return False
+            if account is not None:
+                if account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
+                    return False
+                now = float(self.clock())
+                if self.pacing:
+                    pacing = self.pacing(account, now)
+                else:
+                    from services.account_request_pacing import account_pacing_snapshot
+                    pacing = account_pacing_snapshot(account, now, include_turn=False, include_conversation_read=True)
+                if pacing.get("next_at") is None or float(pacing.get("cooldown_until") or 0) > now:
+                    return False
+                due_image = (kind == "image" and image_original_recovery_pending(receipt)
+                             and float(receipt.get("next_poll_at") or 0) <= now)
+                if due_image and self.pacing is None:
+                    # Book the due original in the existing FIFO before the
+                    # read edge. Polling next_at alone loses every opportunity
+                    # to already queued results/archives. No worker waits here.
+                    from services.account_request_pacing import reserve_account_image_recovery_read
+                    if not reserve_account_image_recovery_read(account, owner, request_id):
+                        keep_reservation = True
+                        return False
+                elif pacing["next_at"] > now:
+                    return False
             threading.Thread(target=run, name="original-result-io", daemon=True).start()
-        except Exception:
-            with self._original_read_lock:
-                self._original_reads.discard(key)
-                self._original_read_slots.release()
-            raise
-        return True
+            started = True
+            return True
+        finally:
+            if not started:
+                release_worker()
+                if not keep_reservation:
+                    cancel_reservation()
 
     def recover_one(self, *, background=False):
         now = float(self.clock())

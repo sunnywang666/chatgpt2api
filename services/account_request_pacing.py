@@ -477,7 +477,13 @@ class AccountRequestClock:
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
-        ordinary_owner = uuid.uuid4().hex if is_conversation_read and not read_owner else None
+        ordinary_owner = None
+        if is_conversation_read and not read_owner:
+            # Due image recovery may already hold a FIFO place before its
+            # worker starts. Reuse it at the actual GET; do not queue behind
+            # our own reservation. The original image claim prevents overlap.
+            ordinary_owner = (_image_read_owner(context.owner, context.request_id)
+                              if getattr(context, "kind", None) == "image" else uuid.uuid4().hex)
         if archive_guard is not None:
             archive_guard()
             # Each HTTP step must finish inside the renewed 300s work claim.
@@ -959,6 +965,58 @@ def account_pacing_snapshot(account, now=None, *, include_turn=True, include_con
 
 _clocks: dict[str, AccountRequestClock] = {}
 _clocks_lock = threading.Lock()
+
+
+def _image_read_owner(owner, request_id):
+    return "image:" + hashlib.sha256(json.dumps([owner, request_id]).encode()).hexdigest()
+
+
+def reserve_account_image_recovery_read(account, owner, request_id):
+    """Join the existing read FIFO without an I/O worker or consuming credit.
+
+    Called only for due original image recovery, outside account/SQLite locks.
+    Each scan renews the existing short lease; a stopped/dead task expires by
+    the same rule as other readers. The transport still enforces every clock.
+    """
+    return _image_recovery_read_reservation(account, owner, request_id, cancel=False)
+
+
+def release_account_image_recovery_read(account, owner, request_id):
+    return _image_recovery_read_reservation(account, owner, request_id, cancel=True)
+
+
+def _image_recovery_read_reservation(account, owner, request_id, *, cancel):
+    identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
+    if not identity:
+        return False
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    try:
+        with _clocks_lock:
+            clock = _clocks.get(key)
+            if clock is None:
+                clock = AccountRequestClock(key[:12], DATA_DIR / "account_request_clocks" / f"{key}.json")
+                _clocks[key] = clock
+        if not clock.lock.acquire(blocking=False):
+            return False
+        try:
+            read_owner = _image_read_owner(owner, request_id)
+            if cancel:
+                clock._release_ordinary_read(read_owner)
+                return True
+            now = time.monotonic()
+            if max(clock.cooldown_until, clock._read_cooldown_until()) > now:
+                clock._release_ordinary_read(read_owner)
+                return False
+            delay = max(0, clock.next_request - now, clock._read_ready(now) - now)
+            if not getattr(config, "account_conversation_read_interval_secs", 0.0):
+                clock._release_ordinary_read(read_owner)
+                return delay <= 0
+            first = clock._ordinary_read_turn(read_owner, now, delay)
+            return first and delay <= 0 and not (clock.archive_read_owner and clock.archive_read_until > now)
+        finally:
+            clock.lock.release()
+    except (OSError, ValueError):
+        return False
 
 
 def reserve_account_archive_read(account, owner):

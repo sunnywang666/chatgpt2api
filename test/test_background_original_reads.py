@@ -160,6 +160,195 @@ def test_worker_bound_and_start_failure_release_permit(recovery):
     assert len(r.admission._original_reads) == 4
 
 
+def test_due_saved_image_joins_fifo_before_read_edge_without_occupying_worker(recovery, tmp_path):
+    """A failed download must not race every already-booked result/archive."""
+    import hashlib
+    import services.account_request_pacing as pacing
+    from services.request_context import executing
+
+    r = recovery
+    r.admission.pacing = None
+    receipt = {"id": "saved-image", "owner_id": "owner", "status": "error",
+               "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "provider_account_identity": "account-0",
+               "conversation_id": "original", "request_message_id": "original-message",
+               "result_file_ids": ["original-file"], "upstream_outcome": "generated",
+               "upstream_unfinished": False, "next_poll_at": 999}
+    key = hashlib.sha256(b"upstream-0").hexdigest()
+    path = tmp_path / "account_request_clocks" / (key + ".json")
+    finished = threading.Event()
+    calls = []
+    errors = []
+
+    class Context:
+        kind, owner, request_id = "image", "owner", "saved-image"
+
+    def read(owner, rid):
+        try:
+            with executing(Context()):
+                pacing.AccountRequestClock(key[:12], path).request(
+                    lambda method, url, **kw: calls.append((method, r.clock())) or
+                        SimpleNamespace(status_code=200, headers={}),
+                    "GET", "https://fixture.invalid/conversation/original")
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    with patch.object(pacing, "DATA_DIR", tmp_path), patch.object(pacing, "_clocks", {}), \
+         patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                                                        account_conversation_read_interval_secs=52.5)), \
+         patch.object(pacing.time, "time", side_effect=r.clock), \
+         patch.object(pacing.time, "monotonic", side_effect=r.clock):
+        clock = pacing.AccountRequestClock(key[:12], path)
+        clock.next_conversation_read = 1052.5
+        clock.last_read_was_archive = True
+        clock._save()
+        assert not r.admission._dispatch_original_read("image", "owner", "saved-image", read, receipt)
+        queued = pacing.AccountRequestClock(key[:12], path)
+        assert len(queued.ordinary_read_queue) == 1, "due recovery never joined the read FIFO"
+        first_owner = queued.ordinary_read_queue[0]["owner"]
+        assert not r.admission._original_reads and not calls
+        with queued.lock:
+            assert not queued._ordinary_read_turn("later-result", r.clock(), 52.5)
+            assert not queued._reserve_archive_read("later-archive", r.clock())
+        # Repeated scheduler scans renew the same entry, never spend read credit.
+        r.clock.now = 1030
+        assert not r.admission._dispatch_original_read("image", "owner", "saved-image", read, receipt)
+        queued = pacing.AccountRequestClock(key[:12], path)
+        assert [v["owner"] for v in queued.ordinary_read_queue] == [first_owner, "later-result"]
+        assert queued.next_conversation_read == 1052.5
+        r.clock.now = 1052.5
+        assert r.admission._dispatch_original_read("image", "owner", "saved-image", read, receipt)
+        assert finished.wait(2) and not errors
+        assert calls == [("GET", 1052.5)]
+        queued = pacing.AccountRequestClock(key[:12], path)
+        assert [v["owner"] for v in queued.ordinary_read_queue] == ["later-result"]
+        assert queued.next_conversation_read >= 1105
+        assert receipt["upstream_outcome"] == "generated" and receipt["result_file_ids"] == ["original-file"]
+
+
+@pytest.mark.parametrize("limit", ["global", "conversation"])
+def test_image_recovery_fifo_keeps_cooldown_owner_isolation_and_dead_lease_expiry(tmp_path, limit):
+    import hashlib
+    import services.account_request_pacing as pacing
+
+    now = [1000.]
+    account = {"account_id": "upstream"}
+    key = hashlib.sha256(b"upstream").hexdigest()
+    path = tmp_path / "account_request_clocks" / (key + ".json")
+    with patch.object(pacing, "DATA_DIR", tmp_path), patch.object(pacing, "_clocks", {}), \
+         patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                                                        account_conversation_read_interval_secs=52.5)), \
+         patch.object(pacing.time, "time", side_effect=lambda: now[0]), \
+         patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]):
+        clock = pacing.AccountRequestClock(key[:12], path)
+        clock.next_conversation_read = 1052.5
+        if limit == "global":
+            clock.cooldown_until = 1120
+        else:
+            clock.conversation_read_rate_failures = 1
+            clock.last_conversation_read_rate_limit = 1000
+        clock._save()
+        assert not pacing.reserve_account_image_recovery_read(account, "a", "same-id")
+        assert pacing.AccountRequestClock(key[:12], path).ordinary_read_queue == []
+        # Passing the rate edge does not pass a later provider cooldown.
+        now[0] = 1052.5
+        assert not pacing.reserve_account_image_recovery_read(account, "a", "same-id")
+        now[0] = 1200
+        assert pacing.reserve_account_image_recovery_read(account, "a", "same-id")
+        pacing._clocks.clear()  # Same persisted lease across a fresh service.
+        assert not pacing.reserve_account_image_recovery_read(account, "b", "same-id")
+        assert not pacing.reserve_account_image_recovery_read(account, "a", "different-id")
+        queued = pacing.AccountRequestClock(key[:12], path)
+        owners = [v["owner"] for v in queued.ordinary_read_queue]
+        assert len(set(owners)) == 3
+        assert queued.next_conversation_read == 1052.5  # Booking is not a GET.
+        # A stopped task no longer renews. Its old place must expire instead
+        # of blocking other accounts/tasks indefinitely or clearing evidence.
+        now[0] = 1231
+        assert pacing.reserve_account_image_recovery_read(account, "b", "same-id")
+        assert [v["owner"] for v in pacing.AccountRequestClock(key[:12], path).ordinary_read_queue] == [owners[1]]
+
+
+@pytest.mark.parametrize("blocked", ["workers", "same_conversation", "start_failure", "paused", "suppressed", "new_cooldown"])
+def test_image_recovery_cancels_undispatched_fifo_place(recovery, tmp_path, blocked):
+    import hashlib
+    import services.account_request_pacing as pacing
+    from services.pool_admission import physical_conversation_key
+
+    r = recovery
+    r.admission.pacing = None
+    account = {"account_id": "upstream-0"}
+    key = hashlib.sha256(b"upstream-0").hexdigest()
+    path = tmp_path / "account_request_clocks" / (key + ".json")
+    receipt = {"status": "error", "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
+               "provider_account_identity": "account-0", "conversation_id": "same",
+               "request_message_id": "original-message", "result_file_ids": ["original-file"], "next_poll_at": 0}
+    read = Mock(side_effect=AssertionError("blocked recovery must not start"))
+    with patch.object(pacing, "DATA_DIR", tmp_path), patch.object(pacing, "_clocks", {}), \
+         patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                                                        account_conversation_read_interval_secs=52.5)), \
+         patch.object(pacing.time, "time", side_effect=r.clock), \
+         patch.object(pacing.time, "monotonic", side_effect=r.clock):
+        assert pacing.reserve_account_image_recovery_read(account, "owner", "image")
+        assert len(pacing.AccountRequestClock(key[:12], path).ordinary_read_queue) == 1
+        if blocked == "workers":
+            for _ in range(4):
+                assert r.admission._original_read_slots.acquire(blocking=False)
+        elif blocked == "same_conversation":
+            r.admission._original_reads[physical_conversation_key(receipt)] = ("image", "owner", "other-original")
+        elif blocked == "paused":
+            receipt["_recovery_paused"] = True
+        elif blocked == "suppressed":
+            receipt["_recovery_suppressed"] = True
+        elif blocked == "new_cooldown":
+            clock = pacing.AccountRequestClock(key[:12], path)
+            clock.cooldown_until = 1120
+            clock._save()
+        if blocked == "start_failure":
+            with patch("services.pool_admission.threading.Thread", side_effect=RuntimeError("fixture start")), \
+                 pytest.raises(RuntimeError, match="fixture start"):
+                r.admission._dispatch_original_read("image", "owner", "image", read, receipt)
+        else:
+            assert not r.admission._dispatch_original_read("image", "owner", "image", read, receipt)
+        read.assert_not_called()
+        clock = pacing.AccountRequestClock(key[:12], path)
+        assert clock.ordinary_read_queue == []
+        if blocked == "new_cooldown":
+            assert clock.cooldown_until == 1120
+        if blocked == "workers":
+            for _ in range(4):
+                r.admission._original_read_slots.release()
+        r.admission._original_reads.clear()
+        assert r.admission._original_read_slots.acquire(blocking=False)
+        r.admission._original_read_slots.release()
+
+
+def test_zero_read_interval_keeps_http_wait_out_of_recovery_workers(recovery, tmp_path):
+    import hashlib
+    import services.account_request_pacing as pacing
+    r = recovery
+    r.admission.pacing = None
+    key = hashlib.sha256(b"upstream-0").hexdigest()
+    path = tmp_path / "account_request_clocks" / (key + ".json")
+    receipt = {"status": "error", "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
+               "provider_account_identity": "account-0", "conversation_id": "original",
+               "request_message_id": "original-message", "result_file_ids": ["original-file"], "next_poll_at": 0}
+    with patch.object(pacing, "DATA_DIR", tmp_path), patch.object(pacing, "_clocks", {}), \
+         patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=5,
+                                                        account_conversation_read_interval_secs=0)), \
+         patch.object(pacing.time, "time", side_effect=r.clock), \
+         patch.object(pacing.time, "monotonic", side_effect=r.clock):
+        clock = pacing.AccountRequestClock(key[:12], path)
+        clock.next_request = 1005
+        clock._save()
+        read = Mock(side_effect=AssertionError("HTTP interval has not elapsed"))
+        assert not r.admission._dispatch_original_read("image", "owner", "image", read, receipt)
+        assert not r.admission._original_reads
+        assert pacing.AccountRequestClock(key[:12], path).ordinary_read_queue == []
+        read.assert_not_called()
+
+
 def test_archive_dispatch_and_other_original_continue_during_completion_read(recovery):
     r = recovery
     receipt = r.original("completion")
