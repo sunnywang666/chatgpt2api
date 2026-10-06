@@ -96,7 +96,8 @@ def create_router(kind):
             return await run_in_threadpool(service.start, kind, identity, request_id,
                                            allow_unconfirmed_retry=body.allow_unconfirmed_retry,
                                            retry_not_sent_failure_at=body.retry_not_sent_failure_at,
-                                           original_only=company_original_only or admin_original_only)
+                                           original_only=company_original_only or admin_original_only,
+                                           read_only_original=admin_original_only)
         except WorkLifecycleError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
     return router
