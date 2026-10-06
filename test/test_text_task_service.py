@@ -470,7 +470,8 @@ class TextTaskTests(unittest.TestCase):
                 self.assertEqual(backend.session.get.call_count, 1)
                 self.assertEqual(backend.session.post.call_count, failed_at)
                 if stage == "conversation":
-                    self.assertEqual(backend.session.post.call_args.kwargs["json"]["thinking_effort"], "extended")
+                    payload = json.loads(backend.session.post.call_args.kwargs["data"])
+                    self.assertEqual(payload["thinking_effort"], "extended")
 
                 restarted = TextTaskService(self.path, executor=self.queue,
                                             recovery_reader=lambda _receipt: {"status": "running"})

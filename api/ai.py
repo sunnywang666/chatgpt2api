@@ -399,6 +399,19 @@ def create_router() -> APIRouter:
             body.allow_unrecoverable_retry,
         )
 
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/resume-unsent-successor")
+    async def resume_unsent_bound_successor(request_id: str, body: ConversationBindingTextRequest,
+                                            authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        if identity.get("role") != "admin":
+            raise HTTPException(501, detail={"code": "SERVICE_OPERATION_UNAVAILABLE"})
+        require_chat_text_policy(identity)
+        try:
+            return await run_in_threadpool(text_task_service.resume_unsent_successor,
+                str(identity.get("id") or "anonymous"), request_id, body.model_dump(mode="python", exclude_unset=True))
+        except ConversationBindingError as exc:
+            raise HTTPException(409, detail={"code": exc.code, "error": str(exc)}) from exc
+
     @router.post("/api/conversation-bindings/text")
     async def continue_bound_text(
             body: ConversationBindingTextRequest,
