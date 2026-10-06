@@ -475,7 +475,11 @@ class AccountRequestClock:
             if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
                 kwargs["timeout"] = max(0.001, min(float(timeout), remaining))
 
-        def wait_for_pace(delay: float, message: str) -> None:
+        read_wait_seconds = {}
+        read_http_attempts = 0
+        read_queue_position_max = 0
+
+        def wait_for_pace(delay: float, message: str, reason="account_pace") -> None:
             nonlocal deadline_at
             remaining = remaining_budget()
             # Credit only our configured pacing wait. A provider cooldown is
@@ -487,6 +491,8 @@ class AccountRequestClock:
             started_wait = time.monotonic()
             time.sleep(delay)
             elapsed = max(0.0, time.monotonic() - started_wait)
+            if is_conversation_read:
+                read_wait_seconds[reason] = read_wait_seconds.get(reason, 0.0) + elapsed
             if credit and elapsed:
                 local_wait(elapsed)
                 if deadline_at is not None:
@@ -543,6 +549,7 @@ class AccountRequestClock:
         request_ref = request_ref or archive_observation.get("request_ref")
 
         def observed_send(send_method, send_url, send_phase, *, read_started=None, **send_kwargs):
+            nonlocal read_http_attempts
             # Count actual transport attempts, including metadata/preflight GETs.
             # Never log URLs, request bodies/headers, response bodies or exception
             # messages: conversation URLs and signed downloads can contain secrets.
@@ -568,6 +575,8 @@ class AccountRequestClock:
             transport_code = None
             transport_snapshot = {}
             try:
+                if send_phase == "conversation_read":
+                    read_http_attempts += 1
                 if read_started is not None:
                     read_started(started)
                 response = send(send_method, send_url, **send_kwargs)
@@ -643,8 +652,12 @@ class AccountRequestClock:
                 acquire_with_budget(self.lock)
                 try:
                     now = time.monotonic()
-                    read_delay = max(self.next_request, self.cooldown_until,
-                                     self._read_ready(now) if is_conversation_read else 0) - now
+                    read_delay, wait_reason = max((
+                        (max(0, self.next_request - now), "account_pace"),
+                        (max(0, self._read_ready(now) - now) if is_conversation_read else 0, "read_rate"),
+                        (max(0, self.cooldown_until - now,
+                             self._read_cooldown_until() - now if is_conversation_read else 0), "upstream_cooldown")),
+                        key=lambda item: (item[0], item[1] == "upstream_cooldown"))
                     if is_conversation_read and read_owner:
                         if not self._reserve_archive_read(read_owner, now):
                             other = self.archive_read_until if self.archive_read_until > now else 0.0
@@ -655,16 +668,29 @@ class AccountRequestClock:
                             # still determines when an upstream send is legal.
                             retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
                             reservation_delay = min(retry_check, max(0.0, other - now, ordinary - now))
+                            if reservation_delay > read_delay:
+                                wait_reason = "archive_reservation"
                             read_delay = max(read_delay, reservation_delay)
                     elif is_conversation_read:
                         if self.archive_read_owner and self.archive_read_until > now:
-                            read_delay = max(read_delay, self.archive_read_until - now)
+                            # A live archive may release this lease immediately.
+                            # Recheck it promptly; retain the actual rate/cooldown floor.
+                            retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
+                            reservation_delay = min(retry_check, self.archive_read_until - now)
+                            if reservation_delay > read_delay:
+                                wait_reason = "archive_reservation"
+                            read_delay = max(read_delay, reservation_delay)
                         if not self._ordinary_read_turn(ordinary_owner, now, read_delay):
                             # Give the reserved reader time to wake. Do not
                             # consume another full upstream interval locally,
                             # or add a whole second to fractional HTTP pacing.
                             retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
+                            if retry_check > read_delay:
+                                wait_reason = "result_fifo"
                             read_delay = max(read_delay, retry_check)
+                        read_queue_position_max = max(read_queue_position_max,
+                            next((i + 1 for i, entry in enumerate(self.ordinary_read_queue)
+                                  if entry["owner"] == ordinary_owner), 0))
                 except BaseException:
                     self.lock.release()
                     raise
@@ -674,7 +700,7 @@ class AccountRequestClock:
                 # and delay a generation POST that is otherwise ready. Reload
                 # all deadlines under the cross-process lock after waking.
                 self.lock.release()
-                wait_for_pace(read_delay, "account request deadline elapsed during read wait")
+                wait_for_pace(read_delay, "account request deadline elapsed during read wait", wait_reason)
             clock_held = True
             response = None
             try:
@@ -910,6 +936,13 @@ class AccountRequestClock:
             release_turn()
             raise
         finally:
+            if is_conversation_read:
+                logger.info({"event": "account_read_wait_finished", "account": self.account_key,
+                    "request_ref": request_ref, "work_ref": archive_observation.get("work_ref"),
+                    "archive_step": current_archive_step.get() if archive_guard is not None else None,
+                    "observed_at": time.time(), "http_attempts": read_http_attempts,
+                    "queue_position_max": read_queue_position_max,
+                    "wait_seconds_by_controlling_reason": {k: round(v, 6) for k, v in read_wait_seconds.items()}})
             if ordinary_owner:
                 # Deadline/preflight/transport failure must not leave a live
                 # caller's place blocking the following result reader.

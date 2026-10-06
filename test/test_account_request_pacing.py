@@ -214,6 +214,41 @@ class AccountRequestPacingTests(unittest.TestCase):
                 self.assertEqual(sent, [10000 + expected_wait])
                 self.assertEqual(clock.ordinary_read_queue, [])
 
+    def test_original_read_rechecks_released_archive_lease_without_skipping_real_floor(self):
+        for floor, expected in ((None, .1), ("next_conversation_read", 8), ("cooldown_until", 8)):
+            with self.subTest(floor=floor):
+                now = [10000.0]
+                sleeps, sent = [], []
+                clock = AccountRequestClock("account")
+                clock.archive_read_owner, clock.archive_read_until = "archive", 10005
+                if floor:
+                    setattr(clock, floor, 10008)
+                def sleep(seconds):
+                    sleeps.append(seconds)
+                    self.assertFalse(sent)
+                    with clock.lock:
+                        clock.archive_read_owner, clock.archive_read_until = None, 0
+                    now[0] += seconds
+                with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("services.account_request_pacing.time.sleep", side_effect=sleep), \
+                     patch.object(type(config), "account_request_interval_secs", property(lambda _: .1)), \
+                     patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 15)), \
+                     patch("services.account_request_pacing.logger.info") as info:
+                    clock.request(lambda *a, **k: sent.append(now[0]) or Response(),
+                                  "GET", "https://provider/conversation/original")
+                self.assertEqual(sleeps, [expected])
+                self.assertEqual(sent, [10000 + expected])
+                self.assertEqual(clock.ordinary_read_queue, [])
+                waits = [call.args[0] for call in info.call_args_list
+                         if call.args[0].get("event") == "account_read_wait_finished"]
+                self.assertEqual(len(waits), 1)
+                reason = {None: "archive_reservation", "next_conversation_read": "read_rate",
+                          "cooldown_until": "upstream_cooldown"}[floor]
+                self.assertEqual(waits[0]["wait_seconds_by_controlling_reason"], {reason: expected})
+                self.assertEqual(waits[0]["http_attempts"], 1)
+                self.assertEqual(waits[0]["queue_position_max"], 1)
+                self.assertNotIn("https://provider", json.dumps(waits))
+
     def test_metadata_preserves_read_queue_and_persisted_http_floor(self):
         now = [10000.0]
         sent = []
