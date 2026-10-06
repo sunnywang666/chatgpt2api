@@ -48,6 +48,50 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_parallel_preparation_limits_survive_late_200_and_block_generation(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        for method, path in (("GET", "/"),
+                ("POST", "/backend-api/sentinel/chat-requirements/prepare"),
+                ("POST", "/backend-api/sentinel/chat-requirements/finalize"),
+                ("POST", "/backend-api/f/conversation/prepare")):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)):
+                storage = Path(tmp)/"clock.json"
+                entered, release = threading.Event(), threading.Event()
+                contexts, errors = [Context(str(i)) for i in range(3)], []
+                for c in contexts: c.record_limit = lambda evidence: None
+                def delayed(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(2): raise TimeoutError("fixture response withheld")
+                    return Response()
+                def first():
+                    try:
+                        with executing(contexts[0]):
+                            AccountRequestClock("fixture", storage).request(delayed, method, "https://chatgpt.com"+path)
+                    except BaseException as exc: errors.append(exc)
+                worker = threading.Thread(target=first)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    response = Response(); response.status_code = 429; response.headers = {"Retry-After":"90"}
+                    with executing(contexts[1]):
+                        AccountRequestClock("fixture", storage).request(lambda *a, **kw: response, method,
+                            "https://chatgpt.com"+path, _account_request_deadline_monotonic=time.monotonic()+.5)
+                    before = json.loads(storage.read_text())
+                finally:
+                    release.set(); worker.join(3)
+                self.assertFalse(worker.is_alive()); self.assertEqual(errors, [])
+                after = json.loads(storage.read_text())
+                # Disk stores wall time; reloading converts through monotonic.
+                # Permit conversion roundoff only (0.1 ms), not an earlier pace.
+                self.assertGreaterEqual(after["cooldown_until"] + .0001, before["cooldown_until"])
+                self.assertEqual(after["rate_failures"], 1)
+                self.assertTrue(all(c.released == 0 for c in contexts), "preparation must not release admitted slots")
+                def forbidden(*args, **kwargs): self.fail("generation sent during preparation cooldown")
+                with executing(contexts[2]), self.assertRaises(AccountRequestDeadlineExceeded):
+                    AccountRequestClock("fixture", storage).request(forbidden, "POST", "https://chatgpt.com/backend-api/f/conversation",
+                        _account_request_deadline_monotonic=time.monotonic()+.05)
+
     def test_model_send_save_failure_reaps_and_closes_unreturned_stream(self):
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
@@ -110,8 +154,8 @@ class AccountRequestPacingTests(unittest.TestCase):
                 release.set(); worker.join(3)
             self.assertFalse(worker.is_alive()); self.assertEqual(errors, [])
             after = json.loads(path.read_text())
-            self.assertGreaterEqual(after["cooldown_until"], before["cooldown_until"])
-            self.assertGreaterEqual(after["last_turn_started"], before["last_turn_started"])
+            self.assertGreaterEqual(after["cooldown_until"] + .0001, before["cooldown_until"])
+            self.assertGreaterEqual(after["last_turn_started"] + .0001, before["last_turn_started"])
             self.assertEqual(after["rate_failures"], 1)
             never_send = __import__("unittest.mock", fromlist=["Mock"]).Mock()
             with executing(LimitContext("third")), self.assertRaises(AccountRequestDeadlineExceeded):
@@ -1827,6 +1871,99 @@ def test_native_partial_response_timeout_keeps_stage_snapshot(tmp_path, monkeypa
         session.close()
         server.shutdown()
         server.server_close()
+
+
+def test_native_backend_preparations_overlap_without_mixing_tokens(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit
+    from curl_cffi import requests
+    import services.account_request_pacing as pacing
+    import services.openai_backend_api as api
+    from services.config import ConfigStore
+    paths = ["/", "/backend-api/sentinel/chat-requirements/prepare",
+             "/backend-api/sentinel/chat-requirements/finalize",
+             "/backend-api/f/conversation/prepare", "/backend-api/f/conversation"]
+    barriers = {path: threading.Barrier(2) for path in paths}
+    trace, server_errors = {}, []
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_GET(self): self.respond()
+        def do_POST(self): self.respond()
+        def respond(self):
+            sid = self.headers["OAI-Session-Id"]
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"]))) if self.command == "POST" else {}
+            try:
+                trace.setdefault(sid, []).append(self.path)
+                if self.path.endswith("chat-requirements/prepare"):
+                    result = {"prepare_token":"prepare-"+sid}
+                elif self.path.endswith("chat-requirements/finalize"):
+                    assert payload["prepare_token"] == "prepare-"+sid
+                    result = {"token":"requirements-"+sid}
+                elif self.path.endswith("conversation/prepare"):
+                    assert self.headers["OpenAI-Sentinel-Chat-Requirements-Token"] == "requirements-"+sid
+                    result = {"conduit_token":"conduit-"+sid}
+                elif self.path.endswith("conversation"):
+                    assert self.headers["OpenAI-Sentinel-Chat-Requirements-Token"] == "requirements-"+sid
+                    assert self.headers["X-Conduit-Token"] == "conduit-"+sid
+                    result = None
+                else: result = "<html></html>"
+                barriers[self.path].wait(timeout=3)
+                body = (b'data: [DONE]\n\n' if result is None else
+                        result.encode() if isinstance(result, str) else json.dumps(result).encode())
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+            except BaseException as exc:
+                server_errors.append(exc)
+                self.send_error(500)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    raw_send = requests.Session.request
+    def redirect(session, method, url, **kw):
+        assert urlsplit(url).hostname == "chatgpt.com"
+        return raw_send(session, method, f"http://127.0.0.1:{server.server_port}"+urlsplit(url).path, **kw)
+    monkeypatch.setattr(requests.Session, "request", redirect)
+    monkeypatch.setattr(api.proxy_settings, "build_session_kwargs", lambda **kw: {"trust_env":False})
+    monkeypatch.setattr(api.account_service, "get_account", lambda _: {"account_id":"same-fixture-account"})
+    guarded = []
+    monkeypatch.setattr(api.account_service, "require_image_account", lambda *a: guarded.append(a))
+    monkeypatch.setattr(api, "build_legacy_requirements_token", lambda *a: "fixture-p")
+    (tmp_path/"config.json").write_text(json.dumps({"auth-key":"test-only"}))
+    settings = ConfigStore(tmp_path/"config.json")
+    settings.update({"account_request_interval_secs":0, "account_message_interval_secs":0})
+    monkeypatch.setattr(pacing, "config", settings)
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    backends = [api.OpenAIBackendAPI("fixture-token") for _ in range(2)]
+    contexts, errors = [Context(str(i)) for i in range(2)], []
+    def run(index):
+        backend, context = backends[index], contexts[index]
+        context.request_id = str(index)
+        try:
+            with executing(context):
+                backend.image_submission_started = False
+                backend._bootstrap()
+                requirements = backend._get_chat_requirements()
+                conduit = backend._prepare_image_conversation(str(index), requirements, "gpt-image-2")
+                assert context.released == 0 and backend.image_submission_started is False
+                response = backend._start_image_generation(str(index), requirements, conduit, "gpt-image-2")
+                assert context.released == 0 and backend.image_submission_started is True
+                assert [x for x in response.iter_lines() if x] == [b'data: [DONE]']
+        except BaseException as exc: errors.append(exc)
+    workers = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+    try:
+        for worker in workers: worker.start()
+        for worker in workers: worker.join(8)
+        assert not errors and not server_errors
+        assert all(not w.is_alive() for w in workers)
+        assert len(trace) == 2 and all(sequence == paths for sequence in trace.values())
+        assert len(guarded) == 2 and all(c.released == 1 for c in contexts)
+    finally:
+        for barrier in barriers.values(): barrier.abort()
+        for worker in workers: worker.join(6)
+        for backend in backends: backend.close()
+        server.shutdown(); server.server_close()
 
 
 def test_native_parallel_post_keeps_stream_clones_after_worker_handle_cleanup(tmp_path, monkeypatch):

@@ -550,7 +550,17 @@ class AccountRequestClock:
         # request context. Serialize their durable send edge, not the wait for
         # response headers. Legacy calls without admission retain old behavior.
         concurrent_turn = is_turn and context is not None
-        concurrent_io = is_conversation_read or metadata_kind is not None or concurrent_turn
+        # These preparation responses belong to one Backend/Session instance.
+        # Its synchronous caller still preserves bootstrap -> requirements ->
+        # conduit -> generation order. Do not generalize account_read: uploads,
+        # authentication and other writes do not share this independence.
+        concurrent_preparation = context is not None and (str(method).upper(), path) in {
+            ("GET", ""),
+            ("POST", "/backend-api/sentinel/chat-requirements/prepare"),
+            ("POST", "/backend-api/sentinel/chat-requirements/finalize"),
+            ("POST", "/backend-api/f/conversation/prepare"),
+        } and not urlparse(str(url)).query
+        concurrent_io = is_conversation_read or metadata_kind is not None or concurrent_turn or concurrent_preparation
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
@@ -859,7 +869,7 @@ class AccountRequestClock:
                                 entered.set()
                         worker_context = copy_context()
                         worker = threading.Thread(target=worker_context.run, args=(read_io,),
-                                                  name="account-model-send" if concurrent_turn else "account-metadata-read" if metadata_kind else "original-conversation-read")
+                                                  name="account-model-send" if concurrent_turn else "account-turn-prepare" if concurrent_preparation else "account-metadata-read" if metadata_kind else "original-conversation-read")
                         worker.start()
                         reservation_error = None
                         floor_durable = False
