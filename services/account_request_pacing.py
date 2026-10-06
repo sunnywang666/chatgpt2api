@@ -833,12 +833,12 @@ class AccountRequestClock:
                     self.last_turn_started = now
                 # Reserve the interval before sending. Restarting after an
                 # unknown response must not erase the account's wait period.
-                self._save()
+                measure_preparation("clock_persistence", self._save)
                 # Saving pacing state and the submission receipt can consume
                 # part of the declared budget; cap once more at the send edge.
                 cap_timeout_before_send()
                 if context is not None and is_turn and hasattr(context, "record_stage"):
-                    context.record_stage("send_call_started")
+                    measure_preparation("send_receipt", context.record_stage, "send_call_started")
                 sent_at = time.monotonic()
                 try:
                     if concurrent_io:

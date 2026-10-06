@@ -262,6 +262,9 @@ class AccountRequestPacingTests(unittest.TestCase):
                     def before_send(self):
                         super().before_send()
                         advance(5)
+                    def record_stage(self, stage, **fields):
+                        super().record_stage(stage, **fields)
+                        if stage == "send_call_started": advance(3)
                 with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
                      patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
                      patch("services.account_request_pacing.logger.info") as logged, \
@@ -269,6 +272,11 @@ class AccountRequestPacingTests(unittest.TestCase):
                      patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
                     clock = AccountRequestClock("account")
                     turn_acquire, clock_acquire = clock.turn_lock.acquire, clock.lock.acquire
+                    save, saves = clock._save, []
+                    def slow_first_save():
+                        if not saves: advance(2)
+                        saves.append(True)
+                        return save()
                     def slow_turn(*args, **kwargs):
                         advance(2)
                         return turn_acquire(*args, **kwargs)
@@ -281,6 +289,7 @@ class AccountRequestPacingTests(unittest.TestCase):
                             raise OSError("private-transport-text")
                         return Response()
                     with patch.object(clock.turn_lock, "acquire", side_effect=slow_turn), \
+                         patch.object(clock, "_save", side_effect=slow_first_save), \
                          patch.object(clock.lock, "acquire", side_effect=slow_clock), executing(SlowContext("test")):
                         args = (send, "POST", "https://private-host/backend-api/conversation?private-query")
                         options = {"_account_request_preflight": lambda read: advance(4),
@@ -292,10 +301,11 @@ class AccountRequestPacingTests(unittest.TestCase):
                             clock.request(*args, **options)
                     attempts = [c.args[0] for c in logged.call_args_list if c.args[0].get("event") == "account_http_attempt"]
                     self.assertEqual(len(attempts), 1)
-                    self.assertEqual(attempts[0]["pre_send_elapsed_secs"], 20)
+                    self.assertEqual(attempts[0]["pre_send_elapsed_secs"], 25)
                     self.assertEqual(attempts[0]["pre_send_seconds_by_phase"], {
                         "turn_lock": 2, "clock_lock": 3, "preflight": 4,
-                        "admission_guard": 5, "submission_callback": 6})
+                        "admission_guard": 5, "submission_callback": 6,
+                        "clock_persistence": 2, "send_receipt": 3})
                     self.assertEqual(attempts[0]["headers_elapsed_secs"], 7)
                     self.assertNotIn("private-", json.dumps(attempts))
                     logged.reset_mock()
