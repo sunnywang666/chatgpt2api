@@ -13,7 +13,7 @@ from api.external_images import client_sync_result, validate_external_input, is_
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from api.key_policy import require_image_policy, require_chat_text_policy
-from utils.helper import is_image_chat_request, has_response_image_generation_tool
+from utils.helper import UpstreamHTTPError, is_image_chat_request, has_response_image_generation_tool
 from services.content_filter import check_request, request_shape, request_text
 from services.account_request_pacing import AccountReadRetryBudgetInsufficient
 from services.conversation_binding_service import (
@@ -374,6 +374,20 @@ def create_router() -> APIRouter:
                 "code": "CONVERSATION_READ_DEFERRED", "reason": "read_budget_insufficient",
                 "read_sent": False, "retryable": True,
             }) from exc
+        except UpstreamHTTPError as exc:
+            # Preserve the upstream recovery signal for trusted legacy callers;
+            # neither the upstream body nor a locally invented cooldown belongs
+            # in this response. A real upstream error is not a not-sent receipt.
+            if exc.status_code == 429:
+                headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after is not None else None
+                raise HTTPException(status_code=429, detail={
+                    "code": "CONVERSATION_READ_RATE_LIMITED",
+                }, headers=headers) from exc
+            if exc.status_code in {401, 403}:
+                raise HTTPException(status_code=exc.status_code, detail={
+                    "code": "CONVERSATION_READ_AUTH_REQUIRED",
+                }) from exc
+            raise HTTPException(status_code=503, detail={"code": "CONVERSATION_READ_UNAVAILABLE"}) from exc
         except Exception as exc:
             raise HTTPException(status_code=503, detail={"code": "CONVERSATION_READ_UNAVAILABLE"}) from exc
 

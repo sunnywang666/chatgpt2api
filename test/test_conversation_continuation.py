@@ -1711,6 +1711,34 @@ class TextResultRecoveryTests(unittest.TestCase):
             "read_sent": False, "retryable": True,
         })
 
+    def test_admin_cursor_route_preserves_upstream_recovery_classification(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        from utils.helper import UpstreamHTTPError
+
+        app = FastAPI()
+        app.include_router(create_router())
+        for upstream_status, retry_after, expected_status, expected_code in (
+            (429, 45, 429, "CONVERSATION_READ_RATE_LIMITED"),
+            (429, None, 429, "CONVERSATION_READ_RATE_LIMITED"),
+            (401, None, 401, "CONVERSATION_READ_AUTH_REQUIRED"),
+            (403, None, 403, "CONVERSATION_READ_AUTH_REQUIRED"),
+            (502, 45, 503, "CONVERSATION_READ_UNAVAILABLE"),
+        ):
+            with self.subTest(upstream_status=upstream_status, retry_after=retry_after):
+                error = UpstreamHTTPError("read", upstream_status, "private upstream detail", retry_after)
+                with mock.patch("api.ai.require_identity", return_value={"id": "admin", "role": "admin"}), \
+                     mock.patch("api.ai.conversation_binding_service.read_text", side_effect=error) as read:
+                    with TestClient(app) as client:
+                        result = client.get("/api/conversation-bindings/text", params=self.cursor)
+                self.assertEqual(result.status_code, expected_status)
+                self.assertEqual(result.json()["detail"], {"code": expected_code})
+                self.assertEqual(result.headers.get("retry-after"),
+                                 str(retry_after) if upstream_status == 429 and retry_after is not None else None)
+                self.assertNotIn("private upstream detail", result.text)
+                read.assert_called_once_with(self.cursor)
+
     def test_admin_cursor_route_reads_the_same_bound_account(self):
         from fastapi import FastAPI, HTTPException
         from fastapi.testclient import TestClient
