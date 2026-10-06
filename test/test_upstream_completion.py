@@ -688,6 +688,106 @@ def test_websocket_done_wakes_handoff_sse_that_has_not_closed(monkeypatch):
     assert result[-1] == "[DONE]" and calls == [(TOPIC, CID)]
 
 
+@pytest.mark.parametrize("collection_fails", [False, True])
+def test_quiet_handoff_transfers_to_collection_without_waiting_for_listener(monkeypatch, collection_fails):
+    instance, gets, calls = backend(monkeypatch, "timeout")
+    instance.image_request_message_id = "request"
+    instance.account = {"provider_account_identity": "handoff-fixture"}
+    listening, exited = threading.Event(), threading.Event()
+
+    def receive(*args, remaining, **kwargs):
+        listening.set()
+        try:
+            until = time.monotonic() + 3
+            while remaining() > 0 and time.monotonic() < until:
+                time.sleep(.002)
+            return "timeout"
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(completion, "wait_for_turn_done", receive)
+    monkeypatch.setattr(completion, "image_completion_hints",
+                        lambda *a: pytest.fail("must reuse the exact topic, not open a second socket"))
+
+    def payloads():
+        yield json.dumps(HANDOFF)
+        assert listening.wait(1)
+        yield "[DONE]"
+
+    before = time.monotonic()
+    try:
+        assert list(instance._iter_image_completion_payloads(payloads(), CID, before + 60))[-1] == "[DONE]"
+        assert time.monotonic() - before < .5 and not exited.is_set()
+
+        def collect(*args, _completion_wait, **kwargs):
+            assert not _completion_wait(.02, before_first_read=True, max_wait_seconds=1)
+            if collection_fails:
+                raise RuntimeError("controlled original read failure")
+            return "strict-original-read"
+
+        instance._poll_image_results_inner = collect
+        if collection_fails:
+            with pytest.raises(RuntimeError, match="controlled original read failure"):
+                instance._poll_image_results(CID, 20, request_message_id="request")
+        else:
+            assert instance._poll_image_results(CID, 20, request_message_id="request") == "strict-original-read"
+        assert time.monotonic() - before < .5
+        assert exited.is_set() and instance._image_completion_listener is None
+        assert len(gets) == 1
+    finally:
+        instance.close()
+
+
+@pytest.mark.parametrize("notification", ["done", "disconnected"])
+def test_handoff_done_or_disconnect_wakes_strict_collection_without_another_socket(monkeypatch, notification):
+    from services.config import config
+    instance, gets, calls = backend(monkeypatch, notification)
+    instance.image_request_message_id = "request"
+    instance.account = {"provider_account_identity": "handoff-fixture"}
+    monkeypatch.setattr(completion, "image_completion_hints",
+                        lambda *a: pytest.fail("must reuse exact-topic listener"))
+    monkeypatch.setitem(config.data, "image_check_before_hit_enabled", False)
+    reads = []
+    asset = "file_000000001234567890abcdef12345678"
+    document = {"conversation_id": CID, "current_node": "image", "mapping": {
+        "request": {"parent": None, "message": {"id": "request", "author": {"role": "user"}}},
+        "image": {"parent": "request", "message": {"id": "image", "author": {"role": "tool"},
+            "content": {"parts": [{"asset_pointer": "sediment://" + asset}]}}}}}
+    instance._get_conversation = lambda cid: reads.append(cid) or document
+    instance._query_backend_tasks = lambda **kw: pytest.fail("saved result needs no task diagnosis")
+    try:
+        list(instance._iter_image_completion_payloads(iter([json.dumps(HANDOFF), "[DONE]"]), CID, time.monotonic()+60))
+        assert not reads
+        assert instance._poll_image_results(CID, 20, request_message_id="request") == ([asset], [asset])
+        assert reads == [CID] and len(gets) == 1 and calls == [(TOPIC, CID)]
+        assert instance._image_completion_listener is None
+    finally:
+        instance.close()
+
+
+@pytest.mark.parametrize("changed", ["conversation", "request", "snapshot", "close"])
+def test_handoff_cannot_escape_original_attempt_and_unused_listener_is_closed(monkeypatch, changed):
+    instance, gets, calls = backend(monkeypatch, "done")
+    instance.image_request_message_id = "request"
+    list(instance._iter_image_completion_payloads(iter([json.dumps(HANDOFF), "[DONE]"]), CID, time.monotonic()+60))
+    listener = instance._image_completion_listener
+    assert listener is not None
+    instance._poll_image_results_inner = lambda *a, **kw: (
+        pytest.fail("mismatched hint must not wake another original") if "_completion_wait" in kw else "original-only")
+    try:
+        if changed != "close":
+            assert instance._poll_image_results(
+                "other-conversation" if changed == "conversation" else CID, 20,
+                request_message_id="other-request" if changed == "request" else "request",
+                **({"initial_document": {}} if changed == "snapshot" else {})) == "original-only"
+        else:
+            instance.close()
+        assert listener["stopped"].is_set() and not listener["thread"].is_alive()
+        assert instance._image_completion_listener is None
+    finally:
+        instance.close()
+
+
 def test_malformed_item_cannot_keep_connection_alive():
     item = event("stream-item")
     del item["payload"]["payload"]["encoded_item"]

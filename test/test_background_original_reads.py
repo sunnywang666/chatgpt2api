@@ -217,6 +217,17 @@ def test_due_saved_image_joins_fifo_before_read_edge_without_occupying_worker(re
             assert not queued._reserve_archive_read("later-archive", r.clock())
         # Repeated scheduler scans renew the same entry, never spend read credit.
         r.clock.now = 1030
+        for _ in range(4):
+            assert r.admission._original_read_slots.acquire(blocking=False)
+        try:
+            with patch.object(r.admission, "_account_guard", side_effect=AssertionError("full workers need no account lock")):
+                for _ in range(3):
+                    assert not r.admission._dispatch_original_read("image", "owner", "saved-image", read, receipt)
+            queued = pacing.AccountRequestClock(key[:12], path)
+            assert [v["owner"] for v in queued.ordinary_read_queue] == [first_owner, "later-result"]
+        finally:
+            for _ in range(4):
+                r.admission._original_read_slots.release()
         assert not r.admission._dispatch_original_read("image", "owner", "saved-image", read, receipt)
         queued = pacing.AccountRequestClock(key[:12], path)
         assert [v["owner"] for v in queued.ordinary_read_queue] == [first_owner, "later-result"]
@@ -274,7 +285,7 @@ def test_image_recovery_fifo_keeps_cooldown_owner_isolation_and_dead_lease_expir
         assert [v["owner"] for v in pacing.AccountRequestClock(key[:12], path).ordinary_read_queue] == [owners[1]]
 
 
-@pytest.mark.parametrize("blocked", ["workers", "same_conversation", "start_failure", "paused", "suppressed", "new_cooldown"])
+@pytest.mark.parametrize("blocked", ["same_conversation", "start_failure", "paused", "suppressed", "new_cooldown"])
 def test_image_recovery_cancels_undispatched_fifo_place(recovery, tmp_path, blocked):
     import hashlib
     import services.account_request_pacing as pacing
@@ -296,10 +307,7 @@ def test_image_recovery_cancels_undispatched_fifo_place(recovery, tmp_path, bloc
          patch.object(pacing.time, "monotonic", side_effect=r.clock):
         assert pacing.reserve_account_image_recovery_read(account, "owner", "image")
         assert len(pacing.AccountRequestClock(key[:12], path).ordinary_read_queue) == 1
-        if blocked == "workers":
-            for _ in range(4):
-                assert r.admission._original_read_slots.acquire(blocking=False)
-        elif blocked == "same_conversation":
+        if blocked == "same_conversation":
             r.admission._original_reads[physical_conversation_key(receipt)] = ("image", "owner", "other-original")
         elif blocked == "paused":
             receipt["_recovery_paused"] = True
@@ -320,9 +328,6 @@ def test_image_recovery_cancels_undispatched_fifo_place(recovery, tmp_path, bloc
         assert clock.ordinary_read_queue == []
         if blocked == "new_cooldown":
             assert clock.cooldown_until == 1120
-        if blocked == "workers":
-            for _ in range(4):
-                r.admission._original_read_slots.release()
         r.admission._original_reads.clear()
         assert r.admission._original_read_slots.acquire(blocking=False)
         r.admission._original_read_slots.release()

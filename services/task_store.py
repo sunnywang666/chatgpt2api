@@ -220,7 +220,7 @@ class TaskStore:
 
     @staticmethod
     def receipts(db, *, statuses=None, include_pending_completion=False, include_upstream_unfinished=False,
-                 conversation_id=None, work_key=None):
+                 conversation_id=None, work_key=None, include_automatic_completion=False):
         # A scheduler may prefilter candidates before decoding saved image
         # payloads. Keep full receipts and the caller's authoritative predicates;
         # public reads, lineage and admission still use the unfiltered default.
@@ -232,6 +232,11 @@ class TaskStore:
         if include_pending_completion:
             conditions.append("(json_type(receipt,'$._completion')='object' AND "
                               "coalesce(json_extract(receipt,'$._completion.state'),'') NOT IN ('completed','result_ready'))")
+        if include_automatic_completion:
+            conditions.append("(json_extract(receipt,'$._automatic_generation_recovery')=1 AND "
+                              "coalesce(json_type(receipt,'$._completion'),'null')='null' AND "
+                              "json_extract(receipt,'$._completion_of') IS NULL AND "
+                              "json_extract(receipt,'$.status') IN ('unknown','failed','error'))")
         if include_upstream_unfinished:
             # Legacy terminal-looking receipts can still reserve a physical
             # turn. A status prefilter must not hide their unfinished marker.

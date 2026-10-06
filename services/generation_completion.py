@@ -620,9 +620,19 @@ class GenerationCompletionService:
     def process_one(self, *, dispatch=None):
         # Only newly accepted pure-generation requests opt into the automatic
         # policy. Upgrading never silently replays historical UNKNOWN receipts.
-        with self.store.transaction() as db:
-            for kind, owner, rid, row in self.store.receipts(
-                    db, statuses=("unknown", "failed", "error"), include_pending_completion=True):
+        # Historical failures need no writer lock (or full Python payload
+        # decode). Discover only opted-in/pending work under a read snapshot,
+        # then recheck each identity in its own short transaction. Admission
+        # and result persistence can proceed between independent completions.
+        with self.store.connect() as db:
+            identities = [(kind, owner, rid) for kind, owner, rid, row in self.store.receipts(
+                db, statuses=(), include_pending_completion=True, include_automatic_completion=True)
+                if not row.get("_recovery_paused") and not row.get("_recovery_suppressed")]
+        for kind, owner, rid in identities:
+            with self.store.transaction() as db:
+                row = self.store.read_receipt(db, kind, owner, rid)
+                if row is None:
+                    continue
                 if (row.get("_automatic_generation_recovery") and not row.get("_completion")
                         and not row.get("_completion_of") and row.get("status") in {"unknown", "failed", "error"}
                         and not row.get("_recovery_paused") and not row.get("_recovery_suppressed")):

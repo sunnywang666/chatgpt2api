@@ -296,6 +296,7 @@ class OpenAIBackendAPI:
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        self._release_image_completion_listener()
         session = getattr(self, "session", None)
         if session:
             try:
@@ -2607,6 +2608,33 @@ class OpenAIBackendAPI:
         account = getattr(self, "account", None) or {}
         identity = account.get("provider_account_identity")
         cid = args[0] if args else kwargs.get("conversation_id")
+        handoff = getattr(self, "_image_completion_listener", None)
+        self._image_completion_listener = None
+        if handoff is not None:
+            try:
+                if (handoff["conversation_id"] == cid and kwargs.get("initial_document") is None
+                        and handoff["request_message_id"] == kwargs.get("request_message_id", "")):
+                    consumed = False
+                    first_wait = True
+
+                    def wait(seconds, *, before_first_read=False, max_wait_seconds=None):
+                        nonlocal consumed, first_wait
+                        seconds = min(seconds, max_wait_seconds) if max_wait_seconds is not None else seconds
+                        was_finished = handoff["finished"].is_set()
+                        handoff["finished"].wait(max(0.0, seconds))
+                        notified = handoff["outcome"].get("result") == "done" and not consumed
+                        if notified:
+                            consumed = True
+                        elif was_finished and not first_wait:
+                            # A disconnected/consumed listener is not a signal
+                            # for a tight GET loop. Keep the normal fallback.
+                            time.sleep(max(0.0, seconds))
+                        first_wait = False
+                        return notified
+
+                    return self._poll_image_results_inner(*args, **kwargs, _completion_wait=wait)
+            finally:
+                self._release_image_completion_listener(handoff)
         # Recovery's single already-read snapshot never waits; it needs no
         # socket. Unauthenticated/controlled transports retain their old path.
         if not identity or not cid or kwargs.get("initial_document") is not None:
@@ -2616,6 +2644,14 @@ class OpenAIBackendAPI:
         from services.upstream_completion import image_completion_hints
         with image_completion_hints(identity, cid, lambda: self._open_image_notification_transport(deadline)) as wait:
             return self._poll_image_results_inner(*args, **kwargs, _completion_wait=wait)
+
+    def _release_image_completion_listener(self, handoff=None):
+        if handoff is None:
+            handoff = getattr(self, "_image_completion_listener", None)
+            self._image_completion_listener = None
+        if handoff is not None:
+            handoff["stopped"].set()
+            handoff["thread"].join(timeout=1)
 
     def _poll_image_results_inner(
             self,
@@ -3326,6 +3362,7 @@ class OpenAIBackendAPI:
         from services.upstream_completion import handoff_topic, wait_for_turn_done
         from services.request_context import current_request
 
+        self._release_image_completion_listener()
         stopped = threading.Event()
         finished = threading.Event()
         outcome = {}
@@ -3333,6 +3370,7 @@ class OpenAIBackendAPI:
         conversation_changed = False
         sse_done = False
         terminal_message = False
+        transferred = False
 
         def observe(stage):
             context = current_request.get()
@@ -3415,25 +3453,30 @@ class OpenAIBackendAPI:
                 if outcome.get("result") != "done" or stopped.is_set():
                     raise
             if listener is not None and not stopped.is_set():
-                # If SSE handed off then closed naturally, wait for the same
-                # listener. This is event waiting, not repeated upstream GETs.
-                while not finished.wait(0.5):
-                    self._image_active_timeout(max(0.001, deadline - time.monotonic()))
-                    if time.monotonic() >= deadline:
-                        break
+                # SSE may close before the image tool. Hand the same exact
+                # topic to strict collection instead of waiting here for up
+                # to 60 seconds, then starting another notification socket.
+                # Done only wakes a read; it never certifies an image result.
+                self._image_completion_listener = {
+                    "conversation_id": conversation_id,
+                    "request_message_id": str(getattr(self, "image_request_message_id", "") or ""),
+                    "finished": finished, "outcome": outcome, "stopped": stopped, "thread": listener,
+                }
+                transferred = True
                 if outcome.get("result") == "done":
                     observe("upstream_completion_signal")
                     sse_done = True
-                else:
+                elif finished.is_set():
                     observe("upstream_completion_fallback")
             if sse_done:
                 yield "[DONE]"
         finally:
-            stopped.set()
+            if not transferred:
+                stopped.set()
             close = getattr(payloads, "close", None)
             if callable(close):
                 close()
-            if listener is not None:
+            if listener is not None and not transferred:
                 listener.join(timeout=1)
 
     def _iter_sse_payloads_capped(

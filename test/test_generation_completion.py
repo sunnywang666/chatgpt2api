@@ -1,6 +1,7 @@
 """Controlled pure-generation recovery; these are not real upstream samples."""
 import copy
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
@@ -106,6 +107,49 @@ def setup(tmp_path, monkeypatch):
 
 def start(service, kind="text", rid="old-0"):
     return service.start(kind, IDENTITY, rid, allow_unconfirmed_retry=True)
+
+
+def test_completion_discovery_leaves_writer_free_and_rechecks_concurrent_pause(setup, monkeypatch):
+    service, admission, calls = setup
+    patch_row(service, _automatic_generation_recovery=True)
+    with service.store.transaction() as db:
+        for index in range(200):
+            rid = f"historical-failure-{index}"
+            service.store.write_receipt(db, "image", "owner", rid, {
+                "id": rid, "owner_id": "owner", "status": "error", "upstream_outcome": "rejected",
+                "error_code": "IMAGE_CONTENT_POLICY", "data": [{"b64_json": "fixture" * 1000}]})
+    scanned, release = threading.Event(), threading.Event()
+    receipts = service.store.receipts
+    discovered = []
+    first = True
+
+    def snapshot(db, **kwargs):
+        nonlocal first
+        rows = list(receipts(db, **kwargs))
+        if first:
+            first = False
+            discovered.extend((kind, rid) for kind, _, rid, _ in rows)
+            scanned.set()
+            assert release.wait(3)
+        yield from rows
+
+    monkeypatch.setattr(service.store, "receipts", snapshot)
+    service.advance = Mock(side_effect=AssertionError("paused work must not advance"))
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        scan = workers.submit(service.process_one)
+        try:
+            assert scanned.wait(1)
+            # A paused read snapshot must not own SQLite's writer lock.
+            update = workers.submit(patch_row, service, _recovery_paused=True)
+            update.result(timeout=1)
+        finally:
+            release.set()
+        scan.result(timeout=2)
+    assert discovered == [("text", "old-0")]
+    assert row(service)["_recovery_paused"] is True
+    assert not row(service).get("_completion")
+    service.advance.assert_not_called()
+    assert calls == []
 
 
 def ended_original(service):

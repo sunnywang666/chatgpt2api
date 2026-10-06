@@ -404,9 +404,11 @@ class PoolAdmission:
     def _dispatch_original_read(self, kind, owner, request_id, function, receipt):
         if self._stop.is_set():
             return False
-        with self._account_guard():
-            account = next((a for a in self._rows()
-                            if a.get("provider_account_identity") == receipt.get("provider_account_identity")), None)
+        account = None
+        def selected_account():
+            with self._account_guard():
+                return next((a for a in self._rows()
+                             if a.get("provider_account_identity") == receipt.get("provider_account_identity")), None)
         def cancel_reservation():
             if kind == "image" and account is not None and self.pacing is None:
                 from services.account_request_pacing import release_account_image_recovery_read
@@ -425,8 +427,12 @@ class PoolAdmission:
             if not denied:
                 self._original_reads[key] = identity
         if denied:
-            # A duplicate scan must not cancel the active original's GET.
-            if active != identity:
+            # Unrelated busy workers must not discard a due original's FIFO
+            # place. Nor should a full scan contend for the account lock when
+            # no I/O can start. Only a different turn in this same conversation
+            # supersedes this reservation.
+            if active is not None and active != identity:
+                account = selected_account()
                 cancel_reservation()
             return False
 
@@ -446,6 +452,7 @@ class PoolAdmission:
 
         started = keep_reservation = False
         try:
+            account = selected_account()
             if recovery_suppressed(receipt) or receipt.get("_recovery_paused") is True:
                 return False
             if account is not None:
