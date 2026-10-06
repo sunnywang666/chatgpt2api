@@ -25,6 +25,7 @@ class FakeImageTaskService:
         self.resume_calls = []
         self.adoption_calls = []
         self.manual_recovery_calls = []
+        self.failure_continuation_calls = []
 
     def submit_generation(self, identity, **kwargs):
         self.generation_calls.append((identity, kwargs))
@@ -95,6 +96,18 @@ class FakeImageTaskService:
             "created_at": "2026-01-01 00:00:00",
             "updated_at": "2026-01-01 00:00:00",
             "data": [{"url": "http://testserver/images/manual.png"}],
+        }
+
+    def failure_continuation(self, identity, task_id):
+        self.failure_continuation_calls.append((identity, task_id))
+        return {
+            "source_task_id": task_id,
+            "source_request_message_id": "request-1",
+            "provider_binding_id": "binding-1",
+            "provider_account_identity": "account-1",
+            "client_conversation_id": "client-1",
+            "conversation_id": "conversation-1",
+            "parent_message_id": "terminal-1",
         }
 
 
@@ -334,6 +347,35 @@ class ImageTasksApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
         self.assertEqual(payload["missing_ids"], ["missing"])
+
+    def test_list_failure_continuation_requires_one_explicit_id_and_keeps_default_list_unchanged(self):
+        default = self.client.get("/api/image-tasks?ids=task-1", headers=AUTH_HEADERS)
+        self.assertEqual(default.status_code, 200, default.text)
+        self.assertNotIn("failure_continuation", default.json()["items"][0])
+        self.assertEqual(self.fake_service.failure_continuation_calls, [])
+        for query in ("include_failure_continuation=true", "ids=task-1,task-2&include_failure_continuation=true"):
+            response = self.client.get("/api/image-tasks?" + query, headers=AUTH_HEADERS)
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(response.json()["detail"]["code"], "EXACTLY_ONE_IMAGE_TASK_ID_REQUIRED")
+        response = self.client.get(
+            "/api/image-tasks?ids=task-1&include_failure_continuation=true", headers=AUTH_HEADERS
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["items"][0]["failure_continuation"]["parent_message_id"], "terminal-1")
+        self.assertEqual(self.fake_service.failure_continuation_calls, [(
+            {"id": "test-key", "name": "Test", "role": "admin"}, "task-1"
+        )])
+
+    def test_list_failure_continuation_preserves_upstream_rate_limit(self):
+        error = ImageThreadError("RECOVERY_RATE_LIMITED", status=429)
+        error.retry_after = 12
+        with mock.patch.object(self.fake_service, "failure_continuation", side_effect=error):
+            response = self.client.get(
+                "/api/image-tasks?ids=task-1&include_failure_continuation=true", headers=AUTH_HEADERS
+            )
+        self.assertEqual(response.status_code, 429, response.text)
+        self.assertEqual(response.headers["Retry-After"], "12")
+        self.assertEqual(response.json()["detail"]["code"], "RECOVERY_RATE_LIMITED")
 
 
 if __name__ == "__main__":

@@ -133,6 +133,58 @@ class AdoptionBackend:
         return None
 
 
+def failure_cursor_document(*, change=None):
+    mapping = {
+        "anchor": {
+            "message": {"author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True},
+        },
+        "original-request": {
+            "parent": "anchor",
+            "message": {"id": "original-request", "author": {"role": "user"}},
+        },
+        "fresh-terminal": {
+            "parent": "original-request",
+            "message": {
+                "id": "fresh-terminal", "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True,
+                "content": {"content_type": "text", "parts": ["Image request blocked."]},
+            },
+        },
+    }
+    document = {"conversation_id": "conversation-1", "current_node": "fresh-terminal", "mapping": mapping,
+                "is_archived": False}
+    if change == "later_user":
+        mapping["later-user"] = {"parent": "fresh-terminal", "message": {"author": {"role": "user"}}}
+        document["current_node"] = "later-user"
+    elif change == "branch":
+        mapping["sibling"] = {"parent": "original-request", "message": {"author": {"role": "assistant"}}}
+    elif change == "imageasset":
+        mapping["fresh-terminal"]["message"]["content"] = {"content_type": "image_asset_pointer", "asset_pointer": "file-service://generated"}
+    elif change == "running":
+        mapping["fresh-terminal"]["message"].update(status="in_progress", end_turn=False)
+    elif change == "wrongchat":
+        document["conversation_id"] = "other-conversation"
+    return document
+
+
+class FailureCursorBackend:
+    document = failure_cursor_document()
+    reads = 0
+
+    def __init__(self, access_token=None, proxy_url=None):
+        self.access_token = access_token
+
+    def _get_conversation(self, _conversation_id):
+        type(self).reads += 1
+        return type(self).document
+
+    @staticmethod
+    def _has_image_asset_pointer(payload):
+        return OpenAIBackendAPI._has_image_asset_pointer(payload)
+
+    def close(self):
+        return None
+
+
 def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_id: str, status: str, timeout: float = 2.0):
     deadline = time.time() + timeout
     last = None
@@ -146,6 +198,104 @@ def wait_for_task(service: ImageTaskService, identity: dict[str, object], task_i
 
 
 class ImageTaskServiceTests(unittest.TestCase):
+    def test_failure_continuation_returns_only_fresh_exact_terminal_cursor_without_mutating_receipt(self):
+        cases = (
+            (None, {}, True),
+            (None, {"error_code": "NO_IMAGE_GENERATED"}, True),
+            ("later_user", {}, False),
+            ("branch", {}, False),
+            ("wrongchat", {}, False),
+            ("imageasset", {}, False),
+            ("running", {}, False),
+            (None, {"error_code": "CONVERSATION_OUTCOME_UNKNOWN", "upstream_unfinished": True}, False),
+            (None, {"request_message_id": ""}, False),
+        )
+        for change, overrides, eligible in cases:
+            with self.subTest(change=change, overrides=overrides), tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / "image_tasks.json"
+                write_policy_task(path, **overrides)
+                service = self.make_service(path)
+                if change is None and eligible:
+                    # An expired scheduler claim is evidence to recover, not
+                    # an active writer. The task itself is terminal.
+                    with service._transaction():
+                        task = service._tasks["owner-1:policy-task"]
+                        task.update(
+                            _claim_id="expired-claim",
+                            _claim_until=time.time() - 1,
+                            request_parent_message_id="anchor",
+                        )
+                        service._save_locked()
+                FailureCursorBackend.document = failure_cursor_document(change=change)
+                FailureCursorBackend.reads = 0
+                with (
+                    mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="read-token"),
+                    mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", FailureCursorBackend),
+                ):
+                    with service.store.connect() as db:
+                        before = service.store.read_receipt(db, "image", OWNER["id"], "policy-task")
+                    result = service.failure_continuation(OWNER, "policy-task")
+                    with service.store.connect() as db:
+                        after = service.store.read_receipt(db, "image", OWNER["id"], "policy-task")
+                self.assertEqual(after, before)
+                if eligible:
+                    self.assertEqual(result, {
+                        "source_task_id": "policy-task",
+                        "source_request_message_id": "original-request",
+                        "provider_binding_id": "binding-1",
+                        "provider_account_identity": "account-1",
+                        "client_conversation_id": "client-chat-1",
+                        "conversation_id": "conversation-1",
+                        "parent_message_id": "fresh-terminal",
+                    })
+                    self.assertEqual(FailureCursorBackend.reads, 1)
+                else:
+                    self.assertIsNone(result)
+
+    def test_failure_continuation_refuses_account_change_without_provider_read(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            FailureCursorBackend.document = failure_cursor_document()
+            FailureCursorBackend.reads = 0
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="other-account"),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", FailureCursorBackend),
+            ):
+                self.assertIsNone(service.failure_continuation(OWNER, "policy-task"))
+            self.assertEqual(FailureCursorBackend.reads, 0)
+
+    def test_failure_continuation_refuses_an_active_terminal_claim_or_reserved_turn(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path)
+            service = self.make_service(path)
+            FailureCursorBackend.document = failure_cursor_document()
+            FailureCursorBackend.reads = 0
+            with service._transaction():
+                task = service._tasks["owner-1:policy-task"]
+                task.update(_claim_id="live-claim", _claim_until=time.time() + 60)
+                service._save_locked()
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", FailureCursorBackend),
+            ):
+                self.assertIsNone(service.failure_continuation(OWNER, "policy-task"))
+            self.assertEqual(FailureCursorBackend.reads, 0)
+            with service._transaction():
+                task = service._tasks["owner-1:policy-task"]
+                task.update(_claim_id="expired-claim", _claim_until=time.time() - 1, _turn_reserved=True)
+                service._save_locked()
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", FailureCursorBackend),
+            ):
+                self.assertIsNone(service.failure_continuation(OWNER, "policy-task"))
+            self.assertEqual(FailureCursorBackend.reads, 0)
+
     def test_attachment_download_observations_are_bounded_and_follow_actual_bytes(self):
         from services.request_context import executing
         for failure in (False, True):

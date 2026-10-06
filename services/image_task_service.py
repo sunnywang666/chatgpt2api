@@ -795,6 +795,137 @@ class ImageTaskService:
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
 
+    def failure_continuation(self, identity: dict[str, object], task_id: str) -> dict[str, str] | None:
+        """Return one fresh, exact failure cursor without changing its receipt.
+
+        This is deliberately narrower than recovery.  It reads only the named
+        terminal policy failure, keeps the original receipt untouched, and
+        refuses any branch with an asset, active turn, later user turn, or
+        branch fork.
+        """
+        owner = _owner_id(identity)
+        key = _task_key(owner, _clean(task_id))
+        with self._transaction():
+            task = self._tasks.get(key)
+            if not task:
+                return None
+            live_claim = (
+                bool(task.get("_claim_id"))
+                and float(task.get("_claim_until") or 0) > time.time()
+            )
+            if (
+                task.get("status") != TASK_STATUS_ERROR
+                or _clean(task.get("error_code")).lower() not in {
+                    "content_policy_violation", "no_image_generated",
+                }
+                or task.get("upstream_unfinished") is not False
+                or _clean(task.get("upstream_outcome")).lower() in {"unknown", "generated"}
+                or _clean(task.get("binding_status")).lower() != "bound"
+                or task.get("_recovery_paused") is True
+                or task.get("_recovery_suppressed") is True
+                or task.get("_executing") is True
+                or task.get("recovery_claim_id")
+                or live_claim
+                or task.get("_turn_reserved") is True
+                or task.get("waiting")
+                or any(task.get(field) for field in (
+                    "data", "result_file_ids", "result_sediment_ids",
+                    "_pending_image_result_ids", "_pending_image_output",
+                    "adopted_source_request_message_id", "adopted_source_image_message_id",
+                ))
+            ):
+                return None
+            if task.get("_completion"):
+                return None
+            fields = (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id",
+                "conversation_id", "request_message_id",
+            )
+            snapshot = {field: _clean(task.get(field)) for field in fields}
+            for field in ("request_parent_message_id", "_image_thread_request_parent"):
+                if _clean(task.get(field)):
+                    snapshot[field] = _clean(task.get(field))
+            if not all(snapshot.values()):
+                return None
+
+        from services.account_service import account_service
+        from services.generation_completion import retry_cursor
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        try:
+            if account_service.get_bound_account_identity(snapshot["provider_binding_id"]) != snapshot["provider_account_identity"]:
+                return None
+            access_token = account_service.get_bound_text_access_token(
+                snapshot["provider_binding_id"], model="auto"
+            )
+        except Exception as exc:
+            status = _upstream_status_code(exc)
+            if status == 429:
+                error = ImageThreadError("RECOVERY_RATE_LIMITED", status=429)
+                error.retry_after = _retry_after_seconds(exc)
+                raise error from exc
+            raise ImageThreadError(
+                "RECOVERY_AUTH_REQUIRED" if status in {401, 403} else "RECOVERY_READ_FAILED",
+                status=503,
+            ) from exc
+
+        backend = None
+        try:
+            with account_service.conversation_binding_lock(
+                snapshot["provider_binding_id"], snapshot["client_conversation_id"]
+            ):
+                # Recheck authority after taking the same conversation lock as
+                # submission; the account may have rotated while we waited.
+                if account_service.get_bound_account_identity(snapshot["provider_binding_id"]) != snapshot["provider_account_identity"]:
+                    return None
+                backend = OpenAIBackendAPI(access_token=access_token)
+                document = backend._get_conversation(snapshot["conversation_id"])
+                if (
+                    not isinstance(document, dict)
+                    or _clean(document.get("conversation_id")) not in {"", snapshot["conversation_id"]}
+                ):
+                    return None
+                proof = retry_cursor(document, snapshot, kind="image")
+                if not proof:
+                    return None
+                mapping = document.get("mapping")
+                head = _clean(document.get("current_node"))
+                node = mapping.get(head) if isinstance(mapping, dict) else None
+                message = node.get("message") if isinstance(node, dict) else None
+                author = message.get("author") if isinstance(message, dict) else None
+                if (
+                    not isinstance(author, dict)
+                    or _clean(author.get("role")).lower() != "assistant"
+                    or _clean(message.get("status")) != "finished_successfully"
+                    or message.get("end_turn") is not True
+                    or _clean(message.get("id")) != head
+                ):
+                    return None
+                return {
+                    "source_task_id": _clean(task_id),
+                    "source_request_message_id": snapshot["request_message_id"],
+                    "provider_binding_id": snapshot["provider_binding_id"],
+                    "provider_account_identity": snapshot["provider_account_identity"],
+                    "client_conversation_id": snapshot["client_conversation_id"],
+                    "conversation_id": snapshot["conversation_id"],
+                    "parent_message_id": proof["retry_parent_message_id"],
+                }
+        except ImageThreadError:
+            raise
+        except Exception as exc:
+            status = _upstream_status_code(exc)
+            if status == 429:
+                error = ImageThreadError("RECOVERY_RATE_LIMITED", status=429)
+                error.retry_after = _retry_after_seconds(exc)
+                raise error from exc
+            raise ImageThreadError(
+                "RECOVERY_AUTH_REQUIRED" if status in {401, 403} else "RECOVERY_READ_FAILED",
+                status=503,
+            ) from exc
+        finally:
+            if backend is not None:
+                backend.close()
+
     def set_thread_archived(self, identity: dict[str, object], task_id: str, archived: bool) -> dict[str, Any]:
         """Change only the owner's latest, fully recovered image conversation."""
         from services.account_service import account_service
