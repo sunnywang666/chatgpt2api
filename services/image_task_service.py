@@ -502,9 +502,13 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
     from services.openai_backend_api import OpenAIBackendAPI
     for message_id in path[request_index + 1:]:
         message = (mapping[message_id].get("message") or {})
-        if OpenAIBackendAPI._has_image_asset_pointer({
+        if not isinstance(message, dict):
+            return ""
+        output = {
             "content": message.get("content"), "metadata": message.get("metadata"),
-        }):
+        }
+        files, sediments = OpenAIBackendAPI._extract_image_reference_ids(output)
+        if files or sediments or OpenAIBackendAPI._has_image_asset_pointer(output):
             return ""
     return text
 

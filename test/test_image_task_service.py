@@ -1647,14 +1647,14 @@ class ImageTaskServiceTests(unittest.TestCase):
     def test_complete_final_recovery_reuses_proof_but_tool_leaf_keeps_publication_check(self):
         from copy import deepcopy
         from services.config import config
-        for case in ("complete", "new_second_image", "partial_download", "final_external_successor", "download_failure", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed", "settle_failure", "settle_failure_with_asset"):
+        for case in ("complete", "new_second_image", "partial_download", "final_external_successor", "download_failure", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed", "settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp_dir:
                 path = Path(tmp_dir) / "tasks.json"
                 write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", error="",
                     upstream_unfinished=True, _image_thread={"protocol": "image-thread-v1"},
                     _image_thread_request_parent="anchor",
                     **({"_pending_image_result_ids": {"file_ids": ["missing" if case == "pending_missing" else "original-image"], "sediment_ids": []}}
-                       if case in ("pending_missing", "new_second_image", "settle_failure", "settle_failure_with_asset") else {}))
+                       if case in ("pending_missing", "new_second_image", "settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset") else {}))
                 service = self.make_service(path)
                 service._update_task("owner-1:policy-task", _image_thread={"id": "original-thread"},
                                      _image_thread_request_parent="anchor")
@@ -1668,7 +1668,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                     "final": {"parent": "image", "message": {"id": "final", "author": {"role": "assistant"},
                         "status": "finished_successfully", "end_turn": True}}}}
                 if case == "parent_changed": document["mapping"]["original-request"]["parent"] = "other"
-                if case in ("running", "settle_failure", "settle_failure_with_asset"): document["mapping"]["final"]["message"]["status"] = "in_progress"
+                if case in ("running", "settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset"): document["mapping"]["final"]["message"]["status"] = "in_progress"
                 if case == "post_download_changed":
                     # A finished tool leaf is weaker than a complete assistant
                     # final: keep the original late-drift rejection regression.
@@ -1677,6 +1677,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                     document['mapping']['image']['parent'] = 'code'
                     del document['mapping']['final']
                     document['current_node'] = 'image'
+                if case == "settle_failure_with_string_asset":
+                    document["mapping"]["image"]["message"]["content"]["parts"] = ["file-service://original-image"]
                 expected_files = ["original-image"]
                 if case in ("new_second_image", "partial_download"):
                     expected_files.append("second-image")
@@ -1695,7 +1697,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                         result = deepcopy(document)
                         if case == "post_download_changed" and calls["read"] > 1:
                             result["mapping"]["original-request"]["parent"] = "other"
-                        if case in ("settle_failure", "settle_failure_with_asset") and calls["read"] > 1:
+                        if case in ("settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset") and calls["read"] > 1:
                             result["mapping"]["final"]["message"].update(status="finished_successfully",
                                 content={"content_type": "text", "parts": ["Something went wrong while generating your image."]})
                             if case == "settle_failure":
@@ -1704,7 +1706,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                     def _poll_image_results(self, cid, timeout, **kwargs):
                         calls["poll"] += 1
                         expected_document = deepcopy(document)
-                        if case == "settle_failure_with_asset":
+                        if case in ("settle_failure_with_asset", "settle_failure_with_string_asset"):
                             expected_document["mapping"]["final"]["message"].update(status="finished_successfully",
                                 content={"content_type": "text", "parts": ["Something went wrong while generating your image."]})
                         self_test.assertEqual(kwargs["initial_document"], expected_document)
@@ -1756,8 +1758,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                     observe.assert_called_once_with()
                     sleep.assert_not_called()
                 else:
-                    self.assertEqual(calls, {"read": 2 if case in ("pending_missing", "settle_failure", "settle_failure_with_asset") else 1, "poll": 0 if case in ("read_429", "settle_failure") else 1, "download": 0})
-                    if case in ("pending_missing", "settle_failure", "settle_failure_with_asset"): sleep.assert_called_once_with(30)
+                    self.assertEqual(calls, {"read": 2 if case in ("pending_missing", "settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset") else 1, "poll": 0 if case in ("read_429", "settle_failure") else 1, "download": 0})
+                    if case in ("pending_missing", "settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset"): sleep.assert_called_once_with(30)
                     else: sleep.assert_not_called()
                     observe.assert_not_called()
                 if case in ("complete", "new_second_image", "partial_download", "final_external_successor"):
@@ -1774,7 +1776,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                     if case == "settle_failure":
                         self.assertEqual(row["error_code"], "NO_IMAGE_GENERATED")
                         self.assertEqual(row["upstream_outcome"], "failed")
-                    if case == "settle_failure_with_asset":
+                    if case in ("settle_failure_with_asset", "settle_failure_with_string_asset"):
                         self.assertEqual(row["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
                         self.assertEqual(row["_pending_image_result_ids"]["file_ids"], ["original-image"])
 
@@ -3139,9 +3141,12 @@ class ImageTaskServiceTests(unittest.TestCase):
             _authoritative_image_failure(document, "request-1"),
             "Something went wrong while generating your image. Sorry about that.",
         )
-        document["mapping"]["assistant-1"]["message"]["metadata"] = {
-            "asset_pointer": "file-service://file-generated-before-failure"}
-        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+        for asset in ({"asset_pointer": "file-service://file-generated-before-failure"},
+                      {"result": "file-service://file-generated-before-failure"},
+                      {"result": "sediment://existing-result"},
+                      {"result": "file_000000001234567890abcdef12345678"}):
+            document["mapping"]["assistant-1"]["message"]["metadata"] = asset
+            self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
         del document["mapping"]["assistant-1"]["message"]["metadata"]
         document["mapping"]["assistant-1"]["message"]["status"] = "in_progress"
         self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
@@ -3558,6 +3563,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             class FakeBackend:
                 _has_image_asset_pointer = staticmethod(RealBackend._has_image_asset_pointer)
+                _extract_image_reference_ids = staticmethod(RealBackend._extract_image_reference_ids)
                 def __init__(self, access_token=None, proxy_url=None):
                     self.access_token = access_token
 
