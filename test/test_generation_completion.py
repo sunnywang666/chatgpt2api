@@ -677,6 +677,47 @@ def test_admin_image_completion_only_reads_its_legacy_original(failed_unsent_ima
     assert text_rejected.status_code == 403
 
 
+def test_admin_image_completion_does_not_queue_a_proven_not_sent_original(failed_unsent_image, monkeypatch):
+    import api.generation_completion as api
+
+    service = failed_unsent_image
+    admin_identity = {"id": "admin", "role": "admin", "external_image_client": True}
+    with service.store.transaction() as db:
+        receipt = service.store.read_receipt(db, "image", "owner", "repair-image")
+        source = service.store.load_input(receipt["_input_ref"])
+        source["identity"] = admin_identity
+        receipt.update(owner_id="admin", _input_ref=service.store.save_input(source))
+        receipt.pop("_completion", None)
+        service.store.write_receipt(db, "image", "admin", "repair-image", receipt)
+        db.execute("DELETE FROM image_requests WHERE task_key=?", ("owner:repair-image",))
+
+    monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
+    monkeypatch.setattr(api, "require_identity", lambda _authorization, request: admin_identity)
+    monkeypatch.setattr(api, "require_image_policy", lambda *a, **kw: None)
+    wake = Mock()
+    monkeypatch.setattr(service.text.admission, "wake", wake)
+    original_read = Mock()
+    service.images.resume_poll = original_read
+    app = FastAPI()
+    app.include_router(api.create_router("image"))
+    client = TestClient(app)
+
+    response = client.post("/api/image-tasks/repair-image/completion", headers={"Authorization": "admin"},
+                           json={"action": "recover", "allow_unconfirmed_retry": False})
+    assert response.status_code == 200, response.text
+    original_read.assert_not_called()
+    wake.assert_not_called()
+    with service.store.connect() as db:
+        current = service.store.read_receipt(db, "image", "admin", "repair-image")
+        assert current["status"] == "error"
+        assert current["upstream_outcome"] == "not_submitted"
+        assert current["_completion"]["reason"] == "COMPLETION_ORIGINAL_ONLY"
+        assert current["_completion"]["max_extra_requests"] == 0
+        assert "replacement_id" not in current["_completion"]
+        assert db.execute("SELECT count(*) FROM image_requests WHERE task_key LIKE 'admin:%'").fetchone()[0] == 1
+    assert service.text.admission.claim_next() is None
+
+
 def test_api_owner_isolation_and_explicit_saved_reviewed_ack(setup, monkeypatch):
     import api.generation_completion as api
     service, admission, calls = setup
