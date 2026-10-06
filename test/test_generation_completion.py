@@ -8,6 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from api.external_images import external_image_boundary
 from services.generation_completion import GenerationCompletionService, CompletionError
 from services.image_task_service import ImageTaskService
 from services.request_context import current_request, AdmissionLost, executing
@@ -585,11 +586,14 @@ def test_explicit_unsent_repair_rejects_missing_original_input(failed_unsent_ima
 
 def test_image_repair_api_owner_and_exact_failure_contract(failed_unsent_image, monkeypatch):
     import api.generation_completion as api
+    import api.external_images as external_images
     service = failed_unsent_image
     monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
     monkeypatch.setattr(api, "require_identity", lambda authorization, request: {**IDENTITY, "id": authorization or "other"})
+    monkeypatch.setattr(external_images, "require_identity", lambda authorization, request: {**IDENTITY, "id": authorization or "other"})
     monkeypatch.setattr(api, "require_image_policy", lambda *a, **kw: None)
     app = FastAPI()
+    app.middleware("http")(external_image_boundary)
     app.include_router(api.create_router("image"))
     client = TestClient(app)
     endpoint = "/api/image-tasks/repair-image/completion"
@@ -604,6 +608,7 @@ def test_image_repair_api_owner_and_exact_failure_contract(failed_unsent_image, 
 
 def test_admin_image_completion_only_reads_its_legacy_original(failed_unsent_image, monkeypatch):
     import api.generation_completion as api
+    import api.external_images as external_images
 
     service = failed_unsent_image
     admin_identity = {"id": "admin", "role": "admin", "external_image_client": True}
@@ -631,14 +636,35 @@ def test_admin_image_completion_only_reads_its_legacy_original(failed_unsent_ima
         api, "require_identity",
         lambda authorization, request: admin_identity if authorization == "admin" else {**IDENTITY, "id": authorization or "other"},
     )
+    monkeypatch.setattr(
+        external_images, "require_identity",
+        lambda authorization, request: admin_identity if authorization == "admin" else {**IDENTITY, "id": authorization or "other"},
+    )
     monkeypatch.setattr(api, "require_image_policy", lambda *a, **kw: None)
     original_read = Mock()
     service.images.resume_poll = original_read
     app = FastAPI()
+    app.middleware("http")(external_image_boundary)
     app.include_router(api.create_router("image"))
     app.include_router(api.create_router("text"))
     client = TestClient(app)
     image_endpoint = "/api/image-tasks/repair-image/completion"
+
+    public_rejected = client.post(
+        image_endpoint,
+        headers={"Authorization": "admin", "X-Workbench-Image-Client": "1"},
+        json={"action": "recover", "allow_unconfirmed_retry": False},
+    )
+    assert public_rejected.status_code == 403, public_rejected.text
+    original_read.assert_not_called()
+
+    oversized = client.post(
+        image_endpoint, headers={"Authorization": "admin"},
+        json={"action": "recover", "padding": "x" * 1024},
+    )
+    assert oversized.status_code == 413, oversized.text
+    assert oversized.json()["detail"]["code"] == "COMPLETION_BODY_TOO_LARGE"
+    original_read.assert_not_called()
 
     response = client.post(
         image_endpoint, headers={"Authorization": "admin"},
