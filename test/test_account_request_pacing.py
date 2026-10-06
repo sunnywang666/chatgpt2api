@@ -1064,6 +1064,23 @@ class AccountRequestPacingTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(started), 2)
 
+    def test_archive_patch_http_spacing_does_not_restart_the_read_pipeline(self):
+        from services.request_context import guarding_archive
+        now, sent = [10000.0], []
+        with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=lambda delay: now.__setitem__(0, now[0] + delay)), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: .1)):
+            clock = AccountRequestClock()
+            clock.next_request = now[0] + .05
+            def send(method, url, **kwargs):
+                sent.append((method, now[0]))
+                return Response()
+            with guarding_archive(lambda: None, read_owner="archive", defer_reads=True):
+                clock.request(send, "PATCH", "https://provider/conversation/original", json={"is_archived": True})
+            self.assertEqual(sent, [("PATCH", 10000.05)])
+            self.assertEqual(clock.ordinary_read_queue, [])
+
     def test_background_archive_read_joins_result_fifo_and_defers_without_http_or_credit(self):
         from services.request_context import guarding_archive
         from services.account_request_pacing import ArchiveReadDeferred

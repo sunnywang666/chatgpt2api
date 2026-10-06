@@ -750,7 +750,7 @@ class AccountRequestClock:
                 # and delay a generation POST that is otherwise ready. Reload
                 # all deadlines under the cross-process lock after waking.
                 self.lock.release()
-                if read_owner and current_archive_defer_reads.get():
+                if is_conversation_read and read_owner and current_archive_defer_reads.get():
                     # Keep this FIFO position, but release the HTTP worker and
                     # conversation binding lock. Re-entry reads the same chat;
                     # an already-applied PATCH is confirmed by that fresh GET.
