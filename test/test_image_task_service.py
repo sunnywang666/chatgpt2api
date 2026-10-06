@@ -3526,6 +3526,9 @@ class ImageTaskServiceTests(unittest.TestCase):
                 stored = service._tasks["owner-1:terminal-no-image-task"]
                 if refresh_old_unrecoverable:
                     self.assertEqual(stored["recovery_no_result_reads"], 3)
+                self.assertEqual(stored["upstream_outcome"], "failed")
+                from services.generation_completion import unresolved
+                self.assertFalse(unresolved(stored))
                 self.assertFalse(stored["upstream_unfinished"])
                 self.assertEqual(stored["next_poll_at"], 0)
                 self.assertFalse(stored["recovery_retryable"])

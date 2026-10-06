@@ -2841,7 +2841,9 @@ class ImageTaskService:
                     else {}
                 ),
                 **(
-                    {"recovery_retryable": False}
+                    {"upstream_outcome": "failed", "recovery_retryable": False}
+                    if isinstance(exc, AuthoritativeImageTaskFailure)
+                    else {"recovery_retryable": False}
                     if terminal
                     else {"upstream_outcome": "unknown", "recovery_retryable": True}
                     if unrecoverable
