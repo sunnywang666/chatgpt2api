@@ -18,6 +18,21 @@ import time
 import uuid
 
 
+# An expression index keeps the scheduler from reparsing every saved image just
+# to decide whether it needs that receipt. Be conservative: only ordinary,
+# finished successes can be omitted. Retry/completion children remain visible
+# as reverse links, and exact predecessors are fetched separately by primary key.
+_ADMISSION_IMAGE_NEEDED = """CASE WHEN
+    json_extract(receipt,'$.status')='success'
+    AND coalesce(json_extract(receipt,'$.upstream_unfinished'),0)=0
+    AND coalesce(json_extract(receipt,'$.upstream_outcome'),'')!='unknown'
+    AND (coalesce(json_type(receipt,'$._completion'),'')!='object'
+         OR json_extract(receipt,'$._completion.state') IN ('completed','result_ready'))
+    AND json_extract(receipt,'$._same_session_retry_of') IS NULL
+    AND json_extract(receipt,'$._completion_of') IS NULL
+    THEN 0 ELSE 1 END"""
+
+
 def pending_image_result_ids(receipt):
     """Request-scoped observations that still require an authoritative settle read."""
     value = receipt.get("_pending_image_result_ids")
@@ -107,6 +122,10 @@ class TaskStore:
                     db.execute("CREATE TABLE IF NOT EXISTS requests (owner TEXT, id TEXT, request_hash TEXT, receipt TEXT, PRIMARY KEY(owner,id))")
                     db.execute("CREATE TABLE IF NOT EXISTS image_requests (task_key TEXT PRIMARY KEY, receipt TEXT NOT NULL)")
                     db.execute("CREATE TABLE IF NOT EXISTS task_runtime (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                    for table in ("requests", "image_requests"):
+                        db.execute(f"CREATE INDEX IF NOT EXISTS {table}_status ON {table} (json_extract(receipt,'$.status'))")
+                    db.execute("CREATE INDEX IF NOT EXISTS image_requests_admission ON image_requests ("
+                               + _ADMISSION_IMAGE_NEEDED + ")")
             finally:
                 db.close()
             self._ready = True
@@ -232,6 +251,41 @@ class TaskStore:
         else:
             raise ValueError("unsupported receipt kind")
         return json.loads(row[0]) if row else None
+
+    @classmethod
+    def admission_receipts(cls, db):
+        """Claim snapshot without decoding unrelated, completed image results.
+
+        Text history still participates in public-session ordering unchanged.
+        Image dependencies retain the full original payload for fingerprint and
+        cursor checks, including selected same-session retry results. The caller
+        holds the transaction; ordinary receipt/history reads are unchanged.
+        """
+        for owner, request_id, raw in db.execute("SELECT owner,id,receipt FROM requests"):
+            yield "text", owner, request_id, json.loads(raw)
+        images = {}
+        for (raw,) in db.execute("SELECT receipt FROM image_requests WHERE (" + _ADMISSION_IMAGE_NEEDED + ")=1"):
+            receipt = json.loads(raw)
+            images[(receipt["owner_id"], receipt["id"])] = receipt
+        pending = list(images.items())
+        for (owner, _), receipt in pending:
+            thread = receipt.get("_image_thread") or {}
+            completion = receipt.get("_completion") or {}
+            references = [receipt.get(name) for name in (
+                "_previous_request_id", "_terminal_empty_correction_of", "_supersedes_request_id",
+                "_same_session_retry_of", "_completion_of")]
+            references += [thread.get(name) for name in (
+                "previous_task_id", "edit_source_task_id", "origin_task_id")]
+            references.append(completion.get("selected_id"))
+            for request_id in references:
+                if not isinstance(request_id, str) or not request_id or (owner, request_id) in images:
+                    continue
+                previous = cls.read_receipt(db, "image", owner, request_id)
+                if previous is not None:
+                    images[(owner, request_id)] = previous
+                    pending.append(((owner, request_id), previous))
+        for (owner, request_id), receipt in images.items():
+            yield "image", owner, request_id, receipt
 
     @staticmethod
     def work_receipts(db, kind, owner, work_key, conversation_id=None):

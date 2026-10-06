@@ -170,6 +170,53 @@ class AdmissionTests(unittest.TestCase):
         self.assertTrue(self.read("image", "happy", "new-independent")["_submission_started"])
         self.assertEqual(self.read("image", "happy", "old-saved"), saved)
 
+    def test_claim_does_not_decode_unrelated_completed_image_payloads(self):
+        self.image("new-independent")
+        marker = "completed-image-is-not-a-scheduler-candidate"
+        saved = {"id": "old-saved", "owner_id": "happy", "status": "success",
+                 "data": [{"b64_json": marker * 10000}], "upstream_unfinished": False}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "happy", "old-saved", saved)
+        loads = json.loads
+        def candidate_decode(raw):
+            self.assertNotIn(marker, raw)
+            return loads(raw)
+        with patch("services.task_store.json.loads", side_effect=candidate_decode):
+            context = self.admission.claim_next()
+        self.assertEqual(context.request_id, "new-independent")
+        self.assertEqual(self.read("image", "happy", "old-saved"), saved)
+
+    def test_claim_snapshot_keeps_image_lineage_replacements_and_legacy_occupancy(self):
+        rows = {
+            "waiting": {"status": "queued", "_image_thread": {
+                "previous_task_id": "previous", "edit_source_task_id": "source", "origin_task_id": "origin"}},
+            "previous": {"status": "success", "data": [{"b64_json": "exact-previous-bytes"}]},
+            "source": {"status": "success", "_completion": {"state": "completed", "selected_id": "selected"}},
+            "selected": {"status": "success", "data": [{"b64_json": "exact-selected-bytes"}]},
+            "origin": {"status": "success", "_image_thread": {"previous_task_id": "source"}},
+            "legacy": {"status": "success", "upstream_unfinished": True},
+            "unknown": {"status": "success", "upstream_outcome": "unknown"},
+            "pending": {"status": "success", "_completion": {"state": "recovering"}},
+            "empty": {"status": "unknown"},
+            "retry": {"status": "success", "_same_session_retry_of": "empty"},
+            "unrelated": {"status": "success"},
+        }
+        with self.store.transaction() as db:
+            for rid, row in rows.items():
+                self.store.write_receipt(db, "image", "happy", rid, {"id": rid, "owner_id": "happy", **row})
+            self.store.write_receipt(db, "image", "another-owner", "source", {
+                "id": "source", "owner_id": "another-owner", "status": "success", "data": ["must-not-cross-owner"]})
+            snapshot = {(owner, rid): row for _, owner, rid, row in self.store.admission_receipts(db)}
+            self.assertEqual(set(snapshot), {("happy", rid) for rid in rows if rid != "unrelated"})
+            for (owner, rid), receipt in snapshot.items():
+                self.assertEqual(receipt, self.store.read_receipt(db, "image", owner, rid))
+            # The hot query must use the expression index, not reparse every
+            # stored image in SQLite after avoiding Python's JSON decoder.
+            from services.task_store import _ADMISSION_IMAGE_NEEDED
+            plan = db.execute("EXPLAIN QUERY PLAN SELECT receipt FROM image_requests WHERE ("
+                              + _ADMISSION_IMAGE_NEEDED + ")=1").fetchall()
+            self.assertTrue(any("USING INDEX image_requests_admission" in row[-1] for row in plan), plan)
+
     def test_send_guard_preserves_legacy_unfinished_image_capacity(self):
         self.image("new-image")
         context = self.admission.claim_next()
@@ -828,6 +875,11 @@ class AdmissionTests(unittest.TestCase):
             receipt = self.store.read_receipt(db, "image", "happy", "saved-catalog-image")
             receipt.update(status="success", data=data, upstream_unfinished=False)
             self.store.write_receipt(db, "image", "happy", "saved-catalog-image", receipt)
+        self.image("next-catalog-image")
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "image", "happy", "next-catalog-image")
+            receipt["_image_thread"] = {"edit_source_task_id": "saved-catalog-image"}
+            self.store.write_receipt(db, "image", "happy", "next-catalog-image", receipt)
         catalog_calls, reads = [], []
         self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
         original = self.store.receipts
@@ -835,7 +887,13 @@ class AdmissionTests(unittest.TestCase):
             rows = list(original(db, **kwargs))
             reads.append((kwargs, rows))
             return iter(rows)
-        with patch.object(self.store, "receipts", side_effect=observed):
+        admission_original = self.store.admission_receipts
+        def observed_admission(db):
+            rows = list(admission_original(db))
+            reads.append(({}, rows))
+            return iter(rows)
+        with patch.object(self.store, "receipts", side_effect=observed), \
+                patch.object(self.store, "admission_receipts", side_effect=observed_admission):
             self.admission.claim_next()
         self.assertTrue(expected_models <= set(catalog_calls))
         filtered = [rows for args, rows in reads if args.get("statuses") == ("queued", "running", "not_started")]

@@ -1182,7 +1182,7 @@ class PoolAdmission:
                         break
         with self._settings_guard(), self.store.transaction() as db, self._account_guard():
             now = float(self.clock())
-            receipts = list(self.store.receipts(db))
+            receipts = list(self.store.admission_receipts(db))
             workflow_scheduling.expire_unsent(self.store, db, receipts, now)
             self._recover_claims(db, receipts, now)
             bind_waiting_threads(self.store, db, receipts)
