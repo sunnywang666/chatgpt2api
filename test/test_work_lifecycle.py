@@ -186,7 +186,7 @@ def test_filtered_members_keep_newer_child_with_changed_reference(runtime):
 
 
 @pytest.mark.parametrize("background", [False, True])
-def test_waiting_archive_does_not_block_another_account_or_overlap_same_account(runtime, background):
+def test_waiting_archive_allows_independent_same_and_other_account_conversations(runtime, background):
     service, store, _, _, _, add = runtime
     keys = {}
     for rid, account in (("A-1", "account-a"), ("A2-2", "account-a"), ("B-3", "account-b")):
@@ -215,16 +215,16 @@ def test_waiting_archive_does_not_block_another_account_or_overlap_same_account(
     first.start()
     try:
         assert entered.wait(1)
-        assert not service.process_one(target_key=keys["A2-2"])
+        assert service.process_one(target_key=keys["A2-2"])
         assert service.process_one(target_key=keys["B-3"])
-        assert calls == ["A-1", "B-3"]
+        assert calls == ["A-1", "A2-2", "B-3"]
         assert service.get("text", {"id": "one"}, "B-3")["archive"]["status"] == "confirmed"
     finally:
         release.set()
         first.join(3)
         assert finished.wait(2)
     assert not first.is_alive()
-    assert service.process_one(target_key=keys["A2-2"])
+    assert not service.process_one(target_key=keys["A2-2"])
 
 
 def test_background_archive_does_not_occupy_original_result_recovery(runtime):
@@ -317,6 +317,142 @@ def test_archive_workers_are_bounded_and_release_capacity(runtime):
     assert service.get("text", {"id": "one"}, "work4-4")["archive"]["status"] == "confirmed"
 
 
+@pytest.mark.parametrize("desired", [True, False])
+@pytest.mark.parametrize("cursor_changed", [False, True])
+def test_background_readback_yields_worker_and_restart_confirms_original_without_repatch(
+        runtime, monkeypatch, desired, cursor_changed):
+    from services.account_request_pacing import AccountRequestClock
+    from services.config import config
+    from services.openai_backend_api import OpenAIBackendAPI
+    service, store, now, _, _, add = runtime
+    receipt = add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    if not desired:
+        assert service.process_one()
+        service.update("text", {"id": "one"}, "A-1", "active")
+    monkeypatch.setattr("services.account_request_pacing.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("services.account_request_pacing.time.time", lambda: now[0])
+    monkeypatch.setattr("services.account_request_pacing.time.sleep", lambda _: pytest.fail("archive worker slept for read credit"))
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 60))
+    monkeypatch.setattr(type(config), "account_conversation_read_burst", property(lambda _: 1))
+    clock = AccountRequestClock()
+    calls, archived, parent = [], [not desired], ["parent"]
+    def send(method, url, **kwargs):
+        calls.append(method)
+        if method == "PATCH":
+            archived[0] = kwargs["json"]["is_archived"]
+        return SimpleNamespace(status_code=200, headers={}, json=lambda: {
+            "current_node": parent[0], "mapping": {parent[0]: {}}, "is_archived": archived[0]})
+    backend = object.__new__(OpenAIBackendAPI)
+    backend.base_url, backend._headers = "https://fixture.test", lambda *args: {}
+    backend._get_conversation = lambda cid: clock.request(send, "GET", backend.base_url + "/conversation/" + cid, timeout=60).json()
+    backend.session = SimpleNamespace(patch=lambda url, **kw: clock.request(send, "PATCH", url, **kw))
+    def archive(owner, rid, value):
+        return {**backend.set_conversation_archived("original", "parent", value),
+                "request_id": rid, "conversation": {"client_conversation_id": "A"}}
+    service.text.set_public_session_archived = archive
+    finished = threading.Event()
+    service.text.admission = SimpleNamespace(wake=finished.set)
+    assert service.process_one(background=True)
+    assert finished.wait(2)
+    pending = service.get("text", {"id": "one"}, "A-1")
+    assert calls == ["GET", "PATCH"]
+    assert pending["archive"]["status"] == "pending"
+    assert pending["archive"]["next_at"] == 1060
+    assert pending["archive"]["attempts"] == 0
+    assert pending["archive"]["error_code"] is None
+    # Every worker was released, although the original confirmation is pending.
+    assert all(service._operation_slots.acquire(blocking=False) for _ in range(4))
+    for _ in range(4):
+        service._operation_slots.release()
+    assert not service.process_one()
+    now[0] = 1060
+    if cursor_changed:
+        parent[0] = "newer-message"
+    restarted = WorkLifecycleService(service.text, service.images, clock=lambda: now[0])
+    finished.clear()
+    assert restarted.process_one(background=True)
+    assert finished.wait(2)
+    result = restarted.get("text", {"id": "one"}, "A-1")
+    assert calls == ["GET", "PATCH", "GET"]
+    assert result["archive"]["status"] == ("unknown" if cursor_changed else "confirmed")
+    assert result["archive"]["attempts"] == 1
+    assert clock.ordinary_read_queue == []
+    with store.connect() as db:
+        assert store.read_receipt(db, "text", "one", "A-1") == receipt
+
+
+def test_fifo_waiting_archives_do_not_claim_workers_or_block_another_account(runtime, monkeypatch):
+    from services import account_request_pacing as pacing
+    service, store, now, calls, _, add = runtime
+    rows = [add("A-1"), add("A2-2"), add("B-3")]
+    with store.transaction() as db:
+        for i, row in enumerate(rows):
+            row["provider_account_identity"] = "a" if i < 2 else "b"
+            store.write_receipt(db, "text", "one", row["request_id"], row)
+    for row in rows:
+        service.update("text", {"id": "one"}, row["request_id"], "completed", True)
+        now[0] += 1
+    service.text.admission = SimpleNamespace(accounts=SimpleNamespace(
+        admission_accounts=lambda: [{"provider_account_identity": key} for key in ("a", "b")]), wake=lambda: None)
+    monkeypatch.setattr(pacing, "account_pacing_snapshot", lambda *args, **kwargs: {"next_at": now[0], "cooldown_until": 0})
+    monkeypatch.setattr(pacing, "reserve_account_archive_read", lambda account, owner: account["provider_account_identity"] == "b")
+    monkeypatch.setattr(pacing, "release_account_archive_read", lambda *args: None)
+    finished = threading.Event()
+    service.text.admission.wake = finished.set
+    assert service.process_one(background=True)
+    assert finished.wait(2)
+    assert calls == [("one", "B-3", True)]
+    for row in rows[:2]:
+        result = service.get("text", {"id": "one"}, row["request_id"])
+        assert result["archive"]["status"] == "pending" and result["archive"]["attempts"] == 0
+
+
+@pytest.mark.parametrize("failure", ["revalidate", "blocked", "auth"])
+def test_archive_predispatch_failure_releases_fifo_owner_outside_transaction(runtime, monkeypatch, failure):
+    from services import account_request_pacing as pacing
+    from services.work_lifecycle import _archive_read_owner
+    service, store, now, calls, _, add = runtime
+    row = add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    with store.transaction() as db:
+        row["provider_account_identity"] = "test-account"
+        if failure == "blocked":
+            row["status"] = "unknown"
+        store.write_receipt(db, "text", "one", "A-1", row)
+        owner = _archive_read_owner(store.runtime(db, row["_work_key"]))
+    account = {"provider_account_identity": "test-account"}
+    if failure == "auth":
+        account.update(status="异常", last_token_refresh_error="refresh_token_invalidated")
+    service.text.admission = SimpleNamespace(accounts=SimpleNamespace(admission_accounts=lambda: [account]))
+    monkeypatch.setattr(pacing, "account_pacing_snapshot", lambda *args, **kwargs: {"next_at": now[0], "cooldown_until": 0})
+    held = {owner}  # A reservation from the preceding scan.
+    monkeypatch.setattr(pacing, "reserve_account_archive_read", lambda *args: True)
+    def release(account, value):
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.rollback()
+        held.discard(value)
+    monkeypatch.setattr(pacing, "release_account_archive_read", release)
+    if failure == "revalidate":
+        load, count = service._load, [0]
+        def reload(*args):
+            count[0] += 1
+            if count[0] == 2:
+                raise RuntimeError("storage unavailable during revalidation")
+            return load(*args)
+        monkeypatch.setattr(service, "_load", reload)
+        with pytest.raises(RuntimeError, match="storage unavailable"):
+            service.process_one(background=True)
+    else:
+        assert not service.process_one(background=True)
+    assert held == set() and calls == []
+    assert all(service._operation_slots.acquire(blocking=False) for _ in range(4))
+    for _ in range(4):
+        service._operation_slots.release()
+
+
 def test_archive_timestamps_follow_confirmation_not_patch_or_failed_attempt(runtime):
     service, _, now, _, fail, add = runtime
     add("A-1")
@@ -390,7 +526,7 @@ def test_archive_http_steps_are_attributed_without_changing_read_pacing(runtime,
     assert service.get("text", {"id": "one"}, "A-1")["archive"]["confirmed_at"] >= reads[-1]
 
 
-def test_read_deferral_books_oldest_archive_outside_receipt_transaction(runtime, monkeypatch):
+def test_read_deferral_books_archives_in_order_outside_receipt_transaction(runtime, monkeypatch):
     from services import account_request_pacing as pacing
     service, store, now, calls, _, add = runtime
     first = add("Z-1")
@@ -417,8 +553,8 @@ def test_read_deferral_books_oldest_archive_outside_receipt_transaction(runtime,
     assert not service.process_one()
     from services.work_lifecycle import _archive_read_owner
     with store.connect() as db:
-        expected = _archive_read_owner(store.runtime(db, first["_work_key"]))
-    assert booked == [expected]
+        expected = [_archive_read_owner(store.runtime(db, row["_work_key"])) for row in (first, second)]
+    assert booked == expected
     assert calls == []
     assert service.get("text", {"id": "one"}, "Z-1")["archive"]["attempts"] == 0
 

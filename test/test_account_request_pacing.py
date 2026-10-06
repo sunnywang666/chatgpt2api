@@ -1031,6 +1031,78 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertAlmostEqual(sent[1][1], 10090, delta=1e-6)
             self.assertEqual(AccountRequestClock("account", path).ordinary_read_queue, [])
 
+    def test_guarded_archive_patch_responses_overlap_without_holding_account_clock(self):
+        from services.request_context import guarding_archive
+        clock = AccountRequestClock()
+        release, both_entered = threading.Event(), threading.Event()
+        started, errors = [], []
+        def send(method, url, **kwargs):
+            started.append(url)
+            if len(started) == 2:
+                both_entered.set()
+            if not release.wait(2):
+                raise AssertionError("independent PATCH was serialized through response")
+            return Response()
+        def run(label):
+            try:
+                with guarding_archive(lambda: None, read_owner=label):
+                    clock.request(send, "PATCH", "https://provider/conversation/" + label,
+                                  json={"is_archived": True}, timeout=2)
+            except BaseException as exc:
+                errors.append(exc)
+        with patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)):
+            workers = [threading.Thread(target=run, args=(label,)) for label in ("a", "b")]
+            try:
+                for worker in workers:
+                    worker.start()
+                self.assertTrue(both_entered.wait(1))
+                self.assertFalse(clock.lock.locked())
+            finally:
+                release.set()
+                for worker in workers:
+                    worker.join(3)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(started), 2)
+
+    def test_background_archive_read_joins_result_fifo_and_defers_without_http_or_credit(self):
+        from services.request_context import guarding_archive
+        from services.account_request_pacing import ArchiveReadDeferred
+        now = [10000.0]
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=AssertionError("worker must yield")), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)), \
+             patch.object(type(config), "account_conversation_read_burst", property(lambda _: 1)):
+            path = Path(tmp) / "clock.json"
+            clock = AccountRequestClock("account", path)
+            with clock.lock:
+                clock._ordinary_read_turn("ordinary", now[0], 0)
+            def send(*args, **kwargs):
+                sent.append(now[0])
+                return Response()
+            with guarding_archive(lambda: None, read_owner="archive", defer_reads=True):
+                with self.assertRaises(ArchiveReadDeferred):
+                    clock.request(send, "GET", "https://provider/conversation/original")
+            self.assertEqual(sent, [])
+            self.assertIsNone(clock.conversation_read_bucket)
+            restarted = AccountRequestClock("account", path)
+            self.assertEqual([q["owner"] for q in restarted.ordinary_read_queue], ["ordinary", "archive"])
+            with restarted.lock:
+                restarted._release_ordinary_read("ordinary")
+            with guarding_archive(lambda: None, read_owner="archive", defer_reads=True):
+                restarted.request(send, "GET", "https://provider/conversation/original")
+                with restarted.lock:
+                    restarted._ordinary_read_turn("new-result", now[0], 60)
+                with self.assertRaises(ArchiveReadDeferred) as caught:
+                    restarted.request(send, "GET", "https://provider/conversation/original")
+            self.assertEqual(sent, [10000])
+            self.assertEqual(caught.exception.next_at, 10060)
+            self.assertEqual([q["owner"] for q in restarted.ordinary_read_queue], ["new-result", "archive"])
+            self.assertEqual(restarted.conversation_read_bucket["credit"], 0)
+
     def test_archive_read_booking_survives_restart_and_yields_to_waiting_result(self):
         from services.request_context import guarding_archive
         now = [10000.0]
@@ -1074,6 +1146,27 @@ class AccountRequestPacingTests(unittest.TestCase):
                 ("POST", "conversation"), ("GET", "archive-first"),
                 ("GET", "result"), ("GET", "archive-readback")])
             self.assertEqual([at for _, _, at in sent], [10000, 10060, 10120, 10180])
+
+    def test_archive_backlog_cannot_prebook_ahead_of_ordinary_results(self):
+        import hashlib
+        from services import account_request_pacing as pacing
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(pacing, "DATA_DIR", Path(tmp)), patch.object(pacing, "_clocks", {}), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)):
+            account = {"account_id": "fixture-account"}
+            self.assertTrue(pacing.reserve_account_archive_read(account, "archive-0"))
+            for i in range(1, 100):
+                self.assertFalse(pacing.reserve_account_archive_read(account, f"archive-{i}"))
+            clock = pacing._clocks[hashlib.sha256(b"fixture-account").hexdigest()]
+            with clock.lock:
+                self.assertEqual(len(clock.ordinary_read_queue), 1)
+                self.assertFalse(clock._ordinary_read_turn("ordinary-result", time.monotonic(), 0))
+            pacing.release_account_archive_read(account, "archive-0")
+            self.assertFalse(pacing.reserve_account_archive_read(account, "archive-1"))
+            with clock.lock:
+                self.assertTrue(clock._ordinary_read_turn("ordinary-result", time.monotonic(), 0))
+                self.assertEqual([e["owner"] for e in clock.ordinary_read_queue], ["ordinary-result"])
 
     def test_archive_rechecks_released_reader_instead_of_sleeping_its_whole_lease(self):
         from contextvars import Context as EmptyContext

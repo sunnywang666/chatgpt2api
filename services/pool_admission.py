@@ -496,9 +496,11 @@ class PoolAdmission:
             return started
         lifecycle = getattr(self, "work_lifecycle", None)
         if background and lifecycle is not None:
-            # Its existing bounded, per-account workers must get a chance even
-            # while there is a continuous backlog of original result reads.
-            lifecycle.process_one(background=True)
+            # Fill only the existing bounded I/O workers. Independent archive
+            # pipelines need not wait for the next one-second recovery scan.
+            for _ in range(4):
+                if not lifecycle.process_one(background=True):
+                    break
         completion = getattr(self, "generation_completion", None)
         if completion is not None:
             if background:

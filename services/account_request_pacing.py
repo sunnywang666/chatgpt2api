@@ -23,7 +23,7 @@ from curl_cffi import CurlInfo
 from services.config import DATA_DIR, config
 from utils.log import logger
 from services.request_context import (current_request, current_archive_guard, current_archive_read_owner,
-                                      current_archive_observation, current_archive_step)
+                                      current_archive_observation, current_archive_step, current_archive_defer_reads)
 
 
 # libcurl times are cumulative from request start, not individual phase durations.
@@ -168,6 +168,13 @@ class AccountRequestDeadlineExceeded(TimeoutError):
 
 class AccountReadRetryBudgetInsufficient(AccountRequestDeadlineExceeded):
     """An original GET attempt no longer has its minimum connection window."""
+
+
+class ArchiveReadDeferred(RuntimeError):
+    """No GET was sent; resume the same archive intent at its existing read edge."""
+    def __init__(self, next_at):
+        super().__init__("archive read credit is pending")
+        self.next_at = next_at
 
 
 def _backoff_seconds(failures):
@@ -561,18 +568,23 @@ class AccountRequestClock:
             ("POST", "/backend-api/sentinel/chat-requirements/finalize"),
             ("POST", "/backend-api/f/conversation/prepare"),
         } and not urlparse(str(url)).query
-        concurrent_io = is_conversation_read or metadata_kind is not None or concurrent_turn or concurrent_preparation
-        pooled_preparation = concurrent_preparation and callable(preparation_submit) and not kwargs.get("stream")
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
+        # A fenced visibility PATCH for one conversation may receive alongside
+        # another conversation. Keep the durable send edge, not its response,
+        # under the account clock. Other PATCH operations remain unchanged.
+        concurrent_archive = archive_guard is not None and phase in {"conversation_archive", "conversation_restore"}
+        concurrent_io = is_conversation_read or metadata_kind is not None or concurrent_turn or concurrent_preparation or concurrent_archive
+        pooled_preparation = concurrent_preparation and callable(preparation_submit) and not kwargs.get("stream")
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
         ordinary_owner = None
-        if is_conversation_read and not read_owner:
+        read_deferred = False
+        if is_conversation_read:
             # Due image recovery may already hold a FIFO place before its
             # worker starts. Reuse it at the actual GET; do not queue behind
             # our own reservation. The original image claim prevents overlap.
-            ordinary_owner = (_image_read_owner(context.owner, context.request_id)
-                              if getattr(context, "kind", None) == "image" else uuid.uuid4().hex)
+            ordinary_owner = (read_owner or (_image_read_owner(context.owner, context.request_id)
+                              if getattr(context, "kind", None) == "image" else uuid.uuid4().hex))
         if archive_guard is not None:
             archive_guard()
             # Each HTTP step must finish inside the renewed 300s work claim.
@@ -704,21 +716,11 @@ class AccountRequestClock:
                         (max(0, self.cooldown_until - now,
                              self._read_cooldown_until() - now if is_conversation_read else 0), "upstream_cooldown")),
                         key=lambda item: (item[0], item[1] == "upstream_cooldown"))
-                    if is_conversation_read and read_owner:
-                        if not self._reserve_archive_read(read_owner, now):
-                            other = self.archive_read_until if self.archive_read_until > now else 0.0
-                            ordinary = self.ordinary_read_wait_until if self.last_read_was_archive else 0.0
-                            # These leases bound abandoned readers, not the
-                            # time a live reader needs. Recheck released claims
-                            # promptly; the real HTTP/read/cooldown edge above
-                            # still determines when an upstream send is legal.
-                            retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
-                            reservation_delay = min(retry_check, max(0.0, other - now, ordinary - now))
-                            if reservation_delay > read_delay:
-                                wait_reason = "archive_reservation"
-                            read_delay = max(read_delay, reservation_delay)
-                    elif is_conversation_read:
-                        if self.archive_read_owner and self.archive_read_until > now:
+                    if is_conversation_read:
+                        # Honor a live reservation from an older process until
+                        # consumed/expired; new archive reads join the same FIFO
+                        # as ordinary results, including their readback step.
+                        if self.archive_read_owner and self.archive_read_owner != read_owner and self.archive_read_until > now:
                             # A live archive may release this lease immediately.
                             # Recheck it promptly; retain the actual rate/cooldown floor.
                             retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
@@ -726,7 +728,9 @@ class AccountRequestClock:
                             if reservation_delay > read_delay:
                                 wait_reason = "archive_reservation"
                             read_delay = max(read_delay, reservation_delay)
-                        if not self._ordinary_read_turn(ordinary_owner, now, read_delay):
+                        legacy_turn = bool(read_owner and self.archive_read_owner == read_owner
+                                           and self.archive_read_until > now)
+                        if not legacy_turn and not self._ordinary_read_turn(ordinary_owner, now, read_delay):
                             # Give the reserved reader time to wake. Do not
                             # consume another full upstream interval locally,
                             # or add a whole second to fractional HTTP pacing.
@@ -746,6 +750,12 @@ class AccountRequestClock:
                 # and delay a generation POST that is otherwise ready. Reload
                 # all deadlines under the cross-process lock after waking.
                 self.lock.release()
+                if read_owner and current_archive_defer_reads.get():
+                    # Keep this FIFO position, but release the HTTP worker and
+                    # conversation binding lock. Re-entry reads the same chat;
+                    # an already-applied PATCH is confirmed by that fresh GET.
+                    read_deferred = True
+                    raise ArchiveReadDeferred(time.time() + read_delay)
                 wait_for_pace(read_delay, "account request deadline elapsed during read wait", wait_reason)
             clock_held = True
             response = None
@@ -1007,7 +1017,7 @@ class AccountRequestClock:
                     "observed_at": time.time(), "http_attempts": read_http_attempts,
                     "queue_position_max": read_queue_position_max,
                     "wait_seconds_by_controlling_reason": {k: round(v, 6) for k, v in read_wait_seconds.items()}})
-            if ordinary_owner:
+            if ordinary_owner and not read_deferred:
                 # Deadline/preflight/transport failure must not leave a live
                 # caller's place blocking the following result reader.
                 try:
@@ -1166,9 +1176,17 @@ def _image_recovery_read_reservation(account, owner, request_id, *, cancel):
 
 
 def reserve_account_archive_read(account, owner):
-    """Best-effort booking outside SQLite transactions; never wait on HTTP."""
+    """Join the shared result FIFO outside SQLite; never occupy an I/O worker."""
+    return _archive_read_reservation(account, owner, cancel=False)
+
+
+def release_account_archive_read(account, owner):
+    return _archive_read_reservation(account, owner, cancel=True)
+
+
+def _archive_read_reservation(account, owner, *, cancel):
     identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
-    if not identity or not getattr(config, "account_conversation_read_interval_secs", 0.0):
+    if not identity:
         return False
     key = hashlib.sha256(identity.encode()).hexdigest()
     try:
@@ -1180,10 +1198,24 @@ def reserve_account_archive_read(account, owner):
         if not clock.lock.acquire(blocking=False):
             return False
         try:
-            return clock._reserve_archive_read(owner, time.monotonic())
+            if cancel:
+                clock._release_ordinary_read(owner)
+                return True
+            now = time.monotonic()
+            delay = max(0, clock.next_request - now, clock.cooldown_until - now, clock._read_ready(now) - now)
+            live = [entry for entry in clock.ordinary_read_queue if entry["until"] > now]
+            if live and not any(entry["owner"] == owner for entry in live):
+                # Pre-dispatch books at most the next archive, never a whole
+                # backlog ahead of ordinary results. Already-running readbacks
+                # join at the actual GET boundary and retain their FIFO place.
+                return False
+            first = clock._ordinary_read_turn(owner, now, delay)
+            legacy_busy = (clock.archive_read_owner and clock.archive_read_owner != owner
+                           and clock.archive_read_until > now)
+            return first and delay <= 0 and not legacy_busy
         finally:
             clock.lock.release()
-    except (OSError, ValueError):
+    except (OSError, ValueError, KeyError):
         return False
 
 
