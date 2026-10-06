@@ -39,9 +39,12 @@ def create_router(kind):
     router = APIRouter()
     path = "/api/" + ("chat-requests" if kind == "text" else "image-tasks") + "/{request_id}/completion"
 
-    def authorize(request, authorization, request_id, *, enforce_policy=False):
+    def authorize(request, authorization, request_id, *, enforce_policy=False,
+                  allow_admin_image_original_recovery=False):
         identity = require_identity(authorization, request=request)
-        if identity.get("role") != "user":
+        if (identity.get("role") != "user"
+                and not (allow_admin_image_original_recovery and kind == "image"
+                         and identity.get("role") == "admin")):
             raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
         service = get_generation_completion_service()
         try:
@@ -66,8 +69,20 @@ def create_router(kind):
     @router.post(path)
     async def update_completion(request_id: str, body: CompletionRequest, request: Request,
                                 authorization: str | None = Header(default=None)):
-        identity, service = authorize(request, authorization, request_id, enforce_policy=True)
+        identity, service = authorize(
+            request, authorization, request_id, enforce_policy=True,
+            allow_admin_image_original_recovery=True,
+        )
         company_original_only = getattr(request.state, "company_identity", None) is not None
+        admin_original_only = identity.get("role") == "admin"
+        if admin_original_only and (
+            kind != "image" or body.action != "recover" or body.allow_unconfirmed_retry
+            or body.model_fields_set - {"action", "allow_unconfirmed_retry"}
+        ):
+            # Legacy Content/admin receipts may only request a bounded read of
+            # their own original conversation.  They cannot acknowledge,
+            # rework, or authorize another request through this endpoint.
+            raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
         if company_original_only and (
             kind != "image" or body.action != "recover" or body.allow_unconfirmed_retry
             or body.model_fields_set - {"action", "allow_unconfirmed_retry", "retry_not_sent_failure_at"}
@@ -81,7 +96,7 @@ def create_router(kind):
             return await run_in_threadpool(service.start, kind, identity, request_id,
                                            allow_unconfirmed_retry=body.allow_unconfirmed_retry,
                                            retry_not_sent_failure_at=body.retry_not_sent_failure_at,
-                                           original_only=company_original_only)
+                                           original_only=company_original_only or admin_original_only)
         except WorkLifecycleError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
     return router
