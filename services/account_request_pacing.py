@@ -442,6 +442,7 @@ class AccountRequestClock:
         preparation_started = time.monotonic()
         preparation_seconds = {}
         io_cleanup = kwargs.pop("_account_request_io_cleanup", None)
+        preparation_submit = kwargs.pop("_account_request_preparation_submit", None)
         deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
         minimum_budget = kwargs.pop("_account_request_minimum_budget_secs", None)
         if type(minimum_budget) not in (int, float) or not math.isfinite(minimum_budget) or minimum_budget <= 0:
@@ -561,6 +562,7 @@ class AccountRequestClock:
             ("POST", "/backend-api/f/conversation/prepare"),
         } and not urlparse(str(url)).query
         concurrent_io = is_conversation_read or metadata_kind is not None or concurrent_turn or concurrent_preparation
+        pooled_preparation = concurrent_preparation and callable(preparation_submit) and not kwargs.get("stream")
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
@@ -860,7 +862,7 @@ class AccountRequestClock:
                             except BaseException as exc:
                                 outcome["error"] = exc
                             finally:
-                                if callable(io_cleanup):
+                                if callable(io_cleanup) and not pooled_preparation:
                                     try:
                                         io_cleanup()
                                     except Exception:
@@ -868,9 +870,12 @@ class AccountRequestClock:
                                                         "account": self.account_key})
                                 entered.set()
                         worker_context = copy_context()
-                        worker = threading.Thread(target=worker_context.run, args=(read_io,),
-                                                  name="account-model-send" if concurrent_turn else "account-turn-prepare" if concurrent_preparation else "account-metadata-read" if metadata_kind else "original-conversation-read")
-                        worker.start()
+                        if pooled_preparation:
+                            worker = preparation_submit(worker_context.run, read_io)
+                        else:
+                            worker = threading.Thread(target=worker_context.run, args=(read_io,),
+                                                      name="account-model-send" if concurrent_turn else "account-turn-prepare" if concurrent_preparation else "account-metadata-read" if metadata_kind else "original-conversation-read")
+                            worker.start()
                         reservation_error = None
                         floor_durable = False
                         try:
@@ -898,11 +903,17 @@ class AccountRequestClock:
                         try:
                             # Reap the transport even on caller interruption;
                             # never leave a late transport running after return.
-                            while worker.is_alive():
+                            while True:
                                 try:
-                                    worker.join()
+                                    if pooled_preparation:
+                                        worker.result()
+                                    else:
+                                        worker.join()
+                                    break
                                 except BaseException as exc:
                                     reservation_error = reservation_error or exc
+                                    if pooled_preparation and worker.done():
+                                        break
                         finally:
                             response = outcome.get("response")
                             # This is result/cooldown reconciliation, not a new
@@ -1265,6 +1276,56 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
                 finally:
                     del local.curl
 
+    preparation_submit = None
+    if isinstance(session, Session) and session._use_thread_local_curl:
+        # One short-lived Backend owns one Session. Keep its four synchronous
+        # preparation steps on the same worker so libcurl can reuse connections;
+        # independent Backends still run in parallel. The Session's own executor
+        # runs SSE and must not be reused as this single-worker lane.
+        from concurrent.futures import ThreadPoolExecutor
+        preparation_executor = None
+        preparation_lock = threading.Lock()
+        preparation_closed = False
+        preparation_worker_id = None
+        close_session = session.close
+
+        def identify_preparation_worker():
+            nonlocal preparation_worker_id
+            preparation_worker_id = threading.get_ident()
+
+        def submit_preparation(callback, *args):
+            nonlocal preparation_executor
+            with preparation_lock:
+                if preparation_closed:
+                    raise RuntimeError("preparation session is closed")
+                if preparation_executor is None:
+                    preparation_executor = ThreadPoolExecutor(max_workers=1,
+                        thread_name_prefix="account-session-prepare", initializer=identify_preparation_worker)
+                return preparation_executor.submit(callback, *args)
+
+        def close_with_preparation():
+            nonlocal preparation_closed
+            with preparation_lock:
+                if preparation_closed:
+                    return
+                preparation_closed = True
+                executor = preparation_executor
+            try:
+                if executor is not None:
+                    on_worker = threading.get_ident() == preparation_worker_id
+                    try:
+                        if on_worker:
+                            close_read_transport()
+                        else:
+                            executor.submit(close_read_transport).result()
+                    finally:
+                        executor.shutdown(wait=not on_worker)
+            finally:
+                close_session()
+
+        preparation_submit = submit_preparation
+        session.close = close_with_preparation
+
     def send(method, url, **kwargs):
         connect = kwargs.pop("_account_request_connect_timeout_secs", None)
         timeout = kwargs.get("timeout")
@@ -1299,6 +1360,7 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
                 and str(account.get("type") or "").strip().lower() == "free"):
             raise RuntimeError("Free account messages are disabled")
         return clock.request(send, method, url,
-                             _account_request_io_cleanup=close_read_transport, **kwargs)
+                             _account_request_io_cleanup=close_read_transport,
+                             _account_request_preparation_submit=preparation_submit, **kwargs)
 
     session.request = paced_request

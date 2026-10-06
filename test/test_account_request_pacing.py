@@ -48,6 +48,56 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_pooled_preparation_interruption_joins_transport_and_keeps_limit(self):
+        from concurrent.futures import ThreadPoolExecutor
+        for transport_error in (False, True):
+            with self.subTest(transport_error=transport_error), tempfile.TemporaryDirectory() as tmp, \
+                 ThreadPoolExecutor(max_workers=1) as executor, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)):
+                path = Path(tmp)/"clock.json"
+                clock = AccountRequestClock("fixture", path)
+                entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+                response, context = Response(), Context("interrupted-preparation")
+                context.record_limit = lambda evidence: None
+                response.status_code, response.headers = 429, {"Retry-After":"90"}
+                def send(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(2): raise TimeoutError("fixture join did not release transport")
+                    returned.set()
+                    if transport_error: raise ConnectionError("controlled preparation failure")
+                    return response
+                def submit(callback, *args):
+                    future = executor.submit(callback, *args)
+                    result = future.result
+                    interrupted = False
+                    def interrupt_once(*args, **kwargs):
+                        nonlocal interrupted
+                        if not interrupted:
+                            interrupted = True
+                            self.assertTrue(entered.wait(1))
+                            release.set()
+                            raise KeyboardInterrupt("controlled future wait interruption")
+                        return result(*args, **kwargs)
+                    future.result = interrupt_once
+                    return future
+                try:
+                    with executing(context), self.assertRaises(KeyboardInterrupt) as caught:
+                        clock.request(send, "POST", "https://chatgpt.com/backend-api/f/conversation/prepare",
+                            _account_request_preparation_submit=submit)
+                    self.assertTrue(returned.is_set(), "caller must reap its original transport")
+                    self.assertEqual(context.released, 0, "preparation does not release an admitted work slot")
+                    self.assertFalse(clock.lock.locked())
+                    self.assertFalse(clock.turn_lock.locked())
+                    if transport_error:
+                        self.assertIsInstance(caught.exception.__cause__, ConnectionError)
+                    else:
+                        self.assertTrue(response.closed)
+                        reloaded = AccountRequestClock("fixture", path)
+                        self.assertGreater(reloaded.cooldown_until, time.monotonic()+85)
+                        self.assertEqual(reloaded.rate_failures, 1)
+                finally:
+                    release.set()
+
     def test_parallel_preparation_limits_survive_late_200_and_block_generation(self):
         from services.account_request_pacing import AccountRequestDeadlineExceeded
         for method, path in (("GET", "/"),
@@ -1884,8 +1934,9 @@ def test_native_backend_preparations_overlap_without_mixing_tokens(tmp_path, mon
              "/backend-api/sentinel/chat-requirements/finalize",
              "/backend-api/f/conversation/prepare", "/backend-api/f/conversation"]
     barriers = {path: threading.Barrier(2) for path in paths}
-    trace, server_errors = {}, []
+    trace, server_errors, connections, handles = {}, [], {}, []
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
         def log_message(self, *args): pass
         def do_GET(self): self.respond()
         def do_POST(self): self.respond()
@@ -1894,6 +1945,8 @@ def test_native_backend_preparations_overlap_without_mixing_tokens(tmp_path, mon
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"]))) if self.command == "POST" else {}
             try:
                 trace.setdefault(sid, []).append(self.path)
+                if self.path != paths[-1]:
+                    connections.setdefault(sid, set()).add(self.client_address)
                 if self.path.endswith("chat-requirements/prepare"):
                     result = {"prepare_token":"prepare-"+sid}
                 elif self.path.endswith("chat-requirements/finalize"):
@@ -1922,6 +1975,8 @@ def test_native_backend_preparations_overlap_without_mixing_tokens(tmp_path, mon
     raw_send = requests.Session.request
     def redirect(session, method, url, **kw):
         assert urlsplit(url).hostname == "chatgpt.com"
+        if urlsplit(url).path != paths[-1]:
+            handles.append(session.curl)
         return raw_send(session, method, f"http://127.0.0.1:{server.server_port}"+urlsplit(url).path, **kw)
     monkeypatch.setattr(requests.Session, "request", redirect)
     monkeypatch.setattr(api.proxy_settings, "build_session_kwargs", lambda **kw: {"trust_env":False})
@@ -1958,11 +2013,74 @@ def test_native_backend_preparations_overlap_without_mixing_tokens(tmp_path, mon
         assert not errors and not server_errors
         assert all(not w.is_alive() for w in workers)
         assert len(trace) == 2 and all(sequence == paths for sequence in trace.values())
+        assert len(connections) == 2 and all(len(ports) == 1 for ports in connections.values())
+        assert len(set(map(id, handles))) == 2 and all(c._curl is not None for c in handles)
         assert len(guarded) == 2 and all(c.released == 1 for c in contexts)
     finally:
         for barrier in barriers.values(): barrier.abort()
         for worker in workers: worker.join(6)
         for backend in backends: backend.close()
+        server.shutdown(); server.server_close()
+    assert all(c._curl is None for c in handles), "Backend.close must close preparation worker handles"
+
+
+def test_native_preparation_failure_and_close_reap_persistent_worker(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit
+    from curl_cffi import requests
+    from curl_cffi.requests.exceptions import RequestException
+    import services.account_request_pacing as pacing
+    from services.config import ConfigStore
+    import pytest
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *args): pass
+        def do_POST(self):
+            if self.headers.get("X-Fixture") == "transport-error":
+                self.close_connection = True
+                return
+            self.send_response(429)
+            self.send_header("Retry-After", "90")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    (tmp_path/"config.json").write_text(json.dumps({"auth-key":"test-only"}))
+    settings = ConfigStore(tmp_path/"config.json")
+    settings.update({"account_request_interval_secs":0})
+    monkeypatch.setattr(pacing, "config", settings)
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    try:
+        for mode in ("limited", "transport-error"):
+            session = requests.Session(trust_env=False)
+            raw_send, handles, workers = session.request, [], []
+            def redirect(method, url, **kw):
+                handles.append(session.curl)
+                workers.append(threading.current_thread())
+                return raw_send(method, f"http://127.0.0.1:{server.server_port}"+urlsplit(url).path, **kw)
+            session.request = redirect
+            pacing.pace_account_session(session, {"account_id":"fixture-"+mode}, "fixture-token")
+            context = Context(mode); context.record_limit = lambda evidence: None
+            try:
+                with executing(context):
+                    if mode == "limited":
+                        response = session.post("https://chatgpt.com/backend-api/f/conversation/prepare", timeout=1)
+                        assert response.status_code == 429
+                        assert any(c.cooldown_until > time.monotonic()+85 for c in pacing._clocks.values())
+                    else:
+                        with pytest.raises(RequestException):
+                            session.post("https://chatgpt.com/backend-api/f/conversation/prepare",
+                                headers={"X-Fixture": mode}, timeout=1)
+                assert context.released == 0
+                assert len(handles) == 1 and handles[0]._curl is not None
+            finally:
+                session.close()
+            assert handles[0]._curl is None
+            assert not workers[0].is_alive()
+            session.close()  # Closing a completed Backend again remains harmless.
+    finally:
         server.shutdown(); server.server_close()
 
 
