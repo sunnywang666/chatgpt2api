@@ -602,6 +602,81 @@ def test_image_repair_api_owner_and_exact_failure_contract(failed_unsent_image, 
     assert row(service, "image", "repair-image")["status"] == "queued"
 
 
+def test_admin_image_completion_only_reads_its_legacy_original(failed_unsent_image, monkeypatch):
+    import api.generation_completion as api
+
+    service = failed_unsent_image
+    admin_identity = {"id": "admin", "role": "admin", "external_image_client": True}
+    with service.store.transaction() as db:
+        legacy = service.store.read_receipt(db, "image", "owner", "repair-image")
+        source = service.store.load_input(legacy["_input_ref"])
+        source["identity"] = admin_identity
+        legacy.update(
+            owner_id="admin",
+            _input_ref=service.store.save_input(source),
+            status="error",
+            error_code="RESULT_UNRECOVERABLE",
+            upstream_outcome="unknown",
+            upstream_unfinished=False,
+            recovery_no_result_reads=3,
+        )
+        for key in ("_completion", "_attempt_finished_at", "_attempt_reason", "_image_thread",
+                    "_recovery_paused", "_recovery_suppressed", "recovery_claim_id"):
+            legacy.pop(key, None)
+        service.store.write_receipt(db, "image", "admin", "repair-image", legacy)
+        db.execute("DELETE FROM image_requests WHERE task_key=?", ("owner:repair-image",))
+
+    monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
+    monkeypatch.setattr(
+        api, "require_identity",
+        lambda authorization, request: admin_identity if authorization == "admin" else {**IDENTITY, "id": authorization or "other"},
+    )
+    monkeypatch.setattr(api, "require_image_policy", lambda *a, **kw: None)
+    original_read = Mock()
+    service.images.resume_poll = original_read
+    app = FastAPI()
+    app.include_router(api.create_router("image"))
+    app.include_router(api.create_router("text"))
+    client = TestClient(app)
+    image_endpoint = "/api/image-tasks/repair-image/completion"
+
+    response = client.post(
+        image_endpoint, headers={"Authorization": "admin"},
+        json={"action": "recover", "allow_unconfirmed_retry": False},
+    )
+    assert response.status_code == 200, response.text
+    original_read.assert_called_once_with(
+        {"id": "admin"}, "repair-image", extra_timeout_secs=5,
+        allow_unrecoverable_retry=True, completion_recheck=True,
+    )
+    with service.store.connect() as db:
+        current = service.store.read_receipt(db, "image", "admin", "repair-image")
+        assert current["recovery_no_result_reads"] == 3
+        assert current["_completion"]["max_extra_requests"] == 0
+        assert "replacement_id" not in current["_completion"]
+        assert db.execute("SELECT count(*) FROM image_requests WHERE task_key LIKE 'admin:%'").fetchone()[0] == 1
+    assert "replacement_id" not in response.json()
+    assert service.text.admission.claim_next() is None
+
+    before = copy.deepcopy(current)
+    assert client.get(image_endpoint, headers={"Authorization": "admin"}).status_code == 403
+    for body in (
+        {"action": "complete", "selected_id": "repair-image", "results_saved": True, "reviewed": True},
+        {"action": "rework", "selected_id": "repair-image"},
+        {"action": "recover", "allow_unconfirmed_retry": True},
+        {"action": "recover", "retry_not_sent_failure_at": 2900.0},
+        {"action": "recover", "reviewed": False},
+    ):
+        rejected = client.post(image_endpoint, headers={"Authorization": "admin"}, json=body)
+        assert rejected.status_code == 403, rejected.text
+        with service.store.connect() as db:
+            assert service.store.read_receipt(db, "image", "admin", "repair-image") == before
+
+    text_rejected = client.post("/api/chat-requests/old-0/completion", headers={"Authorization": "admin"},
+                                json={"action": "recover"})
+    assert text_rejected.status_code == 403
+
+
 def test_api_owner_isolation_and_explicit_saved_reviewed_ack(setup, monkeypatch):
     import api.generation_completion as api
     service, admission, calls = setup
