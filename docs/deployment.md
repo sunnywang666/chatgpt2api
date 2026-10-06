@@ -147,6 +147,16 @@ Provider 只识别保留的 Workbench 类目专用提示词：单 user 消息、
 
 新回执的 `derived_input` 返回 `kind`、`original_input_hash`、`directory_sha256`、`category_count` 和 `text_utf8_bytes`。原 hash 由 Provider 从原 DB 记录绑定，无须客户端提供。目录指纹为 SHA256(UTF8(JSON.stringify(rows)))，其中 rows 按原序列保留全部重复叶，每行为 `[descriptionCategoryId,typeId,name,descriptionCategoryName ?? null,categoryPath]`；消费者可从冻结 recovery_request 重算并对照。派生请求保存自己的输入和 hash，并复用普通后继的唯一性、幂等及发送前原分支检查；旧输入及 hash 不改写。
 
+#### 原类目后继已证实未发送时的一次性恢复
+
+仅 admin/Content 可显式调用 `POST /api/conversation-bindings/text-requests/{request_id}/resume-unsent-successor`，body 是该后继原七身份字段及 `derived_input:{"kind":"category_directory_parent_v1"}`，URL ID 必须与 `client_request_id` 相同。禁止替换 messages、账号、会话、父节点或原请求引用；不新建后继 ID 或授权记录。运行实例必须具备持久 admission；缺失时 GET 不显示可恢复标志，显式接口拒绝且不消费一次性重排额度。
+
+本地校验要求原后继为 `failed/CHAT_SUPERSEDE_CURSOR_CHANGED/not_sent`、提交/占位/执行标记明确为 false、没有发送序列或发送时间线、无有效 claim/人工暂停、保留派生输入及双方 hash/绑定全部相符。GET 仅在全部本地校验通过时返回 `bound_successor_resume_retryable:true`、`upstream_outcome:not_submitted`、`upstream_submission_started:false`；此标志不证明上游父节点当前可用。GET、普通 submit 和 recover 均不重排。
+
+显式调用在原 SQLite 事务中最多重排一次，保留原 request/message ID、input/hash、唯一后继关系和失败快照。并发或重启后的同 ID 同参数调用只返回同一回执；恢复后再次失败不会获得第二次重排。资格不足返回 HTTP409 `CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE`，身份变化仍返回原冲突错误。
+
+正常 runner 继续在初次读取和账号节拍后的发送边界检查原请求/父节点。除原 assistant 终态外，仅兼容已完成 user → 已完成 assistant code 调用 → 已完成 image tool 的唯一父链：调用 recipient 必须等于 tool author.name，tool 必须有合法 `image_asset_pointer` 且无子节点。任意普通 tool/null end_turn、活跃状态、缺失链条、兄弟分支、实际 current node 变化或旧请求出现均不能因此绕过检查。
+
 
 ### 429 分层
 

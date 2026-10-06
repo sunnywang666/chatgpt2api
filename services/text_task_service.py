@@ -306,6 +306,7 @@ class TextTaskService:
         # Do not trust an arbitrary persisted public projection. This field is
         # emitted only from the exact internal terminal-state predicate above.
         result.pop("upstream_submission_started", None)
+        result.pop("bound_successor_resume_retryable", None)
         if TextTaskService._public_not_submitted(receipt):
             result["upstream_submission_started"] = False
         # Derive diagnostics only from validated private records. Never trust a
@@ -1185,6 +1186,20 @@ class TextTaskService:
                     lease_thread.join(timeout=1)
             return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result
         result = self._public(json.loads(row[0]))
+        # This advertisement is a local proof only, never an implicit retry or
+        # upstream read. The explicit endpoint revalidates it transactionally.
+        if self.admission is not None and self._known_unsent_category_successor(json.loads(row[0]), now):
+            try:
+                with self._db() as db:
+                    current = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+                    if current:
+                        current_receipt = json.loads(current[1])
+                        self._validated_unsent_successor_input(db, owner, current[0], current_receipt, self._now())
+                        result = self._public(current_receipt)
+                        result.update(bound_successor_resume_retryable=True, upstream_outcome="not_submitted",
+                                      upstream_submission_started=False)
+            except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
+                pass
         return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result
 
     def recover(self, owner: str, request_id: str, allow_unrecoverable_retry: bool = False,
@@ -1689,6 +1704,83 @@ class TextTaskService:
                 # No upstream call was scheduled, so this is a known rejection.
                 self._update(owner, request_id, status="failed", error_code="CONVERSATION_SCHEDULING_FAILED")
         return self.read(owner, request_id)
+
+    @staticmethod
+    def _known_unsent_category_successor(receipt, now):
+        timeline = receipt.get("_execution_timeline")
+        if (not isinstance(timeline, list) or not timeline
+                or any(not isinstance(item, dict) or item.get("stage") not in {"accepted", "execution_claimed"} for item in timeline)
+                or receipt.get("_last_sent_sequence") is not None
+                or type(receipt.get("send_count", 0)) is not int or receipt.get("send_count", 0) != 0
+                or type(receipt.get("_bound_successor_resume_count", 0)) is not int
+                or receipt.get("_bound_successor_resume_count", 0) != 0):
+            return False
+        for claim, until in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until")):
+            expires = receipt.get(until)
+            if (expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires) or expires > now)
+                    or receipt.get(claim) and expires is None):
+                return False
+        return bool(receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
+            and not receipt.get("_public_session_ref") and not receipt.get("_forward_protocol")
+            and receipt.get("status") == "failed" and receipt.get("error_code") == "CHAT_SUPERSEDE_CURSOR_CHANGED"
+            and receipt.get("upstream_outcome") == "not_sent"
+            and all(receipt.get(key) is False for key in ("_submission_started", "_turn_reserved", "_executing"))
+            and not any(receipt.get(key) for key in ("_recovery_paused", "_recovery_suppressed", "_execution_wait_ended_at", "_attempt_finished_at"))
+            and isinstance(receipt.get("_derived_input"), dict)
+            and receipt["_derived_input"].get("kind") == "category_directory_parent_v1"
+            and all(isinstance(receipt.get(key), str) and receipt[key] for key in
+                ("_input_ref", "_supersedes_request_id", "request_id", "request_message_id")))
+
+    def _validated_unsent_successor_input(self, db, owner, request_hash, receipt, now):
+        if not self._known_unsent_category_successor(receipt, now):
+            raise ConversationBindingError("successor is not known unsent", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
+        body = self.store.load_input(receipt["_input_ref"])
+        if self._submission_identity(owner, body) != (receipt["request_id"], request_hash):
+            raise ConversationBindingError("retained successor input changed", code="CONVERSATION_REQUEST_CONFLICT")
+        previous = self._validate_supersede(self.store, db, owner, receipt, now)
+        if previous.get("_recovery_paused") or previous.get("_recovery_suppressed"):
+            raise ConversationBindingError("original recovery is paused", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
+        return body
+
+    def resume_unsent_successor(self, owner, request_id, envelope):
+        """One explicit atomic requeue of the same proved-unsent category request.
+
+        No original outcome or identity is rewritten. The normal runner repeats
+        its original-node checks at both the read and final send boundaries.
+        """
+        if self.admission is None:
+            raise ConversationBindingError("durable admission is unavailable", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
+        if (set(envelope) != self.SUPERSEDE_FIELDS | {"derived_input"}
+                or envelope.get("client_request_id") != request_id
+                or envelope.get("derived_input") != {"kind": "category_directory_parent_v1"}):
+            raise ConversationBindingError("original successor envelope required", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
+        expanded = self.submission_input(owner, envelope)
+        identity = self._submission_identity(owner, expanded)
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+            if not row:
+                raise ConversationBindingError("successor not found", code="CHAT_REQUEST_NOT_FOUND")
+            if identity != (request_id, row[0]):
+                raise ConversationBindingError("retained successor input changed", code="CONVERSATION_REQUEST_CONFLICT")
+            receipt = json.loads(row[1])
+            if receipt.get("_bound_successor_resume_count") == 1:
+                return self._public(receipt)  # Concurrent/restart duplicates consume no second resume.
+            try:
+                self._validated_unsent_successor_input(db, owner, row[0], receipt, self._now())
+            except (OSError, ValueError, TypeError, KeyError):
+                raise ConversationBindingError("retained successor input unavailable", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE") from None
+            updated = dict(receipt)
+            updated["_bound_successor_resume_failure"] = {key: receipt[key] for key in (
+                "status", "error_code", "upstream_outcome", "finished_at", "updated_at", "_execution_timeline") if key in receipt}
+            for key in ("error_code", "upstream_outcome", "finished_at", "waiting", "_ready_at", "_claim_id", "_claim_until"):
+                updated.pop(key, None)
+            updated.update(status="queued", boot=self.boot, updated_at=self._now(),
+                _bound_successor_resume_count=1, _executing=False, _turn_reserved=False, _submission_started=False)
+            updated["_execution_timeline"] = [*receipt["_execution_timeline"], {"stage": "known_unsent_successor_resumed", "at": self._now()}][-32:]
+            self.store.write_receipt(db, "text", owner, request_id, updated)
+        self.admission.wake()
+        return self._public(updated)
 
     @staticmethod
     def _known_unsent_terminal_empty_correction(receipt, now):
