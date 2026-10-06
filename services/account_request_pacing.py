@@ -546,7 +546,11 @@ class AccountRequestClock:
                 and isinstance(body["timezone_offset_min"], (int, float))
                 and not isinstance(body["timezone_offset_min"], bool)):
             metadata_kind = "account_limits"
-        concurrent_io = is_conversation_read or metadata_kind is not None
+        # Admitted independent turns keep their activity reservation in the
+        # request context. Serialize their durable send edge, not the wait for
+        # response headers. Legacy calls without admission retain old behavior.
+        concurrent_turn = is_turn and context is not None
+        concurrent_io = is_conversation_read or metadata_kind is not None or concurrent_turn
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
@@ -676,6 +680,7 @@ class AccountRequestClock:
                     if context is not None:
                         context.release_turn()
 
+        response = None
         try:
             while True:
                 measure_preparation("clock_lock", acquire_with_budget, self.lock)
@@ -827,7 +832,7 @@ class AccountRequestClock:
                     if concurrent_io:
                         # Keep the durable clock through the local transport-call
                         # edge, not through the network response. Other original
-                        # conversations may read once their own start floor is due.
+                        # conversations may send once their start floor is due.
                         # The caller still joins this one timeout-limited request;
                         # no retry, detached task or new scheduling queue is added.
                         entered = threading.Event()
@@ -854,7 +859,7 @@ class AccountRequestClock:
                                 entered.set()
                         worker_context = copy_context()
                         worker = threading.Thread(target=worker_context.run, args=(read_io,),
-                                                  name="account-metadata-read" if metadata_kind else "original-conversation-read")
+                                                  name="account-model-send" if concurrent_turn else "account-metadata-read" if metadata_kind else "original-conversation-read")
                         worker.start()
                         reservation_error = None
                         floor_durable = False
@@ -865,6 +870,9 @@ class AccountRequestClock:
                             sent_at = outcome["started_at"]
                             self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
                             correct_read_start(sent_at)
+                            if is_turn:
+                                self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
+                                self.last_turn_started = max(self.last_turn_started or sent_at, sent_at)
                             self._save()
                             floor_durable = True
                         except BaseException as exc:
@@ -876,9 +884,10 @@ class AccountRequestClock:
                         if floor_durable:
                             self.lock.release()
                             clock_held = False
+                            release_pacing()
                         try:
                             # Reap the transport even on caller interruption;
-                            # never leave a late GET running after this returns.
+                            # never leave a late transport running after return.
                             while worker.is_alive():
                                 try:
                                     worker.join()
@@ -906,7 +915,7 @@ class AccountRequestClock:
                         correct_read_start(sent_at)
                         if is_turn:
                             self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
-                            self.last_turn_started = sent_at
+                            self.last_turn_started = max(self.last_turn_started or sent_at, sent_at)
                         self._save()
                 release_pacing()
                 response_headers = getattr(response, "headers", {}) or {}
@@ -919,14 +928,11 @@ class AccountRequestClock:
                                  evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id,
                                            "response_features": _rate_limit_response_features(response)})
                 if concurrent_io and reservation_error is not None:
-                    response.close()
                     raise reservation_error
                 if context is not None and is_turn and hasattr(context, "record_stage"):
                     context.record_stage("response_headers_received", status_code=response.status_code,
                                          upstream_request_id=safe_id)
             finally:
-                if not clock_held and response is not None:
-                    response.close()
                 if clock_held:
                     self.lock.release()
             if is_turn and kwargs.get("stream") and 200 <= response.status_code < 300:
@@ -961,6 +967,14 @@ class AccountRequestClock:
                 release_turn()
             return response
         except BaseException:
+            # A persistence/reconciliation failure after headers must reap the
+            # original stream too. No response has been transferred to a caller.
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    logger.warning({"event": "account_transport_cleanup_failed",
+                                    "account": self.account_key})
             release_pacing()
             release_turn()
             raise
@@ -1227,10 +1241,11 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
     raw_send = session.request
 
     def close_read_transport():
-        # Buffered GETs run on a joined, short-lived I/O thread. Session.close
+        # Joined requests run on a short-lived I/O thread. Session.close
         # on the caller cannot close this thread-local handle; retained errors
         # can otherwise keep it alive through a traceback cycle until GC.
-        # Never close the Session or any other thread's stream/handle here.
+        # Streaming curl_cffi responses use a separate duphandle; only this
+        # thread's idle source handle is closed, never the live stream clone.
         if isinstance(session, Session) and session._use_thread_local_curl:
             local = session._local
             curl = getattr(local, "curl", None)

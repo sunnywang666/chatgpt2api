@@ -48,6 +48,116 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_model_send_save_failure_reaps_and_closes_unreturned_stream(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            sent, returned = threading.Event(), threading.Event()
+            response, context = Response(), Context("save-failure")
+            save = clock._save
+            def failing_save():
+                if sent.is_set():
+                    raise OSError("fixture storage unavailable after send")
+                save()
+            def send(*args, **kwargs):
+                sent.set()
+                threading.Event().wait(.05)
+                returned.set()
+                return response
+            with patch.object(clock, "_save", side_effect=failing_save), executing(context):
+                with self.assertRaisesRegex(OSError, "storage unavailable"):
+                    clock.request(send, "POST", "https://provider/conversation", stream=True)
+            self.assertTrue(returned.is_set(), "request must join the original transport")
+            self.assertTrue(response.closed, "unreturned stream must not leak on final save failure")
+            self.assertEqual(context.released, 1)
+            self.assertIn("send_call_started", context.stages)
+            self.assertFalse(clock.lock.locked())
+            self.assertFalse(clock.turn_lock.locked())
+
+    def test_parallel_model_reply_preserves_newer_send_and_429_after_restart(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            path = Path(tmp) / "clock.json"
+            entered, release = threading.Event(), threading.Event()
+            results, errors = [], []
+            class LimitContext(Context):
+                def record_limit(self, evidence): self.limit = evidence
+            def delayed(*args, **kwargs):
+                entered.set()
+                if not release.wait(3): raise TimeoutError("fixture headers not released")
+                return Response()
+            def first():
+                try:
+                    with executing(LimitContext("older")):
+                        results.append(AccountRequestClock("account", path).request(
+                            delayed, "POST", "https://provider/conversation", stream=True))
+                except BaseException as exc: errors.append(exc)
+            worker = threading.Thread(target=first)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                def limited(*args, **kwargs):
+                    response = Response(); response.status_code = 429
+                    response.headers = {"Retry-After": "90"}
+                    return response
+                with executing(LimitContext("newer")):
+                    AccountRequestClock("account", path).request(limited, "POST", "https://provider/conversation")
+                before = json.loads(path.read_text())
+            finally:
+                release.set(); worker.join(3)
+            self.assertFalse(worker.is_alive()); self.assertEqual(errors, [])
+            after = json.loads(path.read_text())
+            self.assertGreaterEqual(after["cooldown_until"], before["cooldown_until"])
+            self.assertGreaterEqual(after["last_turn_started"], before["last_turn_started"])
+            self.assertEqual(after["rate_failures"], 1)
+            never_send = __import__("unittest.mock", fromlist=["Mock"]).Mock()
+            with executing(LimitContext("third")), self.assertRaises(AccountRequestDeadlineExceeded):
+                AccountRequestClock("account", path).request(never_send, "POST", "https://provider/conversation",
+                    _account_request_deadline_monotonic=time.monotonic()+.05)
+            never_send.assert_not_called()
+            for response in results: response.close()
+
+    def test_independent_model_sends_overlap_before_first_response_headers(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            entered = [threading.Event(), threading.Event()]
+            release = threading.Event()
+            contexts = [Context("first"), Context("second")]
+            results, errors = {}, []
+            def run(index):
+                def send(*args, **kwargs):
+                    entered[index].set()
+                    if not release.wait(3):
+                        raise TimeoutError("fixture response headers not released")
+                    return Response()
+                try:
+                    with executing(contexts[index]):
+                        results[index] = clock.request(send, "POST", "https://provider/conversation", stream=True)
+                except BaseException as exc:
+                    errors.append(exc)
+            workers = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+            try:
+                workers[0].start()
+                self.assertTrue(entered[0].wait(1))
+                workers[1].start()
+                self.assertTrue(entered[1].wait(.5), "independent POST waited for earlier response headers")
+            finally:
+                release.set()
+                for worker in workers:
+                    if worker.ident is not None:
+                        worker.join(2)
+            self.assertFalse(errors)
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(c.released == 0 for c in contexts), "send lock release must not release active work slots")
+            for response in results.values():
+                list(response.iter_lines())
+            self.assertTrue(all(c.released == 1 for c in contexts))
+
     def test_model_send_preparation_timing_excludes_transport_and_preserves_guards(self):
         for transport_fails in (False, True):
             with self.subTest(transport_fails=transport_fails):
@@ -1717,6 +1827,76 @@ def test_native_partial_response_timeout_keeps_stage_snapshot(tmp_path, monkeypa
         session.close()
         server.shutdown()
         server.server_close()
+
+
+def test_native_parallel_post_keeps_stream_clones_after_worker_handle_cleanup(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from curl_cffi import requests
+    import services.account_request_pacing as pacing
+    from services.config import ConfigStore
+    both = threading.Barrier(3)
+    headers, tail = threading.Event(), threading.Event()
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            both.wait(timeout=3)
+            if not headers.wait(3): return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b'data: {"part":1}\n\n'); self.wfile.flush()
+            if not tail.wait(4): return
+            self.wfile.write(b'data: [DONE]\n\n'); self.wfile.flush()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    session = requests.Session(trust_env=False)
+    caller_curl, raw_send = session.curl, session.request
+    worker_handles = []
+    def native_send(method, url, **kw):
+        worker_handles.append(session.curl)
+        return raw_send(method, f"http://127.0.0.1:{server.server_port}/conversation", **kw)
+    session.request = native_send
+    (tmp_path/"config.json").write_text(json.dumps({"auth-key":"test-only"}))
+    settings = ConfigStore(tmp_path/"config.json")
+    settings.update({"account_request_interval_secs":0, "account_message_interval_secs":0})
+    monkeypatch.setattr(pacing, "config", settings)
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    pacing.pace_account_session(session, {"account_id":"fixture-only"}, "fixture-token")
+    responses, errors = {}, []
+    contexts = [Context("first"), Context("second")]
+    def run(index):
+        contexts[index].request_id = str(index)
+        try:
+            with executing(contexts[index]):
+                responses[index] = session.post("https://chatgpt.com/backend-api/conversation",
+                    json={"model":"fixture"}, stream=True, timeout=5)
+        except BaseException as exc: errors.append(exc)
+    workers = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+    try:
+        for worker in workers: worker.start()
+        both.wait(timeout=3)  # Both POST bodies arrived before either header.
+        assert not responses
+        headers.set()
+        for worker in workers: worker.join(2)
+        assert not errors and len(responses) == 2
+        assert all(c.released == 0 for c in contexts)
+        assert len(worker_handles) == 2 and all(c._curl is None for c in worker_handles)
+        assert caller_curl._curl is not None
+        assert all(r.curl not in worker_handles and r.curl._curl is not None for r in responses.values())
+        tail.set()
+        for response in responses.values():
+            assert [line for line in response.iter_lines() if line] == [b'data: {"part":1}', b'data: [DONE]']
+            response.stream_task.result(timeout=2)
+        assert all(c.released == 1 for c in contexts)
+        assert all(r.curl._curl is None for r in responses.values())
+    finally:
+        headers.set(); tail.set()
+        for worker in workers: worker.join(6)
+        for response in responses.values(): response.close()
+        session.close(); server.shutdown(); server.server_close()
 
 
 def test_native_joined_read_releases_only_worker_handle_and_keeps_buffered_result(tmp_path, monkeypatch):
