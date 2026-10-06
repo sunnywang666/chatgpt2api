@@ -25,7 +25,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.account_request_pacing import AccountRequestDeadlineExceeded, pace_account_session, retry_after_seconds
 from services.config import config
-from services.request_context import observing_archive_step
+from services.request_context import current_archive_observation, observing_archive_step
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -1345,6 +1345,32 @@ class OpenAIBackendAPI:
                 headers=self._headers(path, {"Accept": "application/json", "Content-Type": "application/json"}),
                 json={"is_archived": archived}, timeout=60)
         ensure_ok(response, path)
+        # Observe whether this upstream offers a complete mutation receipt.
+        # Only fixed structural flags leave this function; never log the body,
+        # unknown field names, conversation IDs, cursors, or parse errors.
+        try:
+            ack = response.json()
+            ack_shape = "json_object" if isinstance(ack, dict) else "non_object"
+        except Exception:
+            ack, ack_shape = None, "json_parse_failed"
+        ack = ack if isinstance(ack, dict) else {}
+        identities = [ack[key] for key in ("conversation_id", "id") if key in ack]
+        states = [ack[key] for key in ("is_archived", "archived") if key in ack]
+        observation = current_archive_observation.get() or {}
+        logger.info({
+            "event": "archive_patch_ack_shape",
+            "request_ref": observation.get("request_ref"),
+            "work_ref": observation.get("work_ref"),
+            "shape": ack_shape,
+            "success_is_true": ack.get("success") is True,
+            "identity_present": bool(identities),
+            "identity_matches": bool(identities) and all(isinstance(v, str) and v == conversation_id for v in identities),
+            "state_present": bool(states),
+            "state_is_bool": bool(states) and all(type(v) is bool for v in states),
+            "state_matches": bool(states) and all(v is archived for v in states),
+            "cursor_present": "current_node" in ack,
+            "cursor_matches": isinstance(ack.get("current_node"), str) and ack["current_node"] == parent_message_id,
+        })
         # A timeout on PATCH is safe to recover by reading this exact chat first.
         with observing_archive_step("readback"):
             readback = self._get_conversation(conversation_id)
