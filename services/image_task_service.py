@@ -819,7 +819,7 @@ class ImageTaskService:
 
         owner = _owner_id(identity)
         key = _task_key(owner, _clean(task_id))
-        with self._transaction():
+        with self._transaction(task_key=key):
             task = self._tasks.get(key)
             if not task or not task.get("_image_thread"):
                 raise ImageThreadError("IMAGE_THREAD_NOT_FOUND", status=404)
@@ -835,11 +835,19 @@ class ImageTaskService:
             # Generation on this conversation uses the same lock. Recheck after
             # obtaining it so an in-flight result or newer revision cannot be
             # hidden by an old approval event.
-            with self._transaction():
+            with self._transaction(task_key=key) as db:
                 task = self._tasks.get(key)
                 thread = (task or {}).get("_image_thread") or {}
-                members = [item for item in self._tasks.values()
-                    if item.get("owner_id") == owner and (item.get("_image_thread") or {}).get("id") == thread.get("id")]
+                thread_id = thread.get("id")
+                # Keep every member, including UNKNOWN and selected retry
+                # history, but do not decode unrelated saved image payloads.
+                # This fresh read remains inside the conversation binding lock.
+                members = [task if member_key == key else json.loads(raw)
+                    for member_key, raw in db.execute(
+                        "SELECT task_key,receipt FROM image_requests "
+                        "WHERE json_extract(receipt,'$.owner_id')=? "
+                        "AND json_extract(receipt,'$._image_thread.id')=?",
+                        (owner, thread_id))] if isinstance(thread_id, str) and thread_id else []
                 from services.image_thread import selected_thread_result
                 owned = {item["id"]: item for item in members}
                 # The original failed attempt stays in history. An explicitly

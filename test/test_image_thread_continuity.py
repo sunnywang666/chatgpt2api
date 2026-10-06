@@ -612,6 +612,78 @@ def test_review_approval_archives_exact_image_thread_and_later_edit_restores_it(
     assert r.state.archive_actions[-1] == (first["conversation_id"], False)
 
 
+def test_archive_decodes_only_original_thread_not_unrelated_saved_images(runtime, monkeypatch):
+    r = runtime
+    r.submit("main-v1"); first = run_next(r, "main-v1")
+    with r.store.transaction() as db:
+        for index in range(64):
+            owner = "other-owner" if index % 2 else WHO["id"]
+            row = {"id": f"history-{index}", "owner_id": owner, "status": "success",
+                   "_image_thread": {"id": "product-a" if index % 2 else "other-thread"},
+                   "data": [{"b64_json": "unrelated-history-payload" + "x" * 131072}]}
+            r.store.write_receipt(db, "image", owner, row["id"], row)
+    loads = json.loads
+    decoded = []
+    def reject_unrelated(raw, *args, **kwargs):
+        if isinstance(raw, (str, bytes)):
+            marker = "unrelated-history-payload" if isinstance(raw, str) else b"unrelated-history-payload"
+            assert marker not in raw, "archive decoded unrelated saved image payload"
+        result = loads(raw, *args, **kwargs)
+        if isinstance(result, dict) and result.get("id") == "main-v1":
+            decoded.append(result["id"])
+        return result
+    monkeypatch.setattr(json, "loads", reject_unrelated)
+    assert r.service.archive_thread(WHO, "main-v1")["archived"] is True
+    assert decoded and r.state.archive_actions == [(first["conversation_id"], True)]
+    with r.store.connect() as db:
+        assert db.execute("SELECT count(*) FROM image_requests").fetchone()[0] == 65
+
+
+@pytest.mark.parametrize("later_status", ["queued", "running", "error"])
+def test_archive_reloads_same_thread_member_accepted_while_waiting_for_binding(runtime, monkeypatch, later_status):
+    from contextlib import contextmanager
+    r = runtime
+    r.submit("main-v1"); first = run_next(r, "main-v1")
+    @contextmanager
+    def accept_before_lock(*args):
+        later = copy.deepcopy(first)
+        later.update(id="late-v2", status=later_status, _sequence=first["_sequence"] + 1,
+                     _image_thread_terminal=False, upstream_outcome="unknown")
+        with r.store.transaction() as db:
+            r.store.write_receipt(db, "image", WHO["id"], "late-v2", later)
+        yield
+    monkeypatch.setattr(r.account_stub, "conversation_binding_lock", accept_before_lock)
+    with pytest.raises(ImageThreadError, match="IMAGE_THREAD_NOT_TERMINAL"):
+        r.service.archive_thread(WHO, "main-v1")
+    assert not r.state.archive_actions
+
+
+@pytest.mark.parametrize("changed_thread", [None, {}, {"id": ""}, {"id": 1}])
+def test_archive_missing_thread_after_binding_wait_never_loads_unthreaded_history(runtime, monkeypatch, changed_thread):
+    from contextlib import contextmanager
+    r = runtime
+    r.submit("main-v1"); run_next(r, "main-v1")
+    @contextmanager
+    def replace_before_lock(*args):
+        with r.store.transaction() as db:
+            task = r.store.read_receipt(db, "image", WHO["id"], "main-v1")
+            task["_image_thread"] = changed_thread
+            r.store.write_receipt(db, "image", WHO["id"], "main-v1", task)
+            r.store.write_receipt(db, "image", WHO["id"], "unthreaded", {
+                "id": "unthreaded", "owner_id": WHO["id"], "status": "success",
+                "data": ["unthreaded-history-payload" + "x" * 4096]})
+        yield
+    loads = json.loads
+    def reject_unthreaded(raw, *args, **kwargs):
+        assert not isinstance(raw, str) or "unthreaded-history-payload" not in raw
+        return loads(raw, *args, **kwargs)
+    monkeypatch.setattr(r.account_stub, "conversation_binding_lock", replace_before_lock)
+    monkeypatch.setattr(json, "loads", reject_unthreaded)
+    with pytest.raises(ImageThreadError, match="IMAGE_THREAD_NOT_TERMINAL"):
+        r.service.archive_thread(WHO, "main-v1")
+    assert not r.state.archive_actions
+
+
 def test_unarchive_timeout_requeues_original_image_request_before_any_new_send(runtime, monkeypatch):
     r = runtime
     r.submit("main-v1"); first = run_next(r, "main-v1")
