@@ -319,3 +319,58 @@ def test_two_asset_consumptions_before_download_invalidate_interleaved_observati
     service.update_account("fixture", snapshot(4), quiet=True, expected_capacity_observation=between)
     saved = service.get_account("fixture")
     assert saved["quota"] == 3 and saved["capacity_used_since_observation"] is True
+
+
+@pytest.mark.parametrize("after_image_consumption", [False, True])
+def test_text_usage_does_not_invalidate_image_metadata_read(tmp_path, after_image_consumption):
+    from services.account_service import AccountService
+    from services.storage.json_storage import JSONStorageBackend
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([{"access_token": "fixture", "managed_owner": "fixture-owner",
+        "source_type": "web", "status": "正常", "type": "Plus", **snapshot(5)}])
+    if after_image_consumption:
+        service.mark_image_capacity_consumed("fixture")
+    expected = service._capacity_observation_revision(service.get_account("fixture"))
+    service.mark_text_used("fixture")
+    service.update_account("fixture", snapshot(3), quiet=True, expected_capacity_observation=expected)
+    saved = service.get_account("fixture")
+    assert saved["quota"] == 3
+    assert saved["capacity_used_since_observation"] is False
+
+
+def test_old_account_import_cannot_rewind_asset_consumption_counter(tmp_path):
+    from services.account_service import AccountService
+    from services.storage.json_storage import JSONStorageBackend
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([{"access_token": "fixture", "managed_owner": "fixture-owner",
+        "source_type": "web", "status": "正常", "type": "Plus", **snapshot(5)}])
+    service.mark_image_capacity_consumed("fixture")
+    service.add_account_items([{"access_token": "fixture", "capacity_consumption_count": 0, **snapshot(5)}])
+    saved = AccountService(JSONStorageBackend(tmp_path / "accounts.json")).get_account("fixture")
+    assert saved["capacity_consumption_count"] == 1
+    assert saved["capacity_used_since_observation"] is True
+    assert saved["quota"] == 4
+
+
+def test_refresh_rotation_and_generic_update_preserve_consumption_counter(tmp_path):
+    from services.account_service import AccountService
+    from services.storage.json_storage import JSONStorageBackend
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([{"access_token": "fixture-old", "managed_owner": "fixture-owner",
+        "source_type": "web", "status": "正常", "type": "Plus", **snapshot(5)}])
+    service.mark_image_capacity_consumed("fixture-old")
+    service.update_account("fixture-old", {"capacity_consumption_count": 0}, quiet=True)
+    token = service._apply_refreshed_tokens("fixture-old", {"access_token": "fixture-new"}, "fixture")
+    saved = service.get_account(token)
+    assert token == "fixture-new"
+    assert saved["capacity_consumption_count"] == 1 and saved["quota"] == 4
+    assert saved["capacity_used_since_observation"] is True
+
+
+@pytest.mark.parametrize("value", [None, -1, True, "invalid", 1.5])
+def test_invalid_consumption_counter_normalizes_without_breaking_account(tmp_path, value):
+    from services.account_service import AccountService
+    from services.storage.json_storage import JSONStorageBackend
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    saved = service._normalize_account({"access_token": "fixture", "capacity_consumption_count": value})
+    assert saved["capacity_consumption_count"] == 0

@@ -351,6 +351,8 @@ class AccountService:
         normalized["restore_at"] = normalized.get("restore_at") or None
         normalized["success"] = int(normalized.get("success") or 0)
         normalized["fail"] = int(normalized.get("fail") or 0)
+        consumed = normalized.get("capacity_consumption_count", 0)
+        normalized["capacity_consumption_count"] = consumed if type(consumed) is int and consumed >= 0 else 0
         normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
@@ -785,7 +787,7 @@ class AccountService:
     def _apply_refreshed_tokens(
         self, old_access_token: str, token_data: dict, event: str, *,
         expected_revision: str | None = None, chat_info: dict | None = None,
-        expected_capacity_observation: tuple[int, int, str, str] | None = None,
+        expected_capacity_observation: tuple[int, int, str, int] | None = None,
         capacity_observed_at: str | None = None,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
@@ -3189,7 +3191,7 @@ class AccountService:
                     # Re-importing an old export cannot rewind server-owned
                     # consumption/observation state; fresh reads update it.
                     for key in ("success", "fail", "last_used_at", "quota", "limits_progress",
-                                "capacity_observed_at", "capacity_used_since_observation",
+                                "capacity_observed_at", "capacity_used_since_observation", "capacity_consumption_count",
                                 "capacity_read_failed_at", "status", "restore_at"):
                         incoming.pop(key, None)
                 if not incoming.get("created_at"):
@@ -3235,15 +3237,16 @@ class AccountService:
         return {"removed": removed, "items": items}
 
     @staticmethod
-    def _capacity_observation_revision(account: dict) -> tuple[int, int, str, str]:
-        # Reuse the persisted consumption counters and last observation rather
-        # than letting a slow response certify capacity from before a result.
+    def _capacity_observation_revision(account: dict) -> tuple[int, int, str, int]:
+        # A generated asset consumes capacity before download outcome counters
+        # change. Track that transition separately from last_used_at, which is
+        # also updated by text requests and cannot invalidate image metadata.
         return (int(account.get("success") or 0), int(account.get("fail") or 0),
-                str(account.get("capacity_observed_at") or ""), str(account.get("last_used_at") or ""))
+                str(account.get("capacity_observed_at") or ""), int(account.get("capacity_consumption_count") or 0))
 
     @classmethod
     def _capacity_observation_can_apply(
-        cls, current: dict, expected: tuple[int, int, str, str] | None, observed_at: str | None,
+        cls, current: dict, expected: tuple[int, int, str, int] | None, observed_at: str | None,
     ) -> bool:
         if expected is None:
             return True
@@ -3267,7 +3270,7 @@ class AccountService:
         *,
         expected_credentials: tuple[str, str] | None = None,
         expected_codex_credentials: tuple[str, str] | None = None,
-        expected_capacity_observation: tuple[int, int, str, str] | None = None,
+        expected_capacity_observation: tuple[int, int, str, int] | None = None,
     ) -> dict | None:
         if not access_token:
             return None
@@ -3289,7 +3292,8 @@ class AccountService:
             if not self._capacity_observation_can_apply(
                     current, expected_capacity_observation, updates.get("capacity_observed_at")):
                 return dict(current)
-            account = self._normalize_account({**current, **updates, "access_token": access_token})
+            account = self._normalize_account({**current, **updates, "access_token": access_token,
+                "capacity_consumption_count": current.get("capacity_consumption_count", 0)})
             if account is None:
                 return None
             if updates.get("status") == "限流" and account.get("status") == "限流" and config.auto_remove_rate_limited_accounts and not account.get("managed_owner"):
@@ -3354,9 +3358,9 @@ class AccountService:
     def mark_image_capacity_consumed(self, access_token: str) -> None:
         """Invalidate quota before persisted result IDs release generation capacity.
 
-        The later download outcome only updates success/failure counters. Reuse
-        last_used_at in metadata CAS so an observation begun before these
-        assets cannot clear this invalidation while the download is in flight.
+        The later download outcome only updates success/failure counters. The
+        image-only counter prevents an older metadata read from clearing this
+        invalidation; unrelated text usage does not restart image observation.
         """
         with self._lock:
             access_token = self._resolve_access_token_locked(access_token)
@@ -3365,7 +3369,8 @@ class AccountService:
                 raise RuntimeError("selected image account disappeared")
             next_item = dict(current)
             next_item["capacity_used_since_observation"] = True
-            next_item["last_used_at"] = datetime.now().isoformat(sep=" ", timespec="microseconds")
+            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            next_item["capacity_consumption_count"] = int(next_item.get("capacity_consumption_count") or 0) + 1
             next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
             if next_item["quota"] == 0:
                 next_item["status"] = "限流"
