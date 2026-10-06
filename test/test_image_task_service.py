@@ -3007,6 +3007,98 @@ class ImageTaskServiceTests(unittest.TestCase):
         document["current_node"] = "later-failure"
         self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
 
+        def known_generation_error_document():
+            return {
+                "current_node": "terminal-1",
+                "mapping": {
+                    "request-1": {
+                        "parent": "prior-turn",
+                        "message": {
+                            "id": "request-1", "author": {"role": "user"},
+                            # Input references belong to the user's request;
+                            # only output assets after it disqualify this receipt.
+                            "content": {
+                                "content_type": "multimodal_text",
+                                "parts": [{
+                                    "content_type": "image_asset_pointer",
+                                    "asset_pointer": "file-service://reference-image",
+                                }],
+                            },
+                        },
+                    },
+                    "worker-1": {
+                        "parent": "request-1",
+                        "message": {
+                            "id": "worker-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": False,
+                            "content": {"content_type": "code", "parts": []},
+                        },
+                    },
+                    "tool-1": {
+                        "parent": "worker-1",
+                        "message": {
+                            "id": "tool-1", "author": {"role": "tool"},
+                            "status": "finished_successfully",
+                            "metadata": {"is_error": True},
+                            "content": {
+                                "content_type": "text",
+                                "parts": [
+                                    "We experienced an error when generating images. Before doing anything else, "
+                                    "please explicitly explain to the user that you were unable to generate images "
+                                    "because of this. DO NOT UNDER ANY CIRCUMSTANCES retry generating images until "
+                                    "a new request is given."
+                                ],
+                            },
+                        },
+                    },
+                    "terminal-1": {
+                        "parent": "tool-1",
+                        "message": {
+                            "id": "terminal-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": True,
+                            "content": {"content_type": "text", "parts": ["由于我这边发生了错误，我未能生成图片。"]},
+                        },
+                    },
+                },
+            }
+
+        document = known_generation_error_document()
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "由于我这边发生了错误，我未能生成图片。")
+
+        document = known_generation_error_document()
+        document["mapping"]["later-user"] = {
+            "parent": "terminal-1", "message": {"id": "later-user", "author": {"role": "user"}},
+        }
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document = known_generation_error_document()
+        document["mapping"]["sibling"] = {
+            "parent": "request-1", "message": {"id": "sibling", "author": {"role": "assistant"}},
+        }
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document = known_generation_error_document()
+        document["mapping"]["tool-1"]["message"]["metadata"] = {}
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document = known_generation_error_document()
+        document["mapping"]["tool-1"]["message"]["content"]["parts"] = ["another tool error"]
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document = known_generation_error_document()
+        document["mapping"]["worker-1"]["message"]["author"] = None
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document = known_generation_error_document()
+        document["mapping"]["worker-1"]["message"] = None
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document = known_generation_error_document()
+        document["mapping"]["worker-1"]["message"]["content"] = {
+            "content_type": "image_asset_pointer", "asset_pointer": "file-service://generated-image",
+        }
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
     def test_legacy_resume_without_submitted_message_boundary_is_non_rotating_unknown(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
@@ -3291,71 +3383,152 @@ class ImageTaskServiceTests(unittest.TestCase):
                 self.assertEqual(slot["inflight"], 1)
 
     def test_unknown_resume_maps_authoritative_finished_failure_to_terminal_code(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            error = RuntimeError("ChatGPT 生图超时")
-            error.code = "CONVERSATION_OUTCOME_UNKNOWN"
-            error.provider_binding_id = "cb_account_a"
-            error.provider_account_identity = "account_opaque_a"
-            error.conversation_id = "conversation-1"
-            error.parent_message_id = "message-1"
-            error.request_message_id = "request-1"
-
-            service = self.make_service(Path(tmp_dir) / "image_tasks.json", lambda _payload: (_ for _ in ()).throw(error))
-            service.submit_generation(
-                OWNER,
-                client_task_id="terminal-no-image-task",
-                prompt="cat",
-                model="gpt-image-2",
-                size=None,
-                provider_binding_id="cb_account_a",
-                provider_account_identity="account_opaque_a",
-                client_conversation_id="workbench-conversation-1",
-                retain_conversation=True,
-            )
-            wait_for_task(service, OWNER, "terminal-no-image-task", "error")
-
-            class FakeBackend:
-                def __init__(self, access_token=None, proxy_url=None):
-                    self.access_token = access_token
-
-                def _get_conversation(self, _conversation_id):
-                    return {
-                        "current_node": "assistant-1",
-                        "mapping": {
-                            "request-1": {
-                                "parent": "prior-turn",
-                                "message": {"author": {"role": "user"}},
+        def english_failure_document():
+            return {
+                "current_node": "assistant-1",
+                "mapping": {
+                    "request-1": {
+                        "parent": "prior-turn",
+                        "message": {"id": "request-1", "author": {"role": "user"}},
+                    },
+                    "assistant-1": {
+                        "parent": "request-1",
+                        "message": {
+                            "id": "assistant-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": True,
+                            "content": {
+                                "content_type": "text",
+                                "parts": ["Something went wrong while generating your image. Sorry about that."],
                             },
-                            "assistant-1": {
-                                "parent": "request-1",
-                                "message": {
-                                    "author": {"role": "assistant"},
-                                    "status": "finished_successfully",
-                                    "end_turn": True,
-                                    "content": {
-                                        "content_type": "text",
-                                        "parts": ["Something went wrong while generating your image. Sorry about that."],
-                                    },
-                                }
-                            }
                         },
-                    }
+                    },
+                },
+            }
 
-                def close(self):
-                    return None
+        def known_generation_error_document():
+            return {
+                "current_node": "terminal-1",
+                "mapping": {
+                    "request-1": {
+                        "parent": "prior-turn",
+                        "message": {"id": "request-1", "author": {"role": "user"}},
+                    },
+                    "worker-1": {
+                        "parent": "request-1",
+                        "message": {
+                            "id": "worker-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": False,
+                            "content": {"content_type": "code", "parts": []},
+                        },
+                    },
+                    "tool-1": {
+                        "parent": "worker-1",
+                        "message": {
+                            "id": "tool-1", "author": {"role": "tool"},
+                            "status": "finished_successfully", "metadata": {"is_error": True},
+                            "content": {
+                                "content_type": "text",
+                                "parts": [
+                                    "We experienced an error when generating images. Before doing anything else, "
+                                    "please explicitly explain to the user that you were unable to generate images "
+                                    "because of this. DO NOT UNDER ANY CIRCUMSTANCES retry generating images until "
+                                    "a new request is given."
+                                ],
+                            },
+                        },
+                    },
+                    "terminal-1": {
+                        "parent": "tool-1",
+                        "message": {
+                            "id": "terminal-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": True,
+                            "content": {
+                                "content_type": "text",
+                                "parts": ["由于我这边发生了错误，我未能生成图片。"],
+                            },
+                        },
+                    },
+                },
+            }
 
-            with (
-                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account_opaque_a"),
-                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="bound-token"),
-                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
-                mock.patch("services.account_service.account_service.release_image_slot"),
-                mock.patch("services.openai_backend_api.OpenAIBackendAPI", FakeBackend),
-            ):
-                resumed = service.resume_poll(OWNER, "terminal-no-image-task", 30, "http://content-provider")
-                self.assertIn(resumed["status"], {"running", "error"}, resumed)
-                task = wait_for_task(service, OWNER, "terminal-no-image-task", "error")
+        for name, document, refresh_old_unrecoverable in (
+            ("english", english_failure_document(), False),
+            ("known_tool", known_generation_error_document(), True),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp_dir:
+                error = RuntimeError("ChatGPT 生图超时")
+                error.code = "CONVERSATION_OUTCOME_UNKNOWN"
+                error.provider_binding_id = "cb_account_a"
+                error.provider_account_identity = "account_opaque_a"
+                error.conversation_id = "conversation-1"
+                error.parent_message_id = "message-1"
+                error.request_message_id = "request-1"
 
-            self.assertEqual(task["error_code"], "NO_IMAGE_GENERATED")
+                service = self.make_service(Path(tmp_dir) / "image_tasks.json", lambda _payload: (_ for _ in ()).throw(error))
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="terminal-no-image-task",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    provider_binding_id="cb_account_a",
+                    provider_account_identity="account_opaque_a",
+                    client_conversation_id="workbench-conversation-1",
+                    retain_conversation=True,
+                )
+                wait_for_task(service, OWNER, "terminal-no-image-task", "error")
+                if refresh_old_unrecoverable:
+                    # This mirrors the original-only recovery receipt after it
+                    # has reserved zero further requests: no edit-only state
+                    # or finished-at marker is needed to read the original.
+                    with service._transaction():
+                        current = service._tasks["owner-1:terminal-no-image-task"]
+                        self.assertEqual(current["request_message_id"], "request-1")
+                        current.update(
+                            error_code="RESULT_UNRECOVERABLE",
+                            upstream_outcome="unknown",
+                            recovery_no_result_reads=3,
+                            _completion={
+                                "state": "checking_original",
+                                "allow_unconfirmed_retry": False,
+                                "max_extra_requests": 0,
+                            },
+                        )
+                        service._save_locked()
+
+                class FakeBackend:
+                    def __init__(self, access_token=None, proxy_url=None):
+                        self.access_token = access_token
+
+                    def _get_conversation(self, _conversation_id):
+                        return document
+
+                    def close(self):
+                        return None
+
+                with (
+                    mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account_opaque_a"),
+                    mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="bound-token"),
+                    mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.account_service.account_service.release_image_slot"),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", FakeBackend),
+                ):
+                    resumed = service.resume_poll(
+                        OWNER, "terminal-no-image-task", 30, "http://content-provider",
+                        completion_recheck=refresh_old_unrecoverable,
+                    )
+                    self.assertIn(resumed["status"], {"running", "error"}, resumed)
+                    task = wait_for_task(service, OWNER, "terminal-no-image-task", "error")
+
+                self.assertEqual(task["error_code"], "NO_IMAGE_GENERATED", task)
+                expected_terminal = "terminal-1" if refresh_old_unrecoverable else "assistant-1"
+                self.assertEqual(task["image_session_parent_id"], expected_terminal)
+                stored = service._tasks["owner-1:terminal-no-image-task"]
+                if refresh_old_unrecoverable:
+                    self.assertEqual(stored["recovery_no_result_reads"], 3)
+                self.assertFalse(stored["upstream_unfinished"])
+                self.assertEqual(stored["next_poll_at"], 0)
+                self.assertFalse(stored["recovery_retryable"])
 
     def test_different_owner_cannot_query_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

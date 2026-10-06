@@ -447,6 +447,35 @@ def _request_hash(mode: str, payload: dict[str, Any]) -> str:
 class AuthoritativeImageTaskFailure(RuntimeError):
     code = "NO_IMAGE_GENERATED"
 
+    def __init__(self, message: str, *, terminal_parent_message_id: str = ""):
+        super().__init__(message)
+        self.terminal_parent_message_id = terminal_parent_message_id
+
+
+_KNOWN_IMAGE_GENERATION_ERROR = (
+    "We experienced an error when generating images. Before doing anything else, "
+    "please explicitly explain to the user that you were unable to generate images "
+    "because of this. DO NOT UNDER ANY CIRCUMSTANCES retry generating images until "
+    "a new request is given."
+)
+
+
+def _normalized_text(parts: object) -> str:
+    text = "\n".join(part for part in parts if isinstance(part, str)).strip() if isinstance(parts, list) else ""
+    return " ".join(text.lower().split())
+
+
+def _has_image_asset_pointer(value: object) -> bool:
+    if isinstance(value, dict):
+        if _clean(value.get("content_type")) == "image_asset_pointer":
+            return True
+        if _clean(value.get("asset_pointer")).startswith(("file-service://", "sediment://")):
+            return True
+        return any(_has_image_asset_pointer(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_image_asset_pointer(item) for item in value)
+    return False
+
 
 def _authoritative_image_failure(document: object, request_message_id: str) -> str:
     if not isinstance(document, dict):
@@ -473,6 +502,8 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
         node = mapping.get(message_id) or {}
         message = node.get("message") if isinstance(node, dict) else {}
         author = message.get("author") if isinstance(message, dict) else {}
+        if not isinstance(author, dict):
+            author = {}
         if _clean(author.get("role")).lower() == "user":
             return ""
     node = mapping.get(current_node) if current_node and isinstance(mapping, dict) else None
@@ -492,12 +523,69 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
         return ""
     parts = content.get("parts")
     text = "\n".join(part for part in parts if isinstance(part, str)).strip() if isinstance(parts, list) else ""
-    normalized = " ".join(text.lower().split())
+    normalized = _normalized_text(parts)
     explicit_failures = {
         "something went wrong while generating your image. sorry about that.",
         "something went wrong while generating your image.",
     }
-    return text if normalized in explicit_failures else ""
+    if normalized in explicit_failures:
+        return text
+
+    # The provider's localized assistant message does not name the failure
+    # reliably.  Only promote it when its immediate tool predecessor is the
+    # exact generation-error receipt and the request-to-leaf branch is
+    # unambiguous and produced no image asset.  Keep the older English
+    # assistant-only receipt above compatible with its existing settlement
+    # behavior, including a prior generated tool result.
+    request = mapping.get(request_message_id)
+    request_message = request.get("message") if isinstance(request, dict) else None
+    request_author = request_message.get("author") if isinstance(request_message, dict) else None
+    if (not isinstance(request_author, dict)
+            or _clean(request_author.get("role")).lower() != "user"
+            or (request_message.get("id") and request_message.get("id") != request_message_id)):
+        return ""
+    children: dict[str, list[str]] = {}
+    for node_id, candidate in mapping.items():
+        if isinstance(candidate, dict):
+            parent_id = _clean(candidate.get("parent"))
+            if parent_id:
+                children.setdefault(parent_id, []).append(str(node_id))
+    request_path = path[request_index:]
+    for index, message_id in enumerate(request_path):
+        branch_node = mapping.get(message_id) or {}
+        branch_message = branch_node.get("message") if isinstance(branch_node, dict) else {}
+        branch_author = branch_message.get("author") if isinstance(branch_message, dict) else {}
+        if not isinstance(branch_author, dict):
+            branch_author = {}
+        if index and _clean(branch_author.get("role")).lower() not in {"assistant", "tool"}:
+            return ""
+        if index and _has_image_asset_pointer({
+            "content": branch_message.get("content"), "metadata": branch_message.get("metadata"),
+        }):
+            return ""
+        following = children.get(message_id, [])
+        if index == len(request_path) - 1:
+            if following:
+                return ""
+        elif len(following) != 1 or following[0] != request_path[index + 1]:
+            return ""
+    parent = mapping.get(_clean(node.get("parent"))) if isinstance(node, dict) else None
+    tool_message = parent.get("message") if isinstance(parent, dict) else None
+    tool_author = tool_message.get("author") if isinstance(tool_message, dict) else None
+    tool_content = tool_message.get("content") if isinstance(tool_message, dict) else None
+    tool_metadata = tool_message.get("metadata") if isinstance(tool_message, dict) else None
+    if (
+        isinstance(tool_author, dict)
+        and _clean(tool_author.get("role")).lower() == "tool"
+        and _clean(tool_message.get("status")) == "finished_successfully"
+        and isinstance(tool_metadata, dict)
+        and tool_metadata.get("is_error") is True
+        and isinstance(tool_content, dict)
+        and _clean(tool_content.get("content_type")) == "text"
+        and _normalized_text(tool_content.get("parts")) == _normalized_text([_KNOWN_IMAGE_GENERATION_ERROR])
+    ):
+        return text
+    return ""
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -2475,7 +2563,10 @@ class ImageTaskService:
                     self._update_task(key, _completion_read_at=time.time())
                 authoritative_failure = _authoritative_image_failure(document, request_message_id)
                 if authoritative_failure:
-                    raise AuthoritativeImageTaskFailure(authoritative_failure)
+                    raise AuthoritativeImageTaskFailure(
+                        authoritative_failure,
+                        terminal_parent_message_id=_clean(document.get("current_node")),
+                    )
                 no_active_task = False
                 if allow_unrecoverable_retry or deadline_expired:
                     tasks = backend._query_backend_tasks(
@@ -2573,7 +2664,10 @@ class ImageTaskService:
                         self._update_task(key, _retry_cursor=retry_cursor(document, task, kind="image"))
                         authoritative_failure = _authoritative_image_failure(document, request_message_id)
                         if authoritative_failure:
-                            raise AuthoritativeImageTaskFailure(authoritative_failure)
+                            raise AuthoritativeImageTaskFailure(
+                                authoritative_failure,
+                                terminal_parent_message_id=_clean(document.get("current_node")),
+                            )
                     pending_options = (
                         {"initial_file_ids": pending_ids.get("file_ids", []),
                          "initial_sediment_ids": pending_ids.get("sediment_ids", []),
@@ -2708,8 +2802,9 @@ class ImageTaskService:
             recovery_error_code = _recovery_failure_code(exc, failure_phase, result_captured=result_captured)
             retry_after = _retry_after_seconds(exc)
             final_error_code = (
-                "RESULT_UNRECOVERABLE" if unrecoverable
-                else error_code if terminal else "CONVERSATION_OUTCOME_UNKNOWN"
+                error_code if terminal
+                else "RESULT_UNRECOVERABLE" if unrecoverable
+                else "CONVERSATION_OUTCOME_UNKNOWN"
             )
             if final_error_code == "CONVERSATION_OUTCOME_UNKNOWN":
                 error_message = _safe_recovery_error(recovery_error_code, recovery_phase)
@@ -2719,8 +2814,9 @@ class ImageTaskService:
                 error=error_message,
                 error_code=final_error_code,
                 last_recovery_failure=_failure_details(exc, failure_phase),
-                binding_status=("unavailable" if unrecoverable and requires_new_conversation
-                                else "bound" if terminal or unrecoverable else "unknown"),
+                binding_status=("bound" if terminal
+                                else "unavailable" if unrecoverable and requires_new_conversation
+                                else "bound" if unrecoverable else "unknown"),
                 data=[],
                 duration_ms=duration_ms,
                 upstream_unfinished=not (terminal or unrecoverable or result_captured),
@@ -2739,11 +2835,21 @@ class ImageTaskService:
                     retry_after
                     if final_error_code == "CONVERSATION_OUTCOME_UNKNOWN" else None
                 ),
-                **({"upstream_outcome": "unknown", "recovery_retryable": True}
-                   if unrecoverable else {}),
+                **(
+                    {"parent_message_id": _clean(getattr(exc, "terminal_parent_message_id", ""))}
+                    if terminal and _clean(getattr(exc, "terminal_parent_message_id", ""))
+                    else {}
+                ),
+                **(
+                    {"recovery_retryable": False}
+                    if terminal
+                    else {"upstream_outcome": "unknown", "recovery_retryable": True}
+                    if unrecoverable
+                    else {}
+                ),
                 next_poll_at=(
                     0
-                    if unrecoverable
+                    if terminal or unrecoverable
                     else time.time() + (
                         retry_after
                         if retry_after is not None
