@@ -1503,6 +1503,82 @@ def _generate_bound_single_image(
             conversation_id=request.conversation_id,
             parent_message_id=request.parent_message_id,
         )
+
+    def check_current_parent(send=None) -> None:
+        """Refuse a retained image continuation after its saved reply ceased to be the tip.
+
+        A normal direct-listing continuation has no Provider image-thread
+        envelope, so it cannot rely on the thread-only predecessor proof below.
+        The same check runs once before streaming and again at the paced POST
+        edge.  It accepts a completed final assistant reply or the existing
+        completed tool/image endpoint; malformed, active, branched, or later
+        user state is never a valid image parent.
+        """
+        try:
+            document = backend._get_conversation(
+                request.conversation_id,
+                **({"_send": send} if send else {}),
+            )
+        except Exception as exc:
+            raise ImageGenerationError(
+                "bound image conversation could not be read before submission",
+                code="CONVERSATION_OUTCOME_UNKNOWN",
+                provider_binding_id=binding_id,
+                provider_account_identity=account_identity,
+                conversation_id=request.conversation_id,
+                parent_message_id=request.parent_message_id,
+                upstream_submitted=False,
+            ) from exc
+        mapping = document.get("mapping") if isinstance(document, dict) else None
+        mapping_valid = (
+            isinstance(mapping, dict)
+            and bool(mapping)
+            and all(isinstance(node, dict) for node in mapping.values())
+        )
+        parent = mapping.get(request.parent_message_id) if mapping_valid else None
+        message = parent.get("message") if isinstance(parent, dict) else None
+        author = message.get("author") if isinstance(message, dict) else None
+        children = (
+            mapping_valid
+            and isinstance(parent, dict)
+            and isinstance(parent.get("children"), list)
+            and not parent["children"]
+            and not any(isinstance(node, dict) and node.get("parent") == request.parent_message_id
+                        for node in mapping.values())
+        )
+        assistant_final = (
+            isinstance(message, dict)
+            and message.get("id") == request.parent_message_id
+            and isinstance(author, dict)
+            and author.get("role") == "assistant"
+            and message.get("status") == "finished_successfully"
+            and message.get("end_turn") is True
+            and message.get("channel") in {None, "final"}
+            and children
+        )
+        image_tool_final = False
+        if mapping_valid:
+            from services.conversation_binding_service import ConversationBindingService
+            image_tool_final = ConversationBindingService._completed_image_tool_parent(
+                mapping, request.parent_message_id,
+            )
+        if (
+            not isinstance(document, dict)
+            or not mapping_valid
+            or str(document.get("conversation_id") or "").strip() != request.conversation_id
+            or str(document.get("current_node") or "").strip() != request.parent_message_id
+            or not (assistant_final or image_tool_final)
+        ):
+            raise ImageGenerationError(
+                "bound image conversation cursor changed before submission",
+                code="CONVERSATION_BINDING_MISMATCH",
+                provider_binding_id=binding_id,
+                provider_account_identity=account_identity,
+                conversation_id=request.conversation_id,
+                parent_message_id=request.parent_message_id,
+                upstream_submitted=False,
+            )
+
     token = ""
     binding_id = request.provider_binding_id
     account_identity = request.provider_account_identity
@@ -1612,6 +1688,13 @@ def _generate_bound_single_image(
                     except Exception as exc:
                         raise ImageGenerationError("Original image conversation cannot yet be continued",
                             code=getattr(exc, "code", "IMAGE_THREAD_PREVIOUS_UNCONFIRMED"), upstream_submitted=False) from exc
+                elif request.conversation_id:
+                    # Non-thread bound edits, including the original listing
+                    # revision route, still must not fork from a completed
+                    # reply after a later user turn. Keep the Provider's
+                    # current-parent check at the actual POST boundary too.
+                    check_current_parent()
+                    backend.image_pre_send_check = check_current_parent
                 request = replace(request)
                 request._defer_image_publication = True
                 confirmed_result = None

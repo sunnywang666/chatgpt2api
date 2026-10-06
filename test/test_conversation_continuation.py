@@ -547,6 +547,20 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
                 self.access_token = access_token
                 self.progress_callback = None
 
+            def _get_conversation(self, conversation_id: str, **_kwargs) -> dict:
+                self.test_case.assertEqual(conversation_id, "conversation-1")
+                return {
+                    "conversation_id": conversation_id,
+                    "current_node": "message-1",
+                    "mapping": {
+                        "message-1": {"children": [], "message": {
+                            "id": "message-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": True,
+                            "channel": "final",
+                        }},
+                    },
+                }
+
             def get_conversation_parent_message_id(self, conversation_id: str) -> str:
                 self.test_case.assertEqual(conversation_id, "conversation-1")
                 self.test_case.assertEqual(self.image_upstream_model, "gpt-5-6-instant")
@@ -565,6 +579,13 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
             data=[{"url": "image.png"}],
             conversation_id="conversation-1",
         )
+
+        def stream(backend, sent_request, *_args):
+            self.assertEqual(sent_request.parent_message_id, "message-1")
+            self.assertTrue(callable(backend.image_pre_send_check))
+            backend.image_pre_send_check()
+            return iter([output])
+
         with (
             mock.patch(
                 "services.protocol.conversation.account_service.acquire_bound_image_access_token",
@@ -591,7 +612,7 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
             mock.patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
             mock.patch(
                 "services.protocol.conversation.stream_image_outputs",
-                return_value=iter([output]),
+                side_effect=stream,
             ),
         ):
             result = _generate_bound_single_image(request, 1, 1)
@@ -601,6 +622,263 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         self.assertEqual(result[0].provider_binding_id, "cb-account-a")
         self.assertEqual(result[0].conversation_id, "conversation-1")
         self.assertEqual(result[0].parent_message_id, "message-2")
+
+    def test_bound_image_without_thread_rejects_later_user_before_submit(self) -> None:
+        request = ConversationRequest(
+            model="gpt-image-2",
+            prompt="continue",
+            provider_binding_id="cb-account-a",
+            provider_account_identity="account-opaque-a",
+            client_conversation_id="workbench-conversation-1",
+            conversation_id="conversation-1",
+            parent_message_id="completed-revision-reply",
+            retain_conversation=True,
+        )
+        submitted = []
+        documents = [
+            {
+                "conversation_id": "conversation-1",
+                "current_node": "completed-revision-reply",
+                "mapping": {
+                    "completed-revision-reply": {"children": [], "message": {
+                        "id": "completed-revision-reply", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True, "channel": "final",
+                    }},
+                },
+            },
+            {
+                "conversation_id": "conversation-1",
+                "current_node": "later-user",
+                "mapping": {
+                    "completed-revision-reply": {"children": ["later-user"], "message": {
+                        "id": "completed-revision-reply", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True, "channel": "final",
+                    }},
+                    "later-user": {"parent": "completed-revision-reply", "children": [], "message": {
+                        "id": "later-user", "author": {"role": "user"},
+                    }},
+                },
+            },
+        ]
+
+        class FakeBackend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+
+            def _get_conversation(self, conversation_id: str, **_kwargs) -> dict:
+                self.test_case.assertEqual(conversation_id, "conversation-1")
+                return documents.pop(0)
+
+            def close(self) -> None:
+                pass
+
+        FakeBackend.test_case = self
+
+        def stream(backend, _request, *_args):
+            backend.image_pre_send_check()
+            submitted.append(True)
+            return iter(())
+
+        with (
+            mock.patch(
+                "services.protocol.conversation.account_service.acquire_bound_image_access_token",
+                return_value="token-a",
+            ),
+            mock.patch(
+                "services.protocol.conversation.account_service.get_bound_account_identity",
+                return_value="account-opaque-a",
+            ),
+            mock.patch(
+                "services.protocol.conversation.account_service.get_account",
+                return_value={"email": "a@example.test"},
+            ),
+            mock.patch(
+                "services.protocol.conversation.account_service.conversation_binding_lock",
+                return_value=nullcontext(),
+            ),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.account_service.release_image_slot"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream),
+        ):
+            with self.assertRaises(ImageGenerationError) as captured:
+                _generate_bound_single_image(request, 1, 1)
+
+        self.assertEqual(captured.exception.code, "CONVERSATION_BINDING_MISMATCH")
+        self.assertFalse(captured.exception.upstream_submitted)
+        self.assertEqual(submitted, [])
+
+    def test_bound_image_without_thread_accepts_completed_image_tool_parent(self) -> None:
+        request = ConversationRequest(
+            model="gpt-image-2",
+            prompt="continue",
+            provider_binding_id="cb-account-a",
+            provider_account_identity="account-opaque-a",
+            client_conversation_id="workbench-conversation-1",
+            conversation_id="conversation-1",
+            parent_message_id="completed-image-tool",
+            retain_conversation=True,
+        )
+
+        class FakeBackend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+
+            def _get_conversation(self, conversation_id: str, **_kwargs) -> dict:
+                self.test_case.assertEqual(conversation_id, "conversation-1")
+                return {
+                    "conversation_id": conversation_id,
+                    "current_node": "completed-image-tool",
+                    "mapping": {
+                        "original-user": {"children": ["image-call"], "message": {
+                            "id": "original-user", "author": {"role": "user"},
+                            "status": "finished_successfully",
+                        }},
+                        "image-call": {"parent": "original-user", "children": ["completed-image-tool"], "message": {
+                            "id": "image-call", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": False,
+                            "recipient": "image_gen", "content": {"content_type": "code"},
+                        }},
+                        "completed-image-tool": {"parent": "image-call", "children": [], "message": {
+                            "id": "completed-image-tool", "author": {"role": "tool", "name": "image_gen"},
+                            "status": "finished_successfully", "end_turn": True, "recipient": "all",
+                            "content": {"content_type": "multimodal_text", "parts": [{
+                                "content_type": "image_asset_pointer",
+                                "asset_pointer": "file-service://generated-image",
+                            }]},
+                        }},
+                    },
+                }
+
+            def get_conversation_parent_message_id(self, conversation_id: str) -> str:
+                self.test_case.assertEqual(conversation_id, "conversation-1")
+                return "next-parent"
+
+            def close(self) -> None:
+                pass
+
+        FakeBackend.test_case = self
+        output = ImageOutput(
+            kind="result", model="gpt-image-2", index=1, total=1,
+            data=[{"url": "image.png"}], conversation_id="conversation-1",
+        )
+
+        def stream(backend, sent_request, *_args):
+            self.assertEqual(sent_request.parent_message_id, "completed-image-tool")
+            backend.image_pre_send_check()
+            return iter([output])
+
+        with (
+            mock.patch(
+                "services.protocol.conversation.account_service.acquire_bound_image_access_token",
+                return_value="token-a",
+            ),
+            mock.patch(
+                "services.protocol.conversation.account_service.get_bound_account_identity",
+                return_value="account-opaque-a",
+            ),
+            mock.patch(
+                "services.protocol.conversation.account_service.get_account",
+                return_value={"email": "a@example.test"},
+            ),
+            mock.patch(
+                "services.protocol.conversation.account_service.conversation_binding_lock",
+                return_value=nullcontext(),
+            ),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.account_service.release_image_slot"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream),
+        ):
+            result = _generate_bound_single_image(request, 1, 1)
+
+        self.assertEqual(result[0].parent_message_id, "next-parent")
+
+    def test_bound_image_without_thread_rejects_missing_or_unfinished_reply_before_submit(self) -> None:
+        request = ConversationRequest(
+            model="gpt-image-2",
+            prompt="continue",
+            provider_binding_id="cb-account-a",
+            provider_account_identity="account-opaque-a",
+            client_conversation_id="workbench-conversation-1",
+            conversation_id="conversation-1",
+            parent_message_id="completed-revision-reply",
+            retain_conversation=True,
+        )
+        documents = {
+            "missing_parent": {"conversation_id": "conversation-1", "current_node": "completed-revision-reply", "mapping": {}},
+            "malformed_mapping": {
+                "conversation_id": "conversation-1", "current_node": "completed-revision-reply",
+                "mapping": {
+                    "completed-revision-reply": {"children": [], "message": {
+                        "id": "completed-revision-reply", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True,
+                    }},
+                    "unexpected-shape": "not-a-conversation-node",
+                },
+            },
+            "unfinished_parent": {
+                "conversation_id": "conversation-1", "current_node": "completed-revision-reply",
+                "mapping": {"completed-revision-reply": {"children": [], "message": {
+                    "id": "completed-revision-reply", "author": {"role": "assistant"},
+                    "status": "in_progress", "end_turn": False,
+                }}},
+            },
+        }
+        submitted = []
+
+        class FakeBackend:
+            document = None
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.progress_callback = None
+
+            def _get_conversation(self, conversation_id: str, **_kwargs) -> dict:
+                self.test_case.assertEqual(conversation_id, "conversation-1")
+                return self.document
+
+            def close(self) -> None:
+                pass
+
+        FakeBackend.test_case = self
+
+        def stream(_backend, _request, *_args):
+            submitted.append(True)
+            return iter(())
+
+        with (
+            mock.patch(
+                "services.protocol.conversation.account_service.acquire_bound_image_access_token",
+                return_value="token-a",
+            ),
+            mock.patch(
+                "services.protocol.conversation.account_service.get_bound_account_identity",
+                return_value="account-opaque-a",
+            ),
+            mock.patch(
+                "services.protocol.conversation.account_service.get_account",
+                return_value={"email": "a@example.test"},
+            ),
+            mock.patch(
+                "services.protocol.conversation.account_service.conversation_binding_lock",
+                return_value=nullcontext(),
+            ),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.account_service.release_image_slot"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream),
+        ):
+            for case, document in documents.items():
+                with self.subTest(case=case):
+                    FakeBackend.document = document
+                    with self.assertRaises(ImageGenerationError) as captured:
+                        _generate_bound_single_image(request, 1, 1)
+                    self.assertEqual(captured.exception.code, "CONVERSATION_BINDING_MISMATCH")
+                    self.assertFalse(captured.exception.upstream_submitted)
+                    self.assertEqual(submitted, [])
 
     def test_unavailable_bound_account_fails_without_fallback(self) -> None:
         request = ConversationRequest(
