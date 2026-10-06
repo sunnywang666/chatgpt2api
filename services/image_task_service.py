@@ -937,7 +937,8 @@ class ImageTaskService:
                 ))
             ):
                 return None
-            if task.get("_completion"):
+            from services.generation_completion import read_only_original_completion
+            if task.get("_completion") and not read_only_original_completion(task["_completion"]):
                 return None
             fields = (
                 "provider_binding_id", "provider_account_identity", "client_conversation_id",

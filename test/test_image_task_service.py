@@ -203,6 +203,19 @@ class ImageTaskServiceTests(unittest.TestCase):
             (None, {}, True),
             (None, {"error_code": "NO_IMAGE_GENERATED"}, True),
             (None, {"upstream_outcome": "unknown"}, True),
+            (None, {"_completion": {
+                "state": "needs_attention", "reason": "COMPLETION_ORIGINAL_ONLY", "next_at": None,
+                "read_only_original": True, "max_extra_requests": 0, "allow_unconfirmed_retry": False,
+            }}, True),
+            (None, {"_completion": {
+                "state": "needs_attention", "reason": "COMPLETION_ORIGINAL_ONLY", "next_at": None,
+                "read_only_original": True, "max_extra_requests": 0, "allow_unconfirmed_retry": True,
+            }}, False),
+            (None, {"_completion": {
+                "state": "needs_attention", "reason": "COMPLETION_ORIGINAL_ONLY", "next_at": None,
+                "read_only_original": True, "max_extra_requests": 0, "allow_unconfirmed_retry": False,
+                "replacement_id": "child",
+            }}, False),
             ("later_user", {"upstream_outcome": "unknown"}, False),
             ("branch", {"upstream_outcome": "unknown"}, False),
             ("wrongchat", {}, False),
@@ -217,6 +230,13 @@ class ImageTaskServiceTests(unittest.TestCase):
                 path = Path(tmp_dir) / "image_tasks.json"
                 write_policy_task(path, **overrides)
                 service = self.make_service(path)
+                if "_completion" in overrides:
+                    # Legacy JSON import intentionally drops completion state;
+                    # exercise the actual SQLite receipt shape used after the
+                    # admin original-result read has been persisted.
+                    with service._transaction():
+                        service._tasks["owner-1:policy-task"]["_completion"] = overrides["_completion"]
+                        service._save_locked()
                 if change is None and eligible:
                     # An expired scheduler claim is evidence to recover, not
                     # an active writer. The task itself is terminal.
