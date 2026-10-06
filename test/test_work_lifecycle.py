@@ -57,6 +57,29 @@ def test_completion_persists_original_archive_intent_and_releases_only_its_work(
     assert not service.process_one()
 
 
+def test_ensure_work_filters_payloads_but_preserves_cross_owner_conversation_conflict(runtime, monkeypatch):
+    _, store, _, _, _, _ = runtime
+    marker = "unrelated-image-bytes"
+    original = {"request_id": "first", "conversation_id": "original", "provider_account_identity": "account",
+                "provider_binding_id": "binding", "_public_session_ref": "session"}
+    with store.transaction() as db:
+        ensure_work(store, db, "text", "one", "first", original)
+        store.write_receipt(db, "text", "one", "first", original)
+        store.write_receipt(db, "image", "other", "history", {
+            "id": "history", "owner_id": "other", "conversation_id": "different", "data": [{"b64_json": marker * 10000}]})
+    loads = json.loads
+    def narrow_load(raw, *args, **kwargs):
+        assert marker not in raw
+        return loads(raw, *args, **kwargs)
+    monkeypatch.setattr("services.task_store.json.loads", narrow_load)
+    with store.transaction() as db:
+        successor = {**original, "request_id": "next"}
+        ensure_work(store, db, "text", "one", "next", successor)
+        assert successor["_work_key"] == original["_work_key"]
+        with pytest.raises(WorkLifecycleError, match="WORK_OWNER_CONFLICT"):
+            ensure_work(store, db, "text", "other", "foreign", {**original, "request_id": "foreign"})
+
+
 def test_work_reads_do_not_decode_unrelated_saved_images(runtime, monkeypatch):
     service, store, _, calls, _, add = runtime
     first = add("A-1")

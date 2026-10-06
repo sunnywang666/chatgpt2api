@@ -458,6 +458,10 @@ class AccountRequestClock:
         local_wait = kwargs.pop("_account_request_local_wait", None)
         before_send = kwargs.pop("_account_request_before_send", None)
         preflight = kwargs.pop("_account_request_preflight", None)
+        preflight_read = kwargs.pop("_account_request_preflight_read", False)
+        preflight_model = kwargs.pop("_account_request_preflight_model", None)
+        if preflight_read and str(method).upper() != "GET":
+            raise ValueError("submission preflight must be read-only")
         if not isinstance(deadline_at, (int, float)) or isinstance(deadline_at, bool):
             deadline_at = None
 
@@ -539,6 +543,8 @@ class AccountRequestClock:
                 phase = "conversation_archive" if body["is_archived"] else "conversation_restore"
         elif "/conversation/" in path and "/attachment/" not in path and str(method).upper() == "GET":
             phase = "conversation_read"
+        if preflight_read:
+            phase = "conversation_preflight"
         is_conversation_read = phase == "conversation_read"
         # Only the three read-only account observations used by get_user_info
         # may receive outside the pacing lock. Other account_read operations
@@ -585,7 +591,7 @@ class AccountRequestClock:
             or re.fullmatch(r"/backend-api/conversation/[^/]+/attachment/[^/]+/download", path) is not None
         )
         concurrent_io = (is_conversation_read or metadata_kind is not None or concurrent_turn
-                         or concurrent_preparation or concurrent_archive or concurrent_result_metadata)
+                         or concurrent_preparation or concurrent_archive or concurrent_result_metadata or preflight_read)
         pooled_preparation = concurrent_preparation and callable(preparation_submit) and not kwargs.get("stream")
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
         ordinary_owner = None
@@ -603,6 +609,7 @@ class AccountRequestClock:
             archive_deadline = time.monotonic() + 240
             deadline_at = min(deadline_at, archive_deadline) if deadline_at is not None else archive_deadline
         raw_model = (kwargs.get("json") or {}).get("model") if isinstance(kwargs.get("json"), dict) else None
+        raw_model = preflight_model if preflight_read else raw_model
         model = raw_model if isinstance(raw_model, str) and len(raw_model) <= 160 else None
         request_ref = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24] if context else None
         archive_observation = (current_archive_observation.get() or {}) if archive_guard is not None else {}
@@ -694,9 +701,7 @@ class AccountRequestClock:
         # Serialize only the send edge. The account activity reservation lives
         # in PoolAdmission until the response stream is terminal; holding this
         # file lock for the whole stream would silently force capacity back to 1.
-        if is_turn:
-            measure_preparation("turn_lock", acquire_with_budget, self.turn_lock)
-        pacing_held = is_turn
+        pacing_held = False
         turn_held = is_turn
         release_lock = threading.Lock()
 
@@ -717,12 +722,38 @@ class AccountRequestClock:
 
         response = None
         try:
+            if preflight is not None:
+                # The binding owner keeps same-conversation ordering. A slow
+                # original-read response must not hold the account turn mutex.
+                # Reuse the normal send-edge transport and cooldown merge, but
+                # preserve preflight evidence and its existing non-credit lane.
+                def read_original(read_method, read_url, **read_kwargs):
+                    if str(read_method).upper() != "GET":
+                        raise ValueError("submission preflight must be read-only")
+                    def credit_wait(elapsed):
+                        nonlocal deadline_at
+                        local_wait(elapsed)
+                        if deadline_at is not None:
+                            deadline_at += elapsed
+                    read_kwargs.setdefault("timeout", 60)
+                    return self.request(send, read_method, read_url,
+                        _account_request_preflight_read=True,
+                        _account_request_io_cleanup=io_cleanup,
+                        _account_request_preflight_model=model,
+                        _account_request_deadline_monotonic=deadline_at,
+                        _account_request_local_wait=credit_wait if callable(local_wait) else None,
+                        **read_kwargs)
+                measure_preparation("preflight", preflight, read_original)
+            if is_turn:
+                measure_preparation("turn_lock", acquire_with_budget, self.turn_lock)
+                pacing_held = True
             while True:
                 measure_preparation("clock_lock", acquire_with_budget, self.lock)
                 try:
                     now = time.monotonic()
                     read_delay, wait_reason = max((
-                        (max(0, self.next_request - now), "account_pace"),
+                        (max(0, self.next_request - now,
+                             self.next_turn - now if is_turn or preflight_read else 0), "account_pace"),
                         (max(0, self._read_ready(now) - now) if is_conversation_read else 0, "read_rate"),
                         (max(0, self.cooldown_until - now,
                              self._read_cooldown_until() - now if is_conversation_read else 0), "upstream_cooldown")),
@@ -773,46 +804,10 @@ class AccountRequestClock:
             try:
                 self._expire_backoff()
                 ready = max(self.next_request, self.cooldown_until,
-                            self.next_turn if is_turn else 0.0)
+                            self.next_turn if is_turn or preflight_read else 0.0)
                 delay = ready - time.monotonic()
                 if delay > 0:
                     wait_for_pace(delay, "account request deadline elapsed during cooldown wait")
-                if preflight is not None:
-                    # A superseded original may arrive during the cooldown.
-                    # This GET shares the held pacing lock and raw transport;
-                    # recursively calling the paced session would deadlock.
-                    def read_original(read_method, read_url, **read_kwargs):
-                        if str(read_method).upper() != "GET":
-                            raise ValueError("submission preflight must be read-only")
-                        remaining = remaining_budget()
-                        if remaining is not None:
-                            if remaining <= 0:
-                                raise AccountRequestDeadlineExceeded("preflight deadline elapsed")
-                            read_kwargs["timeout"] = min(float(read_kwargs.get("timeout", 60)), remaining)
-                        self.next_request = time.monotonic() + min(60.0, config.account_request_interval_secs * 2 ** min(self.rate_failures, 4))
-                        self._save()
-                        sent_at = time.monotonic()
-                        try:
-                            response = observed_send(read_method, read_url, "conversation_preflight", **read_kwargs)
-                        finally:
-                            # Persisting the reservation can itself take time.
-                            # Correct its floor from the actual transport edge
-                            # before another caller can acquire this clock.
-                            self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * 2 ** min(self.rate_failures, 4)))
-                            self._save()
-                        if response.status_code == 429:
-                            request_id = (response.headers.get("x-request-id") or response.headers.get("openai-request-id"))
-                            safe_id = request_id if isinstance(request_id, str) and len(request_id) <= 160 and request_id.isascii() and not any(c.isspace() for c in request_id) else None
-                            self.limited(retry_after_seconds(response.headers.get("Retry-After")),
-                                         retry_after_present="Retry-After" in response.headers,
-                                         evidence={"phase": "conversation_preflight", "model": model, "origin": "http_429", "upstream_request_id": safe_id,
-                                                   "response_features": _rate_limit_response_features(response)})
-                        return response
-                    measure_preparation("preflight", preflight, read_original)
-                    # The metadata GET does not bypass the account request pace.
-                    delay = max(self.next_request, self.cooldown_until, self.next_turn if is_turn else 0.0) - time.monotonic()
-                    if delay > 0:
-                        wait_for_pace(delay, "deadline elapsed after preflight")
                 if context is not None and is_turn:
                     measure_preparation("admission_guard", context.before_send)
                 if callable(before_send):

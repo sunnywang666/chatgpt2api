@@ -482,18 +482,8 @@ class PoolAdmission:
 
     def recover_one(self, *, background=False):
         now = float(self.clock())
-        image_dispatched = False
         def dispatch(kind, owner, request_id, function, receipt):
-            nonlocal image_dispatched
-            # Image recovery owns a separate asynchronous worker. Preserve its
-            # existing one-dispatch-per-scan cadence; the local read permit only
-            # bounds synchronous text I/O, not that image worker's lifetime.
-            if kind == "image" and image_dispatched:
-                return False
-            started = self._dispatch_original_read(kind, owner, request_id, function, receipt)
-            if started and kind == "image":
-                image_dispatched = True
-            return started
+            return self._dispatch_original_read(kind, owner, request_id, function, receipt)
         lifecycle = getattr(self, "work_lifecycle", None)
         if background and lifecycle is not None:
             # Fill only the existing bounded I/O workers. Independent archive
@@ -1674,7 +1664,11 @@ def configure_original_task_admission():
                                      body["identity"], str(payload.get("model") or "gpt-image-2"))
     admission.register("image", image)
     admission.recoveries["text"] = lambda owner, request_id: text_task_service.read(owner, request_id)
-    admission.recoveries["image"] = lambda owner, request_id: image_task_service.resume_poll({"id": owner, "role": "user"}, request_id)
+    # Internal recovery handlers finish one read before returning, so the
+    # dispatcher owns its permit for the full I/O. Public resume_poll remains
+    # asynchronous by default; no API calls recover_one directly.
+    admission.recoveries["image"] = lambda owner, request_id: image_task_service.resume_poll(
+        {"id": owner, "role": "user"}, request_id, wait_for_completion=True)
     text_task_service.admission = admission
     image_task_service.admission = admission
     from services.work_lifecycle import WorkLifecycleService

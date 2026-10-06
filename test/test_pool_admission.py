@@ -336,6 +336,113 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(sent["parent_message_id"], "answer-0")
         self.assertEqual(sent["conversation_id"], "chat-0")
 
+    def test_image_input_fsync_does_not_block_another_receipt_writer(self):
+        saving, release, written = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        save = self.store.save_input
+        def slow_save(body):
+            result = save(body)
+            saving.set()
+            if not release.wait(3): raise TimeoutError()
+            return result
+        def submit():
+            try: self.image("large-input")
+            except BaseException as exc: errors.append(exc)
+        def update_other():
+            try:
+                with self.store.transaction() as db:
+                    self.store.set_runtime(db, "independent-progress", {"received": True})
+                written.set()
+            except BaseException as exc: errors.append(exc)
+        workers = [threading.Thread(target=submit), threading.Thread(target=update_other)]
+        with patch.object(self.store, "save_input", side_effect=slow_save):
+            try:
+                workers[0].start()
+                self.assertTrue(saving.wait(1))
+                workers[1].start()
+                self.assertTrue(written.wait(.5), "input file I/O held the shared receipt writer")
+            finally:
+                release.set()
+                for worker in workers:
+                    if worker.ident is not None: worker.join(3)
+        self.assertEqual(errors, [])
+        original = self.read("image", "happy", "large-input")
+        files = set(self.store.input_dir.iterdir())
+        with patch.object(self.store, "save_input", side_effect=AssertionError("duplicate must be read-only")):
+            self.image("large-input")
+        self.assertEqual(set(self.store.input_dir.iterdir()), files, "duplicate input was leaked")
+        self.assertEqual(self.read("image", "happy", "large-input"), original)
+
+    def test_new_image_thread_submission_never_decodes_or_rewrites_unrelated_images(self):
+        history = {"id": "history", "owner_id": "happy", "status": "success", "retain_receipt": True,
+                   "data": [{"b64_json": "unrelated-history-payload" * 100000}]}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "happy", "history", history)
+            raw = db.execute("SELECT receipt FROM image_requests WHERE task_key='happy:history'").fetchone()[0]
+        loads = json.loads
+        def narrow_load(raw, *args, **kwargs):
+            self.assertNotIn("unrelated-history-payload", raw)
+            return loads(raw, *args, **kwargs)
+        with patch("services.image_task_service.json.loads", side_effect=narrow_load), \
+             patch.object(self.store, "write_receipt", wraps=self.store.write_receipt) as writes:
+            result = self.images.submit_generation({"id": "happy", "external_image_client": True},
+                client_task_id="new-thread", prompt="fixture", model="gpt-image-2", size=None,
+                image_thread_id="fresh-thread")
+            self.assertEqual(result["status"], "queued")
+            self.assertEqual(writes.call_count, 1)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("SELECT receipt FROM image_requests WHERE task_key='happy:history'").fetchone()[0], raw)
+
+    def test_image_recovery_parallel_workers_hold_permits_until_actual_io_finishes(self):
+        import time
+        entered = [threading.Event() for _ in range(5)]
+        release = [threading.Event() for _ in range(5)]
+        finished = [threading.Event() for _ in range(5)]
+        for index in range(5):
+            rid = f"recover-{index}"
+            receipt = {"id": rid, "owner_id": "happy", "status": "error", "mode": "generate",
+                       "model": "gpt-image-2", "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
+                       "upstream_unfinished": True, "provider_account_identity": "account-0",
+                       "provider_binding_id": "binding-0", "client_conversation_id": f"client-{index}",
+                       "conversation_id": f"conversation-{index}", "request_message_id": f"message-{index}"}
+            with self.store.transaction() as db:
+                self.store.write_receipt(db, "image", "happy", rid, receipt)
+        def read_original(key, *args):
+            index = int(key.rsplit("-", 1)[1])
+            entered[index].set()
+            try:
+                if not release[index].wait(3): raise TimeoutError()
+                self.images._update_task(key, status="error", next_poll_at=time.time() + 120)
+            finally:
+                finished[index].set()
+        self.images._run_resume_poll = read_original
+        self.admission.recoveries["image"] = lambda owner, rid: self.images.resume_poll(
+            {"id": owner}, rid, wait_for_completion=True)
+        try:
+            self.admission.recover_one(background=True)
+            self.assertTrue(all(event.wait(1) for event in entered[:4]), "image recovery is still serialized")
+            self.assertFalse(entered[4].is_set())
+            with self.admission._original_read_lock:
+                self.assertEqual(len(self.admission._original_reads), 4)
+            self.admission.recover_one(background=True)
+            self.assertFalse(entered[4].is_set(), "permit released before image I/O finished")
+            release[0].set()
+            self.assertTrue(finished[0].wait(1))
+            limit = time.monotonic() + 2
+            while time.monotonic() < limit and not entered[4].is_set():
+                self.admission.recover_one(background=True)
+                entered[4].wait(.01)
+            self.assertTrue(entered[4].is_set())
+        finally:
+            for event in release: event.set()
+            for event in finished: event.wait(2)
+            limit = time.monotonic() + 2
+            while self.admission._original_reads and time.monotonic() < limit:
+                time.sleep(.01)
+        self.assertEqual(self.admission._original_reads, {})
+        self.assertTrue(self.admission._original_read_slots.acquire(blocking=False))
+        self.admission._original_read_slots.release()
+
     def test_completed_image_with_iso_creation_time_cannot_stop_text_recovery(self):
         self.image("saved-image")
         self.submit("original", provider_binding_id="binding-0", provider_account_identity="account-0")

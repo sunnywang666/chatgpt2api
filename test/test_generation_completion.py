@@ -67,9 +67,15 @@ def patch_row(service, kind="text", request_id="old-0", **changes):
 
 
 @pytest.fixture
-def setup(tmp_path):
+def setup(tmp_path, monkeypatch):
     text, admission, backend, _ = migration(tmp_path)
     admission.clock.now = 3000
+    # This suite fakes archive I/O; its fake business clock must not read or
+    # write a real account clock, including clocks left by another test run.
+    monkeypatch.setattr("services.account_request_pacing.account_pacing_snapshot",
+                        lambda account, now, **kwargs: {"next_at": now, "cooldown_until": 0})
+    monkeypatch.setattr("services.account_request_pacing.reserve_account_archive_read", lambda *a, **k: True)
+    monkeypatch.setattr("services.account_request_pacing.release_account_archive_read", lambda *a, **k: None)
     body = {"client_request_id": "old-0", "client_conversation_id": "client-0", "_public_route": "chat",
             "_public_session_ref": "original-session", "model": "fixture-text",
             "messages": [{"role": "user", "content": "Retained original input"}]}

@@ -128,7 +128,8 @@ class AccountRequestPacingTests(unittest.TestCase):
                             _account_request_preparation_submit=submit)
                     self.assertTrue(returned.is_set(), "caller must reap its original transport")
                     self.assertEqual(context.released, 0, "preparation does not release an admitted work slot")
-                    self.assertFalse(clock.lock.locked())
+                    self.assertTrue(clock.lock.acquire(timeout=.5), "response retained the clock")
+                    clock.lock.release()
                     self.assertFalse(clock.turn_lock.locked())
                     if transport_error:
                         self.assertIsInstance(caught.exception.__cause__, ConnectionError)
@@ -1108,7 +1109,8 @@ class AccountRequestPacingTests(unittest.TestCase):
                 for worker in workers:
                     worker.start()
                 self.assertTrue(both_entered.wait(1))
-                self.assertFalse(clock.lock.locked())
+                self.assertTrue(clock.lock.acquire(timeout=.5), "PATCH response retained the clock")
+                clock.lock.release()
             finally:
                 release.set()
                 for worker in workers:
@@ -1435,6 +1437,76 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertEqual(clock.last_rate_limit_evidence["phase"], "conversation_read")
             clock.request(send, "POST", "https://provider/conversation")
             self.assertGreaterEqual(sent[1][1] - sent[0][1], 123)
+
+    def test_slow_preflight_does_not_block_independent_turn_or_consume_read_credit(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: .03)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            entered, independent, release = threading.Event(), threading.Event(), threading.Event()
+            sends, errors, cleaned = [], [], []
+            def send(method, url, **kwargs):
+                sends.append((method, url, time.monotonic()))
+                if method == "GET":
+                    entered.set()
+                    if not release.wait(2): raise TimeoutError()
+                elif "independent" in url:
+                    independent.set()
+                return Response()
+            def request(name, preflight=False):
+                try:
+                    with executing(Context(name)):
+                        options = ({"_account_request_preflight": lambda read: read(
+                            "GET", "https://provider/backend-api/conversation/original")} if preflight else {})
+                        clock.request(send, "POST", "https://provider/" + name + "/conversation",
+                            _account_request_io_cleanup=lambda: cleaned.append(threading.get_ident()), **options)
+                except BaseException as exc:
+                    errors.append(exc)
+            workers = [threading.Thread(target=request, args=("retry", True)),
+                       threading.Thread(target=request, args=("independent",))]
+            original_credit = clock.next_conversation_read
+            try:
+                workers[0].start()
+                self.assertTrue(entered.wait(1))
+                workers[1].start()
+                self.assertTrue(independent.wait(.5), "slow preflight serialized another conversation")
+                self.assertFalse(any("retry/" in url for _, url, _ in sends))
+            finally:
+                release.set()
+                for worker in workers:
+                    if worker.ident is not None: worker.join(2)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(cleaned), 3, "each transport must close its own thread-local handle")
+            self.assertEqual([method for method, _, _ in sends], ["GET", "POST", "POST"])
+            self.assertTrue(all(b[2] - a[2] >= .025 for a, b in zip(sends, sends[1:])))
+            self.assertAlmostEqual(clock.next_conversation_read, original_credit, delta=.001)
+
+    def test_turn_interval_wait_does_not_lock_other_read_and_preflight_stays_after_interval(self):
+        with patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account")
+            clock.next_turn = time.monotonic() + .25
+            due = clock.next_turn
+            sent, errors = [], []
+            def request():
+                try:
+                    with executing(Context("retry")):
+                        clock.request(lambda method, *a, **kw: sent.append((method, time.monotonic())) or Response(),
+                            "POST", "https://provider/backend-api/conversation",
+                            _account_request_preflight=lambda read: read("GET", "https://provider/backend-api/conversation/original"))
+                except BaseException as exc: errors.append(exc)
+            worker = threading.Thread(target=request)
+            worker.start()
+            try:
+                clock.request(lambda *a, **kw: sent.append(("download", time.monotonic())) or Response(),
+                              "GET", "https://provider/backend-api/files/file/download")
+                self.assertEqual(sent[0][0], "download")
+                self.assertLess(sent[0][1], due)
+            finally:
+                worker.join(2)
+            self.assertEqual(errors, [])
+            self.assertEqual([row[0] for row in sent], ["download", "GET", "POST"])
+            self.assertGreaterEqual(sent[1][1], due)
 
     def test_legacy_clock_and_submission_preflight_keep_existing_semantics(self):
         import json

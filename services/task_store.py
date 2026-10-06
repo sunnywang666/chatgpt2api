@@ -219,7 +219,8 @@ class TaskStore:
             yield handle
 
     @staticmethod
-    def receipts(db, *, statuses=None, include_pending_completion=False, include_upstream_unfinished=False):
+    def receipts(db, *, statuses=None, include_pending_completion=False, include_upstream_unfinished=False,
+                 conversation_id=None, work_key=None):
         # A scheduler may prefilter candidates before decoding saved image
         # payloads. Keep full receipts and the caller's authoritative predicates;
         # public reads, lineage and admission still use the unfiltered default.
@@ -236,6 +237,10 @@ class TaskStore:
             # turn. A status prefilter must not hide their unfinished marker.
             conditions.append("json_extract(receipt,'$.upstream_unfinished')=1")
         where = " WHERE (" + " OR ".join(conditions) + ")" if conditions else " WHERE 0" if statuses is not None else ""
+        for field, value in (("conversation_id", conversation_id), ("_work_key", work_key)):
+            if value is not None:
+                where += (" AND " if where else " WHERE ") + "json_extract(receipt,'$." + field + "')=?"
+                values.append(value)
         for owner, request_id, raw in db.execute("SELECT owner,id,receipt FROM requests" + where, values):
             yield "text", owner, request_id, json.loads(raw)
         for key, raw in db.execute("SELECT task_key,receipt FROM image_requests" + where, values):

@@ -71,7 +71,8 @@ def ensure_work(store, db, kind, owner, request_id, receipt, *, source=None, sch
         if previous and previous.get("_work_key"):
             receipt["_work_key"] = previous["_work_key"]
     if (receipt.get("provider_binding_id") or receipt.get("provider_account_identity")) and receipt.get("conversation_id"):
-        known = {r["_work_key"] for k, _, _, r in store.receipts(db)
+        known = {r["_work_key"] for k, _, _, r in store.receipts(
+                    db, conversation_id=receipt["conversation_id"])
                  if r.get("_work_key") and _same_conversation(r, receipt)}
         if len(known) > 1:
             raise WorkLifecycleError("WORK_BINDING_CONFLICT")

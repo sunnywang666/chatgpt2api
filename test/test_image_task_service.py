@@ -1333,6 +1333,29 @@ class ImageTaskServiceTests(unittest.TestCase):
             with service.store.output_file(saved["_pending_image_output"]["output_ref"]) as output:
                 self.assertEqual(json.load(output), items)
 
+    def test_recovery_and_occupancy_do_not_decode_historical_image_payloads(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_unfinished=True)
+            service = self.make_service(path)
+            with service.store.transaction() as db:
+                for index, flag in enumerate((None, False, 1, True)):
+                    row = {"id": f"history-{index}", "owner_id": "owner-1", "status": "running",
+                           "provider_account_identity": "legacy", "data": [{"b64_json": "unrelated-history" * 10000}]}
+                    if flag is not None: row["upstream_unfinished"] = flag
+                    service.store.write_receipt(db, "image", "owner-1", row["id"], row)
+            loads = json.loads
+            def bounded_load(raw, *args, **kwargs):
+                self.assertNotIn("unrelated-history", raw)
+                return loads(raw, *args, **kwargs)
+            def finish(key, *args):
+                service._update_task(key, status="error", next_poll_at=time.time() + 60)
+            with mock.patch("services.image_task_service.json.loads", side_effect=bounded_load), \
+                 mock.patch.object(service, "_run_resume_poll", side_effect=finish):
+                result = service.resume_poll({"id": "owner-1"}, "policy-task", wait_for_completion=True)
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(service.resource_occupancy(), {"by_account": {"account-1": 1, "legacy": 2}, "unattributed": 0})
+
     def test_nested_progress_update_preserves_outer_transaction_changes(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"

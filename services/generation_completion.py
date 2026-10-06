@@ -452,7 +452,7 @@ class GenerationCompletionService:
         work_key = receipt.get("_work_key")
         if not work_key:
             return
-        members = [r for _, _, _, r in self.store.receipts(db) if r.get("_work_key") == work_key]
+        members = [r for _, _, _, r in self.store.receipts(db, work_key=work_key) if r.get("_work_key") == work_key]
         if any(r.get("_executing") or r.get("recovery_claim_id")
                or not r.get("_attempt_finished_at") and (unresolved(r) or r.get("status") in {"queued", "running"}) for r in members):
             return
@@ -461,7 +461,7 @@ class GenerationCompletionService:
             work["slot_held"] = False
             self.store.set_runtime(db, work_key, work)
 
-    def advance(self, kind, owner, request_id):
+    def advance(self, kind, owner, request_id, *, wait_for_image_recovery=False):
         now = float(self.clock())
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id)
@@ -488,7 +488,8 @@ class GenerationCompletionService:
               and now >= float(root.get("next_poll_at") or 0)
               and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS):
             self.images.resume_poll({"id": owner}, request_id, extra_timeout_secs=5,
-                                    allow_unrecoverable_retry=True, completion_recheck=True)
+                                    allow_unrecoverable_retry=True, completion_recheck=True,
+                                    **({"wait_for_completion": True} if wait_for_image_recovery else {}))
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id)
             state = root["_completion"]
@@ -652,7 +653,8 @@ class GenerationCompletionService:
                 self.advance(*candidates[0][:3])
             else:
                 for kind, owner, rid, row in candidates:
-                    dispatch(kind, owner, rid, lambda o, r, k=kind: self.advance(k, o, r), row)
+                    dispatch(kind, owner, rid, lambda o, r, k=kind: self.advance(
+                        k, o, r, wait_for_image_recovery=True), row)
 
     def read(self, kind, identity, request_id):
         owner = str(identity["id"])

@@ -666,10 +666,20 @@ class ImageTaskService:
 
     def resource_occupancy(self) -> dict:
         """Internal aggregate only: keep unfinished original receipts after restart."""
-        with self._transaction():
-            held = {}
-            unattributed = 0
-            for task in self._tasks.values():
+        fields = ("_attempt_finished_at", "_executing", "upstream_unfinished",
+                  "provider_account_identity", "status", "error_code")
+        expression = "json_object(" + ",".join(
+            "'" + key + "',json_extract(receipt,'$." + key + "')" for key in fields) + ")"
+        held, unattributed = {}, 0
+        with self.store.connect() as db:
+            for raw, unfinished_type in db.execute(
+                    "SELECT " + expression + ",json_type(receipt,'$.upstream_unfinished') FROM image_requests"):
+                task = json.loads(raw)
+                # JSON booleans are typed evidence; numeric 1 is not true.
+                if unfinished_type is None:
+                    task.pop("upstream_unfinished", None)
+                else:
+                    task["upstream_unfinished"] = unfinished_type == "true"
                 if not _holds_upstream_slot(task):
                     continue
                 identity = str(task.get("provider_account_identity") or "")
@@ -677,7 +687,7 @@ class ImageTaskService:
                     held[identity] = held.get(identity, 0) + 1
                 else:
                     unattributed += 1
-            return {"by_account": held, "unattributed": unattributed}
+        return {"by_account": held, "unattributed": unattributed}
 
     def submit_generation(
         self,
@@ -911,6 +921,13 @@ class ImageTaskService:
         thread_fields = input_fields(payload)
         if thread_fields and self.admission is None:
             raise ImageThreadError("IMAGE_THREAD_SCHEDULER_UNAVAILABLE", status=503)
+        # An accepted ID is a read: don't fsync another copy of its input.
+        with self.store.connect() as db:
+            existing = self.store.read_receipt(db, "image", owner, task_id)
+        if existing is not None and not self._receipt_expired(existing, self._retention_cutoff()):
+            if existing.get("request_hash") and existing["request_hash"] != _request_hash(mode, payload):
+                raise ValueError("client_task_id already exists with a different immutable request")
+            return _public_task(existing)
         source_snapshot = None
         source_bytes = None
         if thread_fields.get("edit_source_task_id"):
@@ -932,83 +949,115 @@ class ImageTaskService:
             if source_bytes is None or source_fingerprint(source) != source_fingerprint(source_snapshot):
                 raise ImageThreadError("IMAGE_THREAD_SOURCE_CHANGED")
             return source_bytes
-        with self._transaction():
-            cleaned = self._cleanup_locked()
-            task = self._tasks.get(key)
-            if task is not None:
-                if task.get("request_hash") and task.get("request_hash") != _request_hash(mode, payload):
-                    raise ValueError("client_task_id already exists with a different immutable request")
-                if cleaned:
-                    self._save_locked()
-                return _public_task(task)
-            task = {
-                "id": task_id,
-                "owner_id": owner,
-                "retain_receipt": bool(identity.get("external_image_client")),
-                "status": TASK_STATUS_QUEUED,
-                "mode": mode,
-                "model": _clean(payload.get("model"), "gpt-image-2"),
-                "upstream_model": _clean(payload.get("upstream_model")),
-                "size": _clean(payload.get("size")),
-                "quality": _clean(payload.get("quality"), "auto"),
-                "base_url": _clean(payload.get("base_url")),
-                "created_at": now,
-                "updated_at": now,
-                "created_ts": time.time(),
-                "provider_binding_id": _clean(payload.get("provider_binding_id")),
-                "provider_account_identity": _clean(payload.get("provider_account_identity")),
-                "client_conversation_id": _clean(payload.get("client_conversation_id")),
-                "conversation_id": _clean(payload.get("conversation_id")),
-                "parent_message_id": _clean(payload.get("parent_message_id")),
-                "binding_status": "bound" if payload.get("provider_binding_id") else "unbound",
-                "request_hash": _request_hash(mode, payload),
-                "upstream_unfinished": False,
-                "admission_recorded": True,
-                "_input_ref": None,
-                "_sequence": self.store.next_sequence(self._transaction_local.db),
-                "_source": str(identity.get("_trusted_source") or "key:" + owner),
-                "_input_bytes": __import__("services.text_task_service", fromlist=["_retained_size"])._retained_size(payload),
-                "_submission_started": False,
-                "_turn_reserved": False,
-                "_execution_timeline": [{"stage": "accepted", "at": time.time()}],
-            }
-            if is_codex_image_model(task["model"]):
-                task["_route"] = "codex"
-                if any(payload.get(k) for k in ("provider_binding_id", "conversation_id", "parent_message_id", "retain_conversation")):
-                    raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
-            if "_requested_account_ref" in payload:
-                from services.account_service import account_service
-                accounts = self.admission.accounts if self.admission is not None else account_service
-                requested_identity = accounts.resolve_image_account(payload["_requested_account_ref"])
-                if (task.get("provider_account_identity") and task["provider_account_identity"] != requested_identity):
-                    raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
-                if task.get("provider_binding_id"):
-                    try:
-                        bound_identity = accounts.get_bound_account_identity(task["provider_binding_id"])
-                    except RuntimeError:
-                        raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT") from None
-                    if bound_identity != requested_identity:
+        # Persist/fsync potentially large edit input before taking the shared
+        # receipt writer lock. Keep a referenced file even if commit reporting
+        # fails; only a never-linked, freshly created input is disposable.
+        input_ref = self.store.save_input({"payload": payload, "identity": {
+            k: identity[k] for k in ("id", "name", "role", "external_image_client", "_trusted_source")
+            if k in identity}, "mode": mode})
+        input_linked = False
+        try:
+            with self._transaction(task_key=key) as db:
+                cutoff = self._retention_cutoff()
+                task = self._tasks.get(key)
+                if task is not None and self._receipt_expired(task, cutoff):
+                    db.execute("DELETE FROM image_requests WHERE task_key=?", (key,))
+                    self._tasks.pop(key, None)
+                    task = None
+                if task is not None:
+                    if task.get("request_hash") and task.get("request_hash") != _request_hash(mode, payload):
+                        raise ValueError("client_task_id already exists with a different immutable request")
+                    return _public_task(task)
+                task = {
+                    "id": task_id,
+                    "owner_id": owner,
+                    "retain_receipt": bool(identity.get("external_image_client")),
+                    "status": TASK_STATUS_QUEUED,
+                    "mode": mode,
+                    "model": _clean(payload.get("model"), "gpt-image-2"),
+                    "upstream_model": _clean(payload.get("upstream_model")),
+                    "size": _clean(payload.get("size")),
+                    "quality": _clean(payload.get("quality"), "auto"),
+                    "base_url": _clean(payload.get("base_url")),
+                    "created_at": now,
+                    "updated_at": now,
+                    "created_ts": time.time(),
+                    "provider_binding_id": _clean(payload.get("provider_binding_id")),
+                    "provider_account_identity": _clean(payload.get("provider_account_identity")),
+                    "client_conversation_id": _clean(payload.get("client_conversation_id")),
+                    "conversation_id": _clean(payload.get("conversation_id")),
+                    "parent_message_id": _clean(payload.get("parent_message_id")),
+                    "binding_status": "bound" if payload.get("provider_binding_id") else "unbound",
+                    "request_hash": _request_hash(mode, payload),
+                    "upstream_unfinished": False,
+                    "admission_recorded": True,
+                    "_input_ref": None,
+                    "_sequence": self.store.next_sequence(self._transaction_local.db),
+                    "_source": str(identity.get("_trusted_source") or "key:" + owner),
+                    "_input_bytes": __import__("services.text_task_service", fromlist=["_retained_size"])._retained_size(payload),
+                    "_submission_started": False,
+                    "_turn_reserved": False,
+                    "_execution_timeline": [{"stage": "accepted", "at": time.time()}],
+                }
+                if is_codex_image_model(task["model"]):
+                    task["_route"] = "codex"
+                    if any(payload.get(k) for k in ("provider_binding_id", "conversation_id", "parent_message_id", "retain_conversation")):
                         raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
-                task.update(_requested_account_ref=payload["_requested_account_ref"],
-                            _requested_account_identity=requested_identity)
-            accept_thread(task, self._tasks.values(), payload, mode, output_reader=read_source)
-            from services.generation_completion import attach_replacement
-            attach_replacement(self.store, self._transaction_local.db, "image", owner, task_id, payload, task)
-            if task.get("_same_session_retry_of"):
-                root_id = task["_same_session_retry_of"]
-                self._tasks[owner + ":" + root_id] = self.store.read_receipt(
-                    self._transaction_local.db, "image", owner, root_id)
-            if task.get("retain_receipt") and not task.get("_completion_of") and task.get("_route", "chat") == "chat":
-                task["_automatic_generation_recovery"] = True
-            from services.workflow_scheduling import prepare_receipt
-            from services.work_lifecycle import ensure_work
-            prepare_receipt(task, payload.get("_scheduling"), task["_source"])
-            ensure_work(self.store, self._transaction_local.db, "image", owner, task_id, task,
-                        source=task["_source"], scheduling=task.get("_scheduling"))
-            task["_input_ref"] = self.store.save_input({"payload": payload, "identity": {k: identity[k] for k in ("id", "name", "role", "external_image_client", "_trusted_source") if k in identity}, "mode": mode})
-            self._tasks[key] = task
-            self._save_locked()
-            should_start = True
+                if "_requested_account_ref" in payload:
+                    from services.account_service import account_service
+                    accounts = self.admission.accounts if self.admission is not None else account_service
+                    requested_identity = accounts.resolve_image_account(payload["_requested_account_ref"])
+                    if (task.get("provider_account_identity") and task["provider_account_identity"] != requested_identity):
+                        raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
+                    if task.get("provider_binding_id"):
+                        try:
+                            bound_identity = accounts.get_bound_account_identity(task["provider_binding_id"])
+                        except RuntimeError:
+                            raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT") from None
+                        if bound_identity != requested_identity:
+                            raise ImageThreadError("IMAGE_ACCOUNT_SELECTION_CONFLICT")
+                    task.update(_requested_account_ref=payload["_requested_account_ref"],
+                                _requested_account_identity=requested_identity)
+                if thread_fields:
+                    # Ordering requires this owner's thread history, not saved image
+                    # bytes from every account. Only the edit source needs full data.
+                    owned = {row["id"]: row for (raw,) in db.execute(
+                        "SELECT json_remove(receipt,'$.data') FROM image_requests "
+                        "WHERE json_extract(receipt,'$.owner_id')=?", (owner,))
+                        if not self._receipt_expired(row := json.loads(raw), cutoff)}
+                    source_id = thread_fields.get("edit_source_task_id")
+                    if source_id and source_id in owned:
+                        source = self.store.read_receipt(db, "image", owner, source_id)
+                        owned[source_id] = source
+                        selected_id = (source.get("_completion") or {}).get("selected_id")
+                        if selected_id and selected_id in owned:
+                            owned[selected_id] = self.store.read_receipt(db, "image", owner, selected_id)
+                    accept_thread(task, owned.values(), payload, mode, output_reader=read_source)
+                from services.generation_completion import attach_replacement
+                attach_replacement(self.store, self._transaction_local.db, "image", owner, task_id, payload, task)
+                if task.get("_same_session_retry_of"):
+                    root_id = task["_same_session_retry_of"]
+                    self._tasks[owner + ":" + root_id] = self.store.read_receipt(
+                        self._transaction_local.db, "image", owner, root_id)
+                if task.get("retain_receipt") and not task.get("_completion_of") and task.get("_route", "chat") == "chat":
+                    task["_automatic_generation_recovery"] = True
+                from services.workflow_scheduling import prepare_receipt
+                from services.work_lifecycle import ensure_work
+                prepare_receipt(task, payload.get("_scheduling"), task["_source"])
+                ensure_work(self.store, self._transaction_local.db, "image", owner, task_id, task,
+                            source=task["_source"], scheduling=task.get("_scheduling"))
+                task["_input_ref"] = input_ref
+                input_linked = True
+                self._tasks[key] = task
+                self._save_locked(task_key=key)
+                should_start = True
+
+        finally:
+            if not input_linked:
+                try:
+                    (self.store.input_dir / input_ref).unlink(missing_ok=True)
+                except OSError:
+                    logger.warning({"event": "unused_image_input_cleanup_failed"})
 
         if should_start and self.admission is not None:
             self.admission.wake()
@@ -1030,7 +1079,7 @@ class ImageTaskService:
         identity: dict[str, object],
         model: str,
     ) -> None:
-        with self._transaction():
+        with self._transaction(task_key=key):
             original = self._tasks.get(key) or {}
             payload = {**payload, **{k: original[k] for k in ("_requested_account_ref", "_requested_account_identity") if original.get(k)}}
         if (identity.get("external_image_client") or payload.get("_requested_account_ref")) and not payload.get("_admission_claim"):
@@ -1242,9 +1291,15 @@ class ImageTaskService:
         progress_callback.image_thread_predecessor_result_ids = payload.get("_image_thread_predecessor_result_ids")
         prior_id = (payload.get("_image_thread") or {}).get("previous_task_id")
         if prior_id:
-            with self._transaction():
+            with self.store.connect() as db:
                 from services.image_thread import selected_thread_result
-                owned = {item["id"]: item for item in self._tasks.values() if item.get("owner_id") == _owner_id(identity)}
+                prior = self.store.read_receipt(db, "image", _owner_id(identity), prior_id)
+                owned = {prior_id: prior} if prior else {}
+                selected_id = ((prior or {}).get("_completion") or {}).get("selected_id")
+                if selected_id:
+                    selected = self.store.read_receipt(db, "image", _owner_id(identity), selected_id)
+                    if selected:
+                        owned[selected_id] = selected
                 prior = selected_thread_result(owned.get(prior_id), owned) or {}
                 # Call-local proof only; do not rewrite a successful source receipt
                 # or invalidate an already accepted edit's source fingerprint.
@@ -1798,11 +1853,12 @@ class ImageTaskService:
         base_url: str = "",
         allow_unrecoverable_retry: bool = False,
         completion_recheck: bool = False,
+        wait_for_completion: bool = False,
     ) -> dict[str, Any]:
         """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
         owner = _owner_id(identity)
         key = _task_key(owner, _clean(task_id))
-        with self._transaction():
+        with self._transaction(task_key=key):
             task = self._tasks.get(key)
             if task is None:
                 raise ValueError("task not found")
@@ -1880,15 +1936,17 @@ class ImageTaskService:
                 **({"deadline_recovery_started": True} if deadline_recovery_start else {}),
             )
 
-        # 启动新线程继续轮询
         arguments = (key, conversation_id, extra_timeout_secs, base_url, dict(identity), mode, model,
                      bool(allow_unrecoverable_retry), bool(deadline_expired))
-        thread = threading.Thread(
-            target=self.admission.run_recovery if recovery_context is not None else self._run_resume_poll,
-            args=(recovery_context, self._run_resume_poll, arguments) if recovery_context is not None else arguments,
-            name=f"image-resume-{_clean(task_id)[:16]}",
-            daemon=True,
-        )
+        target = self.admission.run_recovery if recovery_context is not None else self._run_resume_poll
+        worker_args = (recovery_context, self._run_resume_poll, arguments) if recovery_context is not None else arguments
+        if wait_for_completion:
+            # The dispatcher already owns a bounded worker and conversation
+            # permit. Keep both until the actual original-read I/O finishes.
+            target(*worker_args)
+            return self.list_tasks(identity, task_ids=[task_id])["items"][0]
+        thread = threading.Thread(target=target, args=worker_args,
+            name=f"image-resume-{_clean(task_id)[:16]}", daemon=True)
         thread.start()
         return _public_task(task)
 
@@ -1915,7 +1973,7 @@ class ImageTaskService:
         )))
         if not all(supplied_identity):
             raise ConversationImageAdoptionError("complete conversation authority is required")
-        with self._transaction():
+        with self._transaction(task_key=key):
             task = self._tasks.get(key)
             if task is None:
                 raise ConversationImageAdoptionError("task not found")
@@ -1991,7 +2049,7 @@ class ImageTaskService:
         if allow_no_image_generated:
             eligible_errors.add("no_image_generated")
 
-        with self._transaction():
+        with self._transaction(task_key=key):
             task = self._tasks.get(key)
             if task is None:
                 raise ConversationImageAdoptionError("task not found")
@@ -2126,7 +2184,7 @@ class ImageTaskService:
             if not data:
                 raise ConversationImageAdoptionError("latest manual image could not be stored")
 
-            with self._transaction():
+            with self._transaction(task_key=key):
                 current = self._tasks.get(key)
                 if current is None:
                     raise ConversationImageAdoptionError("task not found")
@@ -2175,7 +2233,7 @@ class ImageTaskService:
                         "updated_at": _now_iso(),
                         "updated_ts": time.time(),
                     })
-                    self._save_locked()
+                    self._save_locked(task_key=key)
                 except Exception:
                     current.clear()
                     current.update(snapshot)
@@ -2243,7 +2301,7 @@ class ImageTaskService:
             from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
             from services.protocol.conversation import format_image_result, _validate_image_download_count
 
-            with self._transaction():
+            with self._transaction(task_key=key) as db:
                 task = self._tasks.get(key)
                 binding_id = _clean(task.get("provider_binding_id")) if task else ""
                 account_identity = _clean(task.get("provider_account_identity")) if task else ""
@@ -2256,8 +2314,8 @@ class ImageTaskService:
                 expected_parent = (task or {}).get("_image_thread_request_parent")
                 predecessor_message = (task or {}).get("_image_thread_predecessor_message")
                 predecessor_ids = (task or {}).get("_image_thread_predecessor_result_ids")
-                retry_predecessor = self._tasks.get(_task_key(_owner_id(identity),
-                    (image_thread or {}).get("previous_task_id") or ""))
+                retry_predecessor = self.store.read_receipt(db, "image", _owner_id(identity),
+                    (image_thread or {}).get("previous_task_id") or "")
             def recovered_parent(backend, result_file_ids, result_sediment_ids):
                 if image_thread:
                     return finished_parent(backend._get_conversation(conversation_id), conversation_id,
