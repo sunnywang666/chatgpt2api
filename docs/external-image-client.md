@@ -446,6 +446,16 @@ absent. HTTP 404/429 alone, a timeout or a client crash never proves non-submiss
 The client saves `phase=unknown` before each POST and replaces that state only
 with an actual response; it never clears the original ID.
 
+Task completion, archive and rework control POSTs use the same explicit
+`not_sent` and 429/503 evidence for at most one automatic retry per invocation,
+only when `Retry-After` is at most 30 seconds. The original control endpoint and
+payload stay unchanged. Its deadline is saved separately as `control_retry` and
+honored on a later matching invocation; the old not-sent proof is invalidated
+before another send, while the rejection record remains after acknowledgement.
+This never changes the generation `phase` or resubmits generation. An
+unaccepted archive/restore remains `lifecycle.status=not_sent`; ambiguous errors
+remain `unknown`. Authentication, body-size and active body-reader limits remain.
+
 `GET` the same `/completion` to inspect `state`, `reason`, `waiting`,
 `original_status`, `replacement_status`, `replacement_id` and `selected_id`.
 Selection is durable and write-once. An original found before the replacement

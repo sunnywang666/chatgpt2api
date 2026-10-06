@@ -248,6 +248,41 @@ def _submit_original(api, state_path, state, endpoint, **kwargs):
                 raise
 
 
+def _post_original_control(api, state_path, state, endpoint, payload):
+    """Retry one explicitly unaccepted control, never an uncertain operation."""
+    for attempt in range(2):
+        pending = state.get("control_retry") or {}
+        same_control = pending.get("endpoint") == endpoint and pending.get("payload") == payload
+        if same_control and pending.get("status") == "not_sent":
+            delay = max(0, pending.get("retry_not_before", 0) - time.time())
+            if delay > 30:
+                raise ClientError("original control was not accepted; retry after its persisted cooldown")
+            if delay:
+                time.sleep(delay)
+            # Invalidate the old not-sent proof before this transport attempt.
+            pending.pop("retry_not_before", None)
+            pending["status"] = "unknown"
+            _atomic_write_state(state_path, state)
+        try:
+            result = api.json("POST", endpoint, payload=payload)
+            if same_control:
+                pending["status"] = "acknowledged_after_retry"
+                _atomic_write_state(state_path, state)
+            return result
+        except HttpFailure as exc:
+            if not exc.not_sent:
+                raise
+            pending = {"endpoint": endpoint, "payload": payload, "http_status": exc.status,
+                       "status": "not_sent"}
+            if exc.retry_after is not None:
+                pending["retry_not_before"] = time.time() + exc.retry_after
+            state["control_retry"] = pending
+            _atomic_write_state(state_path, state)
+            if (attempt or exc.status not in {429, 503} or exc.retry_after is None
+                    or exc.retry_after > 30):
+                raise
+
+
 def _read_input_image(path_text: str) -> dict[str, Any]:
     path = Path(path_text).expanduser()
     try:
@@ -988,7 +1023,7 @@ def _command_completion(api: ApiClient, args: argparse.Namespace) -> int:
             payload = {"action": action, "selected_id": selected}
             if action == "complete":
                 payload.update(results_saved=True, reviewed=True)
-            current = api.json("POST", endpoint, payload=payload)
+            current = _post_original_control(api, path, state, endpoint, payload)
             if current.get("original_id") != original_id or current.get("selected_id") != selected:
                 raise ClientError("completion acknowledgement changed result identity")
             state["completion"] = current
@@ -1050,7 +1085,7 @@ def _command_work_lifecycle(api: ApiClient, args: argparse.Namespace) -> int:
         _atomic_write_state(path, state)
         try:
             try:
-                result = api.json("POST", endpoint, payload={})
+                result = _post_original_control(api, path, state, endpoint, {})
             except HttpFailure as exc:
                 if not archived or (exc.status, exc.detail) not in {
                     (409, "WORK_TURN_UNFINISHED"), (503, "WORK_ARCHIVE_UNCONFIRMED")
@@ -1092,7 +1127,10 @@ def _command_work_lifecycle(api: ApiClient, args: argparse.Namespace) -> int:
                     or scope.get(scope_key) != expected.get(scope_key)):
                 raise ClientError("lifecycle response did not confirm the original work and archive state")
         except ClientError:
-            state["lifecycle"].update(status="unknown", updated_at=_utc_now())
+            pending = state.get("control_retry") or {}
+            not_sent = (pending.get("endpoint") == endpoint and pending.get("payload") == {}
+                        and pending.get("status") == "not_sent")
+            state["lifecycle"].update(status="not_sent" if not_sent else "unknown", updated_at=_utc_now())
             _atomic_write_state(path, state)
             raise
         state["lifecycle"].update(status="confirmed", archived=archived, updated_at=_utc_now())

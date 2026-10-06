@@ -598,6 +598,83 @@ def test_complete_preserves_original_work_during_cleanup_and_archive_pending(tmp
         assert calls == [("POST", "/api/image-tasks/original/archive-thread"), ("GET", "/api/image-tasks/original/work")]
 
 
+def test_complete_retries_only_explicit_unaccepted_control(tmp_path):
+    path = tmp_path / "original.json"
+    image_client._atomic_write_state(path, {"schema_version": 1, "client_task_id": "original",
+        "input_fingerprint": "immutable", "phase": "accepted", "input": {"image_thread_id": "thread"}})
+    calls = []
+    class Api:
+        def json(self, method, endpoint, payload=None):
+            calls.append((method, endpoint, payload))
+            persisted = json.loads(path.read_text())
+            assert persisted["phase"] == "accepted"
+            assert persisted.get("control_retry", {}).get("status") in {None, "unknown"}
+            if len(calls) == 1:
+                raise image_client.HttpFailure(429, "CHAT_BODY_READER_CAPACITY_EXCEEDED",
+                                               not_sent=True, retry_after=1)
+            return {"task_id": "original", "archived": True,
+                    "image_thread": {"protocol": "image-thread-v1", "id": "thread"}}
+    args = image_client._parser().parse_args(["complete", "--state", str(path)])
+    with mock.patch.object(image_client, "_lookup_task", return_value={"status": "success",
+            "image_thread": {"protocol": "image-thread-v1", "id": "thread"}}), \
+            mock.patch.object(image_client.time, "time", return_value=100), \
+            mock.patch.object(image_client.time, "sleep") as sleep, mock.patch.object(image_client, "_emit"):
+        assert image_client._command_work_lifecycle(Api(), args) == 0
+        sleep.assert_called_once_with(1)
+    saved = json.loads(path.read_text())
+    assert saved["phase"] == "accepted" and saved["input_fingerprint"] == "immutable"
+    assert saved["lifecycle"]["status"] == "confirmed"
+    assert saved["control_retry"]["status"] == "acknowledged_after_retry"
+    assert saved["control_retry"]["http_status"] == 429
+    assert calls == [("POST", "/api/image-tasks/original/archive-thread", {})] * 2
+
+
+def test_control_rejection_is_bounded_and_cooldown_survives_restart(tmp_path):
+    path = tmp_path / "original.json"
+    state = {"phase": "accepted", "client_task_id": "original"}
+    calls = []
+    class Api:
+        def json(self, method, endpoint, payload=None):
+            calls.append((method, endpoint, payload))
+            raise image_client.HttpFailure(429, "capacity", not_sent=True, retry_after=1)
+    endpoint = "/api/image-tasks/original/archive-thread"
+    with mock.patch.object(image_client.time, "time", return_value=100), \
+            mock.patch.object(image_client.time, "sleep") as sleep:
+        with unittest.TestCase().assertRaises(image_client.HttpFailure):
+            image_client._post_original_control(Api(), path, state, endpoint, {})
+        assert len(calls) == 2
+        sleep.assert_called_once_with(1)
+    saved = json.loads(path.read_text())
+    assert saved["control_retry"]["retry_not_before"] == 101
+    assert saved["phase"] == "accepted"
+    with mock.patch.object(image_client.time, "time", return_value=100.5), \
+            mock.patch.object(image_client.time, "sleep") as sleep:
+        with unittest.TestCase().assertRaises(image_client.HttpFailure):
+            image_client._post_original_control(Api(), path, saved, endpoint, {})
+        assert sleep.call_args_list[0].args == (.5,)
+
+
+def test_control_does_not_retry_ambiguous_or_unbounded_errors(tmp_path):
+    for number, failure in enumerate([
+        image_client.HttpFailure(429, "unknown", retry_after=1),
+        image_client.HttpFailure(503, "unknown", retry_after=1),
+        image_client.HttpFailure(429, "capacity", not_sent=True),
+        image_client.HttpFailure(429, "capacity", not_sent=True, retry_after=120),
+        image_client.HttpFailure(403, "forbidden", not_sent=True, retry_after=1),
+        image_client.ClientError("transport unknown"),
+    ]):
+        api = mock.Mock()
+        api.json.side_effect = failure
+        state = {"phase": "accepted", "client_task_id": "original"}
+        with mock.patch.object(image_client.time, "sleep") as sleep:
+            with unittest.TestCase().assertRaises(type(failure)):
+                image_client._post_original_control(api, tmp_path / f"{number}.json", state,
+                                                    "/api/image-tasks/original/archive-thread", {})
+            assert api.json.call_count == 1
+            sleep.assert_not_called()
+        assert state["phase"] == "accepted"
+
+
 def test_complete_rejects_other_work_on_pending_readback(tmp_path):
     path = tmp_path / "original.json"
     image_client._atomic_write_state(path, {"schema_version": 1, "client_task_id": "original",
