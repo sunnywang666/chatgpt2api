@@ -439,6 +439,8 @@ class AccountRequestClock:
                         "retry_after_secs": retry_after, "cooldown_secs": wait, **observed})
 
     def request(self, send, method, url, **kwargs):
+        preparation_started = time.monotonic()
+        preparation_seconds = {}
         io_cleanup = kwargs.pop("_account_request_io_cleanup", None)
         deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
         minimum_budget = kwargs.pop("_account_request_minimum_budget_secs", None)
@@ -479,6 +481,15 @@ class AccountRequestClock:
         read_http_attempts = 0
         read_queue_position_max = 0
 
+        def measure_preparation(part, callback, *args):
+            if not is_turn:
+                return callback(*args)
+            began = time.monotonic()
+            try:
+                return callback(*args)
+            finally:
+                preparation_seconds[part] = preparation_seconds.get(part, 0.0) + max(0.0, time.monotonic() - began)
+
         def wait_for_pace(delay: float, message: str, reason="account_pace") -> None:
             nonlocal deadline_at
             remaining = remaining_budget()
@@ -499,6 +510,10 @@ class AccountRequestClock:
             elapsed = max(0.0, time.monotonic() - started_wait)
             if is_conversation_read:
                 read_wait_seconds[reason] = read_wait_seconds.get(reason, 0.0) + elapsed
+            if is_turn:
+                part = ("upstream_cooldown" if provider_wait > started_wait
+                        and provider_wait >= max(self.next_request, self.next_turn) else "account_pace")
+                preparation_seconds[part] = preparation_seconds.get(part, 0.0) + elapsed
             if credit and elapsed:
                 local_wait(elapsed)
                 if deadline_at is not None:
@@ -560,6 +575,13 @@ class AccountRequestClock:
             # Never log URLs, request bodies/headers, response bodies or exception
             # messages: conversation URLs and signed downloads can contain secrets.
             started_at, started = time.time(), time.monotonic()
+            # Snapshot before transport: response/SSE time is not preparation.
+            # Only actual model POST attempts receive these numeric fields;
+            # a failed local guard must not look like an upstream send.
+            preparation = ({
+                "pre_send_elapsed_secs": round(max(0.0, started - preparation_started), 6),
+                "pre_send_seconds_by_phase": {k: round(v, 6) for k, v in preparation_seconds.items()},
+            } if is_turn and send_phase == "conversation" else {})
             endpoint = urlparse(str(send_url)).path.rstrip("/")
             endpoint_kind = metadata_kind or send_phase
             if "/attachment/" in endpoint:
@@ -621,6 +643,7 @@ class AccountRequestClock:
                              "archive_step": current_archive_step.get() if archive_guard is not None else None,
                              "method": verb if verb in {"GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "OPTIONS"} else "OTHER",
                              "phase": send_phase, "endpoint_kind": endpoint_kind, "started_at": started_at,
+                             **preparation,
                              "headers_elapsed_secs": round(time.monotonic() - started, 6),
                              "status_code": status if isinstance(status, int) and not isinstance(status, bool) else None,
                              "outcome": "response" if response is not None else "transport_error",
@@ -633,7 +656,7 @@ class AccountRequestClock:
         # in PoolAdmission until the response stream is terminal; holding this
         # file lock for the whole stream would silently force capacity back to 1.
         if is_turn:
-            acquire_with_budget(self.turn_lock)
+            measure_preparation("turn_lock", acquire_with_budget, self.turn_lock)
         pacing_held = is_turn
         turn_held = is_turn
         release_lock = threading.Lock()
@@ -655,7 +678,7 @@ class AccountRequestClock:
 
         try:
             while True:
-                acquire_with_budget(self.lock)
+                measure_preparation("clock_lock", acquire_with_budget, self.lock)
                 try:
                     now = time.monotonic()
                     read_delay, wait_reason = max((
@@ -747,15 +770,15 @@ class AccountRequestClock:
                                          evidence={"phase": "conversation_preflight", "model": model, "origin": "http_429", "upstream_request_id": safe_id,
                                                    "response_features": _rate_limit_response_features(response)})
                         return response
-                    preflight(read_original)
+                    measure_preparation("preflight", preflight, read_original)
                     # The metadata GET does not bypass the account request pace.
                     delay = max(self.next_request, self.cooldown_until, self.next_turn if is_turn else 0.0) - time.monotonic()
                     if delay > 0:
                         wait_for_pace(delay, "deadline elapsed after preflight")
                 if context is not None and is_turn:
-                    context.before_send()
+                    measure_preparation("admission_guard", context.before_send)
                 if callable(before_send):
-                    before_send()
+                    measure_preparation("submission_callback", before_send)
                 if archive_guard is not None:
                     archive_guard()
                 # Receipt persistence and final fences must not consume the

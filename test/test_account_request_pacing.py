@@ -48,6 +48,59 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_model_send_preparation_timing_excludes_transport_and_preserves_guards(self):
+        for transport_fails in (False, True):
+            with self.subTest(transport_fails=transport_fails):
+                now = [10000.0]
+                def advance(seconds):
+                    now[0] += seconds
+                class SlowContext(Context):
+                    def before_send(self):
+                        super().before_send()
+                        advance(5)
+                with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+                     patch("services.account_request_pacing.logger.info") as logged, \
+                     patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                     patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+                    clock = AccountRequestClock("account")
+                    turn_acquire, clock_acquire = clock.turn_lock.acquire, clock.lock.acquire
+                    def slow_turn(*args, **kwargs):
+                        advance(2)
+                        return turn_acquire(*args, **kwargs)
+                    def slow_clock(*args, **kwargs):
+                        advance(3)
+                        return clock_acquire(*args, **kwargs)
+                    def send(*args, **kwargs):
+                        advance(7)
+                        if transport_fails:
+                            raise OSError("private-transport-text")
+                        return Response()
+                    with patch.object(clock.turn_lock, "acquire", side_effect=slow_turn), \
+                         patch.object(clock.lock, "acquire", side_effect=slow_clock), executing(SlowContext("test")):
+                        args = (send, "POST", "https://private-host/backend-api/conversation?private-query")
+                        options = {"_account_request_preflight": lambda read: advance(4),
+                                   "_account_request_before_send": lambda: advance(6)}
+                        if transport_fails:
+                            with self.assertRaises(OSError):
+                                clock.request(*args, **options)
+                        else:
+                            clock.request(*args, **options)
+                    attempts = [c.args[0] for c in logged.call_args_list if c.args[0].get("event") == "account_http_attempt"]
+                    self.assertEqual(len(attempts), 1)
+                    self.assertEqual(attempts[0]["pre_send_elapsed_secs"], 20)
+                    self.assertEqual(attempts[0]["pre_send_seconds_by_phase"], {
+                        "turn_lock": 2, "clock_lock": 3, "preflight": 4,
+                        "admission_guard": 5, "submission_callback": 6})
+                    self.assertEqual(attempts[0]["headers_elapsed_secs"], 7)
+                    self.assertNotIn("private-", json.dumps(attempts))
+                    logged.reset_mock()
+                    def reject():
+                        raise RuntimeError("private-local-guard")
+                    with self.assertRaises(RuntimeError), executing(SlowContext("rejected")):
+                        clock.request(send, "POST", "https://provider/conversation", _account_request_before_send=reject)
+                    self.assertFalse(any(c.args[0].get("event") == "account_http_attempt" for c in logged.call_args_list))
+
     def test_read_defers_before_wait_that_cannot_leave_connection_budget(self):
         from types import SimpleNamespace
         from unittest.mock import Mock
