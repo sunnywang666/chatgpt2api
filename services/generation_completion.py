@@ -198,6 +198,10 @@ def replacement_send_allowed(store, db, kind, owner, request_id, receipt):
         return True
     root = store.read_receipt(db, kind, owner, root_id)
     state = (root or {}).get("_completion") or {}
+    if kind == "image" and str((root or {}).get("error_code") or "").lower() == "content_policy_violation":
+        # A late refusal can arrive after a replacement was prepared. A saved
+        # cursor proves a location, not permission to repeat the refused input.
+        return False
     if receipt.get("_same_session_retry_of") and not same_session_retry(root, receipt):
         return False
     if kind == "image" and root and (root.get("result_file_ids") or root.get("result_sediment_ids")
@@ -348,6 +352,8 @@ class GenerationCompletionService:
             raise CompletionError("COMPLETION_ORIGINAL_INPUT_UNAVAILABLE") from None
 
     def _prepare(self, db, kind, owner, request_id, root, replacement_id):
+        if kind == "image" and str(root.get("error_code") or "").lower() == "content_policy_violation":
+            raise CompletionError("COMPLETION_ORIGINAL_NOT_RETRYABLE")
         body = copy.deepcopy(self._load_verified_input(db, kind, owner, request_id, root))
         if kind == "text":
             if self.text._verified_retryable_empty(root):

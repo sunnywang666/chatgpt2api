@@ -92,6 +92,7 @@ def runtime(tmp_path, monkeypatch):
         monkeypatch.setattr(mod, "count_text_tokens", lambda *a, **k: 0)
     class Backend:
         _has_image_asset_pointer = RealOpenAIBackendAPI._has_image_asset_pointer
+        _extract_image_reference_ids = staticmethod(RealOpenAIBackendAPI._extract_image_reference_ids)
         def __init__(self, access_token):
             assert access_token == "fixture-token"
             self.image_submission_started = False
@@ -1346,7 +1347,7 @@ def test_predecessor_diagnostics_are_specific_and_read_only(previous, reason):
     assert predecessor_state(task, owned) == ({}, reason)
     assert owned == before
 
-@pytest.mark.parametrize('case', ['success', 'terminal_failure', 'late_original_success', 'selected_source_changed', 'drift', 'late_result', 'missing_root'])
+@pytest.mark.parametrize('case', ['success', 'terminal_failure', 'late_original_success', 'selected_source_changed', 'drift', 'late_result', 'late_policy', 'missing_root'])
 def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runtime, case):
     import time
     from services.generation_completion import GenerationCompletionService, retry_cursor
@@ -1401,11 +1402,13 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
     assert ctx and ctx.request_id == child_id
     r.state.fail_after_send = False
     if case == 'drift': r.state.drift = True
-    if case in {'late_result', 'missing_root'}:
+    if case in {'late_result', 'late_policy', 'missing_root'}:
         with r.store.transaction() as db:
             root = r.store.read_receipt(db, 'image', WHO['id'], 'empty-original')
             if case == 'late_result':
                 root.update(result_file_ids=['already-generated'], upstream_outcome='generated', recovery_phase='download_image_result')
+            elif case == 'late_policy':
+                root.update(error_code='content_policy_violation', upstream_outcome='rejected', upstream_unfinished=False)
             else:
                 # Identity loss has the same fail-closed effect as a missing row,
                 # without bypassing the store's retention policy in the fixture.

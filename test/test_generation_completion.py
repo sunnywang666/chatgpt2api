@@ -557,6 +557,74 @@ def failed_unsent_image(setup):
     return service
 
 
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("proof_source", [None, "terminal_image_failure"])
+@pytest.mark.parametrize("error_code", ["content_policy_violation", "CONTENT_POLICY_VIOLATION"])
+def test_policy_refusal_never_replays_original_image_from_saved_cursor(failed_unsent_image, automatic, proof_source, error_code):
+    service = failed_unsent_image
+    rid = "repair-image"
+    proof = {"conversation_id": "original-chat", "request_message_id": "original-user",
+             "retry_parent_message_id": "refusal", "observed_at": service.clock()}
+    if proof_source:
+        proof["source"] = proof_source
+    patch_row(service, "image", rid, retain_receipt=True, status="error",
+              error_code=error_code, upstream_outcome="rejected",
+              _submission_started=True, upstream_submission_started=True, upstream_unfinished=False,
+              provider_binding_id="original-binding", provider_account_identity="original-account",
+              client_conversation_id="original-client", conversation_id="original-chat",
+              request_message_id="original-user", parent_message_id="refusal",
+              _attempt_finished_at=service.clock(), _turn_reserved=False,
+              _retry_cursor=proof, _completion=None, _automatic_generation_recovery=automatic)
+    original = row(service, "image", rid)
+    service.images._submit = Mock()
+    if automatic:
+        service.process_one()
+    else:
+        service.start("image", IDENTITY, rid, allow_unconfirmed_retry=True)
+    after = row(service, "image", rid)
+    assert after["_completion"]["state"] == "needs_attention"
+    assert after["_completion"]["reason"] == "COMPLETION_ORIGINAL_NOT_RETRYABLE"
+    assert not after["_completion"].get("replacement_id")
+    assert after["_retry_cursor"] == original["_retry_cursor"]
+    assert after["error_code"] == error_code
+    service.images._submit.assert_not_called()
+
+
+def test_late_policy_refusal_blocks_already_prepared_image_replacement(failed_unsent_image):
+    from services.generation_completion import replacement_send_allowed
+    service = failed_unsent_image
+    patch_row(service, "image", "repair-image", status="error", error_code="content_policy_violation",
+              upstream_outcome="rejected", _completion={"state": "replacement_pending", "replacement_id": "child"})
+    with service.store.connect() as db:
+        assert not replacement_send_allowed(service.store, db, "image", "owner", "child",
+                                            {"_completion_of": "repair-image"})
+
+
+def test_verified_empty_image_still_prepares_retry_in_original_conversation(failed_unsent_image):
+    service = failed_unsent_image
+    rid = "repair-image"
+    patch_row(service, "image", rid, retain_receipt=True, status="error", error_code="NO_IMAGE_GENERATED",
+              upstream_outcome="failed", _submission_started=True, upstream_submission_started=True,
+              upstream_unfinished=False, provider_binding_id="original-binding",
+              provider_account_identity="original-account", client_conversation_id="original-client",
+              conversation_id="original-chat", request_message_id="original-user", parent_message_id="empty-final",
+              _attempt_finished_at=service.clock(), _turn_reserved=False, _completion=None,
+              _retry_cursor={"conversation_id": "original-chat", "request_message_id": "original-user",
+                             "retry_parent_message_id": "empty-final", "observed_at": service.clock(),
+                             "source": "terminal_image_failure"})
+    service.images._submit = Mock()
+    service.start("image", IDENTITY, rid)
+    root = row(service, "image", rid)
+    assert root["_completion"]["state"] == "replacement_pending"
+    service.images._submit.assert_called_once()
+    submitted = service.images._submit.call_args.kwargs
+    assert submitted["client_task_id"] == root["_completion"]["replacement_id"]
+    for field in ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"):
+        assert submitted["payload"][field] == root[field]
+    assert submitted["payload"]["parent_message_id"] == "empty-final"
+    assert submitted["payload"]["prompt"] == "retained input"
+
+
 @pytest.mark.parametrize("kind", ["text", "image"])
 @pytest.mark.parametrize("pending_delay", [None, 30])
 def test_background_settles_saved_original_without_waiting_for_investigation(setup, kind, pending_delay):
