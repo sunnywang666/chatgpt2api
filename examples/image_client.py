@@ -35,6 +35,10 @@ class ClientError(RuntimeError):
     """A safe user-facing error that never contains credentials."""
 
 
+class TransportUncertain(ClientError):
+    """The transport ended without establishing the original operation's outcome."""
+
+
 class HttpFailure(ClientError):
     def __init__(self, status: int, detail: str, *, not_sent=False, retry_after=None):
         self.status = status
@@ -172,7 +176,7 @@ class ApiClient:
                               retry_after=getattr(exc, "pool_retry_after", None)) from exc
         except (TimeoutError, error.URLError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
-            raise ClientError(f"request result is unknown: {reason}") from exc
+            raise TransportUncertain(f"request result is unknown: {reason}") from exc
 
     def json(self, method: str, endpoint: str, *, payload: object | None = None, body: bytes | None = None, content_type: str = "") -> dict[str, Any]:
         if payload is not None:
@@ -182,7 +186,7 @@ class ApiClient:
             with self.open(method, endpoint, body=body, content_type=content_type) as response:
                 raw = response.read(MAX_JSON_BYTES + 1)
         except (OSError, HTTPException) as exc:
-            raise ClientError("response interrupted; query the original durable request") from exc
+            raise TransportUncertain("response interrupted; query the original durable request") from exc
         if len(raw) > MAX_JSON_BYTES:
             raise ClientError("server JSON response exceeds 4 MiB")
         try:
@@ -1086,37 +1090,44 @@ def _command_work_lifecycle(api: ApiClient, args: argparse.Namespace) -> int:
         try:
             try:
                 result = _post_original_control(api, path, state, endpoint, {})
-            except HttpFailure as exc:
-                if not archived or (exc.status, exc.detail) not in {
-                    (409, "WORK_TURN_UNFINISHED"), (503, "WORK_ARCHIVE_UNCONFIRMED")
-                }:
+            except (HttpFailure, TransportUncertain) as exc:
+                interrupted = isinstance(exc, TransportUncertain)
+                if isinstance(exc, HttpFailure) and exc.not_sent:
+                    raise
+                waiting_turn = (archived and isinstance(exc, HttpFailure)
+                                and (exc.status, exc.detail) == (409, "WORK_TURN_UNFINISHED"))
+                if not interrupted and not waiting_turn and (exc.status, exc.detail) != (503, "WORK_ARCHIVE_UNCONFIRMED"):
                     raise
                 # A saved result can precede execution-claim cleanup; a
-                # committed archive intent can precede its upstream readback.
-                # Read this same work instead of labelling either as UNKNOWN.
+                # committed archive/restore intent can outlast this HTTP call.
+                # Read this same work once; never repeat an uncertain POST.
                 work = api.json("GET", f"/api/{'chat-requests' if chat else 'image-tasks'}/{parse.quote(task_id, safe='')}/work")
                 ref = expected.get("client_conversation_id" if chat else "id")
                 if (not isinstance(work, dict) or work.get("protocol") != "work-v1" or work.get("request_id") != task_id
                         or work.get("kind") != ("text" if chat else "image") or work.get("work_ref") != ref
-                        or work.get("state") not in {"active", "completed"}
-                        or exc.detail == "WORK_ARCHIVE_UNCONFIRMED" and work.get("state") != "completed"):
+                        or work.get("state") not in ({"active", "completed"} if archived else {"restoring", "active"})
+                        or archived and not waiting_turn and work.get("state") != "completed"):
                     raise ClientError("pending lifecycle response changed the original work")
                 state["work"] = work
                 archive = work.get("archive") or {}
                 if not isinstance(archive, dict):
                     raise ClientError("original work archive is not confirmed or safely pending")
-                if work["state"] == "active":
+                if waiting_turn and work["state"] == "active":
                     lifecycle = "waiting_turn"
-                elif (archive.get("status") == "confirmed" and archive.get("archived") is True
-                      and archive.get("desired") is True):
+                elif (archive.get("status") == "confirmed" and archive.get("archived") is archived
+                      and archive.get("desired") is archived
+                      and work["state"] == ("completed" if archived else "active")):
                     lifecycle = "confirmed"
-                elif archive.get("status") in {"pending", "running"} and archive.get("desired") is True and not archive.get("error_code"):
+                elif (archive.get("status") in {"pending", "running"} and archive.get("desired") is archived
+                      and work["state"] == ("completed" if archived else "restoring") and not archive.get("error_code")):
                     lifecycle = "pending"
                 else:
                     raise ClientError("original work archive is not confirmed or safely pending")
                 state["lifecycle"].update(status=lifecycle, updated_at=_utc_now())
+                if interrupted:
+                    state["lifecycle"]["transport_interrupted"] = True
                 if lifecycle == "confirmed":
-                    state["lifecycle"]["archived"] = True
+                    state["lifecycle"]["archived"] = archived
                 _atomic_write_state(path, state)
                 _emit({"request_id": task_id, "waiting": lifecycle != "confirmed", "work": work})
                 return 0 if lifecycle == "confirmed" else 2

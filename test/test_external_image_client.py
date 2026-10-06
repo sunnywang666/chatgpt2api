@@ -773,3 +773,73 @@ def test_complete_classifies_archive_readback_without_hiding_unknown_or_confirma
             assert saved["lifecycle"]["status"] == lifecycle
             assert saved["work"]["archive"] == archive
             assert [method for method, _ in calls] == ["POST", "GET"]
+
+
+def test_lifecycle_timeout_reads_original_intent_without_reposting(tmp_path):
+    for chat in (False, True):
+        for archived in (False, True):
+            for confirmed in (False, True):
+                for transport_failure in (True, False):
+                    path = tmp_path / f"work-{chat}-{archived}-{confirmed}-{transport_failure}.json"
+                    conversation = {"protocol": "sequential-v1", "client_conversation_id": "work"}
+                    state = ({"schema": "chatgpt2api.chat-request.v1", "request_id": "original", "conversation": conversation}
+                             if chat else {"schema_version": 1, "client_task_id": "original", "input": {"image_thread_id": "work"}})
+                    state.update(input_fingerprint="immutable", phase="accepted")
+                    image_client._atomic_write_state(path, state)
+                    calls = []
+                    class Api:
+                        def json(self, method, endpoint, payload=None):
+                            calls.append((method, endpoint))
+                            if method == "POST":
+                                if not transport_failure:
+                                    raise image_client.HttpFailure(503, "WORK_ARCHIVE_UNCONFIRMED")
+                                # Exercise the real client's network-error classifier without network I/O.
+                                client = image_client.ApiClient("http://127.0.0.1:1", "fixture", 1)
+                                with mock.patch.object(client.opener, "open", side_effect=TimeoutError("timed out")):
+                                    return client.json(method, endpoint, payload=payload)
+                            return {"protocol": "work-v1", "kind": "text" if chat else "image", "request_id": "original",
+                                    "work_ref": "work", "state": "completed" if archived else "active" if confirmed else "restoring",
+                                    "archive": {"status": "confirmed" if confirmed else "running", "desired": archived,
+                                                **({"archived": archived} if confirmed else {})}}
+                    command = ("chat-" if chat else "") + ("complete" if archived else "rework")
+                    args = image_client._parser().parse_args([command, "--state", str(path)])
+                    with mock.patch.object(image_client, "_lookup_task", return_value={"status": "success", "image_thread": {"protocol": "image-thread-v1", "id": "work"}}), \
+                         mock.patch.object(image_client, "_chat_receipt", return_value={"status": "succeeded"}), \
+                         mock.patch.object(image_client, "_emit") as emit:
+                        assert image_client._command_work_lifecycle(Api(), args) == (0 if confirmed else 2)
+                    saved = json.loads(path.read_text())
+                    assert saved["lifecycle"]["status"] == ("confirmed" if confirmed else "pending")
+                    assert saved["input_fingerprint"] == "immutable" and saved["phase"] == "accepted"
+                    assert saved["lifecycle"].get("transport_interrupted", False) is transport_failure
+                    assert emit.call_args.args[0]["waiting"] is not confirmed
+                    assert [method for method, _ in calls] == ["POST", "GET"]
+
+
+def test_lifecycle_timeout_does_not_accept_foreign_failed_or_opposite_intent(tmp_path):
+    for archived in (False, True):
+        for change in ({"request_id": "foreign"}, {"work_ref": "foreign"}, {"kind": "text"},
+                       {"state": "active" if archived else "completed"},
+                       {"archive": {"status": "running", "desired": not archived}},
+                       {"archive": {"status": "unknown", "desired": archived}},
+                       {"archive": {"status": "pending", "desired": archived, "error_code": "UPSTREAM_AUTH_REQUIRED"}}):
+            path = tmp_path / "original.json"
+            image_client._atomic_write_state(path, {"schema_version": 1, "client_task_id": "original",
+                "input_fingerprint": "immutable", "phase": "accepted", "input": {"image_thread_id": "work"}})
+            calls = []
+            class Api:
+                def json(self, method, endpoint, payload=None):
+                    calls.append(method)
+                    if method == "POST":
+                        client = image_client.ApiClient("http://127.0.0.1:1", "fixture", 1)
+                        with mock.patch.object(client.opener, "open", side_effect=TimeoutError("timed out")):
+                            return client.json(method, endpoint, payload=payload)
+                    return {"protocol": "work-v1", "kind": "image", "request_id": "original", "work_ref": "work",
+                            "state": "completed" if archived else "restoring", "archive": {"status": "running", "desired": archived}, **change}
+            args = image_client._parser().parse_args(["complete" if archived else "rework", "--state", str(path)])
+            with mock.patch.object(image_client, "_lookup_task", return_value={"status": "success", "image_thread": {"protocol": "image-thread-v1", "id": "work"}}), \
+                 mock.patch.object(image_client, "_emit") as emit:
+                with unittest.TestCase().assertRaises(image_client.ClientError):
+                    image_client._command_work_lifecycle(Api(), args)
+                emit.assert_not_called()
+            assert json.loads(path.read_text())["lifecycle"]["status"] == "unknown"
+            assert calls == ["POST", "GET"]
