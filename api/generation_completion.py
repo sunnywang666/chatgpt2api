@@ -49,7 +49,11 @@ def create_router(kind):
         service = get_generation_completion_service()
         try:
             with service.store.connect() as db:
-                row = service._root(db, kind, str(identity["id"]), request_id)
+                row = service._root(
+                    db, kind, str(identity["id"]), request_id,
+                    read_only_original=(allow_admin_image_original_recovery and kind == "image"
+                                        and identity.get("role") == "admin"),
+                )
             if enforce_policy and kind == "text":
                 require_chat_text_policy(identity, endpoint="/api/chat-requests", model=row.get("model"))
             elif enforce_policy:
