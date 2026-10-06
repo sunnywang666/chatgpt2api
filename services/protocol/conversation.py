@@ -451,6 +451,9 @@ def _record_result_ids(
     file_ids: list[str],
     sediment_ids: list[str],
 ) -> None:
+    consume = getattr(request, "_record_image_capacity_consumed", None)
+    if callable(consume) and (file_ids or sediment_ids):
+        consume()
     callback = getattr(request.progress_callback, "record_result_ids", None)
     if callable(callback) and (file_ids or sediment_ids):
         callback(list(dict.fromkeys(file_ids)), list(dict.fromkeys(sediment_ids)))
@@ -1552,6 +1555,14 @@ def _generate_bound_single_image(
 
     slot_acquired = bool(token) and not pool_managed
     image_result_marked = False
+    capacity_consumed = False
+
+    def record_capacity_consumed():
+        nonlocal capacity_consumed
+        if not capacity_consumed:
+            account_service.mark_image_capacity_consumed(token)
+            capacity_consumed = True
+
     account_email = ""
     backend: OpenAIBackendAPI | None = None
     outputs: list[ImageOutput] = []
@@ -1629,6 +1640,8 @@ def _generate_bound_single_image(
                             code=getattr(exc, "code", "IMAGE_THREAD_PREVIOUS_UNCONFIRMED"), upstream_submitted=False) from exc
                 request = replace(request)
                 request._defer_image_publication = True
+                if pool_managed:
+                    request._record_image_capacity_consumed = record_capacity_consumed
                 confirmed_result = None
                 if thread:
                     def poll_terminal(document, conversation_id, request_message_id, files, sediments):
@@ -1723,7 +1736,8 @@ def _generate_bound_single_image(
                     output.parent_message_id = next_parent_message_id
                     output.image_thread_terminal = bool(thread)
                 image_result_marked = True
-                account_service.mark_image_result(token, True, **({"release_slot": False} if pool_managed else {}))
+                account_service.mark_image_result(token, True, **({"release_slot": False} if pool_managed else {}),
+                    **({"capacity_consumed": True} if capacity_consumed else {}))
                 return outputs
             except Exception as exc:
                 from services.request_context import AdmissionLost
@@ -1735,7 +1749,8 @@ def _generate_bound_single_image(
                 unsent_guard_rejection = isinstance(exc, AdmissionLost) and upstream_submitted is False
                 if not image_result_marked and not unsent_guard_rejection:
                     image_result_marked = True
-                    account_service.mark_image_result(token, False, **({"release_slot": False} if pool_managed else {}))
+                    account_service.mark_image_result(token, False, **({"release_slot": False} if pool_managed else {}),
+                        **({"capacity_consumed": True} if capacity_consumed else {}))
                 conversation_id = str(getattr(exc, "conversation_id", "") or last_conversation_id)
                 parent_message_id = str(getattr(exc, "parent_message_id", "") or "")
                 request_message_id = str(getattr(backend, "image_request_message_id", "") or "")

@@ -83,6 +83,7 @@ def runtime(tmp_path, monkeypatch):
     account_stub = SimpleNamespace(get_bound_account_identity=lambda _b: "account-0",
         acquire_bound_image_access_token=lambda *a, **k: "fixture-token", get_account=lambda _t: rows[0],
         conversation_binding_lock=lambda *a: nullcontext(), mark_image_result=lambda *a, **kw: None,
+        mark_image_capacity_consumed=lambda *a: None,
         release_image_slot=lambda *a: None, get_bound_text_access_token=lambda *a, **k: "fixture-token")
     monkeypatch.setattr(conversation, "account_service", account_stub)
     import services.account_service as account_module

@@ -271,3 +271,51 @@ def test_reimport_old_export_does_not_rewind_consumption_or_reenable_late_observ
     assert saved["success"] == 1 and saved["fail"] == 0
     assert saved["capacity_used_since_observation"] is True
     assert saved["refresh_token"] == "fixture-replacement"
+
+
+@pytest.mark.parametrize("download_success", [True, False])
+@pytest.mark.parametrize("remaining", [0, 4])
+def test_download_settlement_keeps_observation_after_asset_consumption(tmp_path, download_success, remaining):
+    from services.account_service import AccountService
+    from services.storage.json_storage import JSONStorageBackend
+
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([{"access_token": "fixture", "managed_owner": "fixture-owner",
+        "source_type": "web", "status": "正常", "type": "Plus", **snapshot(5)}])
+    before = service._capacity_observation_revision(service.get_account("fixture"))
+    service.mark_image_capacity_consumed("fixture")
+    consumed = service.get_account("fixture")
+    assert consumed["capacity_used_since_observation"] is True
+    assert consumed["quota"] == 4
+    assert (consumed["success"], consumed["fail"]) == (0, 0)
+    # A metadata read that started before the asset was produced must fail CAS,
+    # even though download outcome counters have not changed yet.
+    service.update_account("fixture", snapshot(5), quiet=True, expected_capacity_observation=before)
+    assert service.get_account("fixture")["capacity_used_since_observation"] is True
+    current = service._capacity_observation_revision(service.get_account("fixture"))
+    service.update_account("fixture", {**snapshot(remaining), "status": "限流" if remaining == 0 else "正常"},
+        quiet=True, expected_capacity_observation=current)
+    fresh = service.get_account("fixture")
+    assert fresh["capacity_used_since_observation"] is False
+    # A late save/failure must neither subtract the same generation again nor
+    # invalidate the newer real observation (including a real zero).
+    service.mark_image_result("fixture", download_success, release_slot=False, capacity_consumed=True)
+    saved = AccountService(JSONStorageBackend(tmp_path / "accounts.json")).get_account("fixture")
+    assert saved["quota"] == remaining and saved["status"] == fresh["status"]
+    assert saved["capacity_used_since_observation"] is False
+    assert saved["last_used_at"] == consumed["last_used_at"]
+    assert (saved["success"], saved["fail"]) == ((1, 0) if download_success else (0, 1))
+
+
+def test_two_asset_consumptions_before_download_invalidate_interleaved_observation(tmp_path):
+    from services.account_service import AccountService
+    from services.storage.json_storage import JSONStorageBackend
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([{"access_token": "fixture", "managed_owner": "fixture-owner",
+        "source_type": "web", "status": "正常", "type": "Plus", **snapshot(5)}])
+    service.mark_image_capacity_consumed("fixture")
+    between = service._capacity_observation_revision(service.get_account("fixture"))
+    service.mark_image_capacity_consumed("fixture")
+    service.update_account("fixture", snapshot(4), quiet=True, expected_capacity_observation=between)
+    saved = service.get_account("fixture")
+    assert saved["quota"] == 3 and saved["capacity_used_since_observation"] is True

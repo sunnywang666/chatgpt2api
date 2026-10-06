@@ -785,7 +785,7 @@ class AccountService:
     def _apply_refreshed_tokens(
         self, old_access_token: str, token_data: dict, event: str, *,
         expected_revision: str | None = None, chat_info: dict | None = None,
-        expected_capacity_observation: tuple[int, int, str] | None = None,
+        expected_capacity_observation: tuple[int, int, str, str] | None = None,
         capacity_observed_at: str | None = None,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
@@ -3235,20 +3235,20 @@ class AccountService:
         return {"removed": removed, "items": items}
 
     @staticmethod
-    def _capacity_observation_revision(account: dict) -> tuple[int, int, str]:
+    def _capacity_observation_revision(account: dict) -> tuple[int, int, str, str]:
         # Reuse the persisted consumption counters and last observation rather
         # than letting a slow response certify capacity from before a result.
         return (int(account.get("success") or 0), int(account.get("fail") or 0),
-                str(account.get("capacity_observed_at") or ""))
+                str(account.get("capacity_observed_at") or ""), str(account.get("last_used_at") or ""))
 
     @classmethod
     def _capacity_observation_can_apply(
-        cls, current: dict, expected: tuple[int, int, str] | None, observed_at: str | None,
+        cls, current: dict, expected: tuple[int, int, str, str] | None, observed_at: str | None,
     ) -> bool:
         if expected is None:
             return True
         actual = cls._capacity_observation_revision(current)
-        if expected[:2] != actual[:2]:
+        if expected[:2] != actual[:2] or expected[3:] != actual[3:]:
             return False
         if expected[2] == actual[2]:
             return True
@@ -3267,7 +3267,7 @@ class AccountService:
         *,
         expected_credentials: tuple[str, str] | None = None,
         expected_codex_credentials: tuple[str, str] | None = None,
-        expected_capacity_observation: tuple[int, int, str] | None = None,
+        expected_capacity_observation: tuple[int, int, str, str] | None = None,
     ) -> dict | None:
         if not access_token:
             return None
@@ -3351,7 +3351,35 @@ class AccountService:
                 return False
         return True
 
-    def mark_image_result(self, access_token: str, success: bool, *, release_slot: bool = True) -> dict | None:
+    def mark_image_capacity_consumed(self, access_token: str) -> None:
+        """Invalidate quota before persisted result IDs release generation capacity.
+
+        The later download outcome only updates success/failure counters. Reuse
+        last_used_at in metadata CAS so an observation begun before these
+        assets cannot clear this invalidation while the download is in flight.
+        """
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                raise RuntimeError("selected image account disappeared")
+            next_item = dict(current)
+            next_item["capacity_used_since_observation"] = True
+            next_item["last_used_at"] = datetime.now().isoformat(sep=" ", timespec="microseconds")
+            next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
+            if next_item["quota"] == 0:
+                next_item["status"] = "限流"
+                next_item["restore_at"] = next_item.get("restore_at") or None
+            elif next_item.get("status") == "限流":
+                next_item["status"] = "正常"
+            account = self._normalize_account(next_item)
+            if account is None:
+                raise RuntimeError("selected image account is invalid")
+            self._accounts[access_token] = account
+            self._save_accounts()
+
+    def mark_image_result(self, access_token: str, success: bool, *, release_slot: bool = True,
+                          capacity_consumed: bool = False) -> dict | None:
         if not access_token:
             return None
         if release_slot:
@@ -3362,16 +3390,18 @@ class AccountService:
             if current is None:
                 return None
             next_item = dict(current)
-            next_item["capacity_used_since_observation"] = True
-            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if not capacity_consumed:
+                next_item["capacity_used_since_observation"] = True
+                next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
-                next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
-                if next_item["quota"] == 0:
-                    next_item["status"] = "限流"
-                    next_item["restore_at"] = next_item.get("restore_at") or None
-                elif next_item.get("status") == "限流":
-                    next_item["status"] = "正常"
+                if not capacity_consumed:
+                    next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
+                    if next_item["quota"] == 0:
+                        next_item["status"] = "限流"
+                        next_item["restore_at"] = next_item.get("restore_at") or None
+                    elif next_item.get("status") == "限流":
+                        next_item["status"] = "正常"
             else:
                 next_item["fail"] = int(next_item.get("fail") or 0) + 1
             account = self._normalize_account(next_item)

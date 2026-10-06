@@ -745,6 +745,49 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertEqual(raised.exception.conversation_id, "conversation-1")
         self.assertIn("timed out", str(raised.exception))
 
+    def test_asset_consumption_precedes_capacity_release_and_is_not_repeated_on_download(self):
+        from services.request_context import executing
+        from services.protocol.conversation import _record_result_ids
+        for download_fails in (False, True):
+            with self.subTest(download_fails=download_fails):
+                events = []
+                request = ConversationRequest(model="gpt-image-2", prompt="mug",
+                    provider_binding_id="binding-1", provider_account_identity="account-1",
+                    client_conversation_id="client-1", retain_conversation=True,
+                    progress_callback=lambda *_args: None)
+                request.progress_callback.record_result_ids = lambda *_args: events.append("release_generation")
+                backend = mock.Mock(image_submission_started=True, image_request_message_id="message-1")
+                backend.get_conversation_parent_message_id.return_value = "answer-1"
+                def stream(_backend, forwarded, *_args):
+                    _record_result_ids(forwarded, ["file-1"], [])
+                    _record_result_ids(forwarded, ["file-1"], [])
+                    events.append("download")
+                    if download_fails:
+                        raise RuntimeError("download failed after generated asset")
+                    yield ImageOutput(kind="result", model="gpt-image-2", index=1, total=1,
+                        data=[{"b64_json": "image"}], conversation_id="chat-1")
+                with (
+                    executing(mock.Mock()),
+                    mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.protocol.conversation.account_service.acquire_bound_image_access_token", return_value="token"),
+                    mock.patch("services.protocol.conversation.account_service.get_account", return_value={}),
+                    mock.patch("services.protocol.conversation.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.protocol.conversation.account_service.mark_image_capacity_consumed", side_effect=lambda *_: events.append("consume")) as consumed,
+                    mock.patch("services.protocol.conversation.account_service.mark_image_result") as mark,
+                    mock.patch("services.protocol.conversation.account_service.release_image_slot") as release,
+                    mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend),
+                    mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream),
+                ):
+                    if download_fails:
+                        with self.assertRaises(ImageGenerationError):
+                            _generate_bound_single_image(request, 1, 1)
+                    else:
+                        _generate_bound_single_image(request, 1, 1)
+                    self.assertEqual(events, ["consume", "release_generation", "release_generation", "download"])
+                    consumed.assert_called_once_with("token")
+                    mark.assert_called_once_with("token", not download_fails, release_slot=False, capacity_consumed=True)
+                    release.assert_not_called()
+
     def test_admitted_bound_image_never_releases_another_legacy_slot(self):
         from services.request_context import executing
         for outcome in ("success", "stream_error", "setup_error"):
