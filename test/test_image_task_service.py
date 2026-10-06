@@ -1647,14 +1647,14 @@ class ImageTaskServiceTests(unittest.TestCase):
     def test_complete_final_recovery_reuses_proof_but_tool_leaf_keeps_publication_check(self):
         from copy import deepcopy
         from services.config import config
-        for case in ("complete", "new_second_image", "partial_download", "final_external_successor", "download_failure", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed", "settle_failure"):
+        for case in ("complete", "new_second_image", "partial_download", "final_external_successor", "download_failure", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed", "settle_failure", "settle_failure_with_asset"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp_dir:
                 path = Path(tmp_dir) / "tasks.json"
                 write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", error="",
                     upstream_unfinished=True, _image_thread={"protocol": "image-thread-v1"},
                     _image_thread_request_parent="anchor",
                     **({"_pending_image_result_ids": {"file_ids": ["missing" if case == "pending_missing" else "original-image"], "sediment_ids": []}}
-                       if case in ("pending_missing", "new_second_image", "settle_failure") else {}))
+                       if case in ("pending_missing", "new_second_image", "settle_failure", "settle_failure_with_asset") else {}))
                 service = self.make_service(path)
                 service._update_task("owner-1:policy-task", _image_thread={"id": "original-thread"},
                                      _image_thread_request_parent="anchor")
@@ -1668,7 +1668,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                     "final": {"parent": "image", "message": {"id": "final", "author": {"role": "assistant"},
                         "status": "finished_successfully", "end_turn": True}}}}
                 if case == "parent_changed": document["mapping"]["original-request"]["parent"] = "other"
-                if case in ("running", "settle_failure"): document["mapping"]["final"]["message"]["status"] = "in_progress"
+                if case in ("running", "settle_failure", "settle_failure_with_asset"): document["mapping"]["final"]["message"]["status"] = "in_progress"
                 if case == "post_download_changed":
                     # A finished tool leaf is weaker than a complete assistant
                     # final: keep the original late-drift rejection regression.
@@ -1695,13 +1695,19 @@ class ImageTaskServiceTests(unittest.TestCase):
                         result = deepcopy(document)
                         if case == "post_download_changed" and calls["read"] > 1:
                             result["mapping"]["original-request"]["parent"] = "other"
-                        if case == "settle_failure" and calls["read"] > 1:
+                        if case in ("settle_failure", "settle_failure_with_asset") and calls["read"] > 1:
                             result["mapping"]["final"]["message"].update(status="finished_successfully",
                                 content={"content_type": "text", "parts": ["Something went wrong while generating your image."]})
+                            if case == "settle_failure":
+                                result["mapping"]["image"]["message"]["content"] = {}
                         return result
                     def _poll_image_results(self, cid, timeout, **kwargs):
                         calls["poll"] += 1
-                        self_test.assertEqual(kwargs["initial_document"], document)
+                        expected_document = deepcopy(document)
+                        if case == "settle_failure_with_asset":
+                            expected_document["mapping"]["final"]["message"].update(status="finished_successfully",
+                                content={"content_type": "text", "parts": ["Something went wrong while generating your image."]})
+                        self_test.assertEqual(kwargs["initial_document"], expected_document)
                         raise ImagePollTimeoutError("not confirmed", cid)
                     def resolve_conversation_image_urls(self, cid, files, sediments, **kwargs):
                         self_test.assertEqual((cid, files, sediments), ("conversation-1", expected_files, []))
@@ -1750,8 +1756,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                     observe.assert_called_once_with()
                     sleep.assert_not_called()
                 else:
-                    self.assertEqual(calls, {"read": 2 if case in ("pending_missing", "settle_failure") else 1, "poll": 0 if case in ("read_429", "settle_failure") else 1, "download": 0})
-                    if case in ("pending_missing", "settle_failure"): sleep.assert_called_once_with(30)
+                    self.assertEqual(calls, {"read": 2 if case in ("pending_missing", "settle_failure", "settle_failure_with_asset") else 1, "poll": 0 if case in ("read_429", "settle_failure") else 1, "download": 0})
+                    if case in ("pending_missing", "settle_failure", "settle_failure_with_asset"): sleep.assert_called_once_with(30)
                     else: sleep.assert_not_called()
                     observe.assert_not_called()
                 if case in ("complete", "new_second_image", "partial_download", "final_external_successor"):
@@ -1765,6 +1771,12 @@ class ImageTaskServiceTests(unittest.TestCase):
                     publish.assert_not_called()
                     self.assertFalse(row.get("data"))
                     if case == "post_download_changed": self.assertTrue(row["_pending_image_output"])
+                    if case == "settle_failure":
+                        self.assertEqual(row["error_code"], "NO_IMAGE_GENERATED")
+                        self.assertEqual(row["upstream_outcome"], "failed")
+                    if case == "settle_failure_with_asset":
+                        self.assertEqual(row["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+                        self.assertEqual(row["_pending_image_result_ids"]["file_ids"], ["original-image"])
 
     def test_downloaded_original_is_private_and_reused_after_confirmation_failure(self):
         from services.request_context import executing
@@ -3127,6 +3139,10 @@ class ImageTaskServiceTests(unittest.TestCase):
             _authoritative_image_failure(document, "request-1"),
             "Something went wrong while generating your image. Sorry about that.",
         )
+        document["mapping"]["assistant-1"]["message"]["metadata"] = {
+            "asset_pointer": "file-service://file-generated-before-failure"}
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+        del document["mapping"]["assistant-1"]["message"]["metadata"]
         document["mapping"]["assistant-1"]["message"]["status"] = "in_progress"
         self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
 
@@ -3322,6 +3338,83 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertEqual(raised.exception.request_message_id, "request-message-1")
         self.assertEqual(raised.exception.conversation_id, "conversation-1")
 
+    def test_terminal_image_error_persists_outcome_but_preserves_captured_result(self):
+        from services.generation_completion import unresolved
+        for code, outcome in (("content_policy_violation", "rejected"), ("NO_IMAGE_GENERATED", "failed")):
+            for captured in (False, True):
+                with self.subTest(code=code, captured=captured), tempfile.TemporaryDirectory() as tmp_dir:
+                    def reject(payload):
+                        callback = payload["progress_callback"]
+                        callback.record_submission_started()
+                        if captured:
+                            callback.record_result_ids(["file-original"], [])
+                        raise ImageGenerationError("explicit terminal image rejection", code=code,
+                            provider_binding_id="cb_account_a", provider_account_identity="account_opaque_a",
+                            conversation_id="conversation-1", parent_message_id="assistant-1",
+                            request_message_id="request-1", upstream_submitted=True)
+                    service = self.make_service(Path(tmp_dir) / "images.json", reject)
+                    service.submit_generation(OWNER, client_task_id="terminal", prompt="cat",
+                        model="gpt-image-2", size=None, provider_binding_id="cb_account_a",
+                        provider_account_identity="account_opaque_a", client_conversation_id="client-1",
+                        retain_conversation=True)
+                    wait_for_task(service, OWNER, "terminal", "error")
+                    with service.store.connect() as db:
+                        receipt = service.store.read_receipt(db, "image", OWNER["id"], "terminal")
+                    self.assertEqual(receipt["upstream_outcome"], "generated" if captured else outcome)
+                    self.assertEqual(receipt["error_code"], "CONVERSATION_OUTCOME_UNKNOWN" if captured else code)
+                    self.assertEqual(unresolved(receipt), captured)
+                    self.assertEqual(receipt["conversation_id"], "conversation-1")
+                    self.assertEqual(receipt["request_message_id"], "request-1")
+                    if captured:
+                        self.assertEqual(receipt["result_file_ids"], ["file-original"])
+                    else:
+                        self.assertEqual(receipt["next_poll_at"], 0)
+
+    def test_original_policy_read_clears_unknown_without_generation(self):
+        from services.generation_completion import unresolved
+        document = {"current_node": "refusal", "mapping": {
+            "original-request": {"message": {"author": {"role": "user"}}},
+            "refusal": {"parent": "original-request", "message": {
+                "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True,
+                "content": {"content_type": "text", "parts": ["This request violates our content policy."]},
+            }},
+        }}
+        class Backend(OpenAIBackendAPI):
+            def __init__(self, **kwargs):
+                pass
+            def _get_conversation(self, _conversation_id):
+                return document
+            def _poll_image_results(self, cid, *args, **kwargs):
+                message = OpenAIBackendAPI._find_content_policy_error_in_conversation(
+                    kwargs["initial_document"], kwargs["request_message_id"])
+                if not message:
+                    raise AssertionError("missing original terminal proof")
+                raise ImageContentPolicyError(message, cid)
+            def close(self):
+                pass
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "images.json"
+            write_policy_task(path, upstream_outcome="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                              recovery_no_result_reads=100)
+            handler = mock.Mock(side_effect=AssertionError("must not generate again"))
+            service = self.make_service(path, handler)
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="bound-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", Backend),
+            ):
+                service._run_resume_poll("owner-1:policy-task", "conversation-1", 30,
+                    "http://content-provider", OWNER, "generate", "gpt-image-2", False, False)
+            with service.store.connect() as db:
+                receipt = service.store.read_receipt(db, "image", OWNER["id"], "policy-task")
+            self.assertEqual(receipt["error_code"], "content_policy_violation", receipt)
+            self.assertEqual(receipt["upstream_outcome"], "rejected")
+            self.assertFalse(unresolved(receipt))
+            self.assertEqual(receipt["next_poll_at"], 0)
+            self.assertEqual(receipt["request_message_id"], "original-request")
+            handler.assert_not_called()
+
     def test_bound_image_slot_is_settled_once_when_a_waiter_acquires_after_release(self):
         class Backend:
             image_request_message_id = "request-message-1"
@@ -3511,6 +3604,9 @@ class ImageTaskServiceTests(unittest.TestCase):
                     task = service.list_tasks(OWNER, ["terminal-no-image-task"])["items"][0]
 
             self.assertEqual(task["error_code"], "NO_IMAGE_GENERATED", task)
+            self.assertEqual(task["upstream_outcome"], "failed")
+            from services.generation_completion import unresolved
+            self.assertFalse(unresolved(task))
             with service.store.connect() as db:
                 receipt = service.store.read_receipt(db, "image", str(OWNER["id"]), "terminal-no-image-task")
             self.assertEqual(receipt["_retry_cursor"]["source"], "terminal_image_failure")

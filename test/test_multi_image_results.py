@@ -678,6 +678,41 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertTrue(_is_content_policy_error("This request violates our content policy."))
         self.assertTrue(_is_content_policy_error("I can't generate that because it violates our content policy."))
 
+    def test_task_list_error_cannot_turn_poll_timeout_into_terminal_rejection(self) -> None:
+        for detail in ("temporary service failure", "This request violates our content policy."):
+            with self.subTest(detail=detail):
+                backend = FakeBackend()
+                failure = ImagePollTimeoutError("original branch still unconfirmed", "conv-1")
+                failure.task_error = detail
+                backend._poll_image_results = mock.Mock(side_effect=failure)
+                with self.assertRaises(ImagePollTimeoutError) as raised:
+                    backend.resolve_conversation_image_urls("conv-1", [], [], request_message_id="request")
+                self.assertIs(raised.exception, failure)
+
+    def test_policy_rejection_requires_finished_original_branch_without_assets(self) -> None:
+        import copy
+        document = {"current_node": "refusal", "mapping": {
+            "request": {"message": {"author": {"role": "user"}}},
+            "refusal": {"parent": "request", "message": {
+                "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True,
+                "content": {"content_type": "text", "parts": ["This request violates our content policy."]},
+            }},
+        }}
+        find = OpenAIBackendAPI._find_content_policy_error_in_conversation
+        self.assertEqual(find(document, "request"), "This request violates our content policy.")
+        for change in ({"status": "in_progress"}, {"end_turn": False}, {"author": {"role": "tool"}}):
+            altered = copy.deepcopy(document)
+            altered["mapping"]["refusal"]["message"].update(change)
+            self.assertEqual(find(altered, "request"), "")
+        altered = copy.deepcopy(document)
+        altered["mapping"]["refusal"]["message"]["content"]["parts"].append(
+            {"content_type": "image_asset_pointer", "asset_pointer": "file-service://file-result"})
+        self.assertEqual(find(altered, "request"), "")
+        altered = copy.deepcopy(document)
+        altered["mapping"]["later-user"] = {"parent": "refusal", "message": {"author": {"role": "user"}}}
+        altered["current_node"] = "later-user"
+        self.assertEqual(find(altered, "request"), "")
+
     def test_text_only_image_message_is_not_reclassified_as_policy(self) -> None:
         ordinary = _message_output_error(ImageOutput(
             kind="message", model="gpt-image-2", index=1, total=1,
@@ -983,6 +1018,7 @@ class MultiImageResultTests(unittest.TestCase):
                     "parent": "request",
                     "message": {
                         "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True,
                         "content": {"parts": ["This request violates our content policy."]},
                     },
                 },

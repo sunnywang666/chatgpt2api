@@ -497,7 +497,16 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
         "something went wrong while generating your image. sorry about that.",
         "something went wrong while generating your image.",
     }
-    return text if normalized in explicit_failures else ""
+    if normalized not in explicit_failures:
+        return ""
+    from services.openai_backend_api import OpenAIBackendAPI
+    for message_id in path[request_index + 1:]:
+        message = (mapping[message_id].get("message") or {})
+        if OpenAIBackendAPI._has_image_asset_pointer({
+            "content": message.get("content"), "metadata": message.get("metadata"),
+        }):
+            return ""
+    return text
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -1451,7 +1460,7 @@ class ImageTaskService:
             )
             # Only explicit terminal rejections prove there is no generation
             # left upstream. An unclassified transport exception does not.
-            terminal = error_code.lower() in {
+            terminal = not result_captured and error_code.lower() in {
                 "no_image_generated", "content_policy_violation",
                 "conversation_binding_contract_invalid",
             }
@@ -1488,6 +1497,13 @@ class ImageTaskService:
                                       "recovery_error_code": "",
                                       "recovery_phase": "",
                                       "recovery_retry_after_seconds": None,
+                                      **({
+                                          "upstream_outcome": (
+                                              "rejected" if error_code.lower() == "content_policy_violation" else "failed"
+                                          ),
+                                          "next_poll_at": 0,
+                                      } if terminal and not known_not_submitted
+                                         and error_code.lower() in {"content_policy_violation", "no_image_generated"} else {}),
                                   }
                               ),
                               **(
@@ -2762,10 +2778,10 @@ class ImageTaskService:
                         qualified_read_recorded = True
             if isinstance(exc, ImageContentPolicyError):
                 error_code = "content_policy_violation"
-            terminal = error_code in {"NO_IMAGE_GENERATED", "content_policy_violation"}
+            terminal = not result_captured and error_code in {"NO_IMAGE_GENERATED", "content_policy_violation"}
             # A captured image is a download obligation, even if earlier reads
             # exhausted the no-result budget. Keep its retry/cooldown evidence.
-            unrecoverable = qualified_reads >= UNRECOVERABLE_QUALIFIED_READS and not result_captured
+            unrecoverable = qualified_reads >= UNRECOVERABLE_QUALIFIED_READS and not result_captured and not terminal
             recovery_phase = (
                 "download_image_result" if result_captured else "read_image_request"
             )
@@ -2810,11 +2826,13 @@ class ImageTaskService:
                     retry_after
                     if final_error_code == "CONVERSATION_OUTCOME_UNKNOWN" else None
                 ),
-                **({"upstream_outcome": "unknown", "recovery_retryable": True}
-                   if unrecoverable else {}),
+                upstream_outcome=("generated" if result_captured else
+                                  "rejected" if terminal and error_code == "content_policy_violation" else
+                                  "failed" if terminal else "unknown"),
+                **({"recovery_retryable": True} if unrecoverable else {}),
                 next_poll_at=(
                     0
-                    if unrecoverable
+                    if unrecoverable or terminal
                     else time.time() + (
                         retry_after
                         if retry_after is not None

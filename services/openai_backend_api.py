@@ -2534,6 +2534,21 @@ class OpenAIBackendAPI:
         branch_ids = OpenAIBackendAPI._current_message_branch_ids(data, request_message_id)
         if not branch_ids:
             return ""
+        current_node = str(data.get("current_node") or "")
+        current = (mapping.get(current_node) or {}).get("message") or {}
+        if (current_node not in branch_ids
+                or (current.get("author") or {}).get("role") != "assistant"
+                or current.get("status") != "finished_successfully"
+                or current.get("end_turn") is not True):
+            return ""
+        # A partial refusal or an unrelated task error cannot close this
+        # generation. Nor can policy text erase an already observed asset.
+        for message_id in branch_ids - {request_message_id}:
+            message = (mapping.get(message_id) or {}).get("message") or {}
+            output = {"content": message.get("content"), "metadata": message.get("metadata")}
+            files, sediments = OpenAIBackendAPI._extract_image_reference_ids(output)
+            if files or sediments or OpenAIBackendAPI._has_image_asset_pointer(output):
+                return ""
         for message_id in branch_ids:
             node = mapping.get(message_id)
             message = (node or {}).get("message") or {}
@@ -3121,12 +3136,10 @@ class OpenAIBackendAPI:
                     request_message_id=request_message_id,
                 )
             except ImagePollTimeoutError as exc:
-                # 如果轮询超时且有 task error（如 moderation 拦截），抛出 ImageContentPolicyError
-                # 而非 ImagePollTimeoutError，让调用方能区分真正的超时和上游拒绝
-                task_error = getattr(exc, "task_error", "")
+                # Task-list errors are diagnostic hints, not proof that this
+                # submitted branch ended. Only the original conversation (or
+                # explicit stream moderation) can prove a policy rejection.
                 if not file_ids and not sediment_ids:
-                    if task_error:
-                        raise ImageContentPolicyError(task_error, conversation_id or "") from exc
                     raise
                 logger.warning({
                     "event": "image_resolve_poll_partial_timeout",
