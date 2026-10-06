@@ -459,6 +459,11 @@ _KNOWN_IMAGE_GENERATION_ERROR = (
     "a new request is given."
 )
 
+_KNOWN_LOCALIZED_NO_IMAGE_GENERATED = (
+    "无法生成图片：图片生成过程中发生了错误，因此这次未能完成生成。"
+    "请重新发起一次新的图片生成请求后，我可以继续处理。"
+)
+
 
 def _normalized_text(parts: object) -> str:
     text = "\n".join(part for part in parts if isinstance(part, str)).strip() if isinstance(parts, list) else ""
@@ -569,6 +574,12 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
                 return ""
         elif len(following) != 1 or following[0] != request_path[index + 1]:
             return ""
+    # This exact localized receipt was observed after an unambiguous original
+    # request branch that ended without a generation tool node or image asset.
+    # Keep this an exact sentence match: generic localized error text remains
+    # unknown unless the provider supplies the known tool error receipt below.
+    if text == _KNOWN_LOCALIZED_NO_IMAGE_GENERATED:
+        return text
     parent = mapping.get(_clean(node.get("parent"))) if isinstance(node, dict) else None
     tool_message = parent.get("message") if isinstance(parent, dict) else None
     tool_author = tool_message.get("author") if isinstance(tool_message, dict) else None

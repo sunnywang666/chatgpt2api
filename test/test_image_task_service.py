@@ -3062,6 +3062,49 @@ class ImageTaskServiceTests(unittest.TestCase):
                 },
             }
 
+        def localized_no_image_generated_document():
+            # Provider receipt for product 341981723: original user request,
+            # code node, reasoning recap, then this exact terminal assistant text.
+            return {
+                "current_node": "terminal-1",
+                "mapping": {
+                    "request-1": {
+                        "parent": "prior-turn",
+                        "message": {"id": "request-1", "author": {"role": "user"}},
+                    },
+                    "worker-1": {
+                        "parent": "request-1",
+                        "message": {
+                            "id": "worker-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": False,
+                            "content": {"content_type": "code", "parts": []},
+                        },
+                    },
+                    "recap-1": {
+                        "parent": "worker-1",
+                        "message": {
+                            "id": "recap-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": False,
+                            "content": {"content_type": "reasoning_recap", "parts": []},
+                        },
+                    },
+                    "terminal-1": {
+                        "parent": "recap-1",
+                        "message": {
+                            "id": "terminal-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": True,
+                            "content": {
+                                "content_type": "text",
+                                "parts": [
+                                    "无法生成图片：图片生成过程中发生了错误，因此这次未能完成生成。"
+                                    "请重新发起一次新的图片生成请求后，我可以继续处理。"
+                                ],
+                            },
+                        },
+                    },
+                },
+            }
+
         document = known_generation_error_document()
         self.assertEqual(_authoritative_image_failure(document, "request-1"), "由于我这边发生了错误，我未能生成图片。")
 
@@ -3097,6 +3140,39 @@ class ImageTaskServiceTests(unittest.TestCase):
         document["mapping"]["worker-1"]["message"]["content"] = {
             "content_type": "image_asset_pointer", "asset_pointer": "file-service://generated-image",
         }
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        localized_terminal = (
+            "无法生成图片：图片生成过程中发生了错误，因此这次未能完成生成。"
+            "请重新发起一次新的图片生成请求后，我可以继续处理。"
+        )
+        document = localized_no_image_generated_document()
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), localized_terminal)
+
+        document = localized_no_image_generated_document()
+        document["mapping"]["terminal-1"]["message"]["status"] = "in_progress"
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document = localized_no_image_generated_document()
+        document["mapping"]["sibling"] = {
+            "parent": "request-1", "message": {"id": "sibling", "author": {"role": "assistant"}},
+        }
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document = localized_no_image_generated_document()
+        document["mapping"]["later-user"] = {
+            "parent": "terminal-1", "message": {"id": "later-user", "author": {"role": "user"}},
+        }
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document = localized_no_image_generated_document()
+        document["mapping"]["worker-1"]["message"]["content"] = {
+            "content_type": "image_asset_pointer", "asset_pointer": "file-service://generated-image",
+        }
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+
+        document = localized_no_image_generated_document()
+        document["mapping"]["terminal-1"]["message"]["content"]["parts"] = ["无法生成图片：图片生成过程中发生了错误。"]
         self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
 
     def test_legacy_resume_without_submitted_message_boundary_is_non_rotating_unknown(self):
@@ -3451,9 +3527,51 @@ class ImageTaskServiceTests(unittest.TestCase):
                 },
             }
 
+        def localized_no_image_generated_document():
+            return {
+                "current_node": "terminal-1",
+                "mapping": {
+                    "request-1": {
+                        "parent": "prior-turn",
+                        "message": {"id": "request-1", "author": {"role": "user"}},
+                    },
+                    "worker-1": {
+                        "parent": "request-1",
+                        "message": {
+                            "id": "worker-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": False,
+                            "content": {"content_type": "code", "parts": []},
+                        },
+                    },
+                    "recap-1": {
+                        "parent": "worker-1",
+                        "message": {
+                            "id": "recap-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": False,
+                            "content": {"content_type": "reasoning_recap", "parts": []},
+                        },
+                    },
+                    "terminal-1": {
+                        "parent": "recap-1",
+                        "message": {
+                            "id": "terminal-1", "author": {"role": "assistant"},
+                            "status": "finished_successfully", "end_turn": True,
+                            "content": {
+                                "content_type": "text",
+                                "parts": [
+                                    "无法生成图片：图片生成过程中发生了错误，因此这次未能完成生成。"
+                                    "请重新发起一次新的图片生成请求后，我可以继续处理。"
+                                ],
+                            },
+                        },
+                    },
+                },
+            }
+
         for name, document, refresh_old_unrecoverable in (
             ("english", english_failure_document(), False),
             ("known_tool", known_generation_error_document(), True),
+            ("localized_no_tool", localized_no_image_generated_document(), True),
         ):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp_dir:
                 error = RuntimeError("ChatGPT 生图超时")
