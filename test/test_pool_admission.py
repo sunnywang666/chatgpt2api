@@ -96,6 +96,24 @@ class AdmissionTests(unittest.TestCase):
         return self.images.submit_generation({"id": owner, "role": "user", "external_image_client": True},
                                              client_task_id=name, prompt="private image input", model="gpt-image-2", size=None)
 
+    def test_healthy_image_scan_does_not_delay_first_needed_refresh(self):
+        self.image("capacity-refresh")
+        with patch.object(self.accounts, "refresh_image_capability", side_effect=RuntimeError("fixture read failure")) as refresh:
+            self.admission._refresh_waiting_image_capabilities()
+            refresh.assert_not_called()
+            self.clock.now += 1
+            self.rows[0]["capacity_used_since_observation"] = True
+            (self.root / "accounts.json").write_text(json.dumps(self.rows))
+            self.admission._refresh_waiting_image_capabilities()
+            self.assertEqual(refresh.call_count, 1)
+            # Real reads, including failed ones, retain the existing cooldown.
+            self.clock.now += 29
+            self.admission._refresh_waiting_image_capabilities()
+            self.assertEqual(refresh.call_count, 1)
+            self.clock.now += 1
+            self.admission._refresh_waiting_image_capabilities()
+            self.assertEqual(refresh.call_count, 2)
+
     def test_inactive_text_work_does_not_refresh_catalog_and_resume_keeps_id(self):
         self.submit("paused-catalog")
         with self.store.transaction() as db:

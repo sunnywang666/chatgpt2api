@@ -1140,7 +1140,6 @@ class PoolAdmission:
                        and r.get("status") == "queued" and not r.get("_submission_started")]
         if not waiting:
             return
-        self._next_image_probe = float(self.clock()) + 30
         from services.owned_accounts import observed_capacity
         from utils.helper import is_codex_image_model
         with self._account_guard():
@@ -1162,6 +1161,11 @@ class PoolAdmission:
                     and capacity["remaining"] is not None and capacity["remaining"] > 0
                     and account.get("status") not in {"异常", "限流"}):
                 continue
+            if probes == 0:
+                # A healthy/unmatched scan made no upstream request. It must
+                # not delay the first real refresh after image consumption.
+                # Actual refreshes (including failures) retain the cooldown.
+                self._next_image_probe = float(self.clock()) + 30
             try:
                 refresh(self.accounts.pool_account_ref(account))
             except Exception:
