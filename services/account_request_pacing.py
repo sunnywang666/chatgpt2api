@@ -289,6 +289,8 @@ class AccountRequestClock:
         self.state_path = state_path
         self.lock = ProcessMutex(state_path.with_suffix(".lock") if state_path else None, self._load)
         self.turn_lock = ProcessMutex(state_path.with_suffix(".turn.lock") if state_path else None)
+        self.read_slots = {}
+        self.read_capacity_changed = threading.Event()
         self.next_request = 0.0
         self.next_turn = 0.0
         self.next_conversation_read = 0.0
@@ -306,6 +308,54 @@ class AccountRequestClock:
         self.last_rate_limit_evidence = None
         self.last_turn_started = None
         self._load()
+
+    def _try_read_slot(self):
+        """Called under the send clock. Kernel locks release capacity on crash.
+
+        Count all occupied slots, including those admitted before a limit was
+        lowered or enabled. Existing I/O drains; new admissions obey the limit.
+        Idle lock files are reused and never unlinked while another process
+        may have the same inode open.
+        """
+        limit = config.account_conversation_read_max_inflight
+        indices = set(self.read_slots)
+        if self.state_path is not None:
+            prefix = self.state_path.stem + ".read-"
+            for path in self.state_path.parent.glob(prefix + "*.lock"):
+                suffix = path.name[len(prefix):-len(".lock")]
+                if suffix.isdigit():
+                    indices.add(int(suffix))
+        candidate, busy = None, 0
+        try:
+            for index in sorted(indices):
+                slot = self.read_slots.get(index)
+                if slot is None:
+                    slot = ProcessMutex(self.state_path.with_suffix(f".read-{index}.lock")
+                                        if self.state_path else None)
+                    self.read_slots[index] = slot
+                if not slot.acquire(blocking=False):
+                    busy += 1
+                elif candidate is None:
+                    candidate = slot
+                else:
+                    slot.release()
+            if limit and busy >= limit:
+                if candidate is not None:
+                    candidate.release()
+                return None
+            if candidate is None:
+                index = max(indices, default=-1) + 1
+                slot = ProcessMutex(self.state_path.with_suffix(f".read-{index}.lock")
+                                    if self.state_path else None)
+                self.read_slots[index] = slot
+                if not slot.acquire(blocking=False):
+                    return None
+                candidate = slot
+            return candidate
+        except BaseException:
+            if candidate is not None:
+                candidate.release()
+            raise
 
     def _load(self):
         if self.state_path is None or not self.state_path.exists():
@@ -557,6 +607,17 @@ class AccountRequestClock:
         read_wait_seconds = {}
         read_http_attempts = 0
         read_queue_position_max = 0
+        read_slot = None
+        read_slot_transferred = False
+        read_slot_release_lock = threading.Lock()
+
+        def release_read_slot():
+            nonlocal read_slot
+            with read_slot_release_lock:
+                slot, read_slot = read_slot, None
+            if slot is not None:
+                slot.release()
+                self.read_capacity_changed.set()
 
         def measure_preparation(part, callback, *args):
             if not is_turn:
@@ -583,7 +644,12 @@ class AccountRequestClock:
                 # clock and leaving the caller to retry the same original read.
                 raise AccountReadRetryBudgetInsufficient("original read connection budget unavailable")
             started_wait = time.monotonic()
-            time.sleep(delay)
+            if reason == "read_concurrency":
+                # Same-process completion wakes immediately. A bounded recheck
+                # also observes a different process releasing its kernel lock.
+                self.read_capacity_changed.wait(delay)
+            else:
+                time.sleep(delay)
             elapsed = max(0.0, time.monotonic() - started_wait)
             if is_conversation_read:
                 read_wait_seconds[reason] = read_wait_seconds.get(reason, 0.0) + elapsed
@@ -888,6 +954,11 @@ class AccountRequestClock:
                             read_queue_position_max = max(read_queue_position_max,
                                 next((i + 1 for i, entry in enumerate(self.ordinary_read_queue)
                                       if entry["owner"] == ordinary_owner), 0))
+                            if read_delay <= 0:
+                                self.read_capacity_changed.clear()
+                                read_slot = self._try_read_slot()
+                                if read_slot is None:
+                                    read_delay, wait_reason = 0.1, "read_concurrency"
                     except BaseException:
                         self.lock.release()
                         raise
@@ -1132,6 +1203,28 @@ class AccountRequestClock:
                 response.iter_lines = paced_lines
             else:
                 release_turn()
+            if is_conversation_read and kwargs.get("stream"):
+                # The ordinary path buffers the entire GET. If a caller opts
+                # into streaming, headers alone do not free transport capacity.
+                close_read = response.close
+                def close_read_response():
+                    try:
+                        return close_read()
+                    finally:
+                        release_read_slot()
+                def finish_read_iterator(iterator):
+                    def consume(*args, **options):
+                        try:
+                            yield from iterator(*args, **options)
+                        finally:
+                            close_read_response()
+                    return consume
+                response.close = close_read_response
+                for name in ("iter_lines", "iter_content"):
+                    iterator = getattr(response, name, None)
+                    if callable(iterator):
+                        setattr(response, name, finish_read_iterator(iterator))
+                read_slot_transferred = True
             return response
         except BaseException:
             # A persistence/reconciliation failure after headers must reap the
@@ -1146,6 +1239,8 @@ class AccountRequestClock:
             release_turn()
             raise
         finally:
+            if not read_slot_transferred:
+                release_read_slot()
             if is_conversation_read:
                 logger.info({"event": "account_read_wait_finished", "account": self.account_key,
                     "request_ref": request_ref, "work_ref": archive_observation.get("work_ref"),

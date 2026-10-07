@@ -114,6 +114,12 @@ def _read_burst_value(raw: object) -> int:
     return raw
 
 
+def _read_inflight_value(raw: object) -> int:
+    if type(raw) is not int or not 0 <= raw <= 100:
+        raise ValueError("account_conversation_read_max_inflight must be an integer between 0 and 100")
+    return raw
+
+
 def _valid_temporary_chat_second_slot(value: object) -> bool:
     if not isinstance(value, dict) or set(value) != {"account_identity", "request_id", "expires_at"}:
         return False
@@ -501,6 +507,14 @@ class ConfigStore:
             return 1
 
     @property
+    def account_conversation_read_max_inflight(self) -> int:
+        """Per-account conversation GET capacity; zero preserves uncapped I/O."""
+        try:
+            return _read_inflight_value(self.data.get("account_conversation_read_max_inflight", 0))
+        except ValueError:
+            return 0
+
+    @property
     def image_account_concurrency(self) -> int:
         try:
             return max(1, int(self._resource_data().get("image_account_concurrency", self.data.get("image_account_concurrency", 3))))
@@ -768,6 +782,7 @@ class ConfigStore:
         data["account_message_interval_secs"] = self.account_message_interval_secs
         data["account_conversation_read_interval_secs"] = self.account_conversation_read_interval_secs
         data["account_conversation_read_burst"] = self.account_conversation_read_burst
+        data["account_conversation_read_max_inflight"] = self.account_conversation_read_max_inflight
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
@@ -829,6 +844,8 @@ class ConfigStore:
                 data[key] = _pacing_value(key, data[key])
         if "account_conversation_read_burst" in data:
             data["account_conversation_read_burst"] = _read_burst_value(data["account_conversation_read_burst"])
+        if "account_conversation_read_max_inflight" in data:
+            data["account_conversation_read_max_inflight"] = _read_inflight_value(data["account_conversation_read_max_inflight"])
         next_data = dict(self.data)
         next_data.update(dict(data or {}))
         if "account_message_interval_secs" in data:

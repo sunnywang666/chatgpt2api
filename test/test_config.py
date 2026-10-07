@@ -153,6 +153,23 @@ class PacingSettingsTests(unittest.TestCase):
         self.path.write_text(json.dumps(saved))
         self.assertEqual(ConfigStore(self.path).account_conversation_read_burst, 1)
 
+    def test_read_inflight_capacity_is_persisted_and_invalid_update_is_atomic(self):
+        from services.config import ConfigStore
+        key = "account_conversation_read_max_inflight"
+        self.assertEqual(self.store.get()[key], 0)
+        for value in (4, 1, 100, 0):
+            self.store.update({key: value})
+            self.assertEqual(ConfigStore(self.path).get()[key], value)
+        before = self.path.read_bytes()
+        for value in (-1, 101, 1.5, True, "4", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.store.update({key: value, "proxy": "must-not-change"})
+            self.assertEqual(self.path.read_bytes(), before)
+        raw = json.loads(self.path.read_text())
+        raw[key] = "invalid-legacy"
+        self.path.write_text(json.dumps(raw))
+        self.assertEqual(ConfigStore(self.path).get()[key], 0)
+
     def test_conversation_read_setting_is_independent_and_defaults_to_no_extra_floor(self):
         from services.config import ConfigStore
         self.assertEqual(self.store.get()["account_conversation_read_interval_secs"], 0)

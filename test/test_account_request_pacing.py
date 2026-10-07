@@ -47,6 +47,178 @@ class Context:
         return {"model": "gpt-5 fixture", "operation": "text", "source": "key:test"}
 
 
+class ReadInflightCapacityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "clock.json"
+        self.cap = 2
+        for name, getter in (
+            ("account_request_interval_secs", lambda _: 0),
+            ("account_conversation_read_interval_secs", lambda _: 0),
+            ("account_conversation_read_max_inflight", lambda _: self.cap),
+        ):
+            p = patch.object(type(config), name, property(getter))
+            p.start()
+            self.addCleanup(p.stop)
+
+    def read(self, clock, send=lambda *a, **kw: Response(), **kwargs):
+        return clock.request(send, "GET", "https://provider/conversation/original", **kwargs)
+
+    def test_parallel_read_capacity_is_shared_across_clock_instances(self):
+        entered, release = threading.Event(), threading.Event()
+        guard = threading.Lock()
+        active, peak, count = 0, 0, 0
+        errors = []
+        def send(*args, **kwargs):
+            nonlocal active, peak, count
+            with guard:
+                active += 1
+                count += 1
+                peak = max(peak, active)
+                if active == 2:
+                    entered.set()
+            try:
+                if not release.wait(4):
+                    raise TimeoutError("fixture not released")
+                return Response()
+            finally:
+                with guard:
+                    active -= 1
+        def run():
+            try:
+                self.read(AccountRequestClock("fixture", self.path), send,
+                          _account_request_deadline_monotonic=time.monotonic() + 5)
+            except BaseException as exc:
+                errors.append(exc)
+        workers = [threading.Thread(target=run) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            time.sleep(.15)
+            self.assertEqual(count, 2)
+            # Read capacity must not hold the account send clock or block
+            # another account, a generation POST, or attachment metadata.
+            clock = AccountRequestClock("fixture", self.path)
+            self.assertEqual(clock.request(lambda *a, **kw: Response(), "POST",
+                             "https://provider/conversation").status_code, 200)
+            self.assertEqual(clock.request(lambda *a, **kw: Response(), "GET",
+                             "https://provider/backend-api/files/f/download").status_code, 200)
+            self.assertEqual(self.read(AccountRequestClock("other", Path(self.tmp.name) / "other.json")).status_code, 200)
+        finally:
+            release.set()
+            for worker in workers:
+                worker.join(6)
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual((count, peak), (8, 2))
+        self.assertEqual(AccountRequestClock("fixture", self.path).ordinary_read_queue, [])
+        # Files follow peak occupancy, not the cumulative number of reads.
+        self.assertEqual(len(list(self.path.parent.glob("clock.read-*.lock"))), 2)
+
+    def test_lowering_enabled_or_unlimited_capacity_sees_existing_streams(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        for initial in (0, 4):
+            with self.subTest(initial=initial):
+                self.cap = initial
+                clock = AccountRequestClock("fixture", self.path)
+                streams = [self.read(clock, stream=True) for _ in range(3)]
+                self.cap = 1
+                try:
+                    # Leave only a high-numbered slot occupied.
+                    streams[0].close()
+                    streams[1].close()
+                    sent = []
+                    reopened = AccountRequestClock("fixture", self.path)
+                    with self.assertRaises(AccountRequestDeadlineExceeded):
+                        self.read(reopened, lambda *a, **kw: sent.append(True),
+                                  _account_request_deadline_monotonic=time.monotonic() + .15)
+                    self.assertEqual(sent, [])
+                    self.assertEqual(reopened.ordinary_read_queue, [])
+                finally:
+                    for stream in streams:
+                        stream.close()
+                self.assertEqual(self.read(clock).status_code, 200)
+
+    def test_failed_transport_cleanup_pre_send_and_thread_start_release_capacity(self):
+        self.cap = 1
+        clock = AccountRequestClock("fixture", self.path)
+        def fail(*args, **kwargs):
+            raise OSError("fixture")
+        for case in ("transport", "pre_send", "thread_start", "save"):
+            with self.subTest(case=case):
+                if case == "transport":
+                    with self.assertRaises(OSError):
+                        self.read(clock, fail, _account_request_io_cleanup=fail)
+                elif case == "pre_send":
+                    with self.assertRaises(OSError):
+                        self.read(clock, _account_request_before_send=fail)
+                else:
+                    target, attr = (threading.Thread, "start") if case == "thread_start" else (clock, "_save")
+                    with patch.object(target, attr, side_effect=OSError("fixture")), self.assertRaises(OSError):
+                        self.read(clock)
+                self.assertEqual(self.read(clock).status_code, 200)
+                self.assertTrue(all(not slot.locked() for slot in clock.read_slots.values()))
+
+    def test_waiting_for_capacity_does_not_consume_read_credit(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        self.cap = 1
+        clock = AccountRequestClock("fixture", self.path)
+        with patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)), \
+             patch.object(type(config), "account_conversation_read_burst", property(lambda _: 8)):
+            response = self.read(clock, stream=True)
+            try:
+                with clock.lock:
+                    clock.conversation_read_bucket["credit"] = 7
+                    clock.next_conversation_read = time.monotonic()
+                    clock._save()
+                before = json.loads(self.path.read_text())["conversation_read_bucket"]["credit"]
+                with self.assertRaises(AccountRequestDeadlineExceeded):
+                    self.read(clock, _account_request_deadline_monotonic=time.monotonic() + .15)
+                after = json.loads(self.path.read_text())["conversation_read_bucket"]["credit"]
+                self.assertGreaterEqual(after, before)
+                self.assertEqual(clock.ordinary_read_queue, [])
+            finally:
+                response.close()
+
+    def test_stream_exhaustion_and_iterator_error_release_capacity(self):
+        self.cap = 1
+        clock = AccountRequestClock("fixture", self.path)
+        response = self.read(clock, stream=True)
+        self.assertTrue(any(slot.locked() for slot in clock.read_slots.values()))
+        self.assertEqual(len(list(response.iter_lines())), 1)
+        self.assertFalse(any(slot.locked() for slot in clock.read_slots.values()))
+        class BrokenResponse(Response):
+            def iter_lines(self):
+                yield b"partial"
+                raise OSError("fixture")
+        response = self.read(clock, lambda *a, **kw: BrokenResponse(), stream=True)
+        with self.assertRaises(OSError):
+            list(response.iter_lines())
+        response.close()
+        self.assertEqual(self.read(clock).status_code, 200)
+
+    def test_process_exit_releases_kernel_capacity(self):
+        import subprocess
+        import sys
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        self.cap = 1
+        slot = self.path.with_suffix(".read-0.lock")
+        child = subprocess.Popen([sys.executable, "-c",
+            "import fcntl,sys; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); sys.stdin.read()",
+            str(slot)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            with self.assertRaises(AccountRequestDeadlineExceeded):
+                self.read(AccountRequestClock("fixture", self.path),
+                          _account_request_deadline_monotonic=time.monotonic() + .15)
+        finally:
+            child.kill()
+            child.communicate(timeout=3)
+        self.assertEqual(self.read(AccountRequestClock("fixture", self.path)).status_code, 200)
+
+
 class AccountRequestPacingTests(unittest.TestCase):
     def test_independent_notification_and_download_lookups_overlap_without_read_credit(self):
         endpoints = ("/backend-api/celsius/ws/user", "/backend-api/files/file-1/download",
@@ -372,7 +544,7 @@ class AccountRequestPacingTests(unittest.TestCase):
                 sleep = Mock(side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds))
                 fake_time = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1700000000 + now[0], sleep=sleep)
                 with tempfile.TemporaryDirectory() as directory, patch.object(pacing, "time", fake_time), \
-                     patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                     patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0, account_conversation_read_max_inflight=0,
                                                                    account_conversation_read_interval_secs=0)):
                     clock = AccountRequestClock("fixture", Path(directory)/"clock.json")
                     with clock.lock:
@@ -421,7 +593,7 @@ class AccountRequestPacingTests(unittest.TestCase):
                         target(*target_args)
                     return original_thread(*args, target=delayed, **kwargs)
                 with tempfile.TemporaryDirectory() as directory, patch.object(pacing, "time", fake_time), \
-                     patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                     patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0, account_conversation_read_max_inflight=0,
                                                                   account_conversation_read_interval_secs=30)), \
                      patch.object(pacing.threading, "Thread", delayed_thread):
                     clock = AccountRequestClock("fixture", Path(directory)/"clock.json")
