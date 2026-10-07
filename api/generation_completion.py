@@ -87,11 +87,17 @@ def create_router(kind):
             # their own original conversation.  They cannot acknowledge,
             # rework, or authorize another request through this endpoint.
             raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
-        if company_original_only and (
-            kind != "image" or body.action != "recover" or body.allow_unconfirmed_retry
-            or body.model_fields_set - {"action", "allow_unconfirmed_retry", "retry_not_sent_failure_at"}
-        ):
-            raise HTTPException(403, detail={"code": "COMPANY_ORIGINAL_RECOVERY_REQUIRED"})
+        if company_original_only:
+            # Company image clients already own work/archive/restore actions.
+            # Acknowledge their selected saved result through the same contract,
+            # without expanding original-only recovery or its retry authority.
+            fields = {
+                "recover": {"action", "allow_unconfirmed_retry", "retry_not_sent_failure_at"},
+                "complete": {"action", "selected_id", "results_saved", "reviewed"},
+                "rework": {"action", "selected_id"},
+            }[body.action]
+            if kind != "image" or body.allow_unconfirmed_retry or body.model_fields_set - fields:
+                raise HTTPException(403, detail={"code": "COMPANY_ORIGINAL_RECOVERY_REQUIRED"})
         try:
             if body.action == "complete":
                 return await run_in_threadpool(service.complete, kind, identity, request_id, body.selected_id)

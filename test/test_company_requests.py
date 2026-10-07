@@ -327,15 +327,13 @@ def test_company_completion_restores_only_owned_unsent_original(company_repair, 
 
 
 @pytest.mark.parametrize("payload", [
-    {"action": "complete", "selected_id": "repair-image", "results_saved": True, "reviewed": True},
-    {"action": "rework", "selected_id": "repair-image"},
     {"action": "recover", "allow_unconfirmed_retry": True},
     {"action": "recover", "reviewed": False},
     {"action": "recover", "results_saved": False},
     {"action": "recover", "selected_id": None},
     {"action": "recover", "unexpected": "field"},
 ])
-def test_company_completion_rejects_other_actions_and_fields(company_repair, payload):
+def test_company_completion_rejects_recovery_authority_and_extra_fields(company_repair, payload):
     company, service, identity = company_repair
     before = company_image_row(service, identity)
     response = company.client.post(PREFIX + "/api/image-tasks/repair-image/completion",
@@ -358,3 +356,235 @@ def test_company_completion_saved_original_never_regenerates(company_repair):
     assert "replacement_id" not in response.json()
     assert company_image_row(service, identity)["data"] == original["data"]
     service.images.resume_poll.assert_not_called()
+
+
+@pytest.fixture
+def company_selected_result(company_repair, monkeypatch):
+    """Saved selected result and a separate unresolved original physical work."""
+    import copy
+    from services.work_lifecycle import ensure_work
+
+    company, service, identity = company_repair
+    selected_id = "company-selected-image"
+    with service.store.transaction() as db:
+        original = service.store.read_receipt(db, "image", identity["id"], "repair-image")
+        original.update(status="error", upstream_outcome="unknown", error_code="CONTENT_POLICY_VIOLATION",
+                        _submission_started=True, upstream_unfinished=False, _attempt_finished_at=3000,
+                        conversation_id="unknown-original", provider_binding_id="binding-original",
+                        provider_account_identity="account-original", request_message_id="original-user",
+                        _image_thread={"id": "original-thread"})
+        original.pop("_work_key", None)
+        original.pop("_work_ref", None)
+        selected = copy.deepcopy(original)
+        selected.update(id=selected_id, status="success", upstream_outcome="completed", error_code=None,
+                        conversation_id="selected-conversation", parent_message_id="selected-final",
+                        request_message_id="selected-user", _image_thread={"id": "selected-thread"},
+                        _completion_of="repair-image", data=[{"b64_json": base64.b64encode(company.png).decode()}])
+        selected.pop("_completion", None)
+        original["_completion"] = {"state": "result_ready", "replacement_id": selected_id,
+                                   "selected_id": selected_id, "max_extra_requests": 1, "next_at": None}
+        for rid, receipt in (("repair-image", original), (selected_id, selected)):
+            work = ensure_work(service.store, db, "image", identity["id"], rid, receipt)
+            work["slot_held"] = True
+            service.store.set_runtime(db, work["key"], work)
+            service.store.write_receipt(db, "image", identity["id"], rid, receipt)
+    monkeypatch.setattr(image_tasks, "image_task_service", service.images)
+    monkeypatch.setattr(image_tasks, "get_work_lifecycle_service", lambda: service.lifecycle)
+    service.images.generation_handler = Mock(side_effect=AssertionError("lifecycle must not generate"))
+    service.images.resume_poll = Mock(side_effect=AssertionError("selected result must not repoll original"))
+
+    def archive(identity_arg, rid, desired):
+        assert identity_arg["id"] == identity["id"] and rid == selected_id
+        return {"task_id": rid, "image_thread": {"id": "selected-thread"}, "archived": desired}
+
+    service.images.set_thread_archived = Mock(side_effect=archive)
+    return company, service, identity, selected_id
+
+
+def test_company_selected_image_save_complete_archive_rework_keeps_original_unknown(company_selected_result):
+    company, service, identity, selected_id = company_selected_result
+    endpoint = PREFIX + "/api/image-tasks/repair-image/completion"
+    headers = company.headers()
+    ready = company.client.get(endpoint, headers=headers).json()
+    assert ready["state"] == "result_ready" and ready["original_turn_ended"] is False
+    assert ready["original_cleanup"] == "pending"
+    downloaded = company.client.get(PREFIX + f"/api/image-tasks/{selected_id}/images/0", headers=headers)
+    assert downloaded.status_code == 200 and downloaded.content == company.png
+    original = company_image_row(service, identity)
+    done = company.client.post(endpoint, headers=headers, json={
+        "action": "complete", "selected_id": selected_id, "results_saved": True, "reviewed": True})
+    assert done.status_code == 200, done.text
+    result = done.json()
+    assert result["state"] == "completed" and result["selected_id"] == selected_id
+    assert result["work"]["slot_held"] is False and result["work"]["archive"]["status"] == "pending"
+    assert result["original_cleanup"] == "pending" and result["original_work"]["slot_held"] is True
+    assert result["original_turn_ended"] is False
+    with service.store.connect() as db:
+        chosen = service.store.read_receipt(db, "image", identity["id"], selected_id)
+    pending = company.client.post(endpoint, headers=headers, json={"action": "rework", "selected_id": selected_id})
+    assert pending.status_code == 409 and pending.json()["detail"]["code"] == "WORK_ARCHIVE_PENDING"
+    service.lifecycle.process_one(target_key=chosen["_work_key"])
+    rework = company.client.post(endpoint, headers=headers, json={"action": "rework", "selected_id": selected_id})
+    assert rework.status_code == 200, rework.text
+    assert rework.json()["work"]["state"] == "restoring"
+    service.lifecycle.process_one(target_key=chosen["_work_key"])
+    assert service.lifecycle.get("image", identity, selected_id)["state"] == "active"
+    # The pre-existing thread endpoints also operate on the selected receipt.
+    for action in ("archive-thread", "restore-thread"):
+        response = company.client.post(PREFIX + f"/api/image-tasks/{selected_id}/{action}", headers=headers, json={})
+        assert response.status_code == 200, response.text
+    after = company_image_row(service, identity)
+    assert after["status"] == original["status"] and after["upstream_outcome"] == "unknown"
+    assert after["conversation_id"] == original["conversation_id"]
+    assert service.read("image", identity, "repair-image")["original_work"]["slot_held"] is True
+    service.images.generation_handler.assert_not_called()
+    service.images.resume_poll.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["complete", "rework"])
+def test_company_selected_completion_checks_owner_and_exact_selected_result(company_selected_result, action):
+    company, service, identity, selected_id = company_selected_result
+    endpoint = PREFIX + "/api/image-tasks/repair-image/completion"
+    payload = {"action": action, "selected_id": selected_id}
+    if action == "complete":
+        payload.update(results_saved=True, reviewed=True)
+    before = company_image_row(service, identity)
+    for headers in (company.headers(user="other"), company.headers(org="other"), company.headers(connector=OTHER_CONNECTOR)):
+        assert company.client.post(endpoint, headers=headers, json=payload).status_code == 404
+    response = company.client.post(endpoint, headers=company.headers(), json={**payload, "selected_id": "unrelated-image"})
+    assert response.status_code == 409, response.text
+    assert company_image_row(service, identity) == before
+    service.images.set_thread_archived.assert_not_called()
+
+
+def test_company_same_thread_selected_closes_only_after_saved_success(company_selected_result):
+    from services.work_lifecycle import ensure_work
+    company, service, identity, selected_id = company_selected_result
+    with service.store.transaction() as db:
+        original = service.store.read_receipt(db, "image", identity["id"], "repair-image")
+        selected = service.store.read_receipt(db, "image", identity["id"], selected_id)
+        db.execute("DELETE FROM task_runtime WHERE name=?", (selected["_work_key"],))
+        original.update(_sequence=1, client_conversation_id="same-client", error_code="RESULT_UNRECOVERABLE",
+                        _retry_cursor={"conversation_id": original["conversation_id"],
+                                       "request_message_id": original["request_message_id"],
+                                       "retry_parent_message_id": "verified-empty-final", "observed_at": service.clock()})
+        selected.update({k: original[k] for k in ("provider_binding_id", "provider_account_identity",
+                        "client_conversation_id", "conversation_id", "_work_key", "_image_thread")})
+        selected.update(_sequence=2, _same_session_retry_of="repair-image",
+                        _submission_parent_message_id="verified-empty-final")
+        service.store.write_receipt(db, "image", identity["id"], "repair-image", original)
+        ensure_work(service.store, db, "image", identity["id"], selected_id, selected)
+        service.store.write_receipt(db, "image", identity["id"], selected_id, selected)
+    endpoint = PREFIX + "/api/image-tasks/repair-image/completion"
+    response = company.client.post(endpoint, headers=company.headers(), json={
+        "action": "complete", "selected_id": selected_id, "results_saved": True, "reviewed": True})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["state"] == "completed" and result["original_status"] == "error"
+    assert result["work"]["slot_held"] is False and result["work"]["archive"]["status"] == "pending"
+    assert result["original_work"]["request_id"] == selected_id
+    service.images.set_thread_archived.side_effect = lambda who, rid, desired: {
+        "task_id": rid, "image_thread": {"id": "original-thread"}, "archived": desired}
+    service.lifecycle.process_one(target_key=selected["_work_key"])
+    service.images.set_thread_archived.assert_called_once_with({"id": identity["id"], "role": "user"}, selected_id, True)
+    assert company_image_row(service, identity)["upstream_outcome"] == "unknown"
+    response = company.client.post(endpoint, headers=company.headers(),
+                                   json={"action": "rework", "selected_id": selected_id})
+    assert response.status_code == 200 and response.json()["work"]["state"] == "restoring"
+    service.images.generation_handler.assert_not_called()
+    service.images.resume_poll.assert_not_called()
+
+
+@pytest.mark.parametrize("action,extra", [
+    ("complete", {"allow_unconfirmed_retry": False}),
+    ("complete", {"retry_not_sent_failure_at": None}),
+    ("complete", {"results_saved": "true"}),
+    ("complete", {"reviewed": False}),
+    ("rework", {"allow_unconfirmed_retry": False}),
+    ("rework", {"results_saved": False}),
+    ("rework", {"retry_not_sent_failure_at": None}),
+])
+def test_company_selected_lifecycle_does_not_expand_recovery_fields(company_selected_result, action, extra):
+    company, service, identity, selected_id = company_selected_result
+    payload = {"action": action, "selected_id": selected_id}
+    if action == "complete":
+        payload.update(results_saved=True, reviewed=True)
+    before = company_image_row(service, identity)
+    response = company.client.post(PREFIX + "/api/image-tasks/repair-image/completion",
+                                   headers=company.headers(), json={**payload, **extra})
+    assert response.status_code in (403, 422), response.text
+    assert company_image_row(service, identity) == before
+    service.images.set_thread_archived.assert_not_called()
+
+
+@pytest.mark.parametrize("later_status", ["success", "running"])
+@pytest.mark.parametrize("invalid", [None, "thread", "work_ref", "sequence", "work", "selected_asset"])
+def test_company_intermediate_selected_ack_preserves_newer_work_and_restart(company_selected_result, monkeypatch,
+                                                                          later_status, invalid):
+    import copy
+    from services.generation_completion import GenerationCompletionService
+    from services.work_lifecycle import ensure_work
+
+    company, service, identity, selected_id = company_selected_result
+    with service.store.transaction() as db:
+        selected = service.store.read_receipt(db, "image", identity["id"], selected_id)
+        selected["_sequence"] = 2
+        service.store.write_receipt(db, "image", identity["id"], selected_id, selected)
+        later = copy.deepcopy(selected)
+        later.update(id="later-image", _sequence=3, status=later_status, _completion_of=None,
+                     _previous_request_id=selected_id, _executing=later_status == "running",
+                     request_message_id="later-user")
+        later["_image_thread"]["previous_task_id"] = selected_id
+        if later_status == "running":
+            later.pop("data", None)
+        ensure_work(service.store, db, "image", identity["id"], "later-image", later)
+        if invalid == "thread":
+            later["_image_thread"]["id"] = "unrelated-thread"
+        elif invalid == "work_ref":
+            selected["_image_thread"]["id"] = later["_image_thread"]["id"] = "unrelated-thread"
+            service.store.write_receipt(db, "image", identity["id"], selected_id, selected)
+        elif invalid == "sequence":
+            later["_sequence"] = selected["_sequence"]
+        elif invalid == "work":
+            later["_work_key"] = "unrelated-work"
+        elif invalid == "selected_asset":
+            selected["data"] = []
+            service.store.write_receipt(db, "image", identity["id"], selected_id, selected)
+        service.store.write_receipt(db, "image", identity["id"], "later-image", later)
+        before_work = service.store.runtime(db, selected["_work_key"])
+    endpoint = PREFIX + "/api/image-tasks/repair-image/completion"
+    payload = {"action": "complete", "selected_id": selected_id, "results_saved": True, "reviewed": True}
+    for restarted in (False, True):
+        if restarted:
+            service = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+            monkeypatch.setattr("api.generation_completion.get_generation_completion_service", lambda: service)
+        response = company.client.post(endpoint, headers=company.headers(), json=payload)
+        if invalid:
+            assert response.status_code == 409, response.text
+            assert company_image_row(service, identity)["_completion"]["state"] == "result_ready"
+            with service.store.connect() as db:
+                assert service.store.runtime(db, selected["_work_key"]) == before_work
+            continue
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["state"] == "completed" and result["selected_id"] == selected_id
+        assert result["results_saved"] is True
+        assert result["work"]["request_id"] == "later-image" and result["work"]["state"] == "active"
+        assert result["work"]["slot_held"] is True and result["work"]["archive"]["status"] == "not_requested"
+        assert result["original_status"] == "error" and result["original_cleanup"] == "pending"
+        with service.store.connect() as db:
+            assert service.store.runtime(db, selected["_work_key"]) == before_work
+            assert service.store.read_receipt(db, "image", identity["id"], "later-image") == later
+        # Rework must not roll a shared conversation back over its later turn.
+        before_root = company_image_row(service, identity)
+        response = company.client.post(endpoint, headers=company.headers(),
+                                       json={"action": "rework", "selected_id": selected_id})
+        assert response.status_code == 409 and response.json()["detail"]["code"] == "WORK_SUPERSEDED"
+        assert company_image_row(service, identity) == before_root
+        assert not service.lifecycle.process_one()
+        with service.store.connect() as db:
+            assert service.store.runtime(db, selected["_work_key"]) == before_work
+            assert service.store.read_receipt(db, "image", identity["id"], "later-image") == later
+    service.images.generation_handler.assert_not_called()
+    service.images.resume_poll.assert_not_called()
+    service.images.set_thread_archived.assert_not_called()
