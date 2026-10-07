@@ -102,18 +102,22 @@ class ConversationBindingTextRequest(BaseModel):
     client_request_id: str | None = Field(default=None, min_length=1, max_length=200)
     supersedes_request_id: str | None = Field(default=None, min_length=1, max_length=200)
     derived_input: dict[str, object] | None = Field(default=None, exclude_if=lambda value: value is None)
+    continue_after_no_final: bool | None = Field(default=None, strict=True, exclude_if=lambda value: value is None)
     conversation_id: str | None = None
     parent_message_id: str | None = None
 
 
     @model_validator(mode="after")
     def original_or_successor(self):
+        no_final = "continue_after_no_final" in self.model_fields_set
+        if no_final and (self.continue_after_no_final is not True or not self.supersedes_request_id or self.derived_input is not None):
+            raise ValueError("no-final continuation requires an explicit original-request successor")
         if self.supersedes_request_id is None:
             if self.derived_input is not None:
                 raise ValueError("derived input requires an original request")
             if self.messages is None:
                 raise ValueError("messages are required")
-        elif self.model_fields_set != (TextTaskService.SUPERSEDE_FIELDS | ({"derived_input"} if self.derived_input is not None else set())):
+        elif self.model_fields_set != (TextTaskService.SUPERSEDE_FIELDS | ({"derived_input"} if self.derived_input is not None else set()) | ({"continue_after_no_final"} if no_final else set())):
             raise ValueError("explicit successor requires only original binding and request identities")
         return self
 
