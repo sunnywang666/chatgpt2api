@@ -168,6 +168,22 @@ Download completed images promptly. The existing server image-retention policy s
 
 ## Failures and recovery
 
+Retained single-image requests distinguish a native connection failure before
+the generation POST from an uncertain submitted request. DNS/connect/TLS errors
+are considered not submitted only when the completed transport snapshot also
+proves zero request/upload/early-data bytes, no redirect or response, and no
+library retry. A proxy CONNECT 200 alone is not a generation response. The
+receipt's `last_recovery_failure` exposes only `submission_evidence` and the
+numeric `transport_error_code`, never raw network errors or credentials.
+
+Such a proven unsent failure uses the existing completion recovery to retry the
+same task once, retaining its input, account, message ID and existing conversation.
+A second failure ends with explicit attention required and releases execution
+occupancy. It does not consume image capacity or invalidate observed quota.
+Multi-send image sets are excluded from this whole-task retry. Missing evidence,
+ordinary timeouts, and failures after sending remain original-result recovery;
+historical UNKNOWN receipts are not reclassified by an upgrade.
+
 The client prints JSON to stdout on success and a JSON error to stderr on failure. Common server responses are:
 
 - `400`: malformed input or a resume request that is not valid for the receipt;

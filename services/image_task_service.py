@@ -167,6 +167,8 @@ def _failure_details(exc: BaseException, phase: str) -> dict[str, Any]:
         "status_code": _upstream_status_code(exc),
         "at": time.time(),
     }
+    from services.account_request_pacing import unsent_transport_failure
+    details.update(unsent_transport_failure(exc))
     if isinstance(exc, ImageThreadError) and isinstance(exc.code, str) and exc.code in _IMAGE_THREAD_FAILURE_CODES:
         details["code"] = exc.code
     reason = getattr(exc, "binding_reason", None)
@@ -202,6 +204,11 @@ def _public_failure_details(value: object) -> dict[str, Any]:
     reason = value.get("binding_reason")
     if isinstance(reason, str) and reason in _BINDING_FAILURE_REASONS:
         details["binding_reason"] = reason
+    if (value.get("submission_evidence") == "connect_failed_before_request"
+            and type(value.get("transport_error_code")) is int
+            and value["transport_error_code"] in {5, 6, 7, 35, 60}):
+        details.update(submission_evidence="connect_failed_before_request",
+                       transport_error_code=value["transport_error_code"])
     return details
 
 

@@ -1658,6 +1658,9 @@ def _generate_bound_single_image(
             backend = OpenAIBackendAPI(access_token=token)
             # Request-owned model selection; never mutate the shared pool
             # default used by Content or other callers.
+            # Only a single-send request can safely retry the whole original;
+            # never replay a partial multi-image set after its later send fails.
+            backend.image_transport_retry_eligible = total == 1
             backend.retain_bound_conversation = True
             backend.image_upstream_model = request.upstream_model
             if request.progress_callback:
@@ -1835,7 +1838,9 @@ def _generate_bound_single_image(
                 # count it as an upstream image failure. Unknown/submitted
                 # attempts retain the existing accounting and recovery path.
                 unsent_guard_rejection = isinstance(exc, AdmissionLost) and upstream_submitted is False
-                if not image_result_marked and not unsent_guard_rejection:
+                from services.account_request_pacing import unsent_transport_failure
+                unsent_connection_failure = upstream_submitted is False and bool(unsent_transport_failure(exc))
+                if not image_result_marked and not unsent_guard_rejection and not unsent_connection_failure:
                     image_result_marked = True
                     account_service.mark_image_result(token, False, **({"release_slot": False} if pool_managed else {}),
                         **({"capacity_consumed": True} if capacity_consumed else {}))

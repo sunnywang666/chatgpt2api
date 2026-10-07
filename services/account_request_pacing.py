@@ -40,7 +40,62 @@ _TRANSPORT_INFO_FIELDS = {
     CurlInfo.OS_ERRNO: "os_errno",
     CurlInfo.HTTP_CONNECTCODE: "http_connect_code",
     CurlInfo.SIZE_DOWNLOAD_T: "downloaded_bytes",
+    CurlInfo.REQUEST_SIZE: "request_bytes",
+    CurlInfo.SIZE_UPLOAD_T: "uploaded_bytes",
+    CurlInfo.EARLYDATA_SENT_T: "early_data_bytes",
+    CurlInfo.REDIRECT_COUNT: "redirect_count",
+    CurlInfo.RESPONSE_CODE: "response_code",
+    CurlInfo.HTTP_VERSION: "http_version",
 }
+
+
+def _connect_failed_before_request(session, exc):
+    """Classify a finished native connect failure, never a timeout/read error.
+
+    Zero byte counters alone cannot prove non-submission. Require connect-stage
+    failure without TLS early data, redirects, responses or library retries.
+    CONNECT 200 describes the proxy tunnel, not the target application's POST.
+    Missing evidence deliberately retains the original UNKNOWN behavior.
+    """
+    from curl_cffi.requests import Session
+    from curl_cffi.requests.exceptions import RequestException
+    try:
+        if (not isinstance(session, Session) or not isinstance(exc, RequestException)
+                or getattr(session.retry, "count", None) != 0
+                or isinstance(exc.code, bool) or exc.code not in {5, 6, 7, 35, 60}):
+            return False
+        response = exc.response
+        if type(response.status_code) is not int or response.status_code != 0:
+            return False
+        infos = response.infos
+        zero = (CurlInfo.REQUEST_SIZE, CurlInfo.SIZE_UPLOAD_T, CurlInfo.EARLYDATA_SENT_T,
+                CurlInfo.REDIRECT_COUNT, CurlInfo.RESPONSE_CODE, CurlInfo.HTTP_VERSION,
+                CurlInfo.SIZE_DOWNLOAD_T)
+        if any(type(infos.get(k)) is not int or infos[k] != 0 for k in zero):
+            return False
+        appconnect, connections = infos.get(CurlInfo.APPCONNECT_TIME), infos.get(CurlInfo.NUM_CONNECTS)
+        return (type(appconnect) in (int, float) and appconnect == 0
+                and type(connections) is int and 0 <= connections <= 1)
+    except Exception:
+        # Classification must not mask the original transport failure.
+        return False
+
+
+def unsent_transport_failure(exc):
+    """Return safe evidence marked by the native transport, including its cause."""
+    try:
+        for _ in range(8):
+            if exc is None:
+                break
+            if getattr(exc, "_account_request_not_submitted", False) is True:
+                code = exc.code
+                if isinstance(code, int) and not isinstance(code, bool) and code in {5, 6, 7, 35, 60}:
+                    return {"submission_evidence": "connect_failed_before_request", "transport_error_code": int(code)}
+                return {}
+            exc = exc.__cause__
+    except Exception:
+        pass  # Exception accessors are not allowed to replace the real failure.
+    return {}
 
 
 def _transport_snapshot(response):
@@ -1440,7 +1495,12 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
             # to the caller's existing deadline or mutate shared curl options.
             connect = min(connect, timeout)
             kwargs["timeout"] = (connect, timeout - connect)
-        return _send_with_bounded_stream_close(session, raw_send, method, url, **kwargs)
+        try:
+            return _send_with_bounded_stream_close(session, raw_send, method, url, **kwargs)
+        except Exception as exc:
+            if str(method).upper() == "POST" and _connect_failed_before_request(session, exc):
+                exc._account_request_not_submitted = True
+            raise
 
     def paced_request(method, url, **kwargs):
         # Object-storage downloads are not ChatGPT account API calls.

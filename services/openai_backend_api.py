@@ -23,7 +23,8 @@ from curl_cffi import requests
 from PIL import Image
 
 from services.account_service import account_service
-from services.account_request_pacing import AccountRequestDeadlineExceeded, pace_account_session, retry_after_seconds
+from services.account_request_pacing import (AccountRequestDeadlineExceeded, pace_account_session,
+                                             retry_after_seconds, unsent_transport_failure)
 from services.config import config
 from services.request_context import current_archive_observation, observing_archive_step
 from services.proxy_service import proxy_settings
@@ -1278,6 +1279,10 @@ class OpenAIBackendAPI:
             # send reservation is not proof that the POST actually happened.
             self.image_submission_started = False
             raise
+        except Exception as exc:
+            if getattr(self, "image_transport_retry_eligible", False) and unsent_transport_failure(exc):
+                self.image_submission_started = False
+            raise
         if response.status_code == 404:
             response.close()
             path = "/backend-api/conversation"
@@ -1298,6 +1303,10 @@ class OpenAIBackendAPI:
                 )
             except AccountRequestDeadlineExceeded:
                 self.image_submission_started = False
+                raise
+            except Exception as exc:
+                if getattr(self, "image_transport_retry_eligible", False) and unsent_transport_failure(exc):
+                    self.image_submission_started = False
                 raise
         ensure_ok(response, path)
         return response
