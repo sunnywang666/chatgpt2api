@@ -274,6 +274,79 @@ def test_completion_scheduled_on_another_receipt_blocks_proof(harness, kind, sta
         assert service.continuation_cursor(OWNER, "policy-task", ANCHORS)["source_task_id"] == "policy-task"
 
 
+def paused_original_peer(**changes):
+    peer = {**ANCHORS, "id":"paused-peer", "owner_id":"other-owner", "status":"error",
+        "error_code":"RESULT_UNRECOVERABLE", "upstream_outcome":"unknown", "upstream_unfinished":False,
+        "_recovery_paused":True, "_executing":False,
+        "_completion":{"state":"checking_original", "next_at":100,
+            "max_extra_requests":0, "read_only_original":True, "allow_unconfirmed_retry":False}}
+    completion_changes = changes.pop("completion", {})
+    peer.update(changes);peer["_completion"].update(completion_changes)
+    return peer
+
+
+def store_peer(service, peer, kind="image"):
+    with service.store.transaction() as db:
+        if kind == "text":
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("other-owner","paused-peer","hash","{}"))
+        service.store.write_receipt(db,kind,"other-owner","paused-peer",peer)
+
+
+def test_paused_original_only_peer_does_not_block_read_only_refusal_proof(harness):
+    service,backend,_=harness
+    peer=paused_original_peer();store_peer(service,peer)
+    def raw_receipts():
+        with service.store.connect() as db:
+            return list(db.execute("SELECT task_key,receipt FROM image_requests ORDER BY task_key"))
+    before=raw_receipts()
+    proof=service.continuation_cursor(OWNER,"policy-task",ANCHORS)
+    assert proof["source_task_id"]=="policy-task"
+    assert raw_receipts()==before
+    assert backend.reads==backend.task_reads==1
+    service.generation_handler.assert_not_called()
+    service.edit_handler.assert_not_called()
+
+
+@pytest.mark.parametrize("changes", [
+    {"_recovery_paused":False}, {"_recovery_suppressed":True}, {"status":"unknown"},
+    {"upstream_unfinished":True}, {"upstream_outcome":"generated"}, {"error_code":"OTHER"},
+    {"_executing":True}, {"_turn_reserved":True}, {"waiting":True}, {"recovery_claim_id":"claim"},
+    {"_claim_id":"claim","_claim_until":9999999999}, {"_recovery_claim_until":9999999999},
+    {"_completion_of":"parent"}, {"same_request_retry":True}, {"automatic_failure_retry":True},
+    {"data":[{}]}, {"result_file_ids":["file"]}, {"result_sediment_ids":["asset"]},
+    {"_pending_image_result_ids":["file"]}, {"_pending_image_output":{} ,"recovery_phase":"download_image_result"},
+    {"adopted_source_request_message_id":"original"}, {"_pending_image_output":{"present":True}},
+    {"completion":{"max_extra_requests":1}}, {"completion":{"max_extra_requests":False}},
+    {"completion":{"read_only_original":None}}, {"completion":{"allow_unconfirmed_retry":True}},
+    {"completion":{"replacement_id":"next"}}, {"completion":{"prepared_input":{"present":True}}},
+    {"completion":{"selected_id":"next"}}, {"completion":{"same_request_retry":True}},
+    {"completion":{"automatic_failure_retry":True}},
+])
+def test_paused_peer_exception_never_allows_generation_or_live_work(harness,changes):
+    service,backend,_=harness
+    store_peer(service,paused_original_peer(**copy.deepcopy(changes)))
+    with pytest.raises(ImageThreadError,match="IMAGE_CONTINUATION_BUSY"):
+        service.continuation_cursor(OWNER,"policy-task",ANCHORS)
+    assert backend.reads==backend.task_reads==0
+
+
+def test_paused_text_completion_still_blocks_image_continuation(harness):
+    service,backend,_=harness
+    store_peer(service,paused_original_peer(),kind="text")
+    with pytest.raises(ImageThreadError,match="IMAGE_CONTINUATION_BUSY"):
+        service.continuation_cursor(OWNER,"policy-task",ANCHORS)
+    assert backend.reads==0
+
+
+def test_paused_original_reader_still_checks_upstream_activity(harness):
+    service,backend,_=harness
+    store_peer(service,paused_original_peer())
+    backend.tasks={"tasks":[{"status":"in_progress"}]}
+    with pytest.raises(ImageThreadError,match="IMAGE_CONTINUATION_BUSY"):
+        service.continuation_cursor(OWNER,"policy-task",ANCHORS)
+    assert backend.reads==backend.task_reads==1
+
+
 @pytest.mark.parametrize("status,code", [(429, "RECOVERY_RATE_LIMITED"), (401, "RECOVERY_AUTH_REQUIRED"),
     (403, "RECOVERY_AUTH_REQUIRED"), (502, "RECOVERY_READ_FAILED")])
 def test_upstream_failure_never_returns_a_cursor(harness, monkeypatch, status, code):
