@@ -43,7 +43,8 @@ class AccountRequestPacingTests(unittest.TestCase):
         mock.patch.object(pacing.time, "time", side_effect=lambda: 1000000 + self.now).start()
         mock.patch.object(pacing.time, "sleep", side_effect=self.advance).start()
         mock.patch.object(pacing, "config", SimpleNamespace(
-            account_request_interval_secs=5.0, account_message_interval_secs=30.0)).start()
+            account_request_interval_secs=5.0, account_message_interval_secs=30.0,
+            account_conversation_read_max_inflight=0)).start()
 
     def advance(self, delay):
         self.now += delay
@@ -2252,7 +2253,8 @@ class TextResultRecoveryTests(unittest.TestCase):
                     return response
                 with mock.patch.object(pacing, "time", fake_time), \
                      mock.patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
-                                                                       account_conversation_read_interval_secs=30)):
+                                                                       account_conversation_read_interval_secs=30,
+                                                                       account_conversation_read_max_inflight=0)):
                     clock = pacing.AccountRequestClock("fixture", Path(directory)/"clock.json")
                     clock.next_conversation_read = now[0] + initial_wait
                     clock._save()
