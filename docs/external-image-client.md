@@ -474,6 +474,14 @@ resolves its selected same-thread result and checks the supplied bytes against
 that result. Archive/restore also resolves that selected turn while retaining
 the original failed receipt. A late successful original never replaces the
 already selected child, and any newer unfinished task still blocks archive.
+When a later image task already owns the same work, `complete` can acknowledge
+the earlier, durably selected successful image as saved and reviewed. This
+updates only that original task's completion: `work.request_id` still identifies
+the later task, and its state, slot and archive intent remain unchanged. Complete
+the legal latest task to close the shared conversation. `rework` of a superseded
+intermediate result returns `WORK_SUPERSEDED`; it cannot roll back over later
+turns. Company image ingress supports the same selected-result `complete` and
+`rework` fields, while its `recover` remains restricted to the original request.
 Historical UNKNOWN receipts do not
 opt in merely because the service upgrades; new pure-generation requests use
 the bounded policy described above.
