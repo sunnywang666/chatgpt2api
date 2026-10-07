@@ -215,6 +215,25 @@ def test_confirmed_original_turn_retries_same_account_session_work_and_closes(se
     assert restarted.read("text", IDENTITY, "old-0")["work"]["state"] == "active"
     assert row(service)["status"] == status and row(service)["_input_ref"] == original["_input_ref"]
     assert len(calls) == 1
+    # A later user turn follows the selected successful receipt. The failed
+    # original remains readable evidence, not a successful continuation cursor.
+    from services.conversation_binding_service import ConversationBindingError
+    body = service.store.load_input(original["_input_ref"])
+    later = {**body, "client_request_id": "after-selected-result",
+             "messages": [{"role": "user", "content": "Continue from the recovered answer."}]}
+    with pytest.raises(ConversationBindingError) as rejected:
+        service.text.submit("owner", {**later, "_previous_request_id": "old-0"})
+    assert rejected.value.code == "CHAT_CONVERSATION_CONFLICT"
+    assert row(service, request_id=later["client_request_id"]) is None
+    submitted = service.text.submit("owner", {**later, "_previous_request_id": child_id})
+    assert submitted["status"] == "queued"
+    next_turn = row(service, request_id=later["client_request_id"])
+    selected = row(service, request_id=child_id)
+    for key in ("provider_account_identity", "provider_binding_id", "conversation_id",
+                "client_conversation_id", "_public_session_ref", "parent_message_id", "_work_key"):
+        assert next_turn[key] == selected[key]
+    assert next_turn["_previous_request_id"] == child_id
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("terminal_empty", [False, True])
