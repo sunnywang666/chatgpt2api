@@ -26,6 +26,16 @@ def compact_json(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
+def derive_retained_input(original, request_id, previous_id, parameters, *, no_final=False):
+    """Only the two closed transforms exist; their original-result proofs differ."""
+    from services.required_attributes_derivation import KIND as ATTRIBUTES_KIND, derive_required_attributes_input
+    if parameters == {"kind": ATTRIBUTES_KIND} and no_final is True:
+        return derive_required_attributes_input(original, request_id, previous_id, parameters)
+    if parameters == {"kind": KIND} and no_final is False:
+        return derive_category_parent_input(original, request_id, previous_id, parameters)
+    reject("CHAT_DERIVED_INPUT_INVALID")
+
+
 def derive_category_parent_input(original, request_id, previous_id, parameters):
     """Return (derived durable body, safe audit metadata); never mutate original."""
     if parameters != {"kind": KIND}:

@@ -110,7 +110,11 @@ class ConversationBindingTextRequest(BaseModel):
     @model_validator(mode="after")
     def original_or_successor(self):
         no_final = "continue_after_no_final" in self.model_fields_set
-        if no_final and (self.continue_after_no_final is not True or not self.supersedes_request_id or self.derived_input is not None):
+        attributes_upgrade = self.derived_input == {"kind": "attributes_required_only_v4"}
+        if attributes_upgrade and not no_final:
+            raise ValueError("attributes upgrade requires explicit no-final continuation")
+        if no_final and (self.continue_after_no_final is not True or not self.supersedes_request_id
+                         or self.derived_input is not None and not attributes_upgrade):
             raise ValueError("no-final continuation requires an explicit original-request successor")
         if self.supersedes_request_id is None:
             if self.derived_input is not None:
