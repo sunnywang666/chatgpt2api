@@ -300,6 +300,14 @@ class TextTaskService:
             result.update(error_code=None, waiting=None, upstream_outcome="completed")
         result.pop("execution", None)
         result["recovery_control"] = recovery_control(receipt)
+        result.pop("recovery_automatic_stopped", None)
+        result.pop("recovery_stop_reason", None)
+        if (receipt.get("_attempt_finished_at")
+                and receipt.get("_attempt_reason") == "ORIGINAL_RESULT_NO_FINAL"
+                and receipt.get("status") == "failed"
+                and receipt.get("upstream_outcome") == "unknown"
+                and not receipt.get("_completion")):
+            result.update(recovery_automatic_stopped=True, recovery_stop_reason="ORIGINAL_RESULT_NO_FINAL")
         if (receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
                 and not receipt.get("_forward_protocol")):
             result["execution"] = project_text_execution(receipt)

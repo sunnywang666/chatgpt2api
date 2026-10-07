@@ -327,7 +327,7 @@ Happy 主循环依据原生 DSH 消息 `source.replayState.response.requestId` �
 
 ### 已结束等待、仍无最终文字的旧请求
 
-没有工作生命周期或 completion 处理器的原生 Chat 请求，在达到既有无结果预算、释放本地执行占用后，如果原会话仍为 `REQUEST_RESULT_NOT_FOUND` 且没有结束或可重试游标证明，会停止自动读取。普通状态 GET 和后台扫描不会重新开启查询；原 ID、输入、账号、会话和 `upstream_outcome=unknown` 保留。这也适用于升级前已经重复读取很多次的记录。工具步骤 `finished_successfully` 不代表最终 assistant 回答完成。
+没有工作生命周期或 completion 处理器的原生 Chat 请求，在达到既有无结果预算、释放本地执行占用后，如果原会话仍为 `REQUEST_RESULT_NOT_FOUND` 且没有结束或可重试游标证明，会停止自动读取。普通状态 GET 和后台扫描不会重新开启查询；原 ID、输入、账号、会话和 `upstream_outcome=unknown` 保留。这也适用于升级前已经重复读取很多次的记录。工具步骤 `finished_successfully` 不代表最终 assistant 回答完成。 旧绑定接口返回 `recovery_automatic_stopped:true`、`recovery_stop_reason:ORIGINAL_RESULT_NO_FINAL`；公共 Chat 回执对应 `recovery.automatic_stopped`／`recovery.stop_reason`。客户端收到此标记应结束自动查询并显示原任务仍缺最终结果；`retryable:true` 仅表示允许显式原读，不表示继续定时查询或重新生成。
 
 需要再次核对时，使用已有 `POST /api/chat-requests/{request_id}/recover`（默认空请求体），只执行一次受账号节奏与冷却限制的原会话读取。仍无结果则保持停止；迟到的有效最终回答可沿原 ID 收回。此操作不直接重发生成、不换会话，也不把原任务标成完成。已有工作 completion 调查和明确空终态的有界恢复仍沿原合同执行。
 

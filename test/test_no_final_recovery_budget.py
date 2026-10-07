@@ -87,6 +87,7 @@ def test_explicit_recheck_adopts_late_final_without_new_submission(legacy):
     result = tasks.recover("owner", "original", explicit_ended_recheck=True)
     assert result["status"] == "succeeded" and result["content"] == "late original answer"
     assert result["upstream_outcome"] == "completed"
+    assert "recovery_automatic_stopped" not in result
     assert raw(tasks)["_last_sent_sequence"] == 0
     assert len(tasks.executor.calls) == 1  # Only the original submit was queued.
 
@@ -152,6 +153,16 @@ def test_bound_text_explicit_recovery_route_can_recheck_once(legacy, monkeypatch
     with TestClient(app) as client:
         response = client.post("/api/conversation-bindings/text-requests/original/recover", json={})
     assert response.status_code == 200 and reader.call_count == 4
+    assert response.json()["recovery_automatic_stopped"] is True
+    assert response.json()["recovery_stop_reason"] == "ORIGINAL_RESULT_NO_FINAL"
     clock.advance(10000)
     tasks.read("owner", "original")
     assert reader.call_count == 4
+
+
+def test_public_stop_flag_requires_derived_proof(legacy):
+    tasks, _, _ = legacy
+    receipt = {**raw(tasks), "recovery_automatic_stopped": True,
+               "recovery_stop_reason": "ORIGINAL_RESULT_NO_FINAL"}
+    result = tasks._public(receipt)
+    assert "recovery_automatic_stopped" not in result and "recovery_stop_reason" not in result

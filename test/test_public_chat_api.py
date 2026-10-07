@@ -42,6 +42,8 @@ def test_get_cannot_reopen_exhausted_no_final_recovery(public_chat):
         response = f.client.get("/api/chat-requests/no-final", headers=f.headers())
         assert response.status_code == 200
         assert response.json()["execution"]["attempt_state"] == "ended"
+        assert response.json()["recovery"]["automatic_stopped"] is True
+        assert response.json()["recovery"]["stop_reason"] == "ORIGINAL_RESULT_NO_FINAL"
     reader.assert_not_called()
     response = f.client.post("/api/chat-requests/no-final/recover", headers=f.headers())
     assert response.status_code == 200 and reader.call_count == 1
