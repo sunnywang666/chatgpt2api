@@ -6,7 +6,7 @@ from services.request_context import trusted_source
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from api.external_images import client_sync_result, validate_external_input, is_external, synchronous_external_task
@@ -228,8 +228,17 @@ def create_router() -> APIRouter:
     async def list_models(request: Request, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization, request=request)
         require_chat_text_policy(identity)
+        catalog_pending = False
+
+        def pending_response():
+            return JSONResponse(status_code=503, headers={"Retry-After": "1"},
+                                content={"detail": {"code": "MODEL_CATALOG_PENDING"}})
+
         try:
             result = await run_in_threadpool(openai_v1_models.list_models)
+            catalog_pending = isinstance(result, dict) and result.get("model_catalog") == {"state": "partial"}
+            if catalog_pending and result.get("data") == []:
+                return pending_response()
             if is_external(request):
                 result = await run_in_threadpool(project_public_models, result)
                 from services.image_thread import PROTOCOL
@@ -239,6 +248,8 @@ def create_router() -> APIRouter:
             # callers receive this capability on the marked ingress only.
             return result
         except PublicChatContractError as exc:
+            if catalog_pending and exc.code == "MODEL_DISCOVERY_UNAVAILABLE":
+                return pending_response()
             raise HTTPException(status_code=502, detail={"code": exc.code}) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail={"error": "model discovery unavailable" if is_external(request) else str(exc)}) from exc
