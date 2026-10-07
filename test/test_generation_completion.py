@@ -217,6 +217,46 @@ def test_confirmed_original_turn_retries_same_account_session_work_and_closes(se
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("terminal_empty", [False, True])
+@pytest.mark.parametrize("effort", [None, "high"])
+def test_text_completion_preserves_public_effort_through_durable_retry(setup, terminal_empty, effort):
+    from api.chat_requests import PublicChatRequest, _payload
+
+    service, admission, calls = setup
+    messages = [{"role": "user", "content": 'Return only JSON with keys "answer" and "steps".'}]
+    public = PublicChatRequest(client_request_id="old-0", model="fixture-text", messages=messages,
+                               **({"reasoning_effort": effort} if effort else {}))
+    mapped = _payload("owner", public, messages)
+    with service.store.transaction() as db:
+        root = service.store.read_receipt(db, "text", "owner", "old-0")
+        body = service.store.load_input(root["_input_ref"])
+        body["messages"] = messages
+        if "thinking_effort" in mapped:
+            body["thinking_effort"] = mapped["thinking_effort"]
+        root["_input_ref"] = service.store.save_input(body)
+        service.store.write_receipt(db, "text", "owner", "old-0", root)
+        db.execute("UPDATE requests SET request_hash=? WHERE owner='owner' AND id='old-0'",
+                   (service.text._submission_identity("owner", body)[1],))
+    if terminal_empty:
+        ended_original(service)
+    result = service.start("text", IDENTITY, "old-0", allow_unconfirmed_retry=not terminal_empty)
+    child_id = result["replacement_id"]
+    prepared = service.store.load_input(row(service)["_completion"]["prepared_input"])
+    assert prepared.get("thinking_effort") == effort
+    assert ("thinking_effort" in prepared) is (effort is not None)
+    assert prepared["messages"] == messages
+    assert prepared["_previous_request_id"] == prepared["_completion_of"] == "old-0"
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=admission.clock)
+    assert restarted.start("text", IDENTITY, "old-0", allow_unconfirmed_retry=not terminal_empty)["replacement_id"] == child_id
+    ctx = admission.claim_next()
+    assert ctx and ctx.request_id == child_id
+    admission.execute(ctx)
+    assert len(calls) == 1
+    assert calls[0].get("thinking_effort") == effort
+    assert ("thinking_effort" in calls[0]) is (effort is not None)
+    assert calls[0]["messages"] == messages
+
+
 def test_ended_empty_alone_cannot_close_work_and_drift_before_retry_never_sends(setup):
     service, admission, calls = setup
     ended_original(service)

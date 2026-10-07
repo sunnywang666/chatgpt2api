@@ -429,7 +429,7 @@ class GenerationCompletionService:
                 # Reuse the proven session/physical binding through the existing
                 # continuation validator. Do not reconstruct its prior context
                 # or allocate a second conversation work slot.
-                payload = {k: body[k] for k in ("model", "reasoning_effort", "messages", "_requested_account_ref", "_scheduling") if k in body}
+                payload = {k: body[k] for k in ("model", "thinking_effort", "messages", "_requested_account_ref", "_scheduling") if k in body}
                 for key in ("_requested_account_ref", "_scheduling"):
                     if root.get(key) is not None:
                         payload[key] = copy.deepcopy(root[key])
@@ -442,7 +442,7 @@ class GenerationCompletionService:
             proof = retry_evidence(root)
             if not proof or not root.get("_public_session_ref"):
                 raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
-            payload = {k: body[k] for k in ("model", "reasoning_effort", "messages", "_requested_account_ref", "_scheduling") if k in body}
+            payload = {k: body[k] for k in ("model", "thinking_effort", "messages", "_requested_account_ref", "_scheduling") if k in body}
             payload.update(client_request_id=replacement_id,
                            client_conversation_id=root["client_conversation_id"],
                            _public_session_ref=root["_public_session_ref"], _public_route="chat",
