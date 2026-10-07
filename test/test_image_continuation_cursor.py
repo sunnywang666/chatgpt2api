@@ -166,6 +166,47 @@ def test_commentary_is_only_completed_later_context(harness, case):
     assert read_receipt(service) == before
 
 
+@pytest.mark.parametrize("case", ["past", "original", "current", "active_tool", "active_recap",
+    "wrong_recipient", "recap_recipient", "no_tool", "unended_text", "fork"])
+def test_completed_past_tool_recap_is_context_only(harness, case):
+    service, backend, _ = harness
+    doc = backend.document = completed_context(2)
+    mapping = doc["mapping"]
+    final = "fresh-terminal" if case == "original" else "final-0"
+    user = mapping[final]["parent"]
+    previous = user
+    for index, kind in enumerate(["multimodal_text", "multimodal_text", "text"]):
+        node = f"past-tool-{index}"
+        mapping[node] = {"parent": previous, "message": {"id": node,
+            "author": {"role": "tool"}, "status": "finished_successfully",
+            "content": {"content_type": kind, "parts": ["past context"]}}}
+        previous = node
+    mapping[final]["parent"] = previous
+    mapping[final]["message"].update(end_turn=False, channel=None,
+        content={"content_type": "reasoning_recap"})
+    if case == "current":
+        del mapping["manual-1"], mapping["final-1"]
+        doc["current_node"] = final
+    elif case == "active_tool": mapping["past-tool-1"]["message"]["status"] = "in_progress"
+    elif case == "active_recap": mapping[final]["message"]["status"] = "in_progress"
+    elif case == "wrong_recipient": mapping["past-tool-1"]["message"]["recipient"] = "python"
+    elif case == "recap_recipient": mapping[final]["message"]["recipient"] = "python"
+    elif case == "no_tool": mapping["past-tool-1"]["message"]["author"] = {"role": "assistant"}
+    elif case == "unended_text": mapping[final]["message"]["content"] = {"content_type": "text", "parts": ["unfinished"]}
+    elif case == "fork": mapping["fork"] = {"parent": previous, "message": {"id": "fork", "author": {"role": "user"}}}
+    before = read_receipt(service)
+    if case == "past":
+        proof = service.continuation_cursor(OWNER, "policy-task", ANCHORS)
+        assert proof["parent_message_id"] == "final-1"
+        assert proof["original_terminal_message_id"] == "fresh-terminal"
+        assert backend.task_reads == 1
+    else:
+        with pytest.raises(ImageThreadError, match="IMAGE_CONTINUATION_UNAVAILABLE"):
+            service.continuation_cursor(OWNER, "policy-task", ANCHORS)
+        assert backend.task_reads == 0
+    assert read_receipt(service) == before
+
+
 @pytest.mark.parametrize("changes", [dict(status="success"), dict(error_code="RESULT_UNRECOVERABLE"),
     dict(upstream_unfinished=True), dict(data=[{"url": "old"}]), dict(_pending_image_result_ids=["old"]),
     dict(_recovery_paused=True), dict(_recovery_suppressed=True), dict(_executing=True), dict(_turn_reserved=True),
