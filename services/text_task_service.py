@@ -350,6 +350,8 @@ class TextTaskService:
             result["correction_of_request_id"] = receipt["_terminal_empty_correction_of"]
         if receipt.get("_supersedes_request_id"):
             result["supersedes_request_id"] = receipt["_supersedes_request_id"]
+        if receipt.get("_supersedes_no_final"):
+            result["continue_after_no_final"] = True
         if receipt.get("_derived_input"):
             result["derived_input"] = receipt["_derived_input"]
         completion = receipt.get("_completion")
@@ -1384,8 +1386,10 @@ class TextTaskService:
                 raise ConversationBindingError("original successor input cannot be changed", code=conflict)
             derived = "derived_input" in body
             no_final = "continue_after_no_final" in body
+            attributes_upgrade = body.get("derived_input") == {"kind": "attributes_required_only_v4"}
             if (set(body) != self.SUPERSEDE_FIELDS | ({"derived_input"} if derived else set()) | ({"continue_after_no_final"} if no_final else set()) or not owner
-                    or no_final and (body["continue_after_no_final"] is not True or derived)
+                    or no_final and (body["continue_after_no_final"] is not True or derived and not attributes_upgrade)
+                    or attributes_upgrade and not no_final
                     or any(not isinstance(body.get(k), str) or not body[k].strip() or body[k] != body[k].strip() for k in self.SUPERSEDE_FIELDS)
                     or len(request_id) > 200 or len(body["supersedes_request_id"]) > 200
                     or request_id == body["supersedes_request_id"]):
@@ -1405,8 +1409,9 @@ class TextTaskService:
             if no_final and not existing:
                 expected["continue_after_no_final"] = True
             if derived and not existing:
-                from services.category_directory_derivation import derive_category_parent_input
-                expected, _ = derive_category_parent_input(retained, request_id, body["supersedes_request_id"], body["derived_input"])
+                from services.category_directory_derivation import derive_retained_input
+                expected, _ = derive_retained_input(retained, request_id, body["supersedes_request_id"], body["derived_input"],
+                                                    no_final=no_final)
             if existing and retained.get("supersedes_request_id") != body["supersedes_request_id"]:
                 reject()
             if existing and ("derived_input" in retained) != derived:
@@ -1420,6 +1425,14 @@ class TextTaskService:
     @staticmethod
     def _supersede_order_link(previous, successor):
         """A server-registered successor releases only its own predecessor's order head."""
+        audit = successor.get("_derived_input") or {}
+        attributes_upgrade = isinstance(audit, dict) and audit.get("kind") == "attributes_required_only_v4"
+        model_upgrade = bool(attributes_upgrade
+            and successor.get("_supersedes_no_final") is True
+            and previous and previous.get("model") == audit.get("original_model") == "gpt-5-6-instant"
+            and audit.get("original_thinking_effort") == "standard"
+            and successor.get("model") == audit.get("model") == "gpt-5-6-thinking"
+            and audit.get("thinking_effort") == "high")
         return bool(previous and successor.get("_supersedes_request_id") == previous.get("request_id")
             and successor.get("request_id") != previous.get("request_id")
             and successor.get("_supersedes_request_message_id") == previous.get("request_message_id")
@@ -1428,8 +1441,9 @@ class TextTaskService:
             and successor.get("_route", "chat") == previous.get("_route", "chat") == "chat"
             and successor.get("_operation", "text") == previous.get("_operation", "text") == "text"
             and not successor.get("_forward_protocol") and not previous.get("_forward_protocol")
+            and (model_upgrade if attributes_upgrade else successor.get("model") == previous.get("model"))
             and all(successor.get(k) == previous.get(k) and previous.get(k) for k in (
-                "provider_binding_id", "provider_account_identity", "conversation_id", "client_conversation_id", "model"))
+                "provider_binding_id", "provider_account_identity", "conversation_id", "client_conversation_id"))
             and successor.get("_submission_parent_message_id") == (
                 previous.get("_submission_parent_message_id") or previous.get("parent_message_id")))
 
@@ -1473,15 +1487,20 @@ class TextTaskService:
         if identity != (previous_id, row[0]):
             reject("CHAT_SUPERSEDE_INVALID")
         if successor.get("_derived_input"):
-            if (previous.get("original_http_status") != 413
+            attributes_upgrade = successor["_derived_input"].get("kind") == "attributes_required_only_v4"
+            if attributes_upgrade:
+                if successor.get("_supersedes_no_final") is not True or not TextTaskService._no_final_successor_source(previous, now):
+                    reject("CHAT_DERIVED_INPUT_INVALID")
+            elif (previous.get("original_http_status") != 413
                     or previous.get("original_failure_phase") != "stream_open"
                     or previous.get("original_upstream_request_stage") != "conversation"
                     or previous.get("original_exception_category") != "http"
                     or previous.get("_submission_started") is not True):
                 reject("CHAT_DERIVED_INPUT_INVALID")
-            from services.category_directory_derivation import derive_category_parent_input
-            derived_body, audit = derive_category_parent_input(original_body, successor["request_id"], previous_id,
-                                                               {"kind": successor["_derived_input"].get("kind")})
+            from services.category_directory_derivation import derive_retained_input
+            derived_body, audit = derive_retained_input(original_body, successor["request_id"], previous_id,
+                                                       {"kind": successor["_derived_input"].get("kind")},
+                                                       no_final=successor.get("_supersedes_no_final") is True)
             if successor["_derived_input"] != {**audit, "original_input_hash": row[0]}:
                 reject("CHAT_DERIVED_INPUT_INVALID")
             saved = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, successor["request_id"])).fetchone()
@@ -1527,10 +1546,11 @@ class TextTaskService:
             reject("CHAT_SUPERSEDE_INVALID")
         original = json.loads(row[1])
         if "derived_input" in body:
-            from services.category_directory_derivation import derive_category_parent_input
+            from services.category_directory_derivation import derive_retained_input
             try:
                 retained = self.store.load_input(original["_input_ref"])
-                expected, audit = derive_category_parent_input(retained, body["client_request_id"], previous_id, body["derived_input"])
+                expected, audit = derive_retained_input(retained, body["client_request_id"], previous_id, body["derived_input"],
+                                                       no_final=body.get("continue_after_no_final") is True)
             except (OSError, ValueError, TypeError, KeyError):
                 reject("CHAT_DERIVED_INPUT_INVALID")
             if self._submission_identity(owner, expected) != self._submission_identity(owner, body):
