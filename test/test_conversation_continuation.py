@@ -1762,7 +1762,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         backend._list_recent_conversations.assert_called_once_with(
             limit=20, offset=0, timeout_secs=10.0, strict_schema=True,
         )
-        self.assertEqual(backend._get_conversation.call_count, 20)
+        backend._get_conversation.assert_not_called()
         self.assertEqual(
             ConversationBindingService._conversation_update_time(
                 {"update_time": "2026-09-17T13:30:26.273935Z"}

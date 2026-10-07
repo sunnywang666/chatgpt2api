@@ -73,6 +73,77 @@ class Backend:
         return copy.deepcopy(value)
 
 
+class TimedBackend(Backend):
+    def __init__(self, items):
+        super().__init__((item['id'], document(item['id'])) for item in items)
+        self.items = items
+
+    def _list_recent_conversations(self, *, limit, offset, **_):
+        self.pages.append(offset)
+        return copy.deepcopy(self.items[offset:offset+limit])
+
+
+def test_dispatch_time_coverage_excludes_old_tail_in_the_same_page(clock):
+    row = {**receipt(), 'created_at': 1000.0}
+    items = [{'id': f'new-{i}', 'update_time': 1000-i} for i in range(4)]
+    items += [{'id': 'at-skew-boundary', 'update_time': 970}]
+    items += [{'id': f'old-{i}', 'update_time': 969-i} for i in range(15)]
+    backend = TimedBackend(items)
+    error = scan_error(backend, row)
+    assert backend.pages == [0]
+    assert [c[0] for c in backend.calls] == [item['id'] for item in items[:5]]
+    assert error.recovery_reason == TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value
+
+
+@pytest.mark.parametrize('change', ['missing_time', 'unordered_page', 'missing_dispatch'])
+def test_untrusted_time_coverage_retains_all_detail_candidates(clock, change):
+    row = {**receipt(), 'created_at': 1000.0}
+    items = [{'id': f'c-{i}', 'update_time': 990-i*10} for i in range(20)]
+    if change == 'missing_time': items[4].pop('update_time')
+    if change == 'unordered_page': items[4]['update_time'] = 1100
+    if change == 'missing_dispatch': row.pop('created_at')
+    backend = TimedBackend(items)
+    scan_error(backend, row)
+    assert backend.pages == [0, 20]
+    assert [c[0] for c in backend.calls] == [item['id'] for item in items]
+
+
+def test_cross_page_time_drift_retains_old_tail(clock):
+    row = {**receipt(), 'created_at': 1000.0}
+    items = [{'id': f'first-{i}', 'update_time': 1100-i} for i in range(20)]
+    items += [{'id': f'next-{i}', 'update_time': 1200-i*20} for i in range(20)]
+    backend = TimedBackend(items)
+    scan_error(backend, row)
+    assert backend.pages == [0, 20, 40]
+    assert [c[0] for c in backend.calls] == [item['id'] for item in items]
+
+
+def test_duplicate_id_time_pairing_retains_any_recent_occurrence(clock):
+    row = {**receipt(), 'created_at': 1000.0}
+    items = [{'id': 'duplicate', 'update_time': 1000},
+             {'id': 'duplicate', 'update_time': 999},
+             {'id': 'recent', 'update_time': 998},
+             {'id': 'boundary', 'update_time': 970},
+             {'id': 'duplicate', 'update_time': 969}]
+    items += [{'id': f'old-{i}', 'update_time': 900-i} for i in range(15)]
+    backend = TimedBackend(items)
+    scan_error(backend, row)
+    assert backend.pages == [0]
+    assert [c[0] for c in backend.calls] == ['duplicate', 'recent', 'boundary']
+
+
+def test_existing_persisted_candidates_are_not_pruned_without_their_times(clock):
+    row = {**receipt(), 'created_at': 1000.0}
+    row[SCAN] = {'identity': Binding._recovery_scan_identity(row),
+                 'conversation_ids': ['saved-a', 'saved-b'], 'next_offset': 20,
+                 'coverage_complete': True, 'time_order_valid': True,
+                 'last_update_time': 800.0, 'next_index': 0, 'matches': []}
+    backend = Backend([(name, document(name)) for name in ['saved-a', 'saved-b']])
+    scan_error(backend, row)
+    assert not backend.pages
+    assert [c[0] for c in backend.calls] == ['saved-a', 'saved-b']
+
+
 def scan_error(backend, row):
     with pytest.raises(ConversationBindingError) as info:
         Binding._locate_text_request_conversation(backend, row)
