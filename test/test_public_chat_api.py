@@ -26,6 +26,32 @@ from services.text_task_service import (
 )
 
 
+def test_get_cannot_reopen_exhausted_no_final_recovery(public_chat):
+    f = public_chat
+    owner = f.key_a["id"]
+    f.tasks.submit(owner, {"client_request_id": "no-final", "client_conversation_id": "original-session",
+                           "messages": [{"role": "user", "content": "original input"}]})
+    f.tasks._update(owner, "no-final", status="failed", error_code="RESULT_UNRECOVERABLE",
+        upstream_outcome="unknown", provider_binding_id="binding", provider_account_identity="account",
+        conversation_id="original-chat", parent_message_id="original-parent", _submission_started=True,
+        _executing=False, _claim_id=None, _turn_reserved=False, _execution_wait_ended_at=1000,
+        recovery_no_result_reads=127, recovery_reason="REQUEST_RESULT_NOT_FOUND")
+    reader = Mock(return_value={"status": "unknown", "recovery_reason": "REQUEST_RESULT_NOT_FOUND"})
+    f.tasks.recovery_reader = reader
+    for _ in range(2):
+        response = f.client.get("/api/chat-requests/no-final", headers=f.headers())
+        assert response.status_code == 200
+        assert response.json()["execution"]["attempt_state"] == "ended"
+        assert response.json()["recovery"]["automatic_stopped"] is True
+        assert response.json()["recovery"]["stop_reason"] == "ORIGINAL_RESULT_NO_FINAL"
+    reader.assert_not_called()
+    response = f.client.post("/api/chat-requests/no-final/recover", headers=f.headers())
+    assert response.status_code == 200 and reader.call_count == 1
+    f.client.get("/api/chat-requests/no-final", headers=f.headers())
+    assert reader.call_count == 1
+    f.upstream.assert_not_called()
+
+
 class QueuedExecutor:
     def __init__(self):
         self.calls = []
