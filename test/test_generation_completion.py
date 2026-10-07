@@ -1225,6 +1225,158 @@ def test_recovery_pause_fences_prepared_completion_and_preserves_original(setup)
     assert row(service)["conversation_id"] == original["conversation_id"]
 
 
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("finish_after,no_result_reads", [(61, 4), (601, 3)])
+def test_original_only_read_handoff_stops_after_one_fresh_check(
+        failed_unsent_image, read_only, finish_after, no_result_reads):
+    service = failed_unsent_image
+    rid = "repair-image"
+    patch_row(service, "image", rid, retain_receipt=True, _completion=None,
+              upstream_outcome="unknown", upstream_unfinished=False,
+              _submission_started=True, upstream_submission_started=True,
+              _turn_reserved=True, _executing=False, recovery_claim_id=None,
+              conversation_id="original-conversation", request_message_id="original-request",
+              provider_binding_id="original-binding", provider_account_identity="original-account",
+              client_conversation_id="original-client", next_poll_at=0,
+              recovery_no_result_reads=3, _completion_read_at=0)
+    with service.store.transaction() as db:
+        original = service.store.read_receipt(db, "image", "owner", rid)
+        original["_public_session_ref"] = "original-image-session"
+        work = ensure_work(service.store, db, "image", "owner", rid, original)
+        work["slot_held"] = True
+        service.store.set_runtime(db, work["key"], work)
+        service.store.write_receipt(db, "image", "owner", rid, original)
+        other = service.store.read_receipt(db, "text", "owner", "old-0")
+        other_work = service.store.runtime(db, other["_work_key"])
+        other_work["slot_held"] = True
+        service.store.set_runtime(db, other_work["key"], other_work)
+    before = row(service, "image", rid)
+    service.text.admission.wake = Mock()
+    service._prepare = Mock(side_effect=AssertionError("no replacement allowed"))
+
+    def start_original_read(*args, **kwargs):
+        patch_row(service, "image", rid, status="running", _executing=True)
+
+    service.images.resume_poll = Mock(side_effect=start_original_read)
+    service.start("image", IDENTITY, rid, original_only=True, read_only_original=read_only)
+    assert row(service, "image", rid)["_completion"]["state"] == "checking_original"
+    # The original reader survives an orchestration restart. It must finish;
+    # the next due orchestration pass must not launch it all over again.
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted._prepare = service._prepare
+    service.clock.now += 30
+    restarted.advance("image", "owner", rid)
+    assert row(service, "image", rid)["_executing"] is True
+    assert not row(service, "image", rid).get("_attempt_finished_at")
+    patch_row(service, "image", rid, status="error", _executing=False,
+              error_code="RESULT_UNRECOVERABLE", recovery_no_result_reads=no_result_reads)
+    service.clock.now = 3000 + finish_after
+    for _ in range(4):
+        restarted.advance("image", "owner", rid)
+        service.clock.now += 301
+    after = row(service, "image", rid)
+    assert service.images.resume_poll.call_count == 1
+    assert after["_completion"]["state"] == "needs_attention"
+    assert after["_completion"]["reason"] == "COMPLETION_ORIGINAL_ONLY"
+    assert after["_completion"]["next_at"] is None
+    assert after["_attempt_finished_at"] and after["_turn_reserved"] is False
+    assert after["upstream_outcome"] == "unknown"
+    assert after["recovery_no_result_reads"] == no_result_reads
+    with service.store.connect() as db:
+        assert service.store.runtime(db, work["key"])["slot_held"] is False
+        assert service.store.runtime(db, other_work["key"])["slot_held"] is True
+    for key in ("conversation_id", "request_message_id", "provider_binding_id",
+                "provider_account_identity", "_input_ref", "active_attempt_deadline_at"):
+        assert after[key] == before[key]
+    service._prepare.assert_not_called()
+    if read_only:
+        service.text.admission.wake.assert_not_called()
+    # A late saved original can still be selected; stopping queries is not a
+    # statement that the upstream generation failed or never existed.
+    patch_row(service, "image", rid, status="success", data=[{"b64_json": "saved-original"}],
+              upstream_outcome="generated")
+    restarted.advance("image", "owner", rid)
+    assert row(service, "image", rid)["_completion"]["selected_id"] == rid
+    assert service.images.resume_poll.call_count == 1
+
+
+@pytest.mark.parametrize("asset", [
+    {"result_file_ids": ["original-file"]},
+    {"result_sediment_ids": ["original-sediment"]},
+    {"_pending_image_result_ids": {"file_ids": ["pending-original-file"]}},
+])
+def test_original_only_read_budget_preserves_captured_result(failed_unsent_image, asset):
+    service = failed_unsent_image
+    rid = "repair-image"
+    patch_row(service, "image", rid, retain_receipt=True, upstream_outcome="unknown",
+              conversation_id="original-conversation", request_message_id="original-request",
+              _submission_started=True, upstream_submission_started=True,
+              _executing=False, recovery_claim_id=None, next_poll_at=0,
+              recovery_no_result_reads=4, _completion_read_at=0,
+              _completion={"state": "checking_original", "allow_unconfirmed_retry": False,
+                           "max_extra_requests": 0, "next_at": 0,
+                           "original_read_requested_at": 2000,
+                           "original_read_no_result_baseline": 3}, **asset)
+    service._prepare = Mock(side_effect=AssertionError("never regenerate a captured result"))
+
+    def collect_original(*args, **kwargs):
+        patch_row(service, "image", rid, status="success", data=[{"b64_json": "saved-original"}],
+                  upstream_outcome="generated")
+
+    service.images.resume_poll = Mock(side_effect=collect_original)
+    service.advance("image", "owner", rid)
+    service.images.resume_poll.assert_called_once()
+    service._prepare.assert_not_called()
+    after = row(service, "image", rid)
+    assert after["_completion"]["selected_id"] == rid
+    assert not after.get("_attempt_finished_at")
+
+
+@pytest.mark.parametrize("pause_key", ["_recovery_paused", "_recovery_suppressed"])
+def test_original_only_read_errors_obey_cooldown_and_persistent_investigation_window(
+        failed_unsent_image, pause_key):
+    service = failed_unsent_image
+    rid = "repair-image"
+    patch_row(service, "image", rid, retain_receipt=True, upstream_outcome="unknown",
+              conversation_id="original-conversation", request_message_id="original-request",
+              _submission_started=True, upstream_submission_started=True,
+              _executing=False, recovery_claim_id=None, recovery_no_result_reads=3,
+              _completion_read_at=0, next_poll_at=3060,
+              _completion={"state": "checking_original", "allow_unconfirmed_retry": False,
+                           "max_extra_requests": 0, "next_at": 0,
+                           "original_read_requested_at": 3000,
+                           "original_read_no_result_baseline": 3})
+    original_deadline = row(service, "image", rid)["active_attempt_deadline_at"]
+    service.images.resume_poll = Mock(
+        side_effect=lambda *a, **k: patch_row(service, "image", rid, status="running", _executing=True))
+    # Observe the 429/transport backoff without converting it into a qualified
+    # no-result read. The reader still owns a live handoff during this pass.
+    patch_row(service, "image", rid, _executing=True)
+    service.clock.now = 3030
+    service.advance("image", "owner", rid)
+    service.images.resume_poll.assert_not_called()
+    patch_row(service, "image", rid, _executing=False)
+    service.clock.now = 3060
+    service.advance("image", "owner", rid)
+    service.images.resume_poll.assert_called_once()
+    patch_row(service, "image", rid, status="error", _executing=False,
+              next_poll_at=3120, **{pause_key: True})
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    service.clock.now = 3400
+    restarted.advance("image", "owner", rid)
+    assert not row(service, "image", rid).get("_attempt_finished_at")
+    patch_row(service, "image", rid, **{pause_key: False})
+    restarted.advance("image", "owner", rid)
+    after = row(service, "image", rid)
+    assert service.images.resume_poll.call_count == 1
+    assert after["_completion"]["reason"] == "COMPLETION_ORIGINAL_ONLY"
+    assert after["_completion"]["next_at"] is None
+    assert after["_completion"]["original_read_requested_at"] == 3000
+    assert after["recovery_no_result_reads"] == 3
+    assert after["upstream_outcome"] == "unknown"
+    assert after["active_attempt_deadline_at"] == original_deadline
+
+
 def test_original_only_image_policy_survives_restart_and_prevents_successor(setup):
     service, admission, calls = setup
     service.images.submit_generation(IDENTITY, client_task_id="original-only", prompt="retained input",

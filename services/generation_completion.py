@@ -61,6 +61,26 @@ def read_only_original_selected(state, request_id):
     )
 
 
+def _original_read_exhausted(root, state, now, investigation_seconds):
+    # Keep the existing qualified no-result threshold and investigation window
+    # across asynchronous handoffs. Failed transport/429 is not a qualified
+    # observation. Known assets remain a retrieval obligation, never a redraw.
+    from services.image_task_service import UNRECOVERABLE_QUALIFIED_READS
+    started = state.get("original_read_requested_at")
+    reads = int(root.get("recovery_no_result_reads") or 0)
+    baseline = int(state.get("original_read_no_result_baseline") or 0)
+    return bool(
+        state.get("max_extra_requests") == 0
+        and state.get("allow_unconfirmed_retry") is False
+        and started is not None
+        and (now >= float(started) + investigation_seconds
+             or reads >= UNRECOVERABLE_QUALIFIED_READS and reads > baseline)
+        and root.get("recovery_phase") != "download_image_result"
+        and not any(root.get(k) for k in (
+            "data", "result_file_ids", "result_sediment_ids", "_pending_image_result_ids"))
+    )
+
+
 def successful(kind, receipt):
     return bool(receipt and receipt.get("status") == ("succeeded" if kind == "text" else "success")
                 and (receipt.get("content") if kind == "text" else receipt.get("data")))
@@ -553,15 +573,26 @@ class GenerationCompletionService:
                 return
             if state.get("state") == "needs_attention" and state.get("next_at") is None:
                 return
+            read_image_original = bool(
+                kind == "image" and root.get("status") == "error" and unresolved(root)
+                and not root.get("_executing") and not root.get("recovery_claim_id")
+                and (root.get("conversation_id") or self.images.can_locate_original_cursor(root))
+                and now >= float(root.get("next_poll_at") or 0)
+                and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS
+                and not _original_read_exhausted(root, state, now, self.INVESTIGATION_SECONDS)
+            )
+            if read_image_original and state.get("max_extra_requests") == 0:
+                # Persist before dispatch so restart/repeated API calls cannot
+                # reopen a read whose worker has not yet returned. This marks
+                # a local request, not proof that upstream received the GET.
+                state.setdefault("original_read_requested_at", now)
+                state.setdefault("original_read_no_result_baseline", int(root.get("recovery_no_result_reads") or 0))
             state["next_at"] = now + self.RECHECK_SECONDS
             self.store.write_receipt(db, kind, owner, request_id, root)
         # Existing exact-original readers preserve Retry-After/backoff and errors.
         if kind == "text":
             self.text.read(owner, request_id)
-        elif (root.get("status") == "error" and unresolved(root)
-              and (root.get("conversation_id") or self.images.can_locate_original_cursor(root))
-              and now >= float(root.get("next_poll_at") or 0)
-              and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS):
+        elif read_image_original:
             self.images.resume_poll({"id": owner}, request_id, extra_timeout_secs=5,
                                     allow_unrecoverable_retry=True, completion_recheck=True,
                                     **({"wait_for_completion": True} if wait_for_image_recovery else {}))
@@ -579,6 +610,8 @@ class GenerationCompletionService:
                     work = self.store.runtime(db, root.get("_work_key")) if root.get("_work_key") else None
                     if work and work.get("state") != "active":
                         raise CompletionError("COMPLETION_WORK_NOT_ACTIVE")
+                    if kind == "image" and _original_read_exhausted(root, state, now, self.INVESTIGATION_SECONDS):
+                        raise CompletionError("COMPLETION_ORIGINAL_ONLY")
                     not_sent = (root.get("upstream_outcome") in {"not_sent", "not_submitted"}
                                 and root.get("_submission_started") is not True
                                 and root.get("upstream_submission_started") is not True)
@@ -649,7 +682,9 @@ class GenerationCompletionService:
                         state["next_at"] = now + self.RECHECK_SECONDS if paused else None
                         # End automatic investigation, not the upstream fact.
                         definitely_unsent = root.get("upstream_outcome") in {"not_sent", "not_submitted"} and root.get("_submission_started") is not True
-                        if not active and (definitely_unsent or (state.get("allow_unconfirmed_retry") or state.get("automatic_failure_retry")) and unresolved(root)) and exc.code not in {
+                        original_reads_ended = (kind == "image" and exc.code == "COMPLETION_ORIGINAL_ONLY"
+                                                and _original_read_exhausted(root, state, now, self.INVESTIGATION_SECONDS))
+                        if not active and (definitely_unsent or original_reads_ended or (state.get("allow_unconfirmed_retry") or state.get("automatic_failure_retry")) and unresolved(root)) and exc.code not in {
                                 "COMPLETION_WORK_NOT_ACTIVE", "COMPLETION_ORIGINAL_RECOVERY_PAUSED",
                                 "COMPLETION_DOWNLOAD_ORIGINAL_RESULT"}:
                             root.update(_attempt_finished_at=now, _attempt_reason=exc.code, _turn_reserved=False)
