@@ -537,7 +537,8 @@ def _similarity_failure_tail(document, receipt):
     for i, start in enumerate(user_positions):
         end = user_positions[i + 1] - 1 if i + 1 < len(user_positions) else len(path) - 1
         proof = _completed_request_turn(mapping, children, path[start], conversation,
-                                        allow_completed_tool_call=True)
+                                        allow_completed_tool_call=True,
+                                        allow_completed_commentary=i > 0)
         if (not proof or proof["final_message_id"] != path[end]
                 or mapping[path[end]]["message"].get("recipient") not in {None, "all"}):
             return None

@@ -144,7 +144,8 @@ def _request_parent_matches_receipt(
     )
 
 
-def _completed_request_turn(mapping, children, request_message_id, conversation_id, *, allow_completed_tool_call=False):
+def _completed_request_turn(mapping, children, request_message_id, conversation_id, *, allow_completed_tool_call=False,
+                            allow_completed_commentary=False):
     """Positive terminal evidence for the exact original branch, even without a usable answer."""
     node_id, visited = request_message_id, {request_message_id}
     while True:
@@ -214,7 +215,11 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
                 or message.get("status") != "finished_successfully" and not (stale_reasoning or stale_tool_call)):
             return None
         if role == "assistant" and message.get("end_turn") is True:
-            if message.get("channel") not in {None, "final"}:
+            completed_commentary = (allow_completed_commentary and message.get("channel") == "commentary"
+                and isinstance(content, dict) and content.get("content_type") == "text"
+                and isinstance(content.get("parts"), list) and all(isinstance(p, str) for p in content["parts"])
+                and any(p.strip() for p in content["parts"]))
+            if message.get("channel") not in {None, "final"} and not completed_commentary:
                 return None
             for successor in children.get(node_id, []):
                 following = mapping.get(successor, {}).get("message")
