@@ -399,6 +399,7 @@ def finished_parent(document, conversation_id, request_message_id, *, expected_p
             raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
     seen, current = {request_message_id}, request_message_id
     saw_assistant = False
+    stale_assistant = False
     expected = {item for item in (expected_result_ids or ()) if isinstance(item, str) and item}
     observed = set()
     for _ in range(len(mapping)):
@@ -412,10 +413,17 @@ def finished_parent(document, conversation_id, request_message_id, *, expected_p
         node = mapping[current]
         msg = node.get("message")
         if (not isinstance(msg, dict) or msg.get("id") != current
-                or (msg.get("author") or {}).get("role") not in {"assistant", "tool"}
-                or msg.get("status") != "finished_successfully"):
+                or (msg.get("author") or {}).get("role") not in {"assistant", "tool"}):
             raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED")
         role = (msg.get("author") or {}).get("role")
+        if msg.get("status") != "finished_successfully":
+            # Upstream may retain an in-progress assistant ancestor after its
+            # own image tool and final answer complete. Only a later exact
+            # final leaf with all expected assets can supersede that snapshot.
+            if (role != "assistant" or msg.get("status") != "in_progress"
+                    or msg.get("end_turn") is not False or _image_result_ids(msg)):
+                raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED")
+            stale_assistant = True
         if role == "assistant":
             saw_assistant = True
         observed.update(_image_result_ids(msg))
@@ -424,10 +432,10 @@ def finished_parent(document, conversation_id, request_message_id, *, expected_p
         if role == "assistant" and msg.get("end_turn") is True:
             if msg.get("channel") not in {None, "final"} or document.get("current_node") != current or children.get(current):
                 raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
-            if require_final and (not expected or observed != expected):
+            if (require_final or stale_assistant) and (not expected or observed != expected):
                 raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED")
             return current
-        if (not require_final and role == "tool" and saw_assistant and expected
+        if (not require_final and not stale_assistant and role == "tool" and saw_assistant and expected
                 and document.get("current_node") == current and not children.get(current)
                 and _image_result_ids(msg) and observed == expected):
             return current

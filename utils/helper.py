@@ -371,16 +371,29 @@ def _observe_sse_message(event: dict, observation: dict, request_message_id: str
         return
     count("sse_message_snapshot_events")
     author = message.get("author")
-    if not isinstance(author, dict) or author.get("role") != "assistant":
+    role = author.get("role") if isinstance(author, dict) else None
+    role_bucket = role if role in ("user", "assistant", "tool", "system") else "unknown"
+    count("sse_snapshot_role_" + role_bucket + "_events")
+    status = message.get("status")
+    status_bucket = (status if status in ("in_progress", "finished_successfully")
+                     else "missing" if status is None else "other")
+    count("sse_snapshot_status_" + status_bucket + "_events")
+    metadata = message.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if role == "tool" and metadata.get("async_task_type") == "image_gen":
+        count("sse_image_tool_snapshot_events")
+    if role != "assistant":
         return
     if message.get("status") != "finished_successfully" or message.get("end_turn") is not True:
         return
     count("sse_terminal_assistant_events")
+    content = message.get("content")
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if isinstance(parts, list) and not any(part.strip() if isinstance(part, str) else bool(part) for part in parts):
+        count("sse_terminal_empty_content_events")
     has_id = isinstance(message.get("id"), str) and bool(message["id"])
     if has_id:
         count("sse_terminal_id_events")
-    metadata = message.get("metadata")
-    metadata = metadata if isinstance(metadata, dict) else {}
     if message.get("channel") == "final" or metadata.get("channel") == "final":
         count("sse_terminal_final_channel_events")
     parents = {parent for container in (frame, message, metadata)
@@ -398,7 +411,10 @@ def iter_sse_payloads(response: requests.Response, *, observation: dict | None =
     if observation is not None:
         for key in ("sse_message_snapshot_events", "sse_terminal_assistant_events", "sse_terminal_id_events",
                     "sse_terminal_final_channel_events", "sse_terminal_parent_events",
-                    "sse_terminal_direct_parent_match_events"):
+                    "sse_terminal_direct_parent_match_events", "sse_terminal_empty_content_events",
+                    "sse_image_tool_snapshot_events",
+                    *("sse_snapshot_role_" + role + "_events" for role in ("user", "assistant", "tool", "system", "unknown")),
+                    *("sse_snapshot_status_" + status + "_events" for status in ("in_progress", "finished_successfully", "other", "missing"))):
             observation.setdefault(key, 0)
     error_event = False
     for raw_line in response.iter_lines():

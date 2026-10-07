@@ -3417,8 +3417,10 @@ class OpenAIBackendAPI:
             with asset_tail_lock:
                 if not can_close_stream or asset_tail_closed or asset_tail_expired or stopped.is_set():
                     return False
-                seconds = min(float(config.image_poll_interval_secs), deadline - time.monotonic())
-                if seconds <= 0:
+                seconds = float(config.image_poll_interval_secs)
+                # Do not defer the only result check all the way to the
+                # transport hard cap. With too little time left, probe now.
+                if seconds <= 0 or deadline - time.monotonic() <= seconds:
                     return False
                 asset_tail_armed = True
                 asset_tail_generation += 1

@@ -116,6 +116,7 @@ def test_sse_error_retains_only_structured_category_across_restart(runtime, code
 @pytest.mark.parametrize("end", ["done", "eof", "transport_error"])
 def test_image_stream_records_its_own_end_before_result_collection(monkeypatch, end):
     monkeypatch.setattr("services.openai_backend_api.account_service.get_account", lambda token: {})
+    monkeypatch.setattr("services.openai_backend_api.account_service.require_image_account", lambda *a, **kw: {})
     backend = OpenAIBackendAPI(access_token="fixture-token")
     monkeypatch.setattr(backend, "_bootstrap", lambda: None)
     monkeypatch.setattr(backend, "_get_chat_requirements", lambda: ChatRequirements(token="fixture"))
@@ -179,6 +180,11 @@ def test_sse_terminal_observations_preserve_unknown_and_never_store_nodes_or_con
     assert evidence["sse_terminal_final_channel_events"] == 4
     assert evidence["sse_terminal_parent_events"] == 4
     assert evidence["sse_terminal_direct_parent_match_events"] == 2
+    assert evidence["sse_snapshot_role_assistant_events"] == 6
+    assert evidence["sse_snapshot_role_tool_events"] == 1
+    assert evidence["sse_snapshot_status_in_progress_events"] == 1
+    assert evidence["sse_snapshot_status_finished_successfully_events"] == 6
+    assert evidence["sse_terminal_empty_content_events"] == 0
     assert row["status"] != "succeeded"
     assert sum(e["stage"] == "send_guard_passed" for e in row["_execution_timeline"]) == 1
     assert "PRIVATE" not in json.dumps(evidence)
@@ -192,6 +198,36 @@ def test_sse_done_or_patch_alone_is_not_a_terminal_message_snapshot():
     assert observation["stream_end"] == "done"
     assert observation["sse_terminal_assistant_events"] == 0
     assert observation["sse_terminal_direct_parent_match_events"] == 0
+    assert observation["sse_snapshot_role_assistant_events"] == 0
+    assert observation["sse_image_tool_snapshot_events"] == 0
+
+
+def test_sse_empty_result_diagnostics_use_only_fixed_buckets():
+    from utils.helper import iter_sse_payloads
+    messages = [
+        {"author":{"role":"user"}, "status":"finished_successfully", "content":{"parts":["PRIVATE_PROMPT"]}},
+        {"author":{"role":"assistant"}, "status":"finished_successfully", "end_turn":True, "content":{"parts":[" \n"]}},
+        {"author":{"role":"tool"}, "status":"in_progress", "metadata":{"async_task_type":"image_gen"},
+         "content":{"parts":[{"asset_pointer":"https://PRIVATE_SIGNED_URL"}]}},
+        {"author":{"role":"PRIVATE_ROLE"}, "status":"PRIVATE_STATUS", "content":{"parts":["PRIVATE_BODY"]}},
+        {"author":{"role":{}}, "status":{}, "content":{"parts":[]}},
+        {"author":{"role":"system"}},
+    ]
+    response = Response([("data: " + json.dumps({"message":message})).encode() for message in messages])
+    observation = {}
+    list(iter_sse_payloads(response, observation=observation))
+    assert observation["sse_snapshot_role_user_events"] == 1
+    assert observation["sse_snapshot_role_assistant_events"] == 1
+    assert observation["sse_snapshot_role_tool_events"] == 1
+    assert observation["sse_snapshot_role_system_events"] == 1
+    assert observation["sse_snapshot_role_unknown_events"] == 2
+    assert observation["sse_snapshot_status_finished_successfully_events"] == 2
+    assert observation["sse_snapshot_status_in_progress_events"] == 1
+    assert observation["sse_snapshot_status_missing_events"] == 1
+    assert observation["sse_snapshot_status_other_events"] == 2
+    assert observation["sse_image_tool_snapshot_events"] == 1
+    assert observation["sse_terminal_empty_content_events"] == 1
+    assert "PRIVATE" not in json.dumps(observation)
 
 
 def _snapshot_chain(events, root="PRIVATE_USER"):
@@ -291,6 +327,7 @@ def test_snapshot_chain_counts_unique_blocked_roles_without_persisting_role_valu
 
 def test_image_stream_passes_original_node_to_safe_observation(monkeypatch):
     monkeypatch.setattr("services.openai_backend_api.account_service.get_account", lambda token: {})
+    monkeypatch.setattr("services.openai_backend_api.account_service.require_image_account", lambda *a, **kw: {})
     backend = OpenAIBackendAPI(access_token="fixture-token")
     backend.image_request_message_id = "PRIVATE_IMAGE_USER_NODE"
     monkeypatch.setattr(backend, "_bootstrap", lambda: None)

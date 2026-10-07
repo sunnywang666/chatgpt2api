@@ -61,6 +61,47 @@ def tool_document(cid="conversation-a", rid="request-a", parent="root"):
         rid + "-image": tool}}, result_id
 
 
+@pytest.mark.parametrize("change", [None, "no-final", "unfinished-final", "unfinished-tool",
+    "unknown-status", "missing-end-turn", "early-end-turn", "ancestor-asset", "foreign-asset",
+    "missing-asset", "no-expected", "sibling", "manual-successor", "wrong-current", "wrong-channel", "wrong-parent"])
+def test_completed_image_final_supersedes_only_stale_assistant_ancestor(change):
+    doc, asset = tool_document()
+    mapping = doc["mapping"]
+    mapping["thinking"] = node("thinking", "assistant", "request-a")
+    mapping["thinking"]["message"].update(status="in_progress", end_turn=False)
+    mapping["request-a-code"]["parent"] = "thinking"
+    mapping["recap"] = node("recap", "assistant", "request-a-image")
+    mapping["recap"]["message"]["content"] = {"content_type": "reasoning_recap"}
+    mapping["final"] = node("final", "assistant", "recap", end=True)
+    mapping["final"]["message"]["channel"] = "final"
+    doc["current_node"] = "final"
+    expected = [asset]
+    if change == "no-final":
+        del mapping["final"]; del mapping["recap"]
+        doc["current_node"] = "request-a-image"
+    elif change == "unfinished-final": mapping["final"]["message"]["status"] = "in_progress"
+    elif change == "unfinished-tool": mapping["request-a-image"]["message"]["status"] = "in_progress"
+    elif change == "unknown-status": mapping["thinking"]["message"]["status"] = "failed"
+    elif change == "missing-end-turn": mapping["thinking"]["message"].pop("end_turn")
+    elif change == "early-end-turn": mapping["thinking"]["message"]["end_turn"] = True
+    elif change == "ancestor-asset": mapping["thinking"]["message"]["content"] = copy.deepcopy(mapping["request-a-image"]["message"]["content"])
+    elif change == "foreign-asset": expected = ["file_00000000" + "f" * 24]
+    elif change == "missing-asset": mapping["request-a-image"]["message"]["content"] = {"parts": []}
+    elif change == "no-expected": expected = []
+    elif change == "sibling": mapping["sibling"] = node("sibling", "assistant", "thinking")
+    elif change == "manual-successor": mapping["recap"]["message"]["author"]["role"] = "user"
+    elif change == "wrong-current": doc["current_node"] = "request-a-image"
+    elif change == "wrong-channel": mapping["final"]["message"]["channel"] = "commentary"
+    elif change == "wrong-parent": mapping["request-a"]["parent"] = "foreign-parent"
+    if change is not None:
+        with pytest.raises(ImageThreadError):
+            finished_parent(doc, "conversation-a", "request-a", expected_parent="root", expected_result_ids=expected)
+        return
+    assert finished_parent(doc, "conversation-a", "request-a", expected_parent="root", expected_result_ids=expected) == "final"
+    from services.image_thread import archive_parent
+    assert archive_parent(doc, "conversation-a", "request-a", "final", expected, expected_parent="root") == "final"
+
+
 @pytest.fixture
 def runtime(tmp_path, monkeypatch):
     rows = [{"access_token": "fixture-token", "account_id": "fixture-upstream",
