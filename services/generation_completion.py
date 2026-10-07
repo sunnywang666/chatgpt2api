@@ -70,14 +70,12 @@ def _original_read_exhausted(root, state, now, investigation_seconds):
     reads = int(root.get("recovery_no_result_reads") or 0)
     baseline = int(state.get("original_read_no_result_baseline") or 0)
     return bool(
-        state.get("max_extra_requests") == 0
-        and state.get("allow_unconfirmed_retry") is False
-        and started is not None
+        started is not None
         and (now >= float(started) + investigation_seconds
              or reads >= UNRECOVERABLE_QUALIFIED_READS and reads > baseline)
         and root.get("recovery_phase") != "download_image_result"
         and not any(root.get(k) for k in (
-            "data", "result_file_ids", "result_sediment_ids", "_pending_image_result_ids"))
+            "data", "result_file_ids", "result_sediment_ids", "_pending_image_result_ids", "_pending_image_output"))
     )
 
 
@@ -363,6 +361,11 @@ class GenerationCompletionService:
                 # An explicit recover may gather fresh evidence after a repair.
                 # Keep the ended marker/history; no automatic restart on upgrade.
                 state.update(state="checking_original", next_at=now)
+                # This existing explicit edit-recheck action opens a bounded
+                # investigation. Background ticks/restarts never renew it, and
+                # original-only policies cannot enter this authorized branch.
+                state.pop("original_read_requested_at", None)
+                state.pop("original_read_no_result_baseline", None)
                 self.store.write_receipt(db, kind, owner, request_id, root)
             if original_only:
                 # The company ingress can recover the original receipt or a
@@ -581,7 +584,7 @@ class GenerationCompletionService:
                 and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS
                 and not _original_read_exhausted(root, state, now, self.INVESTIGATION_SECONDS)
             )
-            if read_image_original and state.get("max_extra_requests") == 0:
+            if read_image_original:
                 # Persist before dispatch so restart/repeated API calls cannot
                 # reopen a read whose worker has not yet returned. This marks
                 # a local request, not proof that upstream received the GET.
@@ -610,8 +613,16 @@ class GenerationCompletionService:
                     work = self.store.runtime(db, root.get("_work_key")) if root.get("_work_key") else None
                     if work and work.get("state") != "active":
                         raise CompletionError("COMPLETION_WORK_NOT_ACTIVE")
+                    ended = (self.text._verified_retryable_empty(root) if kind == "text"
+                             else verified_image_failure(root, now, self.INVESTIGATION_SECONDS))
                     if kind == "image" and _original_read_exhausted(root, state, now, self.INVESTIGATION_SECONDS):
-                        raise CompletionError("COMPLETION_ORIGINAL_ONLY")
+                        if state.get("max_extra_requests") == 0:
+                            raise CompletionError("COMPLETION_ORIGINAL_ONLY")
+                        # An unqualified read must reach the existing failure
+                        # exit instead of rearming another async handoff. Fresh
+                        # original evidence still permits the normal retry path.
+                        if not ended and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS:
+                            raise CompletionError("COMPLETION_ORIGINAL_READ_UNAVAILABLE")
                     not_sent = (root.get("upstream_outcome") in {"not_sent", "not_submitted"}
                                 and root.get("_submission_started") is not True
                                 and root.get("upstream_submission_started") is not True)
@@ -643,8 +654,6 @@ class GenerationCompletionService:
                         # resume_poll cannot query that original without a cursor;
                         # repeating its local ValueError is not an investigation.
                         raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNAVAILABLE")
-                    ended = (self.text._verified_retryable_empty(root) if kind == "text"
-                             else verified_image_failure(root, now, self.INVESTIGATION_SECONDS))
                     retry_authorized = state["allow_unconfirmed_retry"] or state.get("automatic_failure_retry")
                     if kind == "text" and root.get("conversation_id") and not ended and not retry_authorized:
                         raise CompletionError("COMPLETION_ORIGINAL_END_UNCONFIRMED")
@@ -682,7 +691,8 @@ class GenerationCompletionService:
                         state["next_at"] = now + self.RECHECK_SECONDS if paused else None
                         # End automatic investigation, not the upstream fact.
                         definitely_unsent = root.get("upstream_outcome") in {"not_sent", "not_submitted"} and root.get("_submission_started") is not True
-                        original_reads_ended = (kind == "image" and exc.code == "COMPLETION_ORIGINAL_ONLY"
+                        original_reads_ended = (kind == "image" and exc.code in {
+                                                "COMPLETION_ORIGINAL_ONLY", "COMPLETION_ORIGINAL_READ_UNAVAILABLE"}
                                                 and _original_read_exhausted(root, state, now, self.INVESTIGATION_SECONDS))
                         if not active and (definitely_unsent or original_reads_ended or (state.get("allow_unconfirmed_retry") or state.get("automatic_failure_retry")) and unresolved(root)) and exc.code not in {
                                 "COMPLETION_WORK_NOT_ACTIVE", "COMPLETION_ORIGINAL_RECOVERY_PAUSED",

@@ -1611,7 +1611,9 @@ def test_absent_edit_qualified_reads_then_one_same_session_completion(runtime, m
             ended.update(_attempt_finished_at=ended_at, _attempt_reason='COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED',
                          _retry_cursor=None, _completion_read_at=now-400,
                          _completion={'state': 'needs_attention', 'next_at': None, 'started_at': now-1300,
-                                      'allow_unconfirmed_retry': True, 'max_extra_requests': 1})
+                                      'allow_unconfirmed_retry': True, 'max_extra_requests': 1,
+                                      'original_read_requested_at': now-800,
+                                      'original_read_no_result_baseline': ended.get('recovery_no_result_reads', 0)})
             r.store.write_receipt(db, 'image', WHO['id'], 'absent-edit', ended)
         before = len(r.state.reads)
         r.service.resume_poll(WHO, 'absent-edit', allow_unrecoverable_retry=True)

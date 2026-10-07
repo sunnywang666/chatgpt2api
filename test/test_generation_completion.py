@@ -662,7 +662,8 @@ def test_late_policy_refusal_blocks_already_prepared_image_replacement(failed_un
                                             {"_completion_of": "repair-image"})
 
 
-def test_verified_empty_image_still_prepares_retry_in_original_conversation(failed_unsent_image):
+@pytest.mark.parametrize("investigation_ended", [False, True])
+def test_verified_empty_image_still_prepares_retry_in_original_conversation(failed_unsent_image, investigation_ended):
     service = failed_unsent_image
     rid = "repair-image"
     patch_row(service, "image", rid, retain_receipt=True, status="error", error_code="NO_IMAGE_GENERATED",
@@ -674,6 +675,15 @@ def test_verified_empty_image_still_prepares_retry_in_original_conversation(fail
               _retry_cursor={"conversation_id": "original-chat", "request_message_id": "original-user",
                              "retry_parent_message_id": "empty-final", "observed_at": service.clock(),
                              "source": "terminal_image_failure"})
+    if investigation_ended:
+        # A strict terminal proof can arrive on the original stream without a
+        # successful follow-up GET. It still authorizes the existing retry.
+        patch_row(service, "image", rid, _completion_read_at=0,
+                  recovery_no_result_reads=4,
+                  _completion={"state": "checking_original", "allow_unconfirmed_retry": False,
+                               "automatic_failure_retry": True, "max_extra_requests": 1, "next_at": 0,
+                               "original_read_requested_at": service.clock() - 301,
+                               "original_read_no_result_baseline": 3})
     service.images._submit = Mock()
     service.start("image", IDENTITY, rid)
     root = row(service, "image", rid)
@@ -1300,12 +1310,58 @@ def test_original_only_read_handoff_stops_after_one_fresh_check(
     assert service.images.resume_poll.call_count == 1
 
 
+@pytest.mark.parametrize("automatic", [False, True])
+def test_retryable_image_read_handoff_cannot_reopen_missing_original_evidence(failed_unsent_image, automatic):
+    service = failed_unsent_image
+    rid = "repair-image"
+    patch_row(service, "image", rid, retain_receipt=True, upstream_outcome="unknown",
+              _submission_started=True, upstream_submission_started=True,
+              _turn_reserved=True, _executing=False, recovery_claim_id=None,
+              conversation_id="original-conversation", request_message_id="original-request",
+              provider_binding_id="original-binding", provider_account_identity="original-account",
+              client_conversation_id="original-client", next_poll_at=0,
+              recovery_no_result_reads=3, _completion_read_at=0,
+              _completion={"state": "checking_original", "max_extra_requests": 1,
+                           "automatic_failure_retry": automatic,
+                           "allow_unconfirmed_retry": not automatic, "next_at": 0})
+    before = row(service, "image", rid)
+    service._prepare = Mock(side_effect=AssertionError("no retry without original evidence"))
+    service.images.resume_poll = Mock(side_effect=lambda *a, **k:
+                                     patch_row(service, "image", rid, status="running", _executing=True))
+    service.advance("image", "owner", rid)
+    assert row(service, "image", rid)["_executing"]
+    # No usable original message was observed. Restart/ticks must not rearm
+    # the same unsuccessful reader before the existing error exit can run.
+    patch_row(service, "image", rid, status="error", _executing=False,
+              error_code="RESULT_UNRECOVERABLE", recovery_no_result_reads=4)
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted._prepare = service._prepare
+    service.clock.now += 301
+    for _ in range(4):
+        restarted.advance("image", "owner", rid)
+        service.clock.now += 301
+    after = row(service, "image", rid)
+    assert service.images.resume_poll.call_count == 1
+    assert after["_completion"]["reason"] == "COMPLETION_ORIGINAL_READ_UNAVAILABLE"
+    assert after["_completion"]["state"] == "needs_attention"
+    assert after["_completion"]["next_at"] is None
+    assert after["_attempt_finished_at"] and after["_turn_reserved"] is False
+    assert after["upstream_outcome"] == "unknown"
+    assert not after["_completion"].get("replacement_id")
+    for key in ("conversation_id", "request_message_id", "provider_binding_id",
+                "provider_account_identity", "_input_ref", "active_attempt_deadline_at"):
+        assert after[key] == before[key]
+    service._prepare.assert_not_called()
+
+
+@pytest.mark.parametrize("max_extra_requests", [0, 1])
 @pytest.mark.parametrize("asset", [
     {"result_file_ids": ["original-file"]},
     {"result_sediment_ids": ["original-sediment"]},
     {"_pending_image_result_ids": {"file_ids": ["pending-original-file"]}},
+    {"_pending_image_output": {"output_ref": "downloaded-original-output", "coverage": "original-assets"}},
 ])
-def test_original_only_read_budget_preserves_captured_result(failed_unsent_image, asset):
+def test_original_only_read_budget_preserves_captured_result(failed_unsent_image, asset, max_extra_requests):
     service = failed_unsent_image
     rid = "repair-image"
     patch_row(service, "image", rid, retain_receipt=True, upstream_outcome="unknown",
@@ -1314,7 +1370,7 @@ def test_original_only_read_budget_preserves_captured_result(failed_unsent_image
               _executing=False, recovery_claim_id=None, next_poll_at=0,
               recovery_no_result_reads=4, _completion_read_at=0,
               _completion={"state": "checking_original", "allow_unconfirmed_retry": False,
-                           "max_extra_requests": 0, "next_at": 0,
+                           "max_extra_requests": max_extra_requests, "next_at": 0,
                            "original_read_requested_at": 2000,
                            "original_read_no_result_baseline": 3}, **asset)
     service._prepare = Mock(side_effect=AssertionError("never regenerate a captured result"))
