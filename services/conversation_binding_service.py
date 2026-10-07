@@ -4,6 +4,7 @@ import hashlib
 import math
 import re
 import time
+from copy import deepcopy
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -143,7 +144,8 @@ def _request_parent_matches_receipt(
     )
 
 
-def _completed_request_turn(mapping, children, request_message_id, conversation_id, *, allow_completed_tool_call=False):
+def _completed_request_turn(mapping, children, request_message_id, conversation_id, *, allow_completed_tool_call=False,
+                            allow_completed_commentary=False):
     """Positive terminal evidence for the exact original branch, even without a usable answer."""
     node_id, visited = request_message_id, {request_message_id}
     while True:
@@ -213,7 +215,11 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
                 or message.get("status") != "finished_successfully" and not (stale_reasoning or stale_tool_call)):
             return None
         if role == "assistant" and message.get("end_turn") is True:
-            if message.get("channel") not in {None, "final"}:
+            completed_commentary = (allow_completed_commentary and message.get("channel") == "commentary"
+                and isinstance(content, dict) and content.get("content_type") == "text"
+                and isinstance(content.get("parts"), list) and all(isinstance(p, str) for p in content["parts"])
+                and any(p.strip() for p in content["parts"]))
+            if message.get("channel") not in {None, "final"} and not completed_commentary:
                 return None
             for successor in children.get(node_id, []):
                 following = mapping.get(successor, {}).get("message")
@@ -1503,6 +1509,64 @@ class ConversationBindingService:
                 or parent.get("children") or any(node.get("parent") == parent_message_id for node in mapping.values())):
             reject("CHAT_SUPERSEDE_CURSOR_CHANGED")
 
+    @staticmethod
+    def _no_final_successor_tail(document, original):
+        """Completed code/tool steps are context, not a final text answer.
+
+        This permits one explicitly requested continuation; it does not prove
+        the previous upstream turn was cancelled or erase its UNKNOWN receipt.
+        """
+        def reject():
+            raise ConversationBindingError("original no-final branch cannot be continued",
+                                           code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+        if (not isinstance(document, dict) or document.get("conversation_id") != original.get("conversation_id")
+                or document.get("is_archived") is not False or not isinstance(document.get("mapping"), dict)):
+            reject()
+        mapping = document["mapping"]
+        user = original.get("request_message_id")
+        expected = original.get("request_parent_message_id") or original.get("_submission_parent_message_id")
+        if not user or not expected or user not in mapping or any(not isinstance(x, dict) for x in mapping.values()):
+            reject()
+        children = {}
+        for key, node in mapping.items():
+            parent = node.get("parent")
+            if parent is not None and not isinstance(parent, str):
+                reject()
+            children.setdefault(parent, []).append(key)
+        node_id, seen, previous_role, context = user, set(), None, []
+        while True:
+            if node_id in seen:
+                reject()
+            seen.add(node_id)
+            node = mapping[node_id]
+            message = node.get("message")
+            if (not isinstance(message, dict) or message.get("id") != node_id
+                    or not isinstance(message.get("author"), dict)
+                    or message.get("status") != "finished_successfully"):
+                reject()
+            role = message["author"].get("role")
+            if node_id == user:
+                if role != "user" or node.get("parent") != expected:
+                    reject()
+            elif role == "assistant":
+                content = message.get("content")
+                if (previous_role not in {"user", "tool"} or message.get("end_turn") is not False
+                        or message.get("channel") not in {None, "analysis"}
+                        or not isinstance(content, dict) or content.get("content_type") != "code"):
+                    reject()
+            elif role != "tool" or previous_role != "assistant" or message.get("end_turn") is True:
+                reject()
+            context.append(deepcopy({k: message.get(k) for k in
+                ("id", "author", "recipient", "channel", "content", "status", "end_turn")}))
+            next_nodes = children.get(node_id, [])
+            if len(next_nodes) > 1 or (node.get("children") or []) != next_nodes:
+                reject()
+            if not next_nodes:
+                if role != "tool" or document.get("current_node") != node_id:
+                    reject()
+                return node_id, context
+            previous_role, node_id = role, next_nodes[0]
+
     def complete_text(self, body: dict[str, Any], *, on_cursor=None) -> dict[str, Any]:
         binding_id = str(body.get("provider_binding_id") or "").strip()
         account_identity = str(body.get("provider_account_identity") or "").strip()
@@ -1598,8 +1662,12 @@ class ConversationBindingService:
                     except Exception as exc:
                         raise ConversationBindingError("original conversation read is temporarily unavailable",
                                                        code="CHAT_SUPERSEDE_READ_UNAVAILABLE") from exc
-                    self._check_superseded_original(fresh, conversation_id, parent_message_id,
-                                                    body["_supersedes_request_message_id"])
+                    if body.get("_supersedes_no_final_original"):
+                        if self._no_final_successor_tail(fresh, body["_supersedes_no_final_original"]) != no_final_context:
+                            raise ConversationBindingError("original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+                    else:
+                        self._check_superseded_original(fresh, conversation_id, parent_message_id,
+                                                        body["_supersedes_request_message_id"])
                     if fresh["is_archived"]:
                         raise ConversationBindingError("original conversation restore is unconfirmed",
                                                        code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
@@ -1647,8 +1715,14 @@ class ConversationBindingService:
                                                        code=("CHAT_SUPERSEDE_READ_UNAVAILABLE" if body.get("_supersedes_request_message_id")
                                                              else "CHAT_ARCHIVE_RESTORE_UNCONFIRMED")) from exc
                     if body.get("_supersedes_request_message_id"):
-                        self._check_superseded_original(document, conversation_id, parent_message_id,
-                                                        body["_supersedes_request_message_id"])
+                        if body.get("_supersedes_no_final_original"):
+                            no_final_context = self._no_final_successor_tail(document, body["_supersedes_no_final_original"])
+                            parent_message_id = no_final_context[0]
+                            if on_cursor:
+                                on_cursor({"request_parent_message_id": parent_message_id})
+                        else:
+                            self._check_superseded_original(document, conversation_id, parent_message_id,
+                                                            body["_supersedes_request_message_id"])
                     if not isinstance(document, dict) or type(document.get("is_archived")) is not bool:
                         raise ConversationBindingError("original conversation visibility is unconfirmed",
                                                        code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED")

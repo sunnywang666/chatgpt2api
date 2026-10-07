@@ -141,6 +141,32 @@ def test_invalid_context_never_proves_continuation(harness, change):
     assert read_receipt(service) == before and backend.task_reads == 0
 
 
+@pytest.mark.parametrize("case", ["later_completed", "original", "active", "not_ended", "empty", "non_text"])
+def test_commentary_is_only_completed_later_context(harness, case):
+    service, backend, _ = harness
+    doc = backend.document = completed_context(2)
+    message = doc["mapping"]["fresh-terminal" if case == "original" else "final-0"]["message"]
+    message["channel"] = "commentary"
+    if case == "active": message["status"] = "in_progress"
+    elif case == "not_ended": message["end_turn"] = False
+    elif case == "empty": message["content"]["parts"] = [" "]
+    elif case == "non_text": message["content"] = {"content_type": "code", "text": "context"}
+    before = read_receipt(service)
+    if case == "later_completed":
+        proof = service.continuation_cursor(OWNER, "policy-task", ANCHORS)
+        assert proof["parent_message_id"] == "final-1"
+        assert proof["original_terminal_message_id"] == "fresh-terminal"
+        from services.conversation_binding_service import _completed_request_turn
+        children = {}
+        for key, node in doc["mapping"].items(): children.setdefault(node.get("parent"), []).append(key)
+        assert _completed_request_turn(doc["mapping"], children, "manual-0", "conversation-1") is None
+    else:
+        with pytest.raises(ImageThreadError, match="IMAGE_CONTINUATION_UNAVAILABLE"):
+            service.continuation_cursor(OWNER, "policy-task", ANCHORS)
+        assert backend.task_reads == 0
+    assert read_receipt(service) == before
+
+
 @pytest.mark.parametrize("changes", [dict(status="success"), dict(error_code="RESULT_UNRECOVERABLE"),
     dict(upstream_unfinished=True), dict(data=[{"url": "old"}]), dict(_pending_image_result_ids=["old"]),
     dict(_recovery_paused=True), dict(_recovery_suppressed=True), dict(_executing=True), dict(_turn_reserved=True),

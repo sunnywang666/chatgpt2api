@@ -1371,6 +1371,8 @@ class TextTaskService:
     def submission_input(self, owner, body):
         """Resolve an explicit internal reference; callers cannot replace original content."""
         if "supersedes_request_id" not in body:
+            if "continue_after_no_final" in body:
+                raise ConversationBindingError("no-final continuation requires an original request", code="CHAT_SUPERSEDE_INVALID")
             if "derived_input" in body:
                 raise ConversationBindingError("derived input requires original request", code="CHAT_DERIVED_INPUT_INVALID")
             return body
@@ -1381,7 +1383,9 @@ class TextTaskService:
             def reject():
                 raise ConversationBindingError("original successor input cannot be changed", code=conflict)
             derived = "derived_input" in body
-            if (set(body) != self.SUPERSEDE_FIELDS | ({"derived_input"} if derived else set()) or not owner
+            no_final = "continue_after_no_final" in body
+            if (set(body) != self.SUPERSEDE_FIELDS | ({"derived_input"} if derived else set()) | ({"continue_after_no_final"} if no_final else set()) or not owner
+                    or no_final and (body["continue_after_no_final"] is not True or derived)
                     or any(not isinstance(body.get(k), str) or not body[k].strip() or body[k] != body[k].strip() for k in self.SUPERSEDE_FIELDS)
                     or len(request_id) > 200 or len(body["supersedes_request_id"]) > 200
                     or request_id == body["supersedes_request_id"]):
@@ -1398,12 +1402,16 @@ class TextTaskService:
             except (OSError, ValueError, TypeError, KeyError):
                 reject()
             expected = {**retained, "client_request_id": request_id, "supersedes_request_id": body["supersedes_request_id"]}
+            if no_final and not existing:
+                expected["continue_after_no_final"] = True
             if derived and not existing:
                 from services.category_directory_derivation import derive_category_parent_input
                 expected, _ = derive_category_parent_input(retained, request_id, body["supersedes_request_id"], body["derived_input"])
             if existing and retained.get("supersedes_request_id") != body["supersedes_request_id"]:
                 reject()
             if existing and ("derived_input" in retained) != derived:
+                reject()
+            if existing and ("continue_after_no_final" in retained) != no_final:
                 reject()
             if any(expected.get(k) != v for k, v in body.items()):
                 reject()
@@ -1449,7 +1457,8 @@ class TextTaskService:
             reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
         if (previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
                 or previous.get("upstream_outcome") != "unknown"
-                or previous.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND"
+                or (not TextTaskService._no_final_successor_source(previous, now)
+                    if successor.get("_supersedes_no_final") else previous.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND")
                 or previous.get("_recovery_suppressed") or previous.get("_supersedes_request_id")
                 or type(previous.get("_execution_wait_ended_at")) not in (int, float)
                 or not math.isfinite(previous["_execution_wait_ended_at"])):
@@ -1490,6 +1499,17 @@ class TextTaskService:
             reject("CHAT_SUPERSEDE_CONFLICT")
         return previous
 
+    @staticmethod
+    def _no_final_successor_source(previous, now):
+        """Local eligibility only; the original branch is checked again before send."""
+        ended, reads = previous.get("_attempt_finished_at"), previous.get("recovery_no_result_reads")
+        return bool(previous.get("_attempt_reason") == "ORIGINAL_RESULT_NO_FINAL"
+            and previous.get("recovery_reason") == "REQUEST_RESULT_NOT_FOUND"
+            and type(ended) in (int, float) and math.isfinite(ended) and 0 < ended <= now
+            and type(reads) is int and reads >= 3
+            and not any(previous.get(k) for k in ("_work_key", "_completion", "_completion_of",
+                "_retry_cursor", "_recovery_paused", "_recovery_suppressed")))
+
     def _prepare_supersede(self, db, owner, body, receipt):
         if "supersedes_request_id" not in body:
             return
@@ -1517,7 +1537,8 @@ class TextTaskService:
                 reject("CHAT_DERIVED_INPUT_INVALID")
             receipt["_derived_input"] = {**audit, "original_input_hash": row[0]}
         else:
-            comparison = {k: v for k, v in body.items() if k != "supersedes_request_id"}
+            comparison = {k: v for k, v in body.items()
+                          if k not in {"supersedes_request_id", "continue_after_no_final"}}
             comparison["client_request_id"] = previous_id
             if self._submission_identity(owner, comparison) != (previous_id, row[0]):
                 reject("CHAT_SUPERSEDE_INVALID")
@@ -1525,6 +1546,8 @@ class TextTaskService:
         receipt.update(_supersedes_request_id=previous_id, _supersedes_input_hash=row[0],
                        _supersedes_request_message_id=original.get("request_message_id"),
                        _submission_parent_message_id=body.get("parent_message_id"))
+        if body.get("continue_after_no_final") is True:
+            receipt["_supersedes_no_final"] = True
         # This placeholder is used only for validation, never saved or exposed.
         candidate = {**receipt, "_input_ref": True}
         self._validate_supersede(self.store, db, owner, candidate, self._now())
@@ -1948,6 +1971,10 @@ class TextTaskService:
                     "provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id",
                 ) if receipt.get(key)}}
         def progress(cursor):
+            if receipt.get("_supersedes_no_final"):
+                # The immutable predecessor link keeps its submitted root;
+                # request_parent_message_id records the actual fresh tool tail.
+                cursor = {k: v for k, v in cursor.items() if k != "_submission_parent_message_id"}
             self._update(owner, request_id, **cursor)
         if body.get("_forward"):
             from services.durable_forward import run
@@ -1985,6 +2012,8 @@ class TextTaskService:
                 with self.store.transaction() as db:
                     previous = self._validate_supersede(self.store, db, owner, receipt, self._now())
                 body = {**body, "_supersedes_request_message_id": previous["request_message_id"]}
+                if receipt.get("_supersedes_no_final"):
+                    body["_supersedes_no_final_original"] = previous
             if receipt.get("_terminal_empty_correction_of"):
                 with self._db() as db:
                     previous = self.store.read_receipt(db, "text", owner, receipt["_terminal_empty_correction_of"])
