@@ -539,6 +539,23 @@ def _similarity_failure_tail(document, receipt):
         proof = _completed_request_turn(mapping, children, path[start], conversation,
                                         allow_completed_tool_call=True,
                                         allow_completed_commentary=i > 0)
+        # A past manual image turn can end with completed tool outputs and a
+        # recap, without an assistant final. It is context only when a later
+        # user already continued this unique chain. Neither the refused turn
+        # nor the current tail may use this exception as completion evidence.
+        segment = [mapping[node_id]["message"] for node_id in path[start + 1:end + 1]]
+        past_tool_context = (0 < i < len(user_positions) - 1 and len(segment) >= 2
+            and segment[-1]["author"].get("role") == "assistant"
+            and segment[-1].get("end_turn") is False
+            and all(msg.get("status") == "finished_successfully"
+                and msg.get("recipient") in {None, "all"}
+                and isinstance(msg.get("content"), dict) for msg in segment)
+            and segment[-1]["content"].get("content_type") == "reasoning_recap"
+            and all(msg["author"].get("role") == "tool"
+                and msg["content"].get("content_type") in {"text", "multimodal_text", "execution_output"}
+                for msg in segment[:-1]))
+        if not proof and past_tool_context:
+            continue
         if (not proof or proof["final_message_id"] != path[end]
                 or mapping[path[end]]["message"].get("recipient") not in {None, "all"}):
             return None
