@@ -139,9 +139,21 @@
 
 #### 已发送但无最终回答的显式原会话后继
 
-同一内部接口的七个身份字段可额外带 `continue_after_no_final: true`。此模式仅用于旧公司原生文字请求已经以 `ORIGINAL_RESULT_NO_FINAL` 停止自动恢复、至少三次有效读取仍为 `REQUEST_RESULT_NOT_FOUND`，且无工作生命周期、completion、可重试游标、暂停或活跃领取的情况；不能与 `derived_input` 合用，也不能替换提示词、模型或身份。默认省略时继续使用原消息缺失分支，不自动开启重试。
+同一内部接口的七个身份字段可额外带 `continue_after_no_final: true`。此模式仅用于旧公司原生文字请求已经以 `ORIGINAL_RESULT_NO_FINAL` 停止自动恢复、至少三次有效读取仍为 `REQUEST_RESULT_NOT_FOUND`，且无工作生命周期、completion、可重试游标、暂停或活跃领取的情况；客户端不能替换提示词、模型或身份。只有下面的 `attributes_required_only_v4` 封闭升级可与此标志合用；旧 `category_directory_parent_v1` 仍不可合用。默认省略时继续使用原消息缺失分支，不自动开启重试。
 
 Provider 保存唯一幂等后继，复用原输入、原账号和原 Chat。worker 首次读取必须证明原 user 后只有已完成的 assistant code / tool 唯一链，没有最终回答；发送前再次读取，要求尾节点和整条链的内容、角色、完成状态一致。迟到 final、分叉、新 user、运行中的步骤、归档或内容变化均拒发。实际发送父节点是已观察的 tool 尾节点，原提交父节点和旧 UNKNOWN 收据不改写；新回执只认新请求的回答。两次读取之间的内容比较只存在内存，不保存私密上下文副本。此模式仍有 GET/POST 间上游迟到的风险，不等同上游取消或 exactly-once。
+
+#### 旧属性任务的限定 v4 / High 升级
+
+同一内部入口只接受七身份字段、`continue_after_no_final:true` 和
+`derived_input:{"kind":"attributes_required_only_v4"}`。不能带新 messages、model、thinking_effort、目标类别或商品资料。
+原输入须为 `gpt-5-6-instant/standard`、字面一致的已知旧类目或 required-only-v1 模板；类目模板必须只有一个可完整解码的目录叶，即使重复 ID 也不去重选取。属性模板的固定类别、required targets、schema 必须一致。未知前缀、额外指令、重复 JSON 字段、损坏的 image_ref/图片配对、schema 或来源属性索引均拒绝，不猜测修补。
+
+Provider 从保留输入确定性生成 required-only-v4，固定 `gpt-5-6-thinking/high`；全部 SOURCE 值、来源属性原序、image_ref 与图片部分保持不变。schema 仅筛 `required && !provided_by_category && !already_satisfied`，每个入选行的字典及其他元数据完整保留；完整旧 schema/输入仍保留在原私密 input，旧 hash/回执/UNKNOWN 不改。v4 明确引用本请求真实 image_ref，要求正向商品证据，不默认猜测人群。同一账号不支持目标模型时拒发，不能换号或另开会话。原 no-final 资格、唯一后继、重启幂等、发送前原记录及两次上游分支校验全部复用。
+
+回执返回 `continue_after_no_final:true`、`supersedes_request_id` 和 `derived_input` proof：`kind`、`original_input_hash`、`source_contract`（`legacy_category` / `required_only_v1`）、`original_model`、`original_thinking_effort`、`model`、`thinking_effort`、`target:{description_category_id,type_id}`、`schema_count`、`required_target_count`、`image_count`、`text_utf8_bytes`。不返回提示词、图片或 private input 路径。`model`/effort 升级只允许此 kind，派生 body/hash/proof 在受理和真正发送前重算核对。
+
+输入不受支持、非法组合或超 64KiB 文本分别返回 `CHAT_DERIVED_INPUT_UNSUPPORTED/INVALID/TOO_LARGE`；原件资格、活跃领取、原结果出现、第二后继及 ID 漂移仍用现有 `CHAT_SUPERSEDE_*` / `CONVERSATION_REQUEST_CONFLICT`。上游读取暂时失败的已受理后继保留同 ID `queued/not_sent`，不能凭此再建一个。此 mode 不适用旧类目 `resume-unsent-successor`。Provider 先发布，消费者再启用；一旦接受此种后继，回退版本必须仍识别其持久输入和关系。
 
 #### 413 类目目录的受限派生输入
 
