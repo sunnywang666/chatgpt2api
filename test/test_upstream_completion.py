@@ -688,6 +688,58 @@ def test_websocket_done_wakes_handoff_sse_that_has_not_closed(monkeypatch):
     assert result[-1] == "[DONE]" and calls == [(TOPIC, CID)]
 
 
+def test_asset_tail_requires_a_real_stream_close(monkeypatch):
+    instance, _, _ = backend(monkeypatch, "timeout")
+    stream = instance._iter_image_completion_payloads(iter(["{}", "[DONE]"]), CID, time.monotonic()+60)
+    assert next(stream) == "{}"
+    assert not hasattr(instance, "_arm_image_asset_tail")
+    assert list(stream) == ["[DONE]"]
+
+
+def test_asset_tail_refresh_and_cleanup_invalidate_old_callbacks(monkeypatch):
+    instance, _, _ = backend(monkeypatch, "timeout")
+    timers, closed = [], []
+    class Timer:
+        def __init__(self, seconds, fn, args=()):
+            self.fn, self.args, self.cancelled = fn, args, False
+            timers.append(self)
+        def start(self): pass
+        def cancel(self): self.cancelled = True
+        def fire(self): self.fn(*self.args)
+    monkeypatch.setattr(threading, "Timer", Timer)
+    stream = instance._iter_image_completion_payloads(iter(["{}", "{}", "[DONE]"]), CID,
+                                                       time.monotonic()+60, lambda: closed.append(True))
+    next(stream)
+    arm = instance._arm_image_asset_tail
+    assert arm() is True
+    next(stream)  # Fresh SSE activity resets the quiet period.
+    assert timers[0].cancelled and len(timers) == 2
+    timers[0].fire()  # Model a callback already racing with cancel().
+    assert not closed
+    assert list(stream) == ["[DONE]"]
+    for timer in timers: timer.fire()
+    assert not closed and arm() is False
+    assert not hasattr(instance, "_arm_image_asset_tail")
+
+
+@pytest.mark.parametrize("error", [RuntimeError("logic failure"), ImageActiveDeadlineExceeded("deadline")])
+def test_asset_tail_does_not_hide_nontransport_errors(monkeypatch, error):
+    instance, _, _ = backend(monkeypatch, "timeout")
+    from services.config import config
+    monkeypatch.setitem(config.data, "image_poll_interval_secs", .01)
+    closed = threading.Event()
+    def payloads():
+        yield "{}"
+        assert closed.wait(1)
+        raise error
+    stream = instance._iter_image_completion_payloads(payloads(), CID, time.monotonic()+60, closed.set)
+    next(stream)
+    assert instance._arm_image_asset_tail()
+    with pytest.raises(type(error), match=str(error)):
+        next(stream)
+    assert not hasattr(instance, "_arm_image_asset_tail")
+
+
 @pytest.mark.parametrize("collection_fails", [False, True])
 def test_quiet_handoff_transfers_to_collection_without_waiting_for_listener(monkeypatch, collection_fails):
     instance, gets, calls = backend(monkeypatch, "timeout")

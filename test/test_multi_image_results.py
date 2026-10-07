@@ -71,6 +71,59 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_live_assets_wait_for_terminal_or_bounded_quiet_tail_before_strict_read(self):
+        import threading
+        import time
+        from curl_cffi.requests.exceptions import RequestException
+        from services.image_thread import finished_parent
+        document = _conversation(["file-one"])
+        document["mapping"]["request"]["message"]["id"] = "request"
+        document["mapping"]["tool"]["message"].update(id="tool", status="finished_successfully")
+        final = {"id":"final", "author":{"role":"assistant"}, "status":"finished_successfully",
+                 "end_turn":True, "channel":"final"}
+        document["mapping"]["final"] = {"parent":"tool", "message":final}
+        document["current_node"] = "final"
+        for ending in ("terminal", "done", "quiet"):
+            with self.subTest(ending=ending):
+                backend = FakeBackend([document]); backend.image_request_message_id = "request"
+                backend.image_poll_terminal_check = lambda doc, cid, rid, files, sediments: bool(
+                    finished_parent(doc, cid, rid, expected_result_ids=files+sediments))
+                closed, persisted, ready = threading.Event(), [], []
+                callback = mock.Mock(request_message_id="request")
+                callback.record_result_ids.side_effect = lambda files, sediments: persisted.append((files, sediments))
+                def payloads():
+                    yield json.dumps({"conversation_id":"conv-1", "message":document["mapping"]["tool"]["message"]})
+                    self.assertEqual(persisted, [(["file-one"], [])])
+                    self.assertEqual(backend.calls, 0, "live assets alone must not spend an early GET")
+                    ready.append(True)
+                    if ending == "quiet":
+                        self.assertTrue(closed.wait(1), "quiet SSE must be woken for original collection")
+                        raise RequestException("controlled close")
+                    if ending == "terminal":
+                        yield json.dumps({"conversation_id":"conv-1", "message":final})
+                    yield "[DONE]"
+                def events(*args, **kwargs):
+                    wrapped = backend._iter_image_completion_payloads(payloads(), "conv-1", time.monotonic()+60, closed.set)
+                    try:
+                        yield from iter_conversation_payloads(wrapped)
+                    finally:
+                        wrapped.close()
+                def resolve(cid, files, sediments, **kwargs):
+                    self.assertTrue(ready)
+                    if kwargs.get("poll") is not False:
+                        backend._poll_image_results(cid, 1, initial_file_ids=files, initial_sediment_ids=sediments,
+                                                    request_message_id="request")
+                    return ["https://fixture.invalid/image"]
+                backend.resolve_conversation_image_urls = mock.Mock(side_effect=resolve)
+                backend.download_image_bytes = mock.Mock(return_value=[b"original-image"])
+                with mock.patch.dict(config.data, {"image_poll_interval_secs":.02}), \
+                     mock.patch("services.protocol.conversation.conversation_events", events):
+                    output = list(stream_image_outputs(backend, ConversationRequest(
+                        prompt="fixture", model="gpt-image-2", progress_callback=callback)))
+                self.assertTrue(output)
+                self.assertEqual(backend.calls, 1)
+                self.assertFalse(hasattr(backend, "_arm_image_asset_tail"))
+
     def test_first_image_confirmation_has_no_fixed_wait_or_task_list_read(self):
         for with_ids in (False, True):
             with self.subTest(with_ids=with_ids):

@@ -1109,7 +1109,12 @@ def stream_image_outputs(
             if (result_ids[0] or result_ids[1]) and signal not in checked_signals:
                 checked_signals.add(signal)
                 original_message_id = str(getattr(backend, "image_request_message_id", "") or request_message_id)
-                if _stream_image_terminal_result(backend, event, original_message_id, *result_ids,
+                arm_tail = getattr(backend, "_arm_image_asset_tail", None)
+                deferred_to_stream = not terminal_signal and callable(arm_tail) and arm_tail() is True
+                # The live transport owns a bounded quiet-tail fallback. Other
+                # backends retain the existing immediate strict probe, and a
+                # final assistant signal never waits for the stream tail.
+                if not deferred_to_stream and _stream_image_terminal_result(backend, event, original_message_id, *result_ids,
                                                  expected_parent=request.parent_message_id):
                     stream_result_confirmed = True
                     logger.info({"event": "image_stream_result_confirmed", "conversation_id": event_conversation_id})

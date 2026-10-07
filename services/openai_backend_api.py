@@ -3379,7 +3379,7 @@ class OpenAIBackendAPI:
         )
         yield from self._iter_image_completion_payloads(payloads, conversation_id, time.monotonic() + timeout, response.close)
 
-    def _iter_image_completion_payloads(self, payloads, conversation_id, deadline, close_stream=lambda: None):
+    def _iter_image_completion_payloads(self, payloads, conversation_id, deadline, close_stream=None):
         """Listen to an offered topic alongside SSE; always validate actual images.
 
         A matching done only ends transport waiting. The existing protocol still
@@ -3390,6 +3390,8 @@ class OpenAIBackendAPI:
         from services.upstream_completion import handoff_topic, wait_for_turn_done
         from services.request_context import current_request
 
+        can_close_stream = callable(close_stream)
+        close_stream = close_stream if can_close_stream else lambda: None
         self._release_image_completion_listener()
         stopped = threading.Event()
         finished = threading.Event()
@@ -3399,6 +3401,51 @@ class OpenAIBackendAPI:
         sse_done = False
         terminal_message = False
         transferred = False
+        asset_tail_lock = threading.RLock()
+        asset_tail_timer = None
+        asset_tail_generation = 0
+        asset_tail_armed = False
+        asset_tail_closed = False
+        asset_tail_expired = False
+
+        def arm_asset_tail():
+            # Once qualified assets are durable, keep consuming the live SSE
+            # instead of probing a document that may still be in progress.
+            # A quiet tail still falls back to the original strict read, using
+            # the existing polling interval rather than a new normal-path wait.
+            nonlocal asset_tail_timer, asset_tail_generation, asset_tail_armed
+            with asset_tail_lock:
+                if not can_close_stream or asset_tail_closed or asset_tail_expired or stopped.is_set():
+                    return False
+                seconds = min(float(config.image_poll_interval_secs), deadline - time.monotonic())
+                if seconds <= 0:
+                    return False
+                asset_tail_armed = True
+                asset_tail_generation += 1
+                generation = asset_tail_generation
+                if asset_tail_timer is not None:
+                    asset_tail_timer.cancel()
+
+                def quiet_tail():
+                    nonlocal asset_tail_expired
+                    with asset_tail_lock:
+                        if (asset_tail_closed or stopped.is_set()
+                                or generation != asset_tail_generation):
+                            return
+                        asset_tail_expired = True
+                        try:
+                            observe("upstream_asset_tail_fallback")
+                        except Exception:
+                            pass  # Diagnostics must never prevent the wakeup.
+                        close_stream()
+
+                asset_tail_timer = threading.Timer(seconds, copy_context().run, args=(quiet_tail,))
+                asset_tail_timer.daemon = True
+                asset_tail_timer.start()
+                return True
+
+        if can_close_stream:
+            self._arm_image_asset_tail = arm_asset_tail
 
         def observe(stage):
             context = current_request.get()
@@ -3448,6 +3495,8 @@ class OpenAIBackendAPI:
         try:
             try:
                 for payload in payloads:
+                    if asset_tail_armed:
+                        arm_asset_tail()
                     if payload == "[DONE]":
                         sse_done = True
                         break
@@ -3477,8 +3526,9 @@ class OpenAIBackendAPI:
                         listener.start()
                     if terminal_message:
                         stopped.set()
-            except Exception:
-                if outcome.get("result") != "done" or stopped.is_set():
+            except Exception as exc:
+                closed_tail_transport = asset_tail_expired and isinstance(exc, requests.exceptions.RequestException)
+                if not closed_tail_transport and (outcome.get("result") != "done" or stopped.is_set()):
                     raise
             if listener is not None and not stopped.is_set():
                 # SSE may close before the image tool. Hand the same exact
@@ -3499,6 +3549,13 @@ class OpenAIBackendAPI:
             if sse_done:
                 yield "[DONE]"
         finally:
+            with asset_tail_lock:
+                asset_tail_closed = True
+                asset_tail_generation += 1
+                if asset_tail_timer is not None:
+                    asset_tail_timer.cancel()
+                if getattr(self, "_arm_image_asset_tail", None) is arm_asset_tail:
+                    del self._arm_image_asset_tail
             if not transferred:
                 stopped.set()
             close = getattr(payloads, "close", None)
