@@ -174,6 +174,29 @@ def create_router() -> APIRouter:
                 response["items"][0]["failure_continuation"] = continuation
         return response
 
+    @router.get("/api/image-tasks/{task_id}/continuation-cursor")
+    async def read_image_continuation_cursor(
+        task_id: str, request: Request, response: Response,
+        provider_binding_id: str = Query(min_length=1, max_length=300),
+        provider_account_identity: str = Query(min_length=1, max_length=300),
+        client_conversation_id: str = Query(min_length=1, max_length=300),
+        conversation_id: str = Query(min_length=1, max_length=300),
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization, request=request)
+        if identity.get("role") != "admin":
+            raise HTTPException(404, detail={"code": "IMAGE_TASK_NOT_FOUND"})
+        response.headers["Cache-Control"] = "private, no-store"
+        try:
+            return await run_in_threadpool(image_task_service.continuation_cursor, identity, task_id, {
+                "provider_binding_id": provider_binding_id, "provider_account_identity": provider_account_identity,
+                "client_conversation_id": client_conversation_id, "conversation_id": conversation_id,
+            })
+        except ImageThreadError as exc:
+            delay = getattr(exc, "retry_after", None)
+            raise HTTPException(exc.status, detail={"code": exc.code},
+                headers={"Retry-After": str(delay)} if exc.status == 429 and delay is not None else None) from None
+
     @router.post("/api/image-tasks/generations")
     async def create_generation_task(
         body: ImageGenerationTaskRequest,
