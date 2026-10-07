@@ -477,6 +477,90 @@ def _normalized_text(parts: object) -> str:
     return " ".join(text.lower().split())
 
 
+def _similarity_failure_tail(document, receipt):
+    """Prove a completed current tail descended from this refused image turn.
+
+    Later manual turns are context, never results of the original image task.
+    This proof grants no replay, image adoption or change to the old receipt.
+    """
+    from services.conversation_binding_service import _completed_request_turn
+    from services.openai_backend_api import OpenAIBackendAPI
+
+    conversation, original = receipt["conversation_id"], receipt["request_message_id"]
+    if (not isinstance(document, dict) or document.get("conversation_id") != conversation
+            or document.get("is_archived") is not False):
+        return None
+    mapping, head = document.get("mapping"), document.get("current_node")
+    if not isinstance(mapping, dict) or not isinstance(head, str) or not head:
+        return None
+    children = {}
+    for node_id, node in mapping.items():
+        if not isinstance(node_id, str) or not isinstance(node, dict):
+            return None
+        parent = node.get("parent")
+        if parent is not None and not isinstance(parent, str):
+            return None
+        children.setdefault(parent, []).append(node_id)
+    path, cursor = [], head
+    while cursor not in path and len(path) < 128:
+        node = mapping.get(cursor)
+        msg = node.get("message") if isinstance(node, dict) else None
+        if (not isinstance(msg, dict) or msg.get("id") != cursor
+                or not isinstance(msg.get("author"), dict)
+                or msg["author"].get("role") not in {"user", "assistant", "tool"}):
+            return None
+        following = children.get(cursor, [])
+        if following != ([path[-1]] if path else []):
+            return None
+        if "children" in node and node["children"] != following:
+            return None
+        path.append(cursor)
+        if cursor == original:
+            break
+        cursor = node.get("parent")
+    if not path or path[-1] != original:
+        return None
+    path.reverse()
+    first = mapping[original]
+    expected = receipt.get("request_parent_message_id") or receipt.get("_image_thread_request_parent")
+    if (first["message"]["author"].get("role") != "user"
+            or expected and (first.get("parent") != expected or expected not in mapping)):
+        return None
+    user_positions = [i for i, node_id in enumerate(path)
+                      if mapping[node_id]["message"]["author"]["role"] == "user"]
+    original_final = None
+    for i, start in enumerate(user_positions):
+        end = user_positions[i + 1] - 1 if i + 1 < len(user_positions) else len(path) - 1
+        proof = _completed_request_turn(mapping, children, path[start], conversation,
+                                        allow_completed_tool_call=True)
+        if (not proof or proof["final_message_id"] != path[end]
+                or mapping[path[end]]["message"].get("recipient") not in {None, "all"}):
+            return None
+        if i == 0:
+            original_final = path[end]
+            for node_id in path[start + 1:end + 1]:
+                msg = mapping[node_id]["message"]
+                output = {"content": msg.get("content"), "metadata": msg.get("metadata")}
+                files, sediments = OpenAIBackendAPI._extract_image_reference_ids(output)
+                if files or sediments or OpenAIBackendAPI._has_image_asset_pointer(output):
+                    return None
+    content = mapping[original_final]["message"].get("content") if original_final else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if (not isinstance(content, dict) or content.get("content_type") != "text"
+            or not isinstance(parts, list) or not all(isinstance(p, str) for p in parts)):
+        return None
+    # Known upstream refusal sentences only. A generic policy error or a later
+    # manual mention of similarity must not qualify the original failed turn.
+    text = " ".join("".join(parts).split()).lower()
+    if not text.startswith((
+        "非常抱歉，生成的图片可能违反了关于与第三方内容相似性的防护限制。",
+        "we're so sorry, but the image we created may violate our guardrails concerning similarity to third-party content.",
+    )):
+        return None
+    return {"parent_message_id": head, "original_terminal_message_id": original_final,
+            "failure_reason": "third_party_similarity"}
+
+
 def _authoritative_image_failure(document: object, request_message_id: str) -> str:
     if not isinstance(document, dict):
         return ""
@@ -916,6 +1000,101 @@ class ImageTaskService:
                 items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
                 missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
+
+    def continuation_cursor(self, identity, task_id, anchors):
+        """Read a refused image's current completed context, without recovering it."""
+        from services.account_service import account_service
+        from services.generation_completion import read_only_original_completion
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        if identity.get("role") != "admin":
+            raise ImageThreadError("IMAGE_TASK_NOT_FOUND", status=404)
+        owner, task_id = _owner_id(identity), _clean(task_id)
+        fields = ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id")
+
+        def busy(task):
+            completion = task.get("_completion") or {}
+            pending_completion = (not isinstance(completion, dict) or bool(completion) and (
+                completion.get("next_at") is not None
+                or completion.get("state") not in {"result_ready", "completed", "needs_attention"}))
+            return bool(task.get("status") in {"queued", "running", "unknown", "recovering"}
+                or task.get("_executing") or task.get("_turn_reserved") or task.get("waiting")
+                or task.get("upstream_unfinished") is True or task.get("recovery_claim_id")
+                or task.get("_claim_id") and float(task.get("_claim_until") or 0) > time.time()
+                or pending_completion)
+
+        def snapshot():
+            with self.store.connect() as db:
+                db.execute("BEGIN")
+                task = self.store.read_receipt(db, "image", owner, task_id)
+                if not task or task.get("owner_id") != owner or self._receipt_expired(task, self._retention_cutoff()):
+                    raise ImageThreadError("IMAGE_TASK_NOT_FOUND", status=404)
+                if any(not isinstance(anchors.get(k), str) or not anchors[k]
+                       or anchors[k] != task.get(k) for k in fields):
+                    raise ImageThreadError("IMAGE_CONTINUATION_IDENTITY_MISMATCH")
+                if (task.get("status") != TASK_STATUS_ERROR
+                        or _clean(task.get("error_code")).lower() != "content_policy_violation"
+                        or task.get("upstream_unfinished") is not False
+                        or task.get("upstream_outcome") == "generated"
+                        or task.get("binding_status") != "bound"
+                        or not _clean(task.get("request_message_id"))
+                        or task.get("_recovery_paused") or task.get("_recovery_suppressed")
+                        or any(task.get(k) for k in ("data", "result_file_ids", "result_sediment_ids",
+                            "_pending_image_result_ids", "_pending_image_output",
+                            "adopted_source_request_message_id", "adopted_source_image_message_id"))
+                        or task.get("_completion") and not read_only_original_completion(task["_completion"])):
+                    raise ImageThreadError("IMAGE_CONTINUATION_UNAVAILABLE")
+                # Same store as the scheduler; inspect only this upstream chat,
+                # including other owners that may share a trusted binding.
+                for table in ("image_requests", "requests"):
+                    for (raw,) in db.execute(
+                            f"SELECT receipt FROM {table} WHERE json_extract(receipt,'$.provider_account_identity')=? "
+                            "AND (json_extract(receipt,'$.conversation_id')=? OR "
+                            "(json_extract(receipt,'$.provider_binding_id')=? AND json_extract(receipt,'$.client_conversation_id')=?))",
+                            (task["provider_account_identity"], task["conversation_id"],
+                             task["provider_binding_id"], task["client_conversation_id"])):
+                        if busy(json.loads(raw)):
+                            raise ImageThreadError("IMAGE_CONTINUATION_BUSY")
+                return task
+
+        before = snapshot()
+        binding, account, client, conversation = (before[k] for k in fields)
+        backend = None
+        try:
+            if account_service.get_bound_account_identity(binding) != account:
+                raise ImageThreadError("IMAGE_CONTINUATION_IDENTITY_MISMATCH")
+            token = account_service.get_bound_text_access_token(binding, model="auto")
+            with account_service.conversation_binding_lock(binding, client):
+                if (account_service.get_bound_account_identity(binding) != account
+                        or snapshot() != before):
+                    raise ImageThreadError("IMAGE_CONTINUATION_IDENTITY_MISMATCH")
+                backend = OpenAIBackendAPI(access_token=token)
+                document = backend._get_conversation(conversation,
+                    deadline_monotonic=time.monotonic() + 60.0, connect_timeout_secs=10.0,
+                    minimum_budget_secs=10.0)
+                proof = _similarity_failure_tail(document, before)
+                if proof is None:
+                    raise ImageThreadError("IMAGE_CONTINUATION_UNAVAILABLE")
+                tasks = backend._query_backend_tasks(conversation_id=conversation, timeout_secs=5.0, strict_schema=True)
+                if _backend_tasks_may_be_active(tasks):
+                    raise ImageThreadError("IMAGE_CONTINUATION_BUSY")
+                if (snapshot() != before or account_service.get_bound_account_identity(binding) != account):
+                    raise ImageThreadError("IMAGE_CONTINUATION_IDENTITY_MISMATCH")
+                return {"source_task_id": task_id, "source_request_message_id": before["request_message_id"],
+                        **{k: before[k] for k in fields}, **proof, "observed_at": time.time()}
+        except ImageThreadError:
+            raise
+        except Exception as exc:
+            status = _upstream_status_code(exc)
+            if status == 429:
+                error = ImageThreadError("RECOVERY_RATE_LIMITED", status=429)
+                error.retry_after = _retry_after_seconds(exc)
+                raise error from exc
+            raise ImageThreadError("RECOVERY_AUTH_REQUIRED" if status in {401, 403} else "RECOVERY_READ_FAILED",
+                                   status=503) from exc
+        finally:
+            if backend is not None:
+                backend.close()
 
     def failure_continuation(self, identity: dict[str, object], task_id: str) -> dict[str, str] | None:
         """Return one fresh, exact failure cursor without changing its receipt.

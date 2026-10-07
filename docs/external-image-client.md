@@ -74,6 +74,41 @@ The server must expose these authenticated routes under `SERVER_ROOT`:
 | Read original receipts by caller ID | `GET /api/image-tasks?ids={client_task_id}` |
 | Continue polling an eligible original receipt | `POST /api/image-tasks/{client_task_id}/resume-poll` |
 | Download one receipt-owned result | `GET /api/image-tasks/{client_task_id}/images/{index}` |
+
+### Trusted continuation after a refused image and later manual turns
+
+The existing admin/Content identity can read
+`GET /api/image-tasks/{client_task_id}/continuation-cursor` with four required
+query parameters: `provider_binding_id`, `provider_account_identity`,
+`client_conversation_id`, and `conversation_id`. All must match that identity's
+original durable image receipt. Other owners, ordinary program Keys, and company
+ingress do not gain access to this internal cursor API.
+
+This is a read-only context proof for an original terminal
+`content_policy_violation` with a freshly verified third-party-similarity refusal
+and no output assets. The current branch must contain that exact original user
+message, have a complete unambiguous parent chain, and end in a completed
+assistant final. Later manual turns may supply context, including images, but
+are never adopted as the original task's output. Local in-flight work or active
+upstream tasks prevent a proof. Unknown, archived, generic-policy and incomplete
+branches remain unavailable; this call does not recover, generate, restore or
+archive anything, or update the original receipt.
+
+Success returns `source_task_id`, `source_request_message_id`, the four query
+anchors, `original_terminal_message_id`, `parent_message_id` (the current completed
+tail), `failure_reason: "third_party_similarity"`, and numeric `observed_at`
+(Unix UTC seconds, e.g. `1791396000.125`). No conversation content is returned.
+The ordinary image-task GET does not expose `request_message_id`; do not confuse
+its `image_session_parent_id` with this proof's `source_request_message_id`.
+
+A separately authorized new text request may use this cursor in the same chat.
+The normal bound-text send still freshly requires `current_node == parent_message_id`;
+a changed tail rejects the send. The proof is not permission to retry the refused
+image. Missing ownership returns 404; identity mismatch, unavailable context or
+in-flight work return 409 (`IMAGE_CONTINUATION_IDENTITY_MISMATCH`,
+`IMAGE_CONTINUATION_UNAVAILABLE`, `IMAGE_CONTINUATION_BUSY`). Read failures return
+503; upstream 429 preserves `Retry-After`. Existing `failure_continuation` keeps
+its stricter original-turn-only semantics.
 | Synchronous-compatible generation | `POST /v1/images/generations` |
 | Synchronous-compatible edit | `POST /v1/images/edits` |
 
