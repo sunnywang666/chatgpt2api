@@ -757,10 +757,41 @@ class GenerationCompletionService:
         work = self.lifecycle.update(kind, identity, selected_id, "active")
         return {**current, "work": work}
 
+    def _acknowledge_intermediate_image(self, identity, request_id, selected_id):
+        # Several image tasks can share a conversation. Saving an earlier
+        # selected image acknowledges that task, not the current conversation
+        # head. Keep the head, occupancy and archive intent byte-for-byte intact.
+        from services.work_lifecycle import _projection
+        owner = str(identity["id"])
+        with self.store.transaction() as db:
+            root = self._root(db, "image", owner, request_id)
+            state = root.get("_completion") or {}
+            if state.get("selected_id") != selected_id:
+                raise CompletionError("COMPLETION_SELECTED_RESULT_MISMATCH")
+            chosen = self.store.read_receipt(db, "image", owner, selected_id)
+            if not successful("image", chosen) or not chosen.get("_work_key"):
+                return False
+            work = self.store.runtime(db, chosen["_work_key"])
+            if not work or work.get("owner") != owner or work.get("kind") != "image":
+                return False
+            latest = self.store.read_receipt(db, "image", owner, work["last_request_id"])
+            thread_id = (chosen.get("_image_thread") or {}).get("id")
+            if (not latest or not thread_id or work.get("work_ref") != thread_id
+                    or latest.get("_work_key") != chosen["_work_key"]
+                    or (latest.get("_image_thread") or {}).get("id") != thread_id
+                    or int(latest.get("_sequence") or 0) <= int(chosen.get("_sequence") or 0)):
+                return False
+            state.update(state="completed", results_saved=True, work=_projection(work), next_at=None)
+            state.pop("reason", None)
+            self.store.write_receipt(db, "image", owner, request_id, root)
+            return True
+
     def complete(self, kind, identity, request_id, selected_id):
         current = self.read(kind, identity, request_id)
         if not selected_id or current.get("selected_id") != selected_id:
             raise CompletionError("COMPLETION_SELECTED_RESULT_MISMATCH")
+        if kind == "image" and self._acknowledge_intermediate_image(identity, request_id, selected_id):
+            return self.read(kind, identity, request_id)
         # This is the caller's explicit post-save/review acknowledgement. The
         # unknown original remains protected; only the chosen conversation closes.
         work = self.lifecycle.update(kind, identity, selected_id, "completed", results_saved=True)
