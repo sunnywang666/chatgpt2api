@@ -29,7 +29,7 @@ def reset_unsent_image_attempt(kind, receipt):
                        active_attempt_deadline_at=None, started_ts=None)
 
 
-def record_unsent_failure(context, receipt, at, error_type=None, reason=None):
+def record_unsent_failure(context, receipt, at, error_type=None, reason=None, capability_reason=None):
     """Keep why an unsent attempt returned to its original queue, without text."""
     # progress can belong to an older attempt. Only the submission fence proves
     # the phase here; do not attribute the failure to a stale detailed step.
@@ -41,6 +41,9 @@ def record_unsent_failure(context, receipt, at, error_type=None, reason=None):
                   "work_not_active", "send_guard_rejected", "account_unavailable",
                   "image_capability_unavailable", "image_binding_changed"}:
         entry["reason"] = reason
+    if capability_reason in {"disabled", "auth_required", "limited", "read_failed",
+                             "stale_consumed", "stale_expired", "unavailable"}:
+        entry["capability_reason"] = capability_reason
     code = receipt.get("error_code")
     if code in {"CONVERSATION_OUTCOME_UNKNOWN", "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}:
         entry["error_code"] = code
@@ -51,6 +54,21 @@ def record_unsent_failure(context, receipt, at, error_type=None, reason=None):
             entry["binding_reason"] = reason
     receipt["_execution_timeline"] = [*(receipt.get("_execution_timeline") or []), entry][-32:]
     logger.warning({"event": "pool_execution_stage", **entry})
+
+
+def record_sent_interruption(kind, receipt, at, reason):
+    """Keep the local transition even if the original result later recovers.
+
+    A lost execution claim or worker is not proof of an upstream timeout or
+    failed generation. Only fixed local reasons/flags belong in this receipt.
+    """
+    entry = {"stage": "execution_interrupted", "at": at, "source": "local_scheduler",
+             "reason": reason, "from_status": "running",
+             "to_status": "unknown" if kind == "text" else "error",
+             "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "submitted": True,
+             "result_assets_observed": bool(receipt.get("result_file_ids")
+                 or receipt.get("result_sediment_ids") or pending_image_result_ids(receipt))}
+    receipt["_execution_timeline"] = [*(receipt.get("_execution_timeline") or []), entry][-32:]
 
 
 def account_clock_key(account):
@@ -254,12 +272,28 @@ class ExecutionContext:
                           "stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event", "sse_error_category",
                           "sse_message_snapshot_events", "sse_terminal_assistant_events", "sse_terminal_id_events",
                           "sse_terminal_final_channel_events", "sse_terminal_parent_events",
-                          "sse_terminal_direct_parent_match_events"}},
+                          "sse_terminal_empty_content_events", "sse_image_tool_snapshot_events",
+                          "sse_snapshot_role_user_events", "sse_snapshot_role_assistant_events",
+                          "sse_snapshot_role_tool_events", "sse_snapshot_role_system_events", "sse_snapshot_role_unknown_events",
+                          "sse_snapshot_status_in_progress_events", "sse_snapshot_status_finished_successfully_events",
+                          "sse_snapshot_status_other_events", "sse_snapshot_status_missing_events",
+                          "sse_terminal_direct_parent_match_events", "sse_chain_nodes", "sse_chain_parent_edges",
+                          "sse_chain_terminal_chains", "sse_chain_max_depth", "sse_chain_analysis_snapshots",
+                          "sse_chain_metadata_patch_events", "sse_chain_request_seen", "sse_chain_missing_parent",
+                          "sse_chain_conflict", "sse_chain_cycle", "sse_chain_overflow", "sse_chain_unqualified_node",
+                          "sse_chain_terminal_nodes", "sse_chain_blocked_user", "sse_chain_blocked_system",
+                          "sse_chain_blocked_unknown_role", "sse_chain_blocked_parent_is_request"}},
         }
-        timeline = list(receipt.get("_execution_timeline") or [])
-        timeline.append(entry)
         try:
-            self.admission.update_claim(self, _execution_timeline=timeline[-32:])
+            with self.admission.store.transaction() as db:
+                current = self.admission.store.read_receipt(db, self.kind, self.owner, self.request_id)
+                if not current or current.get("_claim_id") != self.claim:
+                    raise AdmissionLost("original execution claim changed")
+                # A late stream callback must append to the newest timeline,
+                # not overwrite an intervening interruption/recovery event.
+                current["_execution_timeline"] = [*(current.get("_execution_timeline") or []), entry][-32:]
+                self.admission.store.write_receipt(db, self.kind, self.owner, self.request_id, current)
+            self.admission.wake()
         except AdmissionLost:
             # Telemetry must never turn an expired original into a retry.
             pass
@@ -328,7 +362,7 @@ class PoolAdmission:
         # originals stay in the existing store, never in an executor queue.
         self._original_read_slots = threading.BoundedSemaphore(4)
         self._original_read_lock = threading.Lock()
-        self._original_reads = set()
+        self._original_reads = {}
         self._event = threading.Event()
         self._stop = threading.Event()
         self._thread = None
@@ -378,32 +412,42 @@ class PoolAdmission:
     def _dispatch_original_read(self, kind, owner, request_id, function, receipt):
         if self._stop.is_set():
             return False
-        # Do not fill the local workers with known pacing waits. The transport
-        # still checks the same persisted clock immediately before its GET.
-        with self._account_guard():
-            account = next((a for a in self._rows()
-                            if a.get("provider_account_identity") == receipt.get("provider_account_identity")), None)
-        if account is not None:
-            if account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
-                return False
-            now = float(self.clock())
-            if self.pacing:
-                pacing = self.pacing(account, now)
-            else:
-                from services.account_request_pacing import account_pacing_snapshot
-                pacing = account_pacing_snapshot(account, now, include_turn=False, include_conversation_read=True)
-            if pacing.get("next_at") is None or pacing["next_at"] > now:
-                return False
+        account = None
+        def selected_account():
+            with self._account_guard():
+                return next((a for a in self._rows()
+                             if a.get("provider_account_identity") == receipt.get("provider_account_identity")), None)
+        def cancel_reservation():
+            if kind == "image" and account is not None and self.pacing is None:
+                from services.account_request_pacing import release_account_image_recovery_read
+                release_account_image_recovery_read(account, owner, request_id)
+
         key = physical_conversation_key(receipt)
         if key is None:
             account_key = receipt.get("provider_account_identity") or receipt.get("provider_binding_id")
             client_conversation = receipt.get("client_conversation_id")
             key = ((account_key, client_conversation) if account_key and client_conversation
                    else (kind, owner, request_id))
+        identity = (kind, owner, request_id)
         with self._original_read_lock:
-            if key in self._original_reads or not self._original_read_slots.acquire(blocking=False):
-                return False
-            self._original_reads.add(key)
+            active = self._original_reads.get(key)
+            denied = active is not None or not self._original_read_slots.acquire(blocking=False)
+            if not denied:
+                self._original_reads[key] = identity
+        if denied:
+            # Unrelated busy workers must not discard a due original's FIFO
+            # place. Nor should a full scan contend for the account lock when
+            # no I/O can start. Only a different turn in this same conversation
+            # supersedes this reservation.
+            if active is not None and active != identity:
+                account = selected_account()
+                cancel_reservation()
+            return False
+
+        def release_worker():
+            with self._original_read_lock:
+                self._original_reads.pop(key, None)
+                self._original_read_slots.release()
 
         def run():
             try:
@@ -411,38 +455,57 @@ class PoolAdmission:
             except Exception:
                 pass  # The original handler persists the bounded failure.
             finally:
-                with self._original_read_lock:
-                    self._original_reads.discard(key)
-                    self._original_read_slots.release()
+                release_worker()
                 self.wake()
+
+        started = keep_reservation = False
         try:
+            account = selected_account()
+            if recovery_suppressed(receipt) or receipt.get("_recovery_paused") is True:
+                return False
+            if account is not None:
+                if account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
+                    return False
+                now = float(self.clock())
+                if self.pacing:
+                    pacing = self.pacing(account, now)
+                else:
+                    from services.account_request_pacing import account_pacing_snapshot
+                    pacing = account_pacing_snapshot(account, now, include_turn=False, include_conversation_read=True)
+                if pacing.get("next_at") is None or float(pacing.get("cooldown_until") or 0) > now:
+                    return False
+                due_image = (kind == "image" and image_original_recovery_pending(receipt)
+                             and float(receipt.get("next_poll_at") or 0) <= now)
+                if due_image and self.pacing is None:
+                    # Book the due original in the existing FIFO before the
+                    # read edge. Polling next_at alone loses every opportunity
+                    # to already queued results/archives. No worker waits here.
+                    from services.account_request_pacing import reserve_account_image_recovery_read
+                    if not reserve_account_image_recovery_read(account, owner, request_id):
+                        keep_reservation = True
+                        return False
+                elif pacing["next_at"] > now:
+                    return False
             threading.Thread(target=run, name="original-result-io", daemon=True).start()
-        except Exception:
-            with self._original_read_lock:
-                self._original_reads.discard(key)
-                self._original_read_slots.release()
-            raise
-        return True
+            started = True
+            return True
+        finally:
+            if not started:
+                release_worker()
+                if not keep_reservation:
+                    cancel_reservation()
 
     def recover_one(self, *, background=False):
         now = float(self.clock())
-        image_dispatched = False
         def dispatch(kind, owner, request_id, function, receipt):
-            nonlocal image_dispatched
-            # Image recovery owns a separate asynchronous worker. Preserve its
-            # existing one-dispatch-per-scan cadence; the local read permit only
-            # bounds synchronous text I/O, not that image worker's lifetime.
-            if kind == "image" and image_dispatched:
-                return False
-            started = self._dispatch_original_read(kind, owner, request_id, function, receipt)
-            if started and kind == "image":
-                image_dispatched = True
-            return started
+            return self._dispatch_original_read(kind, owner, request_id, function, receipt)
         lifecycle = getattr(self, "work_lifecycle", None)
         if background and lifecycle is not None:
-            # Its existing bounded, per-account workers must get a chance even
-            # while there is a continuous backlog of original result reads.
-            lifecycle.process_one(background=True)
+            # Fill only the existing bounded I/O workers. Independent archive
+            # pipelines need not wait for the next one-second recovery scan.
+            for _ in range(4):
+                if not lifecycle.process_one(background=True):
+                    break
         completion = getattr(self, "generation_completion", None)
         if completion is not None:
             if background:
@@ -902,6 +965,7 @@ class PoolAdmission:
             if not r.get("_claim_id") or r.get("status") != "running" or float(r.get("_claim_until") or 0) > now:
                 continue
             if r.get("_submission_started"):
+                record_sent_interruption(kind, r, now, "execution_claim_expired")
                 r.update(status="unknown" if kind == "text" else "error", error_code="CONVERSATION_OUTCOME_UNKNOWN")
                 if kind == "image":
                     r["upstream_unfinished"] = not bool(r.get("result_file_ids") or r.get("result_sediment_ids"))
@@ -1083,7 +1147,6 @@ class PoolAdmission:
                        and r.get("status") == "queued" and not r.get("_submission_started")]
         if not waiting:
             return
-        self._next_image_probe = float(self.clock()) + 30
         from services.owned_accounts import observed_capacity
         from utils.helper import is_codex_image_model
         with self._account_guard():
@@ -1105,6 +1168,11 @@ class PoolAdmission:
                     and capacity["remaining"] is not None and capacity["remaining"] > 0
                     and account.get("status") not in {"异常", "限流"}):
                 continue
+            if probes == 0:
+                # A healthy/unmatched scan made no upstream request. It must
+                # not delay the first real refresh after image consumption.
+                # Actual refreshes (including failures) retain the cooldown.
+                self._next_image_probe = float(self.clock()) + 30
             try:
                 refresh(self.accounts.pool_account_ref(account))
             except Exception:
@@ -1155,7 +1223,7 @@ class PoolAdmission:
                         break
         with self._settings_guard(), self.store.transaction() as db, self._account_guard():
             now = float(self.clock())
-            receipts = list(self.store.receipts(db))
+            receipts = list(self.store.admission_receipts(db))
             workflow_scheduling.expire_unsent(self.store, db, receipts, now)
             self._recover_claims(db, receipts, now)
             bind_waiting_threads(self.store, db, receipts)
@@ -1331,9 +1399,10 @@ class PoolAdmission:
             if binding and self.accounts.get_bound_account_identity(binding) != identity:
                 raise AdmissionLost("original image binding changed before send")
 
-        def run(deadline):
+        def run(deadline, *, local_wait=None):
             still_original()
-            refresh(account_ref, deadline=deadline, before_read=still_original)
+            refresh(account_ref, deadline=deadline, before_read=still_original,
+                    **({"local_wait": local_wait} if callable(local_wait) else {}))
             still_original()
         return run
 
@@ -1380,7 +1449,8 @@ class PoolAdmission:
                                       "SCHEDULING_NOT_BEFORE": "scheduling_changed",
                                       "SCHEDULING_SEND_INTERVAL": "scheduling_changed",
                                       "WORK_NOT_ACTIVE": "work_not_active"}.get(str(exc), "send_guard_rejected")
-                        record_unsent_failure(context, r, now, "AdmissionLost", reason=diagnostic)
+                        record_unsent_failure(context, r, now, "AdmissionLost", reason=diagnostic,
+                                              capability_reason=getattr(exc, "capability_reason", None))
                         r.update(status="queued", upstream_outcome="not_sent", upstream_unfinished=False,
                                  _claim_id=None, _claim_until=0, _turn_reserved=False, _executing=False,
                                  _ready_at=now + 1, waiting={"reasons": [reason], "next_check_at": now + 1})
@@ -1496,7 +1566,15 @@ class PoolAdmission:
                 raise AdmissionLost("original account is unavailable before send")
             if context.kind == "image" or r.get("_operation") == "image":
                 if image_capacity(selected, self._settings(), r.get("model", "gpt-image-2")) <= 0:
-                    raise AdmissionLost("original image capability is unavailable before send")
+                    from services.owned_accounts import image_capability_projection
+                    reason = image_capability_projection(selected).get("reason")
+                    if reason == "stale":
+                        reason = "stale_consumed" if selected.get("capacity_used_since_observation") else "stale_expired"
+                    error = AdmissionLost("original image capability is unavailable before send")
+                    error.capability_reason = reason if reason in {
+                        "disabled", "auth_required", "limited", "read_failed", "stale_consumed", "stale_expired"
+                    } else "unavailable"
+                    raise error
                 if r.get("provider_binding_id"):
                     try:
                         bound_identity = self.accounts.get_bound_account_identity(r["provider_binding_id"])
@@ -1603,14 +1681,23 @@ class PoolAdmission:
                 r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
                 if r and r.get("_claim_id") == context.claim and r.get("status") == "running":
                     if r.get("_submission_started"):
+                        record_sent_interruption(context.kind, r, float(self.clock()), "worker_exception")
                         r.update(status="unknown" if context.kind == "text" else "error", error_code="CONVERSATION_OUTCOME_UNKNOWN")
                     else:
-                        record_unsent_failure(context, r, float(self.clock()), type(exc).__name__)
+                        record_unsent_failure(context, r, float(self.clock()), type(exc).__name__,
+                                              reason=getattr(exc, "reason", None),
+                                              capability_reason=getattr(exc, "capability_reason", None))
                         r.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
                                  _turn_reserved=False, upstream_unfinished=False,
                                  _ready_at=float(self.clock()) + 1)
+                        if isinstance(exc, AdmissionLost):
+                            r.update(upstream_outcome="not_sent", upstream_submission_started=False,
+                                     error_code="", waiting={"reasons": ["send_constraints_changed"],
+                                     "next_check_at": r["_ready_at"]})
                         reset_unsent_image_attempt(context.kind, r)
                     self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
+                    if isinstance(exc, AdmissionLost) and not r.get("_submission_started"):
+                        workflow_scheduling.release_provisional_slot(self.store, db, r)
         finally:
             done.set()
             with self.store.transaction() as db:
@@ -1646,7 +1733,11 @@ def configure_original_task_admission():
                                      body["identity"], str(payload.get("model") or "gpt-image-2"))
     admission.register("image", image)
     admission.recoveries["text"] = lambda owner, request_id: text_task_service.read(owner, request_id)
-    admission.recoveries["image"] = lambda owner, request_id: image_task_service.resume_poll({"id": owner, "role": "user"}, request_id)
+    # Internal recovery handlers finish one read before returning, so the
+    # dispatcher owns its permit for the full I/O. Public resume_poll remains
+    # asynchronous by default; no API calls recover_one directly.
+    admission.recoveries["image"] = lambda owner, request_id: image_task_service.resume_poll(
+        {"id": owner, "role": "user"}, request_id, wait_for_completion=True)
     text_task_service.admission = admission
     image_task_service.admission = admission
     from services.work_lifecycle import WorkLifecycleService

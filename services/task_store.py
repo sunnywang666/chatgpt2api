@@ -18,6 +18,21 @@ import time
 import uuid
 
 
+# An expression index keeps the scheduler from reparsing every saved image just
+# to decide whether it needs that receipt. Be conservative: only ordinary,
+# finished successes can be omitted. Retry/completion children remain visible
+# as reverse links, and exact predecessors are fetched separately by primary key.
+_ADMISSION_IMAGE_NEEDED = """CASE WHEN
+    json_extract(receipt,'$.status')='success'
+    AND coalesce(json_extract(receipt,'$.upstream_unfinished'),0)=0
+    AND coalesce(json_extract(receipt,'$.upstream_outcome'),'')!='unknown'
+    AND (coalesce(json_type(receipt,'$._completion'),'')!='object'
+         OR json_extract(receipt,'$._completion.state') IN ('completed','result_ready'))
+    AND json_extract(receipt,'$._same_session_retry_of') IS NULL
+    AND json_extract(receipt,'$._completion_of') IS NULL
+    THEN 0 ELSE 1 END"""
+
+
 def pending_image_result_ids(receipt):
     """Request-scoped observations that still require an authoritative settle read."""
     value = receipt.get("_pending_image_result_ids")
@@ -107,6 +122,10 @@ class TaskStore:
                     db.execute("CREATE TABLE IF NOT EXISTS requests (owner TEXT, id TEXT, request_hash TEXT, receipt TEXT, PRIMARY KEY(owner,id))")
                     db.execute("CREATE TABLE IF NOT EXISTS image_requests (task_key TEXT PRIMARY KEY, receipt TEXT NOT NULL)")
                     db.execute("CREATE TABLE IF NOT EXISTS task_runtime (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                    for table in ("requests", "image_requests"):
+                        db.execute(f"CREATE INDEX IF NOT EXISTS {table}_status ON {table} (json_extract(receipt,'$.status'))")
+                    db.execute("CREATE INDEX IF NOT EXISTS image_requests_admission ON image_requests ("
+                               + _ADMISSION_IMAGE_NEEDED + ")")
             finally:
                 db.close()
             self._ready = True
@@ -200,7 +219,8 @@ class TaskStore:
             yield handle
 
     @staticmethod
-    def receipts(db, *, statuses=None, include_pending_completion=False, include_upstream_unfinished=False):
+    def receipts(db, *, statuses=None, include_pending_completion=False, include_upstream_unfinished=False,
+                 conversation_id=None, work_key=None, include_automatic_completion=False):
         # A scheduler may prefilter candidates before decoding saved image
         # payloads. Keep full receipts and the caller's authoritative predicates;
         # public reads, lineage and admission still use the unfiltered default.
@@ -212,11 +232,20 @@ class TaskStore:
         if include_pending_completion:
             conditions.append("(json_type(receipt,'$._completion')='object' AND "
                               "coalesce(json_extract(receipt,'$._completion.state'),'') NOT IN ('completed','result_ready'))")
+        if include_automatic_completion:
+            conditions.append("(json_extract(receipt,'$._automatic_generation_recovery')=1 AND "
+                              "coalesce(json_type(receipt,'$._completion'),'null')='null' AND "
+                              "json_extract(receipt,'$._completion_of') IS NULL AND "
+                              "json_extract(receipt,'$.status') IN ('unknown','failed','error'))")
         if include_upstream_unfinished:
             # Legacy terminal-looking receipts can still reserve a physical
             # turn. A status prefilter must not hide their unfinished marker.
             conditions.append("json_extract(receipt,'$.upstream_unfinished')=1")
         where = " WHERE (" + " OR ".join(conditions) + ")" if conditions else " WHERE 0" if statuses is not None else ""
+        for field, value in (("conversation_id", conversation_id), ("_work_key", work_key)):
+            if value is not None:
+                where += (" AND " if where else " WHERE ") + "json_extract(receipt,'$." + field + "')=?"
+                values.append(value)
         for owner, request_id, raw in db.execute("SELECT owner,id,receipt FROM requests" + where, values):
             yield "text", owner, request_id, json.loads(raw)
         for key, raw in db.execute("SELECT task_key,receipt FROM image_requests" + where, values):
@@ -232,6 +261,71 @@ class TaskStore:
         else:
             raise ValueError("unsupported receipt kind")
         return json.loads(row[0]) if row else None
+
+    @classmethod
+    def admission_receipts(cls, db):
+        """Claim snapshot without decoding unrelated, completed image results.
+
+        Text history still participates in public-session ordering unchanged.
+        Image dependencies retain the full original payload for fingerprint and
+        cursor checks, including selected same-session retry results. The caller
+        holds the transaction; ordinary receipt/history reads are unchanged.
+        """
+        for owner, request_id, raw in db.execute("SELECT owner,id,receipt FROM requests"):
+            yield "text", owner, request_id, json.loads(raw)
+        images = {}
+        for (raw,) in db.execute("SELECT receipt FROM image_requests WHERE (" + _ADMISSION_IMAGE_NEEDED + ")=1"):
+            receipt = json.loads(raw)
+            images[(receipt["owner_id"], receipt["id"])] = receipt
+        pending = list(images.items())
+        for (owner, _), receipt in pending:
+            thread = receipt.get("_image_thread") or {}
+            completion = receipt.get("_completion") or {}
+            references = [receipt.get(name) for name in (
+                "_previous_request_id", "_terminal_empty_correction_of", "_supersedes_request_id",
+                "_same_session_retry_of", "_completion_of")]
+            references += [thread.get(name) for name in (
+                "previous_task_id", "edit_source_task_id", "origin_task_id")]
+            references.append(completion.get("selected_id"))
+            for request_id in references:
+                if not isinstance(request_id, str) or not request_id or (owner, request_id) in images:
+                    continue
+                previous = cls.read_receipt(db, "image", owner, request_id)
+                if previous is not None:
+                    images[(owner, request_id)] = previous
+                    pending.append(((owner, request_id), previous))
+        for (owner, request_id), receipt in images.items():
+            yield "image", owner, request_id, receipt
+
+    @staticmethod
+    def work_receipts(db, kind, owner, work_key, conversation_id=None):
+        """Read a superset of work members without decoding unrelated images.
+
+        Keep all physical-conversation aliases and all same-owner legacy rows;
+        the lifecycle's existing Python predicates remain authoritative.
+        This only narrows reads, never rewrites saved receipt payloads.
+        """
+        for row_kind, table, owner_column in (
+                ("text", "requests", "owner"),
+                ("image", "image_requests", "json_extract(receipt,'$.owner_id')")):
+            clauses = ["json_extract(receipt,'$._work_key')=?"]
+            values = [work_key]
+            if conversation_id:
+                clauses.append("json_extract(receipt,'$.conversation_id')=?")
+                values.append(conversation_id)
+            if row_kind == kind:
+                # A non-text/empty work key is a broad legacy candidate. Do not
+                # reproduce _reference precedence or Python truthiness in SQL.
+                clauses.append(f"({owner_column}=? AND (json_type(receipt,'$._work_key') IS NOT 'text' "
+                               "OR json_extract(receipt,'$._work_key')=''))")
+                values.append(owner)
+            columns = "owner,id,receipt" if row_kind == "text" else "task_key,receipt"
+            for row in db.execute(f"SELECT {columns} FROM {table} WHERE (" + " OR ".join(clauses) + ")", values):
+                receipt = json.loads(row[-1])
+                if row_kind == "text":
+                    yield row_kind, row[0], row[1], receipt
+                else:
+                    yield row_kind, receipt["owner_id"], receipt["id"], receipt
 
     @staticmethod
     def write_receipt(db, kind, owner, request_id, receipt):

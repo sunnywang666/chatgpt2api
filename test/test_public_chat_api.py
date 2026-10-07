@@ -26,6 +26,32 @@ from services.text_task_service import (
 )
 
 
+def test_get_cannot_reopen_exhausted_no_final_recovery(public_chat):
+    f = public_chat
+    owner = f.key_a["id"]
+    f.tasks.submit(owner, {"client_request_id": "no-final", "client_conversation_id": "original-session",
+                           "messages": [{"role": "user", "content": "original input"}]})
+    f.tasks._update(owner, "no-final", status="failed", error_code="RESULT_UNRECOVERABLE",
+        upstream_outcome="unknown", provider_binding_id="binding", provider_account_identity="account",
+        conversation_id="original-chat", parent_message_id="original-parent", _submission_started=True,
+        _executing=False, _claim_id=None, _turn_reserved=False, _execution_wait_ended_at=1000,
+        recovery_no_result_reads=127, recovery_reason="REQUEST_RESULT_NOT_FOUND")
+    reader = Mock(return_value={"status": "unknown", "recovery_reason": "REQUEST_RESULT_NOT_FOUND"})
+    f.tasks.recovery_reader = reader
+    for _ in range(2):
+        response = f.client.get("/api/chat-requests/no-final", headers=f.headers())
+        assert response.status_code == 200
+        assert response.json()["execution"]["attempt_state"] == "ended"
+        assert response.json()["recovery"]["automatic_stopped"] is True
+        assert response.json()["recovery"]["stop_reason"] == "ORIGINAL_RESULT_NO_FINAL"
+    reader.assert_not_called()
+    response = f.client.post("/api/chat-requests/no-final/recover", headers=f.headers())
+    assert response.status_code == 200 and reader.call_count == 1
+    f.client.get("/api/chat-requests/no-final", headers=f.headers())
+    assert reader.call_count == 1
+    f.upstream.assert_not_called()
+
+
 class QueuedExecutor:
     def __init__(self):
         self.calls = []
@@ -500,6 +526,89 @@ def test_public_chat_body_reader_capacity_is_nonblocking_and_released(monkeypatc
     failed, _ = _asgi_request("/api/chat-requests")
     with pytest.raises(RuntimeError, match="downstream failed"):
         asyncio.run(external_image_boundary(failed, fails))
+    assert external_images._public_chat_body_readers == 0
+
+
+@pytest.mark.parametrize("path", [
+    "/api/image-tasks/original/completion",
+    "/api/image-tasks/original/work",
+    "/api/chat-requests/original/completion",
+    "/api/chat-requests/original/work",
+])
+def test_small_control_body_permits_do_not_cover_downstream_work(monkeypatch, path):
+    monkeypatch.setattr(external_images, "require_identity", lambda *_a, **_k: {"role": "user"})
+
+    async def scenario():
+        entered = asyncio.Queue()
+        release = asyncio.Event()
+        pending = []
+
+        async def downstream(request):
+            assert await request.json() == {"results_saved": True}
+            await entered.put(True)
+            await release.wait()
+            return Response(status_code=204)
+
+        try:
+            # Eight independent completions may wait for durable task state;
+            # their already-read 1 KiB controls must not occupy body readers.
+            for _ in range(8):
+                request, _ = _asgi_request(path, body=b'{"results_saved":true}')
+                pending.append(asyncio.create_task(external_image_boundary(request, downstream)))
+                await asyncio.wait_for(entered.get(), timeout=1)
+            assert external_images._public_chat_body_readers == 0
+        finally:
+            release.set()
+            responses = await asyncio.gather(*pending)
+        assert all(response.status_code == 204 for response in responses)
+
+    asyncio.run(scenario())
+    assert external_images._public_chat_body_readers == 0
+
+
+def test_small_control_retains_incomplete_body_and_size_protection(monkeypatch):
+    monkeypatch.setattr(external_images, "require_identity", lambda *_a, **_k: {"role": "user"})
+
+    async def scenario():
+        entered = asyncio.Queue()
+        release = asyncio.Event()
+        pending = []
+
+        async def downstream(_request):
+            return Response(status_code=204)
+
+        def slow_body():
+            request, _ = _asgi_request("/api/image-tasks/original/completion")
+
+            async def receive():
+                await entered.put(True)
+                await release.wait()
+                return {"type": "http.request", "body": b"{}", "more_body": False}
+
+            request._receive = receive
+            return request
+
+        try:
+            for _ in range(external_images.MAX_CONCURRENT_PUBLIC_CHAT_BODY_READERS):
+                pending.append(asyncio.create_task(external_image_boundary(slow_body(), downstream)))
+                await asyncio.wait_for(entered.get(), timeout=1)
+            request, consumed = _asgi_request("/api/image-tasks/original/completion")
+            response = await external_image_boundary(request, downstream)
+            assert response.status_code == 429
+            assert consumed["value"] is False
+        finally:
+            release.set()
+            await asyncio.gather(*pending)
+
+    asyncio.run(scenario())
+    request, _ = _asgi_request("/api/image-tasks/original/completion", body=b"x" * 1025)
+
+    async def forbidden_downstream(_request):
+        raise AssertionError("oversized control reached the handler")
+
+    response = asyncio.run(external_image_boundary(request, forbidden_downstream))
+    assert response.status_code == 413
+    assert json.loads(response.body)["detail"]["code"] == "COMPLETION_BODY_TOO_LARGE"
     assert external_images._public_chat_body_readers == 0
 
 

@@ -746,7 +746,6 @@ class ConversationBindingService:
                 scan["time_order_valid"] = False
                 scan["last_update_time"] = None
 
-            scan["conversation_ids"].extend(page_ids)
             scan["next_offset"] += len(raw_page_ids)
             dispatch_at = cls._receipt_dispatch_time(receipt)
             covered_by_time = (
@@ -756,6 +755,18 @@ class ConversationBindingService:
                 and scan["last_update_time"]
                     < dispatch_at - cls.RECOVERY_DISPATCH_CLOCK_SKEW_SECONDS
             )
+            if covered_by_time:
+                # The same trusted time boundary that excludes later pages
+                # also excludes this page's old tail. Pair before deduplication
+                # so a repeated ID with a recent timestamp remains a candidate.
+                cutoff = dispatch_at - cls.RECOVERY_DISPATCH_CLOCK_SKEW_SECONDS
+                recent_ids = {
+                    conversation_id
+                    for conversation_id, updated_at in zip(raw_page_ids, page_times)
+                    if updated_at >= cutoff
+                }
+                page_ids = [item for item in page_ids if item in recent_ids]
+            scan["conversation_ids"].extend(page_ids)
             scan["coverage_complete"] = (
                 len(recent) < cls.RECOVERY_RECENT_CONVERSATION_LIMIT
                 or covered_by_time
@@ -1136,7 +1147,7 @@ class ConversationBindingService:
                     try:
                         return self._read_text_result(backend, body, deadline_monotonic=deadline,
                                                       connect_timeout_secs=10.0,
-                                                      minimum_budget_secs=10.0 if attempt else None)
+                                                      minimum_budget_secs=10.0)
                     except AccountReadRetryBudgetInsufficient:
                         if first_error is not None:
                             raise first_error from None

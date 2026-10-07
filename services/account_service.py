@@ -123,23 +123,37 @@ class AccountService:
 
     def require_image_account(self, access_token: str, model: str, *, expected_identity: str | None = None) -> dict:
         """Recheck the exact account before execution; never select another one."""
+        from services.request_context import AdmissionLost
         with self._lock:
             token = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(token) or {}
             identity = self._stable_account_identity(account)
             if (expected_identity and identity != expected_identity
-                    or sum(self._stable_account_identity(a) == identity for a in self._accounts.values()) != 1
-                    or self.image_account_capacity(account, model) <= 0):
-                raise RuntimeError("selected image account capability is unavailable")
+                    or sum(self._stable_account_identity(a) == identity for a in self._accounts.values()) != 1):
+                error = AdmissionLost("selected image account capability is unavailable")
+                error.reason = "image_binding_changed"
+                raise error
+            if self.image_account_capacity(account, model) <= 0:
+                from services.owned_accounts import image_capability_projection
+                reason = image_capability_projection(account).get("reason")
+                if reason == "stale":
+                    reason = "stale_consumed" if account.get("capacity_used_since_observation") else "stale_expired"
+                error = AdmissionLost("selected image account capability is unavailable")
+                error.reason = "image_capability_unavailable"
+                error.capability_reason = reason if reason in {
+                    "disabled", "auth_required", "limited", "read_failed", "stale_consumed", "stale_expired"
+                } else "unavailable"
+                raise error
             return dict(account)
 
-    def refresh_image_capability(self, account_ref: str, *, deadline=None, before_read=None) -> None:
+    def refresh_image_capability(self, account_ref: str, *, deadline=None, before_read=None, local_wait=None) -> None:
         # Existing protected metadata readers; no model execution is a probe.
         with self._lock:
             _, account = self._pool_account_locked(account_ref)
             source = account.get("source_type")
         if source in {None, "web", "oauth_login", "password"}:
-            self._refresh_pool_chat(account_ref, deadline=deadline, before_read=before_read)
+            self._refresh_pool_chat(account_ref, deadline=deadline, before_read=before_read,
+                                    **({"local_wait": local_wait} if callable(local_wait) else {}))
         elif source == "codex":
             self.refresh_pool_account(account_ref, routes=["codex"], stale_only=True)
 
@@ -350,6 +364,8 @@ class AccountService:
         normalized["restore_at"] = normalized.get("restore_at") or None
         normalized["success"] = int(normalized.get("success") or 0)
         normalized["fail"] = int(normalized.get("fail") or 0)
+        consumed = normalized.get("capacity_consumption_count", 0)
+        normalized["capacity_consumption_count"] = consumed if type(consumed) is int and consumed >= 0 else 0
         normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
@@ -460,7 +476,7 @@ class AccountService:
         return subject, account_id
 
     @classmethod
-    def _verified_chat_info(cls, access_token: str, *, deadline=None, before_read=None) -> tuple[tuple[str, str], dict]:
+    def _verified_chat_info(cls, access_token: str, *, deadline=None, before_read=None, local_wait=None) -> tuple[tuple[str, str], dict]:
         """Read the real Chat principal without trusting submitted JWT claims."""
         from services.openai_backend_api import OpenAIBackendAPI
         from services.request_context import AdmissionLost
@@ -470,6 +486,7 @@ class AccountService:
             backend = OpenAIBackendAPI(access_token)
             backend.metadata_deadline = deadline
             backend.metadata_before_send = before_read
+            backend.metadata_local_wait = local_wait
             info = backend.get_user_info()
         except AdmissionLost:
             raise
@@ -789,7 +806,7 @@ class AccountService:
     def _apply_refreshed_tokens(
         self, old_access_token: str, token_data: dict, event: str, *,
         expected_revision: str | None = None, chat_info: dict | None = None,
-        expected_capacity_observation: tuple[int, int, str] | None = None,
+        expected_capacity_observation: tuple[str, int] | None = None,
         capacity_observed_at: str | None = None,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
@@ -2092,7 +2109,7 @@ class AccountService:
             and bool(str(account.get("access_token") or "").strip())
         )
 
-    def _refresh_pool_chat(self, account_ref: str, *, deadline=None, before_read=None) -> None:
+    def _refresh_pool_chat(self, account_ref: str, *, deadline=None, before_read=None, local_wait=None) -> None:
         from services.owned_accounts import utc_now
         with self._lock:
             token, account = self._pool_account_locked(account_ref)
@@ -2115,8 +2132,9 @@ class AccountService:
             expected_user = str(account.get("user_id") or "").strip()
             expected_workspace = self._validated_workspace_id(account.get("account_id"))
         try:
-            observed_identity, info = (self._verified_chat_info(token) if deadline is None and before_read is None
-                else self._verified_chat_info(token, deadline=deadline, before_read=before_read))
+            observed_identity, info = (self._verified_chat_info(token) if deadline is None and before_read is None and local_wait is None
+                else self._verified_chat_info(token, deadline=deadline, before_read=before_read,
+                    **({"local_wait": local_wait} if callable(local_wait) else {})))
             if ((expected_user and observed_identity[0] != expected_user)
                     or (expected_workspace and observed_identity[1] != expected_workspace)):
                 raise CodexAuthorizationAttachError("chat_authorization_account_conflict")
@@ -3202,7 +3220,7 @@ class AccountService:
                     # Re-importing an old export cannot rewind server-owned
                     # consumption/observation state; fresh reads update it.
                     for key in ("success", "fail", "last_used_at", "quota", "limits_progress",
-                                "capacity_observed_at", "capacity_used_since_observation",
+                                "capacity_observed_at", "capacity_used_since_observation", "capacity_consumption_count",
                                 "capacity_read_failed_at", "status", "restore_at"):
                         incoming.pop(key, None)
                 if not incoming.get("created_at"):
@@ -3248,28 +3266,29 @@ class AccountService:
         return {"removed": removed, "items": items}
 
     @staticmethod
-    def _capacity_observation_revision(account: dict) -> tuple[int, int, str]:
-        # Reuse the persisted consumption counters and last observation rather
-        # than letting a slow response certify capacity from before a result.
-        return (int(account.get("success") or 0), int(account.get("fail") or 0),
-                str(account.get("capacity_observed_at") or ""))
+    def _capacity_observation_revision(account: dict) -> tuple[str, int]:
+        # Only new image consumption invalidates an in-flight quota read.
+        # Download outcome counters and unrelated text usage do not consume
+        # again and must not discard a read started after asset production.
+        return (str(account.get("capacity_observed_at") or ""),
+                int(account.get("capacity_consumption_count") or 0))
 
     @classmethod
     def _capacity_observation_can_apply(
-        cls, current: dict, expected: tuple[int, int, str] | None, observed_at: str | None,
+        cls, current: dict, expected: tuple[str, int] | None, observed_at: str | None,
     ) -> bool:
         if expected is None:
             return True
         actual = cls._capacity_observation_revision(current)
-        if expected[:2] != actual[:2]:
+        if expected[1] != actual[1]:
             return False
-        if expected[2] == actual[2]:
+        if expected[0] == actual[0]:
             return True
         # Order concurrent reads by their start, not their completion. A newer
         # zero must survive either completion order; an old positive cannot
         # replace it. Use the existing observation timestamp, no new counter.
         started = cls._parse_time(observed_at)
-        saved = cls._parse_time(actual[2])
+        saved = cls._parse_time(actual[0])
         return started is not None and saved is not None and started > saved
 
     def update_account(
@@ -3280,7 +3299,7 @@ class AccountService:
         *,
         expected_credentials: tuple[str, str] | None = None,
         expected_codex_credentials: tuple[str, str] | None = None,
-        expected_capacity_observation: tuple[int, int, str] | None = None,
+        expected_capacity_observation: tuple[str, int] | None = None,
     ) -> dict | None:
         if not access_token:
             return None
@@ -3302,7 +3321,8 @@ class AccountService:
             if not self._capacity_observation_can_apply(
                     current, expected_capacity_observation, updates.get("capacity_observed_at")):
                 return dict(current)
-            account = self._normalize_account({**current, **updates, "access_token": access_token})
+            account = self._normalize_account({**current, **updates, "access_token": access_token,
+                "capacity_consumption_count": current.get("capacity_consumption_count", 0)})
             if account is None:
                 return None
             if updates.get("status") == "限流" and account.get("status") == "限流" and config.auto_remove_rate_limited_accounts and not account.get("managed_owner"):
@@ -3364,7 +3384,36 @@ class AccountService:
                 return False
         return True
 
-    def mark_image_result(self, access_token: str, success: bool, *, release_slot: bool = True) -> dict | None:
+    def mark_image_capacity_consumed(self, access_token: str) -> None:
+        """Invalidate quota before persisted result IDs release generation capacity.
+
+        The later download outcome only updates success/failure counters. The
+        image-only counter prevents an older metadata read from clearing this
+        invalidation; unrelated text usage does not restart image observation.
+        """
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                raise RuntimeError("selected image account disappeared")
+            next_item = dict(current)
+            next_item["capacity_used_since_observation"] = True
+            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            next_item["capacity_consumption_count"] = int(next_item.get("capacity_consumption_count") or 0) + 1
+            next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
+            if next_item["quota"] == 0:
+                next_item["status"] = "限流"
+                next_item["restore_at"] = next_item.get("restore_at") or None
+            elif next_item.get("status") == "限流":
+                next_item["status"] = "正常"
+            account = self._normalize_account(next_item)
+            if account is None:
+                raise RuntimeError("selected image account is invalid")
+            self._accounts[access_token] = account
+            self._save_accounts()
+
+    def mark_image_result(self, access_token: str, success: bool, *, release_slot: bool = True,
+                          capacity_consumed: bool = False) -> dict | None:
         if not access_token:
             return None
         if release_slot:
@@ -3375,16 +3424,21 @@ class AccountService:
             if current is None:
                 return None
             next_item = dict(current)
-            next_item["capacity_used_since_observation"] = True
-            next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if not capacity_consumed:
+                next_item["capacity_used_since_observation"] = True
+                next_item["last_used_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # Legacy callers have not recorded asset consumption early.
+                # Preserve their invalidation of an older in-flight read.
+                next_item["capacity_consumption_count"] = int(next_item.get("capacity_consumption_count") or 0) + 1
             if success:
                 next_item["success"] = int(next_item.get("success") or 0) + 1
-                next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
-                if next_item["quota"] == 0:
-                    next_item["status"] = "限流"
-                    next_item["restore_at"] = next_item.get("restore_at") or None
-                elif next_item.get("status") == "限流":
-                    next_item["status"] = "正常"
+                if not capacity_consumed:
+                    next_item["quota"] = max(0, int(next_item.get("quota") or 0) - 1)
+                    if next_item["quota"] == 0:
+                        next_item["status"] = "限流"
+                        next_item["restore_at"] = next_item.get("restore_at") or None
+                    elif next_item.get("status") == "限流":
+                        next_item["status"] = "正常"
             else:
                 next_item["fail"] = int(next_item.get("fail") or 0) + 1
             account = self._normalize_account(next_item)

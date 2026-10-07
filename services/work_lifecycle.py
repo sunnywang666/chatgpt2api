@@ -71,7 +71,8 @@ def ensure_work(store, db, kind, owner, request_id, receipt, *, source=None, sch
         if previous and previous.get("_work_key"):
             receipt["_work_key"] = previous["_work_key"]
     if (receipt.get("provider_binding_id") or receipt.get("provider_account_identity")) and receipt.get("conversation_id"):
-        known = {r["_work_key"] for k, _, _, r in store.receipts(db)
+        known = {r["_work_key"] for k, _, _, r in store.receipts(
+                    db, conversation_id=receipt["conversation_id"])
                  if r.get("_work_key") and _same_conversation(r, receipt)}
         if len(known) > 1:
             raise WorkLifecycleError("WORK_BINDING_CONFLICT")
@@ -177,7 +178,6 @@ class WorkLifecycleService:
         self.clock = clock
         self._operation_lock = threading.Lock()
         self._operation_slots = threading.BoundedSemaphore(4)
-        self._active_accounts = set()
 
     def _load(self, db, kind, identity, request_id):
         owner = str(identity["id"])
@@ -195,7 +195,7 @@ class WorkLifecycleService:
             raise WorkLifecycleError("WORK_SUPERSEDED")
         # Legacy sessions did not have work rows. Include their proven native
         # session members so a prior UNKNOWN is never lost during adoption.
-        rows = list(self.store.receipts(db))
+        rows = list(self.store.work_receipts(db, kind, owner, work["key"], receipt.get("conversation_id")))
         members = [r for k, o, _, r in rows if _same_conversation(r, receipt) or (k == kind and o == owner and (
             r.get("_work_key") == work["key"] or (
                 not r.get("_work_key") and _reference(k, o, r) == work["work_ref"]))) ]
@@ -207,6 +207,17 @@ class WorkLifecycleService:
         return receipt, work, members
 
     def get(self, kind, identity, request_id):
+        # An existing work is an observation, not a writer. Keep its receipt,
+        # work version and member checks in one committed SQLite snapshot so a
+        # concurrent archive/update does not make the read compete for its lock.
+        with self.store.connect() as db:
+            db.execute("BEGIN")
+            receipt = self.store.read_receipt(db, kind, str(identity["id"]), request_id)
+            if receipt and read_work(self.store, db, kind, str(identity["id"]), receipt):
+                _, work, _ = self._load(db, kind, identity, request_id)
+                return _projection(work)
+        # Legacy adoption still needs the original write transaction and full
+        # recheck; never upgrade a potentially stale read snapshot to a writer.
         with self.store.transaction() as db:
             _, work, _ = self._load(db, kind, identity, request_id)
             return _projection(work)
@@ -288,7 +299,7 @@ class WorkLifecycleService:
         with self.store.transaction() as db:
             _, work, _ = self._load(db, kind, identity, request_id)
             key = work["key"]
-        self.process_one(target_key=key)
+        self.process_one(target_key=key, defer_reads=True)
         result = self.get(kind, identity, request_id)
         if result["archive"].get("status") != "confirmed" or result["archive"].get("archived") is not archived:
             raise WorkLifecycleError("WORK_ARCHIVE_UNCONFIRMED", 503)
@@ -300,18 +311,21 @@ class WorkLifecycleService:
         from services.image_thread import public_thread
         return {"task_id": request_id, "archived": archived, "image_thread": public_thread(receipt)}
 
-    def process_one(self, *, target_key=None, background=False):
-        # Claim under a short local guard and the durable transaction. A paced
-        # archive must not occupy the original-result recovery worker or block
-        # another account. One in-flight archive per account also prevents a
-        # single read clock from occupying all four local workers.
+    def process_one(self, *, target_key=None, background=False, defer_reads=False):
+        # Only ready I/O occupies the bounded workers. Independent original
+        # conversations may overlap; a read-credit wait returns its intent to
+        # pending instead of holding a whole-account pipeline lock.
         if not self._operation_slots.acquire(blocking=False):
             return False
         if not self._operation_lock.acquire(blocking=False):
             self._operation_slots.release()
             return False
         work = None
-        account_key = None
+        account = None
+        reservation = candidate_account = None
+        releases = []
+        from services.account_request_pacing import (account_pacing_snapshot,
+            reserve_account_archive_read, release_account_archive_read)
         try:
             now = float(self.clock())
             # Read account identities before the receipt transaction, following
@@ -323,20 +337,24 @@ class WorkLifecycleService:
                 with getattr(accounts, "admission_transaction", nullcontext)():
                     read = getattr(accounts, "admission_accounts", None) or accounts.list_accounts
                     account_rows = {a["provider_account_identity"]: a for a in read() if a.get("provider_account_identity")}
-            with self.store.transaction() as db:
-                work = None
-                reservations = {}
+            with self.store.connect() as db:
                 candidates = [json.loads(raw) for (raw,) in db.execute(
                     "SELECT value FROM task_runtime WHERE name LIKE 'work:%' "
                     "AND json_extract(value,'$.archive.status') IN ('pending','unknown','running')")]
                 candidates.sort(key=lambda w: ((w.get("archive") or {}).get("requested_at", w.get("updated_at", 0)), w["key"]))
-                for candidate in candidates:
+            for candidate in candidates:
+                reservation = None
+                candidate_account = None
+                with self.store.transaction() as db:
+                    candidate = self.store.runtime(db, candidate["key"])
                     if target_key is not None and candidate["key"] != target_key:
                         continue
                     a = candidate.get("archive") or {}
                     if (a.get("status") in {"pending", "unknown", "running"}
                             and float(a.get("next_at") or 0) <= now
                             and float(a.get("claim_until") or 0) <= now):
+                        receipt = self.store.read_receipt(db, candidate["kind"], candidate["owner"], a["request_id"]) or {}
+                        candidate_account = account_rows.get(receipt.get("provider_account_identity"))
                         try:
                             receipt, current, members = self._load(db, candidate["kind"], {"id": candidate["owner"]}, a["request_id"])
                             if current["version"] != a["version"] or any(_blocked(r, members=members) for r in members):
@@ -344,15 +362,14 @@ class WorkLifecycleService:
                         except WorkLifecycleError as exc:
                             a.update(status="unknown", error_code=exc.code, next_at=now + 60)
                             save_work(self.store, db, candidate)
+                            if candidate_account is not None:
+                                releases.append((candidate_account, _archive_read_owner(candidate)))
                             continue
-                        candidate_account = receipt.get("provider_account_identity") or receipt.get("provider_binding_id") or candidate["key"]
-                        if candidate_account in self._active_accounts:
-                            continue
-                        account = account_rows.get(receipt.get("provider_account_identity"))
-                        if account is not None:
-                            refresh_error = str(account.get("last_token_refresh_error") or "").lower()
-                            if (account.get("status") == "异常" and (
-                                    str(account.get("last_refresh_error") or "").lower().startswith("token invalidated")
+                        candidate_account = account_rows.get(receipt.get("provider_account_identity"))
+                        if candidate_account is not None:
+                            refresh_error = str(candidate_account.get("last_token_refresh_error") or "").lower()
+                            if (candidate_account.get("status") == "异常" and (
+                                    str(candidate_account.get("last_refresh_error") or "").lower().startswith("token invalidated")
                                     or "refresh_token_invalidated" in refresh_error
                                     or "app_session_terminated" in refresh_error)):
                                 # The original account needs reauthorization;
@@ -360,48 +377,70 @@ class WorkLifecycleService:
                                 # Keep the intent and allow other accounts to run.
                                 a.update(status="unknown", error_code="RECOVERY_AUTH_REQUIRED", next_at=now + 60)
                                 save_work(self.store, db, candidate)
+                                releases.append((candidate_account, _archive_read_owner(candidate)))
                                 continue
-                            from services.account_request_pacing import account_pacing_snapshot
-                            ready_at = account_pacing_snapshot(account, now, include_turn=False, include_conversation_read=True)["next_at"]
+                            ready_at = account_pacing_snapshot(candidate_account, now, include_turn=False, include_conversation_read=True)["next_at"]
                             if ready_at is None or ready_at > now:
                                 a["next_at"] = now + 60 if ready_at is None else ready_at
                                 if ready_at is None:
                                     a.update(status="unknown", error_code="ACCOUNT_PACING_UNAVAILABLE")
-                                elif float(account_pacing_snapshot(account, now, include_turn=False).get("cooldown_until") or 0) <= now:
+                                elif float(account_pacing_snapshot(candidate_account, now, include_turn=False).get("cooldown_until") or 0) <= now:
                                     # Book after committing: HTTP guards acquire
                                     # SQLite while holding the clock, never invert it.
-                                    reservations.setdefault(receipt["provider_account_identity"],
-                                                            (account, _archive_read_owner(candidate)))
+                                    reservation = _archive_read_owner(candidate)
                                 save_work(self.store, db, candidate)
-                                continue
-                        work = candidate
-                        account_key = candidate_account
-                        break
-                if work is not None:
-                    archive = work["archive"]
-                    request_id = archive["request_id"]
-                    claim = uuid.uuid4().hex
-                    archive.update(status="running", claim=claim, claim_until=now + 300,
-                                   attempts=int(archive.get("attempts") or 0) + 1, attempt_started_at=now)
-                    save_work(self.store, db, work)
-            if work is not None:
-                self._active_accounts.add(account_key)
+                            else:
+                                reservation = _archive_read_owner(candidate)
+                        else:
+                            ready_at = now
+                    else:
+                        continue
+                # Clock -> SQLite is the HTTP guard lock order. Never acquire
+                # a clock/FIFO reservation while holding a receipt transaction.
+                ready = True
+                if reservation is not None:
+                    ready = reserve_account_archive_read(candidate_account, reservation)
+                if ready_at is None or ready_at > now or ((background or defer_reads) and not ready):
+                    continue
+                with self.store.transaction() as db:
+                    receipt, current, members = self._load(db, candidate["kind"], {"id": candidate["owner"]}, a["request_id"])
+                    active = current.get("archive") or {}
+                    if (current["version"] != a["version"] or active.get("version") != a["version"]
+                            or active.get("status") not in {"pending", "unknown", "running"}
+                            or float(active.get("claim_until") or 0) > now
+                            or any(_blocked(r, members=members) for r in members)):
+                        work = None
+                    else:
+                        work = current
+                    if work is not None:
+                        archive = work["archive"]
+                        claim = uuid.uuid4().hex
+                        archive.update(status="running", claim=claim, claim_until=now + 300,
+                                       attempts=int(archive.get("attempts") or 0) + 1, attempt_started_at=now)
+                        save_work(self.store, db, work)
+                if work is None:
+                    if reservation is not None:
+                        release_account_archive_read(candidate_account, reservation)
+                else:
+                    account = candidate_account
+                    break
         except Exception:
+            if reservation is not None and candidate_account is not None:
+                releases.append((candidate_account, reservation))
             self._operation_slots.release()
             raise
         finally:
             self._operation_lock.release()
+            for release_account, owner in releases:
+                release_account_archive_read(release_account, owner)
         if work is None:
             self._operation_slots.release()
-            from services.account_request_pacing import reserve_account_archive_read
-            for account, owner in reservations.values():
-                reserve_account_archive_read(account, owner)
             return False
         # The claim is durable before dispatch. A failed thread start must not
         # strand that original intent for the full 300-second lease.
         if background:
             try:
-                threading.Thread(target=self._run_claim, args=(work, claim, account_key, reservations),
+                threading.Thread(target=self._run_claim, args=(work, claim, account, True),
                                  name="original-work-archive", daemon=True).start()
             except Exception:
                 try:
@@ -414,22 +453,24 @@ class WorkLifecycleService:
                                           next_at=float(self.clock()) + 1)
                             save_work(self.store, db, current)
                 finally:
-                    self._release_operation(account_key)
+                    if account is not None:
+                        release_account_archive_read(account, _archive_read_owner(work))
+                    self._release_operation()
                 raise
             return True
-        return self._run_claim(work, claim, account_key, reservations)
+        return self._run_claim(work, claim, account, defer_reads)
 
-    def _release_operation(self, account_key):
-        with self._operation_lock:
-            self._active_accounts.discard(account_key)
+    def _release_operation(self):
         self._operation_slots.release()
         admission = getattr(self.text, "admission", None)
         if admission is not None:
             admission.wake()
 
-    def _run_claim(self, work, claim, account_key, reservations):
+    def _run_claim(self, work, claim, account, defer_reads):
         archive = work["archive"]
         request_id = archive["request_id"]
+        deferred = None
+        from services.account_request_pacing import ArchiveReadDeferred, release_account_archive_read
         try:
             error_code = None
             def check_and_renew_archive():
@@ -444,12 +485,10 @@ class WorkLifecycleService:
                     active["claim_until"] = now + 300
                     save_work(self.store, db, current)
             try:
-                from services.account_request_pacing import reserve_account_archive_read
-                for account, owner in reservations.values():
-                    reserve_account_archive_read(account, owner)
                 from services.request_context import guarding_archive
                 with guarding_archive(check_and_renew_archive, read_owner=_archive_read_owner(work),
-                                      request_key=work["owner"] + ":" + request_id, work_key=work["key"]):
+                                      request_key=work["owner"] + ":" + request_id, work_key=work["key"],
+                                      defer_reads=defer_reads):
                     if work["kind"] == "text":
                         result = self.text.set_public_session_archived(work["owner"], request_id, archive["desired"])
                         valid = (result.get("request_id") == request_id
@@ -460,6 +499,8 @@ class WorkLifecycleService:
                                  and result.get("image_thread", {}).get("id") == work["work_ref"])
                 if not valid or result.get("archived") is not archive["desired"]:
                     raise WorkLifecycleError("WORK_ARCHIVE_UNCONFIRMED")
+            except ArchiveReadDeferred as exc:
+                deferred = exc
             except Exception as exc:
                 code = str(getattr(exc, "code", "WORK_ARCHIVE_UNCONFIRMED"))
                 error_code = code if re.fullmatch(r"[A-Za-z0-9_]{1,80}", code) else "WORK_ARCHIVE_UNCONFIRMED"
@@ -467,10 +508,14 @@ class WorkLifecycleService:
                 current = self.store.runtime(db, work["key"])
                 if (not current or current["version"] != work["version"]
                         or (current.get("archive") or {}).get("claim") != claim):
+                    deferred = None  # A superseded intent must release its FIFO lease.
                     return True
                 updated = current["archive"]
                 updated.update(claim=None, claim_until=None, error_code=error_code)
-                if error_code:
+                if deferred is not None:
+                    updated.update(status="pending", next_at=deferred.next_at,
+                                   attempts=max(0, updated["attempts"] - 1))
+                elif error_code:
                     updated.update(status="unknown", next_at=float(self.clock()) + min(300, 2 ** min(updated["attempts"], 8)))
                 else:
                     updated.update(status="confirmed", archived=updated["desired"], next_at=None,
@@ -484,7 +529,9 @@ class WorkLifecycleService:
                 save_work(self.store, db, current)
             return True
         finally:
-            self._release_operation(account_key)
+            if deferred is None and account is not None:
+                release_account_archive_read(account, _archive_read_owner(work))
+            self._release_operation()
 
 
 def get_work_lifecycle_service():

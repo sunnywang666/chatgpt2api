@@ -61,6 +61,47 @@ def tool_document(cid="conversation-a", rid="request-a", parent="root"):
         rid + "-image": tool}}, result_id
 
 
+@pytest.mark.parametrize("change", [None, "no-final", "unfinished-final", "unfinished-tool",
+    "unknown-status", "missing-end-turn", "early-end-turn", "ancestor-asset", "foreign-asset",
+    "missing-asset", "no-expected", "sibling", "manual-successor", "wrong-current", "wrong-channel", "wrong-parent"])
+def test_completed_image_final_supersedes_only_stale_assistant_ancestor(change):
+    doc, asset = tool_document()
+    mapping = doc["mapping"]
+    mapping["thinking"] = node("thinking", "assistant", "request-a")
+    mapping["thinking"]["message"].update(status="in_progress", end_turn=False)
+    mapping["request-a-code"]["parent"] = "thinking"
+    mapping["recap"] = node("recap", "assistant", "request-a-image")
+    mapping["recap"]["message"]["content"] = {"content_type": "reasoning_recap"}
+    mapping["final"] = node("final", "assistant", "recap", end=True)
+    mapping["final"]["message"]["channel"] = "final"
+    doc["current_node"] = "final"
+    expected = [asset]
+    if change == "no-final":
+        del mapping["final"]; del mapping["recap"]
+        doc["current_node"] = "request-a-image"
+    elif change == "unfinished-final": mapping["final"]["message"]["status"] = "in_progress"
+    elif change == "unfinished-tool": mapping["request-a-image"]["message"]["status"] = "in_progress"
+    elif change == "unknown-status": mapping["thinking"]["message"]["status"] = "failed"
+    elif change == "missing-end-turn": mapping["thinking"]["message"].pop("end_turn")
+    elif change == "early-end-turn": mapping["thinking"]["message"]["end_turn"] = True
+    elif change == "ancestor-asset": mapping["thinking"]["message"]["content"] = copy.deepcopy(mapping["request-a-image"]["message"]["content"])
+    elif change == "foreign-asset": expected = ["file_00000000" + "f" * 24]
+    elif change == "missing-asset": mapping["request-a-image"]["message"]["content"] = {"parts": []}
+    elif change == "no-expected": expected = []
+    elif change == "sibling": mapping["sibling"] = node("sibling", "assistant", "thinking")
+    elif change == "manual-successor": mapping["recap"]["message"]["author"]["role"] = "user"
+    elif change == "wrong-current": doc["current_node"] = "request-a-image"
+    elif change == "wrong-channel": mapping["final"]["message"]["channel"] = "commentary"
+    elif change == "wrong-parent": mapping["request-a"]["parent"] = "foreign-parent"
+    if change is not None:
+        with pytest.raises(ImageThreadError):
+            finished_parent(doc, "conversation-a", "request-a", expected_parent="root", expected_result_ids=expected)
+        return
+    assert finished_parent(doc, "conversation-a", "request-a", expected_parent="root", expected_result_ids=expected) == "final"
+    from services.image_thread import archive_parent
+    assert archive_parent(doc, "conversation-a", "request-a", "final", expected, expected_parent="root") == "final"
+
+
 @pytest.fixture
 def runtime(tmp_path, monkeypatch):
     rows = [{"access_token": "fixture-token", "account_id": "fixture-upstream",
@@ -83,6 +124,7 @@ def runtime(tmp_path, monkeypatch):
     account_stub = SimpleNamespace(get_bound_account_identity=lambda _b: "account-0",
         acquire_bound_image_access_token=lambda *a, **k: "fixture-token", get_account=lambda _t: rows[0],
         conversation_binding_lock=lambda *a: nullcontext(), mark_image_result=lambda *a, **kw: None,
+        mark_image_capacity_consumed=lambda *a: None,
         release_image_slot=lambda *a: None, get_bound_text_access_token=lambda *a, **k: "fixture-token")
     monkeypatch.setattr(conversation, "account_service", account_stub)
     import services.account_service as account_module
@@ -91,6 +133,7 @@ def runtime(tmp_path, monkeypatch):
         monkeypatch.setattr(mod, "count_text_tokens", lambda *a, **k: 0)
     class Backend:
         _has_image_asset_pointer = RealOpenAIBackendAPI._has_image_asset_pointer
+        _extract_image_reference_ids = staticmethod(RealOpenAIBackendAPI._extract_image_reference_ids)
         def __init__(self, access_token):
             assert access_token == "fixture-token"
             self.image_submission_started = False
@@ -105,8 +148,10 @@ def runtime(tmp_path, monkeypatch):
             state.naive_reads += 1
             raise AssertionError("new thread may not accept arbitrary current_node")
         def set_conversation_archived(self, cid, parent, archived, *, validate_document=None):
+            doc = self._get_conversation(cid)
             if validate_document is not None:
-                validate_document(self._get_conversation(cid))
+                parent = validate_document(doc) or parent
+            assert doc['current_node'] == parent
             assert parent in state.documents[cid]["mapping"]
             state.documents[cid]["is_archived"] = archived
             state.archive_actions.append((cid, archived))
@@ -288,6 +333,89 @@ def test_private_image_output_cannot_escape_through_chunk_or_collection():
     assert private.to_chunk()["data"] == []
     assert conversation.collect_image_outputs([private])["data"] == []
     assert "cHJpdmF0ZQ==" not in repr(private)
+
+
+@pytest.mark.parametrize("change", ["none", "unfinished", "sibling", "successor", "missing-original", "namespace", "namespace-added", "nonfinal", "download-failure"])
+def test_recovery_expands_partial_assets_only_on_complete_original_branch(runtime, monkeypatch, change):
+    r = runtime
+    r.state.tool_leaf = r.state.fail_after_result = True
+    r.submit("original"); r.admission.execute(r.admission.claim_next())
+    original = r.read("original")
+    assert original["status"] == "error"
+    cid, rid = original["conversation_id"], original["request_message_id"]
+    asset = original["result_file_ids"][0]
+    if change == "namespace-added":
+        r.service._update_task("happy:original", result_sediment_ids=[])
+        original = r.read("original")
+    coverage = {"conversation_id": cid, "request_message_id": rid,
+                "file_ids": original["result_file_ids"], "sediment_ids": original["result_sediment_ids"]}
+    r.service._store_pending_image_output("happy:original", coverage,
+        [{"b64_json": base64.b64encode(OUTPUT).decode()}])
+    cached = r.read("original")["_pending_image_output"]
+    doc = r.state.documents[cid]
+    doc["mapping"][rid + "-image"]["message"]["content"]["parts"][0]["asset_pointer"] = "sediment://" + asset
+    extra = "file_00000000" + hashlib.sha256((rid + "-extra").encode()).hexdigest()[:24]
+    if change == "namespace-added": extra = asset
+    tool = copy.deepcopy(doc["mapping"][rid + "-image"])
+    tool["parent"] = rid + "-image"
+    tool["message"]["id"] = rid + "-extra"
+    tool["message"]["content"]["parts"][0]["asset_pointer"] = "sediment://" + extra
+    doc["mapping"][rid + "-extra"] = tool
+    doc["mapping"][rid + "-final"] = node(rid + "-final", "assistant", rid + "-extra", end=True)
+    doc["current_node"] = rid + "-final"
+    if change == "unfinished": tool["message"]["status"] = "in_progress"
+    if change == "nonfinal": doc["mapping"][rid + "-final"]["message"]["channel"] = "commentary"
+    if change == "sibling": doc["mapping"]["sibling"] = node("sibling", "assistant", rid)
+    if change == "successor":
+        doc["mapping"]["foreign"] = node("foreign", "user", doc["current_node"])
+        doc["current_node"] = "foreign"
+    if change == "missing-original":
+        doc["mapping"][rid + "-image"]["message"]["content"]["parts"] = []
+    Backend = conversation.OpenAIBackendAPI
+    for name, value in {
+        "_current_message_branch_ids": staticmethod(RealOpenAIBackendAPI._current_message_branch_ids),
+        "_extract_image_reference_ids": staticmethod(RealOpenAIBackendAPI._extract_image_reference_ids),
+        "_extract_image_tool_records": RealOpenAIBackendAPI._extract_image_tool_records,
+    }.items(): monkeypatch.setattr(Backend, name, value, raising=False)
+    if change == "namespace":
+        def records(self, document, request_id):
+            results = RealOpenAIBackendAPI._extract_image_tool_records(self, document, request_id)
+            for record in results: record["sediment_ids"] = []
+            return results
+        monkeypatch.setattr(Backend, "_extract_image_tool_records", records)
+    downloads = []
+    monkeypatch.setattr(Backend, "resolve_conversation_image_urls",
+        lambda _self, _cid, files, _sediments, **_kw: files)
+    def download(_self, urls):
+        downloads.append(urls)
+        if change == "download-failure": raise TimeoutError("download unavailable")
+        return [OUTPUT] if change == "namespace-added" else [OUTPUT, SOURCE]
+    monkeypatch.setattr(Backend, "download_image_bytes", download)
+    monkeypatch.setattr(conversation, "format_image_result", lambda items, *_a, **_kw: {"data": items})
+    restarted = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
+    restarted._run_resume_poll("happy:original", cid, 5, "", WHO, "edit", "gpt-image-2", False, False)
+    result = r.read("original")
+    assert len(r.state.sends) == 1 and result["conversation_id"] == cid and result["request_message_id"] == rid
+    with r.store.output_file(cached["output_ref"]) as handle:
+        assert json.loads(handle.read())[0]["b64_json"] == base64.b64encode(OUTPUT).decode()
+    if change in {"none", "namespace-added"}:
+        assert result["status"] == "success" and len(result["data"]) == len({asset, extra})
+        assert set(result["result_file_ids"]) == {asset, extra}
+        assert set(result["result_sediment_ids"]) == {asset, extra}
+        assert result["parent_message_id"] == rid + "-final" and result["_image_thread_terminal"]
+        assert downloads == [list(dict.fromkeys([asset, extra]))]
+    else:
+        assert result["status"] == "error" and not result.get("data")
+        assert result["_pending_image_output"] == cached
+        if change != "download-failure":
+            assert not downloads and result["result_file_ids"] == original["result_file_ids"]
+        else:
+            change = "none"
+            restored = ImageTaskService(r.root / "images.json", store=TaskStore(r.store.path), admission=r.admission)
+            restored._run_resume_poll("happy:original", cid, 5, "", WHO, "edit", "gpt-image-2", False, False)
+            result = r.read("original")
+            assert result["status"] == "success" and len(result["data"]) == 2
+            assert set(result["result_file_ids"]) == {asset, extra} and len(r.state.sends) == 1
 
 
 @pytest.mark.parametrize("change", ["none", "unfinished", "wrong-parent", "sibling", "current", "late-drift"])
@@ -524,6 +652,78 @@ def test_review_approval_archives_exact_image_thread_and_later_edit_restores_it(
     r.submit("main-v2", source="main-v1")
     run_next(r, "main-v2")
     assert r.state.archive_actions[-1] == (first["conversation_id"], False)
+
+
+def test_archive_decodes_only_original_thread_not_unrelated_saved_images(runtime, monkeypatch):
+    r = runtime
+    r.submit("main-v1"); first = run_next(r, "main-v1")
+    with r.store.transaction() as db:
+        for index in range(64):
+            owner = "other-owner" if index % 2 else WHO["id"]
+            row = {"id": f"history-{index}", "owner_id": owner, "status": "success",
+                   "_image_thread": {"id": "product-a" if index % 2 else "other-thread"},
+                   "data": [{"b64_json": "unrelated-history-payload" + "x" * 131072}]}
+            r.store.write_receipt(db, "image", owner, row["id"], row)
+    loads = json.loads
+    decoded = []
+    def reject_unrelated(raw, *args, **kwargs):
+        if isinstance(raw, (str, bytes)):
+            marker = "unrelated-history-payload" if isinstance(raw, str) else b"unrelated-history-payload"
+            assert marker not in raw, "archive decoded unrelated saved image payload"
+        result = loads(raw, *args, **kwargs)
+        if isinstance(result, dict) and result.get("id") == "main-v1":
+            decoded.append(result["id"])
+        return result
+    monkeypatch.setattr(json, "loads", reject_unrelated)
+    assert r.service.archive_thread(WHO, "main-v1")["archived"] is True
+    assert decoded and r.state.archive_actions == [(first["conversation_id"], True)]
+    with r.store.connect() as db:
+        assert db.execute("SELECT count(*) FROM image_requests").fetchone()[0] == 65
+
+
+@pytest.mark.parametrize("later_status", ["queued", "running", "error"])
+def test_archive_reloads_same_thread_member_accepted_while_waiting_for_binding(runtime, monkeypatch, later_status):
+    from contextlib import contextmanager
+    r = runtime
+    r.submit("main-v1"); first = run_next(r, "main-v1")
+    @contextmanager
+    def accept_before_lock(*args):
+        later = copy.deepcopy(first)
+        later.update(id="late-v2", status=later_status, _sequence=first["_sequence"] + 1,
+                     _image_thread_terminal=False, upstream_outcome="unknown")
+        with r.store.transaction() as db:
+            r.store.write_receipt(db, "image", WHO["id"], "late-v2", later)
+        yield
+    monkeypatch.setattr(r.account_stub, "conversation_binding_lock", accept_before_lock)
+    with pytest.raises(ImageThreadError, match="IMAGE_THREAD_NOT_TERMINAL"):
+        r.service.archive_thread(WHO, "main-v1")
+    assert not r.state.archive_actions
+
+
+@pytest.mark.parametrize("changed_thread", [None, {}, {"id": ""}, {"id": 1}])
+def test_archive_missing_thread_after_binding_wait_never_loads_unthreaded_history(runtime, monkeypatch, changed_thread):
+    from contextlib import contextmanager
+    r = runtime
+    r.submit("main-v1"); run_next(r, "main-v1")
+    @contextmanager
+    def replace_before_lock(*args):
+        with r.store.transaction() as db:
+            task = r.store.read_receipt(db, "image", WHO["id"], "main-v1")
+            task["_image_thread"] = changed_thread
+            r.store.write_receipt(db, "image", WHO["id"], "main-v1", task)
+            r.store.write_receipt(db, "image", WHO["id"], "unthreaded", {
+                "id": "unthreaded", "owner_id": WHO["id"], "status": "success",
+                "data": ["unthreaded-history-payload" + "x" * 4096]})
+        yield
+    loads = json.loads
+    def reject_unthreaded(raw, *args, **kwargs):
+        assert not isinstance(raw, str) or "unthreaded-history-payload" not in raw
+        return loads(raw, *args, **kwargs)
+    monkeypatch.setattr(r.account_stub, "conversation_binding_lock", replace_before_lock)
+    monkeypatch.setattr(json, "loads", reject_unthreaded)
+    with pytest.raises(ImageThreadError, match="IMAGE_THREAD_NOT_TERMINAL"):
+        r.service.archive_thread(WHO, "main-v1")
+    assert not r.state.archive_actions
 
 
 def test_unarchive_timeout_requeues_original_image_request_before_any_new_send(runtime, monkeypatch):
@@ -888,6 +1088,92 @@ def test_completed_tool_leaf_continues_and_archives_same_image_thread(runtime):
     assert r.state.archive_actions == [(first["conversation_id"], True)]
 
 
+def test_late_image_terminal_tail_archives_and_reworks_without_changing_source(runtime):
+    r = runtime
+    r.state.tool_leaf = True
+    r.submit("a1")
+    first = run_next(r, "a1")
+    doc = r.state.documents[first['conversation_id']]
+    old = first['parent_message_id']
+    # This fixture's stream reports the same asset in both namespaces.
+    doc['mapping'][old]['message']['content']['parts'].append({
+        'content_type':'image_asset_pointer', 'asset_pointer':'sediment://'+first['result_sediment_ids'][0]})
+    doc['mapping']['late-note'] = node('late-note', 'tool', old)
+    doc['mapping']['late-final'] = node('late-final', 'assistant', 'late-note', end=True)
+    doc['current_node'] = 'late-final'
+    assert r.service.archive_thread(WHO, 'a1')['archived'] is True
+    after = r.read('a1')
+    assert after['parent_message_id'] == old
+    assert after['data'] == first['data'] and after['request_hash'] == first['request_hash']
+    restarted = ImageTaskService(r.root / 'images.json', store=TaskStore(r.store.path), admission=r.admission)
+    assert restarted.restore_thread(WHO, 'a1')['archived'] is False
+    r.submit('a2', source='a1')
+    second = run_next(r, 'a2')
+    assert r.state.sends[1]['parent'] == 'late-final'
+    assert second['conversation_id'] == first['conversation_id']
+    assert len(r.state.sends) == 2
+    assert r.read('a1')['parent_message_id'] == old
+
+
+@pytest.mark.parametrize('change', ['new-user', 'sibling', 'new-asset', 'repeated-asset-tail', 'missing-old', 'unfinished', 'wrong-cursor', 'non-final', 'request-parent', 'namespace'])
+def test_archive_tail_advance_rejects_changed_original(change):
+    from services.image_thread import archive_parent
+    doc, asset = tool_document()
+    old = doc['current_node']
+    doc['mapping']['late-final'] = node('late-final', 'assistant', old, end=True)
+    doc['current_node'] = 'late-final'
+    assert archive_parent(doc, 'conversation-a', 'request-a', old, [asset]) == 'late-final'
+    if change == 'new-user':
+        doc['mapping']['late-final']['message']['author']['role'] = 'user'
+    elif change == 'sibling':
+        doc['mapping']['sibling'] = node('sibling', 'assistant', old, end=True)
+    elif change == 'new-asset':
+        doc['mapping']['late-final']['message']['content'] = {'content_type':'multimodal_text', 'parts':[
+            {'content_type':'image_asset_pointer', 'asset_pointer':'file-service://file_00000000'+'f'*24}]}
+    elif change == 'repeated-asset-tail':
+        doc['mapping']['late-final']['message']['content'] = copy.deepcopy(doc['mapping'][old]['message']['content'])
+    elif change == 'missing-old':
+        del doc['mapping'][old]
+    elif change == 'unfinished':
+        doc['mapping']['late-final']['message']['status'] = 'in_progress'
+    elif change == 'wrong-cursor':
+        old = 'request-a-code'
+    elif change == 'request-parent':
+        doc['mapping']['request-a']['parent'] = 'foreign-parent'
+    elif change == 'namespace':
+        doc['mapping'][old]['message']['content']['parts'][0]['asset_pointer'] = 'sediment://'+asset
+    else:
+        doc['mapping']['late-final']['message']['end_turn'] = False
+    with pytest.raises(ImageThreadError):
+        archive_parent(doc, 'conversation-a', 'request-a', old, [asset], expected_parent='root',
+                       expected_file_ids=[asset], expected_sediment_ids=[])
+
+
+def test_archive_late_tail_does_not_invalidate_edit_accepted_during_readback(runtime, monkeypatch):
+    from services.image_thread import source_fingerprint
+    r = runtime
+    r.state.tool_leaf = True
+    r.submit('a1')
+    first = run_next(r, 'a1')
+    doc = r.state.documents[first['conversation_id']]
+    old = first['parent_message_id']
+    doc['mapping'][old]['message']['content']['parts'].append({
+        'content_type':'image_asset_pointer', 'asset_pointer':'sediment://'+first['result_sediment_ids'][0]})
+    doc['mapping']['late-final'] = node('late-final', 'assistant', old, end=True)
+    doc['current_node'] = 'late-final'
+    original = conversation.OpenAIBackendAPI.set_conversation_archived
+    def accept_during_readback(self, cid, parent, archived, **kwargs):
+        result = original(self, cid, parent, archived, **kwargs)
+        if archived:
+            r.submit('a2', source='a1')
+        return result
+    monkeypatch.setattr(conversation.OpenAIBackendAPI, 'set_conversation_archived', accept_during_readback)
+    r.service.archive_thread(WHO, 'a1')
+    assert source_fingerprint(r.read('a1')) == source_fingerprint(first)
+    assert run_next(r, 'a2')['status'] == 'success'
+    assert r.state.sends[1]['parent'] == 'late-final'
+
+
 def test_mismatched_tool_leaf_keeps_original_generated_result_unclaimed(runtime):
     r = runtime
     r.state.tool_leaf = True
@@ -1102,7 +1388,7 @@ def test_predecessor_diagnostics_are_specific_and_read_only(previous, reason):
     assert predecessor_state(task, owned) == ({}, reason)
     assert owned == before
 
-@pytest.mark.parametrize('case', ['success', 'late_original_success', 'selected_source_changed', 'drift', 'late_result', 'missing_root'])
+@pytest.mark.parametrize('case', ['success', 'terminal_failure', 'late_original_success', 'selected_source_changed', 'drift', 'late_result', 'late_policy', 'missing_root'])
 def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runtime, case):
     import time
     from services.generation_completion import GenerationCompletionService, retry_cursor
@@ -1121,13 +1407,21 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
         if key != mid:
             value['message']['content']['parts'] = []
             value['message'].update(status='in_progress', end_turn=None)
+    if case == 'terminal_failure':
+        final = doc['mapping'][doc['current_node']]['message']
+        final.update(status='finished_successfully', end_turn=True)
+        final['content'] = {'content_type': 'text', 'parts': ['Something went wrong while generating your image. Sorry about that.']}
     now = time.time()
     r.admission.clock = lambda: now
     with r.store.transaction() as db:
         saved = r.store.read_receipt(db, 'image', WHO['id'], 'empty-original')
-        saved.update(_completion_read_at=now, _retry_cursor=retry_cursor(doc, original, kind='image'),
+        saved.update(_completion_read_at=now, _retry_cursor=retry_cursor(doc, original, kind='image', now=now),
                      _execution_timeline=[{'stage': 'send_call_started', 'at': now-1300}],
                      _executing=False, _claim_id=None, _claim_until=0)
+        if case == 'terminal_failure':
+            assert saved['_retry_cursor']['source'] == 'terminal_image_failure'
+            saved.update(error_code='NO_IMAGE_GENERATED', upstream_unfinished=False,
+                         _execution_timeline=[{'stage': 'send_call_started', 'at': now-20}])
         r.store.write_receipt(db, 'image', WHO['id'], 'empty-original', saved)
     text = TextTaskService(r.store.path, admission=r.admission, clock=r.admission.clock)
     lifecycle = WorkLifecycleService(text, r.service, clock=r.admission.clock)
@@ -1136,6 +1430,9 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
     result = completion.start('image', WHO, 'empty-original', allow_unconfirmed_retry=True)
     assert result.get('replacement_id'), result
     child_id = result['replacement_id']; child = r.read(child_id)
+    if case == 'terminal_failure':
+        completion.advance('image', WHO['id'], 'empty-original')
+        assert completion.read('image', WHO, 'empty-original')['replacement_id'] == child_id
     for key in ('provider_account_identity','provider_binding_id','conversation_id','client_conversation_id','_work_key'):
         assert child[key] == original[key]
     assert child['_image_thread']['id'] == original['_image_thread']['id']
@@ -1146,18 +1443,20 @@ def test_bounded_image_retry_retains_original_account_thread_and_send_edge(runti
     assert ctx and ctx.request_id == child_id
     r.state.fail_after_send = False
     if case == 'drift': r.state.drift = True
-    if case in {'late_result', 'missing_root'}:
+    if case in {'late_result', 'late_policy', 'missing_root'}:
         with r.store.transaction() as db:
             root = r.store.read_receipt(db, 'image', WHO['id'], 'empty-original')
             if case == 'late_result':
                 root.update(result_file_ids=['already-generated'], upstream_outcome='generated', recovery_phase='download_image_result')
+            elif case == 'late_policy':
+                root.update(error_code='content_policy_violation', upstream_outcome='rejected', upstream_unfinished=False)
             else:
                 # Identity loss has the same fail-closed effect as a missing row,
                 # without bypassing the store's retention policy in the fixture.
                 root['_completion'] = {}
             r.store.write_receipt(db, 'image', WHO['id'], 'empty-original', root)
     r.admission.execute(ctx)
-    if case not in {'success', 'late_original_success', 'selected_source_changed'}:
+    if case not in {'success', 'terminal_failure', 'late_original_success', 'selected_source_changed'}:
         assert len(r.state.sends) == 1
         assert r.read(child_id)['upstream_outcome'] in {'not_sent', 'not_submitted'}
         return
@@ -1312,7 +1611,9 @@ def test_absent_edit_qualified_reads_then_one_same_session_completion(runtime, m
             ended.update(_attempt_finished_at=ended_at, _attempt_reason='COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED',
                          _retry_cursor=None, _completion_read_at=now-400,
                          _completion={'state': 'needs_attention', 'next_at': None, 'started_at': now-1300,
-                                      'allow_unconfirmed_retry': True, 'max_extra_requests': 1})
+                                      'allow_unconfirmed_retry': True, 'max_extra_requests': 1,
+                                      'original_read_requested_at': now-800,
+                                      'original_read_no_result_baseline': ended.get('recovery_no_result_reads', 0)})
             r.store.write_receipt(db, 'image', WHO['id'], 'absent-edit', ended)
         before = len(r.state.reads)
         r.service.resume_poll(WHO, 'absent-edit', allow_unrecoverable_retry=True)
@@ -1381,3 +1682,24 @@ def test_archive_uses_same_fresh_precheck_for_validator_and_keeps_readback():
     backend.set_conversation_archived('original', 'parent', True, validate_document=lambda doc: validated.append(doc))
     assert len(reads) == 2 and len(patches) == 1 and len(validated) == 1
     assert validated[0]['is_archived'] is False
+
+
+def test_archive_resolved_cursor_still_requires_exact_post_patch_readback():
+    from services.openai_backend_api import ConversationArchiveCursorMismatch
+    backend = object.__new__(RealOpenAIBackendAPI)
+    backend.base_url = 'https://fixture.invalid'
+    backend._headers = lambda *a, **k: {}
+    doc = {'current_node':'new-final','mapping':{'old-tool':{},'new-final':{}},'is_archived':False}
+    patches = []
+    backend._get_conversation = lambda cid: dict(doc)
+    def patch(*a, **kwargs):
+        patches.append(kwargs)
+        doc.update(is_archived=True, current_node='foreign')
+        return SimpleNamespace(status_code=200, raise_for_status=lambda:None)
+    backend.session = SimpleNamespace(patch=patch)
+    with pytest.raises(ConversationArchiveCursorMismatch):
+        backend.set_conversation_archived('original','old-tool',True)
+    assert not patches
+    with pytest.raises(RuntimeError, match='cursor changed during'):
+        backend.set_conversation_archived('original','old-tool',True,validate_document=lambda d:'new-final')
+    assert len(patches) == 1

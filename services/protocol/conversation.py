@@ -451,6 +451,9 @@ def _record_result_ids(
     file_ids: list[str],
     sediment_ids: list[str],
 ) -> None:
+    consume = getattr(request, "_record_image_capacity_consumed", None)
+    if callable(consume) and (file_ids or sediment_ids):
+        consume()
     callback = getattr(request.progress_callback, "record_result_ids", None)
     if callable(callback) and (file_ids or sediment_ids):
         callback(list(dict.fromkeys(file_ids)), list(dict.fromkeys(sediment_ids)))
@@ -1106,7 +1109,12 @@ def stream_image_outputs(
             if (result_ids[0] or result_ids[1]) and signal not in checked_signals:
                 checked_signals.add(signal)
                 original_message_id = str(getattr(backend, "image_request_message_id", "") or request_message_id)
-                if _stream_image_terminal_result(backend, event, original_message_id, *result_ids,
+                arm_tail = getattr(backend, "_arm_image_asset_tail", None)
+                deferred_to_stream = not terminal_signal and callable(arm_tail) and arm_tail() is True
+                # The live transport owns a bounded quiet-tail fallback. Other
+                # backends retain the existing immediate strict probe, and a
+                # final assistant signal never waits for the stream tail.
+                if not deferred_to_stream and _stream_image_terminal_result(backend, event, original_message_id, *result_ids,
                                                  expected_parent=request.parent_message_id):
                     stream_result_confirmed = True
                     logger.info({"event": "image_stream_result_confirmed", "conversation_id": event_conversation_id})
@@ -1628,6 +1636,14 @@ def _generate_bound_single_image(
 
     slot_acquired = bool(token) and not pool_managed
     image_result_marked = False
+    capacity_consumed = False
+
+    def record_capacity_consumed():
+        nonlocal capacity_consumed
+        if not capacity_consumed:
+            account_service.mark_image_capacity_consumed(token)
+            capacity_consumed = True
+
     account_email = ""
     backend: OpenAIBackendAPI | None = None
     outputs: list[ImageOutput] = []
@@ -1642,6 +1658,9 @@ def _generate_bound_single_image(
             backend = OpenAIBackendAPI(access_token=token)
             # Request-owned model selection; never mutate the shared pool
             # default used by Content or other callers.
+            # Only a single-send request can safely retry the whole original;
+            # never replay a partial multi-image set after its later send fails.
+            backend.image_transport_retry_eligible = total == 1
             backend.retain_bound_conversation = True
             backend.image_upstream_model = request.upstream_model
             if request.progress_callback:
@@ -1674,12 +1693,27 @@ def _generate_bound_single_image(
                 elif thread and request.conversation_id:
                     try:
                         prior_message = getattr(request.progress_callback, "image_thread_predecessor_message", None)
+                        proof = getattr(request.progress_callback, "image_thread_predecessor_cursor_proof", None) or {}
                         document = backend._get_conversation(request.conversation_id)
                         parent = finished_parent(document, request.conversation_id, prior_message,
                             expected_result_ids=getattr(request.progress_callback,
-                                "image_thread_predecessor_result_ids", None))
+                                "image_thread_predecessor_result_ids", None),
+                            expected_parent=proof.get("_image_thread_request_parent"),
+                            predecessor_request_message_id=proof.get("_image_thread_predecessor_message"),
+                            predecessor_result_ids=proof.get("_image_thread_predecessor_result_ids"))
                         if parent != request.parent_message_id:
-                            raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                            from services.image_thread import archive_parent
+                            if not proof or proof.get("result_file_ids") is None or proof.get("result_sediment_ids") is None:
+                                raise ImageThreadError("IMAGE_THREAD_UPSTREAM_CHANGED")
+                            parent = archive_parent(document, request.conversation_id, prior_message,
+                                request.parent_message_id, getattr(request.progress_callback,
+                                    "image_thread_predecessor_result_ids", None) or [],
+                                expected_parent=proof.get("_image_thread_request_parent"),
+                                predecessor_request_message_id=proof.get("_image_thread_predecessor_message"),
+                                predecessor_result_ids=proof.get("_image_thread_predecessor_result_ids"),
+                                expected_file_ids=proof["result_file_ids"],
+                                expected_sediment_ids=proof["result_sediment_ids"])
+                            request = replace(request, parent_message_id=parent)
                         # A later review reversal continues this exact conversation.
                         # Restore it before any image POST; failure leaves the original
                         # request unsubmitted and available for exact-ID recovery.
@@ -1697,6 +1731,8 @@ def _generate_bound_single_image(
                     backend.image_pre_send_check = check_current_parent
                 request = replace(request)
                 request._defer_image_publication = True
+                if pool_managed:
+                    request._record_image_capacity_consumed = record_capacity_consumed
                 confirmed_result = None
                 if thread:
                     def poll_terminal(document, conversation_id, request_message_id, files, sediments):
@@ -1791,7 +1827,8 @@ def _generate_bound_single_image(
                     output.parent_message_id = next_parent_message_id
                     output.image_thread_terminal = bool(thread)
                 image_result_marked = True
-                account_service.mark_image_result(token, True, **({"release_slot": False} if pool_managed else {}))
+                account_service.mark_image_result(token, True, **({"release_slot": False} if pool_managed else {}),
+                    **({"capacity_consumed": True} if capacity_consumed else {}))
                 return outputs
             except Exception as exc:
                 from services.request_context import AdmissionLost
@@ -1801,9 +1838,12 @@ def _generate_bound_single_image(
                 # count it as an upstream image failure. Unknown/submitted
                 # attempts retain the existing accounting and recovery path.
                 unsent_guard_rejection = isinstance(exc, AdmissionLost) and upstream_submitted is False
-                if not image_result_marked and not unsent_guard_rejection:
+                from services.account_request_pacing import unsent_transport_failure
+                unsent_connection_failure = upstream_submitted is False and bool(unsent_transport_failure(exc))
+                if not image_result_marked and not unsent_guard_rejection and not unsent_connection_failure:
                     image_result_marked = True
-                    account_service.mark_image_result(token, False, **({"release_slot": False} if pool_managed else {}))
+                    account_service.mark_image_result(token, False, **({"release_slot": False} if pool_managed else {}),
+                        **({"capacity_consumed": True} if capacity_consumed else {}))
                 conversation_id = str(getattr(exc, "conversation_id", "") or last_conversation_id)
                 parent_message_id = str(getattr(exc, "parent_message_id", "") or "")
                 request_message_id = str(getattr(backend, "image_request_message_id", "") or "")

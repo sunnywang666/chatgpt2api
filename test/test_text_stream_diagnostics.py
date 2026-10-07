@@ -116,6 +116,7 @@ def test_sse_error_retains_only_structured_category_across_restart(runtime, code
 @pytest.mark.parametrize("end", ["done", "eof", "transport_error"])
 def test_image_stream_records_its_own_end_before_result_collection(monkeypatch, end):
     monkeypatch.setattr("services.openai_backend_api.account_service.get_account", lambda token: {})
+    monkeypatch.setattr("services.openai_backend_api.account_service.require_image_account", lambda *a, **kw: {})
     backend = OpenAIBackendAPI(access_token="fixture-token")
     monkeypatch.setattr(backend, "_bootstrap", lambda: None)
     monkeypatch.setattr(backend, "_get_chat_requirements", lambda: ChatRequirements(token="fixture"))
@@ -179,6 +180,11 @@ def test_sse_terminal_observations_preserve_unknown_and_never_store_nodes_or_con
     assert evidence["sse_terminal_final_channel_events"] == 4
     assert evidence["sse_terminal_parent_events"] == 4
     assert evidence["sse_terminal_direct_parent_match_events"] == 2
+    assert evidence["sse_snapshot_role_assistant_events"] == 6
+    assert evidence["sse_snapshot_role_tool_events"] == 1
+    assert evidence["sse_snapshot_status_in_progress_events"] == 1
+    assert evidence["sse_snapshot_status_finished_successfully_events"] == 6
+    assert evidence["sse_terminal_empty_content_events"] == 0
     assert row["status"] != "succeeded"
     assert sum(e["stage"] == "send_guard_passed" for e in row["_execution_timeline"]) == 1
     assert "PRIVATE" not in json.dumps(evidence)
@@ -192,10 +198,136 @@ def test_sse_done_or_patch_alone_is_not_a_terminal_message_snapshot():
     assert observation["stream_end"] == "done"
     assert observation["sse_terminal_assistant_events"] == 0
     assert observation["sse_terminal_direct_parent_match_events"] == 0
+    assert observation["sse_snapshot_role_assistant_events"] == 0
+    assert observation["sse_image_tool_snapshot_events"] == 0
+
+
+def test_sse_empty_result_diagnostics_use_only_fixed_buckets():
+    from utils.helper import iter_sse_payloads
+    messages = [
+        {"author":{"role":"user"}, "status":"finished_successfully", "content":{"parts":["PRIVATE_PROMPT"]}},
+        {"author":{"role":"assistant"}, "status":"finished_successfully", "end_turn":True, "content":{"parts":[" \n"]}},
+        {"author":{"role":"tool"}, "status":"in_progress", "metadata":{"async_task_type":"image_gen"},
+         "content":{"parts":[{"asset_pointer":"https://PRIVATE_SIGNED_URL"}]}},
+        {"author":{"role":"PRIVATE_ROLE"}, "status":"PRIVATE_STATUS", "content":{"parts":["PRIVATE_BODY"]}},
+        {"author":{"role":{}}, "status":{}, "content":{"parts":[]}},
+        {"author":{"role":"system"}},
+    ]
+    response = Response([("data: " + json.dumps({"message":message})).encode() for message in messages])
+    observation = {}
+    list(iter_sse_payloads(response, observation=observation))
+    assert observation["sse_snapshot_role_user_events"] == 1
+    assert observation["sse_snapshot_role_assistant_events"] == 1
+    assert observation["sse_snapshot_role_tool_events"] == 1
+    assert observation["sse_snapshot_role_system_events"] == 1
+    assert observation["sse_snapshot_role_unknown_events"] == 2
+    assert observation["sse_snapshot_status_finished_successfully_events"] == 2
+    assert observation["sse_snapshot_status_in_progress_events"] == 1
+    assert observation["sse_snapshot_status_missing_events"] == 1
+    assert observation["sse_snapshot_status_other_events"] == 2
+    assert observation["sse_image_tool_snapshot_events"] == 1
+    assert observation["sse_terminal_empty_content_events"] == 1
+    assert "PRIVATE" not in json.dumps(observation)
+
+
+def _snapshot_chain(events, root="PRIVATE_USER"):
+    from utils.helper import iter_sse_payloads
+    observation = {}
+    payloads = [json.dumps(event) for event in events] + ["[DONE]"]
+    response = Response([("data: " + payload).encode() for payload in payloads])
+    assert list(iter_sse_payloads(response, observation=observation, request_message_id=root)) == payloads
+    assert "PRIVATE" not in json.dumps(observation)
+    return observation
+
+
+def _snapshot(node, parent, *, channel="analysis", terminal=False):
+    return {"message": {"id": node, "author": {"role": "assistant"},
+                        "metadata": {"parent_id": parent}, "channel": channel,
+                        "status": "finished_successfully" if terminal else "in_progress",
+                        "end_turn": terminal, "content": {"parts": ["PRIVATE_BODY"]}}}
+
+
+def test_snapshot_chain_observes_indirect_final_without_claiming_direct_parent_or_storing_text():
+    observation = _snapshot_chain([
+        _snapshot("PRIVATE_ANALYSIS", "PRIVATE_USER"),
+        _snapshot("PRIVATE_FINAL", "PRIVATE_ANALYSIS", channel="final", terminal=True),
+        _snapshot("PRIVATE_FINAL", "PRIVATE_ANALYSIS", channel="final", terminal=True),
+    ])
+    assert observation["sse_terminal_direct_parent_match_events"] == 0
+    assert observation["sse_chain_terminal_chains"] == 1  # unique nodes, not snapshots
+    assert observation["sse_chain_terminal_nodes"] == 1
+    assert observation["sse_chain_max_depth"] == 2
+    assert observation["sse_chain_nodes"] == observation["sse_chain_parent_edges"] == 2
+    assert observation["sse_chain_analysis_snapshots"] == 1
+    assert observation["sse_chain_missing_parent"] is False
+    assert observation["sse_chain_request_seen"] is False  # root need not be echoed
+
+
+@pytest.mark.parametrize("problem", ["missing", "wrong_root", "conflict", "cycle", "patch_only"])
+def test_snapshot_chain_keeps_missing_conflicting_and_unmerged_patch_evidence_distinct(problem):
+    events = [_snapshot("PRIVATE_FINAL", "PRIVATE_ANALYSIS", channel="final", terminal=True)]
+    if problem == "wrong_root":
+        events.insert(0, _snapshot("PRIVATE_ANALYSIS", "PRIVATE_OTHER_USER"))
+    elif problem == "conflict":
+        events[:0] = [_snapshot("PRIVATE_ANALYSIS", "PRIVATE_USER"),
+                      _snapshot("PRIVATE_ANALYSIS", "PRIVATE_OTHER_USER")]
+    elif problem == "cycle":
+        events.insert(0, _snapshot("PRIVATE_ANALYSIS", "PRIVATE_FINAL"))
+    elif problem == "patch_only":
+        events = [_snapshot("PRIVATE_FINAL", "PRIVATE_USER", channel="final"),
+                  {"p": "/message", "o": "patch", "v": [
+                      {"p": "/status", "o": "replace", "v": "finished_successfully"},
+                      {"p": "/end_turn", "o": "replace", "v": True}]}]
+    observation = _snapshot_chain(events)
+    assert observation["sse_chain_terminal_chains"] == 0
+    if problem == "conflict":
+        assert observation["sse_chain_conflict"] is True
+    elif problem == "cycle":
+        assert observation["sse_chain_cycle"] is True
+    elif problem == "patch_only":
+        assert observation["sse_chain_metadata_patch_events"] == 2
+    else:
+        assert observation["sse_chain_missing_parent"] is True
+
+
+def test_snapshot_chain_bounds_nodes_and_rejects_root_as_its_own_assistant():
+    observation = _snapshot_chain([_snapshot("PRIVATE_" + str(n), "PRIVATE_USER") for n in range(80)])
+    assert observation["sse_chain_nodes"] == 64 and observation["sse_chain_overflow"] is True
+    assert _snapshot_chain([_snapshot("PRIVATE_USER", "PRIVATE_USER", channel="final", terminal=True)])["sse_chain_terminal_chains"] == 0
+
+
+def test_snapshot_chain_does_not_cross_later_user_and_preserves_partial_final_snapshot():
+    final = _snapshot("PRIVATE_FINAL", "PRIVATE_USER", channel="final", terminal=True)
+    observation = _snapshot_chain([final, {"message": {"id": "PRIVATE_FINAL"}}])
+    assert observation["sse_chain_terminal_chains"] == 1
+    later_user = {"message": {"id": "PRIVATE_LATER_USER", "author": {"role": "user"},
+                               "parent_id": "PRIVATE_USER"}}
+    observation = _snapshot_chain([
+        later_user, _snapshot("PRIVATE_FINAL", "PRIVATE_LATER_USER", channel="final", terminal=True)])
+    assert observation["sse_chain_terminal_chains"] == 0
+    assert observation["sse_chain_unqualified_node"] is True
+    assert observation["sse_chain_blocked_user"] == 1
+    assert observation["sse_chain_blocked_parent_is_request"] is True
+    observation = _snapshot_chain([final, {"message": {"id": "PRIVATE_FINAL", "end_turn": False}}])
+    assert observation["sse_chain_terminal_chains"] == 0 and observation["sse_chain_conflict"] is True
+
+
+@pytest.mark.parametrize("role,category", [("system", "system"), (None, "unknown_role"), ("unrecognised-private-role", "unknown_role")])
+def test_snapshot_chain_counts_unique_blocked_roles_without_persisting_role_values(role, category):
+    middle = {"message": {"id": "PRIVATE_MIDDLE", "parent_id": "PRIVATE_USER", "author": {"role": role}}}
+    observation = _snapshot_chain([middle,
+        _snapshot("PRIVATE_FINAL_A", "PRIVATE_MIDDLE", channel="final", terminal=True),
+        _snapshot("PRIVATE_FINAL_B", "PRIVATE_MIDDLE", channel="final", terminal=True)])
+    assert observation["sse_chain_terminal_nodes"] == 2
+    assert observation["sse_chain_terminal_chains"] == 0
+    assert observation["sse_chain_blocked_" + category] == 1
+    assert observation["sse_chain_blocked_parent_is_request"] is True
+    assert "unrecognised-private-role" not in json.dumps(observation)
 
 
 def test_image_stream_passes_original_node_to_safe_observation(monkeypatch):
     monkeypatch.setattr("services.openai_backend_api.account_service.get_account", lambda token: {})
+    monkeypatch.setattr("services.openai_backend_api.account_service.require_image_account", lambda *a, **kw: {})
     backend = OpenAIBackendAPI(access_token="fixture-token")
     backend.image_request_message_id = "PRIVATE_IMAGE_USER_NODE"
     monkeypatch.setattr(backend, "_bootstrap", lambda: None)

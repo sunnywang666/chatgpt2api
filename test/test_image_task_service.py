@@ -183,6 +183,7 @@ def failure_cursor_document(*, change=None):
 
 
 class FailureCursorBackend:
+    _extract_image_reference_ids = staticmethod(OpenAIBackendAPI._extract_image_reference_ids)
     document = failure_cursor_document()
     reads = 0
 
@@ -593,6 +594,76 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(clock.cooldown_until, 160)
 
     @mock.patch("services.openai_backend_api.account_service.require_image_account")
+    def test_stale_image_capacity_skips_preparation_without_marking_submitted(self, capability):
+        from services.request_context import AdmissionLost
+        for stale_at in (1, 2, 3):
+            with self.subTest(stale_at=stale_at):
+                capability.reset_mock()
+                capability.side_effect = ([{}] * (stale_at - 1)
+                                          + [AdmissionLost("selected image account capability is unavailable")])
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.access_token = "synthetic-fixture"
+                backend.base_url = "https://provider.test"
+                backend.image_request_message_id = "original-message"
+                backend.retain_bound_conversation = True
+                callback = lambda _step: None
+                callback.record_submission_started = mock.Mock()
+                backend.progress_callback = callback
+                backend._upload_image = mock.Mock(return_value={
+                    "file_id": "fixture-file", "width": 1, "height": 1, "file_size": 1,
+                    "mime_type": "image/png", "file_name": "fixture.png",
+                })
+                backend._bootstrap = mock.Mock()
+                backend._get_chat_requirements = mock.Mock(return_value=ChatRequirements(token="fixture"))
+                backend._prepare_image_conversation = mock.Mock(return_value="conduit")
+                backend._image_model_settings = lambda _model: ("gpt-image", "")
+                backend._image_headers = lambda *_args: {}
+                backend._image_active_timeout = lambda _timeout: 30
+                transport = mock.Mock()
+                def post(_url, **kwargs):
+                    kwargs['_account_request_before_send']()
+                    return transport()
+                backend.session = mock.Mock()
+                backend.session.post.side_effect = post
+                backend.close = mock.Mock()
+                request = ConversationRequest(model="gpt-image-2", prompt="mug",
+                    provider_binding_id="binding-1", provider_account_identity="account-1",
+                    client_conversation_id="original-client", retain_conversation=True,
+                    progress_callback=callback)
+                with (
+                    mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.protocol.conversation.account_service.acquire_bound_image_access_token", return_value="synthetic-fixture"),
+                    mock.patch("services.protocol.conversation.account_service.get_account", return_value={}),
+                    mock.patch("services.protocol.conversation.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.protocol.conversation.account_service.mark_image_result") as mark,
+                    mock.patch("services.protocol.conversation.account_service.release_image_slot") as release,
+                    mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend),
+                    mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=lambda *_args:
+                        backend._stream_picture_conversation("mug", "gpt-image-2", ["fixture"])),
+                ):
+                    with self.assertRaises(ImageGenerationError) as raised:
+                        _generate_bound_single_image(request, 1, 1)
+                    self.assertEqual(raised.exception.code, "IMAGE_GENERATION_NOT_SUBMITTED")
+                    self.assertIs(raised.exception.upstream_submitted, False)
+                    self.assertEqual(raised.exception.request_message_id, "original-message")
+                    mark.assert_not_called()
+                    release.assert_called_once_with("synthetic-fixture")
+                self.assertFalse(backend.image_submission_started)
+                self.assertEqual(backend.image_request_message_id, "original-message")
+                callback.record_submission_started.assert_not_called()
+                transport.assert_not_called()
+                if stale_at == 1:
+                    backend._upload_image.assert_not_called()
+                    backend._bootstrap.assert_not_called()
+                if stale_at <= 2:
+                    backend._get_chat_requirements.assert_not_called()
+                    backend._prepare_image_conversation.assert_not_called()
+                    backend.session.post.assert_not_called()
+                else:
+                    backend._prepare_image_conversation.assert_called_once()
+                    backend.session.post.assert_called_once()
+
+    @mock.patch("services.openai_backend_api.account_service.require_image_account")
     def test_final_local_deadline_after_reservation_remains_known_unsent(self, _capability):
         from services.request_context import executing
         now = [100.0]
@@ -865,6 +936,49 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertIs(raised.exception.upstream_submitted, False)
         self.assertEqual(raised.exception.conversation_id, "conversation-1")
         self.assertIn("timed out", str(raised.exception))
+
+    def test_asset_consumption_precedes_capacity_release_and_is_not_repeated_on_download(self):
+        from services.request_context import executing
+        from services.protocol.conversation import _record_result_ids
+        for download_fails in (False, True):
+            with self.subTest(download_fails=download_fails):
+                events = []
+                request = ConversationRequest(model="gpt-image-2", prompt="mug",
+                    provider_binding_id="binding-1", provider_account_identity="account-1",
+                    client_conversation_id="client-1", retain_conversation=True,
+                    progress_callback=lambda *_args: None)
+                request.progress_callback.record_result_ids = lambda *_args: events.append("release_generation")
+                backend = mock.Mock(image_submission_started=True, image_request_message_id="message-1")
+                backend.get_conversation_parent_message_id.return_value = "answer-1"
+                def stream(_backend, forwarded, *_args):
+                    _record_result_ids(forwarded, ["file-1"], [])
+                    _record_result_ids(forwarded, ["file-1"], [])
+                    events.append("download")
+                    if download_fails:
+                        raise RuntimeError("download failed after generated asset")
+                    yield ImageOutput(kind="result", model="gpt-image-2", index=1, total=1,
+                        data=[{"b64_json": "image"}], conversation_id="chat-1")
+                with (
+                    executing(mock.Mock()),
+                    mock.patch("services.protocol.conversation.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.protocol.conversation.account_service.acquire_bound_image_access_token", return_value="token"),
+                    mock.patch("services.protocol.conversation.account_service.get_account", return_value={}),
+                    mock.patch("services.protocol.conversation.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.protocol.conversation.account_service.mark_image_capacity_consumed", side_effect=lambda *_: events.append("consume")) as consumed,
+                    mock.patch("services.protocol.conversation.account_service.mark_image_result") as mark,
+                    mock.patch("services.protocol.conversation.account_service.release_image_slot") as release,
+                    mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend),
+                    mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream),
+                ):
+                    if download_fails:
+                        with self.assertRaises(ImageGenerationError):
+                            _generate_bound_single_image(request, 1, 1)
+                    else:
+                        _generate_bound_single_image(request, 1, 1)
+                    self.assertEqual(events, ["consume", "release_generation", "release_generation", "download"])
+                    consumed.assert_called_once_with("token")
+                    mark.assert_called_once_with("token", not download_fails, release_slot=False, capacity_consumed=True)
+                    release.assert_not_called()
 
     def test_admitted_bound_image_never_releases_another_legacy_slot(self):
         from services.request_context import executing
@@ -1275,6 +1389,58 @@ class ImageTaskServiceTests(unittest.TestCase):
             retention_days_getter=lambda: 30,
         )
 
+    def test_selected_reads_do_not_decode_history_or_wait_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "images.json")
+            original = {"id": "selected", "owner_id": OWNER["id"], "status": "success",
+                        "model": "gpt-image-2", "updated_at": "2099-01-01 00:00:00",
+                        "data": [{"url": "http://example.test/original.png"}]}
+            history = {**original, "id": "unrelated", "data": [{"b64_json": "unrelated-large-output" * 1000}]}
+            with service.store.transaction() as db:
+                service.store.write_receipt(db, "image", OWNER["id"], "selected", original)
+                service.store.write_receipt(db, "image", OWNER["id"], "unrelated", history)
+            decode = json.loads
+            def scoped_decode(raw, *args, **kwargs):
+                self.assertNotIn("unrelated-large-output", raw)
+                return decode(raw, *args, **kwargs)
+            # A different writer may be updating an original. Read its last
+            # committed receipt without trying to acquire BEGIN IMMEDIATE.
+            with service.store.connect() as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                service.store.write_receipt(writer, "image", OWNER["id"], "selected", {**original, "quality": "pending"})
+                with mock.patch.object(service.store, "transaction", side_effect=AssertionError("read acquired writer")), \
+                        mock.patch("services.task_store.json.loads", side_effect=scoped_decode):
+                    result = service.list_tasks(OWNER, ["selected", "missing", "selected"])
+                writer.rollback()
+            self.assertEqual(result["missing_ids"], ["missing"])
+            self.assertEqual([item["id"] for item in result["items"]], ["selected", "selected"])
+            self.assertTrue(all(item["quality"] is None for item in result["items"]))
+            self.assertEqual(result["items"][0]["data"], original["data"])
+            self.assertEqual(service.list_tasks(OTHER_OWNER, ["selected"]), {"items": [], "missing_ids": ["selected"]})
+            with service.store.connect() as db:
+                self.assertEqual(service.store.read_receipt(db, "image", OWNER["id"], "selected"), original)
+                self.assertEqual(service.store.read_receipt(db, "image", OWNER["id"], "unrelated"), history)
+
+    def test_selected_reads_keep_retention_visibility_and_protected_originals(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "images.json")
+            protections = {"expired": {}, "retained": {"retain_receipt": True},
+                           "paused": {"_recovery_paused": True},
+                           "unknown": {"error_code": "CONVERSATION_OUTCOME_UNKNOWN"},
+                           "unfinished": {"upstream_unfinished": True}}
+            with service.store.transaction() as db:
+                for rid, flags in protections.items():
+                    row = {"id": rid, "owner_id": OWNER["id"], "status": "error",
+                           "model": "gpt-image-2", "updated_at": "2000-01-01 00:00:00", **flags}
+                    service.store.write_receipt(db, "image", OWNER["id"], rid, row)
+            selected = service.list_tasks(OWNER, list(protections))
+            self.assertEqual(selected["missing_ids"], ["expired"])
+            self.assertEqual([item["id"] for item in selected["items"]], list(protections)[1:])
+            # Full listing still performs the established retention cleanup.
+            self.assertEqual({item["id"] for item in service.list_tasks(OWNER, [])["items"]}, set(protections) - {"expired"})
+            with service.store.connect() as db:
+                self.assertIsNone(service.store.read_receipt(db, "image", OWNER["id"], "expired"))
+
     def test_public_result_stage_never_publishes_private_assets_or_hides_stops(self):
         cached = {"output_ref": "private-output-ref", "coverage": {"file_ids": ["private-asset-id"]}}
         recovering = {"status": "error", "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
@@ -1368,6 +1534,60 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertNotIn(key, service._tasks)
             with service.store.connect() as db:
                 self.assertIsNone(service.store.read_receipt(db, "image", "owner-1", "policy-task"))
+
+    def test_pending_download_save_does_not_load_or_overwrite_another_workers_history(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path, result_file_ids=["file-1"])
+            service = self.make_service(path)
+            key = "owner-1:policy-task"
+            history = {"id": "history", "owner_id": "owner-1", "status": "success",
+                       "data": [{"b64_json": "unrelated-historical-image" + "a" * 1000000}]}
+            # Simulate a stale cache and a newer durable write from another worker.
+            service._tasks["owner-1:history"] = {**history, "revision": "stale"}
+            with service.store.transaction() as db:
+                service.store.write_receipt(db, "image", "owner-1", "history", {**history, "revision": "newer"})
+                raw_history = db.execute("SELECT receipt FROM image_requests WHERE task_key='owner-1:history'").fetchone()[0]
+            coverage = {"conversation_id": "conversation-1", "request_message_id": "original-request",
+                        "file_ids": ["file-1"], "sediment_ids": []}
+            items = [{"b64_json": "c2F2ZWQ="}]
+            loads = json.loads
+            def bounded_load(raw, *args, **kwargs):
+                self.assertNotIn("unrelated-historical-image", raw)
+                return loads(raw, *args, **kwargs)
+            with mock.patch("services.image_task_service.json.loads", side_effect=bounded_load), \
+                    mock.patch.object(service.store, "write_receipt", wraps=service.store.write_receipt) as writes:
+                service._store_pending_image_output(key, coverage, items)
+                self.assertEqual(writes.call_count, 1)
+            with service.store.connect() as db:
+                saved = service.store.read_receipt(db, "image", "owner-1", "policy-task")
+                self.assertEqual(db.execute("SELECT receipt FROM image_requests WHERE task_key='owner-1:history'").fetchone()[0], raw_history)
+            self.assertEqual(saved["_pending_image_output"]["coverage"], coverage)
+            with service.store.output_file(saved["_pending_image_output"]["output_ref"]) as output:
+                self.assertEqual(json.load(output), items)
+
+    def test_recovery_and_occupancy_do_not_decode_historical_image_payloads(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_unfinished=True)
+            service = self.make_service(path)
+            with service.store.transaction() as db:
+                for index, flag in enumerate((None, False, 1, True)):
+                    row = {"id": f"history-{index}", "owner_id": "owner-1", "status": "running",
+                           "provider_account_identity": "legacy", "data": [{"b64_json": "unrelated-history" * 10000}]}
+                    if flag is not None: row["upstream_unfinished"] = flag
+                    service.store.write_receipt(db, "image", "owner-1", row["id"], row)
+            loads = json.loads
+            def bounded_load(raw, *args, **kwargs):
+                self.assertNotIn("unrelated-history", raw)
+                return loads(raw, *args, **kwargs)
+            def finish(key, *args):
+                service._update_task(key, status="error", next_poll_at=time.time() + 60)
+            with mock.patch("services.image_task_service.json.loads", side_effect=bounded_load), \
+                 mock.patch.object(service, "_run_resume_poll", side_effect=finish):
+                result = service.resume_poll({"id": "owner-1"}, "policy-task", wait_for_completion=True)
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(service.resource_occupancy(), {"by_account": {"account-1": 1, "legacy": 2}, "unattributed": 0})
 
     def test_nested_progress_update_preserves_outer_transaction_changes(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1660,14 +1880,14 @@ class ImageTaskServiceTests(unittest.TestCase):
     def test_complete_final_recovery_reuses_proof_but_tool_leaf_keeps_publication_check(self):
         from copy import deepcopy
         from services.config import config
-        for case in ("complete", "new_second_image", "partial_download", "final_external_successor", "download_failure", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed", "settle_failure"):
+        for case in ("complete", "new_second_image", "partial_download", "final_external_successor", "download_failure", "pending_missing", "parent_changed", "running", "read_429", "post_download_changed", "settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp_dir:
                 path = Path(tmp_dir) / "tasks.json"
                 write_policy_task(path, error_code="CONVERSATION_OUTCOME_UNKNOWN", error="",
                     upstream_unfinished=True, _image_thread={"protocol": "image-thread-v1"},
                     _image_thread_request_parent="anchor",
                     **({"_pending_image_result_ids": {"file_ids": ["missing" if case == "pending_missing" else "original-image"], "sediment_ids": []}}
-                       if case in ("pending_missing", "new_second_image", "settle_failure") else {}))
+                       if case in ("pending_missing", "new_second_image", "settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset") else {}))
                 service = self.make_service(path)
                 service._update_task("owner-1:policy-task", _image_thread={"id": "original-thread"},
                                      _image_thread_request_parent="anchor")
@@ -1681,7 +1901,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                     "final": {"parent": "image", "message": {"id": "final", "author": {"role": "assistant"},
                         "status": "finished_successfully", "end_turn": True}}}}
                 if case == "parent_changed": document["mapping"]["original-request"]["parent"] = "other"
-                if case in ("running", "settle_failure"): document["mapping"]["final"]["message"]["status"] = "in_progress"
+                if case in ("running", "settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset"): document["mapping"]["final"]["message"]["status"] = "in_progress"
                 if case == "post_download_changed":
                     # A finished tool leaf is weaker than a complete assistant
                     # final: keep the original late-drift rejection regression.
@@ -1690,6 +1910,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                     document['mapping']['image']['parent'] = 'code'
                     del document['mapping']['final']
                     document['current_node'] = 'image'
+                if case == "settle_failure_with_string_asset":
+                    document["mapping"]["image"]["message"]["content"]["parts"] = ["file-service://original-image"]
                 expected_files = ["original-image"]
                 if case in ("new_second_image", "partial_download"):
                     expected_files.append("second-image")
@@ -1708,13 +1930,19 @@ class ImageTaskServiceTests(unittest.TestCase):
                         result = deepcopy(document)
                         if case == "post_download_changed" and calls["read"] > 1:
                             result["mapping"]["original-request"]["parent"] = "other"
-                        if case == "settle_failure" and calls["read"] > 1:
+                        if case in ("settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset") and calls["read"] > 1:
                             result["mapping"]["final"]["message"].update(status="finished_successfully",
                                 content={"content_type": "text", "parts": ["Something went wrong while generating your image."]})
+                            if case == "settle_failure":
+                                result["mapping"]["image"]["message"]["content"] = {}
                         return result
                     def _poll_image_results(self, cid, timeout, **kwargs):
                         calls["poll"] += 1
-                        self_test.assertEqual(kwargs["initial_document"], document)
+                        expected_document = deepcopy(document)
+                        if case in ("settle_failure_with_asset", "settle_failure_with_string_asset"):
+                            expected_document["mapping"]["final"]["message"].update(status="finished_successfully",
+                                content={"content_type": "text", "parts": ["Something went wrong while generating your image."]})
+                        self_test.assertEqual(kwargs["initial_document"], expected_document)
                         raise ImagePollTimeoutError("not confirmed", cid)
                     def resolve_conversation_image_urls(self, cid, files, sediments, **kwargs):
                         self_test.assertEqual((cid, files, sediments), ("conversation-1", expected_files, []))
@@ -1763,8 +1991,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                     observe.assert_called_once_with()
                     sleep.assert_not_called()
                 else:
-                    self.assertEqual(calls, {"read": 2 if case in ("pending_missing", "settle_failure") else 1, "poll": 0 if case in ("read_429", "settle_failure") else 1, "download": 0})
-                    if case in ("pending_missing", "settle_failure"): sleep.assert_called_once_with(30)
+                    self.assertEqual(calls, {"read": 2 if case in ("pending_missing", "settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset") else 1, "poll": 0 if case in ("read_429", "settle_failure") else 1, "download": 0})
+                    if case in ("pending_missing", "settle_failure", "settle_failure_with_asset", "settle_failure_with_string_asset"): sleep.assert_called_once_with(30)
                     else: sleep.assert_not_called()
                     observe.assert_not_called()
                 if case in ("complete", "new_second_image", "partial_download", "final_external_successor"):
@@ -1778,6 +2006,12 @@ class ImageTaskServiceTests(unittest.TestCase):
                     publish.assert_not_called()
                     self.assertFalse(row.get("data"))
                     if case == "post_download_changed": self.assertTrue(row["_pending_image_output"])
+                    if case == "settle_failure":
+                        self.assertEqual(row["error_code"], "NO_IMAGE_GENERATED")
+                        self.assertEqual(row["upstream_outcome"], "failed")
+                    if case in ("settle_failure_with_asset", "settle_failure_with_string_asset"):
+                        self.assertEqual(row["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+                        self.assertEqual(row["_pending_image_result_ids"]["file_ids"], ["original-image"])
 
     def test_downloaded_original_is_private_and_reused_after_confirmation_failure(self):
         from services.request_context import executing
@@ -2611,6 +2845,87 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(restarted._tasks["owner-1:unknown-task"]["_first_qualified_image_assets_observed_at"],
                              recovered["_first_qualified_image_assets_observed_at"])
 
+    def test_missing_cursor_resume_schedules_only_with_original_identity(self):
+        for message in ("original-request", ""):
+            with self.subTest(message=bool(message)), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "tasks.json"
+                write_policy_task(path, conversation_id="", request_message_id=message,
+                                  error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_outcome="unknown")
+                service = self.make_service(path)
+                with mock.patch("services.image_task_service.threading.Thread") as thread:
+                    if message:
+                        service.resume_poll(OWNER, "policy-task")
+                        thread.return_value.start.assert_called_once()
+                        self.assertEqual(thread.call_args.kwargs["args"][1], "")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "conversation_id"):
+                            service.resume_poll(OWNER, "policy-task")
+                        thread.assert_not_called()
+
+    def test_missing_cursor_recovers_exact_message_and_persists_scan_progress(self):
+        from services.conversation_binding_service import ConversationBindingError
+        document = {"current_node": "original-request", "mapping": {
+            "original-request": {"parent": "original-parent", "message": {
+                "id": "original-request", "author": {"role": "user"}}}}}
+        for first_failure in (None, "incomplete", "absent", "limited"):
+            with self.subTest(first_failure=first_failure), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "tasks.json"
+                write_policy_task(path, conversation_id="", parent_message_id="", started_ts=123.0,
+                                  error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_outcome="unknown",
+                                  upstream_unfinished=True, _submission_started=True)
+                service = self.make_service(path)
+                backend = mock.Mock(spec=OpenAIBackendAPI)
+                backend._poll_image_results.return_value = (["original-file"], [])
+                backend.resolve_conversation_image_urls.return_value = ["https://fixture.invalid/original.png"]
+                backend.download_image_bytes.return_value = [b"original-image"]
+                backend.get_conversation_parent_message_id.return_value = "original-final"
+                backend._get_conversation.return_value = document
+                located = ({"conversation_id": "found-original", "request_parent_message_id": "original-parent"}, document)
+                progress = {"next_index": 1, "conversation_ids": ["candidate"]}
+                failure = ConversationBindingError("bounded scan", code="CONVERSATION_OUTCOME_UNKNOWN",
+                    recovery_reason="REQUEST_CONVERSATION_UNATTRIBUTABLE" if first_failure == "absent"
+                        else "REQUEST_CONVERSATION_SCAN_INCOMPLETE",
+                    recovery_scan=progress,
+                    recovery_read_error={"phase": "conversation_list", "category": "http",
+                        "http_status": 429, "retry_after_seconds": 73, "candidate_ref": None}
+                        if first_failure == "limited" else None)
+                with (
+                    mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                    mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="fixture-token"),
+                    mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", return_value=backend),
+                    mock.patch("services.conversation_binding_service.ConversationBindingService._locate_text_request_conversation",
+                               side_effect=[failure, located] if first_failure else [located]) as locate,
+                    mock.patch("services.protocol.conversation.format_image_result", return_value={"data": [{"b64_json": "b3JpZ2luYWw="}]}),
+                ):
+                    service._run_resume_poll("owner-1:policy-task", "", 5, "", OWNER, "generate", "gpt-image-2", False, False)
+                    if first_failure:
+                        saved = service._tasks["owner-1:policy-task"]
+                        self.assertEqual(saved["_recovery_conversation_scan"], progress)
+                        self.assertEqual(saved["conversation_id"], "")
+                        backend._poll_image_results.assert_not_called()
+                        if first_failure == "absent":
+                            self.assertFalse(service.can_locate_original_cursor(saved))
+                            continue
+                        if first_failure == "limited":
+                            self.assertEqual(saved["recovery_error_code"], "RECOVERY_RATE_LIMITED")
+                            self.assertEqual(saved["recovery_retry_after_seconds"], 73)
+                            self.assertGreater(saved["next_poll_at"], time.time() + 71)
+                            continue
+                        service = self.make_service(path)
+                        service._run_resume_poll("owner-1:policy-task", "", 5, "", OWNER, "generate", "gpt-image-2", False, False)
+                        self.assertEqual(locate.call_args.args[1]["_recovery_conversation_scan"], progress)
+                    saved = service._tasks["owner-1:policy-task"]
+                    self.assertEqual(saved["status"], "success")
+                    self.assertEqual(saved["conversation_id"], "found-original")
+                    self.assertEqual(saved["request_message_id"], "original-request")
+                    self.assertEqual(saved["_image_thread_request_parent"], "original-parent")
+                    self.assertEqual(locate.call_args.args[1]["started_at"], 123.0)
+                    self.assertEqual(saved["_recovery_conversation_scan"], {})
+                    backend._poll_image_results.assert_called_once()
+                    self.assertEqual(backend._poll_image_results.call_args.args[0], "found-original")
+                    self.assertEqual(backend._poll_image_results.call_args.kwargs["request_message_id"], "original-request")
+
     def test_unknown_resume_keeps_404_and_empty_final_without_images_unknown(self):
         scenarios = ("conversation-404", "empty-final-and-tasks")
         for scenario in scenarios:
@@ -2638,6 +2953,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                 wait_for_task(service, OWNER, "unknown-task", "error")
 
                 class FakeBackend:
+                    _extract_image_reference_ids = staticmethod(OpenAIBackendAPI._extract_image_reference_ids)
+                    _has_image_asset_pointer = staticmethod(OpenAIBackendAPI._has_image_asset_pointer)
                     poll_calls = []
 
                     def __init__(self, access_token=None, proxy_url=None):
@@ -3059,6 +3376,13 @@ class ImageTaskServiceTests(unittest.TestCase):
             _authoritative_image_failure(document, "request-1"),
             "Something went wrong while generating your image. Sorry about that.",
         )
+        for asset in ({"asset_pointer": "file-service://file-generated-before-failure"},
+                      {"result": "file-service://file-generated-before-failure"},
+                      {"result": "sediment://existing-result"},
+                      {"result": "file_000000001234567890abcdef12345678"}):
+            document["mapping"]["assistant-1"]["message"]["metadata"] = asset
+            self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+        del document["mapping"]["assistant-1"]["message"]["metadata"]
         document["mapping"]["assistant-1"]["message"]["status"] = "in_progress"
         self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
 
@@ -3228,6 +3552,13 @@ class ImageTaskServiceTests(unittest.TestCase):
         )
         document = localized_no_image_generated_document()
         self.assertEqual(_authoritative_image_failure(document, "request-1"), localized_terminal)
+
+        for make_document in (known_generation_error_document, localized_no_image_generated_document):
+            for reference in ("file-service://existing-image", "sediment://existing-image",
+                              "file_000000001234567890abcdef12345678"):
+                document = make_document()
+                document["mapping"]["worker-1"]["message"]["metadata"] = {"result": reference}
+                self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
 
         document = localized_no_image_generated_document()
         document["mapping"]["terminal-1"]["message"]["status"] = "in_progress"
@@ -3425,6 +3756,83 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertEqual(raised.exception.request_message_id, "request-message-1")
         self.assertEqual(raised.exception.conversation_id, "conversation-1")
 
+    def test_terminal_image_error_persists_outcome_but_preserves_captured_result(self):
+        from services.generation_completion import unresolved
+        for code, outcome in (("content_policy_violation", "rejected"), ("NO_IMAGE_GENERATED", "failed")):
+            for captured in (False, True):
+                with self.subTest(code=code, captured=captured), tempfile.TemporaryDirectory() as tmp_dir:
+                    def reject(payload):
+                        callback = payload["progress_callback"]
+                        callback.record_submission_started()
+                        if captured:
+                            callback.record_result_ids(["file-original"], [])
+                        raise ImageGenerationError("explicit terminal image rejection", code=code,
+                            provider_binding_id="cb_account_a", provider_account_identity="account_opaque_a",
+                            conversation_id="conversation-1", parent_message_id="assistant-1",
+                            request_message_id="request-1", upstream_submitted=True)
+                    service = self.make_service(Path(tmp_dir) / "images.json", reject)
+                    service.submit_generation(OWNER, client_task_id="terminal", prompt="cat",
+                        model="gpt-image-2", size=None, provider_binding_id="cb_account_a",
+                        provider_account_identity="account_opaque_a", client_conversation_id="client-1",
+                        retain_conversation=True)
+                    wait_for_task(service, OWNER, "terminal", "error")
+                    with service.store.connect() as db:
+                        receipt = service.store.read_receipt(db, "image", OWNER["id"], "terminal")
+                    self.assertEqual(receipt["upstream_outcome"], "generated" if captured else outcome)
+                    self.assertEqual(receipt["error_code"], "CONVERSATION_OUTCOME_UNKNOWN" if captured else code)
+                    self.assertEqual(unresolved(receipt), captured)
+                    self.assertEqual(receipt["conversation_id"], "conversation-1")
+                    self.assertEqual(receipt["request_message_id"], "request-1")
+                    if captured:
+                        self.assertEqual(receipt["result_file_ids"], ["file-original"])
+                    else:
+                        self.assertEqual(receipt["next_poll_at"], 0)
+
+    def test_original_policy_read_clears_unknown_without_generation(self):
+        from services.generation_completion import unresolved
+        document = {"current_node": "refusal", "mapping": {
+            "original-request": {"message": {"author": {"role": "user"}}},
+            "refusal": {"parent": "original-request", "message": {
+                "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True,
+                "content": {"content_type": "text", "parts": ["This request violates our content policy."]},
+            }},
+        }}
+        class Backend(OpenAIBackendAPI):
+            def __init__(self, **kwargs):
+                pass
+            def _get_conversation(self, _conversation_id):
+                return document
+            def _poll_image_results(self, cid, *args, **kwargs):
+                message = OpenAIBackendAPI._find_content_policy_error_in_conversation(
+                    kwargs["initial_document"], kwargs["request_message_id"])
+                if not message:
+                    raise AssertionError("missing original terminal proof")
+                raise ImageContentPolicyError(message, cid)
+            def close(self):
+                pass
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "images.json"
+            write_policy_task(path, upstream_outcome="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                              recovery_no_result_reads=100)
+            handler = mock.Mock(side_effect=AssertionError("must not generate again"))
+            service = self.make_service(path, handler)
+            with (
+                mock.patch("services.account_service.account_service.get_bound_account_identity", return_value="account-1"),
+                mock.patch("services.account_service.account_service.get_bound_text_access_token", return_value="bound-token"),
+                mock.patch("services.account_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", Backend),
+            ):
+                service._run_resume_poll("owner-1:policy-task", "conversation-1", 30,
+                    "http://content-provider", OWNER, "generate", "gpt-image-2", False, False)
+            with service.store.connect() as db:
+                receipt = service.store.read_receipt(db, "image", OWNER["id"], "policy-task")
+            self.assertEqual(receipt["error_code"], "content_policy_violation", receipt)
+            self.assertEqual(receipt["upstream_outcome"], "rejected")
+            self.assertFalse(unresolved(receipt))
+            self.assertEqual(receipt["next_poll_at"], 0)
+            self.assertEqual(receipt["request_message_id"], "original-request")
+            handler.assert_not_called()
+
     def test_bound_image_slot_is_settled_once_when_a_waiter_acquires_after_release(self):
         class Backend:
             image_request_message_id = "request-message-1"
@@ -3545,8 +3953,10 @@ class ImageTaskServiceTests(unittest.TestCase):
                 self.assertEqual(slot["inflight"], 1)
 
     def test_unknown_resume_maps_authoritative_finished_failure_to_terminal_code(self):
+        from services.openai_backend_api import OpenAIBackendAPI as RealBackend
         def english_failure_document():
             return {
+                "is_archived": False,
                 "current_node": "assistant-1",
                 "mapping": {
                     "request-1": {
@@ -3569,6 +3979,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
         def known_generation_error_document():
             return {
+                "is_archived": False,
                 "current_node": "terminal-1",
                 "mapping": {
                     "request-1": {
@@ -3615,6 +4026,7 @@ class ImageTaskServiceTests(unittest.TestCase):
 
         def localized_no_image_generated_document():
             return {
+                "is_archived": False,
                 "current_node": "terminal-1",
                 "mapping": {
                     "request-1": {
@@ -3701,6 +4113,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                         service._save_locked()
 
                 class FakeBackend:
+                    _has_image_asset_pointer = staticmethod(RealBackend._has_image_asset_pointer)
+                    _extract_image_reference_ids = staticmethod(RealBackend._extract_image_reference_ids)
                     def __init__(self, access_token=None, proxy_url=None):
                         self.access_token = access_token
 
@@ -3736,6 +4150,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                 self.assertFalse(stored["upstream_unfinished"])
                 self.assertEqual(stored["next_poll_at"], 0)
                 self.assertFalse(stored["recovery_retryable"])
+                self.assertEqual(stored["_retry_cursor"]["source"], "terminal_image_failure")
+                self.assertEqual(stored["_retry_cursor"]["retry_parent_message_id"], expected_terminal)
 
     def test_different_owner_cannot_query_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

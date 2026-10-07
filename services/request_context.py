@@ -9,6 +9,7 @@ current_archive_guard = ContextVar("provider_archive_guard", default=None)
 current_archive_read_owner = ContextVar("provider_archive_read_owner", default=None)
 current_archive_observation = ContextVar("provider_archive_observation", default=None)
 current_archive_step = ContextVar("provider_archive_step", default=None)
+current_archive_defer_reads = ContextVar("provider_archive_defer_reads", default=False)
 _FAIR_SOURCE = re.compile(r"^(?:user|company):[0-9a-f]{64}$")
 
 
@@ -31,15 +32,17 @@ def executing(context):
 
 
 @contextmanager
-def guarding_archive(check_and_renew, *, read_owner=None, request_key=None, work_key=None):
+def guarding_archive(check_and_renew, *, read_owner=None, request_key=None, work_key=None, defer_reads=False):
     token = current_archive_guard.set(check_and_renew)
     read_token = current_archive_read_owner.set(read_owner)
+    defer_token = current_archive_defer_reads.set(defer_reads)
     observation_token = current_archive_observation.set({
         "request_ref": safe_account_ref(request_key), "work_ref": safe_account_ref(work_key),
     })
     try:
         yield
     finally:
+        current_archive_defer_reads.reset(defer_token)
         current_archive_observation.reset(observation_token)
         current_archive_read_owner.reset(read_token)
         current_archive_guard.reset(token)

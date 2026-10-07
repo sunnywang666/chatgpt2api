@@ -48,6 +48,362 @@ class Context:
 
 
 class AccountRequestPacingTests(unittest.TestCase):
+    def test_independent_notification_and_download_lookups_overlap_without_read_credit(self):
+        endpoints = ("/backend-api/celsius/ws/user", "/backend-api/files/file-1/download",
+                     "/backend-api/conversation/c/attachment/a/download")
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: .05)):
+                path = Path(tmp) / "clock.json"
+                clock = AccountRequestClock("fixture", path)
+                original_read_at = time.monotonic() + 300
+                clock.next_conversation_read = original_read_at
+                clock._save()
+                entered = [threading.Event(), threading.Event()]
+                release = threading.Event()
+                sends, errors = {}, []
+                def run(index):
+                    def send(*args, **kwargs):
+                        sends[index] = time.monotonic()
+                        entered[index].set()
+                        if not release.wait(2):
+                            raise TimeoutError("independent response remained serialized")
+                        return Response()
+                    try:
+                        AccountRequestClock("fixture", path).request(send, "GET", "https://provider" + endpoint,
+                            _account_request_deadline_monotonic=time.monotonic()+1)
+                    except BaseException as exc:
+                        errors.append(exc)
+                workers = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+                try:
+                    workers[0].start()
+                    self.assertTrue(entered[0].wait(1))
+                    workers[1].start()
+                    self.assertTrue(entered[1].wait(.5), "lookup held account lock until response")
+                    self.assertGreaterEqual(sends[1] - sends[0], .045, "send pace was bypassed")
+                finally:
+                    release.set()
+                    for worker in workers:
+                        if worker.ident is not None: worker.join(2)
+                self.assertEqual(errors, [])
+                restored = AccountRequestClock("fixture", path)
+                self.assertAlmostEqual(restored.next_conversation_read, original_read_at, delta=.001)
+                self.assertEqual(restored.ordinary_read_queue, [])
+
+    def test_pooled_preparation_interruption_joins_transport_and_keeps_limit(self):
+        from concurrent.futures import ThreadPoolExecutor
+        for transport_error in (False, True):
+            with self.subTest(transport_error=transport_error), tempfile.TemporaryDirectory() as tmp, \
+                 ThreadPoolExecutor(max_workers=1) as executor, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)):
+                path = Path(tmp)/"clock.json"
+                clock = AccountRequestClock("fixture", path)
+                entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+                response, context = Response(), Context("interrupted-preparation")
+                context.record_limit = lambda evidence: None
+                response.status_code, response.headers = 429, {"Retry-After":"90"}
+                def send(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(2): raise TimeoutError("fixture join did not release transport")
+                    returned.set()
+                    if transport_error: raise ConnectionError("controlled preparation failure")
+                    return response
+                def submit(callback, *args):
+                    future = executor.submit(callback, *args)
+                    result = future.result
+                    interrupted = False
+                    def interrupt_once(*args, **kwargs):
+                        nonlocal interrupted
+                        if not interrupted:
+                            interrupted = True
+                            self.assertTrue(entered.wait(1))
+                            release.set()
+                            raise KeyboardInterrupt("controlled future wait interruption")
+                        return result(*args, **kwargs)
+                    future.result = interrupt_once
+                    return future
+                try:
+                    with executing(context), self.assertRaises(KeyboardInterrupt) as caught:
+                        clock.request(send, "POST", "https://chatgpt.com/backend-api/f/conversation/prepare",
+                            _account_request_preparation_submit=submit)
+                    self.assertTrue(returned.is_set(), "caller must reap its original transport")
+                    self.assertEqual(context.released, 0, "preparation does not release an admitted work slot")
+                    self.assertTrue(clock.lock.acquire(timeout=.5), "response retained the clock")
+                    clock.lock.release()
+                    self.assertFalse(clock.turn_lock.locked())
+                    if transport_error:
+                        self.assertIsInstance(caught.exception.__cause__, ConnectionError)
+                    else:
+                        self.assertTrue(response.closed)
+                        reloaded = AccountRequestClock("fixture", path)
+                        self.assertGreater(reloaded.cooldown_until, time.monotonic()+85)
+                        self.assertEqual(reloaded.rate_failures, 1)
+                finally:
+                    release.set()
+
+    def test_parallel_preparation_limits_survive_late_200_and_block_generation(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        for method, path in (("GET", "/"),
+                ("POST", "/backend-api/sentinel/chat-requirements/prepare"),
+                ("POST", "/backend-api/sentinel/chat-requirements/finalize"),
+                ("POST", "/backend-api/f/conversation/prepare")):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)):
+                storage = Path(tmp)/"clock.json"
+                entered, release = threading.Event(), threading.Event()
+                contexts, errors = [Context(str(i)) for i in range(3)], []
+                for c in contexts: c.record_limit = lambda evidence: None
+                def delayed(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(2): raise TimeoutError("fixture response withheld")
+                    return Response()
+                def first():
+                    try:
+                        with executing(contexts[0]):
+                            AccountRequestClock("fixture", storage).request(delayed, method, "https://chatgpt.com"+path)
+                    except BaseException as exc: errors.append(exc)
+                worker = threading.Thread(target=first)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    response = Response(); response.status_code = 429; response.headers = {"Retry-After":"90"}
+                    with executing(contexts[1]):
+                        AccountRequestClock("fixture", storage).request(lambda *a, **kw: response, method,
+                            "https://chatgpt.com"+path, _account_request_deadline_monotonic=time.monotonic()+.5)
+                    before = json.loads(storage.read_text())
+                finally:
+                    release.set(); worker.join(3)
+                self.assertFalse(worker.is_alive()); self.assertEqual(errors, [])
+                after = json.loads(storage.read_text())
+                # Disk stores wall time; reloading converts through monotonic.
+                # Permit conversion roundoff only (0.1 ms), not an earlier pace.
+                self.assertGreaterEqual(after["cooldown_until"] + .0001, before["cooldown_until"])
+                self.assertEqual(after["rate_failures"], 1)
+                self.assertTrue(all(c.released == 0 for c in contexts), "preparation must not release admitted slots")
+                def forbidden(*args, **kwargs): self.fail("generation sent during preparation cooldown")
+                with executing(contexts[2]), self.assertRaises(AccountRequestDeadlineExceeded):
+                    AccountRequestClock("fixture", storage).request(forbidden, "POST", "https://chatgpt.com/backend-api/f/conversation",
+                        _account_request_deadline_monotonic=time.monotonic()+.05)
+
+    def test_model_send_save_failure_reaps_and_closes_unreturned_stream(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            sent, returned = threading.Event(), threading.Event()
+            response, context = Response(), Context("save-failure")
+            save = clock._save
+            def failing_save():
+                if sent.is_set():
+                    raise OSError("fixture storage unavailable after send")
+                save()
+            def send(*args, **kwargs):
+                sent.set()
+                threading.Event().wait(.05)
+                returned.set()
+                return response
+            with patch.object(clock, "_save", side_effect=failing_save), executing(context):
+                with self.assertRaisesRegex(OSError, "storage unavailable"):
+                    clock.request(send, "POST", "https://provider/conversation", stream=True)
+            self.assertTrue(returned.is_set(), "request must join the original transport")
+            self.assertTrue(response.closed, "unreturned stream must not leak on final save failure")
+            self.assertEqual(context.released, 1)
+            self.assertIn("send_call_started", context.stages)
+            self.assertFalse(clock.lock.locked())
+            self.assertFalse(clock.turn_lock.locked())
+
+    def test_parallel_model_reply_preserves_newer_send_and_429_after_restart(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            path = Path(tmp) / "clock.json"
+            entered, release = threading.Event(), threading.Event()
+            results, errors = [], []
+            class LimitContext(Context):
+                def record_limit(self, evidence): self.limit = evidence
+            def delayed(*args, **kwargs):
+                entered.set()
+                if not release.wait(3): raise TimeoutError("fixture headers not released")
+                return Response()
+            def first():
+                try:
+                    with executing(LimitContext("older")):
+                        results.append(AccountRequestClock("account", path).request(
+                            delayed, "POST", "https://provider/conversation", stream=True))
+                except BaseException as exc: errors.append(exc)
+            worker = threading.Thread(target=first)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                def limited(*args, **kwargs):
+                    response = Response(); response.status_code = 429
+                    response.headers = {"Retry-After": "90"}
+                    return response
+                with executing(LimitContext("newer")):
+                    AccountRequestClock("account", path).request(limited, "POST", "https://provider/conversation")
+                before = json.loads(path.read_text())
+            finally:
+                release.set(); worker.join(3)
+            self.assertFalse(worker.is_alive()); self.assertEqual(errors, [])
+            after = json.loads(path.read_text())
+            self.assertGreaterEqual(after["cooldown_until"] + .0001, before["cooldown_until"])
+            self.assertGreaterEqual(after["last_turn_started"] + .0001, before["last_turn_started"])
+            self.assertEqual(after["rate_failures"], 1)
+            never_send = __import__("unittest.mock", fromlist=["Mock"]).Mock()
+            with executing(LimitContext("third")), self.assertRaises(AccountRequestDeadlineExceeded):
+                AccountRequestClock("account", path).request(never_send, "POST", "https://provider/conversation",
+                    _account_request_deadline_monotonic=time.monotonic()+.05)
+            never_send.assert_not_called()
+            for response in results: response.close()
+
+    def test_independent_model_sends_overlap_before_first_response_headers(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            entered = [threading.Event(), threading.Event()]
+            release = threading.Event()
+            contexts = [Context("first"), Context("second")]
+            results, errors = {}, []
+            def run(index):
+                def send(*args, **kwargs):
+                    entered[index].set()
+                    if not release.wait(3):
+                        raise TimeoutError("fixture response headers not released")
+                    return Response()
+                try:
+                    with executing(contexts[index]):
+                        results[index] = clock.request(send, "POST", "https://provider/conversation", stream=True)
+                except BaseException as exc:
+                    errors.append(exc)
+            workers = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+            try:
+                workers[0].start()
+                self.assertTrue(entered[0].wait(1))
+                workers[1].start()
+                self.assertTrue(entered[1].wait(.5), "independent POST waited for earlier response headers")
+            finally:
+                release.set()
+                for worker in workers:
+                    if worker.ident is not None:
+                        worker.join(2)
+            self.assertFalse(errors)
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(c.released == 0 for c in contexts), "send lock release must not release active work slots")
+            for response in results.values():
+                list(response.iter_lines())
+            self.assertTrue(all(c.released == 1 for c in contexts))
+
+    def test_model_send_preparation_timing_excludes_transport_and_preserves_guards(self):
+        for transport_fails in (False, True):
+            with self.subTest(transport_fails=transport_fails):
+                now = [10000.0]
+                def advance(seconds):
+                    now[0] += seconds
+                class SlowContext(Context):
+                    def before_send(self):
+                        super().before_send()
+                        advance(5)
+                    def record_stage(self, stage, **fields):
+                        super().record_stage(stage, **fields)
+                        if stage == "send_call_started": advance(3)
+                with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+                     patch("services.account_request_pacing.logger.info") as logged, \
+                     patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                     patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+                    clock = AccountRequestClock("account")
+                    turn_acquire, clock_acquire = clock.turn_lock.acquire, clock.lock.acquire
+                    save, saves = clock._save, []
+                    def slow_first_save():
+                        if not saves: advance(2)
+                        saves.append(True)
+                        return save()
+                    def slow_turn(*args, **kwargs):
+                        advance(2)
+                        return turn_acquire(*args, **kwargs)
+                    def slow_clock(*args, **kwargs):
+                        advance(3)
+                        return clock_acquire(*args, **kwargs)
+                    def send(*args, **kwargs):
+                        advance(7)
+                        if transport_fails:
+                            raise OSError("private-transport-text")
+                        return Response()
+                    with patch.object(clock.turn_lock, "acquire", side_effect=slow_turn), \
+                         patch.object(clock, "_save", side_effect=slow_first_save), \
+                         patch.object(clock.lock, "acquire", side_effect=slow_clock), executing(SlowContext("test")):
+                        args = (send, "POST", "https://private-host/backend-api/conversation?private-query")
+                        options = {"_account_request_preflight": lambda read: advance(4),
+                                   "_account_request_before_send": lambda: advance(6)}
+                        if transport_fails:
+                            with self.assertRaises(OSError):
+                                clock.request(*args, **options)
+                        else:
+                            clock.request(*args, **options)
+                    attempts = [c.args[0] for c in logged.call_args_list if c.args[0].get("event") == "account_http_attempt"]
+                    self.assertEqual(len(attempts), 1)
+                    self.assertEqual(attempts[0]["pre_send_elapsed_secs"], 25)
+                    self.assertEqual(attempts[0]["pre_send_seconds_by_phase"], {
+                        "turn_lock": 2, "clock_lock": 3, "preflight": 4,
+                        "admission_guard": 5, "submission_callback": 6,
+                        "clock_persistence": 2, "send_receipt": 3})
+                    self.assertEqual(attempts[0]["headers_elapsed_secs"], 7)
+                    self.assertNotIn("private-", json.dumps(attempts))
+                    logged.reset_mock()
+                    def reject():
+                        raise RuntimeError("private-local-guard")
+                    with self.assertRaises(RuntimeError), executing(SlowContext("rejected")):
+                        clock.request(send, "POST", "https://provider/conversation", _account_request_before_send=reject)
+                    self.assertFalse(any(c.args[0].get("event") == "account_http_attempt" for c in logged.call_args_list))
+
+    def test_read_defers_before_wait_that_cannot_leave_connection_budget(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import services.account_request_pacing as pacing
+        for reason, delay, credit_local, may_send in (
+                ("read_rate", 59., False, False),
+                ("read_rate", 45., False, True),
+                ("read_rate", 59., True, True),
+                ("provider_cooldown", 59., True, False)):
+            with self.subTest(reason=reason, delay=delay, credit_local=credit_local):
+                now, credited = [100.], []
+                sleep = Mock(side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds))
+                fake_time = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1700000000 + now[0], sleep=sleep)
+                with tempfile.TemporaryDirectory() as directory, patch.object(pacing, "time", fake_time), \
+                     patch.object(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                                                                   account_conversation_read_interval_secs=0)):
+                    clock = AccountRequestClock("fixture", Path(directory)/"clock.json")
+                    with clock.lock:
+                        if reason == "provider_cooldown":
+                            clock.cooldown_until = now[0] + delay
+                        else:
+                            clock.next_conversation_read = now[0] + delay
+                        clock._save()
+                    raw = Mock(return_value=Response())
+                    options = {"_account_request_deadline_monotonic": 160.,
+                               "_account_request_minimum_budget_secs": 10.}
+                    if credit_local:
+                        options["_account_request_local_wait"] = credited.append
+                    if may_send:
+                        clock.request(raw, "GET", "https://fixture.invalid/conversation/original", timeout=60, **options)
+                        raw.assert_called_once()
+                        self.assertEqual(now[0], 100. + delay)
+                    else:
+                        with self.assertRaises(pacing.AccountReadRetryBudgetInsufficient):
+                            clock.request(raw, "GET", "https://fixture.invalid/conversation/original", timeout=60, **options)
+                        raw.assert_not_called()
+                        sleep.assert_not_called()
+                        restored = AccountRequestClock("fixture", Path(directory)/"clock.json")
+                        with restored.lock:
+                            waiting_until = (restored.cooldown_until if reason == "provider_cooldown"
+                                             else restored.next_conversation_read)
+                            self.assertEqual(waiting_until, 100. + delay)
+                    self.assertEqual(credited, [delay] if credit_local and may_send else [])
+                    self.assertEqual(clock.ordinary_read_queue, [])
+                    self.assertFalse(clock.lock.locked())
+
     def test_retry_connection_window_checked_again_in_io_worker(self):
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -214,6 +570,41 @@ class AccountRequestPacingTests(unittest.TestCase):
                 self.assertEqual(sent, [10000 + expected_wait])
                 self.assertEqual(clock.ordinary_read_queue, [])
 
+    def test_original_read_rechecks_released_archive_lease_without_skipping_real_floor(self):
+        for floor, expected in ((None, .1), ("next_conversation_read", 8), ("cooldown_until", 8)):
+            with self.subTest(floor=floor):
+                now = [10000.0]
+                sleeps, sent = [], []
+                clock = AccountRequestClock("account")
+                clock.archive_read_owner, clock.archive_read_until = "archive", 10005
+                if floor:
+                    setattr(clock, floor, 10008)
+                def sleep(seconds):
+                    sleeps.append(seconds)
+                    self.assertFalse(sent)
+                    with clock.lock:
+                        clock.archive_read_owner, clock.archive_read_until = None, 0
+                    now[0] += seconds
+                with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("services.account_request_pacing.time.sleep", side_effect=sleep), \
+                     patch.object(type(config), "account_request_interval_secs", property(lambda _: .1)), \
+                     patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 15)), \
+                     patch("services.account_request_pacing.logger.info") as info:
+                    clock.request(lambda *a, **k: sent.append(now[0]) or Response(),
+                                  "GET", "https://provider/conversation/original")
+                self.assertEqual(sleeps, [expected])
+                self.assertEqual(sent, [10000 + expected])
+                self.assertEqual(clock.ordinary_read_queue, [])
+                waits = [call.args[0] for call in info.call_args_list
+                         if call.args[0].get("event") == "account_read_wait_finished"]
+                self.assertEqual(len(waits), 1)
+                reason = {None: "archive_reservation", "next_conversation_read": "read_rate",
+                          "cooldown_until": "upstream_cooldown"}[floor]
+                self.assertEqual(waits[0]["wait_seconds_by_controlling_reason"], {reason: expected})
+                self.assertEqual(waits[0]["http_attempts"], 1)
+                self.assertEqual(waits[0]["queue_position_max"], 1)
+                self.assertNotIn("https://provider", json.dumps(waits))
+
     def test_metadata_preserves_read_queue_and_persisted_http_floor(self):
         now = [10000.0]
         sent = []
@@ -253,6 +644,12 @@ class AccountRequestPacingTests(unittest.TestCase):
             ("/backend-api/me", "/conversation/original", "conversation_read"),
             ("/conversation/original", "/backend-api/me", "account"),
             ("/backend-api/accounts/check/v4-2023-04-27", "/backend-api/me", "account"),
+            ("/backend-api/celsius/ws/user", "/backend-api/me", "account"),
+            ("/backend-api/files/file-1/download", "/backend-api/me", "account"),
+            ("/backend-api/conversation/c/attachment/a/download", "/backend-api/me", "account"),
+            ("/backend-api/me", "/backend-api/celsius/ws/user", "account"),
+            ("/backend-api/me", "/backend-api/files/file-1/download", "account"),
+            ("/backend-api/me", "/backend-api/conversation/c/attachment/a/download", "account"),
         ):
             with self.subTest(slow_path=slow_path, limited_path=limited_path), tempfile.TemporaryDirectory() as tmp, \
                  patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
@@ -295,12 +692,16 @@ class AccountRequestPacingTests(unittest.TestCase):
 
     def test_non_metadata_init_or_write_retains_send_fence(self):
         from services.account_request_pacing import AccountRequestDeadlineExceeded
-        for endpoint, body in (
-            ("/backend-api/conversation/init", {"conversation_id": "existing"}),
-            ("/backend-api/conversation/init", {"gizmo_id": None, "requested_default_model": None,
+        for method, endpoint, body in (
+            ("POST", "/backend-api/conversation/init", {"conversation_id": "existing"}),
+            ("POST", "/backend-api/conversation/init", {"gizmo_id": None, "requested_default_model": None,
                                               "conversation_id": None, "timezone_offset_min": -480,
                                               "prompt": "an actual operation"}),
-            ("/backend-api/files", {}),
+            ("POST", "/backend-api/files", {}),
+            ("POST", "/backend-api/files/file-1/download", {}),
+            ("GET", "/backend-api/files/file-1", {}),
+            ("GET", "/backend-api/celsius/ws/user?scope=other", {}),
+            ("GET", "/backend-api/conversation/c/attachment/a/unknown", {}),
         ):
             with self.subTest(endpoint=endpoint, body=body), tempfile.TemporaryDirectory() as tmp, \
                  patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
@@ -316,7 +717,7 @@ class AccountRequestPacingTests(unittest.TestCase):
                     return Response()
                 def write():
                     try:
-                        AccountRequestClock("account", path).request(send, "POST", "https://provider" + endpoint, json=body)
+                        AccountRequestClock("account", path).request(send, method, "https://provider" + endpoint, json=body)
                     except BaseException as exc:
                         errors.append(exc)
                 read_errors, deadline_set = [], threading.Event()
@@ -339,7 +740,7 @@ class AccountRequestPacingTests(unittest.TestCase):
                     # lock owner controlled here, rather than waiting for the
                     # reader to finish before releasing that same owner.
                     time.sleep(max(0, deadline[0] - time.monotonic()) + .05)
-                    self.assertEqual(sent, ["POST"])
+                    self.assertEqual(sent, [method])
                 finally:
                     release.set()
                     worker.join(4)
@@ -349,7 +750,7 @@ class AccountRequestPacingTests(unittest.TestCase):
                 self.assertEqual(errors, [])
                 self.assertEqual(len(read_errors), 1)
                 self.assertIsInstance(read_errors[0], AccountRequestDeadlineExceeded)
-                self.assertEqual(sent, ["POST"])
+                self.assertEqual(sent, [method])
 
     def test_fractional_http_floor_preserves_model_floor_and_retry_after(self):
         now = [10000.0]
@@ -683,6 +1084,96 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertAlmostEqual(sent[1][1], 10090, delta=1e-6)
             self.assertEqual(AccountRequestClock("account", path).ordinary_read_queue, [])
 
+    def test_guarded_archive_patch_responses_overlap_without_holding_account_clock(self):
+        from services.request_context import guarding_archive
+        clock = AccountRequestClock()
+        release, both_entered = threading.Event(), threading.Event()
+        started, errors = [], []
+        def send(method, url, **kwargs):
+            started.append(url)
+            if len(started) == 2:
+                both_entered.set()
+            if not release.wait(2):
+                raise AssertionError("independent PATCH was serialized through response")
+            return Response()
+        def run(label):
+            try:
+                with guarding_archive(lambda: None, read_owner=label):
+                    clock.request(send, "PATCH", "https://provider/conversation/" + label,
+                                  json={"is_archived": True}, timeout=2)
+            except BaseException as exc:
+                errors.append(exc)
+        with patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)):
+            workers = [threading.Thread(target=run, args=(label,)) for label in ("a", "b")]
+            try:
+                for worker in workers:
+                    worker.start()
+                self.assertTrue(both_entered.wait(1))
+                self.assertTrue(clock.lock.acquire(timeout=.5), "PATCH response retained the clock")
+                clock.lock.release()
+            finally:
+                release.set()
+                for worker in workers:
+                    worker.join(3)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(started), 2)
+
+    def test_archive_patch_http_spacing_does_not_restart_the_read_pipeline(self):
+        from services.request_context import guarding_archive
+        now, sent = [10000.0], []
+        with patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=lambda delay: now.__setitem__(0, now[0] + delay)), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: .1)):
+            clock = AccountRequestClock()
+            clock.next_request = now[0] + .05
+            def send(method, url, **kwargs):
+                sent.append((method, now[0]))
+                return Response()
+            with guarding_archive(lambda: None, read_owner="archive", defer_reads=True):
+                clock.request(send, "PATCH", "https://provider/conversation/original", json={"is_archived": True})
+            self.assertEqual(sent, [("PATCH", 10000.05)])
+            self.assertEqual(clock.ordinary_read_queue, [])
+
+    def test_background_archive_read_joins_result_fifo_and_defers_without_http_or_credit(self):
+        from services.request_context import guarding_archive
+        from services.account_request_pacing import ArchiveReadDeferred
+        now = [10000.0]
+        sent = []
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=AssertionError("worker must yield")), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)), \
+             patch.object(type(config), "account_conversation_read_burst", property(lambda _: 1)):
+            path = Path(tmp) / "clock.json"
+            clock = AccountRequestClock("account", path)
+            with clock.lock:
+                clock._ordinary_read_turn("ordinary", now[0], 0)
+            def send(*args, **kwargs):
+                sent.append(now[0])
+                return Response()
+            with guarding_archive(lambda: None, read_owner="archive", defer_reads=True):
+                with self.assertRaises(ArchiveReadDeferred):
+                    clock.request(send, "GET", "https://provider/conversation/original")
+            self.assertEqual(sent, [])
+            self.assertIsNone(clock.conversation_read_bucket)
+            restarted = AccountRequestClock("account", path)
+            self.assertEqual([q["owner"] for q in restarted.ordinary_read_queue], ["ordinary", "archive"])
+            with restarted.lock:
+                restarted._release_ordinary_read("ordinary")
+            with guarding_archive(lambda: None, read_owner="archive", defer_reads=True):
+                restarted.request(send, "GET", "https://provider/conversation/original")
+                with restarted.lock:
+                    restarted._ordinary_read_turn("new-result", now[0], 60)
+                with self.assertRaises(ArchiveReadDeferred) as caught:
+                    restarted.request(send, "GET", "https://provider/conversation/original")
+            self.assertEqual(sent, [10000])
+            self.assertEqual(caught.exception.next_at, 10060)
+            self.assertEqual([q["owner"] for q in restarted.ordinary_read_queue], ["new-result", "archive"])
+            self.assertEqual(restarted.conversation_read_bucket["credit"], 0)
+
     def test_archive_read_booking_survives_restart_and_yields_to_waiting_result(self):
         from services.request_context import guarding_archive
         now = [10000.0]
@@ -726,6 +1217,66 @@ class AccountRequestPacingTests(unittest.TestCase):
                 ("POST", "conversation"), ("GET", "archive-first"),
                 ("GET", "result"), ("GET", "archive-readback")])
             self.assertEqual([at for _, _, at in sent], [10000, 10060, 10120, 10180])
+
+    def test_archive_backlog_cannot_prebook_ahead_of_ordinary_results(self):
+        import hashlib
+        from services import account_request_pacing as pacing
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(pacing, "DATA_DIR", Path(tmp)), patch.object(pacing, "_clocks", {}), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)):
+            account = {"account_id": "fixture-account"}
+            self.assertTrue(pacing.reserve_account_archive_read(account, "archive-0"))
+            for i in range(1, 100):
+                self.assertFalse(pacing.reserve_account_archive_read(account, f"archive-{i}"))
+            clock = pacing._clocks[hashlib.sha256(b"fixture-account").hexdigest()]
+            with clock.lock:
+                self.assertEqual(len(clock.ordinary_read_queue), 1)
+                self.assertFalse(clock._ordinary_read_turn("ordinary-result", time.monotonic(), 0))
+            pacing.release_account_archive_read(account, "archive-0")
+            self.assertFalse(pacing.reserve_account_archive_read(account, "archive-1"))
+            with clock.lock:
+                self.assertTrue(clock._ordinary_read_turn("ordinary-result", time.monotonic(), 0))
+                self.assertEqual([e["owner"] for e in clock.ordinary_read_queue], ["ordinary-result"])
+
+    def test_archive_rechecks_released_reader_instead_of_sleeping_its_whole_lease(self):
+        from contextvars import Context as EmptyContext
+        from types import SimpleNamespace
+        from services.request_context import guarding_archive
+        now, sent, injected = [10000.0], [], [False]
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch("services.account_request_pacing.uuid.uuid4", return_value=SimpleNamespace(hex="ordinary-reader")), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: .1)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 45)):
+            path = Path(tmp) / "clock.json"
+            original = AccountRequestClock("account", path)
+            with original.lock:
+                original.last_read_was_archive = True
+                original._ordinary_read_turn("ordinary-reader", now[0], 45)
+            archive = AccountRequestClock("account", path)
+            def send(method, url, **kwargs):
+                sent.append((url.rsplit("/", 1)[-1], now[0]))
+                return Response()
+            def advance(seconds):
+                self.assertFalse(archive.lock.locked())
+                wake_at = now[0] + seconds
+                if not injected[0] and wake_at >= 10000.5:
+                    injected[0] = True
+                    now[0] = 10000.5
+                    # A separate caller finishes its already reserved GET while
+                    # the archive is asleep. Its lease would live until 10075.
+                    EmptyContext().run(AccountRequestClock("account", path).request,
+                                       send, "GET", "https://provider/conversation/result")
+                now[0] = wake_at
+            with patch("services.account_request_pacing.time.sleep", side_effect=advance):
+                with guarding_archive(lambda: None, read_owner="original-work"):
+                    archive.request(send, "GET", "https://provider/conversation/archive")
+            self.assertEqual([name for name, _ in sent], ["result", "archive"])
+            self.assertAlmostEqual(sent[0][1], 10000.5)
+            self.assertAlmostEqual(sent[1][1], 10045.5)
+            self.assertFalse(archive.lock.locked())
 
     def test_abandoned_archive_read_booking_expires_without_blocking_post(self):
         now = [10000.0]
@@ -886,6 +1437,76 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertEqual(clock.last_rate_limit_evidence["phase"], "conversation_read")
             clock.request(send, "POST", "https://provider/conversation")
             self.assertGreaterEqual(sent[1][1] - sent[0][1], 123)
+
+    def test_slow_preflight_does_not_block_independent_turn_or_consume_read_credit(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: .03)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            entered, independent, release = threading.Event(), threading.Event(), threading.Event()
+            sends, errors, cleaned = [], [], []
+            def send(method, url, **kwargs):
+                sends.append((method, url, time.monotonic()))
+                if method == "GET":
+                    entered.set()
+                    if not release.wait(2): raise TimeoutError()
+                elif "independent" in url:
+                    independent.set()
+                return Response()
+            def request(name, preflight=False):
+                try:
+                    with executing(Context(name)):
+                        options = ({"_account_request_preflight": lambda read: read(
+                            "GET", "https://provider/backend-api/conversation/original")} if preflight else {})
+                        clock.request(send, "POST", "https://provider/" + name + "/conversation",
+                            _account_request_io_cleanup=lambda: cleaned.append(threading.get_ident()), **options)
+                except BaseException as exc:
+                    errors.append(exc)
+            workers = [threading.Thread(target=request, args=("retry", True)),
+                       threading.Thread(target=request, args=("independent",))]
+            original_credit = clock.next_conversation_read
+            try:
+                workers[0].start()
+                self.assertTrue(entered.wait(1))
+                workers[1].start()
+                self.assertTrue(independent.wait(.5), "slow preflight serialized another conversation")
+                self.assertFalse(any("retry/" in url for _, url, _ in sends))
+            finally:
+                release.set()
+                for worker in workers:
+                    if worker.ident is not None: worker.join(2)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(cleaned), 3, "each transport must close its own thread-local handle")
+            self.assertEqual([method for method, _, _ in sends], ["GET", "POST", "POST"])
+            self.assertTrue(all(b[2] - a[2] >= .025 for a, b in zip(sends, sends[1:])))
+            self.assertAlmostEqual(clock.next_conversation_read, original_credit, delta=.001)
+
+    def test_turn_interval_wait_does_not_lock_other_read_and_preflight_stays_after_interval(self):
+        with patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock = AccountRequestClock("account")
+            clock.next_turn = time.monotonic() + .25
+            due = clock.next_turn
+            sent, errors = [], []
+            def request():
+                try:
+                    with executing(Context("retry")):
+                        clock.request(lambda method, *a, **kw: sent.append((method, time.monotonic())) or Response(),
+                            "POST", "https://provider/backend-api/conversation",
+                            _account_request_preflight=lambda read: read("GET", "https://provider/backend-api/conversation/original"))
+                except BaseException as exc: errors.append(exc)
+            worker = threading.Thread(target=request)
+            worker.start()
+            try:
+                clock.request(lambda *a, **kw: sent.append(("download", time.monotonic())) or Response(),
+                              "GET", "https://provider/backend-api/files/file/download")
+                self.assertEqual(sent[0][0], "download")
+                self.assertLess(sent[0][1], due)
+            finally:
+                worker.join(2)
+            self.assertEqual(errors, [])
+            self.assertEqual([row[0] for row in sent], ["download", "GET", "POST"])
+            self.assertGreaterEqual(sent[1][1], due)
 
     def test_legacy_clock_and_submission_preflight_keep_existing_semantics(self):
         import json
@@ -1161,6 +1782,65 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertEqual(saved["upstream_request_id"], "fixture-request")
             self.assertNotIn("private-conversation-id", str(saved))
 
+    def test_429_response_features_survive_restart_without_raw_headers_or_body(self):
+        cases = (
+            ({"Content-Type": "application/json; private-header-value", "openai-request-id": "fixture-request",
+              "Retry-After": "0"}, "application_json", "seconds", "openai_request_id", "request_id_marker"),
+            ({"content-type": "text/html; private-header-value", "cf-ray": "private-header-value",
+              "via": "private-header-value", "Retry-After": "bad-private-header-value"},
+             "text_html", "invalid", "none", "edge_marker"),
+            ({"Content-Type": "text/plain", "x-request-id": "fixture-request", "CF-Ray": "private-header-value",
+              "Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"},
+             "text_plain", "http_date", "x_request_id", "mixed_markers"),
+            ({}, "missing", "absent", "none", "no_marker"),
+            ({"Content-Type": "private-header-value", "Retry-After": "NaN"},
+             "other", "invalid", "none", "no_marker"),
+        )
+        for headers, content, retry, request_id, origin in cases:
+            with self.subTest(content=content, retry=retry), tempfile.TemporaryDirectory() as tmp, \
+                 patch("services.account_request_pacing.logger.info") as logged:
+                path = Path(tmp) / "clock.json"
+                response = Response()
+                response.status_code = 429
+                response.headers = {**headers, "Set-Cookie": "private-header-value"}
+                response.text = "private-response-body"
+                clock = AccountRequestClock("account", path)
+                self.assertIs(clock.request(lambda *a, **kw: response, "GET",
+                    "https://provider/conversation/private-conversation-id"), response)
+                saved = AccountRequestClock("account", path).last_rate_limit_evidence
+                attempt = next(c.args[0] for c in logged.call_args_list
+                               if c.args[0].get("event") == "account_http_attempt")
+                for evidence in (saved, attempt):
+                    features = evidence["response_features"]
+                    self.assertEqual(features["content_type_class"], content)
+                    self.assertEqual(features["retry_after_kind"], retry)
+                    self.assertEqual(features["request_id_header"], request_id)
+                    self.assertEqual(features["response_origin_evidence"], origin)
+                serialized = json.dumps([saved, attempt, json.loads(path.read_text())])
+                for secret in ("private-header-value", "private-response-body", "private-conversation-id", "Set-Cookie"):
+                    self.assertNotIn(secret, serialized)
+
+    def test_preflight_429_keeps_the_same_response_features_as_its_http_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("services.account_request_pacing.logger.info") as logged:
+            path = Path(tmp) / "clock.json"
+            clock = AccountRequestClock("account", path)
+            response = Response()
+            response.status_code = 429
+            response.headers = {"Content-Type": "text/html", "CF-Ray": "private-header-value"}
+            def preflight(read):
+                self.assertIs(read("GET", "https://provider/conversation/original"), response)
+                raise RuntimeError("stop before any model send")
+            with self.assertRaisesRegex(RuntimeError, "stop before any model send"):
+                clock.request(lambda *a, **kw: response, "POST", "https://provider/conversation",
+                              _account_request_preflight=preflight)
+            saved = AccountRequestClock("account", path).last_rate_limit_evidence
+            attempts = [c.args[0] for c in logged.call_args_list if c.args[0].get("event") == "account_http_attempt"]
+            self.assertEqual(len(attempts), 1)
+            self.assertEqual(saved["phase"], "conversation_preflight")
+            self.assertEqual(saved["response_features"], attempts[0]["response_features"])
+            self.assertEqual(saved["response_features"]["response_origin_evidence"], "edge_marker")
+            self.assertNotIn("private-header-value", json.dumps([saved, attempts, json.loads(path.read_text())]))
+
     def test_stream_lock_is_released_at_headers_not_stream_terminal(self):
         with tempfile.TemporaryDirectory() as tmp:
             clock = AccountRequestClock("account", Path(tmp) / "clock.json")
@@ -1308,6 +1988,108 @@ class ReadRateLimitIsolationTests(unittest.TestCase):
         self.assertEqual(restored.cooldown_until, 10120)
         self.assertEqual(restored.last_rate_limit_evidence["scope"], "account")
         self.assertFalse(restored.last_rate_limit_evidence["same_read_incident"])
+
+    def test_parallel_read_retry_after_keeps_one_global_incident_across_instances(self):
+        all_sent = threading.Barrier(7)
+        release = [threading.Event() for _ in range(6)]
+        errors = []
+
+        def send(method, url, **kwargs):
+            index = int(url.rsplit("/", 1)[1])
+            all_sent.wait(timeout=3)
+            if not release[index].wait(5):
+                raise TimeoutError("test response was not released")
+            response = Response()
+            response.status_code = 200 if index == 4 else 429
+            response.headers = {"Retry-After": "12"}
+            return response
+
+        def read(index):
+            try:
+                AccountRequestClock("account", self.path).request(
+                    send, "GET", f"https://provider/conversation/{index}")
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)), \
+             patch("services.account_request_pacing.time.sleep",
+                   side_effect=lambda _: threading.Event().wait(.001)):
+            workers = [threading.Thread(target=read, args=(i,)) for i in range(6)]
+            for worker in workers:
+                worker.start()
+            try:
+                all_sent.wait(timeout=3)
+                for index in (2, 4, 0, 5, 1, 3):
+                    self.advance(1)
+                    release[index].set()
+                    workers[index].join(3)
+                    self.assertFalse(workers[index].is_alive())
+                    restored = AccountRequestClock("account", self.path)
+                    self.assertEqual(restored.rate_failures, 1)
+                    self.assertEqual(restored.conversation_read_rate_failures, 0)
+                    self.assertEqual(restored.last_rate_limit, 10001)
+                    self.assertEqual(restored.cooldown_until, 10061)
+                    self.assertEqual(restored.last_rate_limit_evidence["scope"], "account")
+            finally:
+                for event in release:
+                    event.set()
+                for worker in workers:
+                    worker.join(3)
+            self.assertEqual(errors, [])
+            self.assertTrue(restored.last_rate_limit_evidence["same_read_incident"])
+        # A later send is a real retry and must still escalate.
+        self.now = 10062
+        restored = AccountRequestClock("account", self.path)
+        with restored.lock:
+            restored.limited(12, evidence={"phase": "conversation_read"},
+                             retry_after_present=True, read_sent_at=self.now)
+        self.assertEqual(restored.rate_failures, 2)
+        self.assertEqual(restored.cooldown_until, 10182)
+        self.assertFalse(restored.last_rate_limit_evidence["same_read_incident"])
+
+    def test_inflight_read_retry_after_preserves_longest_persisted_deadline(self):
+        first = AccountRequestClock("account", self.path)
+        with first.lock:
+            first.limited(120, evidence={"phase": "conversation_read"},
+                          retry_after_present=True, read_sent_at=9999)
+        self.now = 10010
+        restored = AccountRequestClock("account", self.path)
+        with restored.lock:
+            restored.limited(240, evidence={"phase": "conversation_read"},
+                             retry_after_present=True, read_sent_at=9999)
+        self.assertEqual(restored.rate_failures, 1)
+        self.assertEqual(restored.last_rate_limit, 10000)
+        self.assertEqual(restored.cooldown_until, 10250)
+        self.assertEqual(restored.last_rate_limit_evidence["cooldown_seconds"], 240)
+        self.now = 10020
+        restored = AccountRequestClock("account", self.path)
+        with restored.lock:
+            restored.cooldown_until = 10400  # Existing stricter debt is retained.
+            restored._save()
+        restored = AccountRequestClock("account", self.path)
+        with restored.lock:
+            restored.limited(1, evidence={"phase": "conversation_read"},
+                             retry_after_present=True, read_sent_at=9999)
+        self.assertEqual(restored.rate_failures, 1)
+        self.assertEqual(restored.cooldown_until, 10400)
+        self.assertEqual(restored.last_rate_limit_evidence["cooldown_seconds"], 380)
+        self.assertEqual(restored.last_rate_limit_evidence["cooldown_until"], 1700010400)
+
+    def test_retry_after_incident_grouping_requires_a_known_read_send(self):
+        for phase, sent_at in (("conversation_read", None), ("conversation_read", True),
+                               ("conversation_read", float("-inf")),
+                               ("conversation_read", float("nan")), ("conversation", 9999),
+                               ("account_read", 9999)):
+            with self.subTest(phase=phase, sent_at=sent_at):
+                clock = AccountRequestClock()
+                clock.limited(11, evidence={"phase": phase}, retry_after_present=True,
+                              read_sent_at=sent_at)
+                self.advance(1)
+                clock.limited(11, evidence={"phase": phase}, retry_after_present=True,
+                              read_sent_at=sent_at)
+                self.assertEqual(clock.rate_failures, 2)
+                self.assertFalse(clock.last_rate_limit_evidence["same_read_incident"])
 
     def test_conversation_read_limits_do_not_delay_model_posts_after_restart(self):
         first = AccountRequestClock("account", self.path)
@@ -1487,6 +2269,237 @@ def test_native_partial_response_timeout_keeps_stage_snapshot(tmp_path, monkeypa
         server.server_close()
 
 
+def test_native_backend_preparations_overlap_without_mixing_tokens(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit
+    from curl_cffi import requests
+    import services.account_request_pacing as pacing
+    import services.openai_backend_api as api
+    from services.config import ConfigStore
+    paths = ["/", "/backend-api/sentinel/chat-requirements/prepare",
+             "/backend-api/sentinel/chat-requirements/finalize",
+             "/backend-api/f/conversation/prepare", "/backend-api/f/conversation"]
+    barriers = {path: threading.Barrier(2) for path in paths}
+    trace, server_errors, connections, handles = {}, [], {}, []
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *args): pass
+        def do_GET(self): self.respond()
+        def do_POST(self): self.respond()
+        def respond(self):
+            sid = self.headers["OAI-Session-Id"]
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"]))) if self.command == "POST" else {}
+            try:
+                trace.setdefault(sid, []).append(self.path)
+                if self.path != paths[-1]:
+                    connections.setdefault(sid, set()).add(self.client_address)
+                if self.path.endswith("chat-requirements/prepare"):
+                    result = {"prepare_token":"prepare-"+sid}
+                elif self.path.endswith("chat-requirements/finalize"):
+                    assert payload["prepare_token"] == "prepare-"+sid
+                    result = {"token":"requirements-"+sid}
+                elif self.path.endswith("conversation/prepare"):
+                    assert self.headers["OpenAI-Sentinel-Chat-Requirements-Token"] == "requirements-"+sid
+                    result = {"conduit_token":"conduit-"+sid}
+                elif self.path.endswith("conversation"):
+                    assert self.headers["OpenAI-Sentinel-Chat-Requirements-Token"] == "requirements-"+sid
+                    assert self.headers["X-Conduit-Token"] == "conduit-"+sid
+                    result = None
+                else: result = "<html></html>"
+                barriers[self.path].wait(timeout=3)
+                body = (b'data: [DONE]\n\n' if result is None else
+                        result.encode() if isinstance(result, str) else json.dumps(result).encode())
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+            except BaseException as exc:
+                server_errors.append(exc)
+                self.send_error(500)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    raw_send = requests.Session.request
+    def redirect(session, method, url, **kw):
+        assert urlsplit(url).hostname == "chatgpt.com"
+        if urlsplit(url).path != paths[-1]:
+            handles.append(session.curl)
+        return raw_send(session, method, f"http://127.0.0.1:{server.server_port}"+urlsplit(url).path, **kw)
+    monkeypatch.setattr(requests.Session, "request", redirect)
+    monkeypatch.setattr(api.proxy_settings, "build_session_kwargs", lambda **kw: {"trust_env":False})
+    monkeypatch.setattr(api.account_service, "get_account", lambda _: {"account_id":"same-fixture-account"})
+    guarded = []
+    monkeypatch.setattr(api.account_service, "require_image_account", lambda *a: guarded.append(a))
+    monkeypatch.setattr(api, "build_legacy_requirements_token", lambda *a: "fixture-p")
+    (tmp_path/"config.json").write_text(json.dumps({"auth-key":"test-only"}))
+    settings = ConfigStore(tmp_path/"config.json")
+    settings.update({"account_request_interval_secs":0, "account_message_interval_secs":0})
+    monkeypatch.setattr(pacing, "config", settings)
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    backends = [api.OpenAIBackendAPI("fixture-token") for _ in range(2)]
+    contexts, errors = [Context(str(i)) for i in range(2)], []
+    def run(index):
+        backend, context = backends[index], contexts[index]
+        context.request_id = str(index)
+        try:
+            with executing(context):
+                backend.image_submission_started = False
+                backend._bootstrap()
+                requirements = backend._get_chat_requirements()
+                conduit = backend._prepare_image_conversation(str(index), requirements, "gpt-image-2")
+                assert context.released == 0 and backend.image_submission_started is False
+                response = backend._start_image_generation(str(index), requirements, conduit, "gpt-image-2")
+                assert context.released == 0 and backend.image_submission_started is True
+                assert [x for x in response.iter_lines() if x] == [b'data: [DONE]']
+        except BaseException as exc: errors.append(exc)
+    workers = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+    try:
+        for worker in workers: worker.start()
+        for worker in workers: worker.join(8)
+        assert not errors and not server_errors
+        assert all(not w.is_alive() for w in workers)
+        assert len(trace) == 2 and all(sequence == paths for sequence in trace.values())
+        assert len(connections) == 2 and all(len(ports) == 1 for ports in connections.values())
+        assert len(set(map(id, handles))) == 2 and all(c._curl is not None for c in handles)
+        assert len(guarded) == 2 and all(c.released == 1 for c in contexts)
+    finally:
+        for barrier in barriers.values(): barrier.abort()
+        for worker in workers: worker.join(6)
+        for backend in backends: backend.close()
+        server.shutdown(); server.server_close()
+    assert all(c._curl is None for c in handles), "Backend.close must close preparation worker handles"
+
+
+def test_native_preparation_failure_and_close_reap_persistent_worker(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit
+    from curl_cffi import requests
+    from curl_cffi.requests.exceptions import RequestException
+    import services.account_request_pacing as pacing
+    from services.config import ConfigStore
+    import pytest
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *args): pass
+        def do_POST(self):
+            if self.headers.get("X-Fixture") == "transport-error":
+                self.close_connection = True
+                return
+            self.send_response(429)
+            self.send_header("Retry-After", "90")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    (tmp_path/"config.json").write_text(json.dumps({"auth-key":"test-only"}))
+    settings = ConfigStore(tmp_path/"config.json")
+    settings.update({"account_request_interval_secs":0})
+    monkeypatch.setattr(pacing, "config", settings)
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    try:
+        for mode in ("limited", "transport-error"):
+            session = requests.Session(trust_env=False)
+            raw_send, handles, workers = session.request, [], []
+            def redirect(method, url, **kw):
+                handles.append(session.curl)
+                workers.append(threading.current_thread())
+                return raw_send(method, f"http://127.0.0.1:{server.server_port}"+urlsplit(url).path, **kw)
+            session.request = redirect
+            pacing.pace_account_session(session, {"account_id":"fixture-"+mode}, "fixture-token")
+            context = Context(mode); context.record_limit = lambda evidence: None
+            try:
+                with executing(context):
+                    if mode == "limited":
+                        response = session.post("https://chatgpt.com/backend-api/f/conversation/prepare", timeout=1)
+                        assert response.status_code == 429
+                        assert any(c.cooldown_until > time.monotonic()+85 for c in pacing._clocks.values())
+                    else:
+                        with pytest.raises(RequestException):
+                            session.post("https://chatgpt.com/backend-api/f/conversation/prepare",
+                                headers={"X-Fixture": mode}, timeout=1)
+                assert context.released == 0
+                assert len(handles) == 1 and handles[0]._curl is not None
+            finally:
+                session.close()
+            assert handles[0]._curl is None
+            assert not workers[0].is_alive()
+            session.close()  # Closing a completed Backend again remains harmless.
+    finally:
+        server.shutdown(); server.server_close()
+
+
+def test_native_parallel_post_keeps_stream_clones_after_worker_handle_cleanup(tmp_path, monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from curl_cffi import requests
+    import services.account_request_pacing as pacing
+    from services.config import ConfigStore
+    both = threading.Barrier(3)
+    headers, tail = threading.Event(), threading.Event()
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            both.wait(timeout=3)
+            if not headers.wait(3): return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b'data: {"part":1}\n\n'); self.wfile.flush()
+            if not tail.wait(4): return
+            self.wfile.write(b'data: [DONE]\n\n'); self.wfile.flush()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    session = requests.Session(trust_env=False)
+    caller_curl, raw_send = session.curl, session.request
+    worker_handles = []
+    def native_send(method, url, **kw):
+        worker_handles.append(session.curl)
+        return raw_send(method, f"http://127.0.0.1:{server.server_port}/conversation", **kw)
+    session.request = native_send
+    (tmp_path/"config.json").write_text(json.dumps({"auth-key":"test-only"}))
+    settings = ConfigStore(tmp_path/"config.json")
+    settings.update({"account_request_interval_secs":0, "account_message_interval_secs":0})
+    monkeypatch.setattr(pacing, "config", settings)
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    pacing.pace_account_session(session, {"account_id":"fixture-only"}, "fixture-token")
+    responses, errors = {}, []
+    contexts = [Context("first"), Context("second")]
+    def run(index):
+        contexts[index].request_id = str(index)
+        try:
+            with executing(contexts[index]):
+                responses[index] = session.post("https://chatgpt.com/backend-api/conversation",
+                    json={"model":"fixture"}, stream=True, timeout=5)
+        except BaseException as exc: errors.append(exc)
+    workers = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+    try:
+        for worker in workers: worker.start()
+        both.wait(timeout=3)  # Both POST bodies arrived before either header.
+        assert not responses
+        headers.set()
+        for worker in workers: worker.join(2)
+        assert not errors and len(responses) == 2
+        assert all(c.released == 0 for c in contexts)
+        assert len(worker_handles) == 2 and all(c._curl is None for c in worker_handles)
+        assert caller_curl._curl is not None
+        assert all(r.curl not in worker_handles and r.curl._curl is not None for r in responses.values())
+        tail.set()
+        for response in responses.values():
+            assert [line for line in response.iter_lines() if line] == [b'data: {"part":1}', b'data: [DONE]']
+            response.stream_task.result(timeout=2)
+        assert all(c.released == 1 for c in contexts)
+        assert all(r.curl._curl is None for r in responses.values())
+    finally:
+        headers.set(); tail.set()
+        for worker in workers: worker.join(6)
+        for response in responses.values(): response.close()
+        session.close(); server.shutdown(); server.server_close()
+
+
 def test_native_joined_read_releases_only_worker_handle_and_keeps_buffered_result(tmp_path, monkeypatch):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import urlsplit
@@ -1578,3 +2591,180 @@ def test_native_get_connect_cap_preserves_total_deadline(tmp_path, monkeypatch):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoundedReadBurstTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 10000.0
+        self.interval = 60.0
+        self.capacity = 3
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.path = Path(temp.name) / "clock.json"
+        for target, kwargs in (
+            ("services.account_request_pacing.time.monotonic", {"side_effect": lambda: self.now}),
+            ("services.account_request_pacing.time.time", {"side_effect": lambda: 1700000000 + self.now}),
+            ("services.account_request_pacing.time.sleep", {"side_effect": self.advance}),
+        ):
+            mock = patch(target, **kwargs); mock.start(); self.addCleanup(mock.stop)
+        for name, get in (
+            ("account_request_interval_secs", lambda _: 0.1),
+            ("account_message_interval_secs", lambda _: 5),
+            ("account_conversation_read_interval_secs", lambda _: self.interval),
+            ("account_conversation_read_burst", lambda _: self.capacity),
+        ):
+            mock = patch.object(type(config), name, property(get)); mock.start(); self.addCleanup(mock.stop)
+        self.starts = []
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def send(self, method, url, **kwargs):
+        self.starts.append((method, self.now))
+        return Response()
+
+    def get(self, clock):
+        return clock.request(self.send, "GET", "https://fixture.invalid/conversation/original")
+
+    def test_three_read_burst_then_one_per_interval_survives_every_restart(self):
+        for _ in range(5):
+            self.get(AccountRequestClock("fixture", self.path))
+        self.assertEqual(len(self.starts), 5)
+        for actual, expected in zip([t for _, t in self.starts], [10000, 10000.1, 10000.2, 10060, 10120]):
+            self.assertAlmostEqual(actual, expected, places=5)
+        self.advance(600)
+        for _ in range(4):
+            self.get(AccountRequestClock("fixture", self.path))
+        times = [t for _, t in self.starts[-4:]]
+        self.assertLess(times[2] - times[0], 0.3)
+        self.assertAlmostEqual(times[3] - times[0], 60, places=5)
+
+    def test_legacy_future_floor_is_not_erased_by_enabling_burst(self):
+        clock = AccountRequestClock("fixture", self.path)
+        clock.next_conversation_read = self.now + 80
+        clock._save()
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[0][1], 10080)
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[1][1], 10140)
+
+    def test_policy_changes_do_not_refill_burst_or_reset_debt(self):
+        for _ in range(3): self.get(AccountRequestClock("fixture", self.path))
+        self.capacity = 10
+        self.interval = 120
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1], 10119)
+        self.capacity = 1
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1] - self.starts[-2][1], 120 - 0.001)
+        self.capacity = 10
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1] - self.starts[-2][1], 120 - 0.001)
+
+    def test_policy_enlargement_after_long_idle_inherits_only_one_read(self):
+        self.capacity = 1
+        self.get(AccountRequestClock("fixture", self.path))
+        self.advance(600)
+        self.capacity = 10
+        self.interval = 30
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertAlmostEqual(self.starts[-1][1], 10600, places=5)
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertAlmostEqual(self.starts[-1][1], 10630, places=5)
+        self.advance(120)
+        for _ in range(4): self.get(AccountRequestClock("fixture", self.path))
+        self.assertLess(self.starts[-1][1] - self.starts[-4][1], 0.4)
+
+    def test_read_429_disables_burst_and_does_not_block_generation(self):
+        clock = AccountRequestClock("fixture", self.path)
+        self.get(clock)
+        with clock.lock:
+            clock.limited(evidence={"phase": "conversation_read"}, read_sent_at=self.now)
+        clock = AccountRequestClock("fixture", self.path)
+        clock.request(self.send, "POST", "https://fixture.invalid/conversation")
+        self.assertLess(self.starts[-1][1], 10001)
+        self.get(clock)
+        first_after_limit = self.starts[-1][1]
+        self.assertGreaterEqual(first_after_limit, 10060)
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1] - first_after_limit, 120 - 0.001)
+
+    def test_retry_after_remains_account_wide_even_with_available_credit(self):
+        clock = AccountRequestClock("fixture", self.path)
+        self.get(clock)
+        with clock.lock:
+            clock.limited(125, evidence={"phase": "conversation_read"}, retry_after_present=True)
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1], 10125)
+
+    def test_unknown_transport_still_consumes_persisted_credit(self):
+        clock = AccountRequestClock("fixture", self.path)
+        def fail(*args, **kwargs):
+            raise OSError("fixture connection lost")
+        with self.assertRaises(OSError):
+            clock.request(fail, "GET", "https://fixture.invalid/conversation/original")
+        for _ in range(3): self.get(AccountRequestClock("fixture", self.path))
+        self.assertLess(self.starts[1][1], 10001)
+        self.assertGreaterEqual(self.starts[2][1], 10060)
+
+    def test_snapshot_and_archive_reservation_use_same_credit_floor(self):
+        import hashlib
+        import services.account_request_pacing as pacing
+        account = {"provider_account_identity": "fixture"}
+        root = self.path.parent
+        path = root / "account_request_clocks" / (hashlib.sha256(b"fixture").hexdigest() + ".json")
+        for _ in range(3): self.get(AccountRequestClock("fixture", path))
+        self.interval = 120
+        clock = AccountRequestClock("fixture", path)
+        with patch.object(pacing, "DATA_DIR", root):
+            snapshot = pacing.account_pacing_snapshot(account, now=1700000000+self.now,
+                                                       include_turn=False, include_conversation_read=True)
+        self.assertAlmostEqual(snapshot["next_at"] - 1700000000, clock._read_ready(self.now), places=5)
+        with clock.lock:
+            self.assertTrue(clock._reserve_archive_read("fixture-archive", self.now))
+        self.assertAlmostEqual(clock.archive_read_until - 5, clock._read_ready(self.now), places=5)
+
+    def test_zero_interval_does_not_bank_unpaced_reads_as_free_credit(self):
+        self.interval = 0
+        for _ in range(8): self.get(AccountRequestClock("fixture", self.path))
+        self.interval = 60
+        self.get(AccountRequestClock("fixture", self.path))
+        self.assertGreaterEqual(self.starts[-1][1] - self.starts[-2][1], 60 - 0.001)
+
+    def test_real_overlapping_reads_preserve_newer_limit_when_old_200_arrives(self):
+        started, release = threading.Event(), threading.Event()
+        errors = []
+        def delayed(method, url, **kwargs):
+            started.set()
+            if not release.wait(3): raise TimeoutError("fixture reply not released")
+            return Response()
+        def first_read():
+            try:
+                AccountRequestClock("fixture", self.path).request(
+                    delayed, "GET", "https://fixture.invalid/conversation/first")
+            except BaseException as exc: errors.append(exc)
+        worker = threading.Thread(target=first_read)
+        worker.start()
+        try:
+            self.assertTrue(started.wait(2))
+            def limited(*args, **kwargs):
+                result = Response(); result.status_code = 429; result.headers = {}; return result
+            newer = AccountRequestClock("fixture", self.path)
+            newer.request(limited, "GET", "https://fixture.invalid/conversation/second")
+            before = json.loads(self.path.read_text())
+        finally:
+            release.set(); worker.join(3)
+        self.assertFalse(worker.is_alive()); self.assertEqual(errors, [])
+        after = json.loads(self.path.read_text())
+        self.assertEqual(after["conversation_read_bucket"], before["conversation_read_bucket"])
+        self.assertEqual(after["conversation_read_rate_failures"], 1)
+        self.assertGreaterEqual(after["next_conversation_read"], before["next_conversation_read"])
+        self.assertGreaterEqual(AccountRequestClock("fixture", self.path)._read_ready(self.now), self.now + 59)
+
+    def test_corrupt_bucket_fails_closed(self):
+        clock = AccountRequestClock("fixture", self.path)
+        self.get(clock)
+        saved = json.loads(self.path.read_text())
+        saved["conversation_read_bucket"]["credit"] = float("nan")
+        self.path.write_text(json.dumps(saved))
+        with self.assertRaises(ValueError): AccountRequestClock("fixture", self.path)

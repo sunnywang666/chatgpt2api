@@ -23,9 +23,10 @@ from curl_cffi import requests
 from PIL import Image
 
 from services.account_service import account_service
-from services.account_request_pacing import AccountRequestDeadlineExceeded, pace_account_session, retry_after_seconds
+from services.account_request_pacing import (AccountRequestDeadlineExceeded, pace_account_session,
+                                             retry_after_seconds, unsent_transport_failure)
 from services.config import config
-from services.request_context import observing_archive_step
+from services.request_context import current_archive_observation, observing_archive_step
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -296,6 +297,7 @@ class OpenAIBackendAPI:
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        self._release_image_completion_listener()
         session = getattr(self, "session", None)
         if session:
             try:
@@ -386,6 +388,9 @@ class OpenAIBackendAPI:
         deadline = getattr(self, "metadata_deadline", None)
         if deadline is not None:
             options["_account_request_deadline_monotonic"] = deadline
+        local_wait = getattr(self, "metadata_local_wait", None)
+        if callable(local_wait):
+            options["_account_request_local_wait"] = local_wait
         guard = getattr(self, "metadata_before_send", None)
         if capacity or callable(guard):
             def before_read():
@@ -1274,6 +1279,10 @@ class OpenAIBackendAPI:
             # send reservation is not proof that the POST actually happened.
             self.image_submission_started = False
             raise
+        except Exception as exc:
+            if getattr(self, "image_transport_retry_eligible", False) and unsent_transport_failure(exc):
+                self.image_submission_started = False
+            raise
         if response.status_code == 404:
             response.close()
             path = "/backend-api/conversation"
@@ -1294,6 +1303,10 @@ class OpenAIBackendAPI:
                 )
             except AccountRequestDeadlineExceeded:
                 self.image_submission_started = False
+                raise
+            except Exception as exc:
+                if getattr(self, "image_transport_retry_eligible", False) and unsent_transport_failure(exc):
+                    self.image_submission_started = False
                 raise
         ensure_ok(response, path)
         return response
@@ -1345,14 +1358,16 @@ class OpenAIBackendAPI:
         """Change visibility only after checking the original conversation and cursor."""
         with observing_archive_step("precheck"):
             document = self._get_conversation(conversation_id)
+        if validate_document is not None:
+            # A caller may prove an appended terminal tail of this exact turn
+            # using this same fresh read. Text callers keep exact cursor checks.
+            resolved_parent = validate_document(document)
+            if isinstance(resolved_parent, str) and resolved_parent:
+                parent_message_id = resolved_parent
         if str(document.get("current_node") or "").strip() != parent_message_id:
             raise ConversationArchiveCursorMismatch("original conversation cursor changed")
         if parent_message_id not in (document.get("mapping") or {}):
             raise RuntimeError("original product turn is missing")
-        if validate_document is not None:
-            # Both checks use this fresh pre-PATCH read, never a cached poll
-            # snapshot from before the result download.
-            validate_document(document)
         if document.get("is_archived") is archived:
             return {"archived": archived}
         path = f"/backend-api/conversation/{conversation_id}"
@@ -1361,6 +1376,32 @@ class OpenAIBackendAPI:
                 headers=self._headers(path, {"Accept": "application/json", "Content-Type": "application/json"}),
                 json={"is_archived": archived}, timeout=60)
         ensure_ok(response, path)
+        # Observe whether this upstream offers a complete mutation receipt.
+        # Only fixed structural flags leave this function; never log the body,
+        # unknown field names, conversation IDs, cursors, or parse errors.
+        try:
+            ack = response.json()
+            ack_shape = "json_object" if isinstance(ack, dict) else "non_object"
+        except Exception:
+            ack, ack_shape = None, "json_parse_failed"
+        ack = ack if isinstance(ack, dict) else {}
+        identities = [ack[key] for key in ("conversation_id", "id") if key in ack]
+        states = [ack[key] for key in ("is_archived", "archived") if key in ack]
+        observation = current_archive_observation.get() or {}
+        logger.info({
+            "event": "archive_patch_ack_shape",
+            "request_ref": observation.get("request_ref"),
+            "work_ref": observation.get("work_ref"),
+            "shape": ack_shape,
+            "success_is_true": ack.get("success") is True,
+            "identity_present": bool(identities),
+            "identity_matches": bool(identities) and all(isinstance(v, str) and v == conversation_id for v in identities),
+            "state_present": bool(states),
+            "state_is_bool": bool(states) and all(type(v) is bool for v in states),
+            "state_matches": bool(states) and all(v is archived for v in states),
+            "cursor_present": "current_node" in ack,
+            "cursor_matches": isinstance(ack.get("current_node"), str) and ack["current_node"] == parent_message_id,
+        })
         # A timeout on PATCH is safe to recover by reading this exact chat first.
         with observing_archive_step("readback"):
             readback = self._get_conversation(conversation_id)
@@ -2524,6 +2565,21 @@ class OpenAIBackendAPI:
         branch_ids = OpenAIBackendAPI._current_message_branch_ids(data, request_message_id)
         if not branch_ids:
             return ""
+        current_node = str(data.get("current_node") or "")
+        current = (mapping.get(current_node) or {}).get("message") or {}
+        if (current_node not in branch_ids
+                or (current.get("author") or {}).get("role") != "assistant"
+                or current.get("status") != "finished_successfully"
+                or current.get("end_turn") is not True):
+            return ""
+        # A partial refusal or an unrelated task error cannot close this
+        # generation. Nor can policy text erase an already observed asset.
+        for message_id in branch_ids - {request_message_id}:
+            message = (mapping.get(message_id) or {}).get("message") or {}
+            output = {"content": message.get("content"), "metadata": message.get("metadata")}
+            files, sediments = OpenAIBackendAPI._extract_image_reference_ids(output)
+            if files or sediments or OpenAIBackendAPI._has_image_asset_pointer(output):
+                return ""
         for message_id in branch_ids:
             node = mapping.get(message_id)
             message = (node or {}).get("message") or {}
@@ -2550,7 +2606,84 @@ class OpenAIBackendAPI:
                 return msg_text[:500]
         return ""
 
-    def _poll_image_results(
+    def _open_image_notification_transport(self, deadline):
+        # Use a separate read-only client: the first subscribing image may
+        # finish before the account's other conversations release the socket.
+        backend = OpenAIBackendAPI(access_token=self.access_token)
+        try:
+            remaining = min(10, deadline - time.monotonic())
+            if remaining <= 0:
+                raise ImageActiveDeadlineExceeded("image notification deadline elapsed")
+            path = "/backend-api/celsius/ws/user"
+            # Allow up to ten seconds for the account's send queue, then a
+            # full ten-second HTTP attempt. Never send with the sub-second
+            # remainder of the old combined setup budget; retain the original
+            # active deadline and fall back to polling if no window remains.
+            response = backend.session.get(backend.base_url + path, headers=backend._headers(path),
+                timeout=remaining, allow_redirects=False,
+                _account_request_deadline_monotonic=min(deadline, time.monotonic() + 20),
+                _account_request_minimum_budget_secs=10.0)
+            try:
+                ensure_ok(response, path)
+                url = response.json()["websocket_url"]
+            finally:
+                response.close()
+            return (backend.session, url, proxy_settings.build_session_kwargs(
+                account=backend.account, impersonate=backend.fp["impersonate"], verify=True), backend.close, deadline)
+        except Exception:
+            backend.close()
+            raise
+
+    def _poll_image_results(self, *args, **kwargs):
+        account = getattr(self, "account", None) or {}
+        identity = account.get("provider_account_identity")
+        cid = args[0] if args else kwargs.get("conversation_id")
+        handoff = getattr(self, "_image_completion_listener", None)
+        self._image_completion_listener = None
+        if handoff is not None:
+            try:
+                if (handoff["conversation_id"] == cid and kwargs.get("initial_document") is None
+                        and handoff["request_message_id"] == kwargs.get("request_message_id", "")):
+                    consumed = False
+                    first_wait = True
+
+                    def wait(seconds, *, before_first_read=False, max_wait_seconds=None):
+                        nonlocal consumed, first_wait
+                        seconds = min(seconds, max_wait_seconds) if max_wait_seconds is not None else seconds
+                        was_finished = handoff["finished"].is_set()
+                        handoff["finished"].wait(max(0.0, seconds))
+                        notified = handoff["outcome"].get("result") == "done" and not consumed
+                        if notified:
+                            consumed = True
+                        elif was_finished and not first_wait:
+                            # A disconnected/consumed listener is not a signal
+                            # for a tight GET loop. Keep the normal fallback.
+                            time.sleep(max(0.0, seconds))
+                        first_wait = False
+                        return notified
+
+                    return self._poll_image_results_inner(*args, **kwargs, _completion_wait=wait)
+            finally:
+                self._release_image_completion_listener(handoff)
+        # Recovery's single already-read snapshot never waits; it needs no
+        # socket. Unauthenticated/controlled transports retain their old path.
+        if not identity or not cid or kwargs.get("initial_document") is not None:
+            return self._poll_image_results_inner(*args, **kwargs)
+        budget = self._image_active_timeout(args[1] if len(args) > 1 else kwargs.get("timeout_secs", 120.0))
+        deadline = time.monotonic() + budget
+        from services.upstream_completion import image_completion_hints
+        with image_completion_hints(identity, cid, lambda: self._open_image_notification_transport(deadline)) as wait:
+            return self._poll_image_results_inner(*args, **kwargs, _completion_wait=wait)
+
+    def _release_image_completion_listener(self, handoff=None):
+        if handoff is None:
+            handoff = getattr(self, "_image_completion_listener", None)
+            self._image_completion_listener = None
+        if handoff is not None:
+            handoff["stopped"].set()
+            handoff["thread"].join(timeout=1)
+
+    def _poll_image_results_inner(
             self,
             conversation_id: str,
             timeout_secs: float = 120.0,
@@ -2559,11 +2692,13 @@ class OpenAIBackendAPI:
             request_message_id: str = "",
             require_fresh_result_ids: bool = False,
             initial_document: dict | None = None,
+            _completion_wait=None,
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
-        - The first authoritative read runs as soon as the account clock allows.
-          Stream/asset signals do not add an unconditional initial or settle wait.
+        - With no observed assets, prefer a completion notification before the
+          first read, bounded by the existing polling watchdog. Observed assets
+          and recovery snapshots require no initial wait.
         - Subsequent polls are image_poll_interval_secs apart (default 10s).
         - On upstream 429 / 5xx or network errors, backs off exponentially
           (capped at 16s, +jitter) honoring Retry-After when present.
@@ -2591,6 +2726,7 @@ class OpenAIBackendAPI:
             "conversation_id": conversation_id,
             "timeout_secs": timeout_secs,
             "initial_wait_secs": 0,
+            "completion_first_read_watchdog_secs": interval if _completion_wait is not None and not has_initial_ids and not single_snapshot else 0,
             "interval_secs": interval,
             "initial_file_ids": file_ids,
             "initial_sediment_ids": sediment_ids,
@@ -2601,11 +2737,34 @@ class OpenAIBackendAPI:
             pacing_wait = float(getattr(getattr(self, "progress_callback", None), "local_pacing_wait_secs", 0)) - initial_pacing_wait
             return timeout_secs - (time.time() - start - pacing_wait)
 
+        def wait_for_original(seconds, *, before_first_read=False):
+            if _completion_wait is None:
+                time.sleep(seconds)
+            elif (_completion_wait(seconds, before_first_read=True,
+                                   max_wait_seconds=max(0.0, _remaining() - 10.0)) if before_first_read
+                  else _completion_wait(seconds)):
+                from services.request_context import current_request
+                context = current_request.get()
+                if context is not None:
+                    try:
+                        context.record_stage("upstream_image_completion_signal")
+                    except Exception:
+                        pass  # Timing evidence cannot change image recovery.
+
         # Recovery has already read this exact conversation under the account
         # clock. Consume that fresh observation once; a second immediate GET
         # cannot fit a short recovery budget when the read interval is longer.
         # The recovery caller already enforced any pending-observation settle
-        # window. Live streams instead get a first read before any fallback wait.
+        # window. Live turns with no assets prefer a notification, bounded by
+        # a quiet polling watchdog so a lost event cannot strand the original.
+        # Same-conversation progress may defer that first read, within the
+        # active budget; completion/disconnect still wakes it immediately.
+        if _completion_wait is not None and not has_initial_ids and not single_snapshot:
+            # Retain network time for the fallback instead of spending the
+            # entire active budget waiting on a notification that may be lost.
+            first_wait = min(interval, max(0.0, _remaining() - 10.0))
+            if first_wait > 0:
+                wait_for_original(first_wait, before_first_read=True)
 
         def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
             # retry_after=0 means "retry immediately" — must not be coerced via falsy check.
@@ -2627,10 +2786,16 @@ class OpenAIBackendAPI:
             if error is not None:
                 log_payload["error"] = error
             logger.warning(log_payload)
-            time.sleep(sleep_for)
+            # A completion hint can end optional transport/server backoff,
+            # but never an explicit upstream delay or rate-limit cooldown.
+            if status_code != 429 and retry_after is None:
+                wait_for_original(sleep_for)
+            else:
+                time.sleep(sleep_for)
             return True
 
         last_task_error = ""
+        notification_task_diagnosed = False
         last_read_status: int | None = None
         last_retry_after: int | None = None
         last_read_was_transport = False
@@ -2686,11 +2851,17 @@ class OpenAIBackendAPI:
                     record_pending(list(file_ids), list(sediment_ids))
 
             if not file_ids and not sediment_ids:
-                # Successful asset reads need no separate task-list query. Only
-                # diagnose a missing result after the authoritative conversation read.
-                last_task_error = ""
+                # The task list is a diagnostic, not a completion signal. With
+                # a listener installed, reserve it for the final active-budget
+                # window instead of adding a second GET to each empty poll.
+                diagnose = (_completion_wait is None or
+                            (not notification_task_diagnosed and _remaining() <= interval))
                 try:
-                    tasks = [] if supplied_snapshot else self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                    tasks = []
+                    if not supplied_snapshot and diagnose:
+                        notification_task_diagnosed = True
+                        last_task_error = ""
+                        tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
                     for task in tasks:
                         is_error, error_msg, metadata = self.check_task_error(task)
                         if is_error and error_msg:
@@ -2738,7 +2909,7 @@ class OpenAIBackendAPI:
                         break
                     wait = min(interval, max(0.0, _remaining()))
                     if wait > 0:
-                        time.sleep(wait)
+                        wait_for_original(wait)
                     continue
                 if not config.image_check_before_hit_enabled:
                     # 先check再hit 机制关闭：直接返回首次发现的 file_ids
@@ -2773,7 +2944,7 @@ class OpenAIBackendAPI:
                     break
                 wait = min(config.image_settle_secs, max(0.0, _remaining()))
                 if wait > 0:
-                    time.sleep(wait)
+                    wait_for_original(wait)
                     continue
                 return file_ids, sediment_ids
             if supplied_snapshot:
@@ -2782,7 +2953,7 @@ class OpenAIBackendAPI:
                           "elapsed_secs": round(time.time() - start, 1)})
             wait = min(interval, max(0.0, _remaining()))
             if wait > 0:
-                time.sleep(wait)
+                wait_for_original(wait)
         logger.info({
             "event": "image_poll_timeout",
             "conversation_id": conversation_id,
@@ -3031,12 +3202,10 @@ class OpenAIBackendAPI:
                     request_message_id=request_message_id,
                 )
             except ImagePollTimeoutError as exc:
-                # 如果轮询超时且有 task error（如 moderation 拦截），抛出 ImageContentPolicyError
-                # 而非 ImagePollTimeoutError，让调用方能区分真正的超时和上游拒绝
-                task_error = getattr(exc, "task_error", "")
+                # Task-list errors are diagnostic hints, not proof that this
+                # submitted branch ended. Only the original conversation (or
+                # explicit stream moderation) can prove a policy rejection.
                 if not file_ids and not sediment_ids:
-                    if task_error:
-                        raise ImageContentPolicyError(task_error, conversation_id or "") from exc
                     raise
                 logger.warning({
                     "event": "image_resolve_poll_partial_timeout",
@@ -3180,10 +3349,15 @@ class OpenAIBackendAPI:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
         self.image_submission_started = False
+        # Admission may have waited while another result consumed the last
+        # capacity observation. Avoid uploads/bootstrap for an unsendable turn;
+        # the paced POST still performs the authoritative final check.
+        account_service.require_image_account(self.access_token, model)
         self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         self._report_progress("bootstrapping")
         self._bootstrap()
+        account_service.require_image_account(self.access_token, model)
         self._report_progress("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
@@ -3205,12 +3379,201 @@ class OpenAIBackendAPI:
             parent_message_id=parent_message_id,
         )
         self._report_progress("generating")
-        yield from self._iter_sse_payloads_capped(
+        timeout = self._image_active_timeout(float(config.image_poll_timeout_secs))
+        payloads = self._iter_sse_payloads_capped(
             response,
-            self._image_active_timeout(float(config.image_poll_timeout_secs)),
+            timeout,
             observe_text=True,
             request_message_id=str(getattr(self, "image_request_message_id", "") or ""),
         )
+        yield from self._iter_image_completion_payloads(payloads, conversation_id, time.monotonic() + timeout, response.close)
+
+    def _iter_image_completion_payloads(self, payloads, conversation_id, deadline, close_stream=None):
+        """Listen to an offered topic alongside SSE; always validate actual images.
+
+        A matching done only ends transport waiting. The existing protocol still
+        verifies the original request branch and downloads/persists its assets.
+        This per-attempt listener never submits generation or releases a slot.
+        """
+        from contextvars import copy_context
+        from services.upstream_completion import handoff_topic, wait_for_turn_done
+        from services.request_context import current_request
+
+        can_close_stream = callable(close_stream)
+        close_stream = close_stream if can_close_stream else lambda: None
+        self._release_image_completion_listener()
+        stopped = threading.Event()
+        finished = threading.Event()
+        outcome = {}
+        listener = None
+        conversation_changed = False
+        sse_done = False
+        terminal_message = False
+        transferred = False
+        asset_tail_lock = threading.RLock()
+        asset_tail_timer = None
+        asset_tail_generation = 0
+        asset_tail_armed = False
+        asset_tail_closed = False
+        asset_tail_expired = False
+
+        def arm_asset_tail():
+            # Once qualified assets are durable, keep consuming the live SSE
+            # instead of probing a document that may still be in progress.
+            # A quiet tail still falls back to the original strict read, using
+            # the existing polling interval rather than a new normal-path wait.
+            nonlocal asset_tail_timer, asset_tail_generation, asset_tail_armed
+            with asset_tail_lock:
+                if not can_close_stream or asset_tail_closed or asset_tail_expired or stopped.is_set():
+                    return False
+                seconds = float(config.image_poll_interval_secs)
+                # Do not defer the only result check all the way to the
+                # transport hard cap. With too little time left, probe now.
+                if seconds <= 0 or deadline - time.monotonic() <= seconds:
+                    return False
+                asset_tail_armed = True
+                asset_tail_generation += 1
+                generation = asset_tail_generation
+                if asset_tail_timer is not None:
+                    asset_tail_timer.cancel()
+
+                def quiet_tail():
+                    nonlocal asset_tail_expired
+                    with asset_tail_lock:
+                        if (asset_tail_closed or stopped.is_set()
+                                or generation != asset_tail_generation):
+                            return
+                        asset_tail_expired = True
+                        try:
+                            observe("upstream_asset_tail_fallback")
+                        except Exception:
+                            pass  # Diagnostics must never prevent the wakeup.
+                        close_stream()
+
+                asset_tail_timer = threading.Timer(seconds, copy_context().run, args=(quiet_tail,))
+                asset_tail_timer.daemon = True
+                asset_tail_timer.start()
+                return True
+
+        if can_close_stream:
+            self._arm_image_asset_tail = arm_asset_tail
+
+        def observe(stage):
+            context = current_request.get()
+            if context is not None:
+                context.record_stage(stage)
+
+        def listen(topic, cid):
+            listen_deadline = min(deadline, time.monotonic() + 60)
+
+            def remaining():
+                if stopped.is_set():
+                    return 0.0
+                return self._image_active_timeout(max(0.0, listen_deadline - time.monotonic()))
+
+            try:
+                if remaining() <= 0:
+                    return
+                path = "/backend-api/celsius/ws/user"
+                options = self._image_request_options(min(10, remaining()))
+                options["_account_request_deadline_monotonic"] = min(listen_deadline, time.monotonic() + 10)
+                response = self.session.get(self.base_url + path, headers=self._headers(path),
+                                            allow_redirects=False, **options)
+                try:
+                    ensure_ok(response, path)
+                    url = response.json().get("websocket_url")
+                finally:
+                    response.close()
+                if not isinstance(url, str) or remaining() <= 0:
+                    return
+                result = wait_for_turn_done(
+                    self.session, url, topic, cid, listen_deadline, remaining=remaining,
+                    connect_options=proxy_settings.build_session_kwargs(
+                        account=self.account, impersonate=self.fp["impersonate"], verify=True),
+                )
+                outcome["result"] = result
+                if result == "done" and not stopped.is_set():
+                    # Native SSE close is adapted to wake its reader. Do this
+                    # only after done, never just because handoff was offered.
+                    close_stream()
+            except Exception:
+                # Exceptions can contain signed URLs. Keep only a fixed enum;
+                # the original active deadline and any HTTP cooldown survive.
+                outcome.setdefault("result", "unavailable")
+            finally:
+                finished.set()
+
+        try:
+            try:
+                for payload in payloads:
+                    if asset_tail_armed:
+                        arm_asset_tail()
+                    if payload == "[DONE]":
+                        sse_done = True
+                        break
+                    try:
+                        event = json.loads(payload)
+                    except (TypeError, ValueError):
+                        event = None
+                    if isinstance(event, dict):
+                        value = event.get("v")
+                        candidate = event.get("conversation_id") or (value.get("conversation_id") if isinstance(value, dict) else None)
+                        if isinstance(candidate, str) and candidate:
+                            if conversation_id and candidate != conversation_id:
+                                conversation_changed = True
+                                stopped.set()
+                            else:
+                                conversation_id = candidate
+                        message = event.get("message") or (value.get("message") if isinstance(value, dict) else None)
+                        terminal_message |= (isinstance(message, dict) and message.get("end_turn") is True
+                                             and message.get("status") == "finished_successfully"
+                                             and (message.get("author") or {}).get("role") == "assistant")
+                    yield payload
+                    topic = handoff_topic(event)
+                    if topic and conversation_id and listener is None and not conversation_changed and not terminal_message:
+                        observe("upstream_completion_handoff")
+                        listener = threading.Thread(target=copy_context().run, args=(listen, topic, conversation_id),
+                                                    name="image-completion-listener", daemon=True)
+                        listener.start()
+                    if terminal_message:
+                        stopped.set()
+            except Exception as exc:
+                closed_tail_transport = asset_tail_expired and isinstance(exc, requests.exceptions.RequestException)
+                if not closed_tail_transport and (outcome.get("result") != "done" or stopped.is_set()):
+                    raise
+            if listener is not None and not stopped.is_set():
+                # SSE may close before the image tool. Hand the same exact
+                # topic to strict collection instead of waiting here for up
+                # to 60 seconds, then starting another notification socket.
+                # Done only wakes a read; it never certifies an image result.
+                self._image_completion_listener = {
+                    "conversation_id": conversation_id,
+                    "request_message_id": str(getattr(self, "image_request_message_id", "") or ""),
+                    "finished": finished, "outcome": outcome, "stopped": stopped, "thread": listener,
+                }
+                transferred = True
+                if outcome.get("result") == "done":
+                    observe("upstream_completion_signal")
+                    sse_done = True
+                elif finished.is_set():
+                    observe("upstream_completion_fallback")
+            if sse_done:
+                yield "[DONE]"
+        finally:
+            with asset_tail_lock:
+                asset_tail_closed = True
+                asset_tail_generation += 1
+                if asset_tail_timer is not None:
+                    asset_tail_timer.cancel()
+                if getattr(self, "_arm_image_asset_tail", None) is arm_asset_tail:
+                    del self._arm_image_asset_tail
+            if not transferred:
+                stopped.set()
+            close = getattr(payloads, "close", None)
+            if callable(close):
+                close()
+            if listener is not None and not transferred:
+                listener.join(timeout=1)
 
     def _iter_sse_payloads_capped(
             self,

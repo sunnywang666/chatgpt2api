@@ -17,7 +17,7 @@ from services.config import config
 from services.request_context import AdmissionLost, executing
 from services.image_task_service import ImageTaskService
 from test.test_pool_admission import build, Clock
-from test.test_account_request_pacing import Response
+from test.test_account_request_pacing import Response, Context
 
 
 class ImageCapabilitySendRefreshTests(unittest.TestCase):
@@ -57,7 +57,7 @@ class ImageCapabilitySendRefreshTests(unittest.TestCase):
         with executing(self.context):
             return self.pace.request(self.send, "POST", "https://fixture/backend-api/conversation", **kwargs)
 
-    def refresh(self, account_ref, *, deadline, before_read):
+    def refresh(self, account_ref, *, deadline, before_read, local_wait=None):
         self.assertEqual(account_ref, self.accounts.pool_account_ref(self.row))
         self.assertGreater(deadline, time.monotonic())
         before_read()
@@ -68,7 +68,8 @@ class ImageCapabilitySendRefreshTests(unittest.TestCase):
         def read():
             try:
                 self.pace.request(self.send, "GET", "https://fixture/backend-api/me",
-                    _account_request_deadline_monotonic=deadline)
+                    _account_request_deadline_monotonic=deadline,
+                    **({"_account_request_local_wait": local_wait} if callable(local_wait) else {}))
             except Exception as exc:
                 errors.append(exc)
             finally:
@@ -164,6 +165,159 @@ class ImageCapabilitySendRefreshTests(unittest.TestCase):
         self.send = send
         self.generation()
         self.assertEqual(self.calls, ["GET", "POST"])
+
+    def test_capacity_that_expires_during_local_pace_refreshes_before_original_post(self):
+        self.row["capacity_observed_at"] = datetime.now(timezone.utc).isoformat()
+        self.save()
+        self.assertIsNone(self.context.image_capability_refresh())
+        with self.pace.lock:
+            self.pace.next_request = time.monotonic() + .025
+            self.pace._save()
+        original_sleep = time.sleep
+        def expire_during_wait(seconds):
+            self.row["capacity_observed_at"] = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            self.save()
+            original_sleep(seconds)
+        self.accounts.refresh_image_capability = Mock(side_effect=self.refresh)
+        with patch("services.account_request_pacing.time.sleep", side_effect=expire_during_wait):
+            self.generation()
+        self.accounts.refresh_image_capability.assert_called_once()
+        self.assertEqual(self.calls, ["GET", "POST"])
+
+    def test_slow_refresh_releases_both_send_locks_for_an_independent_turn(self):
+        entered, release, independent = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        def slow(ref, **kwargs):
+            entered.set()
+            if not release.wait(2):
+                raise TimeoutError("fixture refresh blocked")
+            self.refresh(ref, **kwargs)
+        self.accounts.refresh_image_capability = slow
+        def original():
+            try:
+                self.generation()
+            except BaseException as exc:
+                errors.append(exc)
+        def other():
+            try:
+                with executing(Context("independent")):
+                    self.pace.request(lambda *a, **kw: independent.set() or Response(),
+                        "POST", "https://fixture/backend-api/conversation")
+            except BaseException as exc:
+                errors.append(exc)
+        workers = [threading.Thread(target=original), threading.Thread(target=other)]
+        try:
+            workers[0].start()
+            self.assertTrue(entered.wait(1))
+            workers[1].start()
+            self.assertTrue(independent.wait(.5), "refresh serialized an independent conversation")
+            self.assertFalse(self.context.receipt().get("_submission_started"))
+        finally:
+            release.set()
+            for worker in workers:
+                if worker.ident is not None:
+                    worker.join(3)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual(self.calls, ["GET", "POST"])
+
+    def test_refresh_rechecks_cursor_and_is_bounded_if_capacity_stays_stale(self):
+        checks = []
+        refreshed = []
+        def refresh(ref, **kwargs):
+            self.refresh(ref, **kwargs)
+            refreshed.append(True)
+        self.accounts.refresh_image_capability = refresh
+        def cursor(read):
+            read("GET", "https://fixture/backend-api/conversation/original")
+            checks.append(True)
+            if refreshed:
+                raise AdmissionLost("original cursor changed during metadata refresh")
+        with self.assertRaises(AdmissionLost):
+            self.generation(_account_request_preflight=cursor)
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(self.calls, ["GET", "GET", "GET"])
+        self.assertFalse(self.context.receipt().get("_submission_started"))
+        self.assertFalse(self.pace.lock.locked())
+        self.assertFalse(self.pace.turn_lock.locked())
+
+        self.row["capacity_observed_at"] = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        self.save()
+        self.accounts.refresh_image_capability = Mock()
+        with self.assertRaises(AdmissionLost):
+            self.generation()
+        self.accounts.refresh_image_capability.assert_called_once()
+        self.assertEqual(self.calls, ["GET", "GET", "GET"])
+        self.assertFalse(self.pace.lock.locked())
+        self.assertFalse(self.pace.turn_lock.locked())
+
+    def test_metadata_local_wait_is_credited_to_original_active_deadline(self):
+        credited = []
+        def refresh(ref, **kwargs):
+            with self.pace.lock:
+                self.pace.next_request = time.monotonic() + .06
+                self.pace._save()
+            self.refresh(ref, **kwargs)
+        self.accounts.refresh_image_capability = refresh
+        self.generation(_account_request_deadline_monotonic=time.monotonic() + .03,
+                        _account_request_local_wait=credited.append)
+        self.assertGreaterEqual(sum(credited), .05)
+        self.assertEqual(self.calls, ["GET", "POST"])
+
+    def test_refresh_credits_overlapping_metadata_waits_once(self):
+        credited = []
+        def refresh(ref, **kwargs):
+            callback = kwargs["local_wait"]
+            now = time.monotonic()
+            with patch("services.account_request_pacing.time.monotonic", return_value=now):
+                callback(.1)  # [now-.1, now]
+            with patch("services.account_request_pacing.time.monotonic", return_value=now-.05):
+                callback(.1)  # Late callback for [now-.15, now-.05].
+            with patch("services.account_request_pacing.time.monotonic", return_value=now+.1):
+                callback(.02)  # Disjoint wait, not the intervening idle gap.
+            self.refresh(ref, **kwargs)
+        self.accounts.refresh_image_capability = refresh
+        self.generation(_account_request_local_wait=credited.append)
+        self.assertAlmostEqual(sum(credited), .17, places=5)
+        self.assertEqual(self.calls, ["GET", "POST"])
+
+    def test_metadata_provider_cooldown_is_not_credited(self):
+        credited = []
+        def refresh(ref, **kwargs):
+            with self.pace.lock:
+                self.pace.cooldown_until = time.monotonic() + .06
+                self.pace._save()
+            # Preserve the exact raised deadline exception for this assertion.
+            self.pace.request(self.send, "GET", "https://fixture/backend-api/me",
+                _account_request_deadline_monotonic=kwargs["deadline"],
+                _account_request_local_wait=kwargs["local_wait"])
+        self.accounts.refresh_image_capability = refresh
+        with self.assertRaises(AccountRequestDeadlineExceeded):
+            self.generation(_account_request_deadline_monotonic=time.monotonic() + .03,
+                            _account_request_local_wait=credited.append)
+        self.assertEqual(credited, [])
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.context.receipt().get("_submission_started"))
+        self.assertFalse(self.pace.lock.locked())
+        self.assertFalse(self.pace.turn_lock.locked())
+
+    def test_metadata_backend_receives_local_wait_callback(self):
+        callback = Mock()
+        workspace = "12345678-1234-5678-9234-567812345678"
+        real_backend = OpenAIBackendAPI
+        seen = []
+        class Backend:
+            def __init__(self, token):
+                self.access_token = token
+            def get_user_info(self):
+                seen.append(real_backend._metadata_request_options(self))
+                return {"user_id": "fixture-user", "account_id": workspace}
+            def close(self):
+                pass
+        with patch("services.openai_backend_api.OpenAIBackendAPI", Backend):
+            AccountService._verified_chat_info("fixture-only", deadline=10, local_wait=callback)
+        self.assertIs(seen[0]["_account_request_local_wait"], callback)
+        self.assertEqual(seen[0]["_account_request_deadline_monotonic"], 10)
 
     def test_limits_observation_is_stamped_after_pacing_at_actual_send(self):
         backend = object.__new__(OpenAIBackendAPI)

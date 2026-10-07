@@ -1122,14 +1122,17 @@ class TextTaskTests(unittest.TestCase):
                 recovery_reader=reader,
             )
             result = first
-            for _ in range(19):
+            # The second page predates dispatch minus clock skew. It proves
+            # coverage but its obsolete conversations must not be read. Finish
+            # this scan once, rather than starting another complete scan.
+            for _ in range(9):
                 recovery_clock.advance(TextTaskService.RECOVERY_BASE_BACKOFF_SECONDS + 1)
                 result = restarted.recover("owner", "attempt-1", True)
 
         self.assertEqual(backend.list_calls, 2)
         self.assertEqual(
             [conversation_id for conversation_id, _timeout in backend.detail_calls],
-            [f"conversation-{index}" for index in range(40)],
+            [f"conversation-{index}" for index in range(20)],
         )
         self.assertEqual(result["status"], "unknown")
         self.assertEqual(

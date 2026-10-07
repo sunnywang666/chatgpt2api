@@ -1762,7 +1762,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         backend._list_recent_conversations.assert_called_once_with(
             limit=20, offset=0, timeout_secs=10.0, strict_schema=True,
         )
-        self.assertEqual(backend._get_conversation.call_count, 20)
+        backend._get_conversation.assert_not_called()
         self.assertEqual(
             ConversationBindingService._conversation_update_time(
                 {"update_time": "2026-09-17T13:30:26.273935Z"}
@@ -2096,6 +2096,88 @@ class TextResultRecoveryTests(unittest.TestCase):
             self.assertAlmostEqual(clock.next_conversation_read, before, delta=0.001)
             self.assertEqual(clock.conversation_read_rate_failures, 6)
 
+    def test_direct_first_read_requires_network_budget_after_queueing(self):
+        import services.account_request_pacing as pacing
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        with tempfile.TemporaryDirectory() as directory:
+            now = [100.]
+            fake_time = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1700000000 + now[0],
+                                        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
+            with mock.patch.object(pacing, "time", fake_time), mock.patch.object(
+                pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+                                                  account_conversation_read_interval_secs=60)
+            ):
+                clock = pacing.AccountRequestClock("fixture", Path(directory) / "clock.json")
+                clock.next_conversation_read = 159.
+                clock._save()
+                raw = mock.Mock(return_value=SimpleNamespace(status_code=200, headers={},
+                    json=self.document, close=lambda: None))
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.base_url = "https://fixture.invalid"
+                backend._headers = lambda path, headers: headers
+                backend.session = SimpleNamespace(
+                    get=lambda url, **kw: clock.request(raw, "GET", url, **kw), close=lambda: None)
+                with (
+                    mock.patch("services.conversation_binding_service.time", fake_time),
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
+                    mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+                    mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+                ):
+                    with self.assertRaises(pacing.AccountReadRetryBudgetInsufficient):
+                        ConversationBindingService().read_text(self.cursor)
+                raw.assert_not_called()
+                self.assertEqual(clock.ordinary_read_queue, [])
+                self.assertFalse(clock.lock.locked())
+                self.assertEqual(clock.next_conversation_read, 159.)
+
+    def test_admin_cursor_route_reports_first_read_budget_deferral(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        from services.account_request_pacing import AccountReadRetryBudgetInsufficient
+
+        app = FastAPI()
+        app.include_router(create_router())
+        with mock.patch("api.ai.require_identity", return_value={"id": "admin", "role": "admin"}), \
+             mock.patch("api.ai.conversation_binding_service.read_text", side_effect=AccountReadRetryBudgetInsufficient()):
+            with TestClient(app) as client:
+                result = client.get("/api/conversation-bindings/text", params=self.cursor)
+        self.assertEqual(result.status_code, 503)
+        self.assertEqual(result.json()["detail"], {
+            "code": "CONVERSATION_READ_DEFERRED", "reason": "read_budget_insufficient",
+            "read_sent": False, "retryable": True,
+        })
+
+    def test_admin_cursor_route_preserves_upstream_recovery_classification(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+        from utils.helper import UpstreamHTTPError
+
+        app = FastAPI()
+        app.include_router(create_router())
+        for upstream_status, retry_after, expected_status, expected_code in (
+            (429, 45, 429, "CONVERSATION_READ_RATE_LIMITED"),
+            (429, None, 429, "CONVERSATION_READ_RATE_LIMITED"),
+            (401, None, 401, "CONVERSATION_READ_AUTH_REQUIRED"),
+            (403, None, 403, "CONVERSATION_READ_AUTH_REQUIRED"),
+            (502, 45, 503, "CONVERSATION_READ_UNAVAILABLE"),
+        ):
+            with self.subTest(upstream_status=upstream_status, retry_after=retry_after):
+                error = UpstreamHTTPError("read", upstream_status, "private upstream detail", retry_after)
+                with mock.patch("api.ai.require_identity", return_value={"id": "admin", "role": "admin"}), \
+                     mock.patch("api.ai.conversation_binding_service.read_text", side_effect=error) as read:
+                    with TestClient(app) as client:
+                        result = client.get("/api/conversation-bindings/text", params=self.cursor)
+                self.assertEqual(result.status_code, expected_status)
+                self.assertEqual(result.json()["detail"], {"code": expected_code})
+                self.assertEqual(result.headers.get("retry-after"),
+                                 str(retry_after) if upstream_status == 429 and retry_after is not None else None)
+                self.assertNotIn("private upstream detail", result.text)
+                read.assert_called_once_with(self.cursor)
+
     def test_admin_cursor_route_reads_the_same_bound_account(self):
         from fastapi import FastAPI, HTTPException
         from fastapi.testclient import TestClient
@@ -2121,7 +2203,7 @@ class TextResultRecoveryTests(unittest.TestCase):
                 identity.side_effect = HTTPException(status_code=401)
                 self.assertEqual(client.get("/api/conversation-bindings/text", params=self.cursor).status_code, 401)
         backend._get_conversation.assert_called_once_with("conversation-one", deadline_monotonic=mock.ANY,
-                                                         connect_timeout_secs=10.0)
+                                                         connect_timeout_secs=10.0, minimum_budget_secs=10.0)
 
     def test_direct_read_reconnects_once_with_same_cursor_and_deadline(self):
         from curl_cffi.requests.exceptions import SSLError
@@ -2141,7 +2223,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         self.assertEqual(backend._get_conversation.call_count, 2)
         first, second = backend._get_conversation.call_args_list
         self.assertEqual(first.args, second.args)
-        self.assertEqual(first.kwargs, {k: v for k, v in second.kwargs.items() if k != "minimum_budget_secs"})
+        self.assertEqual(first.kwargs, second.kwargs)
         self.assertEqual(second.kwargs["minimum_budget_secs"], 10.0)
         backend.stream_conversation.assert_not_called()
         backend.close.assert_called_once()
@@ -2322,6 +2404,67 @@ class ProductConversationArchiveTests(unittest.TestCase):
         result = backend.archive_conversation("chat-a", "original")
         self.assertTrue(result["archived"])
         self.assertEqual(backend.session.patch.call_args.kwargs["json"], {"is_archived": True})
+        self.assertEqual(backend._get_conversation.call_count, 2)
+
+    def test_archive_ack_observation_is_redacted_and_never_replaces_readback(self):
+        import json
+        from services.request_context import guarding_archive, safe_account_ref
+        cases = [
+            ({"success": True}, "json_object", False, False, False, False, True),
+            ({"conversation_id": "private-chat", "is_archived": True, "current_node": "private-cursor"},
+             "json_object", True, True, True, True, False),
+            ({"id": "private-chat", "archived": True, "is_archived": "true", "current_node": "different"},
+             "json_object", True, False, False, False, False),
+            ({"conversation_id": "private-chat", "id": "other", "is_archived": 1},
+             "json_object", False, False, False, False, False),
+            ({"is_archived": False, "success": 1}, "json_object", False, False, False, True, False),
+            (["private-body"], "non_object", False, False, False, False, False),
+            ("private-body", "non_object", False, False, False, False, False),
+            (ValueError("private-error"), "json_parse_failed", False, False, False, False, False),
+        ]
+        for ack, shape, identity_matches, state_matches, cursor_matches, state_is_bool, success_is_true in cases:
+            with self.subTest(shape=shape, ack_type=type(ack).__name__):
+                backend = self.backend([
+                    {"mapping": {"private-cursor": {}}, "current_node": "private-cursor", "is_archived": False},
+                    {"current_node": "private-cursor", "is_archived": True},
+                ])
+                if isinstance(ack, Exception):
+                    backend.session.patch.return_value.json.side_effect = ack
+                else:
+                    if isinstance(ack, dict):
+                        ack = {**ack, "private-unknown-field": "private-token"}
+                    backend.session.patch.return_value.json.return_value = ack
+                with mock.patch("services.openai_backend_api.logger.info") as log, guarding_archive(
+                    lambda: None, request_key="private-request", work_key="private-work"
+                ):
+                    self.assertTrue(backend.archive_conversation("private-chat", "private-cursor")["archived"])
+                self.assertEqual(backend._get_conversation.call_count, 2)
+                backend.session.patch.assert_called_once()
+                log.assert_called_once()
+                event = log.call_args.args[0]
+                self.assertEqual(set(event), {"event", "request_ref", "work_ref", "shape", "success_is_true",
+                    "identity_present", "identity_matches", "state_present", "state_is_bool", "state_matches",
+                    "cursor_present", "cursor_matches"})
+                self.assertEqual(event["shape"], shape)
+                self.assertEqual(event["identity_matches"], identity_matches)
+                self.assertEqual(event["state_matches"], state_matches)
+                self.assertEqual(event["cursor_matches"], cursor_matches)
+                self.assertEqual(event["state_is_bool"], state_is_bool)
+                self.assertEqual(event["success_is_true"], success_is_true)
+                self.assertEqual(event["request_ref"], safe_account_ref("private-request"))
+                self.assertEqual(event["work_ref"], safe_account_ref("private-work"))
+                self.assertNotIn("private", json.dumps(event))
+
+    def test_positive_archive_ack_still_rejects_readback_cursor_drift(self):
+        backend = self.backend([
+            {"mapping": {"original": {}}, "current_node": "original", "is_archived": False},
+            {"current_node": "newer", "is_archived": True},
+        ])
+        backend.session.patch.return_value.json.return_value = {
+            "id": "chat-a", "current_node": "original", "is_archived": True, "success": True,
+        }
+        with self.assertRaisesRegex(RuntimeError, "cursor changed"):
+            backend.archive_conversation("chat-a", "original")
         self.assertEqual(backend._get_conversation.call_count, 2)
 
     def test_recovery_reads_already_archived_chat_without_repeating_patch(self):

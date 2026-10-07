@@ -57,8 +57,159 @@ def test_completion_persists_original_archive_intent_and_releases_only_its_work(
     assert not service.process_one()
 
 
+def test_ensure_work_filters_payloads_but_preserves_cross_owner_conversation_conflict(runtime, monkeypatch):
+    _, store, _, _, _, _ = runtime
+    marker = "unrelated-image-bytes"
+    original = {"request_id": "first", "conversation_id": "original", "provider_account_identity": "account",
+                "provider_binding_id": "binding", "_public_session_ref": "session"}
+    with store.transaction() as db:
+        ensure_work(store, db, "text", "one", "first", original)
+        store.write_receipt(db, "text", "one", "first", original)
+        store.write_receipt(db, "image", "other", "history", {
+            "id": "history", "owner_id": "other", "conversation_id": "different", "data": [{"b64_json": marker * 10000}]})
+    loads = json.loads
+    def narrow_load(raw, *args, **kwargs):
+        assert marker not in raw
+        return loads(raw, *args, **kwargs)
+    monkeypatch.setattr("services.task_store.json.loads", narrow_load)
+    with store.transaction() as db:
+        successor = {**original, "request_id": "next"}
+        ensure_work(store, db, "text", "one", "next", successor)
+        assert successor["_work_key"] == original["_work_key"]
+        with pytest.raises(WorkLifecycleError, match="WORK_OWNER_CONFLICT"):
+            ensure_work(store, db, "text", "other", "foreign", {**original, "request_id": "foreign"})
+
+
+def test_work_reads_do_not_decode_unrelated_saved_images(runtime, monkeypatch):
+    service, store, _, calls, _, add = runtime
+    first = add("A-1")
+    marker = "unrelated-image-payload-must-remain-on-disk"
+    unrelated = {"id": "unrelated", "owner_id": "one", "status": "success",
+                 "_work_key": "work:unrelated", "conversation_id": "another-conversation",
+                 "data": [{"b64_json": marker * 10000}]}
+    with store.transaction() as db:
+        store.write_receipt(db, "image", "one", "unrelated", unrelated)
+    loads = json.loads
+    def selected_decode(raw, *args, **kwargs):
+        assert marker not in raw
+        return loads(raw, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr("services.task_store.json.loads", selected_decode)
+        assert service.get("text", {"id": "one"}, "A-1")["state"] == "active"
+        service.update("text", {"id": "one"}, "A-1", "completed", True)
+        assert service.process_one()
+        assert service.get("text", {"id": "one"}, "A-1")["archive"]["status"] == "confirmed"
+    assert calls == [("one", "A-1", True)]
+    with store.connect() as db:
+        assert store.read_receipt(db, "image", "one", "unrelated") == unrelated
+        assert store.read_receipt(db, "text", "one", "A-1") == first
+
+
+def test_existing_work_read_uses_committed_snapshot_while_writer_is_active(runtime, monkeypatch):
+    service, store, _, _, _, add = runtime
+    receipt = add("A-1")
+    before = service.get("text", {"id": "one"}, "A-1")
+    with store.connect() as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        work = store.runtime(writer, receipt["_work_key"])
+        work.update(state="completed", slot_held=False, version=work["version"] + 1)
+        store.set_runtime(writer, receipt["_work_key"], work)
+        with monkeypatch.context() as patch:
+            def no_writer():
+                raise AssertionError("work GET attempted a write transaction")
+            patch.setattr(store, "transaction", no_writer)
+            assert service.get("text", {"id": "one"}, "A-1") == before
+        writer.rollback()
+    assert service.get("text", {"id": "one"}, "A-1") == before
+
+
+def test_legacy_work_read_still_adopts_under_write_transaction(runtime):
+    service, store, _, _, _, add = runtime
+    receipt = add("A-1")
+    with store.transaction() as db:
+        db.execute("DELETE FROM task_runtime WHERE name=?", (receipt.pop("_work_key"),))
+        store.write_receipt(db, "text", "one", "A-1", receipt)
+    result = service.get("text", {"id": "one"}, "A-1")
+    assert result["state"] == "active"
+    with store.connect() as db:
+        adopted = store.read_receipt(db, "text", "one", "A-1")
+        assert adopted["_work_key"]
+        assert read_work(store, db, "text", "one", adopted)["work_ref"] == result["work_ref"]
+
+
+@pytest.mark.parametrize("legacy_key", ["missing", None, "", False, [], {}])
+def test_filtered_work_members_keep_legacy_unknown_and_original_reference(runtime, legacy_key):
+    service, store, _, calls, _, add = runtime
+    first = add("A-1")
+    legacy = {**first, "request_id": "legacy", "status": "unknown", "_sequence": 0,
+              "_work_key": legacy_key, "upstream_outcome": "unknown"}
+    if legacy_key == "missing":
+        legacy.pop("_work_key")
+    with store.transaction() as db:
+        db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("one", "legacy", "legacy", json.dumps(legacy)))
+    with pytest.raises(WorkLifecycleError, match="WORK_TURN_UNFINISHED"):
+        service.update("text", {"id": "one"}, "A-1", "completed", True)
+    assert calls == []
+    with store.transaction() as db:
+        legacy["_public_session_ref"] = "different-work"
+        store.write_receipt(db, "text", "one", "legacy", legacy)
+    assert service.update("text", {"id": "one"}, "A-1", "completed", True)["state"] == "completed"
+
+
+@pytest.mark.parametrize("same_account", [True, False])
+def test_filtered_work_members_keep_cross_owner_physical_unknown(runtime, same_account):
+    service, store, _, calls, _, add = runtime
+    first = add("A-1")
+    with store.transaction() as db:
+        first.update(provider_account_identity="account-A", provider_binding_id="binding-A",
+                     conversation_id="native-conversation")
+        store.write_receipt(db, "text", "one", "A-1", first)
+        store.write_receipt(db, "image", "other-owner", "legacy-image", {
+            "id": "legacy-image", "owner_id": "other-owner", "status": "error",
+            "upstream_unfinished": True, "_work_key": "different-work",
+            "provider_account_identity": "account-A" if same_account else "account-B",
+            "provider_binding_id": "binding-other", "conversation_id": "native-conversation"})
+    if same_account:
+        with pytest.raises(WorkLifecycleError, match="WORK_TURN_UNFINISHED"):
+            service.update("text", {"id": "one"}, "A-1", "completed", True)
+    else:
+        assert service.update("text", {"id": "one"}, "A-1", "completed", True)["state"] == "completed"
+    assert calls == []
+
+
+def test_filtered_image_members_use_receipt_owner_and_keep_legacy_unknown(runtime):
+    service, store, _, calls, _, add = runtime
+    owner = "one:alias"
+    first = add("A-1", owner=owner)
+    with store.transaction() as db:
+        db.execute("DELETE FROM requests WHERE owner=? AND id=?", (owner, "A-1"))
+        first.update(id="A-1", owner_id=owner, status="success", _image_thread={"id": "A"})
+        work = store.runtime(db, first["_work_key"])
+        work["kind"] = "image"
+        store.set_runtime(db, work["key"], work)
+        store.write_receipt(db, "image", owner, "A-1", first)
+        legacy = {"id": "legacy", "owner_id": owner, "status": "error",
+                  "_image_thread": {"id": "A"}, "upstream_unfinished": True}
+        store.write_receipt(db, "image", owner, "legacy", legacy)
+    with pytest.raises(WorkLifecycleError, match="WORK_TURN_UNFINISHED"):
+        service.update("image", {"id": owner}, "A-1", "completed", True)
+    assert calls == []
+
+
+def test_filtered_members_keep_newer_child_with_changed_reference(runtime):
+    service, store, _, calls, _, add = runtime
+    first = add("A-1")
+    child = {**first, "request_id": "child", "_public_session_ref": "changed-reference",
+             "_sequence": 2, "status": "queued", "upstream_outcome": "not_sent"}
+    with store.transaction() as db:
+        db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("one", "child", "child", json.dumps(child)))
+    with pytest.raises(WorkLifecycleError, match="WORK_SUPERSEDED"):
+        service.get("text", {"id": "one"}, "A-1")
+    assert calls == []
+
+
 @pytest.mark.parametrize("background", [False, True])
-def test_waiting_archive_does_not_block_another_account_or_overlap_same_account(runtime, background):
+def test_waiting_archive_allows_independent_same_and_other_account_conversations(runtime, background):
     service, store, _, _, _, add = runtime
     keys = {}
     for rid, account in (("A-1", "account-a"), ("A2-2", "account-a"), ("B-3", "account-b")):
@@ -87,16 +238,16 @@ def test_waiting_archive_does_not_block_another_account_or_overlap_same_account(
     first.start()
     try:
         assert entered.wait(1)
-        assert not service.process_one(target_key=keys["A2-2"])
+        assert service.process_one(target_key=keys["A2-2"])
         assert service.process_one(target_key=keys["B-3"])
-        assert calls == ["A-1", "B-3"]
+        assert calls == ["A-1", "A2-2", "B-3"]
         assert service.get("text", {"id": "one"}, "B-3")["archive"]["status"] == "confirmed"
     finally:
         release.set()
         first.join(3)
         assert finished.wait(2)
     assert not first.is_alive()
-    assert service.process_one(target_key=keys["A2-2"])
+    assert not service.process_one(target_key=keys["A2-2"])
 
 
 def test_background_archive_does_not_occupy_original_result_recovery(runtime):
@@ -189,6 +340,142 @@ def test_archive_workers_are_bounded_and_release_capacity(runtime):
     assert service.get("text", {"id": "one"}, "work4-4")["archive"]["status"] == "confirmed"
 
 
+@pytest.mark.parametrize("desired", [True, False])
+@pytest.mark.parametrize("cursor_changed", [False, True])
+def test_background_readback_yields_worker_and_restart_confirms_original_without_repatch(
+        runtime, monkeypatch, desired, cursor_changed):
+    from services.account_request_pacing import AccountRequestClock
+    from services.config import config
+    from services.openai_backend_api import OpenAIBackendAPI
+    service, store, now, _, _, add = runtime
+    receipt = add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    if not desired:
+        assert service.process_one()
+        service.update("text", {"id": "one"}, "A-1", "active")
+    monkeypatch.setattr("services.account_request_pacing.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("services.account_request_pacing.time.time", lambda: now[0])
+    monkeypatch.setattr("services.account_request_pacing.time.sleep", lambda _: pytest.fail("archive worker slept for read credit"))
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 60))
+    monkeypatch.setattr(type(config), "account_conversation_read_burst", property(lambda _: 1))
+    clock = AccountRequestClock()
+    calls, archived, parent = [], [not desired], ["parent"]
+    def send(method, url, **kwargs):
+        calls.append(method)
+        if method == "PATCH":
+            archived[0] = kwargs["json"]["is_archived"]
+        return SimpleNamespace(status_code=200, headers={}, json=lambda: {
+            "current_node": parent[0], "mapping": {parent[0]: {}}, "is_archived": archived[0]})
+    backend = object.__new__(OpenAIBackendAPI)
+    backend.base_url, backend._headers = "https://fixture.test", lambda *args: {}
+    backend._get_conversation = lambda cid: clock.request(send, "GET", backend.base_url + "/conversation/" + cid, timeout=60).json()
+    backend.session = SimpleNamespace(patch=lambda url, **kw: clock.request(send, "PATCH", url, **kw))
+    def archive(owner, rid, value):
+        return {**backend.set_conversation_archived("original", "parent", value),
+                "request_id": rid, "conversation": {"client_conversation_id": "A"}}
+    service.text.set_public_session_archived = archive
+    finished = threading.Event()
+    service.text.admission = SimpleNamespace(wake=finished.set)
+    assert service.process_one(background=True)
+    assert finished.wait(2)
+    pending = service.get("text", {"id": "one"}, "A-1")
+    assert calls == ["GET", "PATCH"]
+    assert pending["archive"]["status"] == "pending"
+    assert pending["archive"]["next_at"] == 1060
+    assert pending["archive"]["attempts"] == 0
+    assert pending["archive"]["error_code"] is None
+    # Every worker was released, although the original confirmation is pending.
+    assert all(service._operation_slots.acquire(blocking=False) for _ in range(4))
+    for _ in range(4):
+        service._operation_slots.release()
+    assert not service.process_one()
+    now[0] = 1060
+    if cursor_changed:
+        parent[0] = "newer-message"
+    restarted = WorkLifecycleService(service.text, service.images, clock=lambda: now[0])
+    finished.clear()
+    assert restarted.process_one(background=True)
+    assert finished.wait(2)
+    result = restarted.get("text", {"id": "one"}, "A-1")
+    assert calls == ["GET", "PATCH", "GET"]
+    assert result["archive"]["status"] == ("unknown" if cursor_changed else "confirmed")
+    assert result["archive"]["attempts"] == 1
+    assert clock.ordinary_read_queue == []
+    with store.connect() as db:
+        assert store.read_receipt(db, "text", "one", "A-1") == receipt
+
+
+def test_fifo_waiting_archives_do_not_claim_workers_or_block_another_account(runtime, monkeypatch):
+    from services import account_request_pacing as pacing
+    service, store, now, calls, _, add = runtime
+    rows = [add("A-1"), add("A2-2"), add("B-3")]
+    with store.transaction() as db:
+        for i, row in enumerate(rows):
+            row["provider_account_identity"] = "a" if i < 2 else "b"
+            store.write_receipt(db, "text", "one", row["request_id"], row)
+    for row in rows:
+        service.update("text", {"id": "one"}, row["request_id"], "completed", True)
+        now[0] += 1
+    service.text.admission = SimpleNamespace(accounts=SimpleNamespace(
+        admission_accounts=lambda: [{"provider_account_identity": key} for key in ("a", "b")]), wake=lambda: None)
+    monkeypatch.setattr(pacing, "account_pacing_snapshot", lambda *args, **kwargs: {"next_at": now[0], "cooldown_until": 0})
+    monkeypatch.setattr(pacing, "reserve_account_archive_read", lambda account, owner: account["provider_account_identity"] == "b")
+    monkeypatch.setattr(pacing, "release_account_archive_read", lambda *args: None)
+    finished = threading.Event()
+    service.text.admission.wake = finished.set
+    assert service.process_one(background=True)
+    assert finished.wait(2)
+    assert calls == [("one", "B-3", True)]
+    for row in rows[:2]:
+        result = service.get("text", {"id": "one"}, row["request_id"])
+        assert result["archive"]["status"] == "pending" and result["archive"]["attempts"] == 0
+
+
+@pytest.mark.parametrize("failure", ["revalidate", "blocked", "auth"])
+def test_archive_predispatch_failure_releases_fifo_owner_outside_transaction(runtime, monkeypatch, failure):
+    from services import account_request_pacing as pacing
+    from services.work_lifecycle import _archive_read_owner
+    service, store, now, calls, _, add = runtime
+    row = add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    with store.transaction() as db:
+        row["provider_account_identity"] = "test-account"
+        if failure == "blocked":
+            row["status"] = "unknown"
+        store.write_receipt(db, "text", "one", "A-1", row)
+        owner = _archive_read_owner(store.runtime(db, row["_work_key"]))
+    account = {"provider_account_identity": "test-account"}
+    if failure == "auth":
+        account.update(status="异常", last_token_refresh_error="refresh_token_invalidated")
+    service.text.admission = SimpleNamespace(accounts=SimpleNamespace(admission_accounts=lambda: [account]))
+    monkeypatch.setattr(pacing, "account_pacing_snapshot", lambda *args, **kwargs: {"next_at": now[0], "cooldown_until": 0})
+    held = {owner}  # A reservation from the preceding scan.
+    monkeypatch.setattr(pacing, "reserve_account_archive_read", lambda *args: True)
+    def release(account, value):
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.rollback()
+        held.discard(value)
+    monkeypatch.setattr(pacing, "release_account_archive_read", release)
+    if failure == "revalidate":
+        load, count = service._load, [0]
+        def reload(*args):
+            count[0] += 1
+            if count[0] == 2:
+                raise RuntimeError("storage unavailable during revalidation")
+            return load(*args)
+        monkeypatch.setattr(service, "_load", reload)
+        with pytest.raises(RuntimeError, match="storage unavailable"):
+            service.process_one(background=True)
+    else:
+        assert not service.process_one(background=True)
+    assert held == set() and calls == []
+    assert all(service._operation_slots.acquire(blocking=False) for _ in range(4))
+    for _ in range(4):
+        service._operation_slots.release()
+
+
 def test_archive_timestamps_follow_confirmation_not_patch_or_failed_attempt(runtime):
     service, _, now, _, fail, add = runtime
     add("A-1")
@@ -262,7 +549,7 @@ def test_archive_http_steps_are_attributed_without_changing_read_pacing(runtime,
     assert service.get("text", {"id": "one"}, "A-1")["archive"]["confirmed_at"] >= reads[-1]
 
 
-def test_read_deferral_books_oldest_archive_outside_receipt_transaction(runtime, monkeypatch):
+def test_read_deferral_books_archives_in_order_outside_receipt_transaction(runtime, monkeypatch):
     from services import account_request_pacing as pacing
     service, store, now, calls, _, add = runtime
     first = add("Z-1")
@@ -289,8 +576,8 @@ def test_read_deferral_books_oldest_archive_outside_receipt_transaction(runtime,
     assert not service.process_one()
     from services.work_lifecycle import _archive_read_owner
     with store.connect() as db:
-        expected = _archive_read_owner(store.runtime(db, first["_work_key"]))
-    assert booked == [expected]
+        expected = [_archive_read_owner(store.runtime(db, row["_work_key"])) for row in (first, second)]
+    assert booked == expected
     assert calls == []
     assert service.get("text", {"id": "one"}, "Z-1")["archive"]["attempts"] == 0
 

@@ -61,6 +61,24 @@ def read_only_original_selected(state, request_id):
     )
 
 
+def _original_read_exhausted(root, state, now, investigation_seconds):
+    # Keep the existing qualified no-result threshold and investigation window
+    # across asynchronous handoffs. Failed transport/429 is not a qualified
+    # observation. Known assets remain a retrieval obligation, never a redraw.
+    from services.image_task_service import UNRECOVERABLE_QUALIFIED_READS
+    started = state.get("original_read_requested_at")
+    reads = int(root.get("recovery_no_result_reads") or 0)
+    baseline = int(state.get("original_read_no_result_baseline") or 0)
+    return bool(
+        started is not None
+        and (now >= float(started) + investigation_seconds
+             or reads >= UNRECOVERABLE_QUALIFIED_READS and reads > baseline)
+        and root.get("recovery_phase") != "download_image_result"
+        and not any(root.get(k) for k in (
+            "data", "result_file_ids", "result_sediment_ids", "_pending_image_result_ids", "_pending_image_output"))
+    )
+
+
 def successful(kind, receipt):
     return bool(receipt and receipt.get("status") == ("succeeded" if kind == "text" else "success")
                 and (receipt.get("content") if kind == "text" else receipt.get("data")))
@@ -148,14 +166,19 @@ def retry_cursor(document, receipt, *, kind="text", now=None, predecessor=None):
         pending.extend(descendants)
     if head not in seen or children.get(head):
         return None
-    return {"conversation_id": conversation, "request_message_id": message,
-            "retry_parent_message_id": head, "observed_at": time.time() if now is None else now}
+    proof = {"conversation_id": conversation, "request_message_id": message,
+             "retry_parent_message_id": head, "observed_at": time.time() if now is None else now}
+    if kind == "image":
+        from services.image_task_service import _authoritative_image_failure
+        if _authoritative_image_failure(document, message):
+            proof["source"] = "terminal_image_failure"
+    return proof
 
 
 def retry_evidence(receipt):
     proof = receipt.get("_retry_cursor")
     fields = {"conversation_id", "request_message_id", "retry_parent_message_id", "observed_at"}
-    if isinstance(proof, dict) and proof.get("source") == "absent_image_thread_request":
+    if isinstance(proof, dict) and proof.get("source") in {"absent_image_thread_request", "terminal_image_failure"}:
         fields.add("source")
     if (not isinstance(proof, dict) or set(proof) != fields
             or any(not isinstance(proof.get(k), str) or not 1 <= len(proof[k]) <= 200 for k in (
@@ -167,6 +190,17 @@ def retry_evidence(receipt):
             or any(not receipt.get(k) for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))):
         return None
     return proof
+
+
+def verified_image_failure(receipt, now, maximum_age):
+    """A fresh strict no-image terminal read, not an error-string guess."""
+    proof = retry_evidence(receipt)
+    return bool(proof and proof.get("source") == "terminal_image_failure"
+                and 0 <= now - proof["observed_at"] <= maximum_age
+                and receipt.get("status") == "error" and receipt.get("error_code") == "NO_IMAGE_GENERATED"
+                and receipt.get("upstream_unfinished") is False
+                and not any(receipt.get(k) for k in ("data", "result_file_ids", "result_sediment_ids",
+                    "_pending_image_result_ids", "_pending_image_output", "_recovery_paused", "_recovery_suppressed")))
 
 
 def same_session_retry(root, child):
@@ -224,6 +258,10 @@ def replacement_send_allowed(store, db, kind, owner, request_id, receipt):
         return True
     root = store.read_receipt(db, kind, owner, root_id)
     state = (root or {}).get("_completion") or {}
+    if kind == "image" and str((root or {}).get("error_code") or "").lower() == "content_policy_violation":
+        # A late refusal can arrive after a replacement was prepared. A saved
+        # cursor proves a location, not permission to repeat the refused input.
+        return False
     if receipt.get("_same_session_retry_of") and not same_session_retry(root, receipt):
         return False
     if kind == "image" and root and (root.get("result_file_ids") or root.get("result_sediment_ids")
@@ -323,6 +361,11 @@ class GenerationCompletionService:
                 # An explicit recover may gather fresh evidence after a repair.
                 # Keep the ended marker/history; no automatic restart on upgrade.
                 state.update(state="checking_original", next_at=now)
+                # This existing explicit edit-recheck action opens a bounded
+                # investigation. Background ticks/restarts never renew it, and
+                # original-only policies cannot enter this authorized branch.
+                state.pop("original_read_requested_at", None)
+                state.pop("original_read_no_result_baseline", None)
                 self.store.write_receipt(db, kind, owner, request_id, root)
             if original_only:
                 # The company ingress can recover the original receipt or a
@@ -401,13 +444,15 @@ class GenerationCompletionService:
             raise CompletionError("COMPLETION_ORIGINAL_INPUT_UNAVAILABLE") from None
 
     def _prepare(self, db, kind, owner, request_id, root, replacement_id):
+        if kind == "image" and str(root.get("error_code") or "").lower() == "content_policy_violation":
+            raise CompletionError("COMPLETION_ORIGINAL_NOT_RETRYABLE")
         body = copy.deepcopy(self._load_verified_input(db, kind, owner, request_id, root))
         if kind == "text":
             if self.text._verified_retryable_empty(root):
                 # Reuse the proven session/physical binding through the existing
                 # continuation validator. Do not reconstruct its prior context
                 # or allocate a second conversation work slot.
-                payload = {k: body[k] for k in ("model", "reasoning_effort", "messages", "_requested_account_ref", "_scheduling") if k in body}
+                payload = {k: body[k] for k in ("model", "thinking_effort", "messages", "_requested_account_ref", "_scheduling") if k in body}
                 for key in ("_requested_account_ref", "_scheduling"):
                     if root.get(key) is not None:
                         payload[key] = copy.deepcopy(root[key])
@@ -420,7 +465,7 @@ class GenerationCompletionService:
             proof = retry_evidence(root)
             if not proof or not root.get("_public_session_ref"):
                 raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
-            payload = {k: body[k] for k in ("model", "reasoning_effort", "messages", "_requested_account_ref", "_scheduling") if k in body}
+            payload = {k: body[k] for k in ("model", "thinking_effort", "messages", "_requested_account_ref", "_scheduling") if k in body}
             payload.update(client_request_id=replacement_id,
                            client_conversation_id=root["client_conversation_id"],
                            _public_session_ref=root["_public_session_ref"], _public_route="chat",
@@ -505,7 +550,7 @@ class GenerationCompletionService:
         work_key = receipt.get("_work_key")
         if not work_key:
             return
-        members = [r for _, _, _, r in self.store.receipts(db) if r.get("_work_key") == work_key]
+        members = [r for _, _, _, r in self.store.receipts(db, work_key=work_key) if r.get("_work_key") == work_key]
         if any(r.get("_executing") or r.get("recovery_claim_id")
                or not r.get("_attempt_finished_at") and (unresolved(r) or r.get("status") in {"queued", "running"}) for r in members):
             return
@@ -514,7 +559,7 @@ class GenerationCompletionService:
             work["slot_held"] = False
             self.store.set_runtime(db, work_key, work)
 
-    def advance(self, kind, owner, request_id):
+    def advance(self, kind, owner, request_id, *, wait_for_image_recovery=False):
         now = float(self.clock())
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id)
@@ -531,15 +576,29 @@ class GenerationCompletionService:
                 return
             if state.get("state") == "needs_attention" and state.get("next_at") is None:
                 return
+            read_image_original = bool(
+                kind == "image" and root.get("status") == "error" and unresolved(root)
+                and not root.get("_executing") and not root.get("recovery_claim_id")
+                and (root.get("conversation_id") or self.images.can_locate_original_cursor(root))
+                and now >= float(root.get("next_poll_at") or 0)
+                and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS
+                and not _original_read_exhausted(root, state, now, self.INVESTIGATION_SECONDS)
+            )
+            if read_image_original:
+                # Persist before dispatch so restart/repeated API calls cannot
+                # reopen a read whose worker has not yet returned. This marks
+                # a local request, not proof that upstream received the GET.
+                state.setdefault("original_read_requested_at", now)
+                state.setdefault("original_read_no_result_baseline", int(root.get("recovery_no_result_reads") or 0))
             state["next_at"] = now + self.RECHECK_SECONDS
             self.store.write_receipt(db, kind, owner, request_id, root)
         # Existing exact-original readers preserve Retry-After/backoff and errors.
         if kind == "text":
             self.text.read(owner, request_id)
-        elif (root.get("status") == "error" and unresolved(root)
-              and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS):
+        elif read_image_original:
             self.images.resume_poll({"id": owner}, request_id, extra_timeout_secs=5,
-                                    allow_unrecoverable_retry=True, completion_recheck=True)
+                                    allow_unrecoverable_retry=True, completion_recheck=True,
+                                    **({"wait_for_completion": True} if wait_for_image_recovery else {}))
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id)
             state = root["_completion"]
@@ -554,6 +613,16 @@ class GenerationCompletionService:
                     work = self.store.runtime(db, root.get("_work_key")) if root.get("_work_key") else None
                     if work and work.get("state") != "active":
                         raise CompletionError("COMPLETION_WORK_NOT_ACTIVE")
+                    ended = (self.text._verified_retryable_empty(root) if kind == "text"
+                             else verified_image_failure(root, now, self.INVESTIGATION_SECONDS))
+                    if kind == "image" and _original_read_exhausted(root, state, now, self.INVESTIGATION_SECONDS):
+                        if state.get("max_extra_requests") == 0:
+                            raise CompletionError("COMPLETION_ORIGINAL_ONLY")
+                        # An unqualified read must reach the existing failure
+                        # exit instead of rearming another async handoff. Fresh
+                        # original evidence still permits the normal retry path.
+                        if not ended and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS:
+                            raise CompletionError("COMPLETION_ORIGINAL_READ_UNAVAILABLE")
                     not_sent = (root.get("upstream_outcome") in {"not_sent", "not_submitted"}
                                 and root.get("_submission_started") is not True
                                 and root.get("upstream_submission_started") is not True)
@@ -570,7 +639,21 @@ class GenerationCompletionService:
                         self.store.write_receipt(db, kind, owner, request_id, root)
                         self.text.admission.wake()
                         return
-                    ended = kind == "text" and self.text._verified_retryable_empty(root)
+                    if kind == "image" and unresolved(root) and not root.get("conversation_id"):
+                        if root.get("recovery_error_code") == "RECOVERY_AUTH_REQUIRED":
+                            raise CompletionError("COMPLETION_ORIGINAL_READ_UNAVAILABLE")
+                        if self.images.can_locate_original_cursor(root):
+                            # The bounded scan may need several windows. A
+                            # missing final cursor during its own cooldown is
+                            # not permission to stop scanning or generate again.
+                            state.update(state="checking_original", reason="COMPLETION_INVESTIGATING_ORIGINAL",
+                                         next_at=max(now + self.RECHECK_SECONDS, float(root.get("next_poll_at") or 0)))
+                            self.store.write_receipt(db, kind, owner, request_id, root)
+                            return
+                        # A send can disconnect before its first cursor arrives.
+                        # resume_poll cannot query that original without a cursor;
+                        # repeating its local ValueError is not an investigation.
+                        raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNAVAILABLE")
                     retry_authorized = state["allow_unconfirmed_retry"] or state.get("automatic_failure_retry")
                     if kind == "text" and root.get("conversation_id") and not ended and not retry_authorized:
                         raise CompletionError("COMPLETION_ORIGINAL_END_UNCONFIRMED")
@@ -608,7 +691,10 @@ class GenerationCompletionService:
                         state["next_at"] = now + self.RECHECK_SECONDS if paused else None
                         # End automatic investigation, not the upstream fact.
                         definitely_unsent = root.get("upstream_outcome") in {"not_sent", "not_submitted"} and root.get("_submission_started") is not True
-                        if not active and (definitely_unsent or (state.get("allow_unconfirmed_retry") or state.get("automatic_failure_retry")) and unresolved(root)) and exc.code not in {
+                        original_reads_ended = (kind == "image" and exc.code in {
+                                                "COMPLETION_ORIGINAL_ONLY", "COMPLETION_ORIGINAL_READ_UNAVAILABLE"}
+                                                and _original_read_exhausted(root, state, now, self.INVESTIGATION_SECONDS))
+                        if not active and (definitely_unsent or original_reads_ended or (state.get("allow_unconfirmed_retry") or state.get("automatic_failure_retry")) and unresolved(root)) and exc.code not in {
                                 "COMPLETION_WORK_NOT_ACTIVE", "COMPLETION_ORIGINAL_RECOVERY_PAUSED",
                                 "COMPLETION_DOWNLOAD_ORIGINAL_RESULT"}:
                             root.update(_attempt_finished_at=now, _attempt_reason=exc.code, _turn_reserved=False)
@@ -656,9 +742,19 @@ class GenerationCompletionService:
     def process_one(self, *, dispatch=None):
         # Only newly accepted pure-generation requests opt into the automatic
         # policy. Upgrading never silently replays historical UNKNOWN receipts.
-        with self.store.transaction() as db:
-            for kind, owner, rid, row in self.store.receipts(
-                    db, statuses=("unknown", "failed", "error"), include_pending_completion=True):
+        # Historical failures need no writer lock (or full Python payload
+        # decode). Discover only opted-in/pending work under a read snapshot,
+        # then recheck each identity in its own short transaction. Admission
+        # and result persistence can proceed between independent completions.
+        with self.store.connect() as db:
+            identities = [(kind, owner, rid) for kind, owner, rid, row in self.store.receipts(
+                db, statuses=(), include_pending_completion=True, include_automatic_completion=True)
+                if not row.get("_recovery_paused") and not row.get("_recovery_suppressed")]
+        for kind, owner, rid in identities:
+            with self.store.transaction() as db:
+                row = self.store.read_receipt(db, kind, owner, rid)
+                if row is None:
+                    continue
                 if (row.get("_automatic_generation_recovery") and not row.get("_completion")
                         and not row.get("_completion_of") and row.get("status") in {"unknown", "failed", "error"}
                         and not row.get("_recovery_paused") and not row.get("_recovery_suppressed")):
@@ -689,7 +785,8 @@ class GenerationCompletionService:
                 self.advance(*candidates[0][:3])
             else:
                 for kind, owner, rid, row in candidates:
-                    dispatch(kind, owner, rid, lambda o, r, k=kind: self.advance(k, o, r), row)
+                    dispatch(kind, owner, rid, lambda o, r, k=kind: self.advance(
+                        k, o, r, wait_for_image_recovery=True), row)
 
     def read(self, kind, identity, request_id):
         owner = str(identity["id"])

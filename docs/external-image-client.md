@@ -74,6 +74,41 @@ The server must expose these authenticated routes under `SERVER_ROOT`:
 | Read original receipts by caller ID | `GET /api/image-tasks?ids={client_task_id}` |
 | Continue polling an eligible original receipt | `POST /api/image-tasks/{client_task_id}/resume-poll` |
 | Download one receipt-owned result | `GET /api/image-tasks/{client_task_id}/images/{index}` |
+
+### Trusted continuation after a refused image and later manual turns
+
+The existing admin/Content identity can read
+`GET /api/image-tasks/{client_task_id}/continuation-cursor` with four required
+query parameters: `provider_binding_id`, `provider_account_identity`,
+`client_conversation_id`, and `conversation_id`. All must match that identity's
+original durable image receipt. Other owners, ordinary program Keys, and company
+ingress do not gain access to this internal cursor API.
+
+This is a read-only context proof for an original terminal
+`content_policy_violation` with a freshly verified third-party-similarity refusal
+and no output assets. The current branch must contain that exact original user
+message, have a complete unambiguous parent chain, and end in a completed
+assistant final. Later manual turns may supply context, including images, but
+are never adopted as the original task's output. Local in-flight work or active
+upstream tasks prevent a proof. Unknown, archived, generic-policy and incomplete
+branches remain unavailable; this call does not recover, generate, restore or
+archive anything, or update the original receipt.
+
+Success returns `source_task_id`, `source_request_message_id`, the four query
+anchors, `original_terminal_message_id`, `parent_message_id` (the current completed
+tail), `failure_reason: "third_party_similarity"`, and numeric `observed_at`
+(Unix UTC seconds, e.g. `1791396000.125`). No conversation content is returned.
+The ordinary image-task GET does not expose `request_message_id`; do not confuse
+its `image_session_parent_id` with this proof's `source_request_message_id`.
+
+A separately authorized new text request may use this cursor in the same chat.
+The normal bound-text send still freshly requires `current_node == parent_message_id`;
+a changed tail rejects the send. The proof is not permission to retry the refused
+image. Missing ownership returns 404; identity mismatch, unavailable context or
+in-flight work return 409 (`IMAGE_CONTINUATION_IDENTITY_MISMATCH`,
+`IMAGE_CONTINUATION_UNAVAILABLE`, `IMAGE_CONTINUATION_BUSY`). Read failures return
+503; upstream 429 preserves `Retry-After`. Existing `failure_continuation` keeps
+its stricter original-turn-only semantics.
 | Synchronous-compatible generation | `POST /v1/images/generations` |
 | Synchronous-compatible edit | `POST /v1/images/edits` |
 
@@ -168,6 +203,22 @@ Download completed images promptly. The existing server image-retention policy s
 
 ## Failures and recovery
 
+Retained single-image requests distinguish a native connection failure before
+the generation POST from an uncertain submitted request. DNS/connect/TLS errors
+are considered not submitted only when the completed transport snapshot also
+proves zero request/upload/early-data bytes, no redirect or response, and no
+library retry. A proxy CONNECT 200 alone is not a generation response. The
+receipt's `last_recovery_failure` exposes only `submission_evidence` and the
+numeric `transport_error_code`, never raw network errors or credentials.
+
+Such a proven unsent failure uses the existing completion recovery to retry the
+same task once, retaining its input, account, message ID and existing conversation.
+A second failure ends with explicit attention required and releases execution
+occupancy. It does not consume image capacity or invalidate observed quota.
+Multi-send image sets are excluded from this whole-task retry. Missing evidence,
+ordinary timeouts, and failures after sending remain original-result recovery;
+historical UNKNOWN receipts are not reclassified by an upgrade.
+
 The client prints JSON to stdout on success and a JSON error to stderr on failure. Common server responses are:
 
 - `400`: malformed input or a resume request that is not valid for the receipt;
@@ -184,6 +235,12 @@ Do not put the bearer token in command arguments, task state, logs, screenshots,
 For the authorized joint observation window, the existing `scripts/audit_pacing_log.py` reads a bounded local log export from stdin. Current clock events retain an opaque original-request reference, model, operation, persisted input size, send sequence, layer/phase and rate-limit evidence in the report; old missing fields stay unknown. Upstream header IDs are hashed, and `coverage.omitted_samples` discloses any sample truncation. This script makes no network calls. A message-start event occurs before final send guards and is not proof of a completed upstream send. Correlate it with the original receipt/result and an observed pool snapshot: current clock logs alone do not record concurrent occupancy or trusted source, and cannot establish a safe concurrency or interval.
 
 Conversation-result GET limits and generation POST limits are separate observations: a `conversation_read` 429 does not establish a generation-slot ceiling. Administrators can set `account_conversation_read_interval_secs` through the existing settings API (0–300 seconds; default 0 adds no extra floor). This persistent, per-account conversation GET interval is additional to the existing HTTP interval and cooldown. Waiting for it releases the send-edge lock, so it does not hold up an otherwise-ready generation POST or reduce configured work slots. Generation message pacing, send-time original-conversation preflight, and shared 429 cooldown remain in force; this setting never bypasses Retry-After. The effective setting is returned by GET `/api/settings`. Verify each endpoint's actual attempts and recovery separately, rather than treating a larger interval or configured slot count as a proven safe upstream limit.
+
+When an image generation's original SSE response offers a `stream_handoff` topic, the Provider listens for that turn's WebSocket completion alongside the original SSE stream. A completion signal immediately hands control to the existing original-message image verification, download and persistence path, subject to the account's read cooldown. It is not itself an image result or permission to release a slot. An absent topic, invalid notification, disconnected listener or its bounded timeout retains the original conversation/query recovery path without another generation POST. The signed socket URL stays in memory. This upstream notification is separate from the ordinary client's saved-result subscription; endpoint connectivity alone does not prove that a particular image operation offers or delivers a completion event.
+
+While polling an original image conversation, the Provider also shares one short-lived `conversations` WebSocket subscription per active account. An `add-messages` update containing a finished image tool with `ghostrider.status=final` wakes the matching conversation's pending poll immediately. The early `conversation-turn-complete`, intermediate image updates and assistant text endings do not qualify. The subsequent GET still uses the account's existing pacing and Retry-After, and only strict original-message verification can publish files. Signals are coalesced, foreign conversations are discarded, and the last subscriber closes the socket. Later active conversations do not inherit a fixed five-minute cutoff from the first subscriber; their own result budgets still apply. Cancellation during the handshake closes the connection without subscribing. Missing notifications or a disconnect retain ordinary polling; this does not promise a reliable upstream completion subscription for every image backend.
+
+Image capacity is checked before upload/bootstrap, again before requirements/prepare, and at the actual generation POST. A local capacity rejection before that POST is known not submitted: it retains the original request identity and does not count as an upstream image failure or consume a capacity observation. With the original admission claim still valid, it returns to the queue and releases only its provisional work slot; repeated local deferrals do not consume the bounded upstream-failure retry. Actual submitted or uncertain attempts keep their original recovery path. The early checks avoid wasted preparation and do not replace the final send guard.
 
 Independent conversation GET responses may overlap after their local transport-call start intervals are reserved. Receiving a response no longer retains the account clock lock; same-conversation ownership and submission preflight checks still apply. Completion reloads the persisted clock before recording any 429, so a late successful read cannot erase another read's cooldown. The synchronous caller joins its timeout-limited read and reconciles the clock even if its send budget has elapsed; that final lock/persistence wait is not an additional upstream request. Timing logs measure local transport-call entry/return, not upstream receipt or model computation time. A configured interval (including 60 seconds) is not a measured upstream minimum.
 
@@ -267,6 +324,12 @@ python3 examples/image_client.py --env-file .image-client.env chat-status --stat
 
 Happy 主循环依据原生 DSH 消息 `source.replayState.response.requestId` 承接，并保留收到的消息指纹和系统/工具版本指纹。截图内多个连续 user 气泡可能是一次请求中的上下文数组，不应据此判断有几次上游发送。图片工具仍有独立持久图片任务；主推理的会话连续不等于把独立图片任务合并成一条图片请求。本增量不改变额度、并发设置、员工权限或原生 Codex 路线。
 
+
+### 已结束等待、仍无最终文字的旧请求
+
+没有工作生命周期或 completion 处理器的原生 Chat 请求，在达到既有无结果预算、释放本地执行占用后，如果原会话仍为 `REQUEST_RESULT_NOT_FOUND` 且没有结束或可重试游标证明，会停止自动读取。普通状态 GET 和后台扫描不会重新开启查询；原 ID、输入、账号、会话和 `upstream_outcome=unknown` 保留。这也适用于升级前已经重复读取很多次的记录。工具步骤 `finished_successfully` 不代表最终 assistant 回答完成。 旧绑定接口返回 `recovery_automatic_stopped:true`、`recovery_stop_reason:ORIGINAL_RESULT_NO_FINAL`；公共 Chat 回执对应 `recovery.automatic_stopped`／`recovery.stop_reason`。客户端收到此标记应结束自动查询并显示原任务仍缺最终结果；`retryable:true` 仅表示允许显式原读，不表示继续定时查询或重新生成。
+
+需要再次核对时，使用已有 `POST /api/chat-requests/{request_id}/recover`（默认空请求体），只执行一次受账号节奏与冷却限制的原会话读取。仍无结果则保持停止；迟到的有效最终回答可沿原 ID 收回。此操作不直接重发生成、不换会话，也不把原任务标成完成。已有工作 completion 调查和明确空终态的有界恢复仍沿原合同执行。
 
 ### Advanced account selection (separate from default setup)
 
@@ -356,6 +419,8 @@ GET the same `/work` path to read `protocol:work-v1`, `kind`, `request_id`, `wor
 
 POST `{"state":"paused"}` to suspend an unsent/finished-turn work without archiving. POST `{"state":"active"}` to resume or rework; an archived work remains `restoring` until original restore is confirmed. A late prior completion cannot close a new work or its slot. UNKNOWN/in-flight work rejects release. Legacy single-request protocols and native Codex without a verified upstream archive API explicitly use `archive.scope:provider_work` / `status:not_applicable`; no upstream archive is claimed.
 
+An image tool result can be followed by the same turn's delayed text final. Archive and rework accept that cursor advance only after a fresh read proves the original user message, a single completed branch, the exact saved image assets, and an asset-free terminal tail. New user messages, branches, missing original nodes or changed assets still block the action. The successful source receipt and accepted edit fingerprint remain unchanged; the proved cursor is used only for the current operation, and archive still requires readback.
+
 Paused, completed, and restoring work does not trigger background admission capacity or model-catalog probes from its queued receipts. Resuming the same work re-enables the normal metadata checks for its original requests. Legacy receipts without a work projection retain their existing behavior.
 
 For example, start two independent sessions under `--workflow-id product-copy --workflow-concurrency 2 --min-send-interval-seconds 12`. Each session keeps its own state files and ordered predecessor IDs. Add `--not-before`/`--wait-deadline` with actual UTC times when needed. Leave the same original ID in place while queued; the scheduler resumes it after capacity or timing constraints clear. `WAIT_DEADLINE_EXCEEDED` with `not_sent` ends only unsent waiting. The client's HTTP timeout is still separate from these server controls.
@@ -437,6 +502,16 @@ when this proof is retained, input is unchanged and the exact original ID is
 absent. HTTP 404/429 alone, a timeout or a client crash never proves non-submission.
 The client saves `phase=unknown` before each POST and replaces that state only
 with an actual response; it never clears the original ID.
+
+Task completion, archive and rework control POSTs use the same explicit
+`not_sent` and 429/503 evidence for at most one automatic retry per invocation,
+only when `Retry-After` is at most 30 seconds. The original control endpoint and
+payload stay unchanged. Its deadline is saved separately as `control_retry` and
+honored on a later matching invocation; the old not-sent proof is invalidated
+before another send, while the rejection record remains after acknowledgement.
+This never changes the generation `phase` or resubmits generation. An
+unaccepted archive/restore remains `lifecycle.status=not_sent`; ambiguous errors
+remain `unknown`. Authentication, body-size and active body-reader limits remain.
 
 `GET` the same `/completion` to inspect `state`, `reason`, `waiting`,
 `original_status`, `replacement_status`, `replacement_id` and `selected_id`.

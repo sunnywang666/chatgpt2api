@@ -96,6 +96,24 @@ class AdmissionTests(unittest.TestCase):
         return self.images.submit_generation({"id": owner, "role": "user", "external_image_client": True},
                                              client_task_id=name, prompt="private image input", model="gpt-image-2", size=None)
 
+    def test_healthy_image_scan_does_not_delay_first_needed_refresh(self):
+        self.image("capacity-refresh")
+        with patch.object(self.accounts, "refresh_image_capability", side_effect=RuntimeError("fixture read failure")) as refresh:
+            self.admission._refresh_waiting_image_capabilities()
+            refresh.assert_not_called()
+            self.clock.now += 1
+            self.rows[0]["capacity_used_since_observation"] = True
+            (self.root / "accounts.json").write_text(json.dumps(self.rows))
+            self.admission._refresh_waiting_image_capabilities()
+            self.assertEqual(refresh.call_count, 1)
+            # Real reads, including failed ones, retain the existing cooldown.
+            self.clock.now += 29
+            self.admission._refresh_waiting_image_capabilities()
+            self.assertEqual(refresh.call_count, 1)
+            self.clock.now += 1
+            self.admission._refresh_waiting_image_capabilities()
+            self.assertEqual(refresh.call_count, 2)
+
     def test_inactive_text_work_does_not_refresh_catalog_and_resume_keeps_id(self):
         self.submit("paused-catalog")
         with self.store.transaction() as db:
@@ -169,6 +187,53 @@ class AdmissionTests(unittest.TestCase):
             context.before_send()
         self.assertTrue(self.read("image", "happy", "new-independent")["_submission_started"])
         self.assertEqual(self.read("image", "happy", "old-saved"), saved)
+
+    def test_claim_does_not_decode_unrelated_completed_image_payloads(self):
+        self.image("new-independent")
+        marker = "completed-image-is-not-a-scheduler-candidate"
+        saved = {"id": "old-saved", "owner_id": "happy", "status": "success",
+                 "data": [{"b64_json": marker * 10000}], "upstream_unfinished": False}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "happy", "old-saved", saved)
+        loads = json.loads
+        def candidate_decode(raw):
+            self.assertNotIn(marker, raw)
+            return loads(raw)
+        with patch("services.task_store.json.loads", side_effect=candidate_decode):
+            context = self.admission.claim_next()
+        self.assertEqual(context.request_id, "new-independent")
+        self.assertEqual(self.read("image", "happy", "old-saved"), saved)
+
+    def test_claim_snapshot_keeps_image_lineage_replacements_and_legacy_occupancy(self):
+        rows = {
+            "waiting": {"status": "queued", "_image_thread": {
+                "previous_task_id": "previous", "edit_source_task_id": "source", "origin_task_id": "origin"}},
+            "previous": {"status": "success", "data": [{"b64_json": "exact-previous-bytes"}]},
+            "source": {"status": "success", "_completion": {"state": "completed", "selected_id": "selected"}},
+            "selected": {"status": "success", "data": [{"b64_json": "exact-selected-bytes"}]},
+            "origin": {"status": "success", "_image_thread": {"previous_task_id": "source"}},
+            "legacy": {"status": "success", "upstream_unfinished": True},
+            "unknown": {"status": "success", "upstream_outcome": "unknown"},
+            "pending": {"status": "success", "_completion": {"state": "recovering"}},
+            "empty": {"status": "unknown"},
+            "retry": {"status": "success", "_same_session_retry_of": "empty"},
+            "unrelated": {"status": "success"},
+        }
+        with self.store.transaction() as db:
+            for rid, row in rows.items():
+                self.store.write_receipt(db, "image", "happy", rid, {"id": rid, "owner_id": "happy", **row})
+            self.store.write_receipt(db, "image", "another-owner", "source", {
+                "id": "source", "owner_id": "another-owner", "status": "success", "data": ["must-not-cross-owner"]})
+            snapshot = {(owner, rid): row for _, owner, rid, row in self.store.admission_receipts(db)}
+            self.assertEqual(set(snapshot), {("happy", rid) for rid in rows if rid != "unrelated"})
+            for (owner, rid), receipt in snapshot.items():
+                self.assertEqual(receipt, self.store.read_receipt(db, "image", owner, rid))
+            # The hot query must use the expression index, not reparse every
+            # stored image in SQLite after avoiding Python's JSON decoder.
+            from services.task_store import _ADMISSION_IMAGE_NEEDED
+            plan = db.execute("EXPLAIN QUERY PLAN SELECT receipt FROM image_requests WHERE ("
+                              + _ADMISSION_IMAGE_NEEDED + ")=1").fetchall()
+            self.assertTrue(any("USING INDEX image_requests_admission" in row[-1] for row in plan), plan)
 
     def test_send_guard_preserves_legacy_unfinished_image_capacity(self):
         self.image("new-image")
@@ -270,6 +335,113 @@ class AdmissionTests(unittest.TestCase):
         sent = self.calls[0][2]
         self.assertEqual(sent["parent_message_id"], "answer-0")
         self.assertEqual(sent["conversation_id"], "chat-0")
+
+    def test_image_input_fsync_does_not_block_another_receipt_writer(self):
+        saving, release, written = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        save = self.store.save_input
+        def slow_save(body):
+            result = save(body)
+            saving.set()
+            if not release.wait(3): raise TimeoutError()
+            return result
+        def submit():
+            try: self.image("large-input")
+            except BaseException as exc: errors.append(exc)
+        def update_other():
+            try:
+                with self.store.transaction() as db:
+                    self.store.set_runtime(db, "independent-progress", {"received": True})
+                written.set()
+            except BaseException as exc: errors.append(exc)
+        workers = [threading.Thread(target=submit), threading.Thread(target=update_other)]
+        with patch.object(self.store, "save_input", side_effect=slow_save):
+            try:
+                workers[0].start()
+                self.assertTrue(saving.wait(1))
+                workers[1].start()
+                self.assertTrue(written.wait(.5), "input file I/O held the shared receipt writer")
+            finally:
+                release.set()
+                for worker in workers:
+                    if worker.ident is not None: worker.join(3)
+        self.assertEqual(errors, [])
+        original = self.read("image", "happy", "large-input")
+        files = set(self.store.input_dir.iterdir())
+        with patch.object(self.store, "save_input", side_effect=AssertionError("duplicate must be read-only")):
+            self.image("large-input")
+        self.assertEqual(set(self.store.input_dir.iterdir()), files, "duplicate input was leaked")
+        self.assertEqual(self.read("image", "happy", "large-input"), original)
+
+    def test_new_image_thread_submission_never_decodes_or_rewrites_unrelated_images(self):
+        history = {"id": "history", "owner_id": "happy", "status": "success", "retain_receipt": True,
+                   "data": [{"b64_json": "unrelated-history-payload" * 100000}]}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "happy", "history", history)
+            raw = db.execute("SELECT receipt FROM image_requests WHERE task_key='happy:history'").fetchone()[0]
+        loads = json.loads
+        def narrow_load(raw, *args, **kwargs):
+            self.assertNotIn("unrelated-history-payload", raw)
+            return loads(raw, *args, **kwargs)
+        with patch("services.image_task_service.json.loads", side_effect=narrow_load), \
+             patch.object(self.store, "write_receipt", wraps=self.store.write_receipt) as writes:
+            result = self.images.submit_generation({"id": "happy", "external_image_client": True},
+                client_task_id="new-thread", prompt="fixture", model="gpt-image-2", size=None,
+                image_thread_id="fresh-thread")
+            self.assertEqual(result["status"], "queued")
+            self.assertEqual(writes.call_count, 1)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("SELECT receipt FROM image_requests WHERE task_key='happy:history'").fetchone()[0], raw)
+
+    def test_image_recovery_parallel_workers_hold_permits_until_actual_io_finishes(self):
+        import time
+        entered = [threading.Event() for _ in range(5)]
+        release = [threading.Event() for _ in range(5)]
+        finished = [threading.Event() for _ in range(5)]
+        for index in range(5):
+            rid = f"recover-{index}"
+            receipt = {"id": rid, "owner_id": "happy", "status": "error", "mode": "generate",
+                       "model": "gpt-image-2", "error_code": "CONVERSATION_OUTCOME_UNKNOWN",
+                       "upstream_unfinished": True, "provider_account_identity": "account-0",
+                       "provider_binding_id": "binding-0", "client_conversation_id": f"client-{index}",
+                       "conversation_id": f"conversation-{index}", "request_message_id": f"message-{index}"}
+            with self.store.transaction() as db:
+                self.store.write_receipt(db, "image", "happy", rid, receipt)
+        def read_original(key, *args):
+            index = int(key.rsplit("-", 1)[1])
+            entered[index].set()
+            try:
+                if not release[index].wait(3): raise TimeoutError()
+                self.images._update_task(key, status="error", next_poll_at=time.time() + 120)
+            finally:
+                finished[index].set()
+        self.images._run_resume_poll = read_original
+        self.admission.recoveries["image"] = lambda owner, rid: self.images.resume_poll(
+            {"id": owner}, rid, wait_for_completion=True)
+        try:
+            self.admission.recover_one(background=True)
+            self.assertTrue(all(event.wait(1) for event in entered[:4]), "image recovery is still serialized")
+            self.assertFalse(entered[4].is_set())
+            with self.admission._original_read_lock:
+                self.assertEqual(len(self.admission._original_reads), 4)
+            self.admission.recover_one(background=True)
+            self.assertFalse(entered[4].is_set(), "permit released before image I/O finished")
+            release[0].set()
+            self.assertTrue(finished[0].wait(1))
+            limit = time.monotonic() + 2
+            while time.monotonic() < limit and not entered[4].is_set():
+                self.admission.recover_one(background=True)
+                entered[4].wait(.01)
+            self.assertTrue(entered[4].is_set())
+        finally:
+            for event in release: event.set()
+            for event in finished: event.wait(2)
+            limit = time.monotonic() + 2
+            while self.admission._original_reads and time.monotonic() < limit:
+                time.sleep(.01)
+        self.assertEqual(self.admission._original_reads, {})
+        self.assertTrue(self.admission._original_read_slots.acquire(blocking=False))
+        self.admission._original_read_slots.release()
 
     def test_completed_image_with_iso_creation_time_cannot_stop_text_recovery(self):
         self.image("saved-image")
@@ -828,6 +1000,11 @@ class AdmissionTests(unittest.TestCase):
             receipt = self.store.read_receipt(db, "image", "happy", "saved-catalog-image")
             receipt.update(status="success", data=data, upstream_unfinished=False)
             self.store.write_receipt(db, "image", "happy", "saved-catalog-image", receipt)
+        self.image("next-catalog-image")
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "image", "happy", "next-catalog-image")
+            receipt["_image_thread"] = {"edit_source_task_id": "saved-catalog-image"}
+            self.store.write_receipt(db, "image", "happy", "next-catalog-image", receipt)
         catalog_calls, reads = [], []
         self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
         original = self.store.receipts
@@ -835,7 +1012,13 @@ class AdmissionTests(unittest.TestCase):
             rows = list(original(db, **kwargs))
             reads.append((kwargs, rows))
             return iter(rows)
-        with patch.object(self.store, "receipts", side_effect=observed):
+        admission_original = self.store.admission_receipts
+        def observed_admission(db):
+            rows = list(admission_original(db))
+            reads.append(({}, rows))
+            return iter(rows)
+        with patch.object(self.store, "receipts", side_effect=observed), \
+                patch.object(self.store, "admission_receipts", side_effect=observed_admission):
             self.admission.claim_next()
         self.assertTrue(expected_models <= set(catalog_calls))
         filtered = [rows for args, rows in reads if args.get("statuses") == ("queued", "running", "not_started")]
@@ -888,6 +1071,42 @@ class AdmissionTests(unittest.TestCase):
         self.assertFalse(work["slot_held"])
         self.assertIsNone(self.admission.claim_next())
         self.assertEqual(self.calls, [])
+
+    def test_saved_text_can_complete_before_worker_finally_without_closing_another_turn(self):
+        from services.work_lifecycle import WorkLifecycleError, WorkLifecycleService
+        self.admission.settings = lambda: {"chat_account_concurrency": 2,
+                                            "image_account_concurrency": 4, "codex_max_concurrency": 4}
+        self.submit("saved", _public_session_ref="session-saved")
+        self.submit("still-running", _public_session_ref="session-still-running")
+        context = self.admission.claim_next()
+        other = self.admission.claim_next()
+        self.assertEqual(context.request_id, "saved")
+        self.assertEqual(other.request_id, "still-running")
+        lifecycle = WorkLifecycleService(self.text, self.images, clock=self.clock)
+        stages = []
+        original_stage = context.record_stage
+
+        def observe(stage, **fields):
+            if stage == "artifact_saved":
+                receipt = self.read("text", "happy", "saved")
+                self.assertEqual(receipt["status"], "succeeded")
+                self.assertEqual(receipt["content"], "done")
+                self.assertFalse(receipt["_executing"])
+                self.assertEqual(receipt["_claim_id"], context.claim)
+                work = lifecycle.update("text", {"id": "happy"}, "saved", "completed", True)
+                self.assertEqual(work["state"], "completed")
+                self.assertFalse(work["slot_held"])
+                with self.assertRaisesRegex(WorkLifecycleError, "WORK_TURN_UNFINISHED"):
+                    lifecycle.update("text", {"id": "happy"}, "still-running", "completed", True)
+                stages.append(stage)
+            return original_stage(stage, **fields)
+
+        with patch.object(context, "record_stage", side_effect=observe):
+            self.admission.execute(context)
+        self.assertEqual(stages, ["artifact_saved"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(lifecycle.get("text", {"id": "happy"}, "saved")["state"], "completed")
+        self.assertTrue(self.read("text", "happy", "still-running")["_executing"])
 
     def test_new_queued_text_still_discovers_models_for_admission(self):
         catalog_calls = []
@@ -944,6 +1163,84 @@ class AdmissionTests(unittest.TestCase):
                 self.assertEqual(record["result_file_ids"], ["original-file"])
                 self.assertFalse(record["upstream_unfinished"])
                 self.assertEqual(sum(e["stage"] == "send_call_started" for e in record["_execution_timeline"]), 1)
+
+    def test_expired_sent_claim_records_local_reason_once_without_inventing_upstream_failure(self):
+        for kind in ("text", "image"):
+            with self.subTest(kind=kind):
+                rid = "expired-sent-" + kind
+                (self.submit if kind == "text" else self.image)(rid)
+                context = self.admission.claim_next()
+                context.before_send()
+                context.record_stage("send_call_started")
+                self.clock.now += 31
+                for _ in range(2):
+                    with self.store.transaction() as db:
+                        row = self.store.read_receipt(db, kind, "happy", rid)
+                        self.admission._recover_claims(db, [(kind, "happy", rid, row)], self.clock())
+                row = self.read(kind, "happy", rid)
+                events = [e for e in row["_execution_timeline"] if e["stage"] == "execution_interrupted"]
+                self.assertEqual(events, [{"stage": "execution_interrupted", "at": self.clock(),
+                    "source": "local_scheduler", "reason": "execution_claim_expired", "from_status": "running",
+                    "to_status": "unknown" if kind == "text" else "error", "submitted": True,
+                    "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "result_assets_observed": False}])
+                self.assertNotIn("last_recovery_failure", row)
+                self.assertEqual(sum(e["stage"] == "send_call_started" for e in row["_execution_timeline"]), 1)
+                # Close this fixture's turn without another model submission.
+                with self.store.transaction() as db:
+                    row.update(status="succeeded" if kind == "text" else "success", upstream_unfinished=False,
+                               _executing=False, _turn_reserved=False, _claim_id=None)
+                    self.store.write_receipt(db, kind, "happy", rid, row)
+
+    def test_worker_exception_after_assets_survives_original_image_recovery_and_restart(self):
+        self.image("interrupted-assets")
+        context = self.admission.claim_next()
+        def interrupted(ctx, body):
+            ctx.before_send()
+            ctx.record_stage("send_call_started")
+            self.admission.update_claim(ctx, result_file_ids=["original-file"])
+            raise RuntimeError("private URL and credential must never become evidence")
+        self.admission.register("image", interrupted)
+        self.admission.execute(context)
+        row = self.read("image", "happy", "interrupted-assets")
+        event = next(e for e in row["_execution_timeline"] if e["stage"] == "execution_interrupted")
+        self.assertEqual(event["reason"], "worker_exception")
+        self.assertEqual(event["source"], "local_scheduler")
+        self.assertTrue(event["result_assets_observed"])
+        self.assertNotIn("private URL", json.dumps(row))
+        self.images._update_task("happy:interrupted-assets", status="success", data=[{"b64_json": "cG5n"}],
+                                 error_code="", upstream_unfinished=False, upstream_outcome="generated")
+        restarted = ImageTaskService(self.root / "image_tasks.json", store=self.store)
+        with restarted.store.connect() as db:
+            final = restarted.store.read_receipt(db, "image", "happy", "interrupted-assets")
+        self.assertEqual(final["status"], "success")
+        self.assertIn(event, final["_execution_timeline"])
+        self.assertEqual(sum(e["stage"] == "send_call_started" for e in final["_execution_timeline"]), 1)
+
+    def test_late_stage_appends_without_erasing_a_concurrent_claim_interruption(self):
+        self.image("late-stage")
+        context = self.admission.claim_next()
+        context.before_send()
+        context.record_stage("send_call_started")
+        read_original = context.receipt
+        def expire_after_read():
+            observed = read_original()
+            self.clock.now += 31
+            with self.store.transaction() as db:
+                latest = self.store.read_receipt(db, "image", "happy", "late-stage")
+                self.admission._recover_claims(db, [("image", "happy", "late-stage", latest)], self.clock())
+            return observed
+        with patch.object(context, "receipt", side_effect=expire_after_read):
+            context.record_stage("stream_finished", stream_end="consumer_closed")
+        row = self.read("image", "happy", "late-stage")
+        self.assertEqual(row["status"], "error")
+        self.assertEqual([e["stage"] for e in row["_execution_timeline"]][-2:],
+                         ["execution_interrupted", "stream_finished"])
+        self.assertEqual(sum(e["stage"] == "send_call_started" for e in row["_execution_timeline"]), 1)
+        with self.store.transaction() as db:
+            row["_claim_id"] = "replacement-claim"
+            self.store.write_receipt(db, "image", "happy", "late-stage", row)
+        context.record_stage("artifact_saved", image_count=1)
+        self.assertEqual(self.read("image", "happy", "late-stage"), row)
 
     def test_account_disabled_between_claim_and_send_is_not_sent(self):
         self.submit("original")
@@ -1279,6 +1576,89 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(failure["stage"], "pre_submit_failure")
         self.assertEqual(failure["error_code"], "IMAGE_RESOURCE_UNAVAILABLE")
 
+    def test_wrapped_image_admission_rejection_requeues_original_without_retry_exhaustion(self):
+        from services.protocol.conversation import ImageGenerationError
+        self.images.submit_generation({"id": "happy", "role": "user", "external_image_client": True},
+            client_task_id="capacity-wait", prompt="private image input", model="gpt-image-2", size=None,
+            image_thread_id="capacity-work")
+        initial = self.read("image", "happy", "capacity-wait")
+        calls = []
+        def handler(payload):
+            ctx = current_request.get()
+            calls.append(ctx.request_id)
+            if len(calls) <= 2:
+                # The bound protocol preserves its public error contract and
+                # chains the exact local guard exception through the handler.
+                try:
+                    rejected = AdmissionLost("selected image account capability is unavailable")
+                    rejected.reason = "image_capability_unavailable"
+                    rejected.capability_reason = "stale_consumed"
+                    raise rejected
+                except AdmissionLost as rejected:
+                    raise ImageGenerationError("capacity changed",
+                        code="IMAGE_GENERATION_NOT_SUBMITTED", upstream_submitted=False) from rejected
+            ctx.before_send()
+            payload["progress_callback"].record_submission_started()
+            ctx.record_stage("send_call_started")
+            return {"data": [{"b64_json": "cG5n"}],
+                    "_provider_binding_id": payload["provider_binding_id"],
+                    "_provider_account_identity": payload["provider_account_identity"],
+                    "_conversation_id": "original-conversation", "_parent_message_id": "original-result",
+                    "_image_thread_terminal": True}
+        self.images.generation_handler = handler
+        self.admission.register("image", lambda ctx, body: self.images._run_task(
+            ctx.owner + ":" + ctx.request_id, body["mode"], body["payload"], body["identity"], "gpt-image-2"))
+        for _ in range(2):
+            ctx = self.admission.claim_next()
+            self.assertEqual(ctx.request_id, "capacity-wait")
+            self.admission.execute(ctx)
+            receipt = self.read("image", "happy", "capacity-wait")
+            self.assertEqual(receipt["status"], "queued")
+            self.assertEqual(receipt["upstream_outcome"], "not_sent")
+            self.assertIs(receipt["_submission_started"], False)
+            self.assertIs(receipt["upstream_submission_started"], False)
+            self.assertFalse(receipt.get("_claim_id"))
+            self.assertFalse(receipt.get("_executing"))
+            self.assertIsNone(receipt.get("active_attempt_deadline_at"))
+            self.assertFalse(receipt.get("_completion"))
+            self.assertEqual(receipt["_input_ref"], initial["_input_ref"])
+            failure = receipt["_execution_timeline"][-1]
+            self.assertEqual(failure["reason"], "image_capability_unavailable")
+            self.assertEqual(failure["capability_reason"], "stale_consumed")
+            self.assertFalse(any(e["stage"] in {"task_finished", "send_call_started"}
+                                 for e in receipt["_execution_timeline"]))
+            with self.store.connect() as db:
+                self.assertIs(self.store.runtime(db, receipt["_work_key"])["slot_held"], False)
+            self.clock.now += 2
+        self.admission.execute(self.admission.claim_next())
+        result = self.read("image", "happy", "capacity-wait")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls, ["capacity-wait"] * 3)
+        self.assertEqual(sum(e["stage"] == "send_call_started" for e in result["_execution_timeline"]), 1)
+
+    def test_image_guard_exception_after_submission_does_not_requeue(self):
+        from services.protocol.conversation import ImageGenerationError
+        self.image("sent-guard")
+        def handler(payload):
+            ctx = current_request.get()
+            ctx.before_send()
+            payload["progress_callback"].record_submission_started()
+            ctx.record_stage("send_call_started")
+            try:
+                raise AdmissionLost("claim changed after send")
+            except AdmissionLost as rejected:
+                raise ImageGenerationError("unknown result", code="CONVERSATION_OUTCOME_UNKNOWN",
+                                           upstream_submitted=True) from rejected
+        self.images.generation_handler = handler
+        self.admission.register("image", lambda ctx, body: self.images._run_task(
+            ctx.owner + ":" + ctx.request_id, body["mode"], body["payload"], body["identity"], "gpt-image-2"))
+        self.admission.execute(self.admission.claim_next())
+        receipt = self.read("image", "happy", "sent-guard")
+        self.assertEqual(receipt["status"], "error")
+        self.assertTrue(receipt["_submission_started"])
+        self.assertEqual(receipt["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+        self.assertFalse(any(e["stage"] == "pre_submit_failure" for e in receipt["_execution_timeline"]))
+
     def test_unsent_binding_reason_is_preserved_in_timeline_on_requeue(self):
         self.image("binding-unavailable")
         context = self.admission.claim_next()
@@ -1389,6 +1769,10 @@ class AdmissionTests(unittest.TestCase):
                 self.assertFalse(receipt["_submission_started"])
                 failures = [e for e in receipt["_execution_timeline"] if e["stage"] == "pre_submit_failure"]
                 self.assertEqual(failures[-1]["reason"], reason)
+                if reason == "image_capability_unavailable":
+                    self.assertEqual(failures[-1]["capability_reason"], "stale_consumed")
+                else:
+                    self.assertNotIn("capability_reason", failures[-1])
                 self.assertNotIn("fixture-token", "\n".join(captured.output))
                 self.assertNotIn("private image input", "\n".join(captured.output))
 
@@ -1398,9 +1782,11 @@ class AdmissionTests(unittest.TestCase):
         context = self.admission.claim_next()
         with patch("services.pool_admission.logger.warning") as logged:
             receipt = {}
-            record_unsent_failure(context, receipt, self.clock(), "AdmissionLost", reason="private credential")
+            record_unsent_failure(context, receipt, self.clock(), "AdmissionLost", reason="private credential",
+                                  capability_reason="private credential")
             self.assertNotIn("private credential", str(logged.call_args_list))
             self.assertNotIn("reason", receipt["_execution_timeline"][0])
+            self.assertNotIn("capability_reason", receipt["_execution_timeline"][0])
         import sqlite3
         update = self.admission.update_claim
         failed = threading.Event()

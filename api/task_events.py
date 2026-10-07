@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -17,6 +18,7 @@ from api.key_policy import require_chat_text_policy, require_codex_endpoint, req
 from api.support import require_identity
 from services.pool_admission import image_original_recovery_pending, image_result_stage
 from services.task_store import pending_image_result_ids
+from services.generation_completion import same_session_retry, verified_image_failure, GenerationCompletionService
 
 STREAM_SECONDS = 30
 CHECK_SECONDS = 1
@@ -63,12 +65,58 @@ def _retrying_unsent(receipt):
                 and receipt.get("_recovery_suppressed") is not True)
 
 
+def _image_completion_state(service, receipt, child, work_active):
+    """Project persisted completion only; never advance it or read upstream."""
+    state = receipt.get("_completion") or {}
+    if (not isinstance(state, dict) or receipt.get("_recovery_paused") is True
+            or receipt.get("_recovery_suppressed") is True):
+        return False, None
+    scheduler_available = getattr(getattr(service, "admission", None), "generation_completion", None) is not None
+    if not state:
+        return bool(scheduler_available and work_active and receipt.get("_automatic_generation_recovery") is True
+                    and not receipt.get("_attempt_finished_at") and not receipt.get("_completion_of")
+                    and verified_image_failure(receipt, time.time(), GenerationCompletionService.INVESTIGATION_SECONDS)), None
+    linked = bool(child and same_session_retry(receipt, child))
+    if linked and receipt.get("_image_thread"):
+        original_thread, child_thread = receipt["_image_thread"], child.get("_image_thread") or {}
+        linked = bool(original_thread.get("protocol") == child_thread.get("protocol") == "image-thread-v1"
+                      and original_thread.get("id") and original_thread["id"] == child_thread.get("id"))
+    if (linked and state.get("state") in {"result_ready", "completed"}
+            and state.get("selected_id") == child.get("id") and child.get("status") == "success"
+            and isinstance(child.get("data"), list) and child["data"]
+            and (not receipt.get("_image_thread") or child.get("_image_thread_terminal") is True)):
+        return False, child
+    next_at = state.get("next_at")
+    pending = (work_active and scheduler_available
+               and state.get("automatic_failure_retry") is True and not state.get("selected_id")
+               and type(next_at) in {int, float} and math.isfinite(next_at))
+    if not pending:
+        return False, None
+    if state.get("state") == "checking_original":
+        # The scheduler already owns this investigation. Its proof may still
+        # be pending or expire while the next original read is rate-limited;
+        # that does not end completion or authorize another submission.
+        return bool(not state.get("same_request_retry") and not state.get("replacement_id")
+                    and not receipt.get("_attempt_finished_at")), None
+    if state.get("state") == "replacement_pending" and not child:
+        # Reservation commits before submit. A reconnect/restart can observe
+        # this gap; keep waiting for the reserved ID without inventing a result.
+        return bool(state.get("replacement_id") and state.get("prepared_input")), None
+    return bool(state.get("state") == "replacement_pending" and linked
+                and child.get("_recovery_paused") is not True and child.get("_recovery_suppressed") is not True
+                and (child.get("status") in {"queued", "running", "success"}
+                     or image_original_recovery_pending(child))), None
+
+
 def _snapshot(kind, service, identity, request_id):
     with service.store.connect() as db:
         receipt = service.store.read_receipt(db, kind, str(identity["id"]), request_id)
         work = (service.store.runtime(db, receipt["_work_key"])
                 if kind == "image" and receipt and receipt.get("status") == "error"
-                and receipt.get("error_code") == "RESULT_UNRECOVERABLE" and receipt.get("_work_key") else None)
+                and receipt.get("_work_key") else None)
+        state = (receipt or {}).get("_completion") or {}
+        child = (service.store.read_receipt(db, kind, str(identity["id"]), state["replacement_id"])
+                 if kind == "image" and isinstance(state, dict) and state.get("replacement_id") else None)
     if receipt is None:
         raise HTTPException(404, detail={"code": "ORIGINAL_REQUEST_NOT_FOUND"})
     if kind == "image":
@@ -87,11 +135,18 @@ def _snapshot(kind, service, identity, request_id):
         status = "unknown"
     retrying_unsent = (_retrying_unsent(receipt) or kind == "image" and _automatic_unsent_image_retry(
         service, receipt, not receipt.get("_work_key") or bool(work and work.get("state") == "active")))
+    completion_pending, selected = (_image_completion_state(service, receipt, child,
+        not receipt.get("_work_key") or bool(work and work.get("state") == "active")) if kind == "image" else (False, None))
+    if selected:
+        ready, result_count = True, len(selected["data"])
     return {"protocol": "task-notification-v1", "kind": kind, "request_id": request_id,
             "status": status, "result_ready": ready, "result_count": result_count,
-            **({"result_stage": "preparing" if retrying_unsent else image_result_stage(receipt)} if kind == "image" else {}),
+            **({"result_stage": "result_ready" if selected else "preparing" if retrying_unsent
+                else "recovering_original" if completion_pending else image_result_stage(receipt)} if kind == "image" else {}),
+            **({"completion_state": state.get("state", "checking_original")} if completion_pending else {}),
+            **({"selected_result_id": selected["id"]} if selected else {}),
             "retrying_unsent": retrying_unsent,
-            "recovering_original": kind == "image" and image_original_recovery_pending(receipt)}
+            "recovering_original": kind == "image" and (image_original_recovery_pending(receipt) or completion_pending)}
 
 
 def _event(name, data):

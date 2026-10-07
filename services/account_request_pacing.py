@@ -10,6 +10,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -23,7 +24,7 @@ from curl_cffi import CurlInfo
 from services.config import DATA_DIR, config
 from utils.log import logger
 from services.request_context import (current_request, current_archive_guard, current_archive_read_owner,
-                                      current_archive_observation, current_archive_step)
+                                      current_archive_observation, current_archive_step, current_archive_defer_reads)
 
 
 # libcurl times are cumulative from request start, not individual phase durations.
@@ -39,7 +40,62 @@ _TRANSPORT_INFO_FIELDS = {
     CurlInfo.OS_ERRNO: "os_errno",
     CurlInfo.HTTP_CONNECTCODE: "http_connect_code",
     CurlInfo.SIZE_DOWNLOAD_T: "downloaded_bytes",
+    CurlInfo.REQUEST_SIZE: "request_bytes",
+    CurlInfo.SIZE_UPLOAD_T: "uploaded_bytes",
+    CurlInfo.EARLYDATA_SENT_T: "early_data_bytes",
+    CurlInfo.REDIRECT_COUNT: "redirect_count",
+    CurlInfo.RESPONSE_CODE: "response_code",
+    CurlInfo.HTTP_VERSION: "http_version",
 }
+
+
+def _connect_failed_before_request(session, exc):
+    """Classify a finished native connect failure, never a timeout/read error.
+
+    Zero byte counters alone cannot prove non-submission. Require connect-stage
+    failure without TLS early data, redirects, responses or library retries.
+    CONNECT 200 describes the proxy tunnel, not the target application's POST.
+    Missing evidence deliberately retains the original UNKNOWN behavior.
+    """
+    from curl_cffi.requests import Session
+    from curl_cffi.requests.exceptions import RequestException
+    try:
+        if (not isinstance(session, Session) or not isinstance(exc, RequestException)
+                or getattr(session.retry, "count", None) != 0
+                or isinstance(exc.code, bool) or exc.code not in {5, 6, 7, 35, 60}):
+            return False
+        response = exc.response
+        if type(response.status_code) is not int or response.status_code != 0:
+            return False
+        infos = response.infos
+        zero = (CurlInfo.REQUEST_SIZE, CurlInfo.SIZE_UPLOAD_T, CurlInfo.EARLYDATA_SENT_T,
+                CurlInfo.REDIRECT_COUNT, CurlInfo.RESPONSE_CODE, CurlInfo.HTTP_VERSION,
+                CurlInfo.SIZE_DOWNLOAD_T)
+        if any(type(infos.get(k)) is not int or infos[k] != 0 for k in zero):
+            return False
+        appconnect, connections = infos.get(CurlInfo.APPCONNECT_TIME), infos.get(CurlInfo.NUM_CONNECTS)
+        return (type(appconnect) in (int, float) and appconnect == 0
+                and type(connections) is int and 0 <= connections <= 1)
+    except Exception:
+        # Classification must not mask the original transport failure.
+        return False
+
+
+def unsent_transport_failure(exc):
+    """Return safe evidence marked by the native transport, including its cause."""
+    try:
+        for _ in range(8):
+            if exc is None:
+                break
+            if getattr(exc, "_account_request_not_submitted", False) is True:
+                code = exc.code
+                if isinstance(code, int) and not isinstance(code, bool) and code in {5, 6, 7, 35, 60}:
+                    return {"submission_evidence": "connect_failed_before_request", "transport_error_code": int(code)}
+                return {}
+            exc = exc.__cause__
+    except Exception:
+        pass  # Exception accessors are not allowed to replace the real failure.
+    return {}
 
 
 def _transport_snapshot(response):
@@ -64,6 +120,52 @@ def _transport_snapshot(response):
     except Exception:
         # A diagnostic accessor must not replace the original transport error.
         pass
+    return result
+
+
+def _rate_limit_response_features(response):
+    """Classify a 429 without retaining body, URL or raw header values.
+
+    Markers are evidence, not an attribution to the application or its edge.
+    This projection must never change retry/cooldown decisions.
+    """
+    result = {"content_type_class": "missing", "retry_after_kind": "absent",
+              "request_id_header": "none", "cf_ray_present": False, "via_present": False,
+              "response_origin_evidence": "no_marker"}
+    try:
+        allowed = {"content-type", "retry-after", "x-request-id", "openai-request-id", "cf-ray", "via"}
+        headers = {k.lower(): v for k, v in (getattr(response, "headers", {}) or {}).items()
+                   if isinstance(k, str) and k.lower() in allowed}
+        if "content-type" in headers:
+            value = headers["content-type"]
+            mime = value.split(";", 1)[0].strip().lower() if isinstance(value, str) else ""
+            result["content_type_class"] = {"application/json": "application_json",
+                "text/html": "text_html", "text/plain": "text_plain"}.get(mime, "other")
+        if "retry-after" in headers:
+            result["retry_after_kind"] = "invalid"
+            value = headers["retry-after"]
+            try:
+                seconds = float(value)
+                if math.isfinite(seconds) and seconds >= 0:
+                    result["retry_after_kind"] = "seconds"
+            except (TypeError, ValueError, OverflowError):
+                if isinstance(value, str):
+                    try:
+                        parsedate_to_datetime(value)
+                        result["retry_after_kind"] = "http_date"
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+        for name in ("x-request-id", "openai-request-id"):
+            if name in headers:
+                result["request_id_header"] = name.replace("-", "_")
+                break
+        result.update(cf_ray_present="cf-ray" in headers, via_present="via" in headers)
+        request_marker = result["request_id_header"] != "none"
+        edge_marker = result["cf_ray_present"] or result["via_present"]
+        result["response_origin_evidence"] = ("mixed_markers" if request_marker and edge_marker
+            else "request_id_marker" if request_marker else "edge_marker" if edge_marker else "no_marker")
+    except Exception:
+        pass  # Diagnostics must not hide the original 429.
     return result
 
 
@@ -121,11 +223,64 @@ class AccountRequestDeadlineExceeded(TimeoutError):
 
 
 class AccountReadRetryBudgetInsufficient(AccountRequestDeadlineExceeded):
-    """An original GET retry no longer has its minimum connection window."""
+    """An original GET attempt no longer has its minimum connection window."""
+
+
+class ArchiveReadDeferred(RuntimeError):
+    """No GET was sent; resume the same archive intent at its existing read edge."""
+    def __init__(self, next_at):
+        super().__init__("archive read credit is pending")
+        self.next_at = next_at
 
 
 def _backoff_seconds(failures):
     return min(900.0, 60.0 * (2 ** min(max(0, failures - 1), 4)))
+
+
+def _read_policy(now, rate_failures, last_limit, read_failures, last_read_limit):
+    failures = max(rate_failures if now - last_limit < 900 else 0,
+                   read_failures if now - last_read_limit < 900 else 0)
+    interval = min(300.0, getattr(config, "account_conversation_read_interval_secs", 0.0)
+                   * 2 ** min(failures, 4))
+    # A real limit disables bursts until the existing backoff history expires.
+    capacity = 1 if failures or not interval else getattr(config, "account_conversation_read_burst", 1)
+    return interval, capacity
+
+
+def _read_credit(bucket, now, interval, capacity, floor):
+    """Project the existing account clock without mutating/reserving a read.
+
+    A policy change never grants new credits: retain at most one old credit,
+    then accrue elapsed time at the current interval. R=0 records no credit.
+    Legacy clocks retain their entire floor and earn credit only while idle.
+    """
+    if not interval:
+        return 0.0, now, max(now, floor)
+    if bucket is None:
+        credit, at = 1.0, floor
+    else:
+        credit, at = bucket["credit"], bucket["at"]
+    credit = min(float(capacity), credit + max(0.0, now - at) / interval)
+    if bucket is not None and (bucket["interval"], bucket["capacity"]) != (interval, capacity):
+        # Clamp AFTER accrual: old idle time cannot fill a newly enlarged burst.
+        # Keep the old timestamp for the read-only projection; resetting it to
+        # now on every snapshot would move the deadline forever. The first
+        # admitted read persists the new policy and its fresh refill timestamp.
+        credit = min(credit, 1.0)
+    at = max(now, at)
+    return credit, at, max(floor, at + max(0.0, 1.0 - credit) * interval)
+
+
+def _checked_read_bucket(bucket, offset=0.0):
+    if bucket is None:
+        return None
+    if (not isinstance(bucket, dict) or set(bucket) != {"credit", "at", "interval", "capacity"}
+            or any(type(bucket[k]) not in (int, float) or not math.isfinite(bucket[k])
+                   for k in ("credit", "at", "interval"))
+            or type(bucket["capacity"]) is not int or not 1 <= bucket["capacity"] <= 100
+            or not 0 <= bucket["credit"] <= bucket["capacity"] or not 0 <= bucket["interval"] <= 300):
+        raise ValueError("Invalid saved conversation read credits")
+    return {**bucket, "at": bucket["at"] - offset}
 
 
 class AccountRequestClock:
@@ -137,6 +292,7 @@ class AccountRequestClock:
         self.next_request = 0.0
         self.next_turn = 0.0
         self.next_conversation_read = 0.0
+        self.conversation_read_bucket = None
         self.archive_read_owner = None
         self.archive_read_until = 0.0
         self.ordinary_read_wait_until = 0.0
@@ -174,6 +330,7 @@ class AccountRequestClock:
         if not math.isfinite(read_at):
             raise ValueError("Invalid saved conversation read clock")
         self.next_conversation_read = read_at - offset
+        self.conversation_read_bucket = _checked_read_bucket(saved.get("conversation_read_bucket"), offset)
         for field in ("archive_read_until", "ordinary_read_wait_until"):
             value = float(saved.get(field, 0.0))
             if not math.isfinite(value):
@@ -209,6 +366,9 @@ class AccountRequestClock:
             {"owner": entry["owner"], "until": entry["until"] + offset}
             for entry in self.ordinary_read_queue]
         saved["last_turn_started"] = None if self.last_turn_started is None else self.last_turn_started + offset
+        if self.conversation_read_bucket is not None:
+            saved["conversation_read_bucket"] = {**self.conversation_read_bucket,
+                                                  "at": self.conversation_read_bucket["at"] + offset}
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_suffix(".tmp")
         with temporary.open("w") as handle:
@@ -250,7 +410,7 @@ class AccountRequestClock:
         """Called with the existing clock lock; reserve one GET, never a POST."""
         if not getattr(config, "account_conversation_read_interval_secs", 0.0):
             return True
-        ready = max(now, self.next_request, self.cooldown_until, self.next_conversation_read)
+        ready = max(now, self.next_request, self.cooldown_until, self._read_ready(now))
         if ready - now >= 235:
             return False  # An archive HTTP step has a 240 second finite budget.
         if self.archive_read_owner and self.archive_read_until > now:
@@ -274,6 +434,25 @@ class AccountRequestClock:
             return 0.0
         return self.last_conversation_read_rate_limit + _backoff_seconds(self.conversation_read_rate_failures)
 
+    def _read_ready(self, now):
+        interval, capacity = _read_policy(now, self.rate_failures, self.last_rate_limit,
+                                         self.conversation_read_rate_failures, self.last_conversation_read_rate_limit)
+        return max(self._read_cooldown_until(),
+                   _read_credit(self.conversation_read_bucket, now, interval, capacity,
+                                self.next_conversation_read)[2])
+
+    def _consume_read(self, now):
+        interval, capacity = _read_policy(now, self.rate_failures, self.last_rate_limit,
+                                         self.conversation_read_rate_failures, self.last_conversation_read_rate_limit)
+        credit, _, ready = _read_credit(self.conversation_read_bucket, now, interval, capacity,
+                                       self.next_conversation_read)
+        if ready > now + 0.000001 or self._read_cooldown_until() > now:
+            raise AccountRequestDeadlineExceeded("conversation read credit is not ready")
+        remaining = max(0.0, credit - 1.0) if interval else 0.0
+        self.conversation_read_bucket = {"credit": remaining, "at": now,
+                                         "interval": interval, "capacity": capacity}
+        self.next_conversation_read = now + max(0.0, 1.0 - remaining) * interval
+
     def limited(self, retry_after=0.0, *, evidence=None, retry_after_present=False, read_sent_at=None):
         # A conversation GET limit without Retry-After backs off that read lane.
         # Explicit provider waits and limits from other/unknown phases retain
@@ -282,9 +461,11 @@ class AccountRequestClock:
         read_only = ((evidence or {}).get("phase") == "conversation_read"
                      and not retry_after_present and retry_after <= 0)
         now = time.monotonic()
-        same_read_incident = (read_only and read_sent_at is not None
-                              and self.conversation_read_rate_failures > 0
-                              and read_sent_at <= self.last_conversation_read_rate_limit)
+        incident_failures = self.conversation_read_rate_failures if read_only else self.rate_failures
+        incident_at = self.last_conversation_read_rate_limit if read_only else self.last_rate_limit
+        same_read_incident = ((evidence or {}).get("phase") == "conversation_read"
+                              and type(read_sent_at) in (int, float) and math.isfinite(read_sent_at)
+                              and incident_failures > 0 and read_sent_at <= incident_at)
         if read_only:
             # Reads already in flight when a limit was observed belong to that
             # incident. Count every response, but do not turn one parallel burst
@@ -297,11 +478,17 @@ class AccountRequestClock:
             failures = self.conversation_read_rate_failures
             wait = max(0.0, self._read_cooldown_until() - now)
         else:
-            self.rate_failures += 1
-            self.last_rate_limit = now
+            # Retry-After still protects the entire account. Reads sent before
+            # this incident was observed are not successive retries, however:
+            # retain one backoff level and honor the longest explicit wait.
+            if not same_read_incident:
+                self.rate_failures += 1
+                self.last_rate_limit = now
             failures = self.rate_failures
-            wait = max(_backoff_seconds(failures), retry_after)
-            self.cooldown_until = max(self.cooldown_until, now + wait)
+            self.cooldown_until = max(self.cooldown_until,
+                                      self.last_rate_limit + _backoff_seconds(failures),
+                                      now + retry_after)
+            wait = max(0.0, self.cooldown_until - now)
         context = current_request.get()
         observed = {"layer": "upstream_chatgpt", "phase": "unknown", "origin": "http_429",
                     **(evidence or {}), "retry_after_seconds": retry_after,
@@ -323,7 +510,10 @@ class AccountRequestClock:
                         "retry_after_secs": retry_after, "cooldown_secs": wait, **observed})
 
     def request(self, send, method, url, **kwargs):
+        preparation_started = time.monotonic()
+        preparation_seconds = {}
         io_cleanup = kwargs.pop("_account_request_io_cleanup", None)
+        preparation_submit = kwargs.pop("_account_request_preparation_submit", None)
         deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
         minimum_budget = kwargs.pop("_account_request_minimum_budget_secs", None)
         if type(minimum_budget) not in (int, float) or not math.isfinite(minimum_budget) or minimum_budget <= 0:
@@ -331,7 +521,11 @@ class AccountRequestClock:
         local_wait = kwargs.pop("_account_request_local_wait", None)
         before_send = kwargs.pop("_account_request_before_send", None)
         preflight = kwargs.pop("_account_request_preflight", None)
+        preflight_read = kwargs.pop("_account_request_preflight_read", False)
+        preflight_model = kwargs.pop("_account_request_preflight_model", None)
         transport_model = kwargs.pop("_account_request_model", None)
+        if preflight_read and str(method).upper() != "GET":
+            raise ValueError("submission preflight must be read-only")
         if not isinstance(deadline_at, (int, float)) or isinstance(deadline_at, bool):
             deadline_at = None
 
@@ -353,14 +547,27 @@ class AccountRequestClock:
             if remaining is None:
                 return
             if minimum_budget is not None and remaining < minimum_budget:
-                raise AccountReadRetryBudgetInsufficient("original read retry connection budget unavailable")
+                raise AccountReadRetryBudgetInsufficient("original read connection budget unavailable")
             if remaining <= 0:
                 raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
             timeout = kwargs.get("timeout")
             if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
                 kwargs["timeout"] = max(0.001, min(float(timeout), remaining))
 
-        def wait_for_pace(delay: float, message: str) -> None:
+        read_wait_seconds = {}
+        read_http_attempts = 0
+        read_queue_position_max = 0
+
+        def measure_preparation(part, callback, *args):
+            if not is_turn:
+                return callback(*args)
+            began = time.monotonic()
+            try:
+                return callback(*args)
+            finally:
+                preparation_seconds[part] = preparation_seconds.get(part, 0.0) + max(0.0, time.monotonic() - began)
+
+        def wait_for_pace(delay: float, message: str, reason="account_pace") -> None:
             nonlocal deadline_at
             remaining = remaining_budget()
             # Credit only our configured pacing wait. A provider cooldown is
@@ -369,9 +576,21 @@ class AccountRequestClock:
             credit = callable(local_wait) and provider_wait <= time.monotonic()
             if remaining is not None and (remaining <= 0 or (not credit and delay >= remaining)):
                 raise AccountRequestDeadlineExceeded(message)
+            if (remaining is not None and minimum_budget is not None and not credit
+                    and remaining - delay < minimum_budget):
+                # No upstream attempt can fit after this known pacing wait.
+                # Return the existing not-sent deferral now, preserving the
+                # clock and leaving the caller to retry the same original read.
+                raise AccountReadRetryBudgetInsufficient("original read connection budget unavailable")
             started_wait = time.monotonic()
             time.sleep(delay)
             elapsed = max(0.0, time.monotonic() - started_wait)
+            if is_conversation_read:
+                read_wait_seconds[reason] = read_wait_seconds.get(reason, 0.0) + elapsed
+            if is_turn:
+                part = ("upstream_cooldown" if provider_wait > started_wait
+                        and provider_wait >= max(self.next_request, self.next_turn) else "account_pace")
+                preparation_seconds[part] = preparation_seconds.get(part, 0.0) + elapsed
             if credit and elapsed:
                 local_wait(elapsed)
                 if deadline_at is not None:
@@ -388,6 +607,8 @@ class AccountRequestClock:
                 phase = "conversation_archive" if body["is_archived"] else "conversation_restore"
         elif "/conversation/" in path and "/attachment/" not in path and str(method).upper() == "GET":
             phase = "conversation_read"
+        if preflight_read:
+            phase = "conversation_preflight"
         is_conversation_read = phase == "conversation_read"
         # Only the three read-only account observations used by get_user_info
         # may receive outside the pacing lock. Other account_read operations
@@ -404,11 +625,47 @@ class AccountRequestClock:
                 and isinstance(body["timezone_offset_min"], (int, float))
                 and not isinstance(body["timezone_offset_min"], bool)):
             metadata_kind = "account_limits"
-        concurrent_io = is_conversation_read or metadata_kind is not None
+        # Admitted independent turns keep their activity reservation in the
+        # request context. Serialize their durable send edge, not the wait for
+        # response headers. Legacy calls without admission retain old behavior.
+        concurrent_turn = is_turn and context is not None
+        # These preparation responses belong to one Backend/Session instance.
+        # Its synchronous caller still preserves bootstrap -> requirements ->
+        # conduit -> generation order. Do not generalize account_read: uploads,
+        # authentication and other writes do not share this independence.
+        concurrent_preparation = context is not None and (str(method).upper(), path) in {
+            ("GET", ""),
+            ("POST", "/backend-api/sentinel/chat-requirements/prepare"),
+            ("POST", "/backend-api/sentinel/chat-requirements/finalize"),
+            ("POST", "/backend-api/f/conversation/prepare"),
+        } and not urlparse(str(url)).query
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
+        # A fenced visibility PATCH for one conversation may receive alongside
+        # another conversation. Keep the durable send edge, not its response,
+        # under the account clock. Other PATCH operations remain unchanged.
+        concurrent_archive = archive_guard is not None and phase in {"conversation_archive", "conversation_restore"}
+        # Independent completion subscriptions and signed-URL lookups need
+        # only a paced send edge. Waiting for their headers must not lock out
+        # another conversation's generation/read. Keep the allowlist exact:
+        # uploads, file mutations and arbitrary attachment routes stay fenced.
+        concurrent_result_metadata = str(method).upper() == "GET" and not urlparse(str(url)).query and (
+            path == "/backend-api/celsius/ws/user"
+            or re.fullmatch(r"/backend-api/files/[^/]+/download", path) is not None
+            or re.fullmatch(r"/backend-api/conversation/[^/]+/attachment/[^/]+/download", path) is not None
+        )
+        concurrent_io = (is_conversation_read or metadata_kind is not None or concurrent_turn
+                         or concurrent_preparation or concurrent_archive or concurrent_result_metadata or preflight_read)
+        pooled_preparation = concurrent_preparation and callable(preparation_submit) and not kwargs.get("stream")
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
-        ordinary_owner = uuid.uuid4().hex if is_conversation_read and not read_owner else None
+        ordinary_owner = None
+        read_deferred = False
+        if is_conversation_read:
+            # Due image recovery may already hold a FIFO place before its
+            # worker starts. Reuse it at the actual GET; do not queue behind
+            # our own reservation. The original image claim prevents overlap.
+            ordinary_owner = (read_owner or (_image_read_owner(context.owner, context.request_id)
+                              if getattr(context, "kind", None) == "image" else uuid.uuid4().hex))
         if archive_guard is not None:
             archive_guard()
             # Each HTTP step must finish inside the renewed 300s work claim.
@@ -416,6 +673,7 @@ class AccountRequestClock:
             archive_deadline = time.monotonic() + 240
             deadline_at = min(deadline_at, archive_deadline) if deadline_at is not None else archive_deadline
         raw_model = (kwargs.get("json") or {}).get("model") if isinstance(kwargs.get("json"), dict) else None
+        raw_model = preflight_model if preflight_read else raw_model
         if not isinstance(raw_model, str) or len(raw_model) > 160:
             raw_model = transport_model
         model = raw_model if isinstance(raw_model, str) and len(raw_model) <= 160 else None
@@ -424,10 +682,18 @@ class AccountRequestClock:
         request_ref = request_ref or archive_observation.get("request_ref")
 
         def observed_send(send_method, send_url, send_phase, *, read_started=None, **send_kwargs):
+            nonlocal read_http_attempts
             # Count actual transport attempts, including metadata/preflight GETs.
             # Never log URLs, request bodies/headers, response bodies or exception
             # messages: conversation URLs and signed downloads can contain secrets.
             started_at, started = time.time(), time.monotonic()
+            # Snapshot before transport: response/SSE time is not preparation.
+            # Only actual model POST attempts receive these numeric fields;
+            # a failed local guard must not look like an upstream send.
+            preparation = ({
+                "pre_send_elapsed_secs": round(max(0.0, started - preparation_started), 6),
+                "pre_send_seconds_by_phase": {k: round(v, 6) for k, v in preparation_seconds.items()},
+            } if is_turn and send_phase == "conversation" else {})
             endpoint = urlparse(str(send_url)).path.rstrip("/")
             endpoint_kind = metadata_kind or send_phase
             if "/attachment/" in endpoint:
@@ -442,11 +708,15 @@ class AccountRequestClock:
                 endpoint_kind = "requirements"
             elif endpoint.endswith("/conversations"):
                 endpoint_kind = "conversation_list"
+            elif endpoint == "/backend-api/celsius/ws/user":
+                endpoint_kind = "completion_subscription"
             response = None
             transport_error = None
             transport_code = None
             transport_snapshot = {}
             try:
+                if send_phase == "conversation_read":
+                    read_http_attempts += 1
                 if read_started is not None:
                     read_started(started)
                 response = send(send_method, send_url, **send_kwargs)
@@ -485,19 +755,19 @@ class AccountRequestClock:
                              "archive_step": current_archive_step.get() if archive_guard is not None else None,
                              "method": verb if verb in {"GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "OPTIONS"} else "OTHER",
                              "phase": send_phase, "endpoint_kind": endpoint_kind, "started_at": started_at,
+                             **preparation,
                              "headers_elapsed_secs": round(time.monotonic() - started, 6),
                              "status_code": status if isinstance(status, int) and not isinstance(status, bool) else None,
                              "outcome": "response" if response is not None else "transport_error",
                              "transport_error_type": transport_error, "transport_error_code": transport_code,
                              **(transport_snapshot if response is None else _transport_snapshot(response)),
+                             **({"response_features": _rate_limit_response_features(response)} if status == 429 else {}),
                              "request_timeout_secs": timeout,
                              "stream": bool(send_kwargs.get("stream"))})
         # Serialize only the send edge. The account activity reservation lives
         # in PoolAdmission until the response stream is terminal; holding this
         # file lock for the whole stream would silently force capacity back to 1.
-        if is_turn:
-            acquire_with_budget(self.turn_lock)
-        pacing_held = is_turn
+        pacing_held = False
         turn_held = is_turn
         release_lock = threading.Lock()
 
@@ -516,105 +786,152 @@ class AccountRequestClock:
                     if context is not None:
                         context.release_turn()
 
+        def run_preflight():
+            if preflight is not None:
+                # The binding owner keeps same-conversation ordering. A slow
+                # original-read response must not hold the account turn mutex.
+                # Reuse the normal send-edge transport and cooldown merge, but
+                # preserve preflight evidence and its existing non-credit lane.
+                def read_original(read_method, read_url, **read_kwargs):
+                    if str(read_method).upper() != "GET":
+                        raise ValueError("submission preflight must be read-only")
+                    def credit_wait(elapsed):
+                        nonlocal deadline_at
+                        local_wait(elapsed)
+                        if deadline_at is not None:
+                            deadline_at += elapsed
+                    read_kwargs.setdefault("timeout", 60)
+                    return self.request(send, read_method, read_url,
+                        _account_request_preflight_read=True,
+                        _account_request_io_cleanup=io_cleanup,
+                        _account_request_preflight_model=model,
+                        _account_request_deadline_monotonic=deadline_at,
+                        _account_request_local_wait=credit_wait if callable(local_wait) else None,
+                        **read_kwargs)
+                measure_preparation("preflight", preflight, read_original)
+        refresh_wait_lock = threading.Lock()
+        refresh_wait_intervals = []
+
+        def credit_refresh_wait(elapsed):
+            nonlocal deadline_at
+            # Metadata readers overlap. Credit the union of local waits, not
+            # their sum; network time and provider cooldown never call this.
+            end = time.monotonic()
+            start = end - max(0.0, elapsed)
+            with refresh_wait_lock:
+                prior = sum(b - a for a, b in refresh_wait_intervals)
+                intervals = sorted([*refresh_wait_intervals, (start, end)])
+                merged = []
+                for a, b in intervals:
+                    if merged and a <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(b, merged[-1][1]))
+                    else:
+                        merged.append((a, b))
+                refresh_wait_intervals[:] = merged
+                credited = sum(b - a for a, b in merged) - prior
+                if credited > 0:
+                    local_wait(credited)
+                    if deadline_at is not None:
+                        deadline_at += credited
+
+        response = None
+        capability_refresh_attempted = False
         try:
             while True:
-                acquire_with_budget(self.lock)
+                run_preflight()
+                if is_turn:
+                    measure_preparation("turn_lock", acquire_with_budget, self.turn_lock)
+                    pacing_held = True
+                while True:
+                    measure_preparation("clock_lock", acquire_with_budget, self.lock)
+                    try:
+                        now = time.monotonic()
+                        read_delay, wait_reason = max((
+                            (max(0, self.next_request - now,
+                                 self.next_turn - now if is_turn or preflight_read else 0), "account_pace"),
+                            (max(0, self._read_ready(now) - now) if is_conversation_read else 0, "read_rate"),
+                            (max(0, self.cooldown_until - now,
+                                 self._read_cooldown_until() - now if is_conversation_read else 0), "upstream_cooldown")),
+                            key=lambda item: (item[0], item[1] == "upstream_cooldown"))
+                        if is_conversation_read:
+                            # Honor a live reservation from an older process until
+                            # consumed/expired; new archive reads join the same FIFO
+                            # as ordinary results, including their readback step.
+                            if self.archive_read_owner and self.archive_read_owner != read_owner and self.archive_read_until > now:
+                                # A live archive may release this lease immediately.
+                                # Recheck it promptly; retain the actual rate/cooldown floor.
+                                retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
+                                reservation_delay = min(retry_check, self.archive_read_until - now)
+                                if reservation_delay > read_delay:
+                                    wait_reason = "archive_reservation"
+                                read_delay = max(read_delay, reservation_delay)
+                            legacy_turn = bool(read_owner and self.archive_read_owner == read_owner
+                                               and self.archive_read_until > now)
+                            if not legacy_turn and not self._ordinary_read_turn(ordinary_owner, now, read_delay):
+                                # Give the reserved reader time to wake. Do not
+                                # consume another full upstream interval locally,
+                                # or add a whole second to fractional HTTP pacing.
+                                retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
+                                if retry_check > read_delay:
+                                    wait_reason = "result_fifo"
+                                read_delay = max(read_delay, retry_check)
+                            read_queue_position_max = max(read_queue_position_max,
+                                next((i + 1 for i, entry in enumerate(self.ordinary_read_queue)
+                                      if entry["owner"] == ordinary_owner), 0))
+                    except BaseException:
+                        self.lock.release()
+                        raise
+                    if not concurrent_io or read_delay <= 0:
+                        break
+                    # Waiting for a safe read must not occupy the shared send-edge lock
+                    # and delay a generation POST that is otherwise ready. Reload
+                    # all deadlines under the cross-process lock after waking.
+                    self.lock.release()
+                    if is_conversation_read and read_owner and current_archive_defer_reads.get():
+                        # Keep this FIFO position, but release the HTTP worker and
+                        # conversation binding lock. Re-entry reads the same chat;
+                        # an already-applied PATCH is confirmed by that fresh GET.
+                        read_deferred = True
+                        raise ArchiveReadDeferred(time.time() + read_delay)
+                    wait_for_pace(read_delay, "account request deadline elapsed during read wait", wait_reason)
+                clock_held = True
                 try:
-                    now = time.monotonic()
-                    read_delay = max(self.next_request, self.cooldown_until,
-                                     self.next_conversation_read if is_conversation_read else 0) - now
-                    if is_conversation_read and read_owner:
-                        if not self._reserve_archive_read(read_owner, now):
-                            other = self.archive_read_until if self.archive_read_until > now else 0.0
-                            ordinary = self.ordinary_read_wait_until if self.last_read_was_archive else 0.0
-                            read_delay = max(read_delay, other - now, ordinary - now)
-                    elif is_conversation_read:
-                        if self.archive_read_owner and self.archive_read_until > now:
-                            read_delay = max(read_delay, self.archive_read_until - now)
-                        if not self._ordinary_read_turn(ordinary_owner, now, read_delay):
-                            # Give the reserved reader time to wake. Do not
-                            # consume another full upstream interval locally,
-                            # or add a whole second to fractional HTTP pacing.
-                            retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
-                            read_delay = max(read_delay, retry_check)
+                    self._expire_backoff()
+                    ready = max(self.next_request, self.cooldown_until,
+                                self.next_turn if is_turn or preflight_read else 0.0)
+                    delay = ready - time.monotonic()
+                    if delay > 0:
+                        wait_for_pace(delay, "account request deadline elapsed during cooldown wait")
+
+                    refresh = (getattr(context, "image_capability_refresh", lambda: None)()
+                               if context is not None and is_turn and not capability_refresh_attempted
+                               else None)
+                    if refresh is None:
+                        break
                 except BaseException:
                     self.lock.release()
+                    clock_held = False
                     raise
-                if not concurrent_io or read_delay <= 0:
-                    break
-                # Waiting for a safe read must not occupy the shared send-edge lock
-                # and delay a generation POST that is otherwise ready. Reload
-                # all deadlines under the cross-process lock after waking.
+                # Capacity may expire during local pacing. Refresh the original
+                # claim without holding either send mutex, then recheck its
+                # cursor and the full send edge. Independent turns stay free.
+                capability_refresh_attempted = True
                 self.lock.release()
-                wait_for_pace(read_delay, "account request deadline elapsed during read wait")
-            clock_held = True
+                clock_held = False
+                release_pacing()
+                refresh_deadline = time.monotonic() + 240
+                if deadline_at is not None:
+                    refresh_deadline = min(refresh_deadline, deadline_at)
+                def refresh_original():
+                    refresh(refresh_deadline, **({"local_wait": credit_refresh_wait}
+                            if callable(local_wait) else {}))
+                measure_preparation("capability_refresh", refresh_original)
             response = None
             try:
-                self._expire_backoff()
-                ready = max(self.next_request, self.cooldown_until,
-                            self.next_turn if is_turn else 0.0)
-                delay = ready - time.monotonic()
-                if delay > 0:
-                    wait_for_pace(delay, "account request deadline elapsed during cooldown wait")
-                refresh = (getattr(context, "image_capability_refresh", lambda: None)()
-                           if context is not None and is_turn else None)
-                if refresh is not None:
-                    # Prepared images must not loop through uploads because
-                    # their capacity observation expired during local pacing.
-                    # Metadata uses this same clock: release it before reading,
-                    # retain the original turn, then apply its new pace and all
-                    # ordinary claim/binding/capacity guards again.
-                    self.lock.release()
-                    clock_held = False
-                    refresh_deadline = time.monotonic() + 240
-                    if deadline_at is not None:
-                        refresh_deadline = min(refresh_deadline, deadline_at)
-                    refresh(refresh_deadline)
-                    acquire_with_budget(self.lock)
-                    clock_held = True
-                    self._expire_backoff()
-                    delay = max(self.next_request, self.cooldown_until, self.next_turn) - time.monotonic()
-                    if delay > 0:
-                        wait_for_pace(delay, "account request deadline elapsed after capability read")
-                if preflight is not None:
-                    # A superseded original may arrive during the cooldown.
-                    # This GET shares the held pacing lock and raw transport;
-                    # recursively calling the paced session would deadlock.
-                    def read_original(read_method, read_url, **read_kwargs):
-                        if str(read_method).upper() != "GET":
-                            raise ValueError("submission preflight must be read-only")
-                        remaining = remaining_budget()
-                        if remaining is not None:
-                            if remaining <= 0:
-                                raise AccountRequestDeadlineExceeded("preflight deadline elapsed")
-                            read_kwargs["timeout"] = min(float(read_kwargs.get("timeout", 60)), remaining)
-                        self.next_request = time.monotonic() + min(60.0, config.account_request_interval_secs * 2 ** min(self.rate_failures, 4))
-                        self._save()
-                        sent_at = time.monotonic()
-                        try:
-                            response = observed_send(read_method, read_url, "conversation_preflight", **read_kwargs)
-                        finally:
-                            # Persisting the reservation can itself take time.
-                            # Correct its floor from the actual transport edge
-                            # before another caller can acquire this clock.
-                            self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * 2 ** min(self.rate_failures, 4)))
-                            self._save()
-                        if response.status_code == 429:
-                            request_id = (response.headers.get("x-request-id") or response.headers.get("openai-request-id"))
-                            safe_id = request_id if isinstance(request_id, str) and len(request_id) <= 160 and request_id.isascii() and not any(c.isspace() for c in request_id) else None
-                            self.limited(retry_after_seconds(response.headers.get("Retry-After")),
-                                         retry_after_present="Retry-After" in response.headers,
-                                         evidence={"phase": "conversation_preflight", "model": model, "origin": "http_429", "upstream_request_id": safe_id})
-                        return response
-                    preflight(read_original)
-                    # The metadata GET does not bypass the account request pace.
-                    delay = max(self.next_request, self.cooldown_until, self.next_turn if is_turn else 0.0) - time.monotonic()
-                    if delay > 0:
-                        wait_for_pace(delay, "deadline elapsed after preflight")
                 if context is not None and is_turn:
-                    context.before_send()
+                    measure_preparation("admission_guard", context.before_send)
                 if callable(before_send):
-                    before_send()
+                    measure_preparation("submission_callback", before_send)
                 if archive_guard is not None:
                     archive_guard()
                 # Receipt persistence and final fences must not consume the
@@ -623,10 +940,18 @@ class AccountRequestClock:
                 cap_timeout_before_send()
                 factor = 2 ** min(self.rate_failures, 4)
                 self.next_request = now + min(60.0, config.account_request_interval_secs * factor)
-                read_factor = 2 ** min(max(self.rate_failures, self.conversation_read_rate_failures), 4)
-                read_interval = min(300.0, getattr(config, "account_conversation_read_interval_secs", 0.0) * read_factor)
+                read_correction_applied = False
+                def correct_read_start(sent_at):
+                    nonlocal read_correction_applied
+                    if is_conversation_read and not read_correction_applied:
+                        # Still under the send mutex: no later reader has consumed
+                        # credit yet. Never repeat this after reloading late replies.
+                        delay = max(0.0, sent_at - now)
+                        self.conversation_read_bucket["at"] += delay
+                        self.next_conversation_read += delay
+                        read_correction_applied = True
                 if is_conversation_read:
-                    self.next_conversation_read = now + read_interval
+                    self._consume_read(now)
                     self.last_read_was_archive = archive_guard is not None
                     if read_owner and self.archive_read_owner == read_owner:
                         self.archive_read_owner = None
@@ -644,18 +969,18 @@ class AccountRequestClock:
                     self.last_turn_started = now
                 # Reserve the interval before sending. Restarting after an
                 # unknown response must not erase the account's wait period.
-                self._save()
+                measure_preparation("clock_persistence", self._save)
                 # Saving pacing state and the submission receipt can consume
                 # part of the declared budget; cap once more at the send edge.
                 cap_timeout_before_send()
                 if context is not None and is_turn and hasattr(context, "record_stage"):
-                    context.record_stage("send_call_started")
+                    measure_preparation("send_receipt", context.record_stage, "send_call_started")
                 sent_at = time.monotonic()
                 try:
                     if concurrent_io:
                         # Keep the durable clock through the local transport-call
                         # edge, not through the network response. Other original
-                        # conversations may read once their own start floor is due.
+                        # conversations may send once their start floor is due.
                         # The caller still joins this one timeout-limited request;
                         # no retry, detached task or new scheduling queue is added.
                         entered = threading.Event()
@@ -673,7 +998,7 @@ class AccountRequestClock:
                             except BaseException as exc:
                                 outcome["error"] = exc
                             finally:
-                                if callable(io_cleanup):
+                                if callable(io_cleanup) and not pooled_preparation:
                                     try:
                                         io_cleanup()
                                     except Exception:
@@ -681,9 +1006,12 @@ class AccountRequestClock:
                                                         "account": self.account_key})
                                 entered.set()
                         worker_context = copy_context()
-                        worker = threading.Thread(target=worker_context.run, args=(read_io,),
-                                                  name="account-metadata-read" if metadata_kind else "original-conversation-read")
-                        worker.start()
+                        if pooled_preparation:
+                            worker = preparation_submit(worker_context.run, read_io)
+                        else:
+                            worker = threading.Thread(target=worker_context.run, args=(read_io,),
+                                                      name="account-model-send" if concurrent_turn else "account-turn-prepare" if concurrent_preparation else "account-metadata-read" if metadata_kind else "original-conversation-read")
+                            worker.start()
                         reservation_error = None
                         floor_durable = False
                         try:
@@ -692,8 +1020,10 @@ class AccountRequestClock:
                                 raise outcome["error"]
                             sent_at = outcome["started_at"]
                             self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
-                            if is_conversation_read:
-                                self.next_conversation_read = max(self.next_conversation_read, sent_at + read_interval)
+                            correct_read_start(sent_at)
+                            if is_turn:
+                                self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
+                                self.last_turn_started = max(self.last_turn_started or sent_at, sent_at)
                             self._save()
                             floor_durable = True
                         except BaseException as exc:
@@ -705,14 +1035,21 @@ class AccountRequestClock:
                         if floor_durable:
                             self.lock.release()
                             clock_held = False
+                            release_pacing()
                         try:
                             # Reap the transport even on caller interruption;
-                            # never leave a late GET running after this returns.
-                            while worker.is_alive():
+                            # never leave a late transport running after return.
+                            while True:
                                 try:
-                                    worker.join()
+                                    if pooled_preparation:
+                                        worker.result()
+                                    else:
+                                        worker.join()
+                                    break
                                 except BaseException as exc:
                                     reservation_error = reservation_error or exc
+                                    if pooled_preparation and worker.done():
+                                        break
                         finally:
                             response = outcome.get("response")
                             # This is result/cooldown reconciliation, not a new
@@ -732,11 +1069,10 @@ class AccountRequestClock:
                     # then account for its I/O delay even if transport fails.
                     if clock_held:
                         self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
-                        if is_conversation_read:
-                            self.next_conversation_read = max(self.next_conversation_read, sent_at + read_interval)
+                        correct_read_start(sent_at)
                         if is_turn:
                             self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
-                            self.last_turn_started = sent_at
+                            self.last_turn_started = max(self.last_turn_started or sent_at, sent_at)
                         self._save()
                 release_pacing()
                 response_headers = getattr(response, "headers", {}) or {}
@@ -746,16 +1082,14 @@ class AccountRequestClock:
                     self.limited(retry_after_seconds(response_headers.get("Retry-After")),
                                  retry_after_present="Retry-After" in response_headers,
                                  read_sent_at=sent_at if is_conversation_read else None,
-                                 evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id})
+                                 evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id,
+                                           "response_features": _rate_limit_response_features(response)})
                 if concurrent_io and reservation_error is not None:
-                    response.close()
                     raise reservation_error
                 if context is not None and is_turn and hasattr(context, "record_stage"):
                     context.record_stage("response_headers_received", status_code=response.status_code,
                                          upstream_request_id=safe_id)
             finally:
-                if not clock_held and response is not None:
-                    response.close()
                 if clock_held:
                     self.lock.release()
             if is_turn and kwargs.get("stream") and 200 <= response.status_code < 300:
@@ -790,11 +1124,26 @@ class AccountRequestClock:
                 release_turn()
             return response
         except BaseException:
+            # A persistence/reconciliation failure after headers must reap the
+            # original stream too. No response has been transferred to a caller.
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    logger.warning({"event": "account_transport_cleanup_failed",
+                                    "account": self.account_key})
             release_pacing()
             release_turn()
             raise
         finally:
-            if ordinary_owner:
+            if is_conversation_read:
+                logger.info({"event": "account_read_wait_finished", "account": self.account_key,
+                    "request_ref": request_ref, "work_ref": archive_observation.get("work_ref"),
+                    "archive_step": current_archive_step.get() if archive_guard is not None else None,
+                    "observed_at": time.time(), "http_attempts": read_http_attempts,
+                    "queue_position_max": read_queue_position_max,
+                    "wait_seconds_by_controlling_reason": {k: round(v, 6) for k, v in read_wait_seconds.items()}})
+            if ordinary_owner and not read_deferred:
                 # Deadline/preflight/transport failure must not leave a live
                 # caller's place blocking the following result reader.
                 try:
@@ -882,6 +1231,17 @@ def account_pacing_snapshot(account, now=None, *, include_turn=True, include_con
             return {"next_at": None, "cooldown_until": None}
         if failures:
             cooldown = max(cooldown, limited_at + _backoff_seconds(failures))
+        try:
+            last_global_limit = float(saved.get("last_rate_limit", 0.0))
+            if not math.isfinite(last_global_limit):
+                raise ValueError("Invalid saved account rate limit")
+            interval, capacity = _read_policy(now, max(0, int(saved.get("rate_failures", 0))),
+                                             last_global_limit, failures, limited_at)
+            bucket = _checked_read_bucket(saved.get("conversation_read_bucket"))
+            values.append(_read_credit(bucket, now, interval, capacity,
+                                       saved.get("next_conversation_read", 0.0))[2])
+        except (TypeError, ValueError, OverflowError, KeyError):
+            return {"next_at": None, "cooldown_until": None}
     return {"next_at": max(now, cooldown, *values), "cooldown_until": cooldown}
 
 
@@ -889,10 +1249,27 @@ _clocks: dict[str, AccountRequestClock] = {}
 _clocks_lock = threading.Lock()
 
 
-def reserve_account_archive_read(account, owner):
-    """Best-effort booking outside SQLite transactions; never wait on HTTP."""
+def _image_read_owner(owner, request_id):
+    return "image:" + hashlib.sha256(json.dumps([owner, request_id]).encode()).hexdigest()
+
+
+def reserve_account_image_recovery_read(account, owner, request_id):
+    """Join the existing read FIFO without an I/O worker or consuming credit.
+
+    Called only for due original image recovery, outside account/SQLite locks.
+    Each scan renews the existing short lease; a stopped/dead task expires by
+    the same rule as other readers. The transport still enforces every clock.
+    """
+    return _image_recovery_read_reservation(account, owner, request_id, cancel=False)
+
+
+def release_account_image_recovery_read(account, owner, request_id):
+    return _image_recovery_read_reservation(account, owner, request_id, cancel=True)
+
+
+def _image_recovery_read_reservation(account, owner, request_id, *, cancel):
     identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
-    if not identity or not getattr(config, "account_conversation_read_interval_secs", 0.0):
+    if not identity:
         return False
     key = hashlib.sha256(identity.encode()).hexdigest()
     try:
@@ -904,10 +1281,67 @@ def reserve_account_archive_read(account, owner):
         if not clock.lock.acquire(blocking=False):
             return False
         try:
-            return clock._reserve_archive_read(owner, time.monotonic())
+            read_owner = _image_read_owner(owner, request_id)
+            if cancel:
+                clock._release_ordinary_read(read_owner)
+                return True
+            now = time.monotonic()
+            if max(clock.cooldown_until, clock._read_cooldown_until()) > now:
+                clock._release_ordinary_read(read_owner)
+                return False
+            delay = max(0, clock.next_request - now, clock._read_ready(now) - now)
+            if not getattr(config, "account_conversation_read_interval_secs", 0.0):
+                clock._release_ordinary_read(read_owner)
+                return delay <= 0
+            first = clock._ordinary_read_turn(read_owner, now, delay)
+            return first and delay <= 0 and not (clock.archive_read_owner and clock.archive_read_until > now)
         finally:
             clock.lock.release()
     except (OSError, ValueError):
+        return False
+
+
+def reserve_account_archive_read(account, owner):
+    """Join the shared result FIFO outside SQLite; never occupy an I/O worker."""
+    return _archive_read_reservation(account, owner, cancel=False)
+
+
+def release_account_archive_read(account, owner):
+    return _archive_read_reservation(account, owner, cancel=True)
+
+
+def _archive_read_reservation(account, owner, *, cancel):
+    identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
+    if not identity:
+        return False
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    try:
+        with _clocks_lock:
+            clock = _clocks.get(key)
+            if clock is None:
+                clock = AccountRequestClock(key[:12], DATA_DIR / "account_request_clocks" / f"{key}.json")
+                _clocks[key] = clock
+        if not clock.lock.acquire(blocking=False):
+            return False
+        try:
+            if cancel:
+                clock._release_ordinary_read(owner)
+                return True
+            now = time.monotonic()
+            delay = max(0, clock.next_request - now, clock.cooldown_until - now, clock._read_ready(now) - now)
+            live = [entry for entry in clock.ordinary_read_queue if entry["until"] > now]
+            if live and not any(entry["owner"] == owner for entry in live):
+                # Pre-dispatch books at most the next archive, never a whole
+                # backlog ahead of ordinary results. Already-running readbacks
+                # join at the actual GET boundary and retain their FIFO place.
+                return False
+            first = clock._ordinary_read_turn(owner, now, delay)
+            legacy_busy = (clock.archive_read_owner and clock.archive_read_owner != owner
+                           and clock.archive_read_until > now)
+            return first and delay <= 0 and not legacy_busy
+        finally:
+            clock.lock.release()
+    except (OSError, ValueError, KeyError):
         return False
 
 
@@ -986,10 +1420,11 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
     raw_send = session.request
 
     def close_read_transport():
-        # Buffered GETs run on a joined, short-lived I/O thread. Session.close
+        # Joined requests run on a short-lived I/O thread. Session.close
         # on the caller cannot close this thread-local handle; retained errors
         # can otherwise keep it alive through a traceback cycle until GC.
-        # Never close the Session or any other thread's stream/handle here.
+        # Streaming curl_cffi responses use a separate duphandle; only this
+        # thread's idle source handle is closed, never the live stream clone.
         if isinstance(session, Session) and session._use_thread_local_curl:
             local = session._local
             curl = getattr(local, "curl", None)
@@ -998,6 +1433,56 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
                     curl.close()
                 finally:
                     del local.curl
+
+    preparation_submit = None
+    if isinstance(session, Session) and session._use_thread_local_curl:
+        # One short-lived Backend owns one Session. Keep its four synchronous
+        # preparation steps on the same worker so libcurl can reuse connections;
+        # independent Backends still run in parallel. The Session's own executor
+        # runs SSE and must not be reused as this single-worker lane.
+        from concurrent.futures import ThreadPoolExecutor
+        preparation_executor = None
+        preparation_lock = threading.Lock()
+        preparation_closed = False
+        preparation_worker_id = None
+        close_session = session.close
+
+        def identify_preparation_worker():
+            nonlocal preparation_worker_id
+            preparation_worker_id = threading.get_ident()
+
+        def submit_preparation(callback, *args):
+            nonlocal preparation_executor
+            with preparation_lock:
+                if preparation_closed:
+                    raise RuntimeError("preparation session is closed")
+                if preparation_executor is None:
+                    preparation_executor = ThreadPoolExecutor(max_workers=1,
+                        thread_name_prefix="account-session-prepare", initializer=identify_preparation_worker)
+                return preparation_executor.submit(callback, *args)
+
+        def close_with_preparation():
+            nonlocal preparation_closed
+            with preparation_lock:
+                if preparation_closed:
+                    return
+                preparation_closed = True
+                executor = preparation_executor
+            try:
+                if executor is not None:
+                    on_worker = threading.get_ident() == preparation_worker_id
+                    try:
+                        if on_worker:
+                            close_read_transport()
+                        else:
+                            executor.submit(close_read_transport).result()
+                    finally:
+                        executor.shutdown(wait=not on_worker)
+            finally:
+                close_session()
+
+        preparation_submit = submit_preparation
+        session.close = close_with_preparation
 
     def send(method, url, **kwargs):
         connect = kwargs.pop("_account_request_connect_timeout_secs", None)
@@ -1010,7 +1495,12 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
             # to the caller's existing deadline or mutate shared curl options.
             connect = min(connect, timeout)
             kwargs["timeout"] = (connect, timeout - connect)
-        return _send_with_bounded_stream_close(session, raw_send, method, url, **kwargs)
+        try:
+            return _send_with_bounded_stream_close(session, raw_send, method, url, **kwargs)
+        except Exception as exc:
+            if str(method).upper() == "POST" and _connect_failed_before_request(session, exc):
+                exc._account_request_not_submitted = True
+            raise
 
     def paced_request(method, url, **kwargs):
         # Object-storage downloads are not ChatGPT account API calls.
@@ -1034,6 +1524,7 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
                 and str(account.get("type") or "").strip().lower() == "free"):
             raise RuntimeError("Free account messages are disabled")
         return clock.request(send, method, url,
-                             _account_request_io_cleanup=close_read_transport, **kwargs)
+                             _account_request_io_cleanup=close_read_transport,
+                             _account_request_preparation_submit=preparation_submit, **kwargs)
 
     session.request = paced_request

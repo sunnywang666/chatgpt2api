@@ -35,6 +35,10 @@ class ClientError(RuntimeError):
     """A safe user-facing error that never contains credentials."""
 
 
+class TransportUncertain(ClientError):
+    """The transport ended without establishing the original operation's outcome."""
+
+
 class HttpFailure(ClientError):
     def __init__(self, status: int, detail: str, *, not_sent=False, retry_after=None):
         self.status = status
@@ -172,7 +176,7 @@ class ApiClient:
                               retry_after=getattr(exc, "pool_retry_after", None)) from exc
         except (TimeoutError, error.URLError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
-            raise ClientError(f"request result is unknown: {reason}") from exc
+            raise TransportUncertain(f"request result is unknown: {reason}") from exc
 
     def json(self, method: str, endpoint: str, *, payload: object | None = None, body: bytes | None = None, content_type: str = "") -> dict[str, Any]:
         if payload is not None:
@@ -182,7 +186,7 @@ class ApiClient:
             with self.open(method, endpoint, body=body, content_type=content_type) as response:
                 raw = response.read(MAX_JSON_BYTES + 1)
         except (OSError, HTTPException) as exc:
-            raise ClientError("response interrupted; query the original durable request") from exc
+            raise TransportUncertain("response interrupted; query the original durable request") from exc
         if len(raw) > MAX_JSON_BYTES:
             raise ClientError("server JSON response exceeds 4 MiB")
         try:
@@ -245,6 +249,41 @@ def _submit_original(api, state_path, state, endpoint, **kwargs):
                 state["retry_not_before"] = time.time() + exc.retry_after
             _atomic_write_state(state_path, state)
             if attempt or exc.status not in {429, 503} or exc.retry_after is None:
+                raise
+
+
+def _post_original_control(api, state_path, state, endpoint, payload):
+    """Retry one explicitly unaccepted control, never an uncertain operation."""
+    for attempt in range(2):
+        pending = state.get("control_retry") or {}
+        same_control = pending.get("endpoint") == endpoint and pending.get("payload") == payload
+        if same_control and pending.get("status") == "not_sent":
+            delay = max(0, pending.get("retry_not_before", 0) - time.time())
+            if delay > 30:
+                raise ClientError("original control was not accepted; retry after its persisted cooldown")
+            if delay:
+                time.sleep(delay)
+            # Invalidate the old not-sent proof before this transport attempt.
+            pending.pop("retry_not_before", None)
+            pending["status"] = "unknown"
+            _atomic_write_state(state_path, state)
+        try:
+            result = api.json("POST", endpoint, payload=payload)
+            if same_control:
+                pending["status"] = "acknowledged_after_retry"
+                _atomic_write_state(state_path, state)
+            return result
+        except HttpFailure as exc:
+            if not exc.not_sent:
+                raise
+            pending = {"endpoint": endpoint, "payload": payload, "http_status": exc.status,
+                       "status": "not_sent"}
+            if exc.retry_after is not None:
+                pending["retry_not_before"] = time.time() + exc.retry_after
+            state["control_retry"] = pending
+            _atomic_write_state(state_path, state)
+            if (attempt or exc.status not in {429, 503} or exc.retry_after is None
+                    or exc.retry_after > 30):
                 raise
 
 
@@ -988,7 +1027,7 @@ def _command_completion(api: ApiClient, args: argparse.Namespace) -> int:
             payload = {"action": action, "selected_id": selected}
             if action == "complete":
                 payload.update(results_saved=True, reviewed=True)
-            current = api.json("POST", endpoint, payload=payload)
+            current = _post_original_control(api, path, state, endpoint, payload)
             if current.get("original_id") != original_id or current.get("selected_id") != selected:
                 raise ClientError("completion acknowledgement changed result identity")
             state["completion"] = current
@@ -1050,38 +1089,45 @@ def _command_work_lifecycle(api: ApiClient, args: argparse.Namespace) -> int:
         _atomic_write_state(path, state)
         try:
             try:
-                result = api.json("POST", endpoint, payload={})
-            except HttpFailure as exc:
-                if not archived or (exc.status, exc.detail) not in {
-                    (409, "WORK_TURN_UNFINISHED"), (503, "WORK_ARCHIVE_UNCONFIRMED")
-                }:
+                result = _post_original_control(api, path, state, endpoint, {})
+            except (HttpFailure, TransportUncertain) as exc:
+                interrupted = isinstance(exc, TransportUncertain)
+                if isinstance(exc, HttpFailure) and exc.not_sent:
+                    raise
+                waiting_turn = (archived and isinstance(exc, HttpFailure)
+                                and (exc.status, exc.detail) == (409, "WORK_TURN_UNFINISHED"))
+                if not interrupted and not waiting_turn and (exc.status, exc.detail) != (503, "WORK_ARCHIVE_UNCONFIRMED"):
                     raise
                 # A saved result can precede execution-claim cleanup; a
-                # committed archive intent can precede its upstream readback.
-                # Read this same work instead of labelling either as UNKNOWN.
+                # committed archive/restore intent can outlast this HTTP call.
+                # Read this same work once; never repeat an uncertain POST.
                 work = api.json("GET", f"/api/{'chat-requests' if chat else 'image-tasks'}/{parse.quote(task_id, safe='')}/work")
                 ref = expected.get("client_conversation_id" if chat else "id")
                 if (not isinstance(work, dict) or work.get("protocol") != "work-v1" or work.get("request_id") != task_id
                         or work.get("kind") != ("text" if chat else "image") or work.get("work_ref") != ref
-                        or work.get("state") not in {"active", "completed"}
-                        or exc.detail == "WORK_ARCHIVE_UNCONFIRMED" and work.get("state") != "completed"):
+                        or work.get("state") not in ({"active", "completed"} if archived else {"restoring", "active"})
+                        or archived and not waiting_turn and work.get("state") != "completed"):
                     raise ClientError("pending lifecycle response changed the original work")
                 state["work"] = work
                 archive = work.get("archive") or {}
                 if not isinstance(archive, dict):
                     raise ClientError("original work archive is not confirmed or safely pending")
-                if work["state"] == "active":
+                if waiting_turn and work["state"] == "active":
                     lifecycle = "waiting_turn"
-                elif (archive.get("status") == "confirmed" and archive.get("archived") is True
-                      and archive.get("desired") is True):
+                elif (archive.get("status") == "confirmed" and archive.get("archived") is archived
+                      and archive.get("desired") is archived
+                      and work["state"] == ("completed" if archived else "active")):
                     lifecycle = "confirmed"
-                elif archive.get("status") in {"pending", "running"} and archive.get("desired") is True and not archive.get("error_code"):
+                elif (archive.get("status") in {"pending", "running"} and archive.get("desired") is archived
+                      and work["state"] == ("completed" if archived else "restoring") and not archive.get("error_code")):
                     lifecycle = "pending"
                 else:
                     raise ClientError("original work archive is not confirmed or safely pending")
                 state["lifecycle"].update(status=lifecycle, updated_at=_utc_now())
+                if interrupted:
+                    state["lifecycle"]["transport_interrupted"] = True
                 if lifecycle == "confirmed":
-                    state["lifecycle"]["archived"] = True
+                    state["lifecycle"]["archived"] = archived
                 _atomic_write_state(path, state)
                 _emit({"request_id": task_id, "waiting": lifecycle != "confirmed", "work": work})
                 return 0 if lifecycle == "confirmed" else 2
@@ -1092,7 +1138,10 @@ def _command_work_lifecycle(api: ApiClient, args: argparse.Namespace) -> int:
                     or scope.get(scope_key) != expected.get(scope_key)):
                 raise ClientError("lifecycle response did not confirm the original work and archive state")
         except ClientError:
-            state["lifecycle"].update(status="unknown", updated_at=_utc_now())
+            pending = state.get("control_retry") or {}
+            not_sent = (pending.get("endpoint") == endpoint and pending.get("payload") == {}
+                        and pending.get("status") == "not_sent")
+            state["lifecycle"].update(status="not_sent" if not_sent else "unknown", updated_at=_utc_now())
             _atomic_write_state(path, state)
             raise
         state["lifecycle"].update(status="confirmed", archived=archived, updated_at=_utc_now())

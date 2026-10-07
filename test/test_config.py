@@ -138,6 +138,21 @@ class PacingSettingsTests(unittest.TestCase):
                 self.assertEqual(reopened.account_message_interval_secs, value)
                 self.assertNotIn(_EXPLICIT_MESSAGE_SPACING, reopened.get())
 
+    def test_read_burst_is_opt_in_and_rejects_invalid_updates_atomically(self):
+        from services.config import ConfigStore
+        self.assertEqual(self.store.get()["account_conversation_read_burst"], 1)
+        self.store.update({"account_conversation_read_burst": 10})
+        self.assertEqual(ConfigStore(self.path).account_conversation_read_burst, 10)
+        before = self.path.read_bytes()
+        for value in (0, 101, 1.5, True, "10", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.store.update({"account_conversation_read_burst": value, "proxy": "must-not-change"})
+            self.assertEqual(self.path.read_bytes(), before)
+        saved = json.loads(self.path.read_text())
+        saved["account_conversation_read_burst"] = "invalid-legacy"
+        self.path.write_text(json.dumps(saved))
+        self.assertEqual(ConfigStore(self.path).account_conversation_read_burst, 1)
+
     def test_conversation_read_setting_is_independent_and_defaults_to_no_extra_floor(self):
         from services.config import ConfigStore
         self.assertEqual(self.store.get()["account_conversation_read_interval_secs"], 0)
