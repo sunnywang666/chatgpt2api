@@ -224,7 +224,7 @@ def _safe_recovery_error(code: str, phase: str) -> str:
         "RECOVERY_RATE_LIMITED": "Image result lookup is rate limited; retry after the provider cooldown.",
         "RECOVERY_AUTH_REQUIRED": "Image result lookup requires the bound account connection to be restored.",
         "RECOVERY_TRANSPORT_FAILED": "Image result lookup could not reach the provider; retry when connectivity returns.",
-        "RECOVERY_READ_FAILED": "Image result lookup returned an unreadable response; retry the same request lookup.",
+        "RECOVERY_READ_FAILED": "Image result lookup could not verify the original result; retry the same request lookup.",
         "RECOVERY_TIMED_OUT": "Image result lookup timed out; retry the same request lookup.",
     }.get(code, "Image result lookup did not complete; retry the same request lookup.")
 

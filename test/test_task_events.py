@@ -392,6 +392,93 @@ def test_automatic_completion_notifies_selected_result_without_ending_wait_early
     assert 'private-result' not in response.text and 'binding' not in response.text
 
 
+def test_completion_notification_waits_across_reserved_child_submit(runtime, monkeypatch):
+    client, put, identity, store = runtime
+    client.app.state.event_service.admission = SimpleNamespace(generation_completion=object())
+    root, child = completion_rows()
+    root['_completion'].update(state='replacement_pending', replacement_id='child',
+                               prepared_input='private-input-path')
+    put(**root)
+    with store.transaction() as db:
+        store.set_runtime(db, 'work', {'state': 'active'})
+    calls = 0
+    def authenticate(*a, **k):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            put(rid='child', **child)
+        elif calls == 3:
+            root['_completion'].update(state='result_ready', selected_id='child', next_at=None)
+            child.update(status='success', data=[{'url': 'private-result'}], _image_thread_terminal=True)
+            put(**root); put(rid='child', **child)
+        return identity.copy()
+    monkeypatch.setattr(events, 'require_identity', authenticate)
+    response = client.get('/api/image-tasks/original/events')
+    assert calls == 3
+    assert 'event: needs_attention' not in response.text
+    assert '"recovering_original":true' in response.text
+    assert response.text.count('event: result_ready\n') == 1
+    assert '"selected_result_id":"child"' in response.text
+    assert 'private-' not in response.text
+
+
+@pytest.mark.parametrize('change', ['proof_missing_source', 'proof_stale', 'proof_wrong_binding',
+                                    'result_asset', 'upstream_unfinished'])
+def test_scheduled_original_investigation_waits_until_completion_stops(runtime, monkeypatch, change):
+    client, put, identity, store = runtime
+    client.app.state.event_service.admission = SimpleNamespace(generation_completion=object())
+    root, _ = completion_rows()
+    if change == 'proof_missing_source': root['_retry_cursor'].pop('source')
+    if change == 'proof_stale': root['_retry_cursor']['observed_at'] -= 301
+    if change == 'proof_wrong_binding': root['_retry_cursor']['conversation_id'] = 'other'
+    if change == 'result_asset': root['result_file_ids'] = ['existing-asset']
+    if change == 'upstream_unfinished': root['upstream_unfinished'] = True
+    with store.transaction() as db:
+        store.set_runtime(db, 'work', {'state': 'active'})
+    # Without a scheduled completion, invalid proof must not invent one.
+    unscheduled = {k: v for k, v in root.items() if k != '_completion'}
+    unscheduled['_automatic_generation_recovery'] = True
+    put(**unscheduled)
+    assert events._snapshot('image', client.app.state.event_service, identity, 'original').get('completion_state') is None
+    put(**root)
+    calls = 0
+    def authenticate(*a, **k):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            root['_completion'].update(state='needs_attention', next_at=None)
+            put(**root)
+        return identity.copy()
+    monkeypatch.setattr(events, 'require_identity', authenticate)
+    response = client.get('/api/image-tasks/original/events')
+    assert calls == 2
+    assert '"completion_state":"checking_original"' in response.text
+    assert 'event: needs_attention' in response.text
+    assert 'event: result_ready' not in response.text
+
+
+@pytest.mark.parametrize('change', ['no_prepared_input', 'wrong_binding', 'wrong_thread', 'wrong_lineage', 'child_paused'])
+def test_reserved_completion_does_not_hide_invalid_child(runtime, monkeypatch, change):
+    client, put, _, store = runtime
+    client.app.state.event_service.admission = SimpleNamespace(generation_completion=object())
+    root, child = completion_rows()
+    root['_completion'].update(state='replacement_pending', replacement_id='child', prepared_input='private-input')
+    if change == 'no_prepared_input': root['_completion'].pop('prepared_input')
+    else:
+        if change == 'wrong_binding': child['provider_binding_id'] = 'other'
+        if change == 'wrong_thread': child['_image_thread'] = {'protocol': 'image-thread-v1', 'id': 'other'}
+        if change == 'wrong_lineage': child['_completion_of'] = 'other'
+        if change == 'child_paused': child['_recovery_paused'] = True
+        put(rid='child', **child)
+    put(**root)
+    with store.transaction() as db:
+        store.set_runtime(db, 'work', {'state': 'active'})
+    monkeypatch.setattr(events, 'STREAM_SECONDS', 0)
+    response = client.get('/api/image-tasks/original/events')
+    assert 'event: needs_attention' in response.text
+    assert 'event: result_ready' not in response.text
+
+
 def test_verified_no_image_failure_waits_across_completion_creation_transaction(runtime, monkeypatch):
     client, put, _, store = runtime
     client.app.state.event_service.admission = SimpleNamespace(generation_completion=object())
@@ -411,8 +498,7 @@ def test_verified_no_image_failure_waits_across_completion_creation_transaction(
 
 
 @pytest.mark.parametrize('change', ['paused', 'work_paused', 'scheduler_missing', 'no_next_at', 'nan_next_at',
-                                    'no_auto_retry', 'proof_missing_source', 'proof_stale', 'proof_wrong_binding',
-                                    'result_asset', 'upstream_unfinished',
+                                    'bool_next_at', 'attempt_finished', 'no_auto_retry',
                                     'selected_wrong_binding', 'selected_wrong_thread', 'selected_not_terminal'])
 def test_invalid_or_stopped_completion_does_not_promise_a_result(runtime, monkeypatch, change):
     client, put, _, store = runtime
@@ -422,12 +508,9 @@ def test_invalid_or_stopped_completion_does_not_promise_a_result(runtime, monkey
     if change == 'scheduler_missing': client.app.state.event_service.admission = None
     if change == 'no_next_at': root['_completion']['next_at'] = None
     if change == 'nan_next_at': root['_completion']['next_at'] = float('nan')
+    if change == 'bool_next_at': root['_completion']['next_at'] = True
+    if change == 'attempt_finished': root['_attempt_finished_at'] = events.time.time()
     if change == 'no_auto_retry': root['_completion']['automatic_failure_retry'] = False
-    if change == 'proof_missing_source': root['_retry_cursor'].pop('source')
-    if change == 'proof_stale': root['_retry_cursor']['observed_at'] -= 301
-    if change == 'proof_wrong_binding': root['_retry_cursor']['conversation_id'] = 'other'
-    if change == 'result_asset': root['result_file_ids'] = ['existing-asset']
-    if change == 'upstream_unfinished': root['upstream_unfinished'] = True
     if change.startswith('selected_'):
         root['_completion'].update(state='result_ready', selected_id='child', replacement_id='child', next_at=None)
         child.update(status='success', data=[{'url': 'private-result'}], _image_thread_terminal=True)

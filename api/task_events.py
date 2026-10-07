@@ -93,9 +93,15 @@ def _image_completion_state(service, receipt, child, work_active):
     if not pending:
         return False, None
     if state.get("state") == "checking_original":
-        return bool(verified_image_failure(receipt, time.time(), GenerationCompletionService.INVESTIGATION_SECONDS)
-                    and not state.get("same_request_retry") and not state.get("replacement_id")
+        # The scheduler already owns this investigation. Its proof may still
+        # be pending or expire while the next original read is rate-limited;
+        # that does not end completion or authorize another submission.
+        return bool(not state.get("same_request_retry") and not state.get("replacement_id")
                     and not receipt.get("_attempt_finished_at")), None
+    if state.get("state") == "replacement_pending" and not child:
+        # Reservation commits before submit. A reconnect/restart can observe
+        # this gap; keep waiting for the reserved ID without inventing a result.
+        return bool(state.get("replacement_id") and state.get("prepared_input")), None
     return bool(state.get("state") == "replacement_pending" and linked
                 and child.get("_recovery_paused") is not True and child.get("_recovery_suppressed") is not True
                 and (child.get("status") in {"queued", "running", "success"}
