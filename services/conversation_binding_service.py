@@ -1151,9 +1151,11 @@ class ConversationBindingService:
                 first_error = None
                 for attempt in range(2):
                     try:
+                        retry_options = ({"reuse_read_credit": True}
+                                         if attempt and self._unsent_direct_read_connection(first_error) else {})
                         return self._read_text_result(backend, body, deadline_monotonic=deadline,
                                                       connect_timeout_secs=10.0,
-                                                      minimum_budget_secs=10.0)
+                                                      minimum_budget_secs=10.0, **retry_options)
                     except AccountReadRetryBudgetInsufficient:
                         if first_error is not None:
                             raise first_error from None
@@ -1196,16 +1198,39 @@ class ConversationBindingService:
             return False
 
     @staticmethod
+    def _unsent_direct_read_connection(exc):
+        """A bounded reconnect may use the credit already paid by this GET.
+
+        Missing native counters keep the ordinary paced retry. This never
+        refunds a shared bucket or changes a task's submission/UNKNOWN state.
+        """
+        if not ConversationBindingService._retryable_direct_read_connection(exc):
+            return False
+        try:
+            infos = exc.response.infos
+            zero = (CurlInfo.REQUEST_SIZE, CurlInfo.SIZE_UPLOAD_T, CurlInfo.EARLYDATA_SENT_T,
+                    CurlInfo.REDIRECT_COUNT, CurlInfo.RESPONSE_CODE, CurlInfo.HTTP_VERSION)
+            return (infos.get(CurlInfo.NUM_CONNECTS) == 1
+                    and type(infos.get(CurlInfo.HTTP_CONNECTCODE)) is int
+                    and infos[CurlInfo.HTTP_CONNECTCODE] in (0, 200)
+                    and all(type(infos.get(key)) is int and infos[key] == 0 for key in zero))
+        except Exception:
+            return False
+
+    @staticmethod
     def _read_text_result(
         backend: OpenAIBackendAPI, cursor: dict[str, Any], *, deadline_monotonic: float | None = None,
         connect_timeout_secs: float | None = None,
         minimum_budget_secs: float | None = None,
+        reuse_read_credit: bool = False,
     ) -> dict[str, Any]:
         options = {} if deadline_monotonic is None else {"deadline_monotonic": deadline_monotonic}
         if connect_timeout_secs is not None:
             options["connect_timeout_secs"] = connect_timeout_secs
         if minimum_budget_secs is not None:
             options["minimum_budget_secs"] = minimum_budget_secs
+        if reuse_read_credit:
+            options["reuse_read_credit"] = True
         document = backend._get_conversation(cursor["conversation_id"], **options)
         if document.get("conversation_id", cursor["conversation_id"]) != cursor["conversation_id"]:
             raise ConversationBindingError("conversation identity changed", code="CONVERSATION_BINDING_MISMATCH")

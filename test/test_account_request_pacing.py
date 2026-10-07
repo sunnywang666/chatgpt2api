@@ -2713,6 +2713,59 @@ def test_native_joined_read_releases_only_worker_handle_and_keeps_buffered_resul
         session.close(); server.shutdown(); server.server_close()
 
 
+def test_prepaid_direct_read_reconnect_cannot_cross_scope(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import pytest
+    import services.account_request_pacing as pacing
+    monkeypatch.setattr(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+        account_conversation_read_interval_secs=60, account_conversation_read_max_inflight=1))
+    clock = pacing.AccountRequestClock("fixture", tmp_path/"clock.json")
+    cases = [("POST", "/backend-api/conversation/original", {}, None, None),
+             ("GET", "/backend-api/conversation/original?query=1", {}, None, None),
+             ("GET", "/backend-api/me", {}, None, None),
+             ("GET", "/backend-api/conversation/original", {"stream":True}, None, None),
+             ("GET", "/backend-api/conversation/original", {"_account_request_preflight_read":True}, None, None),
+             ("GET", "/backend-api/conversation/original", {}, SimpleNamespace(), None),
+             ("GET", "/backend-api/conversation/original", {}, None, lambda:None)]
+    for method,path,options,context,guard in cases:
+        ct=pacing.current_request.set(context);at=pacing.current_archive_guard.set(guard)
+        try:
+            with patch("services.account_request_pacing.time.sleep") as sleep:
+                raw=__import__("unittest").mock.Mock()
+                with pytest.raises(ValueError):
+                    clock.request(raw, method, "https://chatgpt.com"+path,
+                        _account_request_reuse_read_credit=True,
+                        _account_request_deadline_monotonic=time.monotonic()+60,
+                        _account_request_minimum_budget_secs=10, **options)
+                raw.assert_not_called();sleep.assert_not_called()
+        finally:
+            pacing.current_request.reset(ct);pacing.current_archive_guard.reset(at)
+
+
+def test_prepaid_direct_read_reconnect_still_requires_an_inflight_slot(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import pytest
+    import services.account_request_pacing as pacing
+    monkeypatch.setattr(pacing, "config", SimpleNamespace(account_request_interval_secs=0,
+        account_conversation_read_interval_secs=60, account_conversation_read_max_inflight=1))
+    clock = pacing.AccountRequestClock("fixture", tmp_path/"clock.json")
+    occupied=clock._try_read_slot()
+    assert occupied is not None
+    raw=__import__("unittest").mock.Mock()
+    try:
+        with pytest.raises(pacing.AccountRequestDeadlineExceeded):
+            clock.request(raw,"GET","https://chatgpt.com/backend-api/conversation/original",timeout=.05,
+                _account_request_reuse_read_credit=True,
+                _account_request_deadline_monotonic=time.monotonic()+.05,
+                _account_request_minimum_budget_secs=.001)
+        raw.assert_not_called()
+        assert occupied.locked()
+        assert not clock.lock.locked()
+        assert clock.ordinary_read_queue==[]
+    finally:
+        occupied.release()
+
+
 def test_native_get_connect_cap_preserves_total_deadline(tmp_path, monkeypatch):
     import socketserver
     from urllib.parse import urlsplit
@@ -2749,6 +2802,7 @@ def test_native_get_connect_cap_preserves_total_deadline(tmp_path, monkeypatch):
                             _account_request_connect_timeout_secs=.15)
         assert .1 <= time.monotonic()-started < .6
         assert ConversationBindingService._retryable_direct_read_connection(caught.value)
+        assert ConversationBindingService._unsent_direct_read_connection(caught.value)
         attempt = next(c.args[0] for c in log.call_args_list if c.args[0].get("event")=="account_http_attempt")
         assert .6 < attempt["request_timeout_secs"] <= .7
         assert attempt["transport_details"]["appconnect_secs"] == 0

@@ -566,6 +566,7 @@ class AccountRequestClock:
         preparation_submit = kwargs.pop("_account_request_preparation_submit", None)
         deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
         minimum_budget = kwargs.pop("_account_request_minimum_budget_secs", None)
+        reuse_read_credit = kwargs.pop("_account_request_reuse_read_credit", False)
         if type(minimum_budget) not in (int, float) or not math.isfinite(minimum_budget) or minimum_budget <= 0:
             minimum_budget = None
         local_wait = kwargs.pop("_account_request_local_wait", None)
@@ -707,6 +708,13 @@ class AccountRequestClock:
         } and not urlparse(str(url)).query
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
+        if reuse_read_credit and (
+                reuse_read_credit is not True or not is_conversation_read
+                or re.fullmatch(r"/backend-api/conversation/[^/]+", path) is None
+                or urlparse(str(url)).query or kwargs.get("stream")
+                or context is not None or archive_guard is not None
+                or deadline_at is None or minimum_budget is None):
+            raise ValueError("read credit reuse is limited to a bounded direct cursor reconnect")
         # A fenced visibility PATCH for one conversation may receive alongside
         # another conversation. Keep the durable send edge, not its response,
         # under the account clock. Other PATCH operations remain unchanged.
@@ -726,7 +734,7 @@ class AccountRequestClock:
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
         ordinary_owner = None
         read_deferred = False
-        if is_conversation_read:
+        if is_conversation_read and not reuse_read_credit:
             # Due image recovery may already hold a FIFO place before its
             # worker starts. Reuse it at the actual GET; do not queue behind
             # our own reservation. The original image claim prevents overlap.
@@ -925,7 +933,7 @@ class AccountRequestClock:
                         read_delay, wait_reason = max((
                             (max(0, self.next_request - now,
                                  self.next_turn - now if is_turn or preflight_read else 0), "account_pace"),
-                            (max(0, self._read_ready(now) - now) if is_conversation_read else 0, "read_rate"),
+                            (max(0, self._read_ready(now) - now) if is_conversation_read and not reuse_read_credit else 0, "read_rate"),
                             (max(0, self.cooldown_until - now,
                                  self._read_cooldown_until() - now if is_conversation_read else 0), "upstream_cooldown")),
                             key=lambda item: (item[0], item[1] == "upstream_cooldown"))
@@ -933,7 +941,8 @@ class AccountRequestClock:
                             # Honor a live reservation from an older process until
                             # consumed/expired; new archive reads join the same FIFO
                             # as ordinary results, including their readback step.
-                            if self.archive_read_owner and self.archive_read_owner != read_owner and self.archive_read_until > now:
+                            if (not reuse_read_credit and self.archive_read_owner
+                                    and self.archive_read_owner != read_owner and self.archive_read_until > now):
                                 # A live archive may release this lease immediately.
                                 # Recheck it promptly; retain the actual rate/cooldown floor.
                                 retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
@@ -943,7 +952,7 @@ class AccountRequestClock:
                                 read_delay = max(read_delay, reservation_delay)
                             legacy_turn = bool(read_owner and self.archive_read_owner == read_owner
                                                and self.archive_read_until > now)
-                            if not legacy_turn and not self._ordinary_read_turn(ordinary_owner, now, read_delay):
+                            if not reuse_read_credit and not legacy_turn and not self._ordinary_read_turn(ordinary_owner, now, read_delay):
                                 # Give the reserved reader time to wake. Do not
                                 # consume another full upstream interval locally,
                                 # or add a whole second to fractional HTTP pacing.
@@ -1024,7 +1033,7 @@ class AccountRequestClock:
                 read_correction_applied = False
                 def correct_read_start(sent_at):
                     nonlocal read_correction_applied
-                    if is_conversation_read and not read_correction_applied:
+                    if is_conversation_read and not reuse_read_credit and not read_correction_applied:
                         # Still under the send mutex: no later reader has consumed
                         # credit yet. Never repeat this after reloading late replies.
                         delay = max(0.0, sent_at - now)
@@ -1032,7 +1041,11 @@ class AccountRequestClock:
                         self.next_conversation_read += delay
                         read_correction_applied = True
                 if is_conversation_read:
-                    self._consume_read(now)
+                    # Only a same-call, pre-HTTP direct GET reconnect can use
+                    # its already-consumed credit. Keep the shared send spacing,
+                    # cooldown, in-flight slot and original deadline above.
+                    if not reuse_read_credit:
+                        self._consume_read(now)
                     self.last_read_was_archive = archive_guard is not None
                     if read_owner and self.archive_read_owner == read_owner:
                         self.archive_read_owner = None
@@ -1246,6 +1259,7 @@ class AccountRequestClock:
                     "request_ref": request_ref, "work_ref": archive_observation.get("work_ref"),
                     "archive_step": current_archive_step.get() if archive_guard is not None else None,
                     "observed_at": time.time(), "http_attempts": read_http_attempts,
+                    "read_credit_reused": reuse_read_credit,
                     "queue_position_max": read_queue_position_max,
                     "wait_seconds_by_controlling_reason": {k: round(v, 6) for k, v in read_wait_seconds.items()}})
             if ordinary_owner and not read_deferred:

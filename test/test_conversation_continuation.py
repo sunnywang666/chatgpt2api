@@ -2289,6 +2289,81 @@ class TextResultRecoveryTests(unittest.TestCase):
                         self.assertEqual(clock.conversation_read_rate_failures, 0)
                         closed.assert_called_once()
 
+    def test_unsent_read_credit_requires_complete_native_zero_counters(self):
+        from curl_cffi import CurlInfo
+        from curl_cffi.requests.exceptions import Timeout
+        infos = {key: 0 for key in (CurlInfo.REQUEST_SIZE, CurlInfo.SIZE_UPLOAD_T,
+                 CurlInfo.EARLYDATA_SENT_T, CurlInfo.REDIRECT_COUNT, CurlInfo.RESPONSE_CODE,
+                 CurlInfo.HTTP_VERSION, CurlInfo.SIZE_DOWNLOAD_T, CurlInfo.APPCONNECT_TIME)}
+        infos.update({CurlInfo.NUM_CONNECTS: 1, CurlInfo.HTTP_CONNECTCODE: 200})
+        def qualifies(values):
+            return ConversationBindingService._unsent_direct_read_connection(
+                Timeout("private", code=28, response=SimpleNamespace(status_code=0, infos=values)))
+        self.assertTrue(qualifies(infos))
+        self.assertTrue(qualifies({**infos, CurlInfo.HTTP_CONNECTCODE: 0}))
+        for key in infos:
+            with self.subTest(missing=key):
+                self.assertFalse(qualifies({k:v for k,v in infos.items() if k != key}))
+            with self.subTest(nonzero=key):
+                value = 2 if key == CurlInfo.NUM_CONNECTS else 407 if key == CurlInfo.HTTP_CONNECTCODE else 1
+                self.assertFalse(qualifies({**infos, key:value}))
+
+    def test_unsent_direct_read_reuses_one_credit_but_preserves_other_limits(self):
+        from curl_cffi import CurlInfo
+        from curl_cffi.requests.exceptions import Timeout
+        import services.account_request_pacing as pacing
+        cases = ((0., 0., False, False), (29., 0., False, False),
+                 (0., 20., False, False), (0., 0., True, False),
+                 (45., 0., False, False), (0., 0., False, True))
+        for initial_wait, http_interval, second_fails, cooldown in cases:
+            with self.subTest(case=(initial_wait,http_interval,second_fails,cooldown)), tempfile.TemporaryDirectory() as directory:
+                now = [100.]
+                fake_time = SimpleNamespace(monotonic=lambda:now[0], time=lambda:1700000000+now[0],
+                                            sleep=lambda secs:now.__setitem__(0,now[0]+secs))
+                infos = {key:0 for key in (CurlInfo.REQUEST_SIZE, CurlInfo.SIZE_UPLOAD_T,
+                         CurlInfo.EARLYDATA_SENT_T, CurlInfo.REDIRECT_COUNT, CurlInfo.RESPONSE_CODE,
+                         CurlInfo.HTTP_VERSION, CurlInfo.SIZE_DOWNLOAD_T, CurlInfo.APPCONNECT_TIME)}
+                infos.update({CurlInfo.NUM_CONNECTS:1, CurlInfo.HTTP_CONNECTCODE:200})
+                error = Timeout("private", code=28, response=SimpleNamespace(status_code=0, infos=infos))
+                sends=[]
+                response=SimpleNamespace(status_code=200, headers={}, json=self.document, close=lambda:None)
+                def raw(method,url,**kwargs):
+                    self.assertNotIn("_account_request_reuse_read_credit",kwargs)
+                    sends.append((now[0],kwargs["timeout"]))
+                    if len(sends)==1 or second_fails:
+                        now[0]+=10
+                        if cooldown:
+                            with clock.lock:
+                                clock.limited(evidence={"phase":"conversation_read"})
+                        raise error
+                    return response
+                with mock.patch.object(pacing,"time",fake_time), mock.patch.object(pacing,"config",SimpleNamespace(
+                        account_request_interval_secs=http_interval,account_conversation_read_interval_secs=60,
+                        account_conversation_read_max_inflight=0)):
+                    clock=pacing.AccountRequestClock("fixture",Path(directory)/"clock.json")
+                    clock.next_conversation_read=now[0]+initial_wait;clock._save()
+                    backend=object.__new__(OpenAIBackendAPI);backend.base_url="https://fixture.invalid"
+                    backend._headers=lambda path,headers:headers
+                    backend.session=SimpleNamespace(get=lambda url,**kw:clock.request(raw,"GET",url,**kw),close=lambda:None)
+                    with mock.patch("services.conversation_binding_service.time",fake_time), \
+                         mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",return_value="account-one"), \
+                         mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",return_value="synthetic-token"), \
+                         mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",return_value=nullcontext()), \
+                         mock.patch("services.conversation_binding_service.OpenAIBackendAPI",return_value=backend):
+                        if second_fails or initial_wait==45 or cooldown:
+                            expected=pacing.AccountRequestDeadlineExceeded if cooldown else Timeout
+                            with self.assertRaises(expected):ConversationBindingService().read_text(self.cursor)
+                        else:
+                            self.assertEqual(ConversationBindingService().read_text(self.cursor)["status"],"succeeded")
+                    if initial_wait==45 or cooldown:
+                        self.assertEqual(len(sends),1)
+                    else:
+                        self.assertEqual([at for at,_ in sends],[100+initial_wait,100+initial_wait+max(10,http_interval)])
+                    self.assertTrue(all(at+budget<=160 for at,budget in sends))
+                    if not cooldown:self.assertEqual(clock.next_conversation_read,160+initial_wait)
+                    self.assertEqual(clock.ordinary_read_queue,[])
+                    self.assertFalse(clock.lock.locked())
+
     def test_direct_read_preserves_first_error_when_retry_window_expires(self):
         from curl_cffi import CurlInfo
         from curl_cffi.requests.exceptions import SSLError
