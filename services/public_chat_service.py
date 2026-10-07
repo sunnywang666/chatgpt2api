@@ -352,6 +352,8 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
         "recovery_reason": "reason",
         "recovery_no_result_reads": "no_result_reads",
         "recovery_retryable": "retryable",
+        "recovery_automatic_stopped": "automatic_stopped",
+        "recovery_stop_reason": "stop_reason",
         "recovery_requires_new_conversation": "requires_new_conversation",
         "upstream_outcome": "upstream_outcome",
         "recovery_scan_progress": "scan",
