@@ -325,6 +325,12 @@ python3 examples/image_client.py --env-file .image-client.env chat-status --stat
 Happy 主循环依据原生 DSH 消息 `source.replayState.response.requestId` 承接，并保留收到的消息指纹和系统/工具版本指纹。截图内多个连续 user 气泡可能是一次请求中的上下文数组，不应据此判断有几次上游发送。图片工具仍有独立持久图片任务；主推理的会话连续不等于把独立图片任务合并成一条图片请求。本增量不改变额度、并发设置、员工权限或原生 Codex 路线。
 
 
+### 已结束等待、仍无最终文字的旧请求
+
+没有工作生命周期或 completion 处理器的原生 Chat 请求，在达到既有无结果预算、释放本地执行占用后，如果原会话仍为 `REQUEST_RESULT_NOT_FOUND` 且没有结束或可重试游标证明，会停止自动读取。普通状态 GET 和后台扫描不会重新开启查询；原 ID、输入、账号、会话和 `upstream_outcome=unknown` 保留。这也适用于升级前已经重复读取很多次的记录。工具步骤 `finished_successfully` 不代表最终 assistant 回答完成。
+
+需要再次核对时，使用已有 `POST /api/chat-requests/{request_id}/recover`（默认空请求体），只执行一次受账号节奏与冷却限制的原会话读取。仍无结果则保持停止；迟到的有效最终回答可沿原 ID 收回。此操作不直接重发生成、不换会话，也不把原任务标成完成。已有工作 completion 调查和明确空终态的有界恢复仍沿原合同执行。
+
 ### Advanced account selection (separate from default setup)
 
 Automatic account routing remains the default. For an advanced ordinary Chat text or image-input request, an application may copy an opaque `account_ref` from a text model's public `accounts` directory and include it in `POST /api/chat-requests`:

@@ -419,6 +419,7 @@ def create_router() -> APIRouter:
             str(identity.get("id") or "anonymous"),
             request_id,
             body.allow_unrecoverable_retry,
+            explicit_ended_recheck=True,
         )
 
     @router.post("/api/conversation-bindings/text-requests/{request_id}/resume-unsent-successor")

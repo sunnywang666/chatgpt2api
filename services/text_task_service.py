@@ -810,6 +810,35 @@ class TextTaskService:
                        _claim_id=None, _claim_until=None, _executing=False)
         return True
 
+    @classmethod
+    def _end_no_final_recovery(cls, receipt, now):
+        """Bound legacy Chat recovery without claiming that its upstream ended.
+
+        Work-owned requests retain their existing completion investigation.
+        Older internal callers have no such owner: ending execution occupancy
+        alone must not leave ordinary reads scheduling upstream GETs forever.
+        The existing explicit recovery endpoint may still make one fresh read.
+        """
+        if (not cls._bounded_chat_wait(receipt)
+                or not receipt.get("_execution_wait_ended_at")
+                or receipt.get("_attempt_finished_at")
+                or any(receipt.get(key) for key in (
+                    "_work_key", "_completion", "_completion_of", "_retry_cursor",
+                    "_upstream_terminal", "recovery_claim_id", "_claim_id", "_executing"))
+                or receipt.get("status") != "failed"
+                or receipt.get("error_code") != "RESULT_UNRECOVERABLE"
+                or receipt.get("upstream_outcome") != "unknown"
+                or receipt.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value
+                or not all(isinstance(receipt.get(key), str) and receipt[key].strip() for key in (
+                    "request_message_id", "provider_binding_id", "provider_account_identity",
+                    "client_conversation_id", "conversation_id"))
+                or type(receipt.get("recovery_no_result_reads")) is not int
+                or receipt["recovery_no_result_reads"] < cls.UNRECOVERABLE_QUALIFIED_READS):
+            return False
+        receipt.update(_attempt_finished_at=now, _attempt_reason="ORIGINAL_RESULT_NO_FINAL",
+                       recovery_next_at=None, updated_at=now)
+        return True
+
     def _finish_recovery(
         self, owner, request_id, claim_id, recovered=None, error_code=None,
         phase=None, recovery_reason=None, retry_after_seconds=None, *, count_unrecoverable=False,
@@ -974,6 +1003,10 @@ class TextTaskService:
                     and old_claim_until <= now):
                 updated.update(_claim_id=None, _claim_until=None, _executing=False)
             self._end_execution_wait(updated, now, observed=observed)
+            self._end_no_final_recovery(updated, now)
+            if (error_code and updated.get("_attempt_reason") == "ORIGINAL_RESULT_NO_FINAL"
+                    and recovery_reason == TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value):
+                updated["recovery_next_at"] = None
             # Empty-response recovery is part of the original logical task.
             # Reserve at most one child, and never auto-retry that child again.
             if (getattr(self.admission, "generation_completion", None) is not None and not updated.get("_completion_of")
@@ -1035,7 +1068,8 @@ class TextTaskService:
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
             if row:
                 previous = json.loads(row[0])
-                if self._end_execution_wait(previous, now):
+                ended_wait = self._end_execution_wait(previous, now)
+                if self._end_no_final_recovery(previous, now) or ended_wait:
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
                                (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
@@ -1076,7 +1110,7 @@ class TextTaskService:
                 # A caller can recheck an original after repairing a failed
                 # read. Keep the ended attempt and automatic query stop; this
                 # grants one ordinary, paced read, never a generation retry.
-                ended_recheck = bool(
+                completion_recheck = bool(
                     _explicit_ended_recheck and previous.get("_attempt_finished_at")
                     and previous.get("_attempt_reason") == "COMPLETION_ORIGINAL_READ_UNAVAILABLE"
                     and isinstance(completion, dict) and completion.get("state") == "needs_attention"
@@ -1084,6 +1118,12 @@ class TextTaskService:
                     and not completion.get("replacement_id") and not completion.get("selected_id")
                     and not previous.get("_completion_of")
                 )
+                no_final_recheck = bool(
+                    _explicit_ended_recheck and previous.get("_attempt_finished_at")
+                    and previous.get("_attempt_reason") == "ORIGINAL_RESULT_NO_FINAL"
+                    and not previous.get("_completion") and not previous.get("_completion_of")
+                )
+                ended_recheck = completion_recheck or no_final_recheck
                 if (previous.get("_recovery_suppressed") is not True
                         and previous.get("_recovery_paused") is not True
                         and (not previous.get("_attempt_finished_at") or ended_recheck)
