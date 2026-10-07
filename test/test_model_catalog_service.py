@@ -610,9 +610,17 @@ class ModelCatalogServiceTests(unittest.TestCase):
             "pro": RuntimeError("unavailable"),
         })
 
-        self.catalog.list_models()
+        result = self.catalog.list_models()
 
         self.assertTrue(self.catalog.catalog_is_unknown())
+        self.assertEqual(result["data"], [])
+        self.assertEqual(result["model_catalog"], {"state": "partial"})
+        self.outcomes["plus"] = model_list("plus-only")
+        self.outcomes["pro"] = model_list("pro-only")
+        self.now += 301
+        recovered = self.catalog.list_models()
+        self.assertNotIn("model_catalog", recovered)
+        self.assertIn("plus-only", {item["id"] for item in recovered["data"]})
 
     def test_removed_account_type_drops_its_stale_capabilities(self) -> None:
         self.catalog.list_models()

@@ -98,7 +98,9 @@ def project_public_models(result: object) -> dict[str, Any]:
     if not isinstance(result, dict) or not isinstance(result.get("data"), list):
         raise PublicChatContractError("MODEL_DISCOVERY_UNAVAILABLE", "model discovery unavailable")
     unknown = getattr(model_catalog_service, "catalog_is_unknown", None)
-    catalog_unknown = callable(unknown) and unknown() is True
+    catalog_unknown = result.get("model_catalog") == {"state": "partial"}
+    if not catalog_unknown:
+        catalog_unknown = callable(unknown) and unknown() is True
     data: list[dict[str, Any]] = []
     has_known_model = False
 
