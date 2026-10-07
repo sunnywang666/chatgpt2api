@@ -788,6 +788,16 @@ class AccountRequestClock:
 
         def run_preflight():
             if preflight is not None:
+                # Reject a known impossible attempt before invoking its read
+                # callback. Release this snapshot lock before any network I/O.
+                if deadline_at is not None:
+                    measure_preparation("clock_lock", acquire_with_budget, self.lock)
+                    try:
+                        remaining = remaining_budget()
+                        if remaining <= 0 or self.cooldown_until - time.monotonic() >= remaining:
+                            raise AccountRequestDeadlineExceeded("account request deadline precedes cooldown")
+                    finally:
+                        self.lock.release()
                 # The binding owner keeps same-conversation ordering. A slow
                 # original-read response must not hold the account turn mutex.
                 # Reuse the normal send-edge transport and cooldown merge, but
