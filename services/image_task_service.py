@@ -999,7 +999,7 @@ class ImageTaskService:
     def continuation_cursor(self, identity, task_id, anchors):
         """Read a refused image's current completed context, without recovering it."""
         from services.account_service import account_service
-        from services.generation_completion import read_only_original_completion
+        from services.generation_completion import read_only_original_completion, read_only_original_recovery
         from services.openai_backend_api import OpenAIBackendAPI
 
         if identity.get("role") != "admin":
@@ -1007,16 +1007,36 @@ class ImageTaskService:
         owner, task_id = _owner_id(identity), _clean(task_id)
         fields = ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id")
 
-        def busy(task):
+        def busy(task, table):
             completion = task.get("_completion") or {}
             pending_completion = (not isinstance(completion, dict) or bool(completion) and (
                 completion.get("next_at") is not None
                 or completion.get("state") not in {"result_ready", "completed", "needs_attention"}))
+            # A paused original-only reader cannot submit another generation.
+            # Its stale scheduled read is not a live turn. This only permits
+            # the fresh refusal/tail/tasks proof below; the peer stays UNKNOWN
+            # and paused, and no result or successor is selected for it.
+            paused_original_reader = (
+                table == "image_requests" and task.get("_recovery_paused") is True
+                and not task.get("_recovery_suppressed")
+                and task.get("status") == TASK_STATUS_ERROR
+                and task.get("error_code") == "RESULT_UNRECOVERABLE"
+                and task.get("upstream_outcome") == "unknown"
+                and task.get("upstream_unfinished") is False
+                and read_only_original_recovery(completion)
+                and completion.get("state") == "checking_original"
+                and type(completion.get("max_extra_requests")) is int
+                and not any(completion.get(k) for k in ("same_request_retry", "automatic_failure_retry"))
+                and task.get("recovery_phase") != "download_image_result"
+                and not any(task.get(k) for k in ("_completion_of", "same_request_retry", "automatic_failure_retry",
+                    "data", "result_file_ids", "result_sediment_ids", "_pending_image_result_ids",
+                    "_pending_image_output", "adopted_source_request_message_id", "adopted_source_image_message_id")))
             return bool(task.get("status") in {"queued", "running", "unknown", "recovering"}
                 or task.get("_executing") or task.get("_turn_reserved") or task.get("waiting")
                 or task.get("upstream_unfinished") is True or task.get("recovery_claim_id")
                 or task.get("_claim_id") and float(task.get("_claim_until") or 0) > time.time()
-                or pending_completion)
+                or float(task.get("_recovery_claim_until") or 0) > time.time()
+                or pending_completion and not paused_original_reader)
 
         def snapshot():
             with self.store.connect() as db:
@@ -1048,7 +1068,7 @@ class ImageTaskService:
                             "(json_extract(receipt,'$.provider_binding_id')=? AND json_extract(receipt,'$.client_conversation_id')=?))",
                             (task["provider_account_identity"], task["conversation_id"],
                              task["provider_binding_id"], task["client_conversation_id"])):
-                        if busy(json.loads(raw)):
+                        if busy(json.loads(raw), table):
                             raise ImageThreadError("IMAGE_CONTINUATION_BUSY")
                 return task
 
