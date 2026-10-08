@@ -4,6 +4,7 @@ import hashlib
 import math
 import re
 import time
+import uuid
 from copy import deepcopy
 from datetime import datetime
 from enum import Enum
@@ -1149,7 +1150,9 @@ class ConversationBindingService:
             backend = OpenAIBackendAPI(access_token=token)
             try:
                 first_error = None
+                read_ref = uuid.uuid4().hex[:24]
                 for attempt in range(2):
+                    backend._direct_read_observation = (read_ref, attempt + 1)
                     try:
                         retry_options = ({"reuse_read_credit": True}
                                          if attempt and self._unsent_direct_read_connection(first_error) else {})

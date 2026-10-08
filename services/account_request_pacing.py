@@ -567,6 +567,7 @@ class AccountRequestClock:
         deadline_at = kwargs.pop("_account_request_deadline_monotonic", None)
         minimum_budget = kwargs.pop("_account_request_minimum_budget_secs", None)
         reuse_read_credit = kwargs.pop("_account_request_reuse_read_credit", False)
+        direct_read = kwargs.pop("_account_request_direct_read_observation", None)
         if type(minimum_budget) not in (int, float) or not math.isfinite(minimum_budget) or minimum_budget <= 0:
             minimum_budget = None
         local_wait = kwargs.pop("_account_request_local_wait", None)
@@ -754,6 +755,15 @@ class AccountRequestClock:
         request_ref = hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24] if context else None
         archive_observation = (current_archive_observation.get() or {}) if archive_guard is not None else {}
         request_ref = request_ref or archive_observation.get("request_ref")
+        # One random, non-durable reference links the two attempts of a direct
+        # cursor read. Never derive it from a URL, credential or user content.
+        direct_read_log = {}
+        if (is_conversation_read and context is None and archive_guard is None
+                and isinstance(direct_read, tuple) and len(direct_read) == 2
+                and isinstance(direct_read[0], str) and re.fullmatch(r"[0-9a-f]{24}", direct_read[0])
+                and type(direct_read[1]) is int and direct_read[1] in (1, 2)):
+            request_ref = direct_read[0]
+            direct_read_log = {"direct_read_attempt": direct_read[1]}
 
         def observed_send(send_method, send_url, send_phase, *, read_started=None, **send_kwargs):
             nonlocal read_http_attempts
@@ -825,6 +835,7 @@ class AccountRequestClock:
                     timeout = None
                 logger.info({"event": "account_http_attempt", "account": self.account_key,
                              "request_ref": request_ref, "layer": "upstream_chatgpt",
+                             **direct_read_log,
                              "work_ref": archive_observation.get("work_ref"),
                              "archive_step": current_archive_step.get() if archive_guard is not None else None,
                              "method": verb if verb in {"GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "OPTIONS"} else "OTHER",
@@ -1257,6 +1268,7 @@ class AccountRequestClock:
             if is_conversation_read:
                 logger.info({"event": "account_read_wait_finished", "account": self.account_key,
                     "request_ref": request_ref, "work_ref": archive_observation.get("work_ref"),
+                    **direct_read_log,
                     "archive_step": current_archive_step.get() if archive_guard is not None else None,
                     "observed_at": time.time(), "http_attempts": read_http_attempts,
                     "read_credit_reused": reuse_read_credit,

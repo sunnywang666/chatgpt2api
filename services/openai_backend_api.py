@@ -1326,6 +1326,8 @@ class OpenAIBackendAPI:
         # Internal pacing arguments must never reach that raw HTTP transport.
         options = (self._image_request_options(timeout_secs) if _send is None
                    else {"timeout": self._image_active_timeout(timeout_secs)})
+        if _send is None and getattr(self, "_direct_read_observation", None) is not None:
+            options["_account_request_direct_read_observation"] = self._direct_read_observation
         if _send is None and deadline_monotonic is not None:
             existing = options.get("_account_request_deadline_monotonic")
             options["_account_request_deadline_monotonic"] = (

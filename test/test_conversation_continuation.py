@@ -2329,6 +2329,7 @@ class TextResultRecoveryTests(unittest.TestCase):
                 response=SimpleNamespace(status_code=200, headers={}, json=self.document, close=lambda:None)
                 def raw(method,url,**kwargs):
                     self.assertNotIn("_account_request_reuse_read_credit",kwargs)
+                    self.assertNotIn("_account_request_direct_read_observation",kwargs)
                     sends.append((now[0],kwargs["timeout"]))
                     if len(sends)==1 or second_fails:
                         now[0]+=10
@@ -2337,7 +2338,7 @@ class TextResultRecoveryTests(unittest.TestCase):
                                 clock.limited(evidence={"phase":"conversation_read"})
                         raise error
                     return response
-                with mock.patch.object(pacing,"time",fake_time), mock.patch.object(pacing,"config",SimpleNamespace(
+                with mock.patch.object(pacing,"logger") as observed, mock.patch.object(pacing,"time",fake_time), mock.patch.object(pacing,"config",SimpleNamespace(
                         account_request_interval_secs=http_interval,account_conversation_read_interval_secs=60,
                         account_conversation_read_max_inflight=0)):
                     clock=pacing.AccountRequestClock("fixture",Path(directory)/"clock.json")
@@ -2360,6 +2361,15 @@ class TextResultRecoveryTests(unittest.TestCase):
                     else:
                         self.assertEqual([at for at,_ in sends],[100+initial_wait,100+initial_wait+max(10,http_interval)])
                     self.assertTrue(all(at+budget<=160 for at,budget in sends))
+                    events = [call.args[0] for call in observed.info.call_args_list
+                              if call.args[0].get("event") in {"account_http_attempt", "account_read_wait_finished"}]
+                    refs = {event["request_ref"] for event in events}
+                    self.assertEqual(len(refs), 1)
+                    self.assertRegex(next(iter(refs)), r"^[0-9a-f]{24}$")
+                    self.assertEqual([event["direct_read_attempt"] for event in events
+                                      if event["event"] == "account_http_attempt"], list(range(1,len(sends)+1)))
+                    self.assertEqual([event["direct_read_attempt"] for event in events
+                                      if event["event"] == "account_read_wait_finished"], [1,2])
                     if not cooldown:self.assertEqual(clock.next_conversation_read,160+initial_wait)
                     self.assertEqual(clock.ordinary_read_queue,[])
                     self.assertFalse(clock.lock.locked())
