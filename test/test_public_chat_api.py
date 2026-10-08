@@ -132,6 +132,45 @@ def png_data_url() -> str:
     return "data:image/png;base64," + base64.b64encode(stream.getvalue()).decode()
 
 
+@pytest.mark.parametrize("public,data,pending,status", [
+    (False, [], True, 503),
+    (True, [], True, 503),
+    (False, [], False, 200),
+    (True, [], False, 200),
+    (False, [{"id": "gpt-image-2"}], True, 200),
+    (True, [{"id": "gpt-image-2"}], True, 503),
+    (True, [{"id": "hidden-upstream-model"}], True, 503),
+    (False, [{"id": "gpt-text"}], True, 200),
+    (True, [{"id": "gpt-text"}], True, 200),
+])
+def test_model_directory_distinguishes_pending_from_known_empty(
+    public_chat, monkeypatch, public, data, pending, status,
+):
+    payload = {"object": "list", "data": data}
+    if pending:
+        payload["model_catalog"] = {"state": "partial"}
+    read = Mock(return_value=payload)
+    monkeypatch.setattr(ai.openai_v1_models, "list_models", read)
+    # Readiness travels with the returned snapshot, even if the next refresh
+    # could now succeed. It must not turn missing rows into UNKNOWN_MODEL.
+    if pending:
+        monkeypatch.setattr("services.public_chat_service.model_catalog_service.catalog_is_unknown",
+                            Mock(side_effect=AssertionError("do not refresh the partial snapshot")))
+    response = public_chat.client.get("/v1/models", headers=public_chat.headers(public=public))
+    assert response.status_code == status, response.text
+    read.assert_called_once_with()
+    public_chat.upstream.assert_not_called()
+    if status == 503:
+        assert response.json() == {"detail": {"code": "MODEL_CATALOG_PENDING"}}
+        assert response.headers["Retry-After"] == "1"
+    elif pending:
+        assert response.json()["model_catalog"] == {"state": "partial"}
+        assert [item["id"] for item in response.json()["data"]] == [item["id"] for item in data]
+    else:
+        assert response.json()["data"] == []
+        assert "model_catalog" not in response.json()
+
+
 def test_completed_native_image_is_queryable_without_public_resubmission(public_chat):
     from services.conversation_binding_service import ConversationBindingService
     from test.test_non_text_recovery import image_document

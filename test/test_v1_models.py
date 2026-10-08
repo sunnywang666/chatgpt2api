@@ -19,7 +19,8 @@ class ModelListTests(unittest.TestCase):
             mock.patch.object(
                 openai_v1_models.model_catalog_service,
                 "list_models",
-                return_value={"object": "list", "data": [{"id": "gpt-image-2"}]},
+                return_value={"object": "list", "data": [{"id": "gpt-image-2"}],
+                              "model_catalog": {"state": "partial"}},
             ),
             mock.patch.object(
                 openai_v1_models.account_service,
@@ -44,6 +45,8 @@ class ModelListTests(unittest.TestCase):
         self.assertIn("team-codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
         self.assertNotIn("pro-codex-gpt-image-2", ids)
+        # Adding observed image aliases must not hide a pending text catalog.
+        self.assertEqual(result["model_catalog"], {"state": "partial"})
 
     def test_list_models_does_not_return_codex_models_for_web_plus_accounts(self):
         with (

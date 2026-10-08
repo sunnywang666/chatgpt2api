@@ -213,7 +213,8 @@ def test_nonadmission_unavailable_selection_never_binds_a(public_chat, accounts,
 
 
 @pytest.mark.parametrize("observed_image", [True, False])
-def test_image_evidence_keeps_partial_public_directory(public_chat, monkeypatch, observed_image):
+@pytest.mark.parametrize("snapshot_partial", [True, False])
+def test_image_evidence_keeps_partial_public_directory(public_chat, monkeypatch, observed_image, snapshot_partial):
     from api import ai
     from services.model_service import ModelRoute
     catalog = SimpleNamespace(
@@ -228,6 +229,7 @@ def test_image_evidence_keeps_partial_public_directory(public_chat, monkeypatch,
     monkeypatch.setattr("services.public_chat_service.model_catalog_service", catalog)
     monkeypatch.setattr(ai.openai_v1_models, "list_models", lambda: {
         "object": "list", "data": [{"id": "gpt-image-2"}],
+        **({"model_catalog": {"state": "partial"}} if snapshot_partial else {}),
     })
     response = public_chat.client.get("/v1/models", headers=public_chat.headers())
     if observed_image:
@@ -235,8 +237,8 @@ def test_image_evidence_keeps_partial_public_directory(public_chat, monkeypatch,
         assert response.json()["model_catalog"] == {"state": "partial"}
         assert [row["id"] for row in response.json()["data"]] == ["gpt-image-2"]
     else:
-        assert response.status_code == 502
-        assert response.json()["detail"]["code"] == "MODEL_DISCOVERY_UNAVAILABLE"
+        assert response.status_code == (503 if snapshot_partial else 502)
+        assert response.json()["detail"]["code"] == ("MODEL_CATALOG_PENDING" if snapshot_partial else "MODEL_DISCOVERY_UNAVAILABLE")
     unknown = post(public_chat, request_body(model="new-text-model"))
     assert unknown.status_code == 503
     assert unknown.json()["detail"]["code"] == "MODEL_DISCOVERY_UNAVAILABLE"

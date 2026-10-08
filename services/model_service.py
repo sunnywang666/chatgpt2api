@@ -447,10 +447,15 @@ class ModelCatalogService:
             for identity in sorted(self._model_observations):
                 for model_id, item in self._model_observations[identity].get("models", {}).items():
                     union.setdefault(model_id, dict(item))
-        return {
-            "object": "list",
-            "data": [union[model_id] for model_id in sorted(union)],
-        }
+            result = {
+                "object": "list",
+                "data": [union[model_id] for model_id in sorted(union)],
+            }
+            # Keep readiness with this exact snapshot. Missing from a partial
+            # catalog does not prove that a configured model is unsupported.
+            if self._catalog_unknown:
+                result["model_catalog"] = {"state": "partial"}
+            return result
 
     def management_models(self) -> list[dict[str, Any]]:
         """Project observed account-level Chat capability for management reads."""
