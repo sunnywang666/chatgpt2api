@@ -854,6 +854,9 @@ class AccountRequestClock:
                 transport_snapshot.update(_transport_error_features(exc))
                 raise
             finally:
+                finished_at, finished = time.time(), time.monotonic()
+                active_elapsed = finished - started
+                wall_elapsed = finished_at - started_at
                 verb = str(send_method).upper()
                 status = getattr(response, "status_code", None)
                 try:
@@ -870,7 +873,13 @@ class AccountRequestClock:
                              "method": verb if verb in {"GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "OPTIONS"} else "OTHER",
                              "phase": send_phase, "endpoint_kind": endpoint_kind, "started_at": started_at,
                              **preparation,
-                             "headers_elapsed_secs": round(time.monotonic() - started, 6),
+                             # Keep the legacy monotonic duration, but also retain
+                             # wall-clock endpoints: macOS sleep can pause its
+                             # monotonic clock while an upstream socket is open.
+                             "headers_elapsed_secs": round(active_elapsed, 6),
+                             "finished_at": finished_at,
+                             "wall_elapsed_secs": round(wall_elapsed, 6),
+                             "clock_gap_secs": round(wall_elapsed - active_elapsed, 6),
                              "status_code": status if isinstance(status, int) and not isinstance(status, bool) else None,
                              "outcome": "response" if response is not None else "transport_error",
                              "transport_error_type": transport_error, "transport_error_code": transport_code,

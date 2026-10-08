@@ -1765,6 +1765,46 @@ class AccountRequestPacingTests(unittest.TestCase):
                 self.assertNotIn("secret-", repr(attempt))
                 self.assertNotIn("PrivateError", repr(attempt))
 
+    def test_http_timing_keeps_sleep_or_clock_changes_separate_from_active_time(self):
+        from types import SimpleNamespace
+        from curl_cffi.requests.exceptions import ConnectionError as CurlConnectionError
+        for gap in (0, 13.3, -4):
+            for fail in (False, True):
+                with self.subTest(gap=gap, fail=fail):
+                    now = [100., 1700000100.]
+                    fake_time = SimpleNamespace(monotonic=lambda: now[0], time=lambda: now[1])
+                    error = CurlConnectionError("secret-receive-detail", code=56)
+                    sent = []
+                    def send(*args, **kwargs):
+                        sent.append(True)
+                        now[0] += 1.25
+                        now[1] += 1.25 + gap
+                        if fail:
+                            raise error
+                        return Response()
+                    with patch("services.account_request_pacing.time", fake_time), \
+                         patch("services.account_request_pacing.logger.info") as log, \
+                         patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                         patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+                        clock = AccountRequestClock("account-hash")
+                        if fail:
+                            with self.assertRaises(CurlConnectionError) as caught:
+                                clock.request(send, "GET", "https://provider/conversation/secret-id")
+                            self.assertIs(caught.exception, error)
+                        else:
+                            self.assertEqual(clock.request(send, "GET", "https://provider/conversation/secret-id").status_code, 200)
+                    attempts = [c.args[0] for c in log.call_args_list
+                                if c.args[0].get("event") == "account_http_attempt"]
+                    self.assertEqual(len(sent), 1)
+                    self.assertEqual(len(attempts), 1)
+                    attempt = attempts[0]
+                    self.assertEqual(attempt["headers_elapsed_secs"], 1.25)
+                    self.assertAlmostEqual(attempt["wall_elapsed_secs"], 1.25 + gap, places=5)
+                    self.assertAlmostEqual(attempt["clock_gap_secs"], gap, places=5)
+                    self.assertEqual(attempt["finished_at"], now[1])
+                    self.assertEqual(attempt["transport_error_code"], 56 if fail else None)
+                    self.assertNotIn("secret-", repr(attempt))
+
     def test_diagnostic_extraction_failure_cannot_replace_transport_exception(self):
         class BadCode(OSError):
             @property
