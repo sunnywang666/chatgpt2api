@@ -1579,7 +1579,52 @@ class TextTaskService:
             same_chat = (other.get("provider_account_identity") == receipt.get("provider_account_identity")
                          and other.get("conversation_id") == receipt.get("conversation_id"))
             if unfinished(kind, other) and (same_chat or other.get("client_conversation_id") == body.get("client_conversation_id")):
+                if kind == "text" and self._completed_historical_successor(db, owner, other_id, other, original, self._now()):
+                    continue
                 reject("CHAT_SUPERSEDE_CONFLICT")
+
+    @classmethod
+    def _completed_historical_successor(cls, db, owner, previous_id, previous, original, now):
+        """A completed registered child already released this historical head.
+
+        Keep the old UNKNOWN unchanged, just as the admission planner does;
+        accepting a later explicit successor must not revive the old barrier.
+        Here require a terminal child and older ordering, not merely a claim.
+        """
+        if (previous.get("request_id") != previous_id
+                or previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
+                or previous.get("upstream_outcome") != "unknown"
+                or previous.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND"):
+            return False
+        rows = db.execute("SELECT id,receipt FROM requests WHERE owner=? AND "
+                          "json_extract(receipt,'$._supersedes_request_id')=? LIMIT 2",
+                          (owner, previous_id)).fetchall()
+        if len(rows) != 1:
+            return False
+        child = json.loads(rows[0][1])
+        if (child.get("request_id") != rows[0][0]
+                or child.get("status") != "succeeded" or child.get("upstream_outcome") != "completed"
+                or child.get("_upstream_terminal") is not True or not cls._supersede_order_link(previous, child)):
+            return False
+        sequence = [r.get("_sequence") for r in (previous, child, original)]
+        if not all(type(v) is int and v > 0 for v in sequence) or not sequence[0] < sequence[1] < sequence[2]:
+            return False
+        if any(not original.get(k) or original[k] != child.get(k) for k in
+               ("provider_binding_id", "provider_account_identity", "conversation_id", "client_conversation_id")):
+            return False
+        for item in (previous, child):
+            if any(item.get(k) for k in ("_executing", "_turn_reserved", "upstream_unfinished",
+                    "_recovery_paused", "_recovery_suppressed", "_work_key", "_completion", "_completion_of", "_retry_cursor")):
+                return False
+            for claim, until in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until"),
+                                 ("_recovery_claim_id", "_recovery_claim_until")):
+                expiry = item.get(until)
+                if (expiry is not None and (type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry > now)
+                        or item.get(claim) and expiry is None):
+                    return False
+        old = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                         (owner, previous_id)).fetchone()
+        return bool(old and child.get("_supersedes_input_hash") == old[0])
 
     def validate_submission(self, owner: str, body: dict):
         """Read-only conflict check before any optional external review call."""
@@ -1678,7 +1723,7 @@ class TextTaskService:
                 receipt["_terminal_empty_correction_of"] = previous_id
         receipt["_public_session_ref"] = body["_public_session_ref"]
 
-    def submit(self, owner: str, body: dict, *, source: str | None = None):
+    def submit(self, owner: str, body: dict, *, source: str | None = None, _resume_absent_successor: bool = False):
         from services.durable_forward import dispatch_model
         body = self.submission_input(owner, body)
         from services.workflow_scheduling import normalize_scheduling
@@ -1705,6 +1750,10 @@ class TextTaskService:
             previous = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
             if previous and previous[0] != request_hash:
                 raise ConversationBindingError("request identity already has different input", code="CONVERSATION_REQUEST_CONFLICT")
+            if previous and _resume_absent_successor:
+                # The dedicated missing-row recovery can accept exactly once.
+                # A concurrent insert or a lost reply is read back, never reset.
+                return self._public(json.loads(previous[1]))
             schedule = not previous
             previous_receipt = json.loads(previous[1]) if previous else None
             public_chat_submission = str(body.get("_public_route") or "") == "chat"
@@ -1834,13 +1883,22 @@ class TextTaskService:
         return body
 
     def resume_unsent_successor(self, owner, request_id, envelope):
-        """One explicit atomic requeue of the same proved-unsent category request.
+        """Resume a proved-unsent category row, or accept a still-absent v4 ID.
 
         No original outcome or identity is rewritten. The normal runner repeats
         its original-node checks at both the read and final send boundaries.
         """
         if self.admission is None:
             raise ConversationBindingError("durable admission is unavailable", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
+        if (set(envelope) == self.SUPERSEDE_FIELDS | {"derived_input", "continue_after_no_final"}
+                and envelope.get("client_request_id") == request_id
+                and envelope.get("continue_after_no_final") is True
+                and envelope.get("derived_input") == {"kind": "attributes_required_only_v4"}):
+            # A rejected initial submit has no durable row and cannot have sent:
+            # submission always commits its row before admission is awakened.
+            # Reuse that transaction, immutable derivation and fresh send guard.
+            # Existing rows are only returned, including UNKNOWN/failed rows.
+            return self.submit(owner, envelope, _resume_absent_successor=True)
         if (set(envelope) != self.SUPERSEDE_FIELDS | {"derived_input"}
                 or envelope.get("client_request_id") != request_id
                 or envelope.get("derived_input") != {"kind": "category_directory_parent_v1"}):

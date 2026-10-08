@@ -160,7 +160,11 @@ Provider 从保留输入确定性生成 required-only-v4，固定 `gpt-5-6-think
 
 回执返回 `continue_after_no_final:true`、`supersedes_request_id` 和 `derived_input` proof：`kind`、`original_input_hash`、`source_contract`（`legacy_category` / `required_only_v1`）、`original_model`、`original_thinking_effort`、`model`、`thinking_effort`、`target:{description_category_id,type_id}`、`schema_count`、`required_target_count`、`image_count`、`text_utf8_bytes`。不返回提示词、图片或 private input 路径。`model`/effort 升级只允许此 kind，派生 body/hash/proof 在受理和真正发送前重算核对。
 
-输入不受支持、非法组合或超 64KiB 文本分别返回 `CHAT_DERIVED_INPUT_UNSUPPORTED/INVALID/TOO_LARGE`；原件资格、活跃领取、原结果出现、第二后继及 ID 漂移仍用现有 `CHAT_SUPERSEDE_*` / `CONVERSATION_REQUEST_CONFLICT`。上游读取暂时失败的已受理后继保留同 ID `queued/not_sent`，不能凭此再建一个。此 mode 不适用旧类目 `resume-unsent-successor`。Provider 先发布，消费者再启用；一旦接受此种后继，回退版本必须仍识别其持久输入和关系。
+输入不受支持、非法组合或超 64KiB 文本分别返回 `CHAT_DERIVED_INPUT_UNSUPPORTED/INVALID/TOO_LARGE`；原件资格、活跃领取、原结果出现、第二后继及 ID 漂移仍用现有 `CHAT_SUPERSEDE_*` / `CONVERSATION_REQUEST_CONFLICT`。上游读取暂时失败的已受理后继保留同 ID `queued/not_sent`，不能凭此再建一个。Provider 先发布，消费者再启用；一旦接受此种后继，回退版本必须仍识别其持久输入和关系。
+
+如果首次提交在持久化前被冲突拒绝，消费者已经保留原 v4 升级授权及固定后继 ID，但后续读为 `not_found`，可沿专用 `POST /api/conversation-bindings/text-requests/{原后继ID}/resume-unsent-successor` 接续。body 仍是原七身份字段、`continue_after_no_final:true` 和上述 v4 kind，不能重构提示词。消费者的 `not_found` 本身不作为未发送证明：Provider 的持久 admission 必须先在事务内验证原输入和后继关系、保存唯一回执，才可能开始发送。专用接口会重复这些校验和首次输入审核；返回 HTTP 200 的普通原回执，queued 仅代表受理。已有同 ID/hash 回执只读回，任何状态均不重排、不改写 UNKNOWN；不同输入仍 409。不把普通 409 泛化为可重发，也不为 v4 已存在但失败的回执套用旧类目的重排规则。
+
+同会话的历史 `REQUEST_MESSAGE_NOT_FOUND/UNKNOWN` 若已有唯一、严格完成的已登记后继，且两者顺序均早于当前原请求，原绑定/父节点/输入 hash 一致且无活动领取、暂停或工作恢复动作，则不重复占据后续接续的顺序位置。旧 UNKNOWN 原文保持；非终态、多后继、身份/顺序不符仍冲突，实际发送前仍查当前原请求的完整上游分支。
 
 #### 413 类目目录的受限派生输入
 

@@ -291,3 +291,142 @@ def test_large_retained_text_stays_rejected(task):
     with pytest.raises(ConversationBindingError) as exc:
         h.service.submit("owner", h.envelope)
     assert exc.value.code == "CHAT_DERIVED_INPUT_TOO_LARGE" and row(h.service, "successor") is None
+
+
+def history_with_completed_child(h):
+    """Sanitized original 702/766 shape: old 413 -> completed child -> NO_FINAL."""
+    with h.service.store.transaction() as db:
+        target = h.service.store.read_receipt(db, "text", "owner", "old")
+        historical_body = {**h.body, "client_request_id": "historical"}
+        historical = {**target, "request_id": "historical", "request_message_id": "historical-user",
+            "recovery_reason": "REQUEST_MESSAGE_NOT_FOUND", "_sequence": 1,
+            "_input_ref": h.service.store.save_input(historical_body)}
+        for key in ("_attempt_finished_at", "_attempt_reason"):
+            historical.pop(key, None)
+        old_hash = h.service._submission_identity("owner", historical_body)[1]
+        child_body = {**historical_body, "client_request_id": "historical-child", "supersedes_request_id": "historical"}
+        child = {**historical, "request_id": "historical-child", "request_message_id": "historical-child-user",
+            "status": "succeeded", "error_code": None, "upstream_outcome": "completed", "_upstream_terminal": True,
+            "_supersedes_request_id": "historical", "_supersedes_request_message_id": "historical-user",
+            "_supersedes_input_hash": old_hash, "_submission_parent_message_id": "previous-answer",
+            "_input_ref": h.service.store.save_input(child_body), "_sequence": 2, "content": "original completed answer"}
+        for body, receipt in ((historical_body,historical),(child_body,child)):
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("owner",body["client_request_id"],
+                h.service._submission_identity("owner",body)[1],json.dumps(receipt)))
+        target["_sequence"] = 3
+        h.service.store.write_receipt(db,"text","owner","old",target)
+        h.service.store.set_runtime(db,"acceptance_sequence",3)
+    h.old = row(h.service)
+    return h
+
+
+def test_completed_historical_child_does_not_revive_old_barrier(task):
+    h = history_with_completed_child(install(task))
+    with h.service.store.connect() as db:
+        before = db.execute("SELECT id,receipt FROM requests ORDER BY id").fetchall()
+    assert h.service.validate_submission("owner",h.envelope) is None
+    first = h.service.resume_unsent_successor("owner","successor",h.envelope)
+    assert first["status"] == "queued" and first["supersedes_request_id"] == "old"
+    assert not h.sent
+    with h.service.store.connect() as db:
+        assert db.execute("SELECT id,receipt FROM requests WHERE id<>'successor' ORDER BY id").fetchall() == before
+    _,store,restarted = build(h.root,h.clock)
+    service = TextTaskService(store.path,runner=h.service.runner,clock=h.clock,admission=restarted)
+    restarted.register("text",lambda ctx,body:service._run(ctx.owner,ctx.request_id,body))
+    assert service.resume_unsent_successor("owner","successor",h.envelope) == first
+    ctx = restarted.claim_next(); assert ctx.request_id == "successor"
+    restarted.execute(ctx)
+    assert service.resume_unsent_successor("owner","successor",h.envelope)["status"] == "succeeded"
+    assert len(h.sent) == 1 and restarted.claim_next() is None
+    assert row(service) == h.old
+
+
+@pytest.mark.parametrize("change", ["child_running","child_unknown","child_not_terminal","two_children",
+    "binding","parent","message","input_hash","history_reason","history_paused","child_paused",
+    "history_claim","child_claim","history_claim_no_expiry","nan_claim","child_executing","history_reserved",
+    "history_completion","child_work","sequence_missing","sequence_bool","sequence_reversed",
+    "duplicate_receipt_identity","child_table_id"])
+def test_historical_exception_requires_closed_exact_chain(task,change):
+    h = history_with_completed_child(install(task))
+    hist,child = row(h.service,"historical"),row(h.service,"historical-child")
+    if change == "child_running": child["status"]="running"
+    elif change == "child_unknown": child["upstream_outcome"]="unknown"
+    elif change == "child_not_terminal": child["_upstream_terminal"]=False
+    elif change == "binding": child["provider_binding_id"]="different"
+    elif change == "parent": child["_submission_parent_message_id"]="different"
+    elif change == "message": child["_supersedes_request_message_id"]="different"
+    elif change == "input_hash": child["_supersedes_input_hash"]="different"
+    elif change == "history_reason": hist["recovery_reason"]="REQUEST_RESULT_NOT_FOUND"
+    elif change == "history_paused": hist["_recovery_paused"]=True
+    elif change == "child_paused": child["_recovery_paused"]=True
+    elif change == "history_claim": hist.update(_claim_id="active",_claim_until=h.clock()+10)
+    elif change == "child_claim": child.update(recovery_claim_id="active",recovery_lease_until=h.clock()+10)
+    elif change == "history_claim_no_expiry": hist.update(_recovery_claim_id="active")
+    elif change == "nan_claim": child.update(_claim_until=float("nan"))
+    elif change == "child_executing": child["_executing"]=True
+    elif change == "history_reserved": hist["_turn_reserved"]=True
+    elif change == "history_completion": hist["_completion"]={"state":"checking_original"}
+    elif change == "child_work": child["_work_key"]="live-work"
+    elif change == "sequence_missing": child.pop("_sequence")
+    elif change == "sequence_bool": hist["_sequence"]=True
+    elif change == "sequence_reversed": child["_sequence"]=4
+    with h.service.store.transaction() as db:
+        for r in (hist,child):h.service.store.write_receipt(db,"text","owner",r["request_id"],r)
+        if change == "two_children":
+            r={**child,"request_id":"second-child"}
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)",("owner","second-child","synthetic",json.dumps(r)))
+        elif change == "duplicate_receipt_identity":
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)",("owner","unrelated-blocker","synthetic",json.dumps(hist)))
+        elif change == "child_table_id":
+            db.execute("UPDATE requests SET id='child-alias' WHERE id='historical-child'")
+    with pytest.raises(ConversationBindingError) as exc:
+        h.service.resume_unsent_successor("owner","successor",h.envelope)
+    assert exc.value.code == "CHAT_SUPERSEDE_CONFLICT"
+    assert row(h.service,"successor") is None and not h.sent
+
+
+@pytest.mark.parametrize("state",["unknown","failed","not_started","succeeded"])
+def test_resume_existing_v4_only_returns_saved_row_never_requeues(task,state):
+    h=install(task);h.service.submit("owner",h.envelope)
+    update(h.service,"successor",status=state,_submission_started=True,upstream_outcome="unknown")
+    before=row(h.service,"successor")
+    assert h.service.resume_unsent_successor("owner","successor",h.envelope)["status"]==state
+    assert row(h.service,"successor")==before and not h.sent
+    with pytest.raises(ConversationBindingError):
+        h.service.resume_unsent_successor("owner","successor",{**h.envelope,"parent_message_id":"changed"})
+
+
+def test_missing_v4_http_recovery_checks_identity_policy_review_then_accepts_once(task,monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from unittest.mock import AsyncMock
+    import api.ai as api
+    h=history_with_completed_child(install(task));app=FastAPI();app.include_router(api.create_router())
+    monkeypatch.setattr(api,"text_task_service",h.service)
+    monkeypatch.setattr(api,"require_identity",lambda token:{"id":"owner","role":"admin" if token=="internal" else "user"})
+    monkeypatch.setattr(api,"require_chat_text_policy",lambda _:None)
+    review=AsyncMock();monkeypatch.setattr(api,"filter_or_log",review)
+    with TestClient(app) as client:
+        url="/api/conversation-bindings/text-requests/successor/resume-unsent-successor";headers={"Authorization":"internal"}
+        assert client.post(url,json=h.envelope).status_code==501
+        assert client.post(url.replace('/successor/','/wrong/'),json=h.envelope,headers=headers).status_code==409
+        assert review.await_count==0
+        update(h.service,"historical-child",_upstream_terminal=False)
+        assert client.post(url,json=h.envelope,headers=headers).json()["detail"]["code"]=="CHAT_SUPERSEDE_CONFLICT"
+        assert row(h.service,"successor") is None and review.await_count==0
+        update(h.service,"historical-child",_upstream_terminal=True)
+        first=client.post(url,json=h.envelope,headers=headers)
+        assert first.status_code==200 and first.json()["status"]=="queued"
+        assert client.post(url,json=h.envelope,headers=headers).json()==first.json()
+        assert review.await_count==1 and not h.sent
+        assert "_input_ref" not in first.text and "QUJDRA" not in first.text
+
+
+def test_simultaneous_missing_v4_resume_registers_one_row(task):
+    from concurrent.futures import ThreadPoolExecutor
+    h=history_with_completed_child(install(task))
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results=list(workers.map(lambda _:h.service.resume_unsent_successor("owner","successor",h.envelope),range(2)))
+    assert results[0]==results[1]
+    assert h.admission.claim_next().request_id=="successor"
+    assert h.admission.claim_next() is None and not h.sent

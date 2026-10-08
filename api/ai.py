@@ -427,8 +427,20 @@ def create_router() -> APIRouter:
             raise HTTPException(501, detail={"code": "SERVICE_OPERATION_UNAVAILABLE"})
         require_chat_text_policy(identity)
         try:
+            owner = str(identity.get("id") or "anonymous")
+            payload = body.model_dump(mode="python", exclude_unset=True)
+            if payload.get("derived_input") == {"kind": "attributes_required_only_v4"}:
+                if payload.get("client_request_id") != request_id or text_task_service.admission is None:
+                    raise ConversationBindingError("original successor envelope required", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
+                existing = await run_in_threadpool(text_task_service.validate_submission, owner, payload)
+                if existing is None:
+                    review_payload = await run_in_threadpool(text_task_service.submission_input, owner, payload)
+                    preview = request_text(review_payload.get("messages"))
+                    await filter_or_log(LoggedCall(identity,
+                        "/api/conversation-bindings/text-requests/resume-unsent-successor",
+                        str(review_payload.get("model") or "auto"), "绑定会话文本", request_text=preview), preview)
             return await run_in_threadpool(text_task_service.resume_unsent_successor,
-                str(identity.get("id") or "anonymous"), request_id, body.model_dump(mode="python", exclude_unset=True))
+                owner, request_id, payload)
         except ConversationBindingError as exc:
             raise HTTPException(409, detail={"code": exc.code, "error": str(exc)}) from exc
 
