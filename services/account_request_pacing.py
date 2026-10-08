@@ -123,6 +123,34 @@ def _transport_snapshot(response):
     return result
 
 
+def _transport_error_features(exc):
+    """Keep fixed native error markers, never the raw message or its URLs.
+
+    Curl code 35 alone cannot distinguish a reset, EOF or TLS alert. These
+    diagnostic hints do not prove a cause and never change retry decisions.
+    """
+    from curl_cffi.requests.exceptions import RequestException
+    if not isinstance(exc, RequestException):
+        return {}
+    try:
+        message = str(exc)[:4096].lower()
+        markers = {
+            "ssl_error_syscall": "ssl_error_syscall",
+            "ssl_error_ssl": "ssl_error_ssl",
+            "connection reset": "connection_reset",
+            "unexpected eof": "unexpected_eof",
+            "certificate verify failed": "certificate_verification_failed",
+            "certificate_verify_failed": "certificate_verification_failed",
+            "alert handshake failure": "tls_handshake_alert",
+            "alert_handshake_failure": "tls_handshake_alert",
+            "tls connect error": "tls_connect_error",
+        }
+        found = sorted({label for fragment, label in markers.items() if fragment in message})
+        return {"transport_error_markers": found} if found else {}
+    except Exception:
+        return {}  # Diagnostics must not replace the original exception.
+
+
 def _rate_limit_response_features(response):
     """Classify a 429 without retaining body, URL or raw header values.
 
@@ -807,7 +835,7 @@ class AccountRequestClock:
                 return response
             except Exception as exc:
                 # Exception messages/URLs may contain credentials. Retain only
-                # known class names and a numeric transport code for diagnosis.
+                # known class names, numeric codes and fixed markers for diagnosis.
                 names = {"TimeoutError", "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
                          "ConnectionResetError", "SSLError", "ProxyError", "DNSError", "OSError",
                          "CurlError", "RequestsError", "RequestException", "CertificateVerifyError"}
@@ -823,6 +851,7 @@ class AccountRequestClock:
                     transport_snapshot = _transport_snapshot(getattr(exc, "response", None))
                 except Exception:
                     pass
+                transport_snapshot.update(_transport_error_features(exc))
                 raise
             finally:
                 verb = str(send_method).upper()

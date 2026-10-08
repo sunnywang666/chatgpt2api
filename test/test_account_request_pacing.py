@@ -1788,6 +1788,40 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertIsNone(attempt["request_timeout_secs"])
             self.assertNotIn("secret-", repr(attempt))
 
+    def test_native_tls_markers_do_not_expose_error_text_or_change_failure(self):
+        from curl_cffi.requests.exceptions import SSLError
+        error = SSLError(
+            "curl: (35) TLS connect error: SSL_ERROR_SYSCALL; connection reset; "
+            "https://secret-host/path?token=secret-token Authorization: secret-key", code=35)
+        with patch("services.account_request_pacing.logger.info") as log:
+            def fail(*args, **kwargs):
+                raise error
+            with self.assertRaises(SSLError) as caught:
+                AccountRequestClock("account-hash").request(
+                    fail, "GET", "https://provider/conversation/secret-id")
+            self.assertIs(caught.exception, error)
+            attempt = next(c.args[0] for c in log.call_args_list
+                           if c.args[0].get("event") == "account_http_attempt")
+            self.assertEqual(attempt["transport_error_markers"],
+                             ["connection_reset", "ssl_error_syscall", "tls_connect_error"])
+            self.assertEqual(attempt["transport_error_code"], 35)
+            self.assertNotIn("secret-", repr(attempt))
+            self.assertIsNone(attempt["status_code"])
+
+    def test_transport_markers_are_native_only_bounded_and_fail_open(self):
+        from curl_cffi.requests.exceptions import SSLError
+        from services.account_request_pacing import _transport_error_features
+        class BrokenMessage(SSLError):
+            def __str__(self):
+                raise ValueError("secret-format-error")
+        for error in (OSError("SSL_ERROR_SYSCALL"), BrokenMessage("secret", code=35),
+                      SSLError("secret" * 900 + "SSL_ERROR_SYSCALL", code=35)):
+            with self.subTest(error_type=type(error).__name__):
+                self.assertEqual(_transport_error_features(error), {})
+        self.assertEqual(_transport_error_features(SSLError(
+            "CERTIFICATE_VERIFY_FAILED certificate verify failed", code=60)),
+            {"transport_error_markers": ["certificate_verification_failed"]})
+
     def test_partial_transport_response_keeps_only_finite_allowlisted_metrics(self):
         from types import SimpleNamespace
         from curl_cffi import CurlInfo
