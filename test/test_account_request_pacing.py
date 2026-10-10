@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from services.account_request_pacing import AccountRequestClock
@@ -1345,6 +1346,112 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertEqual(caught.exception.next_at, 10060)
             self.assertEqual([q["owner"] for q in restarted.ordinary_read_queue], ["new-result", "archive"])
             self.assertEqual(restarted.conversation_read_bucket["credit"], 0)
+
+    def test_waiting_result_after_archive_read_gets_next_credit_after_an_archive_read(self):
+        """A result queued after an archive waits for the next credit, not two."""
+        from services.account_request_pacing import ArchiveReadDeferred
+        from services.request_context import guarding_archive
+        now, sent = [10000.0], []
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=AssertionError("result must own next read edge")), \
+             patch("services.account_request_pacing.uuid.uuid4", return_value=SimpleNamespace(hex="ordinary-result")), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)), \
+             patch.object(type(config), "account_conversation_read_burst", property(lambda _: 1)):
+            path = Path(tmp) / "clock.json"
+            clock = AccountRequestClock("account", path)
+            def send(method, url, **kwargs):
+                sent.append((method, url.rsplit("/", 1)[-1], now[0]))
+                return Response()
+            # A completed archive GET exhausts the only credit. The following
+            # archive enters through the production defer path, then a result
+            # arrives one second later while that archive is still queued.
+            with guarding_archive(lambda: None, read_owner="archive-previous"):
+                clock.request(send, "GET", "https://provider/conversation/archive-previous")
+            with guarding_archive(lambda: None, read_owner="archive-v1", defer_reads=True):
+                with self.assertRaises(ArchiveReadDeferred) as deferred:
+                    clock.request(send, "GET", "https://provider/conversation/archive")
+            self.assertEqual(deferred.exception.next_at, 1700010060)
+            now[0] = 10001
+            with clock.lock:
+                # This models the result worker obtaining its existing FIFO
+                # reservation at arrival; its actual GET is below at t+60.
+                self.assertTrue(clock._ordinary_read_turn("ordinary-result", now[0], 59))
+            now[0] = 10060
+            clock.request(send, "GET", "https://provider/conversation/result")
+            now[0] = 10120
+            with guarding_archive(lambda: None, read_owner="archive-v1"):
+                clock.request(send, "GET", "https://provider/conversation/archive")
+            self.assertEqual(sent, [("GET", "archive-previous", 10000),
+                                    ("GET", "result", 10060), ("GET", "archive", 10120)])
+            self.assertEqual(clock.ordinary_read_queue, [])
+
+    def test_mixed_archive_and_result_fifo_allows_one_result_after_each_archive(self):
+        """Result FIFO wins once after an archive, while archives retain their own order."""
+        from services.request_context import guarding_archive
+        now, sent = [10000.0], []
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch("services.account_request_pacing.time.sleep", side_effect=AssertionError("unexpected FIFO wait")), \
+             patch("services.account_request_pacing.uuid.uuid4", side_effect=[SimpleNamespace(hex="ordinary-1"), SimpleNamespace(hex="ordinary-2")]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)), \
+             patch.object(type(config), "account_conversation_read_burst", property(lambda _: 1)):
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            with clock.lock:
+                clock.conversation_read_bucket = {"credit": 0.0, "at": now[0], "interval": 60.0, "capacity": 1}
+                clock.next_conversation_read = now[0] + 60
+                clock.last_read_was_archive = True
+                for owner, archive in (("archive-a", True), ("archive-b", True), ("ordinary-1", False), ("ordinary-2", False)):
+                    clock._ordinary_read_turn(owner, now[0], 300, archive=archive)
+                clock._save()
+            def send(method, url, **kwargs):
+                sent.append((url.rsplit("/", 1)[-1], now[0]))
+                return Response()
+            now[0] = 10060
+            clock.request(send, "GET", "https://provider/conversation/result-1")
+            now[0] = 10120
+            with guarding_archive(lambda: None, read_owner="archive-a"):
+                clock.request(send, "GET", "https://provider/conversation/archive-a")
+            now[0] = 10180
+            clock.request(send, "GET", "https://provider/conversation/result-2")
+            now[0] = 10240
+            with guarding_archive(lambda: None, read_owner="archive-b"):
+                clock.request(send, "GET", "https://provider/conversation/archive-b")
+            self.assertEqual(sent, [("result-1", 10060), ("archive-a", 10120),
+                                    ("result-2", 10180), ("archive-b", 10240)])
+            self.assertEqual(clock.ordinary_read_queue, [])
+
+    def test_archive_fifo_kind_survives_restart_and_legacy_entry_remains_ordinary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clock.json"
+            clock = AccountRequestClock("account", path)
+            with clock.lock:
+                clock.ordinary_read_queue = [{"owner": "legacy-result", "until": time.monotonic() + 300}]
+                clock._ordinary_read_turn("archive-v1", time.monotonic(), 30, archive=True)
+                clock._save()
+            restarted = AccountRequestClock("account", path)
+            self.assertEqual(restarted.ordinary_read_queue[0]["owner"], "legacy-result")
+            self.assertNotIn("kind", restarted.ordinary_read_queue[0])
+            self.assertEqual(restarted.ordinary_read_queue[1]["owner"], "archive-v1")
+            self.assertEqual(restarted.ordinary_read_queue[1]["kind"], "archive")
+
+    def test_archive_reservation_after_archive_read_does_not_wait_on_archive_only_queue(self):
+        now = [10000.0]
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60)):
+            clock = AccountRequestClock("account", Path(tmp) / "clock.json")
+            with clock.lock:
+                clock.last_read_was_archive = True
+                clock._ordinary_read_turn("archive-pending", now[0], 60, archive=True)
+                self.assertTrue(clock._reserve_archive_read("archive-pending", now[0]))
 
     def test_archive_read_booking_survives_restart_and_yields_to_waiting_result(self):
         from services.request_context import guarding_archive

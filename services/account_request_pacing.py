@@ -418,9 +418,14 @@ class AccountRequestClock:
         self.ordinary_read_queue = []
         for entry in saved.get("ordinary_read_queue", []):
             until = float(entry["until"])
-            if not isinstance(entry.get("owner"), str) or not math.isfinite(until):
+            kind = entry.get("kind")
+            if (not isinstance(entry.get("owner"), str) or not math.isfinite(until)
+                    or kind not in (None, "archive")):
                 raise ValueError("Invalid saved result read reservation")
-            self.ordinary_read_queue.append({"owner": entry["owner"], "until": until - offset})
+            restored = {"owner": entry["owner"], "until": until - offset}
+            if kind == "archive":
+                restored["kind"] = "archive"
+            self.ordinary_read_queue.append(restored)
         self.last_read_was_archive = saved.get("last_read_was_archive") is True
         started = saved.get("last_turn_started")
         if started is not None:
@@ -441,7 +446,8 @@ class AccountRequestClock:
                      ordinary_read_wait_until=self.ordinary_read_wait_until + offset,
                      last_read_was_archive=self.last_read_was_archive)
         saved["ordinary_read_queue"] = [
-            {"owner": entry["owner"], "until": entry["until"] + offset}
+            {"owner": entry["owner"], "until": entry["until"] + offset,
+             **({"kind": "archive"} if entry.get("kind") == "archive" else {})}
             for entry in self.ordinary_read_queue]
         saved["last_turn_started"] = None if self.last_turn_started is None else self.last_turn_started + offset
         if self.conversation_read_bucket is not None:
@@ -455,7 +461,7 @@ class AccountRequestClock:
             os.fsync(handle.fileno())
         temporary.replace(self.state_path)
 
-    def _ordinary_read_turn(self, owner, now, delay):
+    def _ordinary_read_turn(self, owner, now, delay, *, archive=False):
         # Sleeping outside the send lock is essential, but waking readers must
         # not race for every read edge: a busy reader could starve other results.
         # Keep FIFO reservations in the existing cross-process clock. Renew at
@@ -464,12 +470,23 @@ class AccountRequestClock:
         changed = len(queue) != len(self.ordinary_read_queue)
         entry = next((entry for entry in queue if entry["owner"] == owner), None)
         if entry is None:
-            entry = {"owner": owner, "until": now + max(0, delay) + 30}
+            entry = {"owner": owner, "until": now + max(0, delay) + 30,
+                     **({"kind": "archive"} if archive else {})}
             queue.append(entry)
             changed = True
         elif entry["until"] < now + max(0, delay) + 5:
             entry["until"] = now + max(0, delay) + 30
             changed = True
+        # An old persisted entry has no kind and remains an ordinary reader.
+        # After one archive GET, let the earliest waiting ordinary result take
+        # the following edge. The next archive stays at the head afterwards,
+        # which bounds the yield without inventing a second queue or credit.
+        if self.last_read_was_archive:
+            first_ordinary = next((index for index, queued in enumerate(queue)
+                                   if queued.get("kind") != "archive"), None)
+            if first_ordinary not in (None, 0):
+                queue.insert(0, queue.pop(first_ordinary))
+                changed = True
         self.ordinary_read_queue = queue
         self.ordinary_read_wait_until = max(entry["until"] for entry in queue)
         if changed:
@@ -493,7 +510,9 @@ class AccountRequestClock:
             return False  # An archive HTTP step has a 240 second finite budget.
         if self.archive_read_owner and self.archive_read_until > now:
             return self.archive_read_owner == owner
-        if self.last_read_was_archive and self.ordinary_read_wait_until > now:
+        if self.last_read_was_archive and any(
+                entry["until"] > now and entry.get("kind") != "archive"
+                for entry in self.ordinary_read_queue):
             return False
         self.archive_read_owner = owner
         self.archive_read_until = ready + 5
@@ -1001,7 +1020,9 @@ class AccountRequestClock:
                                 read_delay = max(read_delay, reservation_delay)
                             legacy_turn = bool(read_owner and self.archive_read_owner == read_owner
                                                and self.archive_read_until > now)
-                            if not reuse_read_credit and not legacy_turn and not self._ordinary_read_turn(ordinary_owner, now, read_delay):
+                            if (not reuse_read_credit and not legacy_turn
+                                    and not self._ordinary_read_turn(ordinary_owner, now, read_delay,
+                                                                      archive=archive_guard is not None)):
                                 # Give the reserved reader time to wake. Do not
                                 # consume another full upstream interval locally,
                                 # or add a whole second to fractional HTTP pacing.
@@ -1504,7 +1525,7 @@ def _archive_read_reservation(account, owner, *, cancel):
                 # backlog ahead of ordinary results. Already-running readbacks
                 # join at the actual GET boundary and retain their FIFO place.
                 return False
-            first = clock._ordinary_read_turn(owner, now, delay)
+            first = clock._ordinary_read_turn(owner, now, delay, archive=True)
             legacy_busy = (clock.archive_read_owner and clock.archive_read_owner != owner
                            and clock.archive_read_until > now)
             return first and delay <= 0 and not legacy_busy
