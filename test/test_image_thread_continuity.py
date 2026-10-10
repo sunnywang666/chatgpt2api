@@ -248,11 +248,16 @@ def run_next(r, expected):
 
 @pytest.mark.parametrize("path", ["direct", "text_retry", "fallback"])
 @pytest.mark.parametrize("fail_confirmation", [False, True])
-def test_first_download_stays_private_until_confirmed_and_survives_restart(runtime, monkeypatch, path, fail_confirmation):
+@pytest.mark.parametrize("image_count", [1, 2])
+def test_first_download_stays_private_until_confirmed_and_survives_restart(runtime, monkeypatch, path, fail_confirmation, image_count):
     r = runtime
     backend_class = conversation.OpenAIBackendAPI
     fail = [fail_confirmation]
     calls = {"download": 0, "resolve": 0, "published": 0}
+
+    def assets(rid):
+        _, asset = tool_document("conversation-first-download", rid)
+        return [asset] if image_count == 1 else [asset, "file_00000000" + "b" * 24]
 
     def events(backend, **kwargs):
         callback = backend.progress_callback
@@ -264,9 +269,12 @@ def test_first_download_stays_private_until_confirmed_and_survives_restart(runti
         callback.record_submission_started()
         callback.record_conversation_id(cid)
         doc, asset = tool_document(cid, rid)
+        doc["mapping"][rid + "-image"]["message"]["content"]["parts"] = [
+            {"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + item}
+            for item in assets(rid)]
         r.state.documents[cid] = doc
         r.state.sends.append({"conversation": cid, "message": rid})
-        yield {"conversation_id": cid, "file_ids": [asset] if path == "direct" else [],
+        yield {"conversation_id": cid, "file_ids": assets(rid) if path == "direct" else [],
                "text": '{"referenced_image_ids": ["input"]}' if path == "text_retry" else "",
                "turn_use_case": "image gen"}
 
@@ -275,12 +283,11 @@ def test_first_download_stays_private_until_confirmed_and_survives_restart(runti
         return ["https://fixture.invalid/original.png"] if files or sediments else []
 
     def poll(_backend, cid, *_args, request_message_id, **_kwargs):
-        _, asset = tool_document(cid, request_message_id)
-        return [asset], []
+        return assets(request_message_id), []
 
     def download(_backend, _urls):
         calls["download"] += 1
-        return [OUTPUT]
+        return [OUTPUT] if image_count == 1 else [OUTPUT, SOURCE]
 
     def read(_backend, cid):
         if fail[0]:
@@ -290,7 +297,8 @@ def test_first_download_stays_private_until_confirmed_and_survives_restart(runti
     def publish(items, *_args, **_kwargs):
         assert not fail[0], "no public image storage before exact final confirmation"
         calls["published"] += 1
-        return {"data": [{"b64_json": items[0]["b64_json"], "url": "https://fixture.invalid/confirmed.png"}]}
+        return {"data": [{"b64_json": item["b64_json"], "url": "https://fixture.invalid/confirmed.png"}
+                         for item in items]}
 
     monkeypatch.setattr(conversation, "conversation_events", events)
     monkeypatch.setattr(conversation, "stream_image_outputs", REAL_IMAGE_STREAM)
@@ -321,6 +329,9 @@ def test_first_download_stays_private_until_confirmed_and_survives_restart(runti
         assert calls["resolve"] == resolves_before
     result = r.read("original")
     assert result["status"] == "success" and result["_image_thread_terminal"] is True
+    assert len(result["data"]) == len(result["result_file_ids"]) == image_count
+    assert [base64.b64decode(item["b64_json"]) for item in result["data"]] == (
+        [OUTPUT] if image_count == 1 else [OUTPUT, SOURCE])
     assert not result.get("_pending_image_output")
     assert calls["download"] == calls["published"] == len(r.state.sends) == 1
     assert result["conversation_id"] == original["conversation_id"]

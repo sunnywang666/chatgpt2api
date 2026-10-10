@@ -1784,7 +1784,10 @@ class ImageTaskService:
                 raise RuntimeError("bound image result changed provider binding identity")
             if expected_account_identity and provider_account_identity != expected_account_identity:
                 raise RuntimeError("bound image result changed provider account identity")
-            if payload.get("_image_thread") and (len(data) != 1 or not result.get("_image_thread_terminal") or (payload.get("conversation_id") and payload["conversation_id"] != conversation_id)):
+            # One submitted generation may return multiple original assets.
+            # Preserve the complete confirmed result just as recovery does;
+            # its size alone must not turn a finished request into UNKNOWN.
+            if payload.get("_image_thread") and (not result.get("_image_thread_terminal") or (payload.get("conversation_id") and payload["conversation_id"] != conversation_id)):
                 raise ImageThreadError("IMAGE_THREAD_TURN_UNCONFIRMED", submitted=True)
             if (
                 bool(provider_binding_id) != bool(provider_account_identity)
