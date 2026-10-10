@@ -245,6 +245,18 @@ def image_completion_hints(account_identity, conversation_id, open_transport):
                 hub.observe("hint_consumed", conversation_id)
                 return True
             if hub.stopped.is_set():
+                # The listener can set a matching completion signal and then
+                # stop between the first signal check above and this branch.
+                # Consume that already-routed wakeup before falling back to
+                # normal polling; a stopped transport is not permission to
+                # discard its final local notification.
+                with hub.changed:
+                    notified = signal.is_set()
+                    if notified:
+                        signal.clear()
+                if notified:
+                    hub.observe("hint_consumed", conversation_id)
+                    return True
                 if not fallback_observed:
                     hub.observe("poll_fallback", conversation_id, reason="listener_stopped")
                     fallback_observed = True
@@ -270,8 +282,8 @@ def image_completion_hints(account_identity, conversation_id, open_transport):
                     notified = signal.is_set()
             else:
                 notified = signal.wait(seconds)
-            signal.clear()  # Coalesce duplicate updates into one original GET.
             if notified:
+                signal.clear()  # Coalesce duplicate updates into one original GET.
                 hub.observe("hint_consumed", conversation_id)
             return notified
         yield wait

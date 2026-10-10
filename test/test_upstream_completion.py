@@ -211,6 +211,87 @@ def test_disconnected_shared_listener_preserves_fallback_interval(monkeypatch):
     assert sleeps == [10] and "disconnected-fixture" not in completion._hubs
 
 
+@pytest.mark.parametrize("before_first_read", [True, False])
+def test_completion_signal_wins_when_listener_stops_between_wait_checks(monkeypatch, before_first_read):
+    """A routed final signal must survive the listener's immediate shutdown."""
+    release, started = threading.Event(), threading.Event()
+
+    def run(_hub, _factory):
+        started.set()
+        release.wait(1)
+
+    monkeypatch.setattr(completion._ConversationHints, "run", run)
+    with completion.image_completion_hints("stop-after-signal", CID, lambda: None) as wait:
+        assert started.wait(1)
+        hub = completion._hubs["stop-after-signal"]
+        signal = next(iter(hub.signals[CID]))
+        original_stopped = hub.stopped
+
+        class StopAfterSignal:
+            def is_set(self):
+                signal.set()
+                return True
+
+            def set(self):
+                original_stopped.set()
+
+            def wait(self, *args, **kwargs):
+                return original_stopped.wait(*args, **kwargs)
+
+        hub.stopped = StopAfterSignal()
+        if not before_first_read:
+            monkeypatch.setattr(completion.time, "sleep",
+                                lambda *_: pytest.fail("routed signal must avoid fallback sleep"))
+        assert wait(10, before_first_read=before_first_read) is True
+        release.set()
+
+
+def test_timeout_does_not_clear_completion_signal_routed_after_wait(monkeypatch):
+    """Keep a post-timeout final hint for the next strict original read."""
+    original_event = threading.Event
+    started, release = original_event(), original_event()
+
+    class SignalAfterTimeout:
+        def __init__(self):
+            self.event = original_event()
+            self.injected = False
+            self.clear_calls = 0
+
+        def is_set(self):
+            return self.event.is_set()
+
+        def set(self):
+            self.event.set()
+
+        def clear(self):
+            self.clear_calls += 1
+            self.event.clear()
+
+        def wait(self, _seconds):
+            if not self.injected:
+                self.injected = True
+                self.event.set()  # Arrives after this wait has timed out.
+                return False
+            return self.event.wait(0)
+
+    signal = SignalAfterTimeout()
+    calls = iter([signal])
+    monkeypatch.setattr(completion.threading, "Event", lambda: next(calls, original_event()))
+
+    def run(_hub, _factory):
+        started.set()
+        release.wait(1)
+
+    monkeypatch.setattr(completion._ConversationHints, "run", run)
+    with completion.image_completion_hints("late-signal", CID, lambda: None) as wait:
+        assert started.wait(1)
+        assert wait(.01) is False
+        assert wait(.01) is True
+        assert wait(0) is False
+        assert signal.clear_calls == 1
+        release.set()
+
+
 def test_new_conversation_replaces_dead_listener_without_old_release_stopping_it(monkeypatch):
     runs = []
     def run(hub, _factory):
