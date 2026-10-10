@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import unittest
@@ -517,6 +518,195 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
 
         self.assertEqual(payload["conversation_id"], "conversation-1")
         self.assertEqual(payload["parent_message_id"], "message-1")
+
+    def test_bound_multimodal_parts_preserve_interleaving_and_cursor(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.base_url = "https://chatgpt.test"
+        backend.access_token = "fixture-token"
+        backend.retain_bound_conversation = True
+        backend._bootstrap = mock.Mock()
+        backend._get_chat_requirements = mock.Mock(return_value=ChatRequirements(token="fixture"))
+        backend._chat_target = mock.Mock(return_value=("/backend-api/conversation", "UTC"))
+        backend._conversation_headers = mock.Mock(return_value={})
+        response = SimpleNamespace(status_code=200, headers={}, close=mock.Mock())
+        backend.session = SimpleNamespace(post=mock.Mock(return_value=response))
+        backend._iter_sse_payloads_capped = mock.Mock(return_value=iter(["fixture event"]))
+        backend._upload_image = mock.Mock(side_effect=[
+            {"file_id": "first", "width": 10, "height": 20, "file_size": 30,
+             "mime_type": "image/png", "file_name": "image_1.png"},
+            {"file_id": "second", "width": 11, "height": 21, "file_size": 31,
+             "mime_type": "image/jpeg", "file_name": "image_2.jpg"},
+        ])
+
+        events = list(backend.stream_conversation(
+            [{"role": "user", "content": [
+                {"type": "text", "text": "label first"},
+                {"type": "image", "data": b"first-bytes", "mime": "image/png"},
+                {"type": "text", "text": "label second"},
+                {"type": "image", "data": b"second-bytes", "mime": "image/jpeg"},
+                {"type": "text", "text": "final instruction"},
+            ]}],
+            "gpt-5-6-thinking", thinking_effort="high",
+            conversation_id="conversation-1", parent_message_id="message-1",
+        ))
+
+        self.assertEqual(events, ["fixture event"])
+        backend.session.post.assert_called_once()
+        call = backend.session.post.call_args
+        self.assertEqual(call.args, ("https://chatgpt.test/backend-api/conversation",))
+        self.assertEqual(call.kwargs["_account_request_model"], "gpt-5-6-thinking")
+        payload = json.loads(call.kwargs["data"])
+        response.close.assert_called_once()
+
+        self.assertEqual(payload["conversation_id"], "conversation-1")
+        self.assertEqual(payload["parent_message_id"], "message-1")
+        self.assertEqual(payload["model"], "gpt-5-6-thinking")
+        self.assertEqual(payload["thinking_effort"], "extended")
+        self.assertEqual(
+            payload["messages"][0]["content"]["parts"],
+            [
+                "label first",
+                {"content_type": "image_asset_pointer", "asset_pointer": "file-service://first",
+                 "width": 10, "height": 20, "size_bytes": 30},
+                "label second",
+                {"content_type": "image_asset_pointer", "asset_pointer": "file-service://second",
+                 "width": 11, "height": 21, "size_bytes": 31},
+                "final instruction",
+            ],
+        )
+        self.assertEqual(
+            [item["id"] for item in payload["messages"][0]["metadata"]["attachments"]],
+            ["first", "second"],
+        )
+
+    def test_multimodal_conversion_keeps_text_only_and_single_image_forms(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "fixture-token"
+        backend._upload_image = mock.Mock(return_value={
+            "file_id": "one", "width": 1, "height": 2, "file_size": 3,
+            "mime_type": "image/png", "file_name": "image_1.png",
+        })
+
+        messages = backend._api_messages_to_conversation_messages([
+            {"role": "system", "content": "plain text"},
+            {"role": "user", "content": [{"type": "text", "text": "zero images"}]},
+            {"role": "user", "content": [{"type": "image", "data": b"one", "mime": "image/png"}]},
+        ])
+
+        self.assertEqual(messages[0]["content"], {"content_type": "text", "parts": ["plain text"]})
+        self.assertEqual(messages[1]["content"], {"content_type": "text", "parts": ["zero images"]})
+        self.assertEqual(messages[2]["content"]["parts"], [
+            {"content_type": "image_asset_pointer", "asset_pointer": "file-service://one",
+             "width": 1, "height": 2, "size_bytes": 3},
+        ])
+
+        backend._upload_image.reset_mock()
+        payload = backend._conversation_payload(
+            [{"role": "user", "content": [
+                {"type": "text", "text": "continue "},
+                {"type": "text", "text": "without images"},
+            ]}],
+            "gpt-5-6-thinking", "UTC", thinking_effort="high",
+            conversation_id="conversation-1", parent_message_id="message-1",
+        )
+        self.assertEqual(payload["messages"][0]["content"],
+                         {"content_type": "text", "parts": ["continue without images"]})
+        self.assertEqual(payload["conversation_id"], "conversation-1")
+        self.assertEqual(payload["parent_message_id"], "message-1")
+        self.assertEqual(payload["model"], "gpt-5-6-thinking")
+        self.assertEqual(payload["thinking_effort"], "extended")
+        backend._upload_image.assert_not_called()
+
+    def test_ten_images_keep_labels_upload_bytes_and_attachment_order(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "fixture-token"
+        backend.text_request_message_id = "original-request"
+        refs = [{"file_id": f"file-{i}", "width": i + 1, "height": i + 2,
+                 "file_size": 1, "mime_type": "image/png", "file_name": f"image_{i + 1}.png"}
+                for i in range(10)]
+        backend._upload_image = mock.Mock(side_effect=refs)
+        content = [{"type": "text", "text": ""}]
+        for i in range(10):
+            content.extend([{"type": "text", "text": f"label-{i}"},
+                            {"type": "image", "data": bytes([i]), "mime": "image/png"}])
+        content.extend([{"type": "text", "text": "review the final image"},
+                        {"type": "text", "text": ""}])
+
+        message = backend._api_messages_to_conversation_messages(
+            [{"role": "user", "content": content}])[0]
+
+        self.assertEqual(message["id"], "original-request")
+        parts = message["content"]["parts"]
+        self.assertEqual(len(parts), 21)
+        self.assertEqual(parts[-1], "review the final image")
+        for i in range(10):
+            self.assertEqual(parts[i * 2], f"label-{i}")
+            self.assertEqual(parts[i * 2 + 1]["asset_pointer"], f"file-service://file-{i}")
+            self.assertEqual(parts[i * 2 + 1]["width"], i + 1)
+            self.assertEqual(parts[i * 2 + 1]["height"], i + 2)
+        self.assertEqual(backend._upload_image.call_count, 10)
+        for i, call in enumerate(backend._upload_image.call_args_list):
+            self.assertEqual(base64.b64decode(call.args[0].split(",", 1)[1]), bytes([i]))
+            self.assertEqual(call.args[1], f"image_{i + 1}.png")
+        self.assertEqual([item["id"] for item in message["metadata"]["attachments"]],
+                         [ref["file_id"] for ref in refs])
+
+    def test_image_upload_failure_never_sends_a_partial_conversation(self) -> None:
+        image_bytes = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "first"},
+            {"type": "image", "data": image_bytes, "mime": "image/png"},
+            {"type": "text", "text": "second"},
+            {"type": "image", "data": image_bytes, "mime": "image/png"},
+        ]}]
+
+        for failing_step in ("init", "put", "confirm"):
+            with self.subTest(failing_step=failing_step):
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.base_url = "https://chatgpt.test"
+                backend.user_agent = "fixture"
+                backend.access_token = "fixture-token"
+                backend._bootstrap = mock.Mock()
+                backend._get_chat_requirements = mock.Mock(return_value=ChatRequirements(token="fixture"))
+                backend._chat_target = mock.Mock(return_value=("/backend-api/conversation", "UTC"))
+                backend._headers = mock.Mock(return_value={})
+                backend._image_request_options = mock.Mock(return_value={})
+                calls = []
+                upload_count = 0
+
+                def send(method, url, **kwargs):
+                    nonlocal upload_count
+                    calls.append((method, url))
+                    if url == "https://chatgpt.test/backend-api/files":
+                        upload_count += 1
+                        step = "init"
+                    elif method == "PUT":
+                        step = "put"
+                        self.assertEqual(kwargs["data"], image_bytes)
+                    elif url.endswith("/uploaded"):
+                        step = "confirm"
+                    else:
+                        self.fail(f"unexpected upstream request: {method} {url}")
+                    if upload_count == 2 and step == failing_step:
+                        raise RuntimeError("fixture upload failure")
+                    return SimpleNamespace(status_code=200, headers={}, json=lambda: {
+                        "file_id": f"file-{upload_count}",
+                        "upload_url": f"https://storage.test/file-{upload_count}",
+                    })
+
+                backend.session = SimpleNamespace(
+                    post=lambda url, **kwargs: send("POST", url, **kwargs),
+                    put=lambda url, **kwargs: send("PUT", url, **kwargs),
+                )
+                with self.assertRaisesRegex(RuntimeError, "fixture upload failure"):
+                    list(backend.stream_conversation(
+                        messages, "gpt-5-6-thinking", thinking_effort="high",
+                        conversation_id="conversation-1", parent_message_id="message-1"))
+
+                self.assertEqual(upload_count, 2)
+                self.assertIn(("POST", "https://chatgpt.test/backend-api/files/file-1/uploaded"), calls)
+                self.assertNotIn(("POST", "https://chatgpt.test/backend-api/conversation"), calls)
 
     def test_partial_continuation_cursor_fails_closed(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
