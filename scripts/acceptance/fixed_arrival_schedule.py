@@ -35,9 +35,10 @@ def segmented_timing(items: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, 
     segments = {
         "arrival": ("scheduled_arrival_monotonic", "actual_dispatch_monotonic"),
         "admission": ("actual_dispatch_monotonic", "admitted_monotonic"),
-        "dispatch_to_upstream_send": ("actual_dispatch_monotonic", "upstream_send_monotonic_derived_from_wall"),
-        "upstream_send_to_finished": ("upstream_send_monotonic_derived_from_wall", "upstream_finished_monotonic_derived_from_wall"),
-        "upstream_send_to_success_observed": ("upstream_send_monotonic_derived_from_wall", "provider_success_observed_monotonic"),
+        "dispatch_to_send_intent": ("actual_dispatch_monotonic", "send_intent_monotonic_derived_from_wall"),
+        "send_intent_to_provider_finished": ("send_intent_monotonic_derived_from_wall", "provider_finished_monotonic_derived_from_wall"),
+        "send_intent_to_stream_finished": ("send_intent_monotonic_derived_from_wall", "stream_finished_monotonic_derived_from_wall"),
+        "send_intent_to_success_observed": ("send_intent_monotonic_derived_from_wall", "provider_success_observed_monotonic"),
         "dispatch_to_result_save": ("actual_dispatch_monotonic", "saved_monotonic"),
         "dispatch_to_archive": ("actual_dispatch_monotonic", "archive_confirmed_monotonic"),
     }

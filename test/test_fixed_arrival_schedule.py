@@ -55,9 +55,10 @@ def test_segmented_summary_uses_only_real_timestamp_pairs():
     ])
     assert summary["arrival"] == {"count": 2, "p50": 1.0, "p95": 3.0, "max": 3.0}
     assert summary["admission"] == {"count": 2, "p50": 1.0, "p95": 2.0, "max": 2.0}
-    assert summary["dispatch_to_upstream_send"] is None
-    assert summary["upstream_send_to_finished"] is None
-    assert summary["upstream_send_to_success_observed"] is None
+    assert summary["dispatch_to_send_intent"] is None
+    assert summary["send_intent_to_provider_finished"] is None
+    assert summary["send_intent_to_stream_finished"] is None
+    assert summary["send_intent_to_success_observed"] is None
     assert summary["dispatch_to_result_save"] == {"count": 1, "p50": 4.0, "p95": 4.0, "max": 4.0}
     assert summary["dispatch_to_archive"] == {"count": 1, "p50": 7.0, "p95": 7.0, "max": 7.0}
 
