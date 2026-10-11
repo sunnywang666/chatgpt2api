@@ -19,6 +19,29 @@ class CompletionError(WorkLifecycleError):
     pass
 
 
+def _local_not_sent_completion(kind, root):
+    """This terminal disposition needs no upstream result read."""
+    state = root.get("_completion") or {}
+    return bool(
+        kind in {"text", "image"} and root.get("status") in {"failed", "error"}
+        and root.get("upstream_outcome") in {"not_sent", "not_submitted"}
+        and root.get("_submission_started") is not True
+        and root.get("upstream_submission_started") is not True
+        and not root.get("_executing") and not root.get("recovery_claim_id")
+        and not root.get("upstream_unfinished")
+        and not root.get("_recovery_paused") and not root.get("_recovery_suppressed")
+        and not state.get("selected_id") and not state.get("replacement_id")
+        and not state.get("prepared_input") and not state.get("read_only_original")
+        and not any(root.get(k) for k in (
+            "data", "result_file_ids", "result_sediment_ids", "_pending_image_result_ids", "_pending_image_output"))
+        and (root.get("error_code") in {
+            "TEXT_TASK_CAPACITY_EXCEEDED", "TEXT_GENERATION_NOT_SUBMITTED", "IMAGE_GENERATION_NOT_SUBMITTED",
+            "CONVERSATION_BINDING_UNAVAILABLE", "CHAT_ARCHIVE_RESTORE_UNCONFIRMED"}
+            or kind == "image" and root.get("error_code") == "RESULT_UNRECOVERABLE"
+            and root.get("recovery_retryable") is True)
+    )
+
+
 def read_only_original_state(state):
     """The common no-successor boundary for a legacy original receipt."""
     return bool(
@@ -620,12 +643,16 @@ class GenerationCompletionService:
             work["slot_held"] = False
             self.store.set_runtime(db, work_key, work)
 
-    def advance(self, kind, owner, request_id, *, wait_for_image_recovery=False):
+    def advance(self, kind, owner, request_id, *, wait_for_image_recovery=False, local_only=False):
         now = float(self.clock())
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id)
             state = root.get("_completion")
             if not state or state.get("state") == "completed" or root.get("_recovery_paused") is True or root.get("_recovery_suppressed"):
+                return
+            # Recheck the snapshot before bypassing the read dispatcher. A
+            # concurrent send/result must return to the ordinary paced path.
+            if local_only and not _local_not_sent_completion(kind, root):
                 return
             child = self._select(db, kind, owner, request_id, root)
             if state.get("selected_id"):
@@ -638,7 +665,7 @@ class GenerationCompletionService:
             if state.get("state") == "needs_attention" and state.get("next_at") is None:
                 return
             read_image_original = bool(
-                kind == "image" and root.get("status") == "error" and unresolved(root)
+                not local_only and kind == "image" and root.get("status") == "error" and unresolved(root)
                 and not root.get("_executing") and not root.get("recovery_claim_id")
                 and (root.get("conversation_id") or self.images.can_locate_original_cursor(root))
                 and now >= float(root.get("next_poll_at") or 0)
@@ -654,7 +681,7 @@ class GenerationCompletionService:
             state["next_at"] = now + self.RECHECK_SECONDS
             self.store.write_receipt(db, kind, owner, request_id, root)
         # Existing exact-original readers preserve Retry-After/backoff and errors.
-        if kind == "text":
+        if kind == "text" and not local_only:
             self.text.read(owner, request_id)
         elif read_image_original:
             self.images.resume_poll({"id": owner}, request_id, extra_timeout_secs=5,
@@ -663,6 +690,8 @@ class GenerationCompletionService:
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id)
             state = root["_completion"]
+            if local_only and not _local_not_sent_completion(kind, root):
+                return
             child = self._select(db, kind, owner, request_id, root)
             if not state.get("selected_id") and not child:
                 try:
@@ -858,8 +887,14 @@ class GenerationCompletionService:
                 self.advance(*candidates[0][:3])
             else:
                 for kind, owner, rid, row in candidates:
-                    dispatch(kind, owner, rid, lambda o, r, k=kind: self.advance(
-                        k, o, r, wait_for_image_recovery=True), row)
+                    if _local_not_sent_completion(kind, row):
+                        # Queue the same ID (or end its exhausted retry) locally;
+                        # no GET/read credit is required. Generation still uses
+                        # the ordinary durable admission and account pacing.
+                        self.advance(kind, owner, rid, local_only=True)
+                    else:
+                        dispatch(kind, owner, rid, lambda o, r, k=kind: self.advance(
+                            k, o, r, wait_for_image_recovery=True), row)
 
     def read(self, kind, identity, request_id):
         owner = str(identity["id"])

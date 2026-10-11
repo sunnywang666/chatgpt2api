@@ -619,6 +619,93 @@ def failed_unsent_image(setup):
     return service
 
 
+@pytest.mark.parametrize("kind", ["text", "image"])
+def test_proven_not_sent_local_retry_does_not_wait_for_original_read_credit(setup, monkeypatch, kind):
+    service, admission, calls = setup
+    rid = "old-0"
+    if kind == "image":
+        service.images.submit_generation(IDENTITY, client_task_id=rid, prompt="retained image",
+                                         model="gpt-image-2", size=None)
+    patch_row(service, kind, rid, status="failed" if kind == "text" else "error",
+              upstream_outcome="not_submitted", _submission_started=False, upstream_submission_started=False,
+              upstream_unfinished=False, _executing=False, recovery_claim_id=None,
+              error_code="TEXT_GENERATION_NOT_SUBMITTED" if kind == "text" else "RESULT_UNRECOVERABLE",
+              recovery_retryable=True, _automatic_generation_recovery=True, _completion=None)
+    original = row(service, kind, rid)
+    # Model an account whose archive traffic has exhausted its read credit.
+    dispatch = Mock(return_value=False)
+    service.text.read = Mock(side_effect=AssertionError("no upstream text read"))
+    service.images.resume_poll = Mock(side_effect=AssertionError("no upstream image read"))
+    wake = Mock()
+    monkeypatch.setattr(admission, "wake", wake)
+    service.process_one(dispatch=dispatch)
+    queued = row(service, kind, rid)
+    assert queued["status"] == "queued"
+    assert queued["_completion"]["same_request_retry"] is True
+    assert queued["_input_ref"] == original["_input_ref"]
+    assert "replacement_id" not in queued["_completion"]
+    assert queued["_execution_timeline"][-1]["stage"] == "not_submitted_retry_queued"
+    assert queued["_execution_timeline"][-1]["at"] == service.clock()
+    dispatch.assert_not_called()
+    wake.assert_called_once()
+    assert calls == []  # Actual send remains the ordinary admission's job.
+
+    # A second definitely-unsent failure must finish locally, never grant a
+    # third attempt or wait for another read-credit refill to release work.
+    patch_row(service, kind, rid, status="failed" if kind == "text" else "error",
+              error_code=original["error_code"], _completion={**queued["_completion"], "next_at": 0})
+    service.process_one(dispatch=dispatch)
+    ended = row(service, kind, rid)
+    assert ended["_completion"]["reason"] == "COMPLETION_ORIGINAL_NOT_RETRYABLE"
+    assert ended["_completion"]["next_at"] is None
+    assert ended["_attempt_finished_at"] == service.clock()
+    assert sum(e["stage"] == "not_submitted_retry_queued" for e in ended["_execution_timeline"]) == 1
+    dispatch.assert_not_called()
+    wake.assert_called_once()
+
+
+@pytest.mark.parametrize("change", [
+    {"upstream_outcome": "unknown"}, {"_submission_started": True},
+    {"upstream_submission_started": True}, {"_executing": True},
+    {"result_file_ids": ["existing-asset"]}, {"recovery_retryable": False},
+])
+def test_unproven_unsent_image_keeps_original_read_dispatch(failed_unsent_image, change):
+    service = failed_unsent_image
+    patch_row(service, "image", "repair-image", **change,
+              _completion={"state": "checking_original", "next_at": 0,
+                           "max_extra_requests": 1, "allow_unconfirmed_retry": False})
+    dispatch = Mock(return_value=False)
+    before = row(service, "image", "repair-image")
+    service.process_one(dispatch=dispatch)
+    dispatch.assert_called_once()
+    after = row(service, "image", "repair-image")
+    assert after["status"] == before["status"]
+    assert not after["_completion"].get("same_request_retry")
+
+
+def test_local_unsent_dispatch_rechecks_concurrent_send(failed_unsent_image, monkeypatch):
+    service = failed_unsent_image
+    patch_row(service, "image", "repair-image",
+              _completion={"state": "checking_original", "next_at": 0,
+                           "max_extra_requests": 1, "allow_unconfirmed_retry": False})
+    advance = service.advance
+    def race(*args, **kwargs):
+        patch_row(service, "image", "repair-image", upstream_outcome="unknown", _submission_started=True)
+        return advance(*args, **kwargs)
+    monkeypatch.setattr(service, "advance", race)
+    service.images.resume_poll = Mock(side_effect=AssertionError("changed evidence must re-enter read dispatcher"))
+    dispatch = Mock(return_value=False)
+    service.process_one(dispatch=dispatch)
+    current = row(service, "image", "repair-image")
+    assert current["upstream_outcome"] == "unknown"
+    assert not current["_completion"].get("same_request_retry")
+    assert not any(e["stage"] == "not_submitted_retry_queued" for e in current.get("_execution_timeline", []))
+    service.images.resume_poll.assert_not_called()
+    # The changed original is picked up only through the paced path next tick.
+    service.process_one(dispatch=dispatch)
+    dispatch.assert_called_once()
+
+
 @pytest.mark.parametrize("automatic", [False, True])
 @pytest.mark.parametrize("proof_source", [None, "terminal_image_failure"])
 @pytest.mark.parametrize("error_code", ["content_policy_violation", "CONTENT_POLICY_VIOLATION"])
