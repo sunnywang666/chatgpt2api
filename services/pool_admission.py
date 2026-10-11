@@ -418,9 +418,9 @@ class PoolAdmission:
                 return next((a for a in self._rows()
                              if a.get("provider_account_identity") == receipt.get("provider_account_identity")), None)
         def cancel_reservation():
-            if kind == "image" and account is not None and self.pacing is None:
-                from services.account_request_pacing import release_account_image_recovery_read
-                release_account_image_recovery_read(account, owner, request_id)
+            if kind in {"text", "image"} and account is not None and self.pacing is None:
+                from services.account_request_pacing import release_account_original_recovery_read
+                release_account_original_recovery_read(account, owner, request_id, kind=kind)
 
         key = physical_conversation_key(receipt)
         if key is None:
@@ -451,10 +451,13 @@ class PoolAdmission:
 
         def run():
             try:
-                function(owner, request_id)
+                from services.request_context import reading_original
+                with reading_original(kind, owner, request_id):
+                    function(owner, request_id)
             except Exception:
                 pass  # The original handler persists the bounded failure.
             finally:
+                cancel_reservation()
                 release_worker()
                 self.wake()
 
@@ -476,12 +479,14 @@ class PoolAdmission:
                     return False
                 due_image = (kind == "image" and image_original_recovery_pending(receipt)
                              and float(receipt.get("next_poll_at") or 0) <= now)
-                if due_image and self.pacing is None:
+                due_text = (kind == "text" and unknown_text_result(receipt)
+                            and float(receipt.get("recovery_next_at") or 0) <= now)
+                if (due_image or due_text) and self.pacing is None:
                     # Book the due original in the existing FIFO before the
                     # read edge. Polling next_at alone loses every opportunity
                     # to already queued results/archives. No worker waits here.
-                    from services.account_request_pacing import reserve_account_image_recovery_read
-                    if not reserve_account_image_recovery_read(account, owner, request_id):
+                    from services.account_request_pacing import reserve_account_original_recovery_read
+                    if not reserve_account_original_recovery_read(account, owner, request_id, kind=kind):
                         keep_reservation = True
                         return False
                 elif pacing["next_at"] > now:

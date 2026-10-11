@@ -5,6 +5,7 @@ import hashlib
 import re
 
 current_request = ContextVar("provider_original_request", default=None)
+current_recovery_read = ContextVar("provider_original_recovery_read", default=None)
 current_archive_guard = ContextVar("provider_archive_guard", default=None)
 current_archive_read_owner = ContextVar("provider_archive_read_owner", default=None)
 current_archive_observation = ContextVar("provider_archive_observation", default=None)
@@ -29,6 +30,16 @@ def executing(context):
         yield
     finally:
         current_request.reset(token)
+
+
+@contextmanager
+def reading_original(kind, owner, request_id):
+    """Reuse a due original's read-queue place without granting send authority."""
+    token = current_recovery_read.set((kind, owner, request_id))
+    try:
+        yield
+    finally:
+        current_recovery_read.reset(token)
 
 
 @contextmanager

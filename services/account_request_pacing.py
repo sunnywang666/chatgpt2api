@@ -783,10 +783,12 @@ class AccountRequestClock:
         ordinary_owner = None
         read_deferred = False
         if is_conversation_read and not reuse_read_credit:
-            # Due image recovery may already hold a FIFO place before its
-            # worker starts. Reuse it at the actual GET; do not queue behind
-            # our own reservation. The original image claim prevents overlap.
-            ordinary_owner = (read_owner or (_image_read_owner(context.owner, context.request_id)
+            # Due recovery can reserve its place before an I/O worker starts.
+            # This read-only context grants no authority to send another turn.
+            from services.request_context import current_recovery_read
+            recovery = current_recovery_read.get()
+            recovery_owner = _original_read_owner(recovery[1], recovery[2], recovery[0]) if recovery else None
+            ordinary_owner = (read_owner or recovery_owner or (_original_read_owner(context.owner, context.request_id)
                               if getattr(context, "kind", None) == "image" else uuid.uuid4().hex))
         if archive_guard is not None:
             archive_guard()
@@ -1439,25 +1441,30 @@ _clocks: dict[str, AccountRequestClock] = {}
 _clocks_lock = threading.Lock()
 
 
-def _image_read_owner(owner, request_id):
-    return "image:" + hashlib.sha256(json.dumps([owner, request_id]).encode()).hexdigest()
+def _original_read_owner(owner, request_id, kind="image"):
+    return kind + ":" + hashlib.sha256(json.dumps([owner, request_id]).encode()).hexdigest()
 
 
-def reserve_account_image_recovery_read(account, owner, request_id):
+def reserve_account_original_recovery_read(account, owner, request_id, *, kind="image"):
     """Join the existing read FIFO without an I/O worker or consuming credit.
 
-    Called only for due original image recovery, outside account/SQLite locks.
+    Called only for due original text/image recovery, outside account/SQLite locks.
     Each scan renews the existing short lease; a stopped/dead task expires by
     the same rule as other readers. The transport still enforces every clock.
     """
-    return _image_recovery_read_reservation(account, owner, request_id, cancel=False)
+    return _original_recovery_read_reservation(account, owner, request_id, kind=kind, cancel=False)
 
 
-def release_account_image_recovery_read(account, owner, request_id):
-    return _image_recovery_read_reservation(account, owner, request_id, cancel=True)
+def release_account_original_recovery_read(account, owner, request_id, *, kind="image"):
+    return _original_recovery_read_reservation(account, owner, request_id, kind=kind, cancel=True)
 
 
-def _image_recovery_read_reservation(account, owner, request_id, *, cancel):
+# Retain the original image-only import names for existing callers.
+reserve_account_image_recovery_read = reserve_account_original_recovery_read
+release_account_image_recovery_read = release_account_original_recovery_read
+
+
+def _original_recovery_read_reservation(account, owner, request_id, *, kind, cancel):
     identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
     if not identity:
         return False
@@ -1471,7 +1478,7 @@ def _image_recovery_read_reservation(account, owner, request_id, *, cancel):
         if not clock.lock.acquire(blocking=False):
             return False
         try:
-            read_owner = _image_read_owner(owner, request_id)
+            read_owner = _original_read_owner(owner, request_id, kind)
             if cancel:
                 clock._release_ordinary_read(read_owner)
                 return True
