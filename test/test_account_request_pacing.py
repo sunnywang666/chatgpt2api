@@ -47,6 +47,271 @@ class Context:
     def log_fields(self):
         return {"model": "gpt-5 fixture", "operation": "text", "source": "key:test"}
 
+    def record_limit(self, _observed):
+        pass
+
+
+class OrdinaryReadSendEdgeTests(unittest.TestCase):
+    """A ready ordinary GET owns the next shared HTTP edge, not a new queue."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.now = [10000.0]
+        self.path = Path(self.tmp.name) / "clock.json"
+        self.patches = [
+            patch("services.account_request_pacing.time.monotonic", side_effect=lambda: self.now[0]),
+            patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + self.now[0]),
+            patch.object(type(config), "account_request_interval_secs", property(lambda _: 1.0)),
+            patch.object(type(config), "account_message_interval_secs", property(lambda _: 0.0)),
+            patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 60.0)),
+            patch.object(type(config), "account_conversation_read_max_inflight", property(lambda _: 1)),
+        ]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def _clock_with_ready_result(self, name="clock"):
+        clock = AccountRequestClock("account", Path(self.tmp.name) / f"{name}.json")
+        with clock.lock:
+            self.assertTrue(clock._ordinary_read_turn("ordinary-result", self.now[0], 0))
+        return clock
+
+    def _send_after_result(self, clock, *, preflight=False, status=200):
+        sent, injected = [], [False]
+        def send(method, url, **kwargs):
+            sent.append((method, url.rsplit("/", 1)[-1], self.now[0]))
+            response = Response()
+            response.status_code = status if method != "GET" or "original" not in url else 200
+            response.headers = {"Retry-After": "12"} if response.status_code == 429 else {}
+            return response
+        def advance(delay):
+            self.assertFalse(clock.lock.locked())
+            if not injected[0]:
+                injected[0] = True
+                clock.request(send, "GET", "https://provider/backend-api/conversation/original")
+            self.now[0] += delay
+        options = ({"_account_request_preflight": lambda read: read(
+            "GET", "https://provider/backend-api/conversation/preflight")} if preflight else {})
+        with patch("services.account_request_pacing.uuid.uuid4", return_value=SimpleNamespace(hex="ordinary-result")), \
+             patch("services.account_request_pacing.time.sleep", side_effect=advance), \
+             executing(Context("generic")):
+            response = clock.request(send, "POST", "https://provider/backend-api/conversation", **options)
+        return sent, response
+
+    def test_ready_ordinary_read_precedes_generic_send_edge(self):
+        sent, response = self._send_after_result(self._clock_with_ready_result())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([(method, name) for method, name, _ in sent], [("GET", "original"), ("POST", "conversation")])
+        self.assertGreaterEqual(sent[1][2] - sent[0][2], 1.0)
+
+    def test_nested_preflight_yields_to_ready_ordinary_read(self):
+        sent, response = self._send_after_result(self._clock_with_ready_result(), preflight=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([(method, name) for method, name, _ in sent], [
+            ("GET", "original"), ("GET", "preflight"), ("POST", "conversation"),
+        ])
+
+    def test_not_due_full_or_archive_owned_read_does_not_block_generic_http(self):
+        for state in ("not_due", "full", "archive"):
+            with self.subTest(state=state):
+                clock = self._clock_with_ready_result(state)
+                held = None
+                with clock.lock:
+                    # The setup GET has legitimately reserved the first edge.
+                    # Exercise only the generic-vs-result gate below it.
+                    self.now[0] += 1
+                    if state == "not_due":
+                        clock.next_conversation_read = self.now[0] + 60
+                    elif state == "full":
+                        held = clock._try_read_slot()
+                        self.assertIsNotNone(held)
+                    else:
+                        clock.archive_read_owner = "archive-work"
+                        clock.archive_read_until = self.now[0] + 5
+                    clock._save()
+                sent = []
+                try:
+                    with patch("services.account_request_pacing.time.sleep", side_effect=AssertionError("must not wait")):
+                        clock.request(lambda method, *_args, **_kwargs: sent.append((method, self.now[0])) or Response(),
+                                      "GET", "https://provider/backend-api/me")
+                finally:
+                    if held is not None:
+                        held.release()
+                self.assertEqual(sent, [("GET", self.now[0])])
+
+    def test_expired_head_is_pruned_and_same_recovery_owner_can_prepare_itself(self):
+        from services.account_request_pacing import _original_read_owner
+        from services.request_context import reading_original
+        clock = AccountRequestClock("account", self.path)
+        owner = _original_read_owner("owner", "request", "text")
+        with clock.lock:
+            clock.ordinary_read_queue = [{"owner": "dead-reader", "until": self.now[0] - 1}]
+            clock.ordinary_read_wait_until = self.now[0] - 1
+            clock._save()
+        sent = []
+        clock.request(lambda method, *_args, **_kwargs: sent.append(method) or Response(),
+                      "GET", "https://provider/backend-api/me")
+        self.assertEqual(sent, ["GET"])
+        self.assertEqual(clock.next_request, self.now[0] + 1)
+        self.now[0] = clock.next_request
+        with clock.lock:
+            clock._ordinary_read_turn(owner, self.now[0], 0)
+        with patch("services.account_request_pacing.time.sleep", side_effect=AssertionError("floor already elapsed")), \
+             reading_original("text", "owner", "request"):
+            clock.request(lambda method, *_args, **_kwargs: sent.append(method) or Response(),
+                          "GET", "https://provider/backend-api/conversations")
+        self.assertEqual(sent, ["GET", "GET"])
+        self.assertEqual(clock.ordinary_read_queue[0]["owner"], owner)
+
+    def test_generic_429_after_yield_preserves_account_cooldown(self):
+        clock = self._clock_with_ready_result()
+        sent, response = self._send_after_result(clock, status=429)
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual([(method, name) for method, name, _ in sent], [("GET", "original"), ("POST", "conversation")])
+        self.assertGreaterEqual(clock.cooldown_until, self.now[0] + 12)
+
+    def test_nonconcurrent_generic_rechecks_when_result_becomes_due_during_wait(self):
+        from services.account_request_pacing import _original_read_owner
+        from services.request_context import reading_original
+        clock = AccountRequestClock("account", Path(self.tmp.name) / "nonconcurrent.json")
+        sent, injected = [], [False]
+        owner = _original_read_owner("owner", "request", "text")
+        with clock.lock:
+            clock.next_request = self.now[0] + 10
+            clock.next_conversation_read = self.now[0] + 10
+            self.assertTrue(clock._ordinary_read_turn(owner, self.now[0], 10))
+            clock._save()
+
+        def send(method, url, **_kwargs):
+            sent.append((method, url.rsplit("/", 1)[-1], self.now[0]))
+            return Response()
+
+        def advance(delay):
+            if not injected[0]:
+                injected[0] = True
+                self.assertFalse(clock.lock.locked())
+                self.now[0] += delay
+                with reading_original("text", "owner", "request"):
+                    clock.request(send, "GET", "https://provider/backend-api/conversation/original")
+                return
+            self.now[0] += delay
+
+        with patch("services.account_request_pacing.time.sleep", side_effect=advance):
+            clock.request(send, "POST", "https://provider/backend-api/files")
+        self.assertEqual([(method, name) for method, name, _ in sent], [
+            ("GET", "original"), ("POST", "files"),
+        ])
+        self.assertEqual([started for _method, _name, started in sent], [10010.0, 10011.0])
+
+    def test_deadline_during_result_yield_keeps_booked_read_and_leaks_no_slot(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        clock = self._clock_with_ready_result("deadline")
+        with self.assertRaises(AccountRequestDeadlineExceeded):
+            clock.request(lambda *_args, **_kwargs: Response(), "GET", "https://provider/backend-api/me",
+                          _account_request_deadline_monotonic=self.now[0] + .5)
+        self.assertEqual([entry["owner"] for entry in clock.ordinary_read_queue], ["ordinary-result"])
+        with clock.lock:
+            slot = clock._try_read_slot()
+            self.assertIsNotNone(slot)
+            slot.release()
+
+    def test_cancelled_yield_releases_clock_and_turn_without_disturbing_other_result(self):
+        clock = self._clock_with_ready_result("cancel")
+        context, sent = Context("cancelled-upload"), []
+        with patch("services.account_request_pacing.time.sleep", side_effect=KeyboardInterrupt("cancelled")), \
+             executing(context), self.assertRaisesRegex(KeyboardInterrupt, "cancelled"):
+            clock.request(lambda *_args, **_kwargs: sent.append(True) or Response(),
+                          "POST", "https://provider/backend-api/conversation")
+        self.assertEqual(sent, [])
+        self.assertEqual(context.released, 1)
+        self.assertFalse(clock.lock.locked())
+        self.assertFalse(clock.turn_lock.locked())
+        self.assertTrue(all(not slot.locked() for slot in clock.read_slots.values()))
+        self.assertEqual([entry["owner"] for entry in clock.ordinary_read_queue], ["ordinary-result"])
+
+    def test_archive_owner_patch_and_readback_bypass_result_gate_then_release(self):
+        from services.request_context import guarding_archive
+        clock = self._clock_with_ready_result("archive-lifecycle")
+        sent = []
+        with clock.lock:
+            # Retain the ordinary reservation through the 60-second read
+            # floor; the active archive owner must not need to delete it to
+            # perform its readback.
+            self.assertTrue(clock._ordinary_read_turn("ordinary-result", self.now[0], 60))
+            clock.archive_read_owner = "archive"
+            clock.archive_read_until = self.now[0] + 5
+            clock._save()
+
+        def send(method, url, **_kwargs):
+            sent.append((method, url.rsplit("/", 1)[-1], self.now[0]))
+            return Response()
+
+        with patch("services.account_request_pacing.time.sleep", side_effect=AssertionError("archive patch must not yield")), \
+             guarding_archive(lambda: None, read_owner="archive"):
+            clock.request(send, "PATCH", "https://provider/backend-api/conversation/original",
+                          json={"is_archived": True})
+        self.assertEqual(sent, [("PATCH", "original", 10000.0)])
+        self.assertEqual(clock.archive_read_owner, "archive")
+        self.now[0] += 1
+        with patch("services.account_request_pacing.time.sleep", side_effect=AssertionError("archive readback floor elapsed")), \
+             guarding_archive(lambda: None, read_owner="archive"):
+            clock.request(send, "GET", "https://provider/backend-api/conversation/original")
+        self.assertEqual(sent, [("PATCH", "original", 10000.0), ("GET", "original", 10001.0)])
+        self.assertIsNone(clock.archive_read_owner)
+        self.assertEqual([entry["owner"] for entry in clock.ordinary_read_queue], ["ordinary-result"])
+        self.now[0] = 10061.0
+        with patch("services.account_request_pacing.uuid.uuid4", return_value=SimpleNamespace(hex="ordinary-result")), \
+             patch("services.account_request_pacing.time.sleep", side_effect=AssertionError("ordinary floor elapsed")):
+            clock.request(send, "GET", "https://provider/backend-api/conversation/original")
+        self.assertEqual(sent, [("PATCH", "original", 10000.0), ("GET", "original", 10001.0),
+                                ("GET", "original", 10061.0)])
+        self.assertEqual(clock.ordinary_read_queue, [])
+
+    def test_h10_m60_finite_mixed_sequence_preserves_fifo_and_send_floors(self):
+        from services.account_request_pacing import _original_read_owner
+        from services.request_context import reading_original
+        clock = AccountRequestClock("account", Path(self.tmp.name) / "h10-m60.json")
+        starts = []
+        owner = _original_read_owner("owner", "request", "text")
+
+        def send(method, url, **_kwargs):
+            starts.append((method, url.rsplit("/", 1)[-1], self.now[0]))
+            return Response()
+
+        def advance(delay):
+            if len(starts) == 1:
+                self.assertFalse(clock.lock.locked())
+                self.assertEqual(delay, 1.0)
+                with reading_original("text", "owner", "request"):
+                    clock.request(send, "GET", "https://provider/backend-api/conversation/original")
+            self.now[0] += delay
+
+        with patch.object(type(config), "account_request_interval_secs", property(lambda _: 10.0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 60.0)), \
+             patch("services.account_request_pacing.time.sleep", side_effect=advance):
+            with executing(Context("first")):
+                clock.request(send, "POST", "https://provider/backend-api/conversation")
+            self.now[0] = 10010.0
+            with clock.lock:
+                self.assertTrue(clock._ordinary_read_turn(owner, self.now[0], 0))
+                clock._save()
+            clock.request(send, "POST", "https://provider/backend-api/files")
+            with executing(Context("second")):
+                clock.request(send, "POST", "https://provider/backend-api/conversation")
+
+        self.assertEqual([(method, name) for method, name, _ in starts], [
+            ("POST", "conversation"), ("GET", "original"), ("POST", "files"),
+            ("POST", "conversation"),
+        ])
+        self.assertEqual([started for _method, _name, started in starts],
+                         [10000.0, 10010.0, 10020.0, 10060.0])
+        self.assertTrue(all(later[2] - earlier[2] >= 10.0
+                            for earlier, later in zip(starts, starts[1:])))
+        model_starts = [started for method, name, started in starts
+                        if method == "POST" and name == "conversation"]
+        self.assertGreaterEqual(model_starts[1] - model_starts[0], 60.0)
+
 
 class ReadInflightCapacityTests(unittest.TestCase):
     def setUp(self):

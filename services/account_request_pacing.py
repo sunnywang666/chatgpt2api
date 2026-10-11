@@ -393,6 +393,31 @@ class AccountRequestClock:
                 candidate.release()
             raise
 
+    def _ordinary_read_head(self, now):
+        """Return the live non-archive FIFO head without granting it a credit.
+
+        Generic account HTTP must not repeatedly advance ``next_request`` past
+        an ordinary result read that can already use the next shared edge.  The
+        queue remains the sole ordering mechanism; this helper only prunes the
+        same expired leases which a joining reader would otherwise remove.
+        """
+        queue = [entry for entry in self.ordinary_read_queue if entry["until"] > now]
+        if len(queue) != len(self.ordinary_read_queue):
+            self.ordinary_read_queue = queue
+            self.ordinary_read_wait_until = max((entry["until"] for entry in queue), default=0.0)
+            self._save()
+        if not queue or queue[0].get("kind") == "archive":
+            return None
+        return queue[0]
+
+    def _read_slot_available(self):
+        """Probe capacity for a queued reader without consuming it or credit."""
+        slot = self._try_read_slot()
+        if slot is None:
+            return False
+        slot.release()
+        return True
+
     def _load(self):
         if self.state_path is None or not self.state_path.exists():
             return
@@ -788,14 +813,14 @@ class AccountRequestClock:
                          or concurrent_preparation or concurrent_archive or concurrent_result_metadata or preflight_read)
         pooled_preparation = concurrent_preparation and callable(preparation_submit) and not kwargs.get("stream")
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
+        from services.request_context import current_recovery_read
+        recovery = current_recovery_read.get()
+        recovery_owner = _original_read_owner(recovery[1], recovery[2], recovery[0]) if recovery else None
         ordinary_owner = None
         read_deferred = False
         if is_conversation_read and not reuse_read_credit:
             # Due recovery can reserve its place before an I/O worker starts.
             # This read-only context grants no authority to send another turn.
-            from services.request_context import current_recovery_read
-            recovery = current_recovery_read.get()
-            recovery_owner = _original_read_owner(recovery[1], recovery[2], recovery[0]) if recovery else None
             ordinary_owner = (read_owner or recovery_owner or (_original_read_owner(context.owner, context.request_id)
                               if getattr(context, "kind", None) == "image" else uuid.uuid4().hex))
         if archive_guard is not None:
@@ -1015,6 +1040,7 @@ class AccountRequestClock:
                             (max(0, self.cooldown_until - now,
                                  self._read_cooldown_until() - now if is_conversation_read else 0), "upstream_cooldown")),
                             key=lambda item: (item[0], item[1] == "upstream_cooldown"))
+                        ordinary_yield = ordinary_recheck = False
                         if is_conversation_read:
                             # Honor a live reservation from an older process until
                             # consumed/expired; new archive reads join the same FIFO
@@ -1048,10 +1074,40 @@ class AccountRequestClock:
                                 read_slot = self._try_read_slot()
                                 if read_slot is None:
                                     read_delay, wait_reason = 0.1, "read_concurrency"
+                        else:
+                            # Read-vs-read FIFO alone is insufficient when a
+                            # ready generic HTTP call can repeatedly reserve
+                            # ``next_request`` before the queued original GET
+                            # wakes.  Yield only to the existing live ordinary
+                            # head once it can take every current read gate.
+                            # Archive work keeps its own reservation/release
+                            # path, and a recovery's preliminary account scan
+                            # must be allowed to reach its own booked GET.
+                            ordinary_head = self._ordinary_read_head(now)
+                            archive_busy = (self.archive_read_owner is not None
+                                            and self.archive_read_until > now)
+                            own_recovery_head = bool(ordinary_head and recovery_owner
+                                                     and ordinary_head["owner"] == recovery_owner)
+                            if ordinary_head is not None and not archive_busy and not own_recovery_head:
+                                ordinary_ready_at = max(self.next_request, self.cooldown_until,
+                                                        self._read_ready(now))
+                                if ordinary_ready_at <= now and self._read_slot_available():
+                                    retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
+                                    if retry_check > read_delay:
+                                        wait_reason = "result_fifo"
+                                    read_delay = max(read_delay, retry_check)
+                                    ordinary_yield = True
+                                elif read_delay > 0 and ordinary_ready_at <= now + read_delay:
+                                    # A legacy non-concurrent caller otherwise
+                                    # sleeps with ``self.lock`` until precisely
+                                    # the read becomes eligible, then steals its
+                                    # edge without rerunning the FIFO check.
+                                    ordinary_recheck = True
                     except BaseException:
                         self.lock.release()
                         raise
-                    if not concurrent_io or read_delay <= 0:
+                    if ((not concurrent_io and not ordinary_yield and not ordinary_recheck)
+                            or read_delay <= 0):
                         break
                     # Waiting for a safe read must not occupy the shared send-edge lock
                     # and delay a generation POST that is otherwise ready. Reload
