@@ -647,7 +647,7 @@ class GenerationCompletionService:
                         if state.get("read_only_original") is True:
                             raise CompletionError("COMPLETION_ORIGINAL_ONLY")
                         if (state.get("same_request_retry") or not (root.get("error_code") in {
-                                "TEXT_TASK_CAPACITY_EXCEEDED", "IMAGE_GENERATION_NOT_SUBMITTED",
+                                "TEXT_TASK_CAPACITY_EXCEEDED", "TEXT_GENERATION_NOT_SUBMITTED", "IMAGE_GENERATION_NOT_SUBMITTED",
                                 "CONVERSATION_BINDING_UNAVAILABLE", "CHAT_ARCHIVE_RESTORE_UNCONFIRMED"}
                                 or kind == "image" and root.get("error_code") == "RESULT_UNRECOVERABLE"
                                 and root.get("recovery_retryable") is True)):

@@ -13,7 +13,7 @@ from curl_cffi import CurlInfo
 from curl_cffi.requests.exceptions import RequestException
 
 from services.account_service import account_service
-from services.account_request_pacing import AccountReadRetryBudgetInsufficient
+from services.account_request_pacing import AccountReadRetryBudgetInsufficient, unsent_transport_failure
 from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
 from services.protocol.conversation import conversation_events
 from utils.helper import UpstreamHTTPError
@@ -1904,16 +1904,21 @@ class ConversationBindingService:
                                 return recovered
                     except Exception:
                         pass
+                confirmed_unsent = (
+                    failure_phase == "stream_open"
+                    and not returned_conversation_id and not recovered_parent
+                    and bool(unsent_transport_failure(exc))
+                )
                 raise ConversationBindingError(
                     str(exc) or "upstream conversation outcome is unknown",
-                    code="CONVERSATION_OUTCOME_UNKNOWN",
+                    code="TEXT_GENERATION_NOT_SUBMITTED" if confirmed_unsent else "CONVERSATION_OUTCOME_UNKNOWN",
                     provider_binding_id=binding_id,
                     provider_account_identity=account_identity,
                     conversation_id=returned_conversation_id,
                     parent_message_id=recovered_parent,
                     original_failure_phase=failure_phase,
                     original_http_status=original_status,
-                    original_exception_category=original_category,
+                    original_exception_category="transport" if confirmed_unsent else original_category,
                     original_upstream_request_stage=(
                         _TEXT_HTTP_REQUEST_STAGES.get(exc.context, "unknown")
                         if isinstance(exc, UpstreamHTTPError) else ""

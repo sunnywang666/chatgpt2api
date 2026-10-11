@@ -202,6 +202,150 @@ def test_connect_failure_retries_original_once_across_restart(setup):
     assert row(service, "image", rid)["status"] == "error"
 
 
+@pytest.mark.parametrize("mode", ["unsent", "unmarked", "timeout", "stream_event", "cursor_read"])
+def test_text_transport_proof_survives_wrapper_only_before_response(tmp_path, mode):
+    from services.conversation_binding_service import ConversationBindingService
+    from services.text_task_service import TextTaskService
+    from test.test_text_task_service import QueuedExecutor
+    queue = QueuedExecutor()
+    service = TextTaskService(tmp_path / "text.sqlite3", ConversationBindingService().complete_text,
+                              queue, recovery_reader=lambda _: {"status": "running"})
+    body = {"client_request_id": "original", "client_conversation_id": "original-client",
+            "provider_binding_id": "binding", "provider_account_identity": "account",
+            "messages": [{"role": "user", "content": "retained original input"}]}
+    error = connection_error(code=28 if mode == "timeout" else 35)
+    error._account_request_not_submitted = mode != "unmarked"
+    backend = Mock()
+    backend.get_conversation_parent_message_id.side_effect = error
+
+    def events(*args, **kwargs):
+        # The send guard ran; only native no-request evidence can undo this flag.
+        service._update("owner", "original", _submission_started=True, _turn_reserved=True)
+        if mode in {"stream_event", "cursor_read"}:
+            yield {"type": "conversation.delta", "conversation_id": "original-conversation", "delta": "answer"}
+        if mode != "cursor_read":
+            raise error
+
+    with patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account"), \
+         patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="fixture"), \
+         patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()), \
+         patch("services.conversation_binding_service.account_service.mark_text_used"), \
+         patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend), \
+         patch("services.conversation_binding_service.conversation_events", side_effect=events):
+        service.submit("owner", body)
+        queue.run()
+    with service.store.connect() as db:
+        receipt = service.store.read_receipt(db, "text", "owner", "original")
+    assert receipt["provider_binding_id"] == "binding" and receipt["provider_account_identity"] == "account"
+    assert receipt["_input_ref"]
+    if mode == "unsent":
+        assert receipt["status"] == "failed" and receipt["upstream_outcome"] == "not_sent"
+        assert receipt["error_code"] == "TEXT_GENERATION_NOT_SUBMITTED"
+        assert receipt["_submission_started"] is False and receipt["_turn_reserved"] is False
+        assert receipt.get("_claim_id") is None and not receipt.get("_claim_until")
+        assert receipt["last_recovery_failure"]["submission_evidence"] == "connect_failed_before_request"
+        assert "private" not in json.dumps(receipt)
+        assert service._public(receipt)["upstream_submission_started"] is False
+        for change in ({"_submission_started": True}, {"_executing": True}, {"status": "running"},
+                       {"upstream_outcome": "unknown"}, {"last_recovery_failure": {}},
+                       {"last_recovery_failure": {"submission_evidence": "connect_failed_before_request",
+                                                  "transport_error_code": 28}}):
+            assert "upstream_submission_started" not in service._public({**receipt, **change})
+    else:
+        assert receipt["status"] == "unknown" and receipt["_submission_started"] is True
+        assert not receipt.get("last_recovery_failure")
+
+
+def test_text_confirmed_unsent_retries_original_once_across_restart(setup):
+    service, admission, _ = setup
+    failure = {"at": 2900.0, "submission_evidence": "connect_failed_before_request", "transport_error_code": 35}
+    failed = dict(status="failed", upstream_outcome="not_sent", error_code="TEXT_GENERATION_NOT_SUBMITTED",
+                  _submission_started=False, upstream_submission_started=False, _turn_reserved=False,
+                  _executing=False, last_recovery_failure=failure)
+    patch_row(service, **failed)
+    original = row(service)
+    service.start("text", IDENTITY, "old-0")
+    retried = row(service)
+    assert retried["status"] == "queued" and retried["_completion"]["same_request_retry"]
+    for key in ("_input_ref", "provider_binding_id", "provider_account_identity", "conversation_id",
+                "parent_message_id", "request_message_id"):
+        assert retried.get(key) == original.get(key)
+    assert retried["_execution_timeline"][-1]["failure"] == failure
+    patch_row(service, **failed)
+    restarted = type(service)(service.text, service.images, service.lifecycle, clock=admission.clock)
+    result = restarted.start("text", IDENTITY, "old-0")
+    assert result["state"] == "needs_attention" and "replacement_id" not in result
+    assert row(service)["status"] == "failed"
+
+
+def test_text_unsent_error_code_without_native_cause_cannot_clear_send(tmp_path):
+    from services.conversation_binding_service import ConversationBindingError
+    from services.text_task_service import TextTaskService
+    from test.test_text_task_service import QueuedExecutor
+    queue = QueuedExecutor()
+    def runner(body, on_cursor):
+        service._update("owner", "original", _submission_started=True, _turn_reserved=True)
+        raise ConversationBindingError("unproven", code="TEXT_GENERATION_NOT_SUBMITTED",
+            original_failure_phase="stream_open", original_exception_category="transport")
+    service = TextTaskService(tmp_path / "text.sqlite3", runner, queue)
+    service.submit("owner", {"client_request_id": "original", "client_conversation_id": "client",
+                             "messages": [{"role": "user", "content": "retained input"}]})
+    queue.run()
+    with service.store.connect() as db:
+        receipt = service.store.read_receipt(db, "text", "owner", "original")
+    assert receipt["status"] == "unknown" and receipt["_submission_started"] is True
+    assert receipt["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN"
+
+
+@pytest.mark.parametrize("second_fails", [False, True])
+def test_text_unsent_handler_uses_existing_completion_and_admission(setup, second_fails):
+    from services.conversation_binding_service import ConversationBindingError
+    from services.request_context import current_request
+    service, admission, _ = setup
+    patch_row(service, status="succeeded", _turn_reserved=False)
+    rid = "fresh-text"
+    service.text.submit("owner", {"client_request_id": rid, "client_conversation_id": "fresh-client",
+        "_public_session_ref": "fresh-session", "_public_route": "chat", "_route": "chat", "_operation": "text", "model": "fixture-text",
+        "provider_binding_id": "binding-0", "provider_account_identity": "account-0",
+        "messages": [{"role": "user", "content": "retained original input"}]})
+    original = row(service, request_id=rid)
+    calls = []
+    def runner(body, on_cursor):
+        ctx = current_request.get()
+        ctx.before_send()
+        ctx.release_turn()
+        calls.append((ctx.request_id, body["messages"], body["provider_binding_id"],
+                      body["provider_account_identity"], body.get("_request_message_id"), body.get("conversation_id")))
+        if len(calls) == 1 or second_fails:
+            error = connection_error()
+            error._account_request_not_submitted = True
+            raise ConversationBindingError("connection setup failed", code="TEXT_GENERATION_NOT_SUBMITTED",
+                original_failure_phase="stream_open", original_exception_category="transport") from error
+        return {"content": "saved original answer", "conversation_id": "conv-0", "parent_message_id": "final"}
+    service.text.runner = runner
+    for attempt in range(2):
+        ctx = admission.claim_next()
+        assert ctx is not None and ctx.request_id == rid
+        admission.execute(ctx)
+        receipt = row(service, request_id=rid)
+        assert not receipt.get("_executing") and not receipt.get("_turn_reserved")
+        if attempt == 0:
+            assert receipt["status"] == "failed" and receipt["upstream_outcome"] == "not_sent"
+            assert receipt.get("_claim_id") is None and not receipt.get("_claim_until")
+        service.process_one()
+        admission.clock.now += 2
+    final = row(service, request_id=rid)
+    assert calls[0] == calls[1]
+    assert final["_input_ref"] == original["_input_ref"]
+    assert "replacement_id" not in final["_completion"]
+    if second_fails:
+        assert final["status"] == "failed" and final["_completion"]["state"] == "needs_attention"
+        assert admission.claim_next() is None
+    else:
+        assert final["status"] == "succeeded" and final["content"] == "saved original answer"
+        assert final["_completion"]["state"] == "result_ready"
+
+
 @pytest.mark.parametrize("second_fails", [False, True])
 def test_handler_to_scheduler_retries_once_and_releases_execution(setup, tmp_path, second_fails):
     from services.request_context import current_request

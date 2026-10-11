@@ -275,8 +275,20 @@ class TextTaskService:
         queued or in flight before its send guard runs, and a previously sent
         request retains its send sequence. Only the terminal parent-mismatch
         failure that occurred before that guard may be published as known not
-        submitted.
+        submitted. A separately proven native connection failure may also
+        negate the send guard; its historical send sequence is retained.
         """
+        failure = receipt.get("last_recovery_failure") or {}
+        if (receipt.get("status") == "failed"
+                and receipt.get("error_code") == "TEXT_GENERATION_NOT_SUBMITTED"
+                and receipt.get("upstream_outcome") == "not_sent"
+                and receipt.get("_submission_started") is False
+                and receipt.get("_executing") is False
+                and isinstance(failure, dict)
+                and failure.get("submission_evidence") == "connect_failed_before_request"
+                and type(failure.get("transport_error_code")) is int
+                and failure["transport_error_code"] in {5, 6, 7, 35, 60}):
+            return True
         required_identity = (
             "request_id", "client_conversation_id", "provider_binding_id",
             "provider_account_identity", "conversation_id", "parent_message_id",
@@ -2190,6 +2202,25 @@ class TextTaskService:
                 )
                 if (value := getattr(exc, key, None)) is not None and value != ""
             }
+            if exc.code == "TEXT_GENERATION_NOT_SUBMITTED":
+                from services.account_request_pacing import unsent_transport_failure
+                proof = unsent_transport_failure(exc)
+                if (proof and exc.original_failure_phase == "stream_open"
+                        and exc.original_exception_category == "transport"
+                        and not exc.conversation_id and not exc.parent_message_id):
+                    # The send guard can precede TLS setup. Only its native
+                    # no-request proof may reverse that attempt's send flag.
+                    # Keep the original identity/input and let completion's
+                    # existing single same-ID retry own any next submission.
+                    self._update(owner, request_id, **cursor, **diagnostic,
+                                 status="failed", error_code=exc.code, upstream_outcome="not_sent",
+                                 _submission_started=False, upstream_submission_started=False,
+                                 _turn_reserved=False, _executing=False,
+                                 _claim_id=None, _claim_until=0,
+                                 last_recovery_failure={"at": self._now(), **proof}, finished_at=self._now())
+                    return
+                # A code alone, without the marked native cause, is no proof.
+                exc.code = "CONVERSATION_OUTCOME_UNKNOWN"
             self._update(owner, request_id, **cursor, **diagnostic,
                          classify_before_send=exc.code != "CONVERSATION_OUTCOME_UNKNOWN",
                          status="unknown" if exc.code == "CONVERSATION_OUTCOME_UNKNOWN" else "failed",
