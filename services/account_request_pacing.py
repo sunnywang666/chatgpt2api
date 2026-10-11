@@ -516,6 +516,44 @@ class AccountRequestClock:
                     if context is not None:
                         context.release_turn()
 
+        def wait_for_send_edge(message):
+            # Enter and return with the existing clock held. Production has
+            # one ordinary-read FIFO and fixed read floor, not read credits or
+            # separate inflight slots. Keep that persisted protocol unchanged.
+            nonlocal clock_held
+            while True:
+                now = time.monotonic()
+                delay = max(self.next_request, self.cooldown_until,
+                            self.next_turn if is_turn else 0.0) - now
+                yield_to_read = False
+                if not is_conversation_read:
+                    queue = [entry for entry in self.ordinary_read_queue if entry["until"] > now]
+                    if len(queue) != len(self.ordinary_read_queue):
+                        self.ordinary_read_queue = queue
+                        self.ordinary_read_wait_until = max((entry["until"] for entry in queue), default=0.0)
+                        self._save()
+                    archive_busy = self.archive_read_owner and self.archive_read_until > now
+                    if queue and not archive_busy:
+                        read_ready = max(self.next_request, self.cooldown_until,
+                                         self.next_conversation_read, self._read_cooldown_until())
+                        if read_ready <= now:
+                            delay = max(delay, min(1.0, max(0.1, config.account_request_interval_secs)))
+                            yield_to_read = True
+                        elif delay > 0 and read_ready <= now + delay:
+                            # A queued read becomes due during our pacing wait.
+                            # Let it wake instead of sleeping across its edge
+                            # while holding the clock needed by that reader.
+                            yield_to_read = True
+                if not yield_to_read:
+                    if delay > 0:
+                        wait_for_pace(delay, message)
+                    return
+                self.lock.release()
+                clock_held = False
+                wait_for_pace(delay, message)
+                acquire_with_budget(self.lock)
+                clock_held = True
+
         try:
             while True:
                 acquire_with_budget(self.lock)
@@ -551,11 +589,7 @@ class AccountRequestClock:
             response = None
             try:
                 self._expire_backoff()
-                ready = max(self.next_request, self.cooldown_until,
-                            self.next_turn if is_turn else 0.0)
-                delay = ready - time.monotonic()
-                if delay > 0:
-                    wait_for_pace(delay, "account request deadline elapsed during cooldown wait")
+                wait_for_send_edge("account request deadline elapsed during cooldown wait")
                 refresh = (getattr(context, "image_capability_refresh", lambda: None)()
                            if context is not None and is_turn else None)
                 if refresh is not None:
@@ -573,16 +607,16 @@ class AccountRequestClock:
                     acquire_with_budget(self.lock)
                     clock_held = True
                     self._expire_backoff()
-                    delay = max(self.next_request, self.cooldown_until, self.next_turn) - time.monotonic()
-                    if delay > 0:
-                        wait_for_pace(delay, "account request deadline elapsed after capability read")
+                    wait_for_send_edge("account request deadline elapsed after capability read")
                 if preflight is not None:
                     # A superseded original may arrive during the cooldown.
-                    # This GET shares the held pacing lock and raw transport;
-                    # recursively calling the paced session would deadlock.
+                    # Keep the raw, non-credit preflight path. Its send edge
+                    # also yields to eligible ordinary reads without recursively
+                    # entering the paced session or retaining their clock.
                     def read_original(read_method, read_url, **read_kwargs):
                         if str(read_method).upper() != "GET":
                             raise ValueError("submission preflight must be read-only")
+                        wait_for_send_edge("preflight deadline elapsed")
                         remaining = remaining_budget()
                         if remaining is not None:
                             if remaining <= 0:
@@ -608,9 +642,7 @@ class AccountRequestClock:
                         return response
                     preflight(read_original)
                     # The metadata GET does not bypass the account request pace.
-                    delay = max(self.next_request, self.cooldown_until, self.next_turn if is_turn else 0.0) - time.monotonic()
-                    if delay > 0:
-                        wait_for_pace(delay, "deadline elapsed after preflight")
+                    wait_for_send_edge("deadline elapsed after preflight")
                 if context is not None and is_turn:
                     context.before_send()
                 if callable(before_send):
