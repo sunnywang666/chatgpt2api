@@ -1978,6 +1978,8 @@ class AccountRequestPacingTests(unittest.TestCase):
             CurlInfo.NAMELOOKUP_TIME: float("nan"), CurlInfo.APPCONNECT_TIME: True,
             CurlInfo.PRETRANSFER_TIME: -1, CurlInfo.STARTTRANSFER_TIME: "secret-time",
             CurlInfo.NUM_CONNECTS: 1, CurlInfo.OS_ERRNO: 0,
+            CurlInfo.LOCAL_PORT: 53127, CurlInfo.PRIMARY_PORT: 443,
+            CurlInfo.HEADER_SIZE: 185,
             CurlInfo.SIZE_DOWNLOAD_T: 5, CurlInfo.HTTP_CONNECTCODE: 200,
             CurlInfo.EFFECTIVE_URL: "secret-url", CurlInfo.PRIMARY_IP: "secret-address",
         })
@@ -1994,8 +1996,21 @@ class AccountRequestPacingTests(unittest.TestCase):
             self.assertEqual(attempt["transport_response_status"], 200)
             self.assertEqual(attempt["transport_details"], {
                 "total_secs": 12.5, "connect_secs": .2, "num_connects": 1,
+                "local_port": 53127, "primary_port": 443, "response_header_bytes": 185,
                 "os_errno": 0, "downloaded_bytes": 5, "http_connect_code": 200})
             self.assertNotIn("secret-", repr(attempt))
+
+    def test_transport_ports_reject_non_port_values_without_exposing_addresses(self):
+        from types import SimpleNamespace
+        from curl_cffi import CurlInfo
+        from services.account_request_pacing import _transport_snapshot
+        for port in (None, True, 0, -1, 65536, 443.0, "secret-port"):
+            with self.subTest(port=port):
+                snapshot = _transport_snapshot(SimpleNamespace(status_code=0, infos={
+                    CurlInfo.LOCAL_PORT: port, CurlInfo.PRIMARY_PORT: port,
+                    CurlInfo.HEADER_SIZE: 0, CurlInfo.LOCAL_IP: "secret-address",
+                }))
+                self.assertEqual(snapshot, {"transport_details": {"response_header_bytes": 0}})
 
     def test_explicit_fast_message_spacing_keeps_http_floor_and_persisted_cooldown(self):
         from services.config import ConfigStore
@@ -2573,7 +2588,7 @@ def test_native_partial_response_timeout_keeps_stage_snapshot(tmp_path, monkeypa
         def log_message(self, *args):
             pass
         def do_GET(self):
-            received.append(self.path)
+            received.append((self.path, self.client_address[1]))
             self.send_response(200)
             self.send_header("Content-Length", "100")
             self.end_headers()
@@ -2608,6 +2623,9 @@ def test_native_partial_response_timeout_keeps_stage_snapshot(tmp_path, monkeypa
         metrics = attempt["transport_details"]
         assert metrics["downloaded_bytes"] == 5
         assert metrics["num_connects"] == 1
+        assert metrics["local_port"] == received[0][1]
+        assert metrics["primary_port"] == server.server_port
+        assert metrics["response_header_bytes"] > 0
         assert 0 <= metrics["connect_secs"] <= metrics["starttransfer_secs"] < metrics["total_secs"]
         assert .15 <= metrics["total_secs"] < 1
         assert len(received) == 1, "diagnostics must not retry"

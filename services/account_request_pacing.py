@@ -37,6 +37,11 @@ _TRANSPORT_INFO_FIELDS = {
     CurlInfo.STARTTRANSFER_TIME: "starttransfer_secs",
     CurlInfo.TOTAL_TIME: "total_secs",
     CurlInfo.NUM_CONNECTS: "num_connects",
+    # Numeric socket ports link a failed attempt to local proxy diagnostics;
+    # addresses, proxy URLs and credentials remain excluded.
+    CurlInfo.LOCAL_PORT: "local_port",
+    CurlInfo.PRIMARY_PORT: "primary_port",
+    CurlInfo.HEADER_SIZE: "response_header_bytes",
     CurlInfo.OS_ERRNO: "os_errno",
     CurlInfo.HTTP_CONNECTCODE: "http_connect_code",
     CurlInfo.SIZE_DOWNLOAD_T: "downloaded_bytes",
@@ -113,6 +118,9 @@ def _transport_snapshot(response):
                 if name.endswith("_secs"):
                     if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 86400:
                         values[name] = round(float(value), 6)
+                elif name.endswith("_port"):
+                    if type(value) is int and 1 <= value <= 65535:
+                        values[name] = value
                 elif type(value) is int and 0 <= value <= 2 ** 53:
                     values[name] = value
             if values:
