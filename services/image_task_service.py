@@ -2320,8 +2320,9 @@ class ImageTaskService:
             saved_image = bool(task.get("result_file_ids") or task.get("result_sediment_ids"))
             # Pending evidence permits another original read, never direct download.
             saved_image = saved_image or bool(pending_image_result_ids(task))
-            from services.generation_completion import ended_image_edit_recheck
-            explicit_ended_recheck = completion_recheck and ended_image_edit_recheck(task)
+            from services.generation_completion import ended_image_edit_recheck, ended_image_original_recheck
+            explicit_ended_recheck = completion_recheck and (
+                ended_image_edit_recheck(task) or ended_image_original_recheck(task))
             if task.get("_recovery_suppressed") is True or task.get("_recovery_paused") is True or task.get("_attempt_finished_at") and not saved_image and not explicit_ended_recheck:
                 # Keep this endpoint observational while an operator has
                 # explicitly stopped the old recovery path.

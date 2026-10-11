@@ -573,6 +573,20 @@ authorize another attempt, including after restart. Each confirmed unsent
 image retry gets a fresh active-attempt deadline; previous deadlines and failure
 evidence remain in the receipt timeline. Automatic retry counts stay bounded.
 
+When an image's bounded original-result investigation has ended with UNKNOWN,
+use `completion-recover --state original.json --check-original` to explicitly
+check the same account, conversation and request message again. API callers
+POST `{"action":"check_original"}` to `/api/image-tasks/{original-id}/completion`.
+The original binding must be complete and the work active; paused work, an
+in-flight reader or a selected/replacement result cannot start another check.
+This action permits only original-result reads and retrieval, with zero new
+generation requests. It preserves the original failure/end evidence and obeys
+the existing cooldown. Repeated calls while checking do not reset the bounded
+window; ordinary GETs and background ticks do not reopen an ended check.
+After `result_ready`, save and review the selected original result through the
+existing completion flow. A check that still cannot find a result remains
+UNKNOWN/`needs_attention`; it is not evidence that the message was never sent.
+
 ### 等待已保存的原结果
 
 普通程序 Key 可以 GET `/api/image-tasks/{task_id}/events` 或

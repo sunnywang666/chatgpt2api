@@ -973,6 +973,10 @@ def _command_completion(api: ApiClient, args: argparse.Namespace) -> int:
         payload = None
         if action == "recover":
             payload = {"action": "recover", "allow_unconfirmed_retry": args.allow_unconfirmed_retry}
+            if getattr(args, "check_original", False):
+                if chat or args.allow_unconfirmed_retry or getattr(args, "retry_not_sent", False):
+                    raise ClientError("original-only check cannot authorize another generation")
+                payload = {"action": "check_original"}
             if getattr(args, "retry_not_sent", False):
                 if chat or args.allow_unconfirmed_retry:
                     raise ClientError("confirmed not-sent image repair cannot authorize an unknown send")
@@ -1235,6 +1239,8 @@ def _parser() -> argparse.ArgumentParser:
                 operation.add_argument("--allow-unconfirmed-retry", action="store_true",
                     help="explicitly permit at most one additional generation while original stop/outcome remains unknown")
                 if not prefix:
+                    operation.add_argument("--check-original", action="store_true",
+                        help="explicitly reopen a bounded original-only check after an ended image investigation; never generate")
                     operation.add_argument("--retry-not-sent", action="store_true",
                         help="after repair, explicitly retry the same image ID only when its latest failure proves no generation was sent")
             if action == "save":

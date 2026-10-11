@@ -120,6 +120,18 @@ def ended_image_edit_recheck(receipt):
                 and not state.get("replacement_id") and not state.get("selected_id"))
 
 
+def ended_image_original_recheck(receipt):
+    """Only an explicit, persisted original-only check can pass the ended guard."""
+    state = receipt.get("_completion") or {}
+    return bool(receipt.get("_attempt_finished_at") and read_only_original_state(state)
+                and state.get("original_recheck_requested_at")
+                and state.get("state") == "checking_original" and state.get("next_at") is not None
+                and not state.get("selected_id")
+                and all(receipt.get(k) for k in ("conversation_id", "request_message_id",
+                    "provider_binding_id", "provider_account_identity", "client_conversation_id"))
+                and not any(receipt.get(k) for k in ("_completion_of", "_recovery_paused", "_recovery_suppressed")))
+
+
 def retry_cursor(document, receipt, *, kind="text", now=None, predecessor=None):
     """A fresh, empty original branch; never an arbitrary latest conversation reply.
 
@@ -347,13 +359,45 @@ class GenerationCompletionService:
         return row
 
     def start(self, kind, identity, request_id, *, allow_unconfirmed_retry=False,
-              retry_not_sent_failure_at=None, original_only=False, read_only_original=False):
+              retry_not_sent_failure_at=None, original_only=False, read_only_original=False,
+              recheck_original=False):
         owner, now = str(identity["id"]), float(self.clock())
         if getattr(self.text, "admission", None) is None:
             raise CompletionError("COMPLETION_SCHEDULER_REQUIRED", 503)
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id, read_only_original=read_only_original)
             state = root.get("_completion")
+            if recheck_original:
+                if (kind != "image" or not original_only or not read_only_original
+                        or allow_unconfirmed_retry or retry_not_sent_failure_at is not None):
+                    raise CompletionError("COMPLETION_POLICY_CONFLICT")
+                work = self.store.runtime(db, root.get("_work_key")) if root.get("_work_key") else None
+                if (root.get("_recovery_paused") or root.get("_recovery_suppressed")
+                        or work and work.get("state") != "active"):
+                    raise CompletionError("COMPLETION_WORK_NOT_ACTIVE")
+                # A repeated in-flight action must not renew the investigation.
+                if not ended_image_original_recheck(root):
+                    if (not state or state.get("state") != "needs_attention" or state.get("next_at") is not None
+                            or not root.get("_attempt_finished_at") or root.get("status") != "error"
+                            or root.get("upstream_outcome") != "unknown"
+                            or root.get("error_code") not in {"CONVERSATION_OUTCOME_UNKNOWN", "RESULT_UNRECOVERABLE"}
+                            or not all(root.get(k) for k in ("conversation_id", "request_message_id",
+                                "provider_binding_id", "provider_account_identity", "client_conversation_id"))
+                            or any(root.get(k) for k in ("_executing", "recovery_claim_id", "data",
+                                "result_file_ids", "result_sediment_ids", "_pending_image_result_ids", "_pending_image_output"))
+                            or float(root.get("_claim_until") or 0) > now
+                            or state.get("replacement_id") or state.get("prepared_input") or state.get("selected_id")):
+                        raise CompletionError("COMPLETION_ORIGINAL_RECHECK_CONFLICT")
+                    root.setdefault("_execution_timeline", []).append({
+                        "stage": "original_recheck_requested", "at": now,
+                        "previous_attempt_finished_at": root["_attempt_finished_at"],
+                        "previous_reason": state.get("reason"),
+                    })
+                    state.update(state="checking_original", next_at=now, original_recheck_requested_at=now,
+                                 allow_unconfirmed_retry=False, max_extra_requests=0, read_only_original=True)
+                    state.pop("original_read_requested_at", None)
+                    state.pop("original_read_no_result_baseline", None)
+                    self.store.write_receipt(db, kind, owner, request_id, root)
             if ((read_only_original and (not original_only or retry_not_sent_failure_at is not None)) or (
                     original_only and (kind != "image" or allow_unconfirmed_retry
                                       or state and state.get("replacement_id")))):
@@ -723,7 +767,10 @@ class GenerationCompletionService:
                         if not active and (definitely_unsent or original_reads_ended or (state.get("allow_unconfirmed_retry") or state.get("automatic_failure_retry")) and unresolved(root)) and exc.code not in {
                                 "COMPLETION_WORK_NOT_ACTIVE", "COMPLETION_ORIGINAL_RECOVERY_PAUSED",
                                 "COMPLETION_DOWNLOAD_ORIGINAL_RESULT"}:
-                            root.update(_attempt_finished_at=now, _attempt_reason=exc.code, _turn_reserved=False)
+                            if not (read_only_original_state(state) and state.get("original_recheck_requested_at")
+                                    and root.get("_attempt_finished_at")):
+                                root.update(_attempt_finished_at=now, _attempt_reason=exc.code)
+                            root["_turn_reserved"] = False
             elif child and not state.get("selected_id"):
                 child_anchor = self._age_anchor(child)
                 child_pending = (child.get("status") in {"queued", "running"}

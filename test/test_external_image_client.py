@@ -843,3 +843,23 @@ def test_lifecycle_timeout_does_not_accept_foreign_failed_or_opposite_intent(tmp
                 emit.assert_not_called()
             assert json.loads(path.read_text())["lifecycle"]["status"] == "unknown"
             assert calls == ["POST", "GET"]
+
+
+def test_original_check_client_sends_only_observational_action(tmp_path):
+    path=tmp_path/'original.json'
+    image_client._atomic_write_state(path, {'schema_version':image_client.STATE_SCHEMA_VERSION,
+        'client_task_id':'original-image','input_fingerprint':'retained','phase':'accepted'})
+    api=mock.Mock()
+    api.json.return_value={'protocol':'generation-completion-v1','kind':'image',
+                           'original_id':'original-image','state':'checking_original','max_extra_requests':0}
+    args=image_client._parser().parse_args(['completion-recover','--state',str(path),'--check-original'])
+    with mock.patch.object(image_client,'_emit'):
+        image_client._command_completion(api,args)
+    api.json.assert_called_once_with('POST','/api/image-tasks/original-image/completion',payload={'action':'check_original'})
+    assert json.loads(path.read_text())['client_task_id']=='original-image'
+    for flag in ['--allow-unconfirmed-retry','--retry-not-sent']:
+        api.reset_mock()
+        args=image_client._parser().parse_args(['completion-recover','--state',str(path),'--check-original',flag])
+        with unittest.TestCase().assertRaisesRegex(image_client.ClientError,'cannot authorize'):
+            image_client._command_completion(api,args)
+        api.json.assert_not_called()

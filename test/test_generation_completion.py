@@ -1602,3 +1602,115 @@ def test_original_only_policy_does_not_cancel_existing_successor(failed_unsent_i
     with pytest.raises(CompletionError, match="COMPLETION_POLICY_CONFLICT"):
         service.start("image", IDENTITY, "repair-image", original_only=True)
     assert row(service, "image", "repair-image") == before
+
+
+@pytest.fixture
+def ended_unknown_image(failed_unsent_image):
+    service = failed_unsent_image
+    patch_row(service, 'image', 'repair-image', retain_receipt=True,
+              status='error', upstream_outcome='unknown', upstream_unfinished=True,
+              _submission_started=True, upstream_submission_started=True,
+              error_code='CONVERSATION_OUTCOME_UNKNOWN', _attempt_finished_at=2900,
+              _attempt_reason='COMPLETION_ORIGINAL_READ_UNAVAILABLE', _executing=False,
+              _claim_until=0, recovery_claim_id=None, next_poll_at=0,
+              conversation_id='original-conversation', request_message_id='original-message',
+              provider_binding_id='original-binding', provider_account_identity='original-account',
+              client_conversation_id='original-client', _completion_read_at=2600,
+              _completion={'state':'needs_attention', 'next_at':None, 'allow_unconfirmed_retry':False,
+                           'automatic_failure_retry':True, 'max_extra_requests':1,
+                           'reason':'COMPLETION_ORIGINAL_READ_UNAVAILABLE',
+                           'original_read_requested_at':2600, 'original_read_no_result_baseline':0})
+    return service
+
+
+@pytest.mark.parametrize('found', [False, True])
+def test_explicit_ended_original_check_is_bounded_and_cannot_generate(ended_unknown_image, found):
+    service = ended_unknown_image
+    before = row(service, 'image', 'repair-image')
+    service.text.admission.wake = Mock(side_effect=AssertionError('must not schedule generation'))
+    service._prepare = Mock(side_effect=AssertionError('must not prepare generation'))
+    def read_original(*args, **kwargs):
+        assert kwargs['completion_recheck'] is True
+        patch_row(service, 'image', 'repair-image', status='running', _executing=True)
+    service.images.resume_poll = Mock(side_effect=read_original)
+    args = dict(original_only=True, read_only_original=True, recheck_original=True)
+    service.start('image', IDENTITY, 'repair-image', **args)
+    checking = row(service, 'image', 'repair-image')
+    assert checking['_completion']['max_extra_requests'] == 0
+    assert checking['_completion']['original_read_requested_at'] == 3000
+    assert checking['_attempt_finished_at'] == before['_attempt_finished_at']
+    service.clock.now += 1
+    service.start('image', IDENTITY, 'repair-image', **args)
+    assert row(service, 'image', 'repair-image')['_completion'] == checking['_completion']
+    service.images.resume_poll.assert_called_once()
+    result = {'status':'success', 'data':[{'b64_json':'saved-original'}], 'upstream_outcome':'generated'} if found else {
+        'status':'error', 'error_code':'CONVERSATION_OUTCOME_UNKNOWN', '_completion_read_at':3001}
+    patch_row(service, 'image', 'repair-image', _executing=False, **result)
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted._prepare = service._prepare
+    service.clock.now += 301
+    for _ in range(3):
+        restarted.advance('image', 'owner', 'repair-image')
+        service.clock.now += 301
+    after = row(service, 'image', 'repair-image')
+    assert after['_completion']['selected_id'] == 'repair-image' if found else after['_completion']['state'] == 'needs_attention'
+    assert after['_completion']['next_at'] is None
+    assert after['_attempt_finished_at'] == before['_attempt_finished_at']
+    assert after['_attempt_reason'] == before['_attempt_reason']
+    assert not after['_completion'].get('replacement_id')
+    assert len([x for x in after['_execution_timeline'] if x['stage']=='original_recheck_requested']) == 1
+    for key in ('conversation_id','request_message_id','provider_account_identity','provider_binding_id','_input_ref'):
+        assert after[key] == before[key]
+    service.images.resume_poll.assert_called_once()
+    service._prepare.assert_not_called()
+    service.text.admission.wake.assert_not_called()
+
+
+@pytest.mark.parametrize('change', [
+    {'_recovery_paused':True}, {'_recovery_suppressed':True}, {'_executing':True},
+    {'recovery_claim_id':'live'}, {'_claim_until':4000}, {'conversation_id':''},
+    {'request_message_id':''}, {'data':[{'b64_json':'existing'}]},
+    {'_pending_image_result_ids':{'file_ids':['original-file']}},
+])
+def test_original_recheck_rejects_conflicts_without_mutating_receipt(ended_unknown_image, change):
+    service = ended_unknown_image
+    patch_row(service, 'image', 'repair-image', **change)
+    before = row(service, 'image', 'repair-image')
+    with pytest.raises(CompletionError):
+        service.start('image', IDENTITY, 'repair-image', original_only=True,
+                      read_only_original=True, recheck_original=True)
+    assert row(service, 'image', 'repair-image') == before
+
+
+def test_original_check_api_is_owner_scoped_and_rejects_retry_fields(ended_unknown_image, monkeypatch):
+    import api.generation_completion as api
+    service = ended_unknown_image
+    monkeypatch.setattr(api, 'get_generation_completion_service', lambda:service)
+    monkeypatch.setattr(api, 'require_identity', lambda authorization,request:{**IDENTITY,'id':authorization or 'other'})
+    monkeypatch.setattr(api, 'require_image_policy', lambda *a,**k:None)
+    service.images.resume_poll = Mock(side_effect=lambda *a,**k:patch_row(service, 'image', 'repair-image', status='running', _executing=True))
+    app=FastAPI();app.include_router(api.create_router('image'));client=TestClient(app)
+    endpoint='/api/image-tasks/repair-image/completion'
+    assert client.post(endpoint,headers={'Authorization':'other'},json={'action':'check_original'}).status_code==404
+    for field,value in [('allow_unconfirmed_retry',False),('retry_not_sent_failure_at',2900.0),('selected_id','repair-image')]:
+        assert client.post(endpoint,headers={'Authorization':'owner'},json={'action':'check_original',field:value}).status_code==422
+    response=client.post(endpoint,headers={'Authorization':'owner'},json={'action':'check_original'})
+    assert response.status_code==200, response.text
+    assert response.json()['max_extra_requests']==0
+
+
+def test_actual_image_resume_only_bypasses_ended_guard_for_explicit_check(ended_unknown_image):
+    service=ended_unknown_image
+    run=service.text.admission.run_recovery=Mock()
+    service.images.resume_poll(IDENTITY,'repair-image',completion_recheck=True,wait_for_completion=True)
+    run.assert_not_called()
+    advance=service.advance
+    service.advance=Mock()
+    service.start('image',IDENTITY,'repair-image',original_only=True,read_only_original=True,recheck_original=True)
+    service.advance=advance
+    service.images.resume_poll(IDENTITY,'repair-image',completion_recheck=True,wait_for_completion=True)
+    run.assert_called_once()
+    patch_row(service,'image','repair-image',status='error',_executing=False,_claim_until=0,
+              _completion={**row(service,'image','repair-image')['_completion'],'state':'needs_attention','next_at':None})
+    service.images.resume_poll(IDENTITY,'repair-image',completion_recheck=True,wait_for_completion=True)
+    assert run.call_count==1

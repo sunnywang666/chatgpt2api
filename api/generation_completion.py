@@ -13,7 +13,7 @@ from services.work_lifecycle import WorkLifecycleError
 
 class CompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    action: Literal["recover", "complete", "rework"] = "recover"
+    action: Literal["recover", "check_original", "complete", "rework"] = "recover"
     allow_unconfirmed_retry: bool = Field(default=False, strict=True)
     retry_not_sent_failure_at: float | None = Field(default=None, gt=0, allow_inf_nan=False, strict=True)
     selected_id: str | None = Field(default=None, min_length=1, max_length=200)
@@ -22,6 +22,8 @@ class CompletionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_action(self):
+        if self.action == "check_original" and self.model_fields_set - {"action"}:
+            raise ValueError("original check accepts no retry or result acknowledgement")
         if self.retry_not_sent_failure_at is not None and (self.action != "recover" or self.allow_unconfirmed_retry):
             raise ValueError("confirmed not-sent repair is a separate recovery action")
         if self.action == "complete":
@@ -80,7 +82,7 @@ def create_router(kind):
         company_original_only = getattr(request.state, "company_identity", None) is not None
         admin_original_only = identity.get("role") == "admin"
         if admin_original_only and (
-            kind != "image" or body.action != "recover" or body.allow_unconfirmed_retry
+            kind != "image" or body.action not in {"recover", "check_original"} or body.allow_unconfirmed_retry
             or body.model_fields_set - {"action", "allow_unconfirmed_retry"}
         ):
             # Legacy Content/admin receipts may only request a bounded read of
@@ -93,12 +95,17 @@ def create_router(kind):
             # without expanding original-only recovery or its retry authority.
             fields = {
                 "recover": {"action", "allow_unconfirmed_retry", "retry_not_sent_failure_at"},
+                "check_original": {"action"},
                 "complete": {"action", "selected_id", "results_saved", "reviewed"},
                 "rework": {"action", "selected_id"},
             }[body.action]
             if kind != "image" or body.allow_unconfirmed_retry or body.model_fields_set - fields:
                 raise HTTPException(403, detail={"code": "COMPANY_ORIGINAL_RECOVERY_REQUIRED"})
         try:
+            if body.action == "check_original":
+                return await run_in_threadpool(service.start, kind, identity, request_id,
+                                               original_only=True, read_only_original=True,
+                                               recheck_original=True)
             if body.action == "complete":
                 return await run_in_threadpool(service.complete, kind, identity, request_id, body.selected_id)
             if body.action == "rework":
