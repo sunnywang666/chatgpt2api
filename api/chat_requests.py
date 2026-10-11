@@ -13,6 +13,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from api.image_inputs import normalize_inline_chat_messages
+from api.external_images import release_small_text_body_reader
 from api.key_policy import require_chat_text_policy, require_codex_endpoint
 from api.support import require_identity
 from services.content_filter import check_request, request_shape, request_text
@@ -222,6 +223,7 @@ def create_router() -> APIRouter:
         identity = _ordinary_identity(authorization, request)
         owner = _owner(identity)
         messages = await run_in_threadpool(normalize_inline_chat_messages, body.messages)
+        release_small_text_body_reader(request, messages)
         try:
             payload = _payload(owner, body, messages)
         except ValueError as exc:
@@ -264,9 +266,11 @@ def create_router() -> APIRouter:
             await run_in_threadpool(require_public_text_model, body.model)
         except PublicChatContractError as exc:
             raise HTTPException(503 if exc.code == "MODEL_DISCOVERY_UNAVAILABLE" else 400,
-                                detail={"code": exc.code, "error": str(exc)}) from None
+                                detail={"code": exc.code, "error": str(exc),
+                                        "upstream_outcome": "not_sent", "phase": "before_acceptance"}) from None
         except Exception:
-            raise HTTPException(503, detail={"code": "MODEL_DISCOVERY_UNAVAILABLE"}) from None
+            raise HTTPException(503, detail={"code": "MODEL_DISCOVERY_UNAVAILABLE",
+                                            "upstream_outcome": "not_sent", "phase": "before_acceptance"}) from None
 
         try:
             require_public_reasoning_effort(body.model, body.reasoning_effort)

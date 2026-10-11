@@ -855,6 +855,77 @@ def test_slow_model_discovery_does_not_block_the_async_request_loop(public_chat,
     assert response and response[0].status_code == 202
 
 
+@pytest.mark.parametrize("kind", ["text", "text_parts", "large_text", "image"])
+def test_catalog_wait_does_not_hold_small_text_body_permits(public_chat, monkeypatch, kind):
+    release = threading.Event()
+    entered = [threading.Event() for _ in range(3)]
+    responses, lock = [], threading.Lock()
+    calls = 0
+
+    def slow_require(_model):
+        nonlocal calls
+        with lock:
+            index = calls
+            calls += 1
+        entered[index].set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(chat_requests, "require_public_text_model", slow_require)
+    def submit(index):
+        body = request_body(request_id=f"catalog-{kind}-{index}")
+        if kind != "image":
+            content = "Suggest three product photography tips."
+            if kind == "large_text":
+                content = "x" * (64 * 1024)
+            elif kind == "text_parts":
+                content = [{"type": "input_text", "text": content}]
+            body["messages"] = [{"role": "user", "content": content}]
+        responses.append(public_chat.client.post(
+            "/api/chat-requests", headers=public_chat.headers(), json=body))
+
+    workers = [threading.Thread(target=submit, args=(i,), daemon=True) for i in range(3)]
+    with public_chat.client:
+        try:
+            for i in range(2):
+                workers[i].start()
+                assert entered[i].wait(2)
+            workers[2].start()
+            if kind in {"text", "text_parts"}:
+                assert entered[2].wait(2), "small parsed text blocked behind catalog discovery"
+                assert external_images._public_chat_body_readers == 0
+            else:
+                workers[2].join(2)
+                assert not workers[2].is_alive()
+                assert responses[0].status_code == 429
+                assert responses[0].json()["detail"]["code"] == "CHAT_BODY_READER_CAPACITY_EXCEEDED"
+                assert external_images._public_chat_body_readers == 2
+        finally:
+            release.set()
+            for worker in workers:
+                if worker.ident is not None:
+                    worker.join(3)
+    assert sorted(r.status_code for r in responses) == ([202] * 3 if kind in {"text", "text_parts"} else [202, 202, 429])
+    assert external_images._public_chat_body_readers == 0
+
+
+@pytest.mark.parametrize("generic_failure", [False, True])
+def test_model_discovery_failure_is_explicitly_before_acceptance(public_chat, monkeypatch, generic_failure):
+    from services.public_chat_service import PublicChatContractError
+    def unavailable(_model):
+        if generic_failure:
+            raise RuntimeError("catalog transport interrupted")
+        raise PublicChatContractError("MODEL_DISCOVERY_UNAVAILABLE", "model discovery unavailable")
+    monkeypatch.setattr(chat_requests, "require_public_text_model", unavailable)
+    body = request_body(request_id="catalog-unavailable")
+    response = public_chat.client.post("/api/chat-requests", headers=public_chat.headers(), json=body)
+    assert response.status_code == 503
+    assert response.json()["detail"]["upstream_outcome"] == "not_sent"
+    assert response.json()["detail"]["phase"] == "before_acceptance"
+    assert public_chat.client.get("/api/chat-requests/catalog-unavailable", headers=public_chat.headers()).status_code == 404
+    assert not public_chat.queue.calls
+    assert external_images._public_chat_body_readers == 0
+
+
 def test_known_stale_model_is_durably_accepted_while_new_model_is_retryable(public_chat, monkeypatch):
     from services.model_service import ModelRoute
 

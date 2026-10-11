@@ -22,6 +22,7 @@ from services.image_thread import input_fields, ImageThreadError
 from services.work_lifecycle import WorkLifecycleError
 
 MAX_PUBLIC_CHAT_BODY_BYTES = 140 * 1024 * 1024
+MAX_EARLY_RELEASE_TEXT_BODY_BYTES = 64 * 1024
 MAX_CONCURRENT_PUBLIC_CHAT_BODY_READERS = 2
 _public_chat_body_reader_lock = threading.Lock()
 _public_chat_body_readers = 0
@@ -41,6 +42,7 @@ async def _buffer_bounded_body(request: Request, limit: int, error_code: str):
         if len(body) > limit:
             return JSONResponse({"detail": {"code": error_code}}, status_code=413)
     request._body = bytes(body)
+    request.state.public_chat_body_bytes = len(body)
     return None
 
 
@@ -57,6 +59,23 @@ def _release_public_chat_body_reader() -> None:
     global _public_chat_body_readers
     with _public_chat_body_reader_lock:
         _public_chat_body_readers -= 1
+
+
+def release_small_text_body_reader(request: Request, messages: list[dict]) -> None:
+    """Do not hold upload capacity during catalog/DB waits for bounded text.
+
+    Called only after parsing and input validation. Large bodies and attachments
+    keep the original permit for their retained raw/decoded allocations.
+    """
+    size = getattr(request.state, "public_chat_body_bytes", None)
+    release = getattr(request.state, "release_public_chat_body_reader", None)
+    if size is None or size > MAX_EARLY_RELEASE_TEXT_BODY_BYTES or release is None:
+        return
+    for message in messages:
+        content = message["content"]
+        if not isinstance(content, str) and not all(part.get("type") == "text" for part in content):
+            return
+    release()
 
 
 def _ordinary_chat_identity(request: Request, *, ordinary_only=True):
@@ -126,6 +145,12 @@ async def external_image_boundary(request: Request, call_next):
                 headers={"Retry-After": "1"},
             )
         body_reader_held = True
+        def release_body_reader():
+            nonlocal body_reader_held
+            if body_reader_held:
+                body_reader_held = False
+                _release_public_chat_body_reader()
+        request.state.release_public_chat_body_reader = release_body_reader
         try:
             rejected = await _buffer_bounded_body(
                 request, chat_body_limit, chat_body_error,
@@ -133,14 +158,12 @@ async def external_image_boundary(request: Request, call_next):
             if rejected is not None:
                 return rejected
             if path != "/api/chat-requests":
-                _release_public_chat_body_reader()
-                body_reader_held = False
+                release_body_reader()
             response = await call_next(request)
             response.headers["Cache-Control"] = "private, no-store"
             return response
         finally:
-            if body_reader_held:
-                _release_public_chat_body_reader()
+            release_body_reader()
     if not is_external(request):
         return await call_next(request)
     if request.method == "OPTIONS":
