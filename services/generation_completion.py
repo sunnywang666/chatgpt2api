@@ -79,6 +79,23 @@ def _original_read_exhausted(root, state, now, investigation_seconds):
     )
 
 
+
+def pending_text_cursor_scan(root):
+    """A paced, unfinished scan is not evidence that the original read failed."""
+    if (root.get("conversation_id") or root.get("_attempt_finished_at")
+            or root.get("recovery_reason") != "REQUEST_CONVERSATION_SCAN_INCOMPLETE"
+            or root.get("recovery_error_code") in {"RECOVERY_AUTH_REQUIRED", "RECOVERY_RATE_LIMITED"}
+            or root.get("recovery_last_read_error")):
+        return False
+    from services.conversation_binding_service import ConversationBindingService
+    identity = ConversationBindingService._recovery_scan_identity(root)
+    if not all(identity.values()):
+        return False
+    scan = ConversationBindingService._validated_recovery_scan(root, identity)
+    return bool(scan and not scan.get("failed_reads") and (
+        not scan["coverage_complete"] or scan["next_index"] < len(scan["conversation_ids"])))
+
+
 def successful(kind, receipt):
     return bool(receipt and receipt.get("status") == ("succeeded" if kind == "text" else "success")
                 and (receipt.get("content") if kind == "text" else receipt.get("data")))
@@ -654,6 +671,15 @@ class GenerationCompletionService:
                         # resume_poll cannot query that original without a cursor;
                         # repeating its local ValueError is not an investigation.
                         raise CompletionError("COMPLETION_ORIGINAL_CURSOR_UNAVAILABLE")
+                    if kind == "text" and pending_text_cursor_scan(root):
+                        # Rate pacing can split a valid original-message lookup
+                        # into several windows, even after the task age limit.
+                        # Keep its persisted cursor and due time, without granting
+                        # a retry or reopening an already-ended investigation.
+                        state.update(state="checking_original", reason="COMPLETION_INVESTIGATING_ORIGINAL",
+                                     next_at=max(now + self.RECHECK_SECONDS, float(root.get("recovery_next_at") or 0)))
+                        self.store.write_receipt(db, kind, owner, request_id, root)
+                        return
                     retry_authorized = state["allow_unconfirmed_retry"] or state.get("automatic_failure_retry")
                     if kind == "text" and root.get("conversation_id") and not ended and not retry_authorized:
                         raise CompletionError("COMPLETION_ORIGINAL_END_UNCONFIRMED")

@@ -1536,6 +1536,63 @@ def test_image_cursor_scan_wait_survives_completion_ticks_and_restart(setup, cod
     assert calls == []
 
 
+
+@pytest.mark.parametrize("change", ["pending", "next_page", "finished", "identity", "invalid", "auth", "rate", "read_error", "failed_candidate", "ended"])
+def test_text_cursor_scan_continues_after_age_window_without_reopening_ended_attempt(setup, change):
+    service, admission, calls = setup
+    original = row(service)
+    identity = {key: original[key] for key in (
+        "provider_binding_id", "provider_account_identity", "client_conversation_id", "request_message_id")}
+    scan = {"identity": identity, "conversation_ids": ["candidate-a", "candidate-b"],
+            "next_offset": 20, "coverage_complete": True, "time_order_valid": True,
+            "last_update_time": 10, "next_index": 1, "matches": []}
+    if change == "next_page": scan.update(coverage_complete=False, next_index=2)
+    if change == "finished": scan["next_index"] = 2
+    if change == "identity": scan["identity"]["request_message_id"] = "unrelated-request"
+    if change == "invalid": scan["next_index"] = 99
+    if change == "failed_candidate":
+        scan["failed_reads"] = {"candidate-b": {"attempts": 1, "next_at": service.clock()+73,
+            "code": "RECOVERY_READ_FAILED", "error": {"category": "transport", "phase": "conversation_detail",
+                "http_status": None, "retry_after_seconds": None, "candidate_ref": "a"*16}}}
+    error = {"auth": "RECOVERY_AUTH_REQUIRED", "rate": "RECOVERY_RATE_LIMITED"}.get(change, "CONVERSATION_OUTCOME_UNKNOWN")
+    patch_row(service, conversation_id=None, status="unknown", recovery_reason="REQUEST_CONVERSATION_SCAN_INCOMPLETE",
+              recovery_error_code=error, recovery_next_at=service.clock()+73,
+              _recovery_conversation_scan=scan, _result_last_checked_at=0,
+              _completion={"state": "checking_original", "allow_unconfirmed_retry": False,
+                           "automatic_failure_retry": True, "max_extra_requests": 1, "next_at": 0})
+    if change == "read_error":
+        patch_row(service, recovery_last_read_error={"http_status": 429})
+    if change == "ended":
+        patch_row(service, _attempt_finished_at=service.clock()-1,
+                  _attempt_reason="COMPLETION_ORIGINAL_READ_UNAVAILABLE",
+                  _completion={**row(service)["_completion"], "state": "needs_attention", "next_at": None,
+                               "reason": "COMPLETION_ORIGINAL_READ_UNAVAILABLE"})
+    service.text.read = Mock()
+    service._prepare = Mock(side_effect=AssertionError("scan must not generate"))
+    service.advance("text", "owner", "old-0")
+    after = row(service)
+    if change in {"pending", "next_page"}:
+        assert after["_completion"]["state"] == "checking_original"
+        assert after["_completion"]["next_at"] == after["recovery_next_at"]
+        assert not after.get("_attempt_finished_at")
+        service.text.read.reset_mock()
+        restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+        restarted._prepare = service._prepare
+        admission.clock.now += 72
+        restarted.process_one()
+        service.text.read.assert_not_called()
+        admission.clock.now += 1
+        restarted.process_one()
+        service.text.read.assert_called_once_with("owner", "old-0")
+    else:
+        assert after["_completion"]["state"] == "needs_attention"
+        assert after["_completion"]["next_at"] is None
+    assert after["_recovery_conversation_scan"] == scan
+    assert "replacement_id" not in after["_completion"]
+    service._prepare.assert_not_called()
+    assert calls == []
+
+
 def test_original_only_policy_does_not_cancel_existing_successor(failed_unsent_image):
     service = failed_unsent_image
     prior = row(service, "image", "repair-image")
