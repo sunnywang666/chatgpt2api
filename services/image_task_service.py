@@ -1726,6 +1726,10 @@ class ImageTaskService:
                 recovery_phase="",
                 recovery_retry_after_seconds=None,
                 next_poll_at=0,
+                # The handler has returned validated output with its final
+                # conversation cursor.  Clear only this local execution
+                # marker before admission records post-result bookkeeping.
+                _executing=False,
             )
             self._log_call(
                 identity,
