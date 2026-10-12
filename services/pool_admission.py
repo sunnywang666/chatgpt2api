@@ -18,7 +18,7 @@ import uuid
 from services.admission_planner import Need, Resource, Offer, RequestRef, WaitingRequest, Snapshot, choose_next, fairness_lane
 from services.request_context import AdmissionLost, executing, safe_account_ref
 from services.task_store import TaskStore, pending_image_result_ids
-from services import workflow_scheduling
+from services import workflow_scheduling, product_work
 from utils.log import logger
 
 
@@ -558,9 +558,21 @@ class PoolAdmission:
         read = getattr(self.accounts, "admission_accounts", None)
         return read() if read else self.accounts.list_accounts()
 
-    def _snapshot(self, rows, receipts, settings, types, now, cursor, workflow_state=None):
+    def _snapshot(self, rows, receipts, settings, types, now, cursor, workflow_state=None, product_state=None):
         from services.text_task_service import TextTaskService
         works, workflow_clocks = workflow_state or ({}, {})
+        product_works = product_state or {}
+        product_states = {"queued", "active", "closing", "completed", "failed", "cancelled"}
+        # Product parents are opt-in and intentionally separate from generic
+        # work rows: one product may contain both text and image originals.
+        # A malformed persisted parent makes only a new product claim unsafe;
+        # a previously held parent remains governed by its own send guard.
+        product_state_unknown = any(
+            not isinstance(parent, dict)
+            or parent.get("key") != key
+            or parent.get("state") not in product_states
+            or not isinstance(parent.get("slot_held"), bool)
+            for key, parent in product_works.items())
         # A verified empty upstream turn may have one explicitly accepted
         # correction in the same public Chat session. Its UNKNOWN receipt must
         # remain intact for recovery, but it cannot remain the session's order
@@ -722,6 +734,28 @@ class PoolAdmission:
             scheduling_resources, scheduling_needs, scheduling_ready = workflow_scheduling.constraints(
                 r, works, workflow_clocks, ordered_receipts, now)
             thread_resources.extend(scheduling_resources)
+            product_needs = ()
+            product_fair_group = None
+            product_key = r.get("_product_work_key")
+            if "_product_work_key" in r:
+                parent = product_works.get(product_key)
+                source = r.get("_scheduling_owner") or r.get("_source") or "key:" + owner
+                valid_parent = (isinstance(product_key, str) and isinstance(parent, dict)
+                                and parent.get("key") == product_key
+                                and parent.get("owner") == owner
+                                and parent.get("source") == source)
+                if valid_parent and parent.get("state") == "active" and parent.get("slot_held") is True:
+                    product_fair_group = "product-continuation"
+                elif valid_parent and parent.get("state") == "queued" and parent.get("slot_held") is False:
+                    product_fair_group = "product-new"
+                    product_needs = (Need("product_parent_slots"),)
+                else:
+                    # Do not dispatch a closed, mismatched, or otherwise
+                    # invalid parent while preserving its original receipt.
+                    dependency = "product_parent_state:" + hashlib.sha256(
+                        (owner + "\0" + kind + "\0" + request_id).encode()).hexdigest()
+                    thread_resources.append(Resource(dependency, 0, 0, now))
+                    product_needs = (Need(dependency),)
             physical_needs = ()
             physical = physical_conversation_key(r)
             if physical:
@@ -750,9 +784,10 @@ class PoolAdmission:
                 # `source` is the trusted, stable caller.  The planner scopes
                 # this workflow ID to that source, so workflows cannot gain a
                 # second top-level caller turn by using multiple key owners.
-                fair_group=workflow_id if isinstance(workflow_id, str) and workflow_id else None,
+                fair_group=(product_fair_group if product_fair_group is not None
+                            else workflow_id if isinstance(workflow_id, str) and workflow_id else None),
                 ready_at=max(float(r.get("_ready_at") or 0), scheduling_ready),
-                needs=thread_needs + physical_needs + tuple(scheduling_needs) + (Need("execution_input_bytes", max(1, int(r.get("_input_bytes") or 1))),)
+                needs=thread_needs + physical_needs + product_needs + tuple(scheduling_needs) + (Need("execution_input_bytes", max(1, int(r.get("_input_bytes") or 1))),)
                       + ((Need("chat_executor"),) if kind == "text" and route == "chat" and r.get("_operation") != "image" else ())
                       + ((Need("image_executor"),) if kind == "image" or r.get("_operation") == "image" else ()),
             ))
@@ -762,6 +797,7 @@ class PoolAdmission:
                      "codex_server": Resource("codex_server", int(settings.get("codex_max_concurrency", 4)), codex_used, now)}
         resources.update({resource.key: resource for resource in thread_resources})
         offers = []
+        eligible_product_turns = set()
         scoped_extra_turn = None
         trial = settings.get("temporary_chat_second_slot")
         trial_active = (isinstance(trial, dict)
@@ -805,6 +841,8 @@ class PoolAdmission:
                 ready = max(now, float(pace.get("cooldown_until") or 0))
             new = Resource(turn_key, chat_capacity, None if unknown_unbound else occupied.get(turn_key, 0), ready)
             resources[turn_key] = new
+            if not disabled and chat_saved and paid and identity_counts.get(identity) == 1:
+                eligible_product_turns.add(turn_key)
             previous = resources.get(image_key)
             resources[image_key] = Resource(image_key, min(previous.capacity, image_slots) if previous else image_slots,
                                            None if unknown_unbound else occupied.get(image_key, 0), now)
@@ -844,6 +882,14 @@ class PoolAdmission:
                     if isinstance(limit, dict) and limit.get("feature_name") == model and limit.get("remaining") == 0:
                         enabled = False
                 offers.append(Offer(identity, "chat", model, request.operation, needs, enabled=bool(enabled)))
+        # A single opt-in product parent consumes one durable budget unit,
+        # derived from this same account snapshot. It is deliberately neither
+        # a free-turn count nor a worker limit, and no source gets its own pool.
+        product_capacity = sum(resources[key].capacity for key in eligible_product_turns)
+        product_occupied = None if (unknown_unbound or product_state_unknown) else sum(
+            bool(parent.get("slot_held")) for parent in product_works.values())
+        resources["product_parent_slots"] = Resource(
+            "product_parent_slots", product_capacity, product_occupied, now)
         if self.text_workers is None:
             # Execution threads follow the same usable physical account turns.
             # The retained-input memory ceiling still bounds all work; image
@@ -928,7 +974,8 @@ class PoolAdmission:
             receipts = list(self.store.receipts(db))
             settings = self._settings()
             workflow_state = workflow_scheduling.state_snapshot(self.store, db)
-            snapshot = self._snapshot(rows, receipts, settings, {}, now, {}, workflow_state)
+            product_state = product_work.state_snapshot(self.store, db)
+            snapshot = self._snapshot(rows, receipts, settings, {}, now, {}, workflow_state, product_state)
         resources = {r.key: r for r in snapshot.resources}
         result = []
         seen = set()
@@ -1019,7 +1066,8 @@ class PoolAdmission:
         now = float(self.clock())
         with self._settings_guard(), self.store.connect() as db, self._account_guard():
             rows = self._rows()
-            snapshot = self._snapshot(rows, list(self.store.receipts(db)), self._settings(), {}, now, {}, workflow_scheduling.state_snapshot(self.store, db))
+            snapshot = self._snapshot(rows, list(self.store.receipts(db)), self._settings(), {}, now, {},
+                                      workflow_scheduling.state_snapshot(self.store, db), product_work.state_snapshot(self.store, db))
         resources = {resource.key: resource for resource in snapshot.resources}
         server = resources["codex_server"]
         server_free = None if server.occupied is None else max(0, server.capacity - server.occupied)
@@ -1068,9 +1116,11 @@ class PoolAdmission:
         # because its original receipt still says queued. Legacy rows without
         # a work projection retain their existing allocation behavior.
         works, _ = workflow_scheduling.state_snapshot(self.store, db)
+        parents = product_work.state_snapshot(self.store, db)
         for item in self.store.receipts(db, statuses=statuses):
             work = works.get(item[3].get("_work_key")) or {}
-            if work.get("state", "active") == "active":
+            parent = parents.get(item[3].get("_product_work_key")) or {}
+            if work.get("state", "active") == "active" and parent.get("state", "active") in {"queued", "active"}:
                 yield item
 
     def _refresh_waiting_image_capabilities(self):
@@ -1186,7 +1236,9 @@ class PoolAdmission:
                     self.store.write_receipt(db, kind, owner, request_id, r)
             settings = self._settings()
             workflow_state = workflow_scheduling.state_snapshot(self.store, db)
-            snapshot = self._snapshot(self._rows(), receipts, settings, types, now, self.store.runtime(db, "fairness", {}), workflow_state)
+            product_state = product_work.state_snapshot(self.store, db)
+            snapshot = self._snapshot(self._rows(), receipts, settings, types, now,
+                                      self.store.runtime(db, "fairness", {}), workflow_state, product_state)
             selection = choose_next(snapshot, now)
             for deferred in selection.deferred:
                 r = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id)
@@ -1261,8 +1313,12 @@ class PoolAdmission:
                 r["upstream_unfinished"] = True
                 r["client_conversation_id"] = r.get("client_conversation_id") or "image-task-" + uuid.uuid4().hex
                 r["binding_status"] = "bound"
-            from services.work_lifecycle import record_slot
+            from services.work_lifecycle import WorkLifecycleError, record_slot
             record_slot(self.store, db, ref.kind, ref.owner, r, True)
+            try:
+                product_work.record_slot(self.store, db, r, True)
+            except WorkLifecycleError as exc:
+                raise AdmissionLost(exc.code) from None
             self.store.write_receipt(db, ref.kind, ref.owner, ref.request_id, r)
             owners = {source: owner for source, owner in snapshot.last_owner_by_source
                       if any(request.source == source and request.state == "queued" for request in snapshot.requests)}
@@ -1525,6 +1581,18 @@ class PoolAdmission:
                 if any(isinstance(limit, dict) and limit.get("feature_name") == r.get("model") and limit.get("remaining") == 0
                        for limit in selected.get("limits_progress") or []):
                     raise AdmissionLost("original model quota is unavailable before send")
+            # A parent always needs its durable product guard. A legacy
+            # receipt can conflict with a product parent only when it has a
+            # proven physical conversation identity; do not decode unrelated
+            # saved image payloads for a receipt that cannot have such a match.
+            product_guard_needed = bool(r.get("_product_work_key")) or bool(
+                r.get("conversation_id") and (r.get("provider_account_identity") or r.get("provider_binding_id")))
+            if product_guard_needed:
+                from services.work_lifecycle import WorkLifecycleError
+                try:
+                    product_work.before_send(self.store, db, r)
+                except WorkLifecycleError as exc:
+                    raise AdmissionLost(exc.code) from None
             workflow_scheduling.before_send(self.store, db, r, now)
             if r.get("_supersedes_request_id"):
                 r.update(upstream_outcome="unknown", error_code=None, waiting=None)

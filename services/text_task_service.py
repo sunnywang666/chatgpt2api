@@ -300,6 +300,8 @@ class TextTaskService:
             result.update(error_code=None, waiting=None, upstream_outcome="completed")
         result.pop("execution", None)
         result["recovery_control"] = recovery_control(receipt)
+        if receipt.get("_product_work"):
+            result["product_work"] = {"protocol": "product-work-v1", **receipt["_product_work"]}
         result.pop("recovery_automatic_stopped", None)
         result.pop("recovery_stop_reason", None)
         if (receipt.get("_attempt_finished_at")
@@ -833,7 +835,7 @@ class TextTaskService:
                 or not receipt.get("_execution_wait_ended_at")
                 or receipt.get("_attempt_finished_at")
                 or any(receipt.get(key) for key in (
-                    "_work_key", "_completion", "_completion_of", "_retry_cursor",
+                    "_work_key", "_product_work_key", "_completion", "_completion_of", "_retry_cursor",
                     "_upstream_terminal", "recovery_claim_id", "_claim_id", "_executing"))
                 or receipt.get("status") != "failed"
                 or receipt.get("error_code") != "RESULT_UNRECOVERABLE"
@@ -1064,6 +1066,23 @@ class TextTaskService:
 
     def archive_public_session(self, owner: str, request_id: str) -> dict[str, object]:
         return self.set_public_session_archived(owner, request_id, True)
+
+    def archive_product_work(self, owner, request_id, archived):
+        """Archive the original bound conversation under its durable parent guard."""
+        from services.request_context import current_archive_guard
+        from services.work_lifecycle import WorkLifecycleError
+        guard = current_archive_guard.get()
+        if guard is None or archived is not True:
+            raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_GUARD_REQUIRED")
+        guard()
+        with self._db() as db:
+            receipt = self.store.read_receipt(db, "text", owner, request_id)
+        required = ("_product_work_key", "provider_binding_id", "provider_account_identity",
+                    "client_conversation_id", "conversation_id", "parent_message_id")
+        if not receipt or any(not receipt.get(k) for k in required):
+            raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_CURSOR_UNAVAILABLE")
+        conversation_binding_service.set_archived(receipt, archived)
+        return {"request_id": request_id, "conversation_id": receipt["conversation_id"], "archived": archived}
 
     def restore_public_session(self, owner: str, request_id: str) -> dict[str, object]:
         return self.set_public_session_archived(owner, request_id, False)
@@ -1626,7 +1645,7 @@ class TextTaskService:
                          (owner, previous_id)).fetchone()
         return bool(old and child.get("_supersedes_input_hash") == old[0])
 
-    def validate_submission(self, owner: str, body: dict):
+    def validate_submission(self, owner: str, body: dict, *, source=None):
         """Read-only conflict check before any optional external review call."""
         body = self.submission_input(owner, body)
         request_id, request_hash = self._submission_identity(owner, body)
@@ -1644,7 +1663,13 @@ class TextTaskService:
                 "request identity already has different input",
                 code="CONVERSATION_REQUEST_CONFLICT",
             )
-        return self._public(json.loads(previous[1])) if previous else None
+        if previous:
+            saved = json.loads(previous[1])
+            if saved.get("_product_work_key") and source is not None and saved.get("_source") != source:
+                from services.work_lifecycle import WorkLifecycleError
+                raise WorkLifecycleError("PRODUCT_WORK_SOURCE_CONFLICT", 403)
+            return self._public(saved)
+        return None
 
     def _continue_public_session(self, db, owner, body, receipt):
         """Validate the predecessor and bind this turn atomically, without a second queue.
@@ -1724,13 +1749,40 @@ class TextTaskService:
         receipt["_public_session_ref"] = body["_public_session_ref"]
 
     def submit(self, owner: str, body: dict, *, source: str | None = None, _resume_absent_successor: bool = False):
-        from services.durable_forward import dispatch_model
+        from services.product_work import locking_product_conversations
         body = self.submission_input(owner, body)
+        with locking_product_conversations([body] if body.get("product_work") else []):
+            return self._submit_prepared(owner, body, source=source,
+                                         _resume_absent_successor=_resume_absent_successor)
+
+    def _submit_prepared(self, owner, body, *, source=None, _resume_absent_successor=False):
+        from services.durable_forward import dispatch_model
         from services.workflow_scheduling import normalize_scheduling
         if "_scheduling" in body:
             body = {**body, "_scheduling": normalize_scheduling(body["_scheduling"])}
         if body.get("_scheduling") is not None and self.admission is None:
             raise ValueError("SCHEDULING_UNAVAILABLE")
+        if "product_work" in body:
+            from services.product_work import normalize_product_work, require_product_source
+            from services.work_lifecycle import WorkLifecycleError
+            body = {**body, "product_work": normalize_product_work(body["product_work"])}
+            if body["product_work"] is None:
+                raise WorkLifecycleError("PRODUCT_WORK_INVALID", 400)
+            if source is None and body.get("supersedes_request_id"):
+                # Dedicated original-successor resume has no new caller lane;
+                # inherit only the owner-scoped, validated original relationship.
+                with self._db() as db:
+                    original = self.store.read_receipt(db, "text", owner, body["supersedes_request_id"])
+                if original and original.get("_product_work") == body["product_work"]:
+                    source = original.get("_source")
+            # source is set by the authenticated API, never a body field.
+            require_product_source({"role": "admin", "_trusted_source": source})
+            if self.admission is None:
+                raise WorkLifecycleError("PRODUCT_WORK_UNAVAILABLE", 503)
+            if (body.get("_route", "chat") != "chat" or body.get("_public_session_ref")
+                    or body.get("_scheduling") or body.get("_forward") or body.get("_editable")):
+                raise WorkLifecycleError("PRODUCT_WORK_LEGACY_REQUIRED", 400)
+
         request_id, request_hash = self._submission_identity(owner, body)
         receipt = {"request_id": request_id, "client_conversation_id": body["client_conversation_id"],
                    "_route": body.get("_route", "chat"), "_operation": body.get("_operation", "text"),
@@ -1756,6 +1808,10 @@ class TextTaskService:
                 return self._public(json.loads(previous[1]))
             schedule = not previous
             previous_receipt = json.loads(previous[1]) if previous else None
+            if (previous_receipt and previous_receipt.get("_product_work_key")
+                    and source is not None and previous_receipt.get("_source") != source):
+                from services.work_lifecycle import WorkLifecycleError
+                raise WorkLifecycleError("PRODUCT_WORK_SOURCE_CONFLICT", 403)
             public_chat_submission = str(body.get("_public_route") or "") == "chat"
             safe_capacity_retry = bool(
                 previous_receipt
@@ -1821,8 +1877,26 @@ class TextTaskService:
                 from services.workflow_scheduling import prepare_receipt
                 from services.work_lifecycle import ensure_work
                 prepare_receipt(receipt, body.get("_scheduling"), receipt["_source"])
-                ensure_work(self.store, db, "text", owner, request_id, receipt,
-                            source=receipt["_source"], scheduling=receipt.get("_scheduling"))
+                from services.product_work import ensure_product_work
+                product = body.get("product_work")
+                previous_id = receipt.get("_supersedes_request_id") or receipt.get("_previous_request_id") or receipt.get("_completion_of")
+                original = self.store.read_receipt(db, "text", owner, previous_id) if previous_id else None
+                if original and original.get("_product_work"):
+                    from services.work_lifecycle import WorkLifecycleError
+                    if product is not None and product != original["_product_work"]:
+                        raise WorkLifecycleError("PRODUCT_WORK_BINDING_CONFLICT")
+                    product = original["_product_work"]
+                    if source is not None and source != original.get("_source"):
+                        raise WorkLifecycleError("PRODUCT_WORK_SOURCE_CONFLICT")
+                    receipt["_source"] = original["_source"]
+                    prepare_receipt(receipt, body.get("_scheduling"), receipt["_source"])
+                    if self.admission is None:
+                        raise WorkLifecycleError("PRODUCT_WORK_UNAVAILABLE", 503)
+                parent = ensure_product_work(self.store, db, "text", owner, request_id, receipt,
+                                             product, source=receipt["_source"])
+                if parent is None:
+                    ensure_work(self.store, db, "text", owner, request_id, receipt,
+                                source=receipt["_source"], scheduling=receipt.get("_scheduling"))
                 db.execute("INSERT INTO requests VALUES(?,?,?,?)", (owner, request_id, request_hash, json.dumps(receipt)))
         if schedule and self.admission is not None:
             self.admission.wake()

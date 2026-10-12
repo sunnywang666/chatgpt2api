@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from api.product_works import ProductWorkInput, product_identity
+from services.work_lifecycle import WorkLifecycleError
+
 from api.recovery_control import RecoveryControlRequest, update_recovery_control
 
 from services.request_context import trusted_source
@@ -103,6 +106,14 @@ class ConversationBindingTextRequest(BaseModel):
     supersedes_request_id: str | None = Field(default=None, min_length=1, max_length=200)
     derived_input: dict[str, object] | None = Field(default=None, exclude_if=lambda value: value is None)
     continue_after_no_final: bool | None = Field(default=None, strict=True, exclude_if=lambda value: value is None)
+    product_work: ProductWorkInput | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @field_validator("product_work", mode="before")
+    @classmethod
+    def reject_null_product_work(cls, value):
+        if value is None:
+            raise ValueError("product_work must be omitted or an object")
+        return value
     conversation_id: str | None = None
     parent_message_id: str | None = None
 
@@ -359,8 +370,29 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         if identity.get("role") != "admin":
             raise HTTPException(404, detail={"code": "TASK_NOT_FOUND"})
+        payload = body.model_dump()
+
+        def require_legacy_conversation():
+            from services.work_lifecycle import _same_conversation
+            with text_task_service.store.connect() as db:
+                if any(receipt.get("_product_work_key") and _same_conversation(receipt, payload)
+                       for _, _, _, receipt in text_task_service.store.receipts(db)):
+                    raise WorkLifecycleError("PRODUCT_WORK_REQUIRED")
+
+        def archive_legacy_conversation():
+            from services.product_work import locking_product_conversations
+            from services.request_context import guarding_archive
+            # Use physical identity, not the caller's client-session alias.
+            # Product attachment cannot commit halfway through this archive.
+            with locking_product_conversations([payload]):
+                require_legacy_conversation()
+                with guarding_archive(require_legacy_conversation):
+                    return conversation_binding_service.archive(payload)
+
         try:
-            return await run_in_threadpool(conversation_binding_service.archive, body.model_dump())
+            return await run_in_threadpool(archive_legacy_conversation)
+        except WorkLifecycleError as exc:
+            raise HTTPException(status_code=exc.status, detail={"code": exc.code}) from exc
         except ConversationBindingError as exc:
             raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
         except Exception as exc:
@@ -461,6 +493,10 @@ def create_router() -> APIRouter:
         if body.supersedes_request_id is None:
             payload.pop("supersedes_request_id", None)
         try:
+            if body.product_work is not None:
+                product_identity(identity, request)
+                if text_task_service.admission is None:
+                    raise WorkLifecycleError("PRODUCT_WORK_UNAVAILABLE", 503)
             if body.supersedes_request_id is not None and not body.client_request_id:
                 raise ConversationBindingError("explicit successor request identity is required",
                                                code="CHAT_SUPERSEDE_INVALID")
@@ -470,6 +506,7 @@ def create_router() -> APIRouter:
                 # check transactionally after review to close the race.
                 existing = await run_in_threadpool(
                     text_task_service.validate_submission, owner, payload,
+                    source=trusted_source(identity, request),
                 )
                 if existing is not None:
                     if existing.get("status") == "not_started":
@@ -497,6 +534,8 @@ def create_router() -> APIRouter:
                 payload["client_request_id"] = request.headers.get("x-client-request-id") or uuid.uuid4().hex
                 return await run_in_threadpool(text_task_service.submit, owner, payload, source=trusted_source(identity, request))
             return await run_in_threadpool(conversation_binding_service.complete_text, payload)
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except ConversationBindingError as exc:
             detail = {"code": exc.code, "error": str(exc)}
             for key in (

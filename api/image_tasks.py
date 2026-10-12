@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from api.product_works import ProductWorkInput, product_identity
+
 from api.recovery_control import RecoveryControlRequest, update_recovery_control
 
 from typing import Literal
@@ -32,6 +34,7 @@ class ImageGenerationTaskRequest(BaseModel):
     quality: str = "auto"
     account_ref: str | None = Field(default=None, strict=True, pattern=r"^car_[A-Za-z0-9_-]{43}$")
     scheduling: object | None = None
+    product_work: ProductWorkInput | None = Field(default=None, exclude_if=lambda value: value is None)
     provider_binding_id: str = ""
     provider_account_identity: str = ""
     client_conversation_id: str = ""
@@ -48,6 +51,13 @@ class ImageGenerationTaskRequest(BaseModel):
     def reject_null_account_ref(cls, value):
         if value is None:
             raise ValueError("account_ref must be omitted or an advertised account reference")
+        return value
+
+    @field_validator("product_work", mode="before")
+    @classmethod
+    def reject_null_product_work(cls, value):
+        if value is None:
+            raise ValueError("product_work must be omitted or an object")
         return value
 
     @field_validator("scheduling", mode="before")
@@ -212,6 +222,13 @@ def create_router() -> APIRouter:
             if str(exc).startswith("SCHEDULING_INVALID"):
                 raise HTTPException(400, detail={"code": "SCHEDULING_INVALID"}) from None
             raise
+        if body.product_work is not None:
+            try:
+                product_identity(identity, request)
+                if image_task_service.admission is None:
+                    raise WorkLifecycleError("PRODUCT_WORK_UNAVAILABLE", 503)
+            except WorkLifecycleError as exc:
+                raise HTTPException(exc.status, detail={"code": exc.code}) from None
         require_image_policy(identity, body.model)
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/generations", body.model, "文生图任务", request_text=body.prompt), body.prompt)
         try:
@@ -225,6 +242,7 @@ def create_router() -> APIRouter:
                 quality=body.quality,
                 **({"account_ref": body.account_ref} if body.account_ref is not None else {}),
                 **({"scheduling": scheduling} if scheduling is not None else {}),
+                **({"product_work": body.product_work.model_dump()} if body.product_work is not None else {}),
                 base_url=resolve_image_base_url(request),
                 provider_binding_id=body.provider_binding_id,
                 provider_account_identity=body.provider_account_identity,
@@ -256,6 +274,13 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization, request=request)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         validate_external_input(request, payload)
+        if "product_work" in payload:
+            try:
+                product_identity(identity, request)
+                if image_task_service.admission is None:
+                    raise WorkLifecycleError("PRODUCT_WORK_UNAVAILABLE", 503)
+            except WorkLifecycleError as exc:
+                raise HTTPException(exc.status, detail={"code": exc.code}) from None
         require_image_policy(identity, payload.get("model"))
         client_task_id = str(payload.get("client_task_id") or "").strip()
         if not client_task_id:
@@ -276,6 +301,7 @@ def create_router() -> APIRouter:
                 quality=payload["quality"],
                 **({"account_ref": payload["account_ref"]} if "account_ref" in payload else {}),
                 **({"scheduling": payload["scheduling"]} if "scheduling" in payload else {}),
+                **({"product_work": payload["product_work"]} if "product_work" in payload else {}),
                 base_url=resolve_image_base_url(request),
                 images=images,
                 masks=masks,
