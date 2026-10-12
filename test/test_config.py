@@ -149,6 +149,24 @@ class PacingSettingsTests(unittest.TestCase):
             self.assertEqual(reopened.account_request_interval_secs, 5)
             self.assertEqual(reopened.account_message_interval_secs, 30)
 
+    def test_read_burst_and_inflight_defaults_validate_and_reopen(self):
+        from services.config import ConfigStore
+        self.assertEqual(self.store.get()["account_conversation_read_burst"], 1)
+        self.assertEqual(self.store.get()["account_conversation_read_max_inflight"], 0)
+        settings = self.store.update({"account_conversation_read_burst": 4,
+                                      "account_conversation_read_max_inflight": 4})
+        reopened = ConfigStore(self.path)
+        self.assertEqual(settings["account_conversation_read_burst"], 4)
+        self.assertEqual(reopened.account_conversation_read_max_inflight, 4)
+        before = self.path.read_bytes()
+        for key, value in (("account_conversation_read_burst", 0),
+                           ("account_conversation_read_burst", True),
+                           ("account_conversation_read_max_inflight", -1),
+                           ("account_conversation_read_max_inflight", 101)):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                self.store.update({key: value, "proxy": "must-not-change"})
+            self.assertEqual(self.path.read_bytes(), before)
+
     def test_settings_api_rejects_bad_pacing_and_reads_effective_legacy_value(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
@@ -183,6 +201,26 @@ class PacingSettingsTests(unittest.TestCase):
                     self.assertEqual(response.json()["config"]["account_message_interval_secs"], message)
                     self.assertEqual(client.get("/api/settings").json()["config"]["account_message_interval_secs"], message)
                     self.assertEqual(ConfigStore(self.path).account_message_interval_secs, message)
+                response = client.post("/api/settings", json={
+                    "account_request_interval_secs": .25,
+                    "account_message_interval_secs": 0,
+                    "account_conversation_read_interval_secs": 45,
+                    "account_conversation_read_burst": 4,
+                    "account_conversation_read_max_inflight": 4,
+                })
+                self.assertEqual(response.status_code, 200)
+                saved = response.json()["config"]
+                self.assertEqual({key: saved[key] for key in (
+                    "account_request_interval_secs", "account_message_interval_secs",
+                    "account_conversation_read_interval_secs", "account_conversation_read_burst",
+                    "account_conversation_read_max_inflight")}, {
+                    "account_request_interval_secs": .25, "account_message_interval_secs": 0,
+                    "account_conversation_read_interval_secs": 45, "account_conversation_read_burst": 4,
+                    "account_conversation_read_max_inflight": 4,
+                })
+                reopened = ConfigStore(self.path)
+                self.assertEqual(reopened.account_conversation_read_burst, 4)
+                self.assertEqual(reopened.account_conversation_read_max_inflight, 4)
 
 
 if __name__ == "__main__":

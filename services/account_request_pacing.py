@@ -128,6 +128,45 @@ def _backoff_seconds(failures):
     return min(900.0, 60.0 * (2 ** min(max(0, failures - 1), 4)))
 
 
+def _read_policy(now, rate_failures, last_limit, read_failures, last_read_limit):
+    failures = max(rate_failures if now - last_limit < 900 else 0,
+                   read_failures if now - last_read_limit < 900 else 0)
+    interval = min(300.0, getattr(config, "account_conversation_read_interval_secs", 0.0)
+                   * 2 ** min(failures, 4))
+    # A real limit disables bursts until the existing backoff history expires.
+    capacity = 1 if failures or not interval else getattr(config, "account_conversation_read_burst", 1)
+    return interval, capacity
+
+
+def _read_credit(bucket, now, interval, capacity, floor):
+    """Project the existing account clock without mutating/reserving a read."""
+    if not interval:
+        return 0.0, now, max(now, floor)
+    if bucket is None:
+        credit, at = 1.0, floor
+    else:
+        credit, at = bucket["credit"], bucket["at"]
+    credit = min(float(capacity), credit + max(0.0, now - at) / interval)
+    if bucket is not None and (bucket["interval"], bucket["capacity"]) != (interval, capacity):
+        # A configuration change never grants a fresh burst. Existing idle time
+        # can retain one due GET, then the new policy accrues normally.
+        credit = min(credit, 1.0)
+    at = max(now, at)
+    return credit, at, max(floor, at + max(0.0, 1.0 - credit) * interval)
+
+
+def _checked_read_bucket(bucket, offset=0.0):
+    if bucket is None:
+        return None
+    if (not isinstance(bucket, dict) or set(bucket) != {"credit", "at", "interval", "capacity"}
+            or any(type(bucket[k]) not in (int, float) or not math.isfinite(bucket[k])
+                   for k in ("credit", "at", "interval"))
+            or type(bucket["capacity"]) is not int or not 1 <= bucket["capacity"] <= 100
+            or not 0 <= bucket["credit"] <= bucket["capacity"] or not 0 <= bucket["interval"] <= 300):
+        raise ValueError("Invalid saved conversation read credits")
+    return {**bucket, "at": bucket["at"] - offset}
+
+
 class AccountRequestClock:
     def __init__(self, account_key="", state_path: Path | None = None) -> None:
         self.account_key = account_key
@@ -137,6 +176,9 @@ class AccountRequestClock:
         self.next_request = 0.0
         self.next_turn = 0.0
         self.next_conversation_read = 0.0
+        self.conversation_read_bucket = None
+        self.read_slots = {}
+        self.read_capacity_changed = threading.Event()
         self.archive_read_owner = None
         self.archive_read_until = 0.0
         self.ordinary_read_wait_until = 0.0
@@ -174,6 +216,7 @@ class AccountRequestClock:
         if not math.isfinite(read_at):
             raise ValueError("Invalid saved conversation read clock")
         self.next_conversation_read = read_at - offset
+        self.conversation_read_bucket = _checked_read_bucket(saved.get("conversation_read_bucket"), offset)
         for field in ("archive_read_until", "ordinary_read_wait_until"):
             value = float(saved.get(field, 0.0))
             if not math.isfinite(value):
@@ -209,6 +252,9 @@ class AccountRequestClock:
             {"owner": entry["owner"], "until": entry["until"] + offset}
             for entry in self.ordinary_read_queue]
         saved["last_turn_started"] = None if self.last_turn_started is None else self.last_turn_started + offset
+        if self.conversation_read_bucket is not None:
+            saved["conversation_read_bucket"] = {**self.conversation_read_bucket,
+                                                  "at": self.conversation_read_bucket["at"] + offset}
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.state_path.with_suffix(".tmp")
         with temporary.open("w") as handle:
@@ -250,7 +296,7 @@ class AccountRequestClock:
         """Called with the existing clock lock; reserve one GET, never a POST."""
         if not getattr(config, "account_conversation_read_interval_secs", 0.0):
             return True
-        ready = max(now, self.next_request, self.cooldown_until, self.next_conversation_read)
+        ready = max(now, self.next_request, self.cooldown_until, self._read_ready(now))
         if ready - now >= 235:
             return False  # An archive HTTP step has a 240 second finite budget.
         if self.archive_read_owner and self.archive_read_until > now:
@@ -273,6 +319,89 @@ class AccountRequestClock:
         if not self.conversation_read_rate_failures:
             return 0.0
         return self.last_conversation_read_rate_limit + _backoff_seconds(self.conversation_read_rate_failures)
+
+    def _read_ready(self, now):
+        interval, capacity = _read_policy(now, self.rate_failures, self.last_rate_limit,
+                                         self.conversation_read_rate_failures, self.last_conversation_read_rate_limit)
+        return max(self._read_cooldown_until(),
+                   _read_credit(self.conversation_read_bucket, now, interval, capacity,
+                                self.next_conversation_read)[2])
+
+    def _consume_read(self, now):
+        interval, capacity = _read_policy(now, self.rate_failures, self.last_rate_limit,
+                                         self.conversation_read_rate_failures, self.last_conversation_read_rate_limit)
+        credit, _, ready = _read_credit(self.conversation_read_bucket, now, interval, capacity,
+                                       self.next_conversation_read)
+        if ready > now + 0.000001 or self._read_cooldown_until() > now:
+            raise AccountRequestDeadlineExceeded("conversation read credit is not ready")
+        remaining = max(0.0, credit - 1.0) if interval else 0.0
+        self.conversation_read_bucket = {"credit": remaining, "at": now,
+                                         "interval": interval, "capacity": capacity}
+        self.next_conversation_read = now + max(0.0, 1.0 - remaining) * interval
+
+    def _try_read_slot(self):
+        """Claim one durable per-account read slot, releasing on process exit."""
+        limit = getattr(config, "account_conversation_read_max_inflight", 0)
+        indices = set(self.read_slots)
+        if self.state_path is not None:
+            prefix = self.state_path.stem + ".read-"
+            for path in self.state_path.parent.glob(prefix + "*.lock"):
+                suffix = path.name[len(prefix):-len(".lock")]
+                if suffix.isdigit():
+                    indices.add(int(suffix))
+        candidate, busy = None, 0
+        try:
+            for index in sorted(indices):
+                slot = self.read_slots.get(index)
+                if slot is None:
+                    slot = ProcessMutex(self.state_path.with_suffix(f".read-{index}.lock") if self.state_path else None)
+                    self.read_slots[index] = slot
+                if not slot.acquire(blocking=False):
+                    busy += 1
+                elif candidate is None:
+                    candidate = slot
+                else:
+                    slot.release()
+            if limit and busy >= limit:
+                if candidate is not None:
+                    candidate.release()
+                return None
+            if candidate is None:
+                index = max(indices, default=-1) + 1
+                slot = ProcessMutex(self.state_path.with_suffix(f".read-{index}.lock") if self.state_path else None)
+                self.read_slots[index] = slot
+                if not slot.acquire(blocking=False):
+                    return None
+                candidate = slot
+            return candidate
+        except BaseException:
+            if candidate is not None:
+                candidate.release()
+            raise
+
+    def _read_slot_available(self):
+        """Check current capacity for send-edge priority without claiming it."""
+        limit = getattr(config, "account_conversation_read_max_inflight", 0)
+        if not limit:
+            return True
+        indices = set(self.read_slots)
+        if self.state_path is not None:
+            prefix = self.state_path.stem + ".read-"
+            for path in self.state_path.parent.glob(prefix + "*.lock"):
+                suffix = path.name[len(prefix):-len(".lock")]
+                if suffix.isdigit():
+                    indices.add(int(suffix))
+        busy = 0
+        for index in indices:
+            slot = self.read_slots.get(index)
+            if slot is None:
+                slot = ProcessMutex(self.state_path.with_suffix(f".read-{index}.lock") if self.state_path else None)
+                self.read_slots[index] = slot
+            if slot.acquire(blocking=False):
+                slot.release()
+            else:
+                busy += 1
+        return busy < limit
 
     def limited(self, retry_after=0.0, *, evidence=None, retry_after_present=False, read_sent_at=None):
         # A conversation GET limit without Retry-After backs off that read lane.
@@ -360,7 +489,7 @@ class AccountRequestClock:
             if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
                 kwargs["timeout"] = max(0.001, min(float(timeout), remaining))
 
-        def wait_for_pace(delay: float, message: str) -> None:
+        def wait_for_pace(delay: float, message: str, reason="account_pace") -> None:
             nonlocal deadline_at
             remaining = remaining_budget()
             # Credit only our configured pacing wait. A provider cooldown is
@@ -370,7 +499,10 @@ class AccountRequestClock:
             if remaining is not None and (remaining <= 0 or (not credit and delay >= remaining)):
                 raise AccountRequestDeadlineExceeded(message)
             started_wait = time.monotonic()
-            time.sleep(delay)
+            if reason == "read_concurrency":
+                self.read_capacity_changed.wait(delay)
+            else:
+                time.sleep(delay)
             elapsed = max(0.0, time.monotonic() - started_wait)
             if credit and elapsed:
                 local_wait(elapsed)
@@ -409,6 +541,17 @@ class AccountRequestClock:
             "conversation_read", "conversation_archive", "conversation_restore"} else None
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
         ordinary_owner = uuid.uuid4().hex if is_conversation_read and not read_owner else None
+        read_slot = None
+        read_slot_transferred = False
+        read_slot_release_lock = threading.Lock()
+
+        def release_read_slot():
+            nonlocal read_slot
+            with read_slot_release_lock:
+                slot, read_slot = read_slot, None
+            if slot is not None:
+                slot.release()
+                self.read_capacity_changed.set()
         if archive_guard is not None:
             archive_guard()
             # Each HTTP step must finish inside the renewed 300s work claim.
@@ -517,9 +660,8 @@ class AccountRequestClock:
                         context.release_turn()
 
         def wait_for_send_edge(message):
-            # Enter and return with the existing clock held. Production has
-            # one ordinary-read FIFO and fixed read floor, not read credits or
-            # separate inflight slots. Keep that persisted protocol unchanged.
+            # Enter and return with the existing clock held. The ordinary-read
+            # FIFO remains the admission order; credit only changes its due edge.
             nonlocal clock_held
             while True:
                 now = time.monotonic()
@@ -534,9 +676,8 @@ class AccountRequestClock:
                         self._save()
                     archive_busy = self.archive_read_owner and self.archive_read_until > now
                     if queue and not archive_busy:
-                        read_ready = max(self.next_request, self.cooldown_until,
-                                         self.next_conversation_read, self._read_cooldown_until())
-                        if read_ready <= now:
+                        read_ready = max(self.next_request, self.cooldown_until, self._read_ready(now))
+                        if read_ready <= now and self._read_slot_available():
                             delay = max(delay, min(1.0, max(0.1, config.account_request_interval_secs)))
                             yield_to_read = True
                         elif delay > 0 and read_ready <= now + delay:
@@ -559,8 +700,9 @@ class AccountRequestClock:
                 acquire_with_budget(self.lock)
                 try:
                     now = time.monotonic()
+                    wait_reason = "account_pace"
                     read_delay = max(self.next_request, self.cooldown_until,
-                                     self.next_conversation_read if is_conversation_read else 0) - now
+                                     self._read_ready(now) if is_conversation_read else 0) - now
                     if is_conversation_read and read_owner:
                         if not self._reserve_archive_read(read_owner, now):
                             other = self.archive_read_until if self.archive_read_until > now else 0.0
@@ -575,6 +717,13 @@ class AccountRequestClock:
                             # or add a whole second to fractional HTTP pacing.
                             retry_check = min(1.0, max(0.1, config.account_request_interval_secs))
                             read_delay = max(read_delay, retry_check)
+                    if is_conversation_read and read_delay <= 0:
+                        self.read_capacity_changed.clear()
+                        read_slot = self._try_read_slot()
+                        if read_slot is None:
+                            read_delay, wait_reason = 0.1, "read_concurrency"
+                        else:
+                            wait_reason = "account_pace"
                 except BaseException:
                     self.lock.release()
                     raise
@@ -584,7 +733,8 @@ class AccountRequestClock:
                 # and delay a generation POST that is otherwise ready. Reload
                 # all deadlines under the cross-process lock after waking.
                 self.lock.release()
-                wait_for_pace(read_delay, "account request deadline elapsed during read wait")
+                wait_for_pace(read_delay, "account request deadline elapsed during read wait",
+                              wait_reason)
             clock_held = True
             response = None
             try:
@@ -655,10 +805,18 @@ class AccountRequestClock:
                 cap_timeout_before_send()
                 factor = 2 ** min(self.rate_failures, 4)
                 self.next_request = now + min(60.0, config.account_request_interval_secs * factor)
-                read_factor = 2 ** min(max(self.rate_failures, self.conversation_read_rate_failures), 4)
-                read_interval = min(300.0, getattr(config, "account_conversation_read_interval_secs", 0.0) * read_factor)
+                read_correction_applied = False
+
+                def correct_read_start(sent_at):
+                    nonlocal read_correction_applied
+                    if is_conversation_read and not read_correction_applied:
+                        delay = max(0.0, sent_at - now)
+                        self.conversation_read_bucket["at"] += delay
+                        self.next_conversation_read += delay
+                        read_correction_applied = True
+
                 if is_conversation_read:
-                    self.next_conversation_read = now + read_interval
+                    self._consume_read(now)
                     self.last_read_was_archive = archive_guard is not None
                     if read_owner and self.archive_read_owner == read_owner:
                         self.archive_read_owner = None
@@ -724,8 +882,7 @@ class AccountRequestClock:
                                 raise outcome["error"]
                             sent_at = outcome["started_at"]
                             self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
-                            if is_conversation_read:
-                                self.next_conversation_read = max(self.next_conversation_read, sent_at + read_interval)
+                            correct_read_start(sent_at)
                             self._save()
                             floor_durable = True
                         except BaseException as exc:
@@ -764,8 +921,7 @@ class AccountRequestClock:
                     # then account for its I/O delay even if transport fails.
                     if clock_held:
                         self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
-                        if is_conversation_read:
-                            self.next_conversation_read = max(self.next_conversation_read, sent_at + read_interval)
+                        correct_read_start(sent_at)
                         if is_turn:
                             self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
                             self.last_turn_started = sent_at
@@ -820,12 +976,48 @@ class AccountRequestClock:
                 response.iter_lines = paced_lines
             else:
                 release_turn()
+            if is_conversation_read and kwargs.get("stream"):
+                # Header delivery does not end a streaming GET. Keep the
+                # per-account slot until close or either iterator finishes.
+                close_read = response.close
+
+                def close_read_response():
+                    try:
+                        return close_read()
+                    finally:
+                        future = getattr(response, "stream_task", None)
+                        add_done_callback = getattr(future, "add_done_callback", None)
+                        if callable(add_done_callback):
+                            # `_send_with_bounded_stream_close` only asks the
+                            # native stream to stop. Its response close returns
+                            # before perform exits, so keep capacity until the
+                            # stream Future has actually completed.
+                            add_done_callback(lambda _future: release_read_slot())
+                        else:
+                            release_read_slot()
+
+                def finish_read_iterator(iterator):
+                    def consume(*args, **options):
+                        try:
+                            yield from iterator(*args, **options)
+                        finally:
+                            close_read_response()
+                    return consume
+
+                response.close = close_read_response
+                for name in ("iter_lines", "iter_content"):
+                    iterator = getattr(response, name, None)
+                    if callable(iterator):
+                        setattr(response, name, finish_read_iterator(iterator))
+                read_slot_transferred = True
             return response
         except BaseException:
             release_pacing()
             release_turn()
             raise
         finally:
+            if not read_slot_transferred:
+                release_read_slot()
             if ordinary_owner:
                 # Deadline/preflight/transport failure must not leave a live
                 # caller's place blocking the following result reader.
@@ -914,6 +1106,17 @@ def account_pacing_snapshot(account, now=None, *, include_turn=True, include_con
             return {"next_at": None, "cooldown_until": None}
         if failures:
             cooldown = max(cooldown, limited_at + _backoff_seconds(failures))
+        try:
+            last_global_limit = float(saved.get("last_rate_limit", 0.0))
+            if not math.isfinite(last_global_limit):
+                raise ValueError("Invalid saved account rate limit")
+            interval, capacity = _read_policy(now, max(0, int(saved.get("rate_failures", 0))),
+                                             last_global_limit, failures, limited_at)
+            bucket = _checked_read_bucket(saved.get("conversation_read_bucket"))
+            values.append(_read_credit(bucket, now, interval, capacity,
+                                       saved.get("next_conversation_read", 0.0))[2])
+        except (TypeError, ValueError, OverflowError, KeyError):
+            return {"next_at": None, "cooldown_until": None}
     return {"next_at": max(now, cooldown, *values), "cooldown_until": cooldown}
 
 
