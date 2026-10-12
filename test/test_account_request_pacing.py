@@ -47,6 +47,147 @@ class Context:
         return {"model": "gpt-5 fixture", "operation": "text", "source": "key:test"}
 
 
+class ReadBurstAndCapacityTests(unittest.TestCase):
+    def test_busy_read_slot_does_not_make_ready_post_yield_to_fifo_reader(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_max_inflight", property(lambda _: 1)):
+            path = Path(directory) / "clock.json"
+            clock = AccountRequestClock("fixture", path)
+            first = clock.request(lambda *a, **k: Response(), "GET",
+                                  "https://provider/conversation/first", stream=True)
+            queued, errors, sent = threading.Event(), [], []
+
+            def queued_read():
+                try:
+                    AccountRequestClock("fixture", path).request(
+                        lambda *a, **k: Response(), "GET", "https://provider/conversation/second",
+                        _account_request_deadline_monotonic=time.monotonic() + 2)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            worker = threading.Thread(target=queued_read)
+            worker.start()
+            try:
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    if AccountRequestClock("fixture", path).ordinary_read_queue:
+                        queued.set()
+                        break
+                    time.sleep(.01)
+                self.assertTrue(queued.is_set())
+                self.assertEqual(clock.request(
+                    lambda *a, **k: sent.append(True) or Response(), "POST", "https://provider/conversation",
+                    _account_request_deadline_monotonic=time.monotonic() + .2).status_code, 200)
+                self.assertEqual(sent, [True])
+            finally:
+                first.close()
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+
+    def test_stream_close_holds_read_slot_until_async_stream_finishes(self):
+        from concurrent.futures import Future
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_max_inflight", property(lambda _: 1)):
+            for failed in (False, True):
+                with self.subTest(failed=failed):
+                    path = Path(directory) / f"clock-{failed}.json"
+                    future, released = Future(), threading.Event()
+                    response = Response()
+                    response.stream_task = future
+                    clock = AccountRequestClock("fixture", path)
+                    stream = clock.request(lambda *a, **k: response, "GET",
+                                           "https://provider/conversation/original", stream=True)
+                    stream.close()
+                    with clock.lock:
+                        self.assertIsNone(clock._try_read_slot())
+                    future.add_done_callback(lambda _: released.set())
+                    if failed:
+                        future.set_exception(OSError("fixture"))
+                        self.assertIsInstance(future.exception(), OSError)
+                    else:
+                        future.set_result(None)
+                    self.assertTrue(released.wait(1))
+                    with clock.lock:
+                        slot = clock._try_read_slot()
+                        self.assertIsNotNone(slot)
+                        slot.release()
+
+    def test_burst_clock_survives_restart_without_config_credit_grant(self):
+        import services.account_request_pacing as pacing
+        now, starts = [10000.0], []
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+             patch.object(pacing.time, "time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(pacing.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 45)), \
+             patch.object(type(config), "account_conversation_read_burst", property(lambda _: 4)):
+            path = Path(directory) / "clock.json"
+            for _ in range(5):
+                AccountRequestClock("fixture", path).request(
+                    lambda *a, **k: starts.append(now[0]) or Response(),
+                    "GET", "https://provider/conversation/original")
+            self.assertEqual(starts[:4], [10000.0] * 4)
+            self.assertEqual(starts[4], 10045.0)
+            # Reconfiguring an exhausted clock cannot turn debt into a new burst.
+            with patch.object(type(config), "account_conversation_read_burst", property(lambda _: 100)):
+                AccountRequestClock("fixture", path).request(
+                    lambda *a, **k: starts.append(now[0]) or Response(),
+                    "GET", "https://provider/conversation/original")
+            self.assertEqual(starts[-1], 10090.0)
+
+    def test_per_account_inflight_cap_releases_after_transport(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_max_inflight", property(lambda _: 2)):
+            path = Path(directory) / "clock.json"
+            entered, release, gate = threading.Event(), threading.Event(), threading.Lock()
+            active, peak, errors = [0], [0], []
+
+            def send(*args, **kwargs):
+                with gate:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                    if active[0] == 2:
+                        entered.set()
+                try:
+                    self.assertTrue(release.wait(3))
+                    return Response()
+                finally:
+                    with gate:
+                        active[0] -= 1
+
+            def read():
+                try:
+                    AccountRequestClock("fixture", path).request(
+                        send, "GET", "https://provider/conversation/original",
+                        _account_request_deadline_monotonic=time.monotonic() + 4)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            workers = [threading.Thread(target=read) for _ in range(4)]
+            for worker in workers:
+                worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                time.sleep(.1)
+                self.assertEqual(peak[0], 2)
+            finally:
+                release.set()
+                for worker in workers:
+                    worker.join(5)
+            self.assertEqual(errors, [])
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertEqual(len(list(path.parent.glob("clock.read-*.lock"))), 2)
+
+
 class ProductionOrdinaryReadEdgeTests(unittest.TestCase):
     """Exercise the production clock protocol without candidate-only APIs."""
 

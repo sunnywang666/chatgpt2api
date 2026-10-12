@@ -235,6 +235,102 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.text.read("happy", "legacy")["status"], "succeeded")
         self.assertEqual(len(self.calls), 1)
 
+    def test_terminal_text_success_can_complete_work_before_admission_finally(self):
+        from services.pool_admission import ExecutionContext
+        from services.work_lifecycle import WorkLifecycleError, WorkLifecycleService
+
+        lifecycle = WorkLifecycleService(self.text, self.images, clock=self.clock)
+        self.submit("terminal-work", _public_route="chat", _public_session_ref="terminal-work")
+
+        def runner(body, on_cursor):
+            context = current_request.get()
+            context.before_send()
+            # The upstream call is still active here, so the work must remain
+            # protected even though the fixture will return a result next.
+            with self.assertRaisesRegex(WorkLifecycleError, "WORK_TURN_UNFINISHED"):
+                lifecycle.update("text", {"id": "happy"}, "terminal-work", "completed", True)
+            return {"content": "done"}
+
+        saved = {}
+        original_record_stage = ExecutionContext.record_stage
+
+        def record_stage(context, stage, **extra):
+            if stage == "artifact_saved":
+                saved["receipt"] = context.receipt()
+                saved["work"] = lifecycle.update(
+                    "text", {"id": "happy"}, "terminal-work", "completed", True,
+                )
+            return original_record_stage(context, stage, **extra)
+
+        self.text.runner = runner
+        with patch.object(ExecutionContext, "record_stage", new=record_stage):
+            context = self.admission.claim_next()
+            self.assertIsNotNone(context)
+            self.admission.execute(context)
+
+        self.assertEqual(saved["receipt"]["status"], "succeeded")
+        self.assertFalse(saved["receipt"]["_executing"])
+        self.assertEqual(saved["work"]["state"], "completed")
+        self.assertFalse(saved["work"]["slot_held"])
+
+    def test_terminal_image_success_can_complete_work_before_admission_finally(self):
+        from services.pool_admission import ExecutionContext
+        from services.work_lifecycle import WorkLifecycleError, WorkLifecycleService
+
+        lifecycle = WorkLifecycleService(self.text, self.images, clock=self.clock)
+
+        def handler(payload):
+            context = current_request.get()
+            context.before_send()
+            # The handler has not returned a result yet, so it remains an
+            # active upstream turn and must still reject work completion.
+            with self.assertRaisesRegex(WorkLifecycleError, "WORK_TURN_UNFINISHED"):
+                lifecycle.update("image", {"id": "happy"}, "terminal-image", "completed", True)
+            return {
+                "data": [{"url": "https://provider.test/finished.png"}],
+                "_provider_binding_id": payload["provider_binding_id"],
+                "_provider_account_identity": payload["provider_account_identity"],
+                "_conversation_id": "terminal-image-conversation",
+                "_parent_message_id": "terminal-image-parent",
+            }
+
+        self.images.generation_handler = handler
+        self.images.submit_generation(
+            {"id": "happy", "role": "user", "external_image_client": True},
+            client_task_id="terminal-image", prompt="private image input", model="gpt-image-2", size=None,
+            scheduling={"workflow_id": "batch", "workflow_concurrency": 1},
+        )
+        self.admission.register(
+            "image",
+            lambda context, body: self.images._run_task(
+                context.owner + ":" + context.request_id, body["mode"], body["payload"], body["identity"],
+                str(body["payload"].get("model") or "gpt-image-2"),
+            ),
+        )
+
+        saved = {}
+        original_record_stage = ExecutionContext.record_stage
+
+        def record_stage(context, stage, **extra):
+            if stage == "artifact_saved":
+                saved["receipt"] = context.receipt()
+                saved["work"] = lifecycle.update(
+                    "image", {"id": "happy"}, "terminal-image", "completed", True,
+                )
+            return original_record_stage(context, stage, **extra)
+
+        with patch.object(ExecutionContext, "record_stage", new=record_stage):
+            context = self.admission.claim_next()
+            self.assertIsNotNone(context)
+            self.assertEqual(context.kind, "image")
+            self.admission.execute(context)
+
+        self.assertEqual(saved["receipt"]["status"], "success")
+        self.assertFalse(saved["receipt"]["_executing"])
+        self.assertFalse(saved["receipt"]["upstream_unfinished"])
+        self.assertEqual(saved["work"]["state"], "completed")
+        self.assertFalse(saved["work"]["slot_held"])
+
     def read(self, kind, owner, name):
         with self.store.connect() as db:
             return self.store.read_receipt(db, kind, owner, name)

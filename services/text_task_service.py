@@ -2225,7 +2225,12 @@ class TextTaskService:
                 result = self.runner(body, on_cursor=progress)
             if receipt.get("_supersedes_request_id"):
                 result = {**result, "upstream_outcome": "completed", "error_code": None, "waiting": None}
-            self._update(owner, request_id, **{**result, "status": "succeeded", "finished_at": self._now()})
+            # A returned runner result is the terminal local proof for this
+            # turn.  Persist that before the admission wrapper's bookkeeping:
+            # callers completing the associated work in this small interval
+            # must not be told that this already-saved turn is still executing.
+            self._update(owner, request_id, **{**result, "status": "succeeded", "finished_at": self._now(),
+                                              "_executing": False})
             context = current_request.get()
             if context is not None and hasattr(context, "record_stage"):
                 context.record_stage("artifact_saved")
