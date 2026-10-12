@@ -72,6 +72,8 @@ def create_app() -> FastAPI:
     )
     app.include_router(codex.create_router())
     app.include_router(ai.create_router())
+    from api.product_works import create_router as product_works_router
+    app.include_router(product_works_router())
     app.include_router(chat_requests.create_router())
     app.include_router(accounts.create_router())
     app.include_router(image_tasks.create_router())

@@ -173,6 +173,16 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
     scheduling = scheduling_from_fields(fields)
     if scheduling is not None:
         payload["scheduling"] = scheduling
+    if "product_work" in fields:
+        from api.product_works import ProductWorkInput
+        from pydantic import ValidationError
+        try:
+            value = fields["product_work"]
+            if isinstance(value, str):
+                value = json.loads(value)
+            payload["product_work"] = ProductWorkInput.model_validate(value).model_dump()
+        except (ValidationError, ValueError, TypeError):
+            raise HTTPException(400, detail={"code": "PRODUCT_WORK_INVALID"}) from None
     for field in (
         "provider_binding_id",
         "provider_account_identity",

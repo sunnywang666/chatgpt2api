@@ -179,11 +179,17 @@ class WorkLifecycleService:
         self._operation_slots = threading.BoundedSemaphore(4)
         self._active_accounts = set()
 
+    def _product_service(self):
+        from services.product_work import ProductWorkService
+        return ProductWorkService(self.text, self.images, clock=self.clock)
+
     def _load(self, db, kind, identity, request_id):
         owner = str(identity["id"])
         receipt = self.store.read_receipt(db, kind, owner, request_id)
         if not receipt:
             raise WorkLifecycleError("WORK_REQUEST_NOT_FOUND", 404)
+        if receipt.get("_product_work_key"):
+            raise WorkLifecycleError("PRODUCT_WORK_REQUIRED")
         work = read_work(self.store, db, kind, owner, receipt)
         if not work:
             work = ensure_work(self.store, db, kind, owner, request_id, receipt)
@@ -338,7 +344,10 @@ class WorkLifecycleService:
                             and float(a.get("next_at") or 0) <= now
                             and float(a.get("claim_until") or 0) <= now):
                         try:
-                            receipt, current, members = self._load(db, candidate["kind"], {"id": candidate["owner"]}, a["request_id"])
+                            if candidate.get("_product_archive_parent"):
+                                receipt, current, members = self._product_service().load_archive_target(db, candidate)
+                            else:
+                                receipt, current, members = self._load(db, candidate["kind"], {"id": candidate["owner"]}, a["request_id"])
                             if current["version"] != a["version"] or any(_blocked(r, members=members) for r in members):
                                 raise WorkLifecycleError("WORK_TURN_UNFINISHED")
                         except WorkLifecycleError as exc:
@@ -441,6 +450,8 @@ class WorkLifecycleService:
                             or active.get("claim") != claim or active.get("desired") is not archive["desired"]
                             or float(active.get("claim_until") or 0) <= now):
                         raise WorkLifecycleError("WORK_ARCHIVE_CLAIM_LOST")
+                    if current.get("_product_archive_parent"):
+                        self._product_service().load_archive_target(db, current)
                     active["claim_until"] = now + 300
                     save_work(self.store, db, current)
             try:
@@ -450,7 +461,12 @@ class WorkLifecycleService:
                 from services.request_context import guarding_archive
                 with guarding_archive(check_and_renew_archive, read_owner=_archive_read_owner(work),
                                       request_key=work["owner"] + ":" + request_id, work_key=work["key"]):
-                    if work["kind"] == "text":
+                    if work.get("_product_archive_parent"):
+                        service = self.text if work["kind"] == "text" else self.images
+                        result = service.archive_product_work(work["owner"], request_id, archive["desired"])
+                        valid = (result.get("request_id") == request_id
+                                 and result.get("conversation_id") == work["target"]["conversation_id"])
+                    elif work["kind"] == "text":
                         result = self.text.set_public_session_archived(work["owner"], request_id, archive["desired"])
                         valid = (result.get("request_id") == request_id
                                  and result.get("conversation", {}).get("client_conversation_id") == work["work_ref"])
@@ -482,6 +498,8 @@ class WorkLifecycleService:
                         current["results_saved"] = False
                         current.pop("results_saved_at", None)
                 save_work(self.store, db, current)
+                if current.get("_product_archive_parent"):
+                    self._product_service().archive_confirmed(db, current)
             return True
         finally:
             self._release_operation(account_key)

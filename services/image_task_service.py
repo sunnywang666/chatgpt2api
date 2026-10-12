@@ -439,6 +439,8 @@ def _request_hash(mode: str, payload: dict[str, Any]) -> str:
         contract["_requested_account_ref"] = payload["_requested_account_ref"]
     if "_scheduling" in payload:
         contract["_scheduling"] = payload["_scheduling"]
+    if "_product_work" in payload:
+        contract["_product_work"] = payload["_product_work"]
     contract.update(input_fields(payload))
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -717,6 +719,8 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     }
     if task.get("_scheduling") is not None:
         item["scheduling"] = task["_scheduling"]
+    if task.get("_product_work"):
+        item["product_work"] = {"protocol": "product-work-v1", **task["_product_work"]}
     if isinstance(task.get("_completion"), dict):
         item["completion"] = {k: task["_completion"][k] for k in (
             "state", "reason", "replacement_id", "selected_id", "conversation_mode", "max_extra_requests")
@@ -900,11 +904,13 @@ class ImageTaskService:
         edit_source_index: int = 0,
         account_ref: str | None = None,
         scheduling: dict | None = None,
+        product_work: dict | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
             **({"_requested_account_ref": account_ref} if account_ref is not None else {}),
             **({"_scheduling": scheduling} if scheduling is not None else {}),
+            **({"_product_work": product_work} if product_work is not None else {}),
             "model": model,
             "n": 1,
             "size": size,
@@ -947,11 +953,13 @@ class ImageTaskService:
         edit_source_index: int = 0,
         account_ref: str | None = None,
         scheduling: dict | None = None,
+        product_work: dict | None = None,
     ) -> dict[str, Any]:
         payload = {
             "prompt": prompt,
             **({"_requested_account_ref": account_ref} if account_ref is not None else {}),
             **({"_scheduling": scheduling} if scheduling is not None else {}),
+            **({"_product_work": product_work} if product_work is not None else {}),
             "images": images or [],
             "mask": masks or [],
             "model": model,
@@ -1306,6 +1314,43 @@ class ImageTaskService:
     def archive_thread(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
         return self.set_thread_archived(identity, task_id, True)
 
+    def archive_product_work(self, owner, request_id, archived):
+        """Use the original image binding; never synthesize a public image thread."""
+        from services.account_service import account_service
+        from services.openai_backend_api import OpenAIBackendAPI
+        from services.request_context import current_archive_guard
+        from services.work_lifecycle import WorkLifecycleError
+        guard = current_archive_guard.get()
+        if guard is None or archived is not True:
+            raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_GUARD_REQUIRED")
+        guard()
+        with self.store.connect() as db:
+            task = self.store.read_receipt(db, "image", owner, request_id)
+        required = ("_product_work_key", "provider_binding_id", "provider_account_identity",
+                    "client_conversation_id", "conversation_id", "parent_message_id")
+        if not task or any(not task.get(k) for k in required):
+            raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_CURSOR_UNAVAILABLE")
+        binding = task["provider_binding_id"]
+        if account_service.get_bound_account_identity(binding) != task["provider_account_identity"]:
+            raise WorkLifecycleError("PRODUCT_WORK_BINDING_CONFLICT")
+        token = account_service.get_bound_text_access_token(binding, model="auto")
+        with account_service.conversation_binding_lock(binding, task["client_conversation_id"]):
+            guard()
+            backend = OpenAIBackendAPI(access_token=token)
+            try:
+                conversation_id, parent_id = task["conversation_id"], task["parent_message_id"]
+                original_user = task.get("adopted_source_request_message_id") or task.get("request_message_id")
+                def validate_terminal(document):
+                    actual = finished_parent(document, conversation_id, original_user,
+                        expected_result_ids=(task.get("result_file_ids") or []) + (task.get("result_sediment_ids") or []))
+                    if actual != parent_id:
+                        raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_CURSOR_CHANGED")
+                backend.set_conversation_archived(conversation_id, parent_id, archived,
+                    **({"validate_document": validate_terminal} if task.get("status") == TASK_STATUS_SUCCESS else {}))
+            finally:
+                backend.close()
+        return {"request_id": request_id, "conversation_id": conversation_id, "archived": archived}
+
     def restore_thread(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
         return self.set_thread_archived(identity, task_id, False)
 
@@ -1317,11 +1362,31 @@ class ImageTaskService:
         mode: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        from services.product_work import locking_product_conversations
+        with locking_product_conversations([payload] if payload.get("_product_work") else []):
+            return self._submit_prepared(identity, client_task_id=client_task_id, mode=mode, payload=payload)
+
+    def _submit_prepared(self, identity, *, client_task_id, mode, payload):
         from services.workflow_scheduling import normalize_scheduling
         if "_scheduling" in payload:
             payload = {**payload, "_scheduling": normalize_scheduling(payload["_scheduling"])}
         if payload.get("_scheduling") is not None and self.admission is None:
             raise ValueError("SCHEDULING_UNAVAILABLE")
+        if "_product_work" in payload:
+            from services.product_work import normalize_product_work, require_product_source
+            from services.work_lifecycle import WorkLifecycleError
+            require_product_source(identity)
+            product = normalize_product_work(payload["_product_work"])
+            if product is None:
+                raise WorkLifecycleError("PRODUCT_WORK_INVALID", 400)
+            if self.admission is None:
+                raise WorkLifecycleError("PRODUCT_WORK_UNAVAILABLE", 503)
+            if (is_codex_image_model(payload.get("model")) or input_fields(payload)
+                    or payload.get("_scheduling")):
+                raise WorkLifecycleError("PRODUCT_WORK_LEGACY_REQUIRED", 400)
+            # Product owns conversation cleanup until explicit saved-result close.
+            payload = {**payload, "_product_work": product, "retain_conversation": True}
+
         task_id = _clean(client_task_id)
         if not task_id:
             raise ValueError("client_task_id is required")
@@ -1357,6 +1422,10 @@ class ImageTaskService:
             cleaned = self._cleanup_locked()
             task = self._tasks.get(key)
             if task is not None:
+                if (task.get("_product_work_key")
+                        and task.get("_source") != str(identity.get("_trusted_source") or "key:" + owner)):
+                    from services.work_lifecycle import WorkLifecycleError
+                    raise WorkLifecycleError("PRODUCT_WORK_SOURCE_CONFLICT", 403)
                 if task.get("request_hash") and task.get("request_hash") != _request_hash(mode, payload):
                     raise ValueError("client_task_id already exists with a different immutable request")
                 if cleaned:
@@ -1424,8 +1493,24 @@ class ImageTaskService:
             from services.workflow_scheduling import prepare_receipt
             from services.work_lifecycle import ensure_work
             prepare_receipt(task, payload.get("_scheduling"), task["_source"])
-            ensure_work(self.store, self._transaction_local.db, "image", owner, task_id, task,
-                        source=task["_source"], scheduling=task.get("_scheduling"))
+            from services.product_work import ensure_product_work
+            product = payload.get("_product_work")
+            previous_id = task.get("_same_session_retry_of") or task.get("_completion_of")
+            original = self.store.read_receipt(self._transaction_local.db, "image", owner, previous_id) if previous_id else None
+            if original and original.get("_product_work"):
+                from services.work_lifecycle import WorkLifecycleError
+                if product is not None and product != original["_product_work"]:
+                    raise WorkLifecycleError("PRODUCT_WORK_BINDING_CONFLICT")
+                if task["_source"] != original.get("_source"):
+                    raise WorkLifecycleError("PRODUCT_WORK_SOURCE_CONFLICT")
+                product = original["_product_work"]
+                if self.admission is None:
+                    raise WorkLifecycleError("PRODUCT_WORK_UNAVAILABLE", 503)
+            parent = ensure_product_work(self.store, self._transaction_local.db, "image", owner, task_id,
+                                         task, product, source=task["_source"])
+            if parent is None:
+                ensure_work(self.store, self._transaction_local.db, "image", owner, task_id, task,
+                            source=task["_source"], scheduling=task.get("_scheduling"))
             task["_input_ref"] = self.store.save_input({"payload": payload, "identity": {k: identity[k] for k in ("id", "name", "role", "external_image_client", "_trusted_source") if k in identity}, "mode": mode})
             self._tasks[key] = task
             self._save_locked()
@@ -2167,6 +2252,7 @@ class ImageTaskService:
     def _receipt_expired(task: dict, cutoff: float) -> bool:
         return (task.get("status") in TERMINAL_STATUSES and not _holds_upstream_slot(task)
                 and not task.get("retain_receipt") and not task.get("_recovery_paused")
+                and not task.get("_product_work_key")
                 and task.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
                 and _timestamp(task.get("updated_at")) < cutoff)
 
