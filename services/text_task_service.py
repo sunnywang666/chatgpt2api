@@ -1543,12 +1543,22 @@ class TextTaskService:
     def _no_final_successor_source(previous, now):
         """Local eligibility only; the original branch is checked again before send."""
         ended, reads = previous.get("_attempt_finished_at"), previous.get("recovery_no_result_reads")
+        cursor = previous.get("_retry_cursor")
+        if cursor is not None:
+            # The bounded original-read path keeps an exact empty-branch cursor
+            # as evidence for a later explicit recheck. It has no active
+            # completion owner, but only the text proof for this exact receipt
+            # can coexist with an explicit no-final successor.
+            from services.generation_completion import retry_evidence
+            proof = retry_evidence(previous)
+            if proof is None or "source" in proof:
+                return False
         return bool(previous.get("_attempt_reason") == "ORIGINAL_RESULT_NO_FINAL"
             and previous.get("recovery_reason") == "REQUEST_RESULT_NOT_FOUND"
             and type(ended) in (int, float) and math.isfinite(ended) and 0 < ended <= now
             and type(reads) is int and reads >= 3
             and not any(previous.get(k) for k in ("_work_key", "_completion", "_completion_of",
-                "_retry_cursor", "_recovery_paused", "_recovery_suppressed")))
+                "_recovery_paused", "_recovery_suppressed")))
 
     def _prepare_supersede(self, db, owner, body, receipt):
         if "supersedes_request_id" not in body:

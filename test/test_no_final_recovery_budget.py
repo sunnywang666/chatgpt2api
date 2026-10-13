@@ -63,7 +63,7 @@ def test_no_final_budget_stops_normal_reads_and_survives_restart(legacy):
     assert raw(tasks).get("_retry_cursor") == before.get("_retry_cursor")
     assert len(tasks.executor.calls) == 1  # No new generation after the original submit.
     if before.get("_retry_cursor"):
-        assert not tasks._no_final_successor_source(stopped, clock())
+        assert tasks._no_final_successor_source(stopped, clock())
 
 
 def test_existing_unbounded_receipt_is_closed_without_one_more_upstream_read(legacy):
