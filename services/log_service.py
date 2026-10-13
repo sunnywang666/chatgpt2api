@@ -284,7 +284,7 @@ class LoggedCall:
             self.log(
                 "流式调用失败",
                 status="failed",
-                error=str(exc),
+                error=exc.__class__.__name__,
                 urls=urls,
                 account_email=(account_emails[0] if account_emails else getattr(exc, "account_email", "")),
                 conversation_id=(conversation_ids[0] if conversation_ids else getattr(exc, "conversation_id", "")),
