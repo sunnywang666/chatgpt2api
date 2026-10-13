@@ -26,6 +26,18 @@ Conversation SSE 是上游对话链路的流式返回协议。每条 SSE `data:`
 | JSON string | 短文本 patch 或协议标记 | 结合上下文处理 |
 | 非 JSON 内容 | 原始内容 | 保留为 raw 事件，避免中断流 |
 
+## 错误详情回执
+
+对于 `error`、命名 `event: error`（含纯文本或 JSON 字符串）和
+`response.failed.response.error`，文本任务将有界、脱敏的 `code`、`type`、`message`
+保存到原请求的 `stream_finished` 回执。普通 owner 的查询通过
+`execution.upstream_error` 读到原因，服务重启后仍保留。`message` 最多 512 字符，
+`code/type` 最多 96 字符；不保存原始错误对象或请求体，凭据、链接、引述输入与请求字段内容被遮盖。
+全局运行日志不包含这段原因，公开回执再次净化，成功结果不再显示历史错误详情。
+
+详情只帮助展示“出错：原因”，不改变原请求的恢复与防重发判断。
+旧回执没有详情时应显示“上游返回错误，具体原因未保留”，不得补造历史原因。
+
 ## 常用字段
 
 | 字段 | 说明 |

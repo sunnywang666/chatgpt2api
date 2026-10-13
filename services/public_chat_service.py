@@ -203,6 +203,10 @@ def safe_public_execution(value: object) -> dict[str, Any]:
             result[key] = count
     if type(value.get("sse_error_event")) is bool:
         result["sse_error_event"] = value["sse_error_event"]
+    from utils.upstream_error import safe_upstream_error
+    detail = safe_upstream_error(value.get("upstream_error"))
+    if detail:
+        result["upstream_error"] = detail
     resources = value.get("resources")
     if isinstance(resources, dict):
         result["resources"] = {key: resources[key] for key, allowed in EXECUTION_RESOURCES.items()
@@ -283,6 +287,7 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
         "unchanged_reads": receipt.get("_result_no_progress_reads"), "resources": resources,
         "stream_ended_at": stream.get("at"),
         **{key: stream[key] for key in ("stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event", "sse_error_category") if key in stream},
+        **({"upstream_error": stream["upstream_error"]} if status != "succeeded" and "upstream_error" in stream else {}),
     })
 
 

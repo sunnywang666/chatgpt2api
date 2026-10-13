@@ -1,4 +1,4 @@
-"""Persist structural stream evidence, never raw upstream error bodies."""
+"""Persist structure and bounded redacted reasons, never upstream bodies."""
 import json
 from types import SimpleNamespace
 
@@ -27,7 +27,7 @@ class Response:
 
 @pytest.mark.parametrize("end", ["done", "eof", "consumer_closed", "transport_error", "hard_timeout"])
 def test_stream_end_persists_across_restart_with_only_safe_structural_evidence(runtime, end):
-    lines = [b'event: error', b'data: {"error":"PRIVATE_TOKEN_AND_BODY"}', b'data: PRIVATE_BAD_JSON']
+    lines = [b'event: error', b'data: {"error":"authorization: Bearer PRIVATE_TOKEN_AND_BODY"}', b'data: PRIVATE_BAD_JSON']
     if end == "done":
         lines.append(b'data: [DONE]')
     error = ConnectionError("PRIVATE_TRANSPORT") if end == "transport_error" else (
@@ -86,11 +86,11 @@ def test_public_stream_diagnostics_reject_arbitrary_values():
 @pytest.mark.parametrize("code,category", [
     ("rate_limit_exceeded", "rate_limit"), ("insufficient_quota", "quota"),
     ("authentication_error", "auth"), ("server_error", "upstream"),
-    ("PRIVATE_UNKNOWN_CODE", "unknown"), (None, "unknown"),
+    ("new_upstream_failure", "unknown"), (None, "unknown"),
 ])
 @pytest.mark.parametrize("named_event", [False, True])
-def test_sse_error_retains_only_structured_category_across_restart(runtime, code, category, named_event):
-    error = {"type": code, "message": "PRIVATE_BODY rate_limit_exceeded"}
+def test_sse_error_retains_category_and_redacted_reason_across_restart(runtime, code, category, named_event):
+    error = {"type": code, "message": "The request failed. access_token=PRIVATE_BODY", "body": "PRIVATE_BODY"}
     response = Response(([b'event: error'] if named_event else []) + [
         ("data: " + json.dumps(error if named_event else {"error": error})).encode(), b'', b'data: [DONE]'])
 
@@ -110,6 +110,7 @@ def test_sse_error_retains_only_structured_category_across_restart(runtime, code
     public = project_text_execution(row)
     assert stage["sse_error_category"] == public["sse_error_category"] == category
     assert public["sse_error_event"] is True
+    assert public["upstream_error"]["message"] == "The request failed. [redacted]"
     assert "PRIVATE" not in json.dumps(stage) and "PRIVATE" not in json.dumps(public)
 
 

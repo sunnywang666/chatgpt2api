@@ -13,6 +13,7 @@ from curl_cffi import requests
 from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
+from utils.upstream_error import safe_upstream_error, sse_error_detail
 
 BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
@@ -191,6 +192,23 @@ def ensure_ok(response: requests.Response, context: str) -> None:
     raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
 
 
+def _stream_exception_detail(exc: Exception) -> dict[str, str]:
+    detail = {}
+    formatter = getattr(exc, "to_openai_error", None)
+    if callable(formatter):
+        try:
+            event = formatter()
+            if isinstance(event, dict):
+                detail = sse_error_detail(event)
+        except Exception:
+            pass
+    if not detail:
+        detail = safe_upstream_error({"message": str(exc), "type": exc.__class__.__name__})
+    detail.setdefault("type", "upstream_error")
+    detail.setdefault("message", "Stream failed")
+    return detail
+
+
 def sse_json_stream(items) -> Iterator[str]:
     yield ": stream-open\n\n"
     try:
@@ -200,11 +218,8 @@ def sse_json_stream(items) -> Iterator[str]:
         logger.warning({
             "event": "sse_stream_error",
             "error_type": exc.__class__.__name__,
-            "error": str(exc),
         })
-        error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
-            "error": {"message": str(exc), "type": exc.__class__.__name__}
-        }
+        error = {"error": _stream_exception_detail(exc)}
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
@@ -219,16 +234,15 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         logger.warning({
             "event": "anthropic_sse_stream_error",
             "error_type": exc.__class__.__name__,
-            "error": str(exc),
         })
-        error = {"type": "error", "error": {"type": exc.__class__.__name__, "message": str(exc)}}
+        error = {"type": "error", "error": _stream_exception_detail(exc)}
         yield "event: error\n"
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
 def _sse_error_category(event: dict) -> str:
-    # Interpret only fixed structured codes. Never retain error text, body,
-    # headers or an arbitrary upstream code in diagnostics.
+    # Categories remain fixed; a separate bounded, redacted diagnostic retains
+    # the upstream code and reason without retaining the response body.
     error = event.get("error")
     error = error if isinstance(error, dict) else event
     codes = {value for key in ("code", "type") if isinstance(value := error.get(key), str)}
@@ -282,6 +296,18 @@ def _observe_sse_message(event: dict, observation: dict, request_message_id: str
 
 def iter_sse_payloads(response: requests.Response, *, observation: dict | None = None,
                       request_message_id: str = "") -> Iterator[str]:
+    def observe_error(event: dict, *, named: bool = False):
+        observation["sse_error_event"] = True
+        detail = sse_error_detail(event, named_error=named)
+        if observation.get("sse_error_category", "unknown") == "unknown":
+            observation["sse_error_category"] = _sse_error_category(detail)
+        if detail:
+            # Keep the first reason, but allow a later diagnostic to fill fields
+            # absent from a code-only error event.
+            retained = observation.setdefault("upstream_error", {})
+            for key, value in detail.items():
+                retained.setdefault(key, value)
+
     if observation is not None:
         for key in ("sse_message_snapshot_events", "sse_terminal_assistant_events", "sse_terminal_id_events",
                     "sse_terminal_final_channel_events", "sse_terminal_parent_events",
@@ -311,12 +337,15 @@ def iter_sse_payloads(response: requests.Response, *, observation: dict | None =
                         event = json.loads(payload)
                     except (ValueError, TypeError):
                         observation["sse_parse_errors"] = min(observation.get("sse_parse_errors", 0) + 1, 2147483647)
+                        if error_event:
+                            observe_error({"message": payload}, named=True)
                     else:
                         if isinstance(event, dict):
                             _observe_sse_message(event, observation, request_message_id)
-                        if isinstance(event, dict) and (error_event or event.get("type") == "error" or event.get("error")):
-                            observation["sse_error_event"] = True
-                            observation["sse_error_category"] = _sse_error_category(event)
+                        if isinstance(event, dict) and (error_event or event.get("type") in ("error", "response.failed") or event.get("error")):
+                            observe_error(event, named=error_event)
+                        elif error_event and isinstance(event, str):
+                            observe_error({"message": event}, named=True)
             yield payload
 
 
