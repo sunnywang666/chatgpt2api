@@ -60,10 +60,65 @@ def test_explicit_mode_preserves_original_and_immutable_input_after_restart(task
         service.submit("owner", {**h.envelope, "client_request_id": "second"})
 
 
+def test_verified_stopped_retry_cursor_allows_the_single_no_final_successor(task):
+    h = no_final(task)
+    original = row(h.service)
+    proof = {
+        "conversation_id": original["conversation_id"],
+        "request_message_id": original["request_message_id"],
+        "retry_parent_message_id": original["request_message_id"],
+        "observed_at": h.clock(),
+    }
+    # Match the production receipt shape: recovery stopped after repeated
+    # missing-result reads while the exact original-branch observation remained.
+    update(h.service, recovery_no_result_reads=18, _retry_cursor=proof)
+    original = row(h.service)
+
+    accepted = h.service.submit("owner", h.envelope)
+
+    assert accepted["status"] == "queued"
+    assert row(h.service) == original
+    successor = row(h.service, "successor")
+    assert successor["_supersedes_no_final"] is True
+    assert successor["_supersedes_input_hash"]
+    assert h.admission.claim_next().request_id == "successor"
+
+
+@pytest.mark.parametrize("change", ["mismatched-conversation", "missing-observed-at", "image-source"])
+def test_unverified_or_non_text_retry_cursor_still_blocks_no_final_successor(task, change):
+    h = no_final(task)
+    original = row(h.service)
+    proof = {
+        "conversation_id": original["conversation_id"],
+        "request_message_id": original["request_message_id"],
+        "retry_parent_message_id": original["request_message_id"],
+        "observed_at": h.clock(),
+    }
+    if change == "mismatched-conversation":
+        proof["conversation_id"] = "different-conversation"
+    elif change == "missing-observed-at":
+        proof.pop("observed_at")
+    else:
+        proof["source"] = "absent_image_thread_request"
+    update(h.service, _retry_cursor=proof)
+
+    with pytest.raises(ConversationBindingError):
+        h.service.submit("owner", h.envelope)
+
+    assert row(h.service, "successor") is None and not h.sent
+
+
 @pytest.mark.parametrize("changes", [
     {"recovery_no_result_reads": 2}, {"_attempt_finished_at": None}, {"_attempt_finished_at": float("inf")},
     {"_attempt_reason": "other"}, {"_execution_wait_ended_at": None}, {"_work_key": "work"},
     {"_completion": {"state": "checking"}}, {"_retry_cursor": {"anything": True}},
+    {"_retry_cursor": {"conversation_id": "wrong", "request_message_id": "wrong",
+                         "retry_parent_message_id": "tail", "observed_at": 1}},
+    {"_retry_cursor": {"conversation_id": "original-chat", "request_message_id": "missing-time",
+                         "retry_parent_message_id": "tail"}},
+    {"_retry_cursor": {"conversation_id": "original-chat", "request_message_id": "missing-source",
+                         "retry_parent_message_id": "tail", "observed_at": 1,
+                         "source": "absent_image_thread_request"}},
     {"_recovery_paused": True}, {"_executing": True}, {"_turn_reserved": True},
 ])
 def test_unqualified_original_cannot_enqueue(task, changes):

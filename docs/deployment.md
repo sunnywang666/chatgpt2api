@@ -146,7 +146,7 @@
 
 #### 已发送但无最终回答的显式原会话后继
 
-同一内部接口的七个身份字段可额外带 `continue_after_no_final: true`。此模式仅用于旧公司原生文字请求已经以 `ORIGINAL_RESULT_NO_FINAL` 停止自动恢复、至少三次有效读取仍为 `REQUEST_RESULT_NOT_FOUND`，且无工作生命周期、completion、可重试游标、暂停或活跃领取的情况；客户端不能替换提示词、模型或身份。只有下面的 `attributes_required_only_v4` 封闭升级可与此标志合用；旧 `category_directory_parent_v1` 仍不可合用。默认省略时继续使用原消息缺失分支，不自动开启重试。
+同一内部接口的七个身份字段可额外带 `continue_after_no_final: true`。此模式仅用于旧公司原生文字请求已经以 `ORIGINAL_RESULT_NO_FINAL` 停止自动恢复、至少三次有效读取仍为 `REQUEST_RESULT_NOT_FOUND`，且无工作生命周期、completion、暂停或活跃领取的情况；客户端不能替换提示词、模型或身份。已保存的 text `_retry_cursor` 不代表活动领取：仅当它是精确绑定同一原 `conversation_id`、`request_message_id` 的完整空分支观测，才可保留并走这一显式后继；错锚、缺字段或 image-source 游标仍拒绝。只有下面的 `attributes_required_only_v4` 封闭升级可与此标志合用；旧 `category_directory_parent_v1` 仍不可合用。默认省略时继续使用原消息缺失分支，不自动开启重试。
 
 Provider 保存唯一幂等后继，复用原输入、原账号和原 Chat。worker 首次读取必须证明当前尾节点是原 user 本身且没有后代，或原 user 后只有已完成的 assistant code / tool 唯一链，没有最终回答；原 user 必须已完成、身份和父节点匹配。发送前再次读取，要求尾节点和整条链的内容、角色、完成状态一致。迟到 final、分叉、新 user、运行中的步骤、归档或内容变化均拒发。实际发送父节点是已观察的原 user 或 tool 尾节点，原提交父节点和旧 UNKNOWN 收据不改写；新回执只认新请求的回答。两次读取之间的内容比较只存在内存，不保存私密上下文副本。此模式仍有 GET/POST 间上游迟到的风险，不等同上游取消或 exactly-once。
 
