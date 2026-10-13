@@ -835,7 +835,7 @@ class TextTaskService:
                 or not receipt.get("_execution_wait_ended_at")
                 or receipt.get("_attempt_finished_at")
                 or any(receipt.get(key) for key in (
-                    "_work_key", "_product_work_key", "_completion", "_completion_of", "_retry_cursor",
+                    "_work_key", "_product_work_key", "_completion", "_completion_of",
                     "_upstream_terminal", "recovery_claim_id", "_claim_id", "_executing"))
                 or receipt.get("status") != "failed"
                 or receipt.get("error_code") != "RESULT_UNRECOVERABLE"
@@ -847,6 +847,8 @@ class TextTaskService:
                 or type(receipt.get("recovery_no_result_reads")) is not int
                 or receipt["recovery_no_result_reads"] < cls.UNRECOVERABLE_QUALIFIED_READS):
             return False
+        # A saved branch cursor is evidence for an explicit later recheck,
+        # not an active completion owner. Preserve it without polling forever.
         receipt.update(_attempt_finished_at=now, _attempt_reason="ORIGINAL_RESULT_NO_FINAL",
                        recovery_next_at=None, updated_at=now)
         return True

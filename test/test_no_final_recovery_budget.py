@@ -8,8 +8,8 @@ from test.test_pool_admission import build
 from test.test_text_task_service import ManualClock, QueuedExecutor
 
 
-@pytest.fixture
-def legacy(tmp_path):
+@pytest.fixture(params=[False, True], ids=["no-cursor", "saved-cursor"])
+def legacy(tmp_path, request):
     clock = ManualClock()
     reader = Mock(return_value={"status": "unknown", "recovery_reason": "REQUEST_RESULT_NOT_FOUND"})
     tasks = TextTaskService(tmp_path / "text_tasks.sqlite3", clock=clock,
@@ -21,6 +21,11 @@ def legacy(tmp_path):
                   provider_account_identity="account", conversation_id="chat", parent_message_id="parent",
                   request_parent_message_id="parent", _submission_started=True,
                   _last_sent_sequence=0, _executing=False, _claim_id=None, _claim_until=None)
+    if request.param:
+        proof = {"conversation_id": "chat", "request_message_id": raw(tasks)["request_message_id"],
+                 "retry_parent_message_id": "original-user", "observed_at": clock()}
+        tasks._update("owner", "original", _retry_cursor=proof)
+        reader.return_value["_retry_cursor"] = proof
     return tasks, clock, reader
 
 
@@ -55,6 +60,10 @@ def test_no_final_budget_stops_normal_reads_and_survives_restart(legacy):
         assert result["execution"]["attempt_state"] == "ended"
         assert result["execution"]["resources"]["account_turn"] == "released"
     assert reader.call_count == 3 and raw(tasks)["recovery_no_result_reads"] == 3
+    assert raw(tasks).get("_retry_cursor") == before.get("_retry_cursor")
+    assert len(tasks.executor.calls) == 1  # No new generation after the original submit.
+    if before.get("_retry_cursor"):
+        assert not tasks._no_final_successor_source(stopped, clock())
 
 
 def test_existing_unbounded_receipt_is_closed_without_one_more_upstream_read(legacy):
@@ -63,10 +72,14 @@ def test_existing_unbounded_receipt_is_closed_without_one_more_upstream_read(leg
     tasks._update("owner", "original", status="failed", error_code="RESULT_UNRECOVERABLE",
                   recovery_reason="REQUEST_RESULT_NOT_FOUND", recovery_no_result_reads=127,
                   recovery_attempt=132, _execution_wait_ended_at=2000, _turn_reserved=False)
+    before = raw(tasks)
     tasks.read("owner", "original")
     assert reader.call_count == 0
     assert raw(tasks)["recovery_no_result_reads"] == 127
     assert raw(tasks)["_attempt_reason"] == "ORIGINAL_RESULT_NO_FINAL"
+    assert raw(tasks).get("_retry_cursor") == before.get("_retry_cursor")
+    assert raw(tasks)["upstream_outcome"] == "unknown"
+    assert len(tasks.executor.calls) == 1
 
 
 def test_explicit_recheck_is_one_read_and_preserves_stop_if_still_missing(legacy):
@@ -93,8 +106,8 @@ def test_explicit_recheck_adopts_late_final_without_new_submission(legacy):
 
 
 @pytest.mark.parametrize("guard", [
-    {"_work_key": "work"}, {"_completion": {"state": "checking_original"}},
-    {"_completion_of": "other"}, {"_retry_cursor": {"retry_parent_message_id": "parent"}},
+    {"_work_key": "work"}, {"_product_work_key": "product"},
+    {"_completion": {"state": "checking_original"}}, {"_completion_of": "other"},
     {"_upstream_terminal": True}, {"recovery_claim_id": "live"}, {"_claim_id": "live"},
     {"_executing": True}, {"_forward_protocol": "responses"}, {"_recovery_paused": True},
     {"_recovery_suppressed": True}, {"recovery_reason": "REQUEST_RESULT_INCOMPLETE"},
