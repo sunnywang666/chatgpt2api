@@ -3274,8 +3274,8 @@ class OpenAIBackendAPI:
             except Exception:
                 pass
             if observation is not None:
-                # Only fixed enums/counts are retained, never SSE body, error
-                # text, tool/reasoning content, headers or credentials.
+                # Retain structure and the bounded, redacted error reason;
+                # never the SSE body, tool/reasoning content or credentials.
                 from services.request_context import current_request
                 context = current_request.get()
                 if context is not None:

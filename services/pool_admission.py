@@ -232,6 +232,7 @@ class ExecutionContext:
 
     def record_stage(self, stage, **extra):
         """Persist and log a safe stage in the original request timeline."""
+        from utils.upstream_error import safe_upstream_error
         receipt = self.receipt()
         settings = self.admission._settings()
         accepted = next((item.get("at") for item in receipt.get("_execution_timeline", [])
@@ -256,6 +257,10 @@ class ExecutionContext:
                           "sse_terminal_final_channel_events", "sse_terminal_parent_events",
                           "sse_terminal_direct_parent_match_events"}},
         }
+        if stage == "stream_finished":
+            detail = safe_upstream_error(extra.get("upstream_error"))
+            if detail:
+                entry["upstream_error"] = detail
         timeline = list(receipt.get("_execution_timeline") or [])
         timeline.append(entry)
         try:
@@ -263,7 +268,9 @@ class ExecutionContext:
         except AdmissionLost:
             # Telemetry must never turn an expired original into a retry.
             pass
-        logger.info({"event": "pool_execution_stage", **entry})
+        # The owner-scoped receipt holds the redacted reason. Global operational
+        # logs keep structural evidence only, not even sanitized message text.
+        logger.info({"event": "pool_execution_stage", **{k: v for k, v in entry.items() if k != "upstream_error"}})
         return entry
 
     def record_outcome(self):

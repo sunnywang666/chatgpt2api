@@ -888,3 +888,29 @@ def test_public_chat_scheduling_persists_normalized_receipt_and_original_input(p
         raw = public_chat.tasks.store.read_receipt(db, "text", public_chat.key_a["id"], "scheduled-native")
     saved = public_chat.tasks.store.load_input(raw["_input_ref"])
     assert saved["_scheduling"] == {"workflow_id": "catalog-refresh", "workflow_concurrency": 1}
+
+
+def test_error_reason_http_read_is_owner_scoped_and_never_resends(public_chat):
+    f = public_chat
+    owner = f.key_a["id"]
+    request_id = "stored-error-reason"
+    submitted = f.client.post("/api/chat-requests", headers=f.headers(), json=request_body(request_id=request_id))
+    assert submitted.status_code == 202
+    f.tasks._update(owner, request_id, status="failed", error_code="RESULT_UNRECOVERABLE",
+        upstream_outcome="unknown", _submission_started=True, _executing=False,
+        _claim_id=None, _turn_reserved=False, _execution_wait_ended_at=1000,
+        recovery_no_result_reads=127, recovery_reason="REQUEST_RESULT_NOT_FOUND",
+        _execution_timeline=[{"stage": "stream_finished", "at": 999, "sse_error_event": True,
+            "upstream_error": {"code": "provider_failure", "message": "Temporary service failure; token=PRIVATE"}}])
+    reader = Mock()
+    f.tasks.recovery_reader = reader
+    response = f.client.get("/api/chat-requests/" + request_id, headers=f.headers())
+    assert response.status_code == 200
+    assert response.json()["execution"]["upstream_error"] == {
+        "code": "provider_failure", "message": "Temporary service failure; [redacted]"}
+    assert "PRIVATE" not in response.text
+    other = f.client.get("/api/chat-requests/" + request_id, headers=f.headers(f.secret_b))
+    assert other.status_code == 404
+    assert "Temporary service failure" not in other.text
+    f.upstream.assert_not_called()
+    reader.assert_not_called()
