@@ -33,6 +33,15 @@ def graph(h):
             "tool": node("tool", "code", [], "tool", {"content_type": "multimodal_text", "parts": ["retained tool context"]})}}
 
 
+def user_leaf_graph(h):
+    document = graph(h)
+    user = h.old["request_message_id"]
+    document["mapping"] = {user: document["mapping"][user]}
+    document["mapping"][user]["children"] = []
+    document["current_node"] = user
+    return document
+
+
 def test_explicit_mode_preserves_original_and_immutable_input_after_restart(task):
     h = no_final(task)
     first = h.service.submit("owner", h.envelope)
@@ -97,11 +106,17 @@ def test_graph_changes_fail_closed(task, change):
     with pytest.raises(ConversationBindingError): ConversationBindingService._no_final_successor_tail(d, h.old)
 
 
-@pytest.mark.parametrize("drift", [None, "end_turn", "tool_content", "code_content"])
-def test_fresh_tool_tail_is_used_and_rechecked_without_rewriting_original(task, bound_chat, monkeypatch, drift):
+@pytest.mark.parametrize("tail,drift", [
+    ("tool", None), ("tool", "end_turn"), ("tool", "tool_content"), ("tool", "code_content"),
+    ("user", None), ("user", "user_content"), ("user", "late_answer"), ("user", "in_progress"),
+    ("user", "head"), ("user", "unlisted_child"), ("user", "archived"), ("user", "parent"),
+    ("user", "alias"),
+])
+def test_fresh_tail_is_used_and_rechecked_without_rewriting_original(task, bound_chat, monkeypatch, tail, drift):
     import services.conversation_binding_service as module
     h, chat = no_final(task), bound_chat
-    chat.document = graph(h)
+    chat.document = user_leaf_graph(h) if tail == "user" else graph(h)
+    expected_tail = h.old["request_message_id"] if tail == "user" else "tool"
     h.service.runner = chat.service.complete_text
     original_get = module.OpenAIBackendAPI._get_conversation
     reads = []
@@ -117,11 +132,32 @@ def test_fresh_tool_tail_is_used_and_rechecked_without_rewriting_original(task, 
             chat.document["mapping"]["tool"]["message"]["content"]["parts"] = ["changed context"]
         elif drift == "code_content":
             chat.document["mapping"]["code"]["message"]["content"]["text"] = "changed code"
+        elif drift == "user_content":
+            chat.document["mapping"][expected_tail]["message"]["content"]["parts"] = ["changed input"]
+        elif drift == "late_answer":
+            chat.document["mapping"][expected_tail]["children"] = ["late"]
+            chat.document["mapping"]["late"] = {"parent": expected_tail, "children": [], "message": {
+                "id": "late", "author": {"role": "assistant"}, "status": "finished_successfully",
+                "end_turn": True, "content": {"content_type": "text", "parts": ["original answer"]}}}
+            chat.document["current_node"] = "late"
+        elif drift == "in_progress":
+            chat.document["mapping"][expected_tail]["message"]["status"] = "in_progress"
+        elif drift == "head":
+            chat.document["current_node"] = "different"
+        elif drift == "unlisted_child":
+            chat.document["mapping"]["hidden"] = {"parent": expected_tail}
+        elif drift == "archived":
+            chat.document["is_archived"] = True
+        elif drift == "parent":
+            chat.document["mapping"][expected_tail]["parent"] = "different"
+        elif drift == "alias":
+            chat.document["mapping"][expected_tail]["message"]["id"] = "alias"
         backend.text_pre_send_check(None)
         current_request.get().before_send()
         sends.append(kwargs)
-        assert kwargs["parent_message_id"] == "tool" and kwargs["conversation_id"] == "original-chat"
-        backend.text_cursor_callback({"request_parent_message_id": "tool", "_submission_parent_message_id": "tool"})
+        assert kwargs["parent_message_id"] == expected_tail and kwargs["conversation_id"] == "original-chat"
+        assert kwargs["messages"] == h.body["messages"] and kwargs["model"] == h.body["model"]
+        backend.text_cursor_callback({"request_parent_message_id": expected_tail, "_submission_parent_message_id": expected_tail})
         yield {"type": "conversation.delta", "conversation_id": "original-chat", "delta": "new answer"}
     monkeypatch.setattr(module, "conversation_events", events)
     monkeypatch.setattr(ConversationBindingService, "_read_text_request_result", staticmethod(
@@ -134,7 +170,16 @@ def test_fresh_tool_tail_is_used_and_rechecked_without_rewriting_original(task, 
     assert result["_submission_parent_message_id"] == "previous-answer"
     if drift:
         assert not sends and result["upstream_outcome"] == "not_sent"
+        assert result["status"] == "failed" and result["error_code"] == "CHAT_SUPERSEDE_CURSOR_CHANGED"
     else:
         assert len(sends) == 1 and result["status"] == "succeeded"
-        assert result["request_parent_message_id"] == "tool"
+        assert result["request_parent_message_id"] == expected_tail
         assert h.service.submit("owner", h.envelope)["status"] == "succeeded"
+        with pytest.raises(ConversationBindingError):
+            h.service.submit("owner", {**h.envelope, "client_request_id": "second"})
+        assert len(sends) == 1
+
+
+def test_no_final_two_processes_keep_one_successor_and_one_claim(task):
+    from test.test_explicit_unknown_successor import test_two_processes_cannot_register_two_successors_and_only_one_can_claim
+    test_two_processes_cannot_register_two_successors_and_only_one_can_claim(no_final(task))

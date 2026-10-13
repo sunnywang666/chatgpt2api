@@ -148,7 +148,9 @@
 
 同一内部接口的七个身份字段可额外带 `continue_after_no_final: true`。此模式仅用于旧公司原生文字请求已经以 `ORIGINAL_RESULT_NO_FINAL` 停止自动恢复、至少三次有效读取仍为 `REQUEST_RESULT_NOT_FOUND`，且无工作生命周期、completion、可重试游标、暂停或活跃领取的情况；客户端不能替换提示词、模型或身份。只有下面的 `attributes_required_only_v4` 封闭升级可与此标志合用；旧 `category_directory_parent_v1` 仍不可合用。默认省略时继续使用原消息缺失分支，不自动开启重试。
 
-Provider 保存唯一幂等后继，复用原输入、原账号和原 Chat。worker 首次读取必须证明原 user 后只有已完成的 assistant code / tool 唯一链，没有最终回答；发送前再次读取，要求尾节点和整条链的内容、角色、完成状态一致。迟到 final、分叉、新 user、运行中的步骤、归档或内容变化均拒发。实际发送父节点是已观察的 tool 尾节点，原提交父节点和旧 UNKNOWN 收据不改写；新回执只认新请求的回答。两次读取之间的内容比较只存在内存，不保存私密上下文副本。此模式仍有 GET/POST 间上游迟到的风险，不等同上游取消或 exactly-once。
+Provider 保存唯一幂等后继，复用原输入、原账号和原 Chat。worker 首次读取必须证明当前尾节点是原 user 本身且没有后代，或原 user 后只有已完成的 assistant code / tool 唯一链，没有最终回答；原 user 必须已完成、身份和父节点匹配。发送前再次读取，要求尾节点和整条链的内容、角色、完成状态一致。迟到 final、分叉、新 user、运行中的步骤、归档或内容变化均拒发。实际发送父节点是已观察的原 user 或 tool 尾节点，原提交父节点和旧 UNKNOWN 收据不改写；新回执只认新请求的回答。两次读取之间的内容比较只存在内存，不保存私密上下文副本。此模式仍有 GET/POST 间上游迟到的风险，不等同上游取消或 exactly-once。
+
+原回执已收回迟到结果时返回 `CHAT_SUPERSEDE_ORIGINAL_FOUND`；若答案只在发送前的上游图中出现，后继以 `CHAT_SUPERSEDE_CURSOR_CHANGED` / `not_sent` 拒发。调用方可在原授权内对原 ID 显式恢复读取一次，采用可核验的原答案；不能把任意游标变化当成已有答案，也不能换新 ID 再生成。补发仍失败或结果不明时保留同一后继，不递归补发。消费端须等支持原 user 叶节点的 Provider 实际部署后才启用此路径，旧版本的拒发回执不自动重排。
 
 #### 旧属性任务的限定 v4 / High 升级
 
