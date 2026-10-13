@@ -1511,10 +1511,11 @@ class ConversationBindingService:
 
     @staticmethod
     def _no_final_successor_tail(document, original):
-        """Completed code/tool steps are context, not a final text answer.
+        """Accept the unchanged original user leaf or completed code/tool context.
 
-        This permits one explicitly requested continuation; it does not prove
-        the previous upstream turn was cancelled or erase its UNKNOWN receipt.
+        The task service has already required a stopped no-final attempt and
+        reserved its only successor. This does not prove upstream cancellation
+        or erase the original UNKNOWN receipt.
         """
         def reject():
             raise ConversationBindingError("original no-final branch cannot be continued",
@@ -1562,7 +1563,7 @@ class ConversationBindingService:
             if len(next_nodes) > 1 or (node.get("children") or []) != next_nodes:
                 reject()
             if not next_nodes:
-                if role != "tool" or document.get("current_node") != node_id:
+                if (node_id != user and role != "tool") or document.get("current_node") != node_id:
                     reject()
                 return node_id, context
             previous_role, node_id = role, next_nodes[0]
