@@ -120,6 +120,28 @@ def test_response_failed_nested_error_is_persisted_and_projected(runtime):
     assert project_public_chat_receipt(TextTaskService._public(row))["execution"]["upstream_error"] == expected
 
 
+@pytest.mark.parametrize("top_error", [{"message": "actual original reason"}, "actual original reason"])
+def test_response_failed_preserves_top_level_reason(runtime, top_error):
+    event = {"type": "response.failed", "error": top_error, "response": {"id": "r1"}}
+    row = _unknown_receipt_after_restart(runtime, Response([
+        ("data: " + json.dumps(event)).encode(), b'data: [DONE]',
+    ]), "top-level-error")
+    assert project_public_chat_receipt(TextTaskService._public(row))["execution"]["upstream_error"] == {
+        "message": "actual original reason"}
+
+
+@pytest.mark.parametrize("field", ["messages[0].content", "input_text", "request.body", "body"])
+def test_request_content_inside_error_message_is_redacted(runtime, field):
+    event = {"error": {"message": "invalid request: " + field + "=USER_PRIVATE_PROMPT"}}
+    row = _unknown_receipt_after_restart(runtime, Response([
+        ("data: " + json.dumps(event)).encode(), b'data: [DONE]',
+    ]), "inline-input-redaction")
+    public = project_public_chat_receipt(TextTaskService._public(row))
+    assert "USER_PRIVATE_PROMPT" not in json.dumps(row)
+    assert "USER_PRIVATE_PROMPT" not in json.dumps(public)
+    assert public["execution"]["upstream_error"]["message"] == "invalid request: [redacted]"
+
+
 def test_later_sse_message_completes_code_only_detail_without_replacing_first_reason(runtime):
     response = Response([
         b'data: {"error":{"code":"initial_provider_code"}}',

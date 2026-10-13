@@ -43,7 +43,7 @@ def safe_upstream_error(value: object) -> dict[str, str]:
 def sse_error_detail(event: dict, *, named_error: bool = False) -> dict[str, str]:
     error = event.get("error")
     # Explicit protocol path only; never search arbitrary payload/message trees.
-    if event.get("type") == "response.failed" and isinstance(event.get("response"), dict):
+    if (not isinstance(error, (dict, str)) or not error) and event.get("type") == "response.failed" and isinstance(event.get("response"), dict):
         error = event["response"].get("error")
     if isinstance(error, dict):
         return safe_upstream_error(error)
