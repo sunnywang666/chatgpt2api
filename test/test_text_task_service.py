@@ -288,11 +288,11 @@ class TextTaskTests(unittest.TestCase):
         upstream_response = Response()
         upstream_response.status_code = 422
         upstream_response._content = json.dumps({
-            "error": {"type": "invalid_request_error", "param": "messages[0].content.SECRET_PATH",
-                      "code": "SECRET_CODE", "message": "SECRET_PROMPT"},
+            "error": {"type": "invalid_request_error", "param": "messages[0].content.prompt",
+                      "code": "invalid_request_code", "message": "prompt: USER_PRIVATE_PROMPT"},
         }).encode()
         with self.assertRaises(UpstreamHTTPError) as captured:
-            ensure_ok(upstream_response, "/backend-api/conversation?SECRET_URL")
+            ensure_ok(upstream_response, "/backend-api/conversation?access_token=URL_PRIVATE")
         upstream_error = captured.exception
         backend = mock.Mock()
         with (
@@ -311,6 +311,9 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(receipt["original_http_status"], 422)
         self.assertEqual(receipt["original_upstream_error_form"], "error")
         self.assertEqual(receipt["original_upstream_rejected_field"], "messages")
+        self.assertEqual(receipt["original_upstream_error"], {
+            "code": "invalid_request_code", "type": "invalid_request_error", "message": "[redacted]",
+        })
         app = FastAPI()
         app.include_router(create_router())
         with (
@@ -322,24 +325,28 @@ class TextTaskTests(unittest.TestCase):
                                   headers={"Authorization": "owner"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["original_upstream_rejected_field"], "messages")
-        for secret in ("SECRET_URL", "SECRET_PATH", "SECRET_CODE", "SECRET_PROMPT", "SECRET_TOKEN"):
+        self.assertEqual(response.json()["original_upstream_error"]["code"], "invalid_request_code")
+        for secret in ("URL_PRIVATE", "USER_PRIVATE_PROMPT", "SECRET_TOKEN"):
             self.assertNotIn(secret.encode(), self.path.read_bytes())
             self.assertNotIn(secret, response.text)
 
         validation = _text_http_diagnostic(UpstreamHTTPError(
             "/backend-api/conversation", 422,
-            {"detail": [{"loc": ["body", "thinking_effort"], "msg": "SECRET_PROMPT"}]},
+            {"detail": [{"loc": ["body", "thinking_effort"], "msg": "prompt: USER_PRIVATE_PROMPT"}]},
         ))
         self.assertEqual(validation, {
             "original_upstream_error_form": "validation",
             "original_upstream_rejected_field": "thinking_effort",
         })
         free_text = _text_http_diagnostic(UpstreamHTTPError(
-            "/backend-api/conversation", 422, {"detail": "thinking_effort SECRET_PROMPT"},
+            "/backend-api/conversation", 422, {"detail": "thinking_effort prompt: USER_PRIVATE_PROMPT"},
         ))
-        self.assertEqual(free_text, {"original_upstream_error_form": "detail_text"})
+        self.assertEqual(free_text, {
+            "original_upstream_error_form": "detail_text",
+            "original_upstream_error": {"message": "thinking_effort [redacted]"},
+        })
         unlisted = _text_http_diagnostic(UpstreamHTTPError(
-            "/backend-api/conversation", 422, {"error": {"param": "SECRET_TOKEN"}},
+            "/backend-api/conversation", 422, {"error": {"param": "unknown_parameter"}},
         ))
         self.assertEqual(unlisted, {"original_upstream_error_form": "error"})
 
@@ -361,7 +368,7 @@ class TextTaskTests(unittest.TestCase):
         upstream_response = Response()
         upstream_response.status_code = 404
         upstream_response._content = json.dumps({
-            "error": {"param": "conversation_id", "message": "SECRET_RESPONSE"},
+            "error": {"param": "conversation_id", "message": "request body: USER_PRIVATE_RESPONSE"},
         }).encode()
         with self.assertRaises(UpstreamHTTPError) as captured:
             ensure_ok(upstream_response, "/backend-api/conversation")
@@ -395,7 +402,8 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(receipt["original_upstream_error_form"], "error")
         self.assertNotIn("original_upstream_rejected_field", receipt)
         self.assertFalse(original_turn_ended("text", receipt))
-        for secret in ("SECRET_RESPONSE", "SECRET_TOKEN"):
+        self.assertEqual(receipt["original_upstream_error"], {"message": "[redacted]"})
+        for secret in ("USER_PRIVATE_RESPONSE", "SECRET_TOKEN"):
             self.assertNotIn(secret.encode(), self.path.read_bytes())
             self.assertNotIn(secret, response.text)
 
@@ -410,21 +418,21 @@ class TextTaskTests(unittest.TestCase):
         # Exercise the real stream/bootstrap/requirements code with only HTTP
         # mocked, so the persisted stage comes from the actual ensure_ok site.
         cases = [
-            ("bootstrap", {"error": "SECRET_ERROR_TEXT"}, "error_text", None),
-            ("chat_requirements_prepare", {"message": "SECRET_MESSAGE"}, "message_text", None),
-            ("chat_requirements_finalize", {"error": {"param": "messages[0].SECRET_PATH",
-                                                      "message": "SECRET_MESSAGE"}}, "error", "messages"),
+            ("bootstrap", {"error": "prompt: USER_PRIVATE_PROMPT"}, "error_text", None),
+            ("chat_requirements_prepare", {"message": "prompt: USER_PRIVATE_PROMPT"}, "message_text", None),
+            ("chat_requirements_finalize", {"error": {"param": "messages[0].prompt",
+                                                      "message": "prompt: USER_PRIVATE_PROMPT"}}, "error", "messages"),
             ("conversation", {"detail": [{"loc": ["body", "thinking_effort"],
-                                            "msg": "SECRET_MESSAGE"}]}, "validation", "thinking_effort"),
-            ("conversation", {"SECRET_KEY": "SECRET_VALUE"}, "object", None),
-            ("conversation", [{"error": "SECRET_LIST"}], "list", None),
-            ("conversation", "messages SECRET_TEXT", "text", None),
+                                            "msg": "prompt: USER_PRIVATE_PROMPT"}]}, "validation", "thinking_effort"),
+            ("conversation", {"opaque_key": "opaque_value"}, "object", None),
+            ("conversation", [{"error": "opaque"}], "list", None),
+            ("conversation", "messages prompt: USER_PRIVATE_PROMPT", "text", None),
             ("conversation", "", "empty", None),
             ("conversation", None, "empty", None),
             ("conversation", {}, "object", None),
             ("conversation", [], "list", None),
-            ("conversation", {"detail": {"error": "SECRET_NESTED"}}, "detail_error_text", None),
-            ("conversation", {"error": "SECRET_ERROR", "param": "model"}, "error_text", "model"),
+            ("conversation", {"detail": {"error": "prompt: USER_PRIVATE_PROMPT"}}, "detail_error_text", None),
+            ("conversation", {"error": "prompt: USER_PRIVATE_PROMPT", "param": "model"}, "error_text", "model"),
         ]
         stages = ["bootstrap", "chat_requirements_prepare", "chat_requirements_finalize", "conversation"]
         service = TextTaskService(self.path, ConversationBindingService().complete_text, self.queue,
@@ -498,8 +506,8 @@ class TextTaskTests(unittest.TestCase):
                 self.assertEqual(other_owner.json()["status"], "not_found")
                 self.assertNotIn("original_upstream_request_stage", other_owner.json())
                 self.assertEqual(len(self.queue.calls), 0)
-                self.assertNotIn("SECRET_", readback.text)
-        self.assertNotIn(b"SECRET_", self.path.read_bytes())
+                self.assertNotIn("USER_PRIVATE_PROMPT", readback.text)
+        self.assertNotIn(b"USER_PRIVATE_PROMPT", self.path.read_bytes())
         self.assertNotIn(b"private prompt", self.path.read_bytes())
 
     def test_http_stage_and_error_shape_reject_arbitrary_metadata(self):

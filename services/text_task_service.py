@@ -293,7 +293,15 @@ class TextTaskService:
     @staticmethod
     def _public(receipt):
         from services.public_chat_service import project_text_execution
+        from utils.upstream_error import safe_upstream_error
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
+        # Revalidate owner-scoped HTTP diagnostics on every read.  Receipts can
+        # outlive code versions and must never turn arbitrary stored content
+        # into a public error message.
+        result.pop("original_upstream_error", None)
+        detail = safe_upstream_error(receipt.get("original_upstream_error"))
+        if detail:
+            result["original_upstream_error"] = detail
         if receipt.get("status") == "succeeded":
             # Older successful retries retained their previous active error.
             # Correct the read projection without rewriting original diagnostics.
@@ -2274,6 +2282,7 @@ class TextTaskService:
                     "original_failure_phase", "original_http_status", "original_exception_category",
                     "original_upstream_request_stage",
                     "original_upstream_error_form", "original_upstream_rejected_field",
+                    "original_upstream_error",
                 )
                 if (value := getattr(exc, key, None)) is not None and value != ""
             }

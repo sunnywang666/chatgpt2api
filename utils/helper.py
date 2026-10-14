@@ -141,6 +141,8 @@ def is_image_chat_request(body: dict[str, object]) -> bool:
 
 
 _UPSTREAM_BODY_LOG_LIMIT = 500
+_UPSTREAM_STREAM_ERROR_BODY_LIMIT = 4096
+_UPSTREAM_STREAM_ERROR_READ_SECONDS = 1.0
 
 
 class UpstreamHTTPError(RuntimeError):
@@ -175,12 +177,83 @@ class UpstreamHTTPError(RuntimeError):
         super().__init__(f"{context} failed: status={status_code}, body={body_str}")
 
 
+def _bounded_stream_error_text(response: requests.Response) -> str:
+    """Consume only a small, time-bounded non-2xx streaming body.
+
+    curl_cffi leaves ``response.text`` empty for a streamed error until the
+    caller drains ``iter_content``.  This is deliberately used only after an
+    HTTP failure: successful SSE responses remain entirely stream-owned by
+    their normal consumer.
+    """
+    queue = getattr(response, "queue", None)
+    # curl_cffi exposes ``queue`` only for stream=True responses.  Do not turn
+    # a normal empty non-stream response into another transport read.
+    if queue is None or not callable(getattr(queue, "get", None)):
+        return ""
+    chunks: list[bytes] = []
+    remaining = _UPSTREAM_STREAM_ERROR_BODY_LIMIT
+    deadline = time.monotonic() + _UPSTREAM_STREAM_ERROR_READ_SECONDS
+    terminal = False
+    try:
+        while remaining > 0:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                break
+            try:
+                chunk = queue.get(timeout=timeout)
+            except Exception:
+                break
+            if not isinstance(chunk, (bytes, bytearray)):
+                terminal = True
+                break
+            piece = bytes(chunk[:remaining])
+            chunks.append(piece)
+            remaining -= len(piece)
+    finally:
+        if terminal:
+            # The producer has explicitly ended, so curl_cffi's close does not
+            # wait on an active transfer.
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        else:
+            # Never call Response.close while curl_cffi is still blocked in a
+            # stream task: its implementation waits without a timeout.  Signal
+            # its existing cancellation event and let the request's configured
+            # transport timeout finish cleanup.  Its own completion callback
+            # then closes the curl handle on the completed task, never in
+            # parallel with an active curl transfer.
+            quit_now = getattr(response, "quit_now", None)
+            if callable(getattr(quit_now, "set", None)):
+                quit_now.set()
+            stream_task = getattr(response, "stream_task", None)
+            add_done_callback = getattr(stream_task, "add_done_callback", None)
+            close = getattr(response, "close", None)
+            if callable(add_done_callback) and callable(close):
+                def close_after_stream(_future):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                add_done_callback(close_after_stream)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
 def ensure_ok(response: requests.Response, context: str) -> None:
     if 200 <= response.status_code < 300:
         return
-    body: Any = response.text
+    text = response.text
+    streamed = not text and getattr(response, "queue", None) is not None
+    if streamed:
+        text = _bounded_stream_error_text(response)
+    body: Any = text
     try:
-        body = response.json()
+        # curl_cffi's response.json() observes an empty pre-drain stream;
+        # parse the bounded bytes ourselves in that case.
+        body = json.loads(text) if streamed else response.json()
     except Exception:
         pass
     retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
