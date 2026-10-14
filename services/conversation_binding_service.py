@@ -668,7 +668,24 @@ class ConversationBindingService:
                 code="CONVERSATION_BINDING_MISMATCH",
                 recovery_reason=TextRecoveryReason.ACCOUNT_IDENTITY_MISMATCH.value,
             )
-        token = account_service.get_bound_text_access_token(binding, model="auto")
+        try:
+            token = account_service.get_bound_text_access_token(binding, model="auto")
+        except RuntimeError as exc:
+            # A known local disabled/invalidated bound account is not an
+            # upstream branch observation. Preserve only a typed, redacted
+            # recovery failure; never echo the account helper's exception.
+            probe = getattr(account_service, "bound_text_recovery_auth_unavailable", None)
+            if callable(probe) and probe(binding) is True:
+                raise ConversationBindingError(
+                    "bound account authorization needs restoration",
+                    code="RECOVERY_AUTH_REQUIRED",
+                    recovery_read_error={
+                        "phase": "conversation_detail", "category": "other",
+                        "http_status": None, "retry_after_seconds": None,
+                        "candidate_ref": None,
+                    },
+                ) from exc
+            raise
         with account_service.conversation_binding_lock(binding, receipt["client_conversation_id"]):
             backend = OpenAIBackendAPI(access_token=token)
             try:

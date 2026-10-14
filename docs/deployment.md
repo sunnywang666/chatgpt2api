@@ -148,6 +148,12 @@
 
 同一内部接口的七个身份字段可额外带 `continue_after_no_final: true`。此模式仅用于旧公司原生文字请求已经以 `ORIGINAL_RESULT_NO_FINAL` 停止自动恢复、至少三次有效读取仍为 `REQUEST_RESULT_NOT_FOUND`，且无工作生命周期、completion、暂停或活跃领取的情况；客户端不能替换提示词、模型或身份。已保存的 text `_retry_cursor` 不代表活动领取：仅当它是精确绑定同一原 `conversation_id`、`request_message_id` 的完整空分支观测，才可保留并走这一显式后继；错锚、缺字段或 image-source 游标仍拒绝。只有下面的 `attributes_required_only_v4` 封闭升级可与此标志合用；旧 `category_directory_parent_v1` 仍不可合用。默认省略时继续使用原消息缺失分支，不自动开启重试。
 
+已经合格停止的 no-final 事实与最近一次结果读取错误分开处理。显式原结果重查因连接、限流或其它读取错误失败，不会清除原停止事实；历史 `RECOVERY_READ_FAILED` 未保存安全详情的回执也保留此接续资格。后来读到的成功结果、原消息缺失、活动或变化的分支、身份不匹配等明确新证据仍拒绝，受理、admission 和实际发送前的原请求/分支校验不变。
+
+后继受理前还会只读检查原绑定账号是否可用；账号授权失效时返回 `CHAT_SUPERSEDE_AUTH_REQUIRED`，不保存新后继、不刷新凭据或换号。恢复必须针对原账号，不能通过清除历史失败码或另造请求绕过。原请求 GET 的 `recovery_automatic_stopped`、`recovery_stop_reason` 和五项公开会话身份字段是停止/身份依据，不等于新版本已部署或保证此次会受理。调用方应先等支持该契约的 Provider 上线并确认原账号授权恢复，再沿已批准的同 ID 恢复分支执行；保留旧 absence-resubmit 等消费标记，不因普通 409 自行重放。
+
+读取失败仅保存受限的 `recovery_last_read_error`（phase、category、HTTP 状态、Retry-After），不保存异常正文、凭据或提示词；已知本地账号授权阻塞归为 `RECOVERY_AUTH_REQUIRED`。旧回执缺少详情时不得猜测为网络故障。
+
 Provider 保存唯一幂等后继，复用原输入、原账号和原 Chat。worker 首次读取必须证明当前尾节点是原 user 本身且没有后代，或原 user 后只有已完成的 assistant code / tool 唯一链，没有最终回答；原 user 必须已完成、身份和父节点匹配。发送前再次读取，要求尾节点和整条链的内容、角色、完成状态一致。迟到 final、分叉、新 user、运行中的步骤、归档或内容变化均拒发。实际发送父节点是已观察的原 user 或 tool 尾节点，原提交父节点和旧 UNKNOWN 收据不改写；新回执只认新请求的回答。两次读取之间的内容比较只存在内存，不保存私密上下文副本。此模式仍有 GET/POST 间上游迟到的风险，不等同上游取消或 exactly-once。
 
 原回执已收回迟到结果时返回 `CHAT_SUPERSEDE_ORIGINAL_FOUND`；若答案只在发送前的上游图中出现，后继以 `CHAT_SUPERSEDE_CURSOR_CHANGED` / `not_sent` 拒发。调用方可在原授权内对原 ID 显式恢复读取一次，采用可核验的原答案；不能把任意游标变化当成已有答案，也不能换新 ID 再生成。补发仍失败或结果不明时保留同一后继，不递归补发。消费端须等支持原 user 叶节点的 Provider 实际部署后才启用此路径，旧版本的拒发回执不自动重排。

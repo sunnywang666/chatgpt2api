@@ -40,6 +40,7 @@ from services.conversation_binding_service import (
 
 from services.task_store import TaskStore, recovery_control
 from services.request_context import current_request, AdmissionLost
+from services.account_service import account_service
 
 
 class TextTaskCapacityError(RuntimeError):
@@ -550,6 +551,34 @@ class TextTaskService:
         ):
             return "RECOVERY_TRANSPORT_FAILED", None
         return cls._safe_recovery_code(exc), safe_retry_after if evidence else None
+
+    @staticmethod
+    def _generic_recovery_read_error(exc):
+        """Persist only typed evidence when a direct bound read raises.
+
+        Direct known-conversation reads do not pass through the bounded scan,
+        so they need the same redacted shape as scan failures.  Never retain
+        ``str(exc)``: provider exceptions can contain credentials or prompts.
+        """
+        status = getattr(exc, "status_code", None)
+        status = status if type(status) is int and 100 <= status <= 599 else None
+        retry_after = getattr(exc, "retry_after", None)
+        retry_after = (int(retry_after) if isinstance(retry_after, (int, float))
+                       and not isinstance(retry_after, bool) and math.isfinite(retry_after)
+                       and 0 <= retry_after <= 2147483647 else None)
+        name = type(exc).__name__.lower()
+        category = (
+            "timeout" if isinstance(exc, TimeoutError) or "timeout" in name else
+            "transport" if isinstance(exc, ConnectionError)
+            or any(part in name for part in ("connection", "proxy", "dns", "ssl")) else
+            "parse" if isinstance(exc, (ValueError, TypeError, KeyError)) else
+            "http" if status is not None else "other"
+        )
+        return {
+            "phase": "conversation_detail", "category": category,
+            "http_status": status, "retry_after_seconds": retry_after,
+            "candidate_ref": None,
+        }
 
     @classmethod
     def _safe_recovery_reason(cls, value):
@@ -1291,9 +1320,11 @@ class TextTaskService:
                 # or provider response. The next bounded recovery window is
                 # enough to make the request retryable without hammering GET.
                 recovery_error_code, retry_after_seconds = self._recovery_failure(exc)
+                recovery_error = self._generic_recovery_read_error(exc)
                 result = self._finish_recovery(
                     owner, request_id, recovery_claim[0],
                     error_code=recovery_error_code,
+                    phase=recovery_error["phase"], read_error=recovery_error,
                     retry_after_seconds=retry_after_seconds,
                     recovery_reason=None, count_unrecoverable=allow_unrecoverable_retry,
                 )
@@ -1544,6 +1575,13 @@ class TextTaskService:
                 or type(previous.get("_execution_wait_ended_at")) not in (int, float)
                 or not math.isfinite(previous["_execution_wait_ended_at"])):
             reject("CHAT_SUPERSEDE_INVALID")
+        if (successor.get("_supersedes_no_final") is True
+                and account_service.bound_text_recovery_auth_unavailable(
+                    previous.get("provider_binding_id", ""))):
+            # This is a local, read-only account-state check.  A stopped
+            # original branch is not authority to reuse an invalidated bound
+            # account or create a successor that cannot pass token admission.
+            reject("CHAT_SUPERSEDE_AUTH_REQUIRED")
         if row[0] != successor.get("_supersedes_input_hash"):
             reject("CHAT_SUPERSEDE_INVALID")
         try:
@@ -1599,8 +1637,25 @@ class TextTaskService:
             proof = retry_evidence(previous)
             if proof is None or "source" in proof:
                 return False
+        reason = previous.get("recovery_reason")
+        read_error = safe_recovery_read_error(previous.get("recovery_last_read_error"))
+        error_code = previous.get("recovery_error_code")
+        latest_read_failure = (
+            reason is None
+            and error_code in {"RECOVERY_TRANSPORT_FAILED", "RECOVERY_RATE_LIMITED",
+                               "RECOVERY_AUTH_REQUIRED", "RECOVERY_READ_FAILED"}
+            and (read_error is not None or error_code == "RECOVERY_READ_FAILED")
+        )
+        # A stopped no-final proof survives an unavailable explicit recheck.
+        # Old receipts recorded generic read failures before the typed detail
+        # field existed; their exact stopped proof remains usable. New generic
+        # failures always persist that detail above. A fresh, validated branch
+        # reason still wins either form, and the binding service rechecks the
+        # original branch again before any send.
+        # A fresh, validated recovery reason is evidence about the branch and
+        # must still supersede that historical local qualification.
         return bool(previous.get("_attempt_reason") == "ORIGINAL_RESULT_NO_FINAL"
-            and previous.get("recovery_reason") == "REQUEST_RESULT_NOT_FOUND"
+            and (reason == "REQUEST_RESULT_NOT_FOUND" or latest_read_failure)
             and type(ended) in (int, float) and math.isfinite(ended) and 0 < ended <= now
             and type(reads) is int and reads >= 3
             and not any(previous.get(k) for k in ("_work_key", "_completion", "_completion_of",
