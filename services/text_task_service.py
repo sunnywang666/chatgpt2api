@@ -201,6 +201,10 @@ class TextTaskService:
         "request_parent_message_id", "binding_status",
     })
     _SAFE_RECOVERY_REASONS = frozenset(reason.value for reason in TextRecoveryReason)
+    _BOUNDED_RECOVERY_STOPS = {
+        TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value: "ORIGINAL_RESULT_NO_FINAL",
+        TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value: "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND",
+    }
     _UNRECOVERABLE_REASONS = frozenset({
         TextRecoveryReason.CONVERSATION_NOT_FOUND.value,
         TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
@@ -313,11 +317,11 @@ class TextTaskService:
         result.pop("recovery_automatic_stopped", None)
         result.pop("recovery_stop_reason", None)
         if (receipt.get("_attempt_finished_at")
-                and receipt.get("_attempt_reason") == "ORIGINAL_RESULT_NO_FINAL"
+                and receipt.get("_attempt_reason") in TextTaskService._BOUNDED_RECOVERY_STOPS.values()
                 and receipt.get("status") == "failed"
                 and receipt.get("upstream_outcome") == "unknown"
                 and not receipt.get("_completion")):
-            result.update(recovery_automatic_stopped=True, recovery_stop_reason="ORIGINAL_RESULT_NO_FINAL")
+            result.update(recovery_automatic_stopped=True, recovery_stop_reason=receipt["_attempt_reason"])
         if (receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
                 and not receipt.get("_forward_protocol")):
             result["execution"] = project_text_execution(receipt)
@@ -832,23 +836,28 @@ class TextTaskService:
 
     @classmethod
     def _end_no_final_recovery(cls, receipt, now):
-        """Bound legacy Chat recovery without claiming that its upstream ended.
+        """Bound original Chat reads without claiming that its upstream ended.
 
-        Work-owned requests retain their existing completion investigation.
-        Older internal callers have no such owner: ending execution occupancy
-        alone must not leave ordinary reads scheduling upstream GETs forever.
+        A missing original node is distinct from a known empty result branch.
+        Work ownership does not require querying an absent node forever; keep
+        that work and conversation protected rather than closing or archiving
+        them. Active completion investigators retain their existing contract.
         The existing explicit recovery endpoint may still make one fresh read.
         """
+        reason = receipt.get("recovery_reason")
+        stop_reason = cls._BOUNDED_RECOVERY_STOPS.get(reason)
         if (not cls._bounded_chat_wait(receipt)
                 or not receipt.get("_execution_wait_ended_at")
                 or receipt.get("_attempt_finished_at")
                 or any(receipt.get(key) for key in (
-                    "_work_key", "_product_work_key", "_completion", "_completion_of",
+                    "_completion", "_completion_of",
                     "_upstream_terminal", "recovery_claim_id", "_claim_id", "_executing"))
                 or receipt.get("status") != "failed"
                 or receipt.get("error_code") != "RESULT_UNRECOVERABLE"
                 or receipt.get("upstream_outcome") != "unknown"
-                or receipt.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value
+                or stop_reason is None
+                or reason == TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value
+                and (receipt.get("_work_key") or receipt.get("_product_work_key"))
                 or not all(isinstance(receipt.get(key), str) and receipt[key].strip() for key in (
                     "request_message_id", "provider_binding_id", "provider_account_identity",
                     "client_conversation_id", "conversation_id"))
@@ -857,7 +866,7 @@ class TextTaskService:
             return False
         # A saved branch cursor is evidence for an explicit later recheck,
         # not an active completion owner. Preserve it without polling forever.
-        receipt.update(_attempt_finished_at=now, _attempt_reason="ORIGINAL_RESULT_NO_FINAL",
+        receipt.update(_attempt_finished_at=now, _attempt_reason=stop_reason,
                        recovery_next_at=None, updated_at=now)
         return True
 
@@ -1026,8 +1035,8 @@ class TextTaskService:
                 updated.update(_claim_id=None, _claim_until=None, _executing=False)
             self._end_execution_wait(updated, now, observed=observed)
             self._end_no_final_recovery(updated, now)
-            if (error_code and updated.get("_attempt_reason") == "ORIGINAL_RESULT_NO_FINAL"
-                    and recovery_reason == TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value):
+            if (error_code and updated.get("_attempt_reason") in self._BOUNDED_RECOVERY_STOPS.values()
+                    and recovery_reason in self._BOUNDED_RECOVERY_STOPS):
                 updated["recovery_next_at"] = None
             # Empty-response recovery is part of the original logical task.
             # Reserve at most one child, and never auto-retry that child again.
@@ -1159,7 +1168,7 @@ class TextTaskService:
                 )
                 no_final_recheck = bool(
                     _explicit_ended_recheck and previous.get("_attempt_finished_at")
-                    and previous.get("_attempt_reason") == "ORIGINAL_RESULT_NO_FINAL"
+                    and previous.get("_attempt_reason") in self._BOUNDED_RECOVERY_STOPS.values()
                     and not previous.get("_completion") and not previous.get("_completion_of")
                 )
                 ended_recheck = completion_recheck or no_final_recheck

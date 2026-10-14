@@ -26,7 +26,12 @@ from services.text_task_service import (
 )
 
 
-def test_get_cannot_reopen_exhausted_no_final_recovery(public_chat):
+@pytest.mark.parametrize("reason,stop_reason,work", [
+    ("REQUEST_RESULT_NOT_FOUND", "ORIGINAL_RESULT_NO_FINAL", {}),
+    ("REQUEST_MESSAGE_NOT_FOUND", "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND", {}),
+    ("REQUEST_MESSAGE_NOT_FOUND", "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND", {"_product_work_key": "original-product"}),
+])
+def test_get_cannot_reopen_exhausted_no_final_recovery(public_chat, reason, stop_reason, work):
     f = public_chat
     owner = f.key_a["id"]
     f.tasks.submit(owner, {"client_request_id": "no-final", "client_conversation_id": "original-session",
@@ -35,15 +40,16 @@ def test_get_cannot_reopen_exhausted_no_final_recovery(public_chat):
         upstream_outcome="unknown", provider_binding_id="binding", provider_account_identity="account",
         conversation_id="original-chat", parent_message_id="original-parent", _submission_started=True,
         _executing=False, _claim_id=None, _turn_reserved=False, _execution_wait_ended_at=1000,
-        recovery_no_result_reads=127, recovery_reason="REQUEST_RESULT_NOT_FOUND")
-    reader = Mock(return_value={"status": "unknown", "recovery_reason": "REQUEST_RESULT_NOT_FOUND"})
+        recovery_no_result_reads=127, recovery_reason=reason, **work)
+    reader = Mock(return_value={"status": "unknown", "recovery_reason": reason})
     f.tasks.recovery_reader = reader
     for _ in range(2):
         response = f.client.get("/api/chat-requests/no-final", headers=f.headers())
         assert response.status_code == 200
         assert response.json()["execution"]["attempt_state"] == "ended"
         assert response.json()["recovery"]["automatic_stopped"] is True
-        assert response.json()["recovery"]["stop_reason"] == "ORIGINAL_RESULT_NO_FINAL"
+        assert response.json()["recovery"]["stop_reason"] == stop_reason
+        assert response.json()["recovery"]["upstream_outcome"] == "unknown"
     reader.assert_not_called()
     response = f.client.post("/api/chat-requests/no-final/recover", headers=f.headers())
     assert response.status_code == 200 and reader.call_count == 1
