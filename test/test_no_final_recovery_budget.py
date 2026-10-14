@@ -4,6 +4,7 @@ from unittest.mock import Mock
 import pytest
 
 from services.text_task_service import TextTaskService
+from services.conversation_binding_service import ConversationBindingService
 from test.test_pool_admission import build
 from test.test_text_task_service import ManualClock, QueuedExecutor
 
@@ -111,7 +112,7 @@ def test_explicit_recheck_adopts_late_final_without_new_submission(legacy):
     {"_upstream_terminal": True}, {"recovery_claim_id": "live"}, {"_claim_id": "live"},
     {"_executing": True}, {"_forward_protocol": "responses"}, {"_recovery_paused": True},
     {"_recovery_suppressed": True}, {"recovery_reason": "REQUEST_RESULT_INCOMPLETE"},
-    {"recovery_reason": "REQUEST_MESSAGE_NOT_FOUND"}, {"recovery_no_result_reads": 2},
+    {"recovery_reason": "REQUEST_PARENT_MISMATCH"}, {"recovery_no_result_reads": 2},
     {"recovery_no_result_reads": True}, {"upstream_outcome": "completed"},
     {"conversation_id": None}, {"request_message_id": ""},
 ])
@@ -179,3 +180,114 @@ def test_public_stop_flag_requires_derived_proof(legacy):
                "recovery_stop_reason": "ORIGINAL_RESULT_NO_FINAL"}
     result = tasks._public(receipt)
     assert "recovery_automatic_stopped" not in result and "recovery_stop_reason" not in result
+
+
+@pytest.fixture(params=[None, "_work_key", "_product_work_key"])
+def missing_node(legacy, request):
+    tasks, clock, reader = legacy
+    backend = Mock()
+    backend._get_conversation.return_value = {
+        "conversation_id": "chat", "current_node": "parent", "mapping": {
+            "parent": {"message": {"id": "parent", "author": {"role": "assistant"},
+                                   "status": "finished_successfully", "end_turn": True}},
+        },
+    }
+    reader.side_effect = lambda receipt: ConversationBindingService._read_text_request_result(backend, receipt)
+    tasks._update("owner", "original", **({request.param: "original-work"} if request.param else {}),
+                  original_http_status=404, original_failure_phase="stream_open", _retry_cursor=None)
+    return tasks, clock, reader, backend
+
+
+def test_missing_node_budget_stops_queries_but_keeps_unknown_and_work(missing_node, tmp_path):
+    tasks, clock, reader, _ = missing_node
+    before = raw(tasks)
+    exhaust(tasks, clock)
+    stopped = raw(tasks)
+    assert reader.call_count == 3
+    assert stopped["_attempt_reason"] == "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"
+    assert stopped["recovery_next_at"] is None
+    assert stopped["status"] == "failed" and stopped["upstream_outcome"] == "unknown"
+    assert stopped.get("_upstream_terminal") is not True
+    assert not tasks._no_final_successor_source(stopped, clock())
+    for key in ("request_id", "request_message_id", "conversation_id", "provider_binding_id",
+                "provider_account_identity", "client_conversation_id", "parent_message_id",
+                "_input_ref", "_last_sent_sequence", "_work_key", "_product_work_key", "original_http_status"):
+        assert stopped.get(key) == before.get(key)
+    restarted = TextTaskService(tasks.path, clock=clock, executor=QueuedExecutor(), recovery_reader=reader)
+    clock.advance(100000)
+    result = restarted.read("owner", "original")
+    assert result["recovery_automatic_stopped"] is True
+    assert result["recovery_stop_reason"] == "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"
+    assert result["execution"]["resources"]["conversation"] == "protected"
+    _, _, admission = build(tmp_path, clock)
+    callback = Mock()
+    admission.recoveries["text"] = callback
+    admission.recover_one()
+    callback.assert_not_called()
+    assert reader.call_count == 3 and len(tasks.executor.calls) == 1
+
+
+def test_old_missing_node_receipt_stops_without_extra_get(missing_node):
+    tasks, clock, reader, _ = missing_node
+    clock.advance(10000)
+    tasks._update("owner", "original", status="failed", error_code="RESULT_UNRECOVERABLE",
+                  recovery_reason="REQUEST_MESSAGE_NOT_FOUND", recovery_no_result_reads=127,
+                  recovery_attempt=132, _execution_wait_ended_at=2000, _turn_reserved=False)
+    tasks.read("owner", "original")
+    reader.assert_not_called()
+    assert raw(tasks)["recovery_no_result_reads"] == 127
+    assert raw(tasks)["_attempt_reason"] == "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"
+
+
+def test_missing_node_explicit_recheck_and_late_final(missing_node):
+    tasks, clock, reader, _ = missing_node
+    exhaust(tasks, clock)
+    tasks.recover("owner", "original", explicit_ended_recheck=True)
+    assert reader.call_count == 4 and raw(tasks)["recovery_next_at"] is None
+    reader.side_effect = RuntimeError("controlled read failure")
+    tasks.recover("owner", "original", explicit_ended_recheck=True)
+    assert reader.call_count == 5 and raw(tasks)["recovery_next_at"] > clock()
+    tasks.recover("owner", "original", explicit_ended_recheck=True)
+    assert reader.call_count == 5
+    clock.advance(10000)
+    tasks.read("owner", "original")
+    assert reader.call_count == 5
+    reader.side_effect = None
+    reader.return_value = {"status": "succeeded", "binding_status": "bound", "content": "late original answer",
+                           "conversation_id": "chat", "parent_message_id": "original-final"}
+    result = tasks.recover("owner", "original", explicit_ended_recheck=True)
+    assert reader.call_count == 6 and result["content"] == "late original answer"
+    assert result["status"] == "succeeded" and result["upstream_outcome"] == "completed"
+    assert "recovery_automatic_stopped" not in result
+    assert len(tasks.executor.calls) == 1
+
+
+@pytest.mark.parametrize("case", ["invalid_mapping", "active", "transport"])
+def test_missing_node_budget_excludes_bad_reads_and_active_generation(missing_node, case):
+    tasks, clock, reader, backend = missing_node
+    if case == "invalid_mapping":
+        backend._get_conversation.return_value["mapping"] = []
+    elif case == "active":
+        backend._get_conversation.return_value["mapping"]["parent"]["message"].update(
+            status="in_progress", end_turn=False)
+    else:
+        backend._get_conversation.side_effect = TimeoutError("controlled transport failure")
+    exhaust(tasks, clock)
+    result = raw(tasks)
+    assert reader.call_count == 3
+    assert result.get("recovery_no_result_reads", 0) == 0
+    assert not result.get("_attempt_finished_at")
+
+
+@pytest.mark.parametrize("guard", [
+    {"_completion": {"state": "checking_original"}}, {"_completion_of": "parent"},
+    {"recovery_claim_id": "live"}, {"_claim_id": "live"}, {"_executing": True},
+    {"_recovery_paused": True}, {"_recovery_suppressed": True},
+])
+def test_missing_node_stop_keeps_active_owners_and_leases(legacy, guard):
+    tasks, _, _ = legacy
+    receipt = {**raw(tasks), "status": "failed", "error_code": "RESULT_UNRECOVERABLE",
+               "_execution_wait_ended_at": 2000, "recovery_reason": "REQUEST_MESSAGE_NOT_FOUND",
+               "recovery_no_result_reads": 3, **guard}
+    assert not tasks._end_no_final_recovery(receipt, 3000)
+    assert not receipt.get("_attempt_finished_at")

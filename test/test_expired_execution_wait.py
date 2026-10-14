@@ -41,7 +41,12 @@ def finish_wait(service, admission, backend):
         row = saved(service)
         assert row["recovery_no_result_reads"] == attempt
         assert row["status"] == ("failed" if attempt == 3 else "unknown")
-        admission.clock.now = row["recovery_next_at"] + 1
+        if attempt < 3:
+            admission.clock.now = row["recovery_next_at"] + 1
+        else:
+            assert row["recovery_next_at"] is None
+            assert row["_attempt_reason"] == "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"
+            admission.clock.now += 1
     return row
 
 
@@ -136,7 +141,9 @@ def test_late_read_never_reopens_slot_and_exact_original_success_can_still_be_sa
             answer["status"] = "in_progress"
         return ConversationBindingService._read_text_request_result(backend, row, document=doc)
     service.recovery_reader = read
-    result = service.read("owner", "old-0")
+    service.read("owner", "old-0")
+    assert saved(service) == before  # Ordinary polling stays local after the budget.
+    result = service.recover("owner", "old-0", explicit_ended_recheck=True)
     row = saved(service)
     assert row["_execution_wait_ended_at"] == before["_execution_wait_ended_at"]
     assert row["request_message_id"] == legacy[0]["request_message_id"]
@@ -181,9 +188,9 @@ def test_same_original_submission_does_not_resend_after_local_failure(tmp_path):
     before = finish_wait(service, admission, backend)
     assert service.submit("owner", body)["status"] == "failed"
     after = saved(service)
-    # Same-ID submission may perform a due original-result GET, but cannot
-    # queue another model send or replace identity, outcome, or release time.
-    assert after["recovery_no_result_reads"] == before["recovery_no_result_reads"] + 1
+    # Same-ID submission cannot reopen stopped polling, queue another model
+    # send or replace identity, outcome, or release time.
+    assert after["recovery_no_result_reads"] == before["recovery_no_result_reads"]
     for key in ("request_id", "request_message_id", "request_parent_message_id", "conversation_id",
                 "client_conversation_id", "provider_account_identity", "provider_binding_id",
                 "status", "error_code", "upstream_outcome", "_execution_wait_ended_at"):

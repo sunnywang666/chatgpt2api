@@ -309,6 +309,10 @@ Happy 主循环依据原生 DSH 消息 `source.replayState.response.requestId` �
 
 需要再次核对时，使用已有 `POST /api/chat-requests/{request_id}/recover`（默认空请求体），只执行一次受账号节奏与冷却限制的原会话读取。仍无结果则保持停止；迟到的有效最终回答可沿原 ID 收回。此操作不直接重发生成、不换会话，也不把原任务标成完成。已有工作 completion 调查和明确空终态的有界恢复仍沿原合同执行。
 
+如果成功读取原会话后找不到原请求节点（`REQUEST_MESSAGE_NOT_FOUND`），同样使用既有预算：原请求至少 900 秒、至少 3 次合格的无结果读取，并已结束本地执行等待且无活动执行/恢复 claim。此时返回 `automatic_stopped:true`、`stop_reason:ORIGINAL_REQUEST_MESSAGE_NOT_FOUND`，停止普通 GET 和后台的自动上游查询。此分支也适用于有 work/product-work 归属但没有活动 completion 调查的请求；它保留原工作归属及会话保护，不关闭商品任务、不归档、不重新发送。已有满足预算的旧回执无需再查一次才能停止。
+
+该原因只表示自动查询预算已用完，不能作为“上游确定没有执行”或 `ORIGINAL_RESULT_NO_FINAL` 的证据。HTTP 404 和节点缺失仍保留原 `upstream_outcome:unknown`；客户端不能据此自动创建 successor。读取超时、鉴权/限流错误、无效 mapping、扫描未完成，以及明确仍在运行的 assistant/tool 不计入这项缺失证据。显式原 `/recover` 仍可按冷却执行一次；若取回迟到的最终答案，沿原 ID 返回。显式接续继续遵守原合同及发送前原分支校验，此标记不扩大资格。
+
 ### Advanced account selection (separate from default setup)
 
 Automatic account routing remains the default. For an advanced ordinary Chat text or image-input request, an application may copy an opaque `account_ref` from a text model's public `accounts` directory and include it in `POST /api/chat-requests`:
