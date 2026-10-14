@@ -16,6 +16,7 @@ from services.account_request_pacing import AccountReadRetryBudgetInsufficient
 from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
 from services.protocol.conversation import conversation_events
 from utils.helper import UpstreamHTTPError
+from utils.upstream_error import safe_upstream_error
 
 
 class TextRecoveryReason(str, Enum):
@@ -423,8 +424,34 @@ def _text_422_field(value: object) -> str:
     return top_level if top_level in _TEXT_422_FIELDS else ""
 
 
-def _text_http_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
-    """Keep response shape; only 422 may name a validated field. Never keep text."""
+def _explicit_http_error_detail(body: object) -> dict[str, str]:
+    """Extract only named HTTP error envelopes, never an arbitrary body tree."""
+    if isinstance(body, str):
+        return safe_upstream_error({"message": body})
+    if not isinstance(body, dict):
+        return {}
+    error = body.get("error")
+    if isinstance(error, dict):
+        return safe_upstream_error(error)
+    if isinstance(error, str):
+        return safe_upstream_error({"message": error})
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        nested = detail.get("error")
+        if isinstance(nested, dict):
+            return safe_upstream_error(nested)
+        if isinstance(nested, str):
+            return safe_upstream_error({"message": nested})
+        return safe_upstream_error(detail)
+    if isinstance(detail, str):
+        return safe_upstream_error({"message": detail})
+    if any(key in body for key in ("code", "type", "message")):
+        return safe_upstream_error(body)
+    return {}
+
+
+def _text_http_diagnostic(exc: UpstreamHTTPError) -> dict[str, object]:
+    """Keep safe error details and shape; only 422 may name a validated field."""
     body = exc.body
     candidates: list[object] = []
     form = "opaque"
@@ -466,10 +493,14 @@ def _text_http_diagnostic(exc: UpstreamHTTPError) -> dict[str, str]:
     elif body is None:
         form = "empty"
     fields = {_text_422_field(value) for value in candidates} - {""} if exc.status_code == 422 else set()
-    return {
+    diagnostic: dict[str, object] = {
         "original_upstream_error_form": form,
         **({"original_upstream_rejected_field": next(iter(fields))} if len(fields) == 1 else {}),
     }
+    detail = _explicit_http_error_detail(body)
+    if detail:
+        diagnostic["original_upstream_error"] = detail
+    return diagnostic
 
 
 def _text_failure_category(exc: Exception) -> str:
@@ -548,6 +579,7 @@ class ConversationBindingError(RuntimeError):
         original_upstream_request_stage: str = "",
         original_upstream_error_form: str = "",
         original_upstream_rejected_field: str = "",
+        original_upstream_error: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -587,6 +619,10 @@ class ConversationBindingError(RuntimeError):
             original_upstream_rejected_field
             if is_stream_open_http and self.original_http_status == 422
             and original_upstream_rejected_field in _TEXT_422_FIELDS else ""
+        )
+        self.original_upstream_error = (
+            safe_upstream_error(original_upstream_error)
+            if is_stream_open_http else {}
         )
 
 

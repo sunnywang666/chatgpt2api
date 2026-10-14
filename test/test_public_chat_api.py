@@ -52,6 +52,39 @@ def test_get_cannot_reopen_exhausted_no_final_recovery(public_chat):
     f.upstream.assert_not_called()
 
 
+def test_public_get_exposes_sanitized_http_error_without_resubmitting(public_chat):
+    f = public_chat
+    owner = f.key_a["id"]
+    f.tasks.submit(owner, {"client_request_id": "http-error", "client_conversation_id": "http-error-session",
+                           "messages": [{"role": "user", "content": "input"}]})
+    f.tasks._update(owner, "http-error", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+        original_http_status=404,
+        original_upstream_error={"code": "not_found", "message": "Not found; token=secret-value",
+                                 "body": {"private": "must-not-leak"}})
+    response = f.client.get("/api/chat-requests/http-error", headers=f.headers())
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == "unknown"
+    assert result["execution"]["upstream_http_status"] == 404
+    assert result["execution"]["upstream_error"] == {"code": "not_found", "message": "Not found; [redacted]"}
+    assert "secret-value" not in response.text and "must-not-leak" not in response.text
+    f.upstream.assert_not_called()
+
+    # A later original-result recovery hides the old active error without
+    # rewriting the stored failure evidence.
+    f.tasks._update(owner, "http-error", status="succeeded", content="original result")
+    recovered = f.client.get("/api/chat-requests/http-error", headers=f.headers()).json()
+    assert "upstream_error" not in recovered["execution"]
+    assert "upstream_http_status" not in recovered["execution"]
+    f.upstream.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [True, "404", 99, 600, None])
+def test_public_http_status_rejects_invalid_persisted_values(status):
+    from services.public_chat_service import safe_public_execution
+    assert safe_public_execution({"upstream_http_status": status}) == {}
+
+
 class QueuedExecutor:
     def __init__(self):
         self.calls = []
