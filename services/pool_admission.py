@@ -1287,6 +1287,17 @@ class PoolAdmission:
             r = self.store.read_receipt(db, ref.kind, ref.owner, ref.request_id)
             if r.get("status") != "queued" or not r.get("_input_ref"):
                 return None
+            if ref.kind == "text":
+                from services.text_task_service import TextTaskService
+                missing_attempt = TextTaskService._missing_successor_attempt(r)
+                if ("_missing_successor_resume" in r and missing_attempt is None) or (
+                        missing_attempt and missing_attempt["state"] != "reserved"):
+                    # A stale generic requeue must never turn the durable
+                    # one-use resend into a second transport attempt.
+                    r.update(status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                             _claim_id=None, _claim_until=None, _executing=False, _turn_reserved=False)
+                    self.store.write_receipt(db, ref.kind, ref.owner, ref.request_id, r)
+                    return None
             requested = r.get("_requested_account_identity")
             if (r.get("_requested_account_ref") and not requested
                     or requested and (pick.account != requested
@@ -1524,6 +1535,15 @@ class PoolAdmission:
             if context.kind == "text" and r.get("_supersedes_request_id"):
                 from services.text_task_service import TextTaskService
                 TextTaskService._validate_supersede(self.store, db, context.owner, r, now)
+                missing_attempt = TextTaskService._missing_successor_attempt(r)
+                if "_missing_successor_resume" in r and missing_attempt is None:
+                    raise AdmissionLost("missing-successor resend marker is invalid")
+                if missing_attempt:
+                    if missing_attempt["state"] != "reserved":
+                        raise AdmissionLost("missing-successor resend was already consumed")
+                    r["_missing_successor_resume"] = {
+                        **missing_attempt, "state": "submitted", "submitted_at": now,
+                    }
             if context.kind == "text" and r.get("_public_session_ref") and r.get("_previous_request_id") and not r.get("_terminal_empty_correction_of") and not r.get("_same_session_retry_of"):
                 previous = self.store.read_receipt(db, "text", context.owner, r["_previous_request_id"]) or {}
                 if (r.get("_public_previous_waiting") or previous.get("status") != "succeeded"

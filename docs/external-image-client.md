@@ -313,6 +313,11 @@ Happy 主循环依据原生 DSH 消息 `source.replayState.response.requestId` �
 
 该原因只表示自动查询预算已用完，不能作为“上游确定没有执行”或 `ORIGINAL_RESULT_NO_FINAL` 的证据。HTTP 404 和节点缺失仍保留原 `upstream_outcome:unknown`；客户端不能据此自动创建 successor。读取超时、鉴权/限流错误、无效 mapping、扫描未完成，以及明确仍在运行的 assistant/tool 不计入这项缺失证据。显式原 `/recover` 仍可按冷却执行一次；若取回迟到的最终答案，沿原 ID 返回。显式接续继续遵守原合同及发送前原分支校验，此标记不扩大资格。
 
+对于已经是后继、又发生节点缺失的旧内部任务，普通同 ID POST 仍只查原回执。
+受信任的 admin/Content 调用方另有明确授权后的同 ID 一次性恢复契约，详见
+[内部恢复说明](deployment.md#已发送后继节点缺失时同一请求的一次性恢复)。这不是普通 API 客户端的自动重试入口；
+`automatic_stopped` 也不授权生成新请求。原结果查询和新模型执行应分别处理。
+
 ### Advanced account selection (separate from default setup)
 
 Automatic account routing remains the default. For an advanced ordinary Chat text or image-input request, an application may copy an opaque `account_ref` from a text model's public `accounts` directory and include it in `POST /api/chat-requests`:
