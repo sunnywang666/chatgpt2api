@@ -140,7 +140,6 @@ def is_image_chat_request(body: dict[str, object]) -> bool:
     return isinstance(modalities, list) and "image" in {str(item or "").strip().lower() for item in modalities}
 
 
-_UPSTREAM_BODY_LOG_LIMIT = 500
 _UPSTREAM_STREAM_ERROR_BODY_LIMIT = 4096
 _UPSTREAM_STREAM_ERROR_READ_SECONDS = 1.0
 
@@ -150,8 +149,9 @@ class UpstreamHTTPError(RuntimeError):
 
     Carries structured fields (status_code, body, retry_after) so callers can
     branch on status code instead of string-matching on str(exc). The full
-    body is preserved on the instance; the formatted message truncates it
-    to keep log lines reasonable.
+    body is preserved on the instance for explicit, safe diagnostic
+    extraction; it is deliberately excluded from the exception text because
+    generic callers may log that text.
     """
 
     def __init__(
@@ -165,16 +165,8 @@ class UpstreamHTTPError(RuntimeError):
         self.status_code = status_code
         self.body = body
         self.retry_after = retry_after
-        if isinstance(body, (dict, list)):
-            try:
-                body_str = json.dumps(body, ensure_ascii=False)
-            except (TypeError, ValueError):
-                body_str = repr(body)
-        else:
-            body_str = str(body)
-        if len(body_str) > _UPSTREAM_BODY_LOG_LIMIT:
-            body_str = body_str[:_UPSTREAM_BODY_LOG_LIMIT] + "…[truncated]"
-        super().__init__(f"{context} failed: status={status_code}, body={body_str}")
+        safe_context = str(context or "upstream").split("?", 1)[0].split("#", 1)[0] or "upstream"
+        super().__init__(f"{safe_context} failed: status={status_code}")
 
 
 def _bounded_stream_error_text(response: requests.Response) -> str:

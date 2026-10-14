@@ -14,6 +14,13 @@ from services.conversation_binding_service import (
     ConversationBindingError,
     _text_http_diagnostic,
 )
+from services.protocol.conversation import (
+    ConversationRequest,
+    ImageGenerationError,
+    ImageOutput,
+    _generate_single_image,
+    stream_text_deltas,
+)
 from services.text_task_service import TextTaskService
 from utils.helper import (
     _UPSTREAM_STREAM_ERROR_BODY_LIMIT,
@@ -136,6 +143,159 @@ def test_successful_sse_is_not_consumed_by_ensure_ok(loopback_server):
     response = _stream(loopback_server + "/sse")
     ensure_ok(response, "/backend-api/conversation")
     assert b"".join(response.iter_content()) == b"data: first SSE payload\n\ndata: [DONE]\n\n"
+
+
+def test_image_stream_failure_logs_safe_exception_text_and_keeps_structured_details():
+    private_token = "TOKEN_PRIVATE_VALUE"
+    private_prompt = "PROMPT_PRIVATE_VALUE"
+    upstream = UpstreamHTTPError(
+        "/backend-api/conversation?access_token=" + private_token,
+        429,
+        {"error": {"message": "prompt=" + private_prompt, "token": private_token}},
+        retry_after=12,
+    )
+    logged = []
+
+    class FakeBackend:
+        image_submission_started = False
+
+        def __init__(self, *, access_token):
+            self.access_token = access_token
+
+        def close(self):
+            pass
+
+    def stream(*_args):
+        raise upstream
+        yield
+
+    with (
+        mock.patch("services.protocol.conversation.account_service.get_available_access_token", return_value="fixture-token"),
+        mock.patch("services.protocol.conversation.account_service.get_account", return_value={"email": "fixture@example.test"}),
+        mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+        mock.patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+        mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream),
+        mock.patch("services.protocol.conversation.logger.warning", side_effect=logged.append),
+    ):
+        with pytest.raises(ImageGenerationError) as raised:
+            _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="fixture"), 1, 1)
+
+    assert raised.value.status_code == 429
+    assert raised.value.retry_after == 12
+    assert upstream.body["error"]["message"] == "prompt=" + private_prompt
+    assert str(upstream) == "/backend-api/conversation failed: status=429"
+    assert logged[0]["event"] == "image_stream_fail"
+    assert logged[0]["error"] == str(upstream)
+    serialized = json.dumps(logged)
+    assert private_token not in serialized
+    assert private_prompt not in serialized
+    assert private_token not in str(raised.value)
+    assert private_prompt not in str(raised.value)
+
+
+def test_text_stream_retries_only_structured_invalid_token_code():
+    initial = mock.Mock(access_token="old-token")
+    upstream = UpstreamHTTPError("/backend-api/conversation", 401, {
+        "error": {"code": "token_invalidated", "message": "private upstream body"},
+    })
+
+    def events(backend, **_kwargs):
+        if backend.access_token == "old-token":
+            raise upstream
+        yield {"type": "conversation.delta", "delta": "ok"}
+
+    with (
+        mock.patch("services.protocol.conversation.OpenAIBackendAPI", side_effect=lambda access_token: mock.Mock(access_token=access_token)),
+        mock.patch("services.protocol.conversation.conversation_events", side_effect=events),
+        mock.patch("services.protocol.conversation.account_service.refresh_access_token", return_value="new-token") as refresh,
+        mock.patch("services.protocol.conversation.account_service.remove_invalid_token") as remove,
+        mock.patch("services.protocol.conversation.account_service.mark_text_used"),
+    ):
+        assert list(stream_text_deltas(initial, ConversationRequest(model="auto", prompt="fixture"))) == ["ok"]
+
+    refresh.assert_called_once_with("old-token", force=True, event="text_stream")
+    remove.assert_not_called()
+
+
+def test_text_stream_does_not_retry_upstream_message_without_invalid_token_code():
+    initial = mock.Mock(access_token="old-token")
+    upstream = UpstreamHTTPError("/backend-api/conversation", 401, {
+        "error": {"code": "other_error", "message": "token_invalidated"},
+    })
+
+    with (
+        mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=mock.Mock(access_token="old-token")),
+        mock.patch("services.protocol.conversation.conversation_events", side_effect=upstream),
+        mock.patch("services.protocol.conversation.account_service.refresh_access_token") as refresh,
+        mock.patch("services.protocol.conversation.account_service.remove_invalid_token") as remove,
+    ):
+        with pytest.raises(UpstreamHTTPError):
+            list(stream_text_deltas(initial, ConversationRequest(model="auto", prompt="fixture")))
+
+    refresh.assert_not_called()
+    remove.assert_not_called()
+
+
+def test_image_stream_retries_structured_invalid_token_code_before_submission():
+    upstream = UpstreamHTTPError("/backend-api/conversation", 401, {
+        "error": {"code": "token_revoked", "message": "private upstream body"},
+    })
+
+    class FakeBackend:
+        image_submission_started = False
+
+        def __init__(self, *, access_token):
+            self.access_token = access_token
+
+        def close(self):
+            pass
+
+    def stream(backend, *_args):
+        if backend.access_token == "old-token":
+            raise upstream
+        yield ImageOutput(kind="result", model="gpt-image-2", index=1, total=1, data=[])
+
+    with (
+        mock.patch("services.protocol.conversation.account_service.get_available_access_token", side_effect=["old-token", "new-token"]),
+        mock.patch("services.protocol.conversation.account_service.get_account", return_value={}),
+        mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+        mock.patch("services.protocol.conversation.account_service.refresh_access_token", return_value="new-token") as refresh,
+        mock.patch("services.protocol.conversation.account_service.remove_invalid_token") as remove,
+        mock.patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
+        mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream),
+    ):
+        result = _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="fixture"), 1, 1)
+
+    assert len(result) == 1
+    refresh.assert_called_once_with("old-token", force=True, event="image_stream")
+    remove.assert_not_called()
+
+
+def test_image_stream_invalid_token_code_never_retries_after_submission():
+    upstream = UpstreamHTTPError("/backend-api/conversation", 401, {
+        "error": {"code": "token_invalidated", "message": "private upstream body"},
+    })
+    backend = mock.Mock(image_submission_started=True)
+
+    def stream(*_args):
+        raise upstream
+        yield
+
+    with (
+        mock.patch("services.protocol.conversation.account_service.get_available_access_token", return_value="fixture-token"),
+        mock.patch("services.protocol.conversation.account_service.get_account", return_value={}),
+        mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+        mock.patch("services.protocol.conversation.account_service.refresh_access_token") as refresh,
+        mock.patch("services.protocol.conversation.account_service.remove_invalid_token") as remove,
+        mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend),
+        mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream),
+    ):
+        with pytest.raises(ImageGenerationError) as raised:
+            _generate_single_image(ConversationRequest(model="gpt-image-2", prompt="fixture"), 1, 1)
+
+    assert raised.value.upstream_submitted is True
+    refresh.assert_not_called()
+    remove.assert_not_called()
 
 
 def test_http_detail_is_redacted_persisted_and_revalidated_at_owner_read():
