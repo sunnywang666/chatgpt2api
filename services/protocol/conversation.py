@@ -27,6 +27,7 @@ from services.openai_backend_api import (
 )
 from utils.helper import (
     IMAGE_MODELS,
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -87,8 +88,19 @@ def public_image_error_message(message: str) -> str:
     return text or "The image generation request failed. Please try again later."
 
 
-def is_token_invalid_error(message: str) -> bool:
-    text = str(message or "").lower()
+_TOKEN_INVALID_ERROR_CODES = frozenset({"token_invalidated", "token_revoked"})
+
+
+def is_token_invalid_error(value: object) -> bool:
+    if isinstance(value, UpstreamHTTPError):
+        body = value.body
+        # The upstream error envelope is the only structured source whose
+        # token codes are defined for this retry path. Do not inspect a
+        # free-form message or an untyped top-level field.
+        nested = body.get("error") if isinstance(body, dict) else None
+        code = nested.get("code") if isinstance(nested, dict) else None
+        return isinstance(code, str) and code.strip().lower() in _TOKEN_INVALID_ERROR_CODES
+    text = str(value or "").lower()
     return (
         "token_invalidated" in text
         or "token_revoked" in text
@@ -124,15 +136,25 @@ def is_connection_timeout_error(message: str) -> bool:
     )
 
 
-def image_stream_error_message(message: str) -> str:
-    text = str(message or "")
-    if is_token_invalid_error(text):
+def image_stream_error_message(value: object) -> str:
+    text = str(value or "")
+    if is_token_invalid_error(value):
         return "image generation failed"
     if is_tls_connection_error(text):
         return "upstream image connection failed, please retry later"
     if is_connection_timeout_error(text):
         return "upstream connection timed out, please retry later"
     return text or "image generation failed"
+
+
+def _copy_upstream_http_metadata(error: ImageGenerationError, exc: Exception) -> ImageGenerationError:
+    status_code = getattr(exc, "status_code", None)
+    if type(status_code) is int and 400 <= status_code <= 599:
+        error.status_code = status_code
+    retry_after = getattr(exc, "retry_after", None)
+    if type(retry_after) in (int, float) and math.isfinite(retry_after) and retry_after >= 0:
+        error.retry_after = retry_after
+    return error
 
 
 REFERENCED_IMAGE_IDS_RE = re.compile(r'"referenced_image_ids"\s*:\s*\[([^\]]+)\]')
@@ -896,9 +918,8 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             account_service.mark_text_used(token)
             return
         except Exception as exc:
-            error_message = str(exc)
             submitted = context is not None and context.receipt().get("_submission_started")
-            if token and not emitted and not submitted and is_token_invalid_error(error_message):
+            if token and not emitted and not submitted and is_token_invalid_error(exc):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
                     token = refreshed_token
@@ -1838,7 +1859,7 @@ def _generate_bound_single_image(
                         ),
                     ) from exc
                 error = ImageGenerationError(
-                    image_stream_error_message(str(exc)),
+                    image_stream_error_message(exc),
                     code=(
                         "IMAGE_GENERATION_NOT_SUBMITTED"
                         if upstream_submitted is False
@@ -2075,10 +2096,16 @@ def _generate_single_image(
                 # No yielded chunk is not proof that no generation was sent.
                 # In particular, a confirmed asset's URL failure must never
                 # re-enter generation or switch the selected account.
-                raise ImageGenerationError(image_stream_error_message(last_error),
-                    account_email=account_email, conversation_id=last_conversation_id,
-                    upstream_submitted=True) from exc
-            if not emitted_for_token and is_token_invalid_error(last_error):
+                raise _copy_upstream_http_metadata(
+                    ImageGenerationError(
+                        image_stream_error_message(exc),
+                        account_email=account_email,
+                        conversation_id=last_conversation_id,
+                        upstream_submitted=True,
+                    ),
+                    exc,
+                ) from exc
+            if not emitted_for_token and is_token_invalid_error(exc):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
@@ -2115,7 +2142,14 @@ def _generate_single_image(
                     })
                     time.sleep(wait_secs)
                     continue
-            raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
+            raise _copy_upstream_http_metadata(
+                ImageGenerationError(
+                    image_stream_error_message(exc),
+                    account_email=account_email,
+                    conversation_id="",
+                ),
+                exc,
+            ) from exc
         finally:
             if backend is not None:
                 backend.close()
