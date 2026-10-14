@@ -1604,6 +1604,41 @@ class ConversationBindingService:
                 return node_id, context
             previous_role, node_id = role, next_nodes[0]
 
+    @staticmethod
+    def _check_missing_successor_no_final(document, conversation_id, predecessor,
+                                          original_successor_user, replacement_user, expected_tail):
+        """Fence a resend beside a stopped no-final successor.
+
+        The predecessor's proved tool chain supplies the live tail.  The
+        frozen request root remains input-identity evidence; the outbound
+        payload uses the freshly verified live tail.  Neither proves a late
+        original successor or a prior resend is absent.
+        """
+        mapping = document.get("mapping") if isinstance(document, dict) else None
+        if not isinstance(mapping, dict):
+            raise ConversationBindingError("missing-successor conversation unavailable", code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
+        if not ConversationBindingService._missing_successor_node_absent(mapping, original_successor_user):
+            raise ConversationBindingError("original successor appeared", code="CHAT_SUPERSEDE_ORIGINAL_FOUND")
+        ConversationBindingService._check_missing_successor_replacement_absent(document, replacement_user)
+        tail, context = ConversationBindingService._no_final_successor_tail(document, predecessor)
+        if document.get("conversation_id") != conversation_id or tail != expected_tail:
+            raise ConversationBindingError("original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+        return tail, context
+
+    @staticmethod
+    def _missing_successor_node_absent(mapping, message_id):
+        return (isinstance(mapping, dict) and isinstance(message_id, str) and bool(message_id)
+                and message_id not in mapping and not any(
+                    isinstance(node, dict) and isinstance(node.get("message"), dict)
+                    and node["message"].get("id") == message_id for node in mapping.values()
+                ))
+
+    @staticmethod
+    def _check_missing_successor_replacement_absent(document, replacement_user):
+        mapping = document.get("mapping") if isinstance(document, dict) else None
+        if not ConversationBindingService._missing_successor_node_absent(mapping, replacement_user):
+            raise ConversationBindingError("replacement successor already appeared", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+
     def complete_text(self, body: dict[str, Any], *, on_cursor=None) -> dict[str, Any]:
         binding_id = str(body.get("provider_binding_id") or "").strip()
         account_identity = str(body.get("provider_account_identity") or "").strip()
@@ -1692,6 +1727,7 @@ class ConversationBindingService:
             backend.text_request_message_id = str(body.get("_request_message_id") or "")
             if body.get("_public_session_ref") or body.get("_supersedes_request_message_id"):
                 backend.text_cursor_callback = on_cursor
+            missing_no_final_context = None
             if body.get("_supersedes_request_message_id"):
                 def check_original(send):
                     try:
@@ -1699,12 +1735,22 @@ class ConversationBindingService:
                     except Exception as exc:
                         raise ConversationBindingError("original conversation read is temporarily unavailable",
                                                        code="CHAT_SUPERSEDE_READ_UNAVAILABLE") from exc
-                    if body.get("_supersedes_no_final_original"):
+                    if body.get("_missing_successor_no_final_predecessor"):
+                        if self._check_missing_successor_no_final(
+                                fresh, conversation_id, body["_missing_successor_no_final_predecessor"],
+                                body["_supersedes_request_message_id"], backend.text_request_message_id,
+                                body["_missing_successor_expected_tail"]) != missing_no_final_context:
+                            raise ConversationBindingError("original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+                    elif body.get("_supersedes_no_final_original"):
                         if self._no_final_successor_tail(fresh, body["_supersedes_no_final_original"]) != no_final_context:
                             raise ConversationBindingError("original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
                     else:
                         self._check_superseded_original(fresh, conversation_id, parent_message_id,
                                                         body["_supersedes_request_message_id"])
+                        if body.get("_missing_successor_attempt_message_id"):
+                            self._check_missing_successor_replacement_absent(
+                                fresh, body["_missing_successor_attempt_message_id"],
+                            )
                     if fresh["is_archived"]:
                         raise ConversationBindingError("original conversation restore is unconfirmed",
                                                        code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
@@ -1752,7 +1798,51 @@ class ConversationBindingService:
                                                        code=("CHAT_SUPERSEDE_READ_UNAVAILABLE" if body.get("_supersedes_request_message_id")
                                                              else "CHAT_ARCHIVE_RESTORE_UNCONFIRMED")) from exc
                     if body.get("_supersedes_request_message_id"):
-                        if body.get("_supersedes_no_final_original"):
+                        prior = body.get("_missing_successor_original_receipt")
+                        if prior:
+                            # A late result for the original submitted
+                            # successor wins over the reserved resend.  The
+                            # service keeps both message IDs; do not turn a
+                            # present-but-incomplete original branch into a
+                            # second model POST.
+                            try:
+                                prior_result = self._read_text_request_result(backend, prior, document=document)
+                            except ConversationBindingError as exc:
+                                if getattr(exc, "recovery_reason", None) != TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value:
+                                    raise
+                            else:
+                                if prior_result.get("status") == "succeeded":
+                                    return {**prior_result, "_missing_successor_result_source": "original"}
+                                mapping = document.get("mapping") if isinstance(document, dict) else None
+                                if not self._missing_successor_node_absent(
+                                        mapping, prior.get("request_message_id")):
+                                    # The original user node is now visible,
+                                    # but has not reached a verified text
+                                    # terminal.  Do not send the reserved
+                                    # replacement; let the receipt resume its
+                                    # exact original-ID read path instead.
+                                    raise ConversationBindingError(
+                                        "original successor appeared before resend",
+                                        code="CHAT_SUPERSEDE_ORIGINAL_FOUND",
+                                    )
+                                raise ConversationBindingError(
+                                    "original successor appeared before resend",
+                                    code="CHAT_SUPERSEDE_CURSOR_CHANGED",
+                                )
+                        if body.get("_missing_successor_no_final_predecessor"):
+                            missing_no_final_context = self._check_missing_successor_no_final(
+                                document, conversation_id, body["_missing_successor_no_final_predecessor"],
+                                body["_supersedes_request_message_id"], backend.text_request_message_id,
+                                body["_missing_successor_expected_tail"])
+                            # Keep the frozen submission root in the durable
+                            # receipt, but send from the freshly verified live
+                            # no-final tail.  This mirrors the original
+                            # no-final continuation without reusing its user
+                            # node or accepting a changed context.
+                            parent_message_id = missing_no_final_context[0]
+                            if on_cursor:
+                                on_cursor({"request_parent_message_id": parent_message_id})
+                        elif body.get("_supersedes_no_final_original"):
                             no_final_context = self._no_final_successor_tail(document, body["_supersedes_no_final_original"])
                             parent_message_id = no_final_context[0]
                             if on_cursor:
@@ -1760,6 +1850,10 @@ class ConversationBindingService:
                         else:
                             self._check_superseded_original(document, conversation_id, parent_message_id,
                                                             body["_supersedes_request_message_id"])
+                            if body.get("_missing_successor_attempt_message_id"):
+                                self._check_missing_successor_replacement_absent(
+                                    document, body["_missing_successor_attempt_message_id"],
+                                )
                     if not isinstance(document, dict) or type(document.get("is_archived")) is not bool:
                         raise ConversationBindingError("original conversation visibility is unconfirmed",
                                                        code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED")

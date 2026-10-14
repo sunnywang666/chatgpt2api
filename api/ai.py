@@ -151,6 +151,11 @@ class ConversationArchiveRequest(BaseModel):
     parent_message_id: str = Field(min_length=1)
 
 
+class MissingSuccessorResumeRequest(ConversationArchiveRequest):
+    client_request_id: str = Field(min_length=1, max_length=200)
+    supersedes_request_id: str = Field(min_length=1, max_length=200)
+
+
 class AnthropicMessageRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str | None = None
@@ -475,6 +480,23 @@ def create_router() -> APIRouter:
                 owner, request_id, payload)
         except ConversationBindingError as exc:
             raise HTTPException(409, detail={"code": exc.code, "error": str(exc)}) from exc
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/resume-missing-successor")
+    async def resume_missing_bound_successor(request_id: str, body: MissingSuccessorResumeRequest,
+                                             response: Response,
+                                             authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        if identity.get("role") != "admin":
+            raise HTTPException(501, detail={"code": "SERVICE_OPERATION_UNAVAILABLE"})
+        require_chat_text_policy(identity)
+        response.headers["Cache-Control"] = "private, no-store"
+        if body.client_request_id != request_id:
+            raise HTTPException(409, detail={"code": "CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE"})
+        try:
+            return await run_in_threadpool(text_task_service.resume_missing_successor,
+                str(identity.get("id") or "anonymous"), request_id, body.model_dump(mode="python"))
+        except ConversationBindingError as exc:
+            raise HTTPException(409, detail={"code": exc.code}) from exc
 
     @router.post("/api/conversation-bindings/text")
     async def continue_bound_text(

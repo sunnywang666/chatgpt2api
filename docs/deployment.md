@@ -189,6 +189,63 @@ Provider 只识别保留的 Workbench 类目专用提示词：单 user 消息、
 正常 runner 继续在初次读取和账号节拍后的发送边界检查原请求/父节点。除原 assistant 终态外，仅兼容已完成 user → 已完成 assistant code 调用 → 已完成 image tool 的唯一父链：调用 recipient 必须等于 tool author.name，tool 必须有合法 `image_asset_pointer` 且无子节点。任意普通 tool/null end_turn、活跃状态、缺失链条、兄弟分支、实际 current node 变化或旧请求出现均不能因此绕过检查。
 
 
+#### 已发送后继节点缺失时，同一请求的一次性恢复
+
+仅现有 admin/Content 调用方可显式调用
+`POST /api/conversation-bindings/text-requests/{request_id}/resume-missing-successor`。
+这适用于一个已经发送、仍无结果且上游找不到该请求节点的**既有后继**；它与上面的
+`resume-unsent-successor` 不同，不能把原 `UNKNOWN` 改称为未发送，也不能再创建后继的后继。
+普通同 ID `POST /api/conversation-bindings/text` 继续只返回原回执，不触发这个操作。
+
+请求体只允许七个必填身份字段，不允许附带 messages、model、thinking_effort、product_work、
+derived_input 或 continue_after_no_final。`client_request_id` 必须与 URL 中已有请求 ID 相同，
+`supersedes_request_id` 是该请求已经保存的前继 ID，而非一个新对象。示例中的值必须来自原任务：
+
+```json
+{
+  "client_request_id": "existing-successor-id",
+  "supersedes_request_id": "existing-predecessor-id",
+  "provider_binding_id": "original-binding",
+  "provider_account_identity": "original-account",
+  "client_conversation_id": "original-client-session",
+  "conversation_id": "original-chat",
+  "parent_message_id": "original-frozen-parent"
+}
+```
+
+请求体父节点必须与原冻结输入的 `parent_message_id` 一致，调用方不能用当前最新节点替代。
+既有 no-final 续接还保存了执行时选中的 `request_parent_message_id`，它可能不同于这个冻结根节点；
+Provider 必须分别核对两者，不能将 `_submission_parent_message_id` 当作实际发送尾节点。
+Provider 从自己的持久输入读取原提示词和模型，核对原 hash、
+账户、绑定、会话和唯一前继关系。此路径要求缺失节点已按既有预算停止自动查询，且没有结果、
+后继子请求、活动执行/读取领取、会话占用或工作恢复动作。资格不足或身份冲突返回 HTTP 409；
+额外字段或缺少字段返回 HTTP 422，普通 API 使用者调用内部入口返回 HTTP 501。
+
+受理仅在原回执内保存一次恢复尝试及其上游消息 ID，不新建 Provider 请求、不替换原持久输入。
+原请求节点、原 404/UNKNOWN 和发送历史保留。恢复仍经既有 admission 的账号容量、节拍和冷却，
+首次读取及最终发送边界都验证这个后继自己的旧 user 节点和预留的新 user 节点缺失。
+普通后继要求父节点仍是无子分支的终态叶节点；原 no-final 续接则核对前继的原 user/code/tool
+唯一未完成链，且尾节点仍与该后继原实际发送父节点一致。冻结输入中的 no-final 模式由 Provider
+恢复，调用方不能在新请求体中切换模式。出现迟到最终结果、游标漂移、读取失败或占用冲突，不能绕过检查发送。
+
+回执的 `missing_successor_resume` 包含 `attempt: 1`、`state`（`reserved`、`submitted`、`recovered`）
+以及该尝试的 `request_message_id`。这是一次性恢复的进度，任务是否成功仍以回执 `status` 和已验证结果为准；
+HTTP 200 或 `reserved` 不代表最终成功，前置校验拒绝后的失败也不能通过重复调用重新排队。
+新尝试使用单独的有限结果查询计数和起点，旧计数保留在原回执历史中，账号读取节拍不重置。
+查询预算结束后，普通 GET 不再触发上游读取；只有已有显式 `/recover` 契约允许的受控复查可以再读一次。
+若最终发送前发现旧节点迟到，取消本次补发并保留原请求的 UNKNOWN，由同一 ID 继续读取原结果。
+调用方保留同一 Provider 请求 ID，按原状态接口核对结果；丢失发送响应或进程重启后也不能创建新 ID
+或请求第二次发送。这个显式操作仍是一次新的模型执行，存在上游迟到结果的残余重复风险；代码可用
+不等于获准执行任意历史任务。真实调用前须核对原业务的具体恢复授权。
+
+Provider 必须先部署此契约，消费者才可启用；收到旧版本 404 时不可回退为普通提交或新后继。
+正常 Worker 的恢复分支可在原任务已有明确恢复授权，且原后继返回
+`recovery_automatic_stopped: true`、`recovery_stop_reason: "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"`
+时调用这个显式 POST；Provider 仍独立检查全部资格。该分支沿用原 child 的七字段和请求 ID，
+重启后先读取同一回执；存在 `missing_successor_resume` 时跟踪该尝试，不能重新生成 child ID。
+HTTP 409 保留具体原因并停止该恢复分支；GET 和普通同 ID POST 本身都不触发新发送。
+接受过此尝试后，回退版本必须仍能识别其持久尝试和结果读取规则，不能删除标记或旧回执来回退。
+
 ### 429 分层
 
 | 来源 | 证据与处理 |

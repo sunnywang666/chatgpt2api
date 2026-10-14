@@ -9,6 +9,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import threading
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -368,6 +369,13 @@ class TextTaskService:
             result["continue_after_no_final"] = True
         if receipt.get("_derived_input"):
             result["derived_input"] = receipt["_derived_input"]
+        missing_attempt = TextTaskService._missing_successor_attempt(receipt)
+        if missing_attempt:
+            result["missing_successor_resume"] = {
+                "attempt": missing_attempt["attempt"],
+                "state": missing_attempt["state"],
+                "request_message_id": missing_attempt["request_message_id"],
+            }
         completion = receipt.get("_completion")
         if isinstance(completion, dict):
             result["completion"] = {key: completion[key] for key in (
@@ -821,7 +829,7 @@ class TextTaskService:
                 return False
             receipt.update(_result_wait_ended_at=now, updated_at=now)
             return True
-        created = receipt.get("created_at")
+        created = cls._recovery_started_at(receipt, now)
         reads = receipt.get("recovery_no_result_reads")
         if (type(created) not in (int, float) or not math.isfinite(created)
                 or now - created < cls.UNRECOVERABLE_MIN_AGE_SECONDS
@@ -882,6 +890,7 @@ class TextTaskService:
             if not row:
                 return {"request_id": request_id, "status": "not_found"}
             current = json.loads(row[0])
+            missing_attempt = self._missing_successor_attempt(current)
             if current.get("status") == "succeeded" or (
                 current.get("status") == "failed" and current.get("error_code") == "CHAT_RESPONSE_NOT_TEXT"
             ):
@@ -899,7 +908,7 @@ class TextTaskService:
                 if coverage_version == 1 and current.get(
                         RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD) != 1:
                     qualified_reads = 0
-                created_at = float(current.get("created_at") or now)
+                created_at = self._recovery_started_at(current, now)
                 qualified_read_recorded = (
                     (count_unrecoverable or self._bounded_chat_wait(current))
                     and recovery_reason in self._UNRECOVERABLE_REASONS
@@ -987,14 +996,31 @@ class TextTaskService:
                     "recovery_reason": None,
                     "recovery_requires_new_conversation": False,
                 }
+            if missing_attempt:
+                # The recovered branch belongs to the new private message ID.
+                # Its request-parent cursor must not overwrite the original
+                # submitted successor's historical cursor.
+                changes.pop("request_parent_message_id", None)
+                if not error_code or (recovered or {}).get("status") == "failed":
+                    source = (missing_attempt.get("result_source")
+                              if missing_attempt.get("state") == "recovered" else "replacement")
+                    changes["_missing_successor_resume"] = {
+                        **missing_attempt, "state": "recovered", "recovered_at": now,
+                        "result_source": source,
+                    }
             if not error_code:
                 changes["recovery_last_read_error"] = None
-            observation = self._safe_result_observation((recovered or {}).get("_original_result_observation"), current)
+            recovery_view = self._missing_successor_recovery_receipt(current) or current
+            observation = self._safe_result_observation(
+                (recovered or {}).get("_original_result_observation"), recovery_view,
+            )
             observed = bool(error_code == "UPSTREAM_OUTCOME_UNKNOWN"
                             and recovery_reason == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
                             and observation is not None)
             if observed:
-                previous = self._safe_result_observation(current.get("_original_result_observation"), current)
+                previous = self._safe_result_observation(
+                    current.get("_original_result_observation"), recovery_view,
+                )
                 started = current.get("_result_observation_started_at")
                 progress = current.get("_result_last_progress_at")
                 initial = previous is None or type(started) not in (int, float) or not math.isfinite(started)
@@ -1110,6 +1136,7 @@ class TextTaskService:
              _explicit_ended_recheck: bool = False):
         from services.pool_admission import unknown_text_result
         recovery_claim = None
+        recovery_target = None
         now = self._now()
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1196,6 +1223,7 @@ class TextTaskService:
                     }
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
                                (json.dumps(recovery_claim[1]), owner, request_id))
+                    recovery_target = self._missing_successor_recovery_receipt(recovery_claim[1]) or recovery_claim[1]
         if not row:
             return {"request_id": request_id, "status": "not_found"}
         if recovery_claim:
@@ -1222,8 +1250,9 @@ class TextTaskService:
                     if self.admission is not None:
                         self.admission.wake()
                     return result
-                recovered = self.recovery_reader(recovery_claim[1])
-                safe_result, error_code, phase, recovery_reason = self._safe_recovery_result(recovered, recovery_claim[1])
+                target = recovery_target or recovery_claim[1]
+                recovered = self.recovery_reader(target)
+                safe_result, error_code, phase, recovery_reason = self._safe_recovery_result(recovered, target)
                 if not error_code and recovery_claim[1].get("_forward_protocol"):
                     from services.durable_forward import recovered_chat_wire
                     if recovered.get("status") == "succeeded":
@@ -1318,7 +1347,7 @@ class TextTaskService:
                     or current.get("recovery_claim_id") or current.get("_executing") is True
                     or current.get("_recovery_paused") is True):
                 return self._public(current)
-            created_at = float(current.get("created_at") or now)
+            created_at = self._recovery_started_at(current, now)
             if (
                 current.get("status") != "unknown"
                 or now - created_at < self.UNRECOVERABLE_MIN_AGE_SECONDS
@@ -2035,6 +2064,226 @@ class TextTaskService:
         return self._public(updated)
 
     @staticmethod
+    def _missing_successor_attempt(receipt):
+        """Return the private one-use resend record, if it is well formed.
+
+        ``request_message_id`` remains the ID of the original submitted
+        successor.  The retry needs its own upstream user-node ID, otherwise a
+        late appearance of the original node is indistinguishable from a new
+        send.  This marker is deliberately part of the existing receipt: it is
+        committed before a transport can start and survives a process crash.
+        """
+        value = receipt.get("_missing_successor_resume")
+        if not isinstance(value, dict) or set(value) - {
+            "version", "attempt", "state", "request_message_id",
+            "original_request_message_id", "submission_parent_message_id",
+            "attempt_submission_parent_message_id",
+            "request_parent_message_id", "accepted_at", "submitted_at",
+            "recovered_at", "result_source", "prior",
+        }:
+            return None
+        if (value.get("version") != 1 or value.get("attempt") != 1
+                or value.get("state") not in {"reserved", "submitted", "recovered"}
+                or any(not isinstance(value.get(key), str) or not value[key].strip()
+                       for key in ("request_message_id", "original_request_message_id",
+                                   "submission_parent_message_id"))
+                or value["original_request_message_id"] != receipt.get("request_message_id")
+                or value["request_message_id"] == value["original_request_message_id"]
+                or not isinstance(value.get("prior"), dict)):
+            return None
+        for key in ("accepted_at", "submitted_at", "recovered_at"):
+            if key in value and (type(value[key]) not in (int, float) or not math.isfinite(value[key])):
+                return None
+        parent = value.get("request_parent_message_id")
+        if parent is not None and (not isinstance(parent, str) or not parent.strip()):
+            return None
+        attempt_parent = value.get("attempt_submission_parent_message_id")
+        if attempt_parent is not None and (not isinstance(attempt_parent, str) or not attempt_parent.strip()):
+            return None
+        if value.get("result_source") is not None and value["result_source"] not in {"original", "replacement"}:
+            return None
+        return value
+
+    @classmethod
+    def _recovery_started_at(cls, receipt, now):
+        """Return the current recovery window's durable start time.
+
+        A missing-successor resend retains the original receipt verbatim in
+        ``prior``.  Its own finite original-result reads must begin at the
+        reservation, rather than inheriting the old stopped receipt's age.
+        """
+        marker = cls._missing_successor_attempt(receipt)
+        started = marker.get("accepted_at") if marker else receipt.get("created_at")
+        return float(started) if type(started) in (int, float) and math.isfinite(started) else now
+
+    @classmethod
+    def _missing_successor_recovery_receipt(cls, receipt):
+        marker = cls._missing_successor_attempt(receipt)
+        if not marker or marker["state"] != "submitted":
+            return None
+        # The exact new user node is the only acceptable post-send recovery
+        # target.  Keep the original receipt unchanged so its old node remains
+        # auditable and a late old-node answer is still checked at send time.
+        return {
+            **receipt,
+            "request_message_id": marker["request_message_id"],
+            "request_parent_message_id": marker.get("request_parent_message_id")
+                or marker["submission_parent_message_id"],
+            "_submission_parent_message_id": marker.get("attempt_submission_parent_message_id")
+                or marker["submission_parent_message_id"],
+        }
+
+    def _update_missing_successor_cursor(self, owner, request_id, marker_id, cursor):
+        """Keep new-attempt cursor evidence private to its one-use marker."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+            current = json.loads(row[0]) if row else None
+            marker = self._missing_successor_attempt(current or {})
+            if (not marker or marker["request_message_id"] != marker_id
+                    or marker["state"] not in {"reserved", "submitted"}):
+                return
+            actual_parent = cursor.get("request_parent_message_id")
+            actual_submission_parent = cursor.get("_submission_parent_message_id")
+            if ((isinstance(actual_parent, str) and actual_parent.strip())
+                    or (isinstance(actual_submission_parent, str) and actual_submission_parent.strip())):
+                marker = {
+                    **marker,
+                    **({"request_parent_message_id": actual_parent}
+                       if isinstance(actual_parent, str) and actual_parent.strip() else {}),
+                    **({"attempt_submission_parent_message_id": actual_submission_parent}
+                       if isinstance(actual_submission_parent, str) and actual_submission_parent.strip() else {}),
+                }
+                current["_missing_successor_resume"] = marker
+                current["updated_at"] = self._now()
+                db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(current), owner, request_id))
+
+    def _mark_missing_successor_recovered(self, owner, request_id, source="replacement"):
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+            current = json.loads(row[0]) if row else None
+            marker = self._missing_successor_attempt(current or {})
+            if marker and marker["state"] in {"reserved", "submitted"}:
+                current["_missing_successor_resume"] = {**marker, "state": "recovered", "recovered_at": self._now(),
+                                                          "result_source": source}
+                current["updated_at"] = self._now()
+                db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(current), owner, request_id))
+
+    def _validated_missing_successor_input(self, db, owner, request_id, request_hash, receipt, envelope, now):
+        if (set(envelope) != self.SUPERSEDE_FIELDS
+                or envelope.get("client_request_id") != request_id
+                or any(not isinstance(envelope.get(key), str) or not envelope[key].strip()
+                       or envelope[key] != envelope[key].strip() for key in self.SUPERSEDE_FIELDS)):
+            raise ConversationBindingError("missing-successor envelope is invalid", code="CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE")
+        body = self.store.load_input(receipt.get("_input_ref"))
+        if (not isinstance(body, dict) or self._submission_identity(owner, body) != (request_id, request_hash)
+                or any(body.get(key) != envelope[key] for key in self.SUPERSEDE_FIELDS)
+                or "derived_input" in body):
+            raise ConversationBindingError("retained successor input changed", code="CHAT_MISSING_SUCCESSOR_INPUT_UNAVAILABLE")
+        parent = receipt.get("_submission_parent_message_id")
+        if not isinstance(parent, str) or not parent:
+            # Old receipts can use the public parent only when there is no
+            # distinct actual request parent to confuse the retry cursor.
+            parent = receipt.get("parent_message_id")
+            if (not isinstance(parent, str) or not parent
+                    or receipt.get("request_parent_message_id") not in (None, "", parent)):
+                raise ConversationBindingError("successor parent is ambiguous", code="CHAT_MISSING_SUCCESSOR_CURSOR_CHANGED")
+        if body.get("parent_message_id") != parent:
+            raise ConversationBindingError("retained successor parent changed", code="CHAT_MISSING_SUCCESSOR_CURSOR_CHANGED")
+        marker = self._missing_successor_attempt(receipt)
+        if "_missing_successor_resume" in receipt and marker is None:
+            raise ConversationBindingError("missing-successor marker is invalid", code="CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE")
+        if marker:
+            return body, marker
+        timeline = receipt.get("_execution_timeline")
+        if (receipt.get("_route", "chat") != "chat" or receipt.get("_operation", "text") != "text"
+                or receipt.get("_forward_protocol") or receipt.get("_public_session_ref")
+                or receipt.get("_expected_sends") != 1
+                or receipt.get("_derived_input")
+                or receipt.get("_submission_started") is not True
+                or receipt.get("status") != "failed" or receipt.get("error_code") != "RESULT_UNRECOVERABLE"
+                or receipt.get("upstream_outcome") != "unknown"
+                or receipt.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND"
+                or receipt.get("_attempt_reason") != "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"
+                or not isinstance(receipt.get("_attempt_finished_at"), (int, float))
+                or receipt.get("_execution_wait_ended_at") is None
+                or receipt.get("_executing") or receipt.get("_turn_reserved")
+                or receipt.get("_work_key") or receipt.get("_completion") or receipt.get("_completion_of")
+                or receipt.get("_recovery_paused") or receipt.get("_recovery_suppressed")
+                or not isinstance(timeline, list)
+                or not isinstance(receipt.get("request_message_id"), str) or not receipt["request_message_id"]):
+            raise ConversationBindingError("successor is not an ended missing-node attempt", code="CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE")
+        for claim, until in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until")):
+            value = receipt.get(claim)
+            expiry = receipt.get(until)
+            if value and (type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry > now):
+                raise ConversationBindingError("successor is busy", code="CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE")
+        # An expired original-result read cannot be allowed to finish over the
+        # newly reserved attempt.  Clear only a provably expired lease.
+        if receipt.get("recovery_claim_id"):
+            receipt.pop("recovery_claim_id", None)
+            receipt.pop("recovery_claimed_at", None)
+            receipt.pop("recovery_lease_until", None)
+        previous = self._validate_supersede(self.store, db, owner, receipt, now)
+        if previous.get("status") == "succeeded" or previous.get("_upstream_terminal"):
+            raise ConversationBindingError("original predecessor recovered", code="CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE")
+        child = db.execute("SELECT 1 FROM requests WHERE owner=? AND json_extract(receipt,'$._supersedes_request_id')=? LIMIT 1",
+                           (owner, request_id)).fetchone()
+        if child:
+            raise ConversationBindingError("successor already has a child", code="CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE")
+        return body, None
+
+    def resume_missing_successor(self, owner, request_id, envelope):
+        """Reserve one new upstream user node for a stopped missing successor.
+
+        This is intentionally separate from ordinary same-ID submission.  The
+        frozen input and Provider request ID stay unchanged; only a new private
+        upstream message UUID may be sent, and it is never regenerated.
+        """
+        if self.admission is None:
+            raise ConversationBindingError("durable admission is unavailable", code="CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+            if not row:
+                raise ConversationBindingError("successor not found", code="CHAT_REQUEST_NOT_FOUND")
+            receipt = json.loads(row[1])
+            try:
+                _, marker = self._validated_missing_successor_input(
+                    db, owner, request_id, row[0], receipt, envelope, self._now())
+            except (OSError, ValueError, TypeError, KeyError):
+                raise ConversationBindingError("retained successor input unavailable", code="CHAT_MISSING_SUCCESSOR_INPUT_UNAVAILABLE") from None
+            if marker:
+                return self._public(receipt)
+            now = self._now()
+            parent = receipt.get("_submission_parent_message_id") or receipt.get("parent_message_id")
+            marker = {
+                "version": 1, "attempt": 1, "state": "reserved",
+                "request_message_id": str(uuid.uuid4()),
+                "original_request_message_id": receipt["request_message_id"],
+                "submission_parent_message_id": parent,
+                "accepted_at": now,
+                "prior": deepcopy(receipt),
+            }
+            updated = {**receipt, "status": "queued", "boot": self.boot, "updated_at": now,
+                       "_submission_started": False, "_turn_reserved": False, "_executing": False,
+                       "_claim_id": None, "_claim_until": None,
+                       "_execution_wait_ended_at": None, "_attempt_finished_at": None,
+                       "_attempt_reason": None, "recovery_no_result_reads": 0,
+                       "recovery_attempt": 0, "recovery_next_at": None,
+                       "recovery_error_code": None, "recovery_phase": None,
+                       "recovery_retry_after_seconds": None, "recovery_reason": None,
+                       "recovery_last_read_error": None,
+                       "recovery_requires_new_conversation": False,
+                       "_missing_successor_resume": marker}
+            updated["_execution_timeline"] = [*(receipt.get("_execution_timeline") or []),
+                                                {"stage": "missing_successor_resume_reserved", "at": now}][-32:]
+            self.store.write_receipt(db, "text", owner, request_id, updated)
+        self.admission.wake()
+        return self._public(updated)
+
+    @staticmethod
     def _known_unsent_terminal_empty_correction(receipt, now):
         timeline = receipt.get("_execution_timeline") or []
         claim_until = receipt.get("_claim_until")
@@ -2151,8 +2400,23 @@ class TextTaskService:
                 body = {**body, **{key: receipt[key] for key in (
                     "provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id",
                 ) if receipt.get(key)}}
+            missing_attempt = self._missing_successor_attempt(receipt)
+            if missing_attempt:
+                if missing_attempt["state"] not in {"reserved", "submitted"}:
+                    return
+                # Never rewrite the frozen body.  These are execution-only
+                # pointers for the one reserved upstream attempt.
+                body = {**body, "_request_message_id": missing_attempt["request_message_id"],
+                        "parent_message_id": missing_attempt["submission_parent_message_id"],
+                        "_missing_successor_original_receipt": missing_attempt["prior"],
+                        "_missing_successor_attempt_message_id": missing_attempt["request_message_id"]}
         def progress(cursor):
-            if receipt.get("_supersedes_no_final"):
+            if missing_attempt:
+                self._update_missing_successor_cursor(owner, request_id,
+                                                      missing_attempt["request_message_id"], cursor)
+                cursor = {k: v for k, v in cursor.items()
+                          if k not in {"request_parent_message_id", "_submission_parent_message_id"}}
+            if receipt.get("_supersedes_no_final") and not missing_attempt:
                 # The immutable predecessor link keeps its submitted root;
                 # request_parent_message_id records the actual fresh tool tail.
                 cursor = {k: v for k, v in cursor.items() if k != "_submission_parent_message_id"}
@@ -2192,8 +2456,19 @@ class TextTaskService:
             if receipt.get("_supersedes_request_id"):
                 with self.store.transaction() as db:
                     previous = self._validate_supersede(self.store, db, owner, receipt, self._now())
-                body = {**body, "_supersedes_request_message_id": previous["request_message_id"]}
-                if receipt.get("_supersedes_no_final"):
+                # A missing-node resume must guard the current submitted
+                # successor, not its historical predecessor.
+                guard_message_id = (receipt["request_message_id"] if missing_attempt
+                                    else previous["request_message_id"])
+                body = {**body, "_supersedes_request_message_id": guard_message_id}
+                if missing_attempt and receipt.get("_supersedes_no_final"):
+                    expected_tail = receipt.get("request_parent_message_id")
+                    if not isinstance(expected_tail, str) or not expected_tail:
+                        raise ConversationBindingError("missing-successor no-final tail is unavailable",
+                                                       code="CHAT_MISSING_SUCCESSOR_CURSOR_CHANGED")
+                    body.update(_missing_successor_no_final_predecessor=previous,
+                                _missing_successor_expected_tail=expected_tail)
+                if receipt.get("_supersedes_no_final") and not missing_attempt:
                     body["_supersedes_no_final_original"] = previous
             if receipt.get("_terminal_empty_correction_of"):
                 with self._db() as db:
@@ -2254,17 +2529,40 @@ class TextTaskService:
                 result = self.runner(body, on_cursor=progress)
             if receipt.get("_supersedes_request_id"):
                 result = {**result, "upstream_outcome": "completed", "error_code": None, "waiting": None}
+            missing_result_source = (result.pop("_missing_successor_result_source", "replacement")
+                                     if missing_attempt else None)
             # A returned runner result is the terminal local proof for this
             # turn.  Persist that before the admission wrapper's bookkeeping:
             # callers completing the associated work in this small interval
             # must not be told that this already-saved turn is still executing.
+            if missing_attempt:
+                # The runner/read result belongs to the private replacement
+                # node.  Its current cursor and submission root stay in the
+                # marker, leaving the canonical successor's history intact.
+                result.pop("request_parent_message_id", None)
+                result.pop("_submission_parent_message_id", None)
             self._update(owner, request_id, **{**result, "status": "succeeded", "finished_at": self._now(),
                                               "_executing": False})
+            if missing_attempt:
+                self._mark_missing_successor_recovered(owner, request_id, missing_result_source)
             context = current_request.get()
             if context is not None and hasattr(context, "record_stage"):
                 context.record_stage("artifact_saved")
         except ConversationBindingError as exc:
             cursor = {k: getattr(exc, k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id") if getattr(exc, k, "")}
+            if (missing_attempt and exc.code == "CHAT_SUPERSEDE_ORIGINAL_FOUND"):
+                # The original, already-submitted user node appeared during
+                # the final binding-locked check.  A replacement has not been
+                # sent, so consume this reservation and return to exact
+                # original-ID recovery rather than labelling the historic
+                # UNKNOWN as an unsent failure or queuing another dispatch.
+                self._mark_missing_successor_recovered(owner, request_id, "original")
+                self._update(owner, request_id, status="unknown",
+                             error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_outcome="unknown",
+                             _turn_reserved=False, _executing=False,
+                             _claim_id=None, _claim_until=None, finished_at=None,
+                             recovery_next_at=self._now(), **cursor)
+                return
             if exc.code.startswith("CHAT_SUPERSEDE_"):
                 transient = exc.code in {"CHAT_SUPERSEDE_READ_UNAVAILABLE", "CHAT_SUPERSEDE_PREDECESSOR_BUSY"}
                 changes = {"error_code": exc.code, "upstream_outcome": "not_sent", "_turn_reserved": False,
