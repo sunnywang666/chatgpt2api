@@ -243,6 +243,10 @@ Provider 必须先部署此契约，消费者才可启用；收到旧版本 404 
 `recovery_automatic_stopped: true`、`recovery_stop_reason: "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"`
 时调用这个显式 POST；Provider 仍独立检查全部资格。该分支沿用原 child 的七字段和请求 ID，
 重启后先读取同一回执；存在 `missing_successor_resume` 时跟踪该尝试，不能重新生成 child ID。
+若本地已记为待受理，但进程在 POST 前退出，或 POST 响应丢失，读取仍是原停止状态且没有
+`missing_successor_resume` 时，可按既有有界退避重发完全相同的七字段显式命令。即使首个 POST
+仍在途，Provider 事务也只建立一次尝试；重复命令不等于第二次物理发送。本地待受理标记不能
+当成已发送证据，缺失 Provider 标记也不能证明原 UNKNOWN 从未发送。
 HTTP 409 保留具体原因并停止该恢复分支；GET 和普通同 ID POST 本身都不触发新发送。
 接受过此尝试后，回退版本必须仍能识别其持久尝试和结果读取规则，不能删除标记或旧回执来回退。
 
