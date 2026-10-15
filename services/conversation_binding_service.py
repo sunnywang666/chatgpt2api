@@ -16,7 +16,7 @@ from services.account_request_pacing import AccountReadRetryBudgetInsufficient
 from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
 from services.protocol.conversation import conversation_events
 from utils.helper import UpstreamHTTPError
-from utils.upstream_error import safe_upstream_error
+from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
 
 
 class TextRecoveryReason(str, Enum):
@@ -500,6 +500,9 @@ def _text_http_diagnostic(exc: UpstreamHTTPError) -> dict[str, object]:
     detail = _explicit_http_error_detail(body)
     if detail:
         diagnostic["original_upstream_error"] = detail
+    response_ids = safe_upstream_response_ids(exc.response_ids)
+    if response_ids:
+        diagnostic["original_upstream_response_ids"] = response_ids
     return diagnostic
 
 
@@ -615,6 +618,7 @@ class ConversationBindingError(RuntimeError):
         original_upstream_error_form: str = "",
         original_upstream_rejected_field: str = "",
         original_upstream_error: dict[str, str] | None = None,
+        original_upstream_response_ids: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -657,6 +661,10 @@ class ConversationBindingError(RuntimeError):
         )
         self.original_upstream_error = (
             safe_upstream_error(original_upstream_error)
+            if is_stream_open_http else {}
+        )
+        self.original_upstream_response_ids = (
+            safe_upstream_response_ids(original_upstream_response_ids)
             if is_stream_open_http else {}
         )
 

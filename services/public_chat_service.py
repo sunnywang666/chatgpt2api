@@ -206,10 +206,13 @@ def safe_public_execution(value: object) -> dict[str, Any]:
     http_status = value.get("upstream_http_status")
     if type(http_status) is int and 100 <= http_status <= 599:
         result["upstream_http_status"] = http_status
-    from utils.upstream_error import safe_upstream_error
+    from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
     detail = safe_upstream_error(value.get("upstream_error"))
     if detail:
         result["upstream_error"] = detail
+    response_ids = safe_upstream_response_ids(value.get("upstream_response_ids"))
+    if response_ids:
+        result["upstream_response_ids"] = response_ids
     resources = value.get("resources")
     if isinstance(resources, dict):
         result["resources"] = {key: resources[key] for key, allowed in EXECUTION_RESOURCES.items()
@@ -271,8 +274,9 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
     latest = nodes[-1] if isinstance(nodes, list) and nodes and isinstance(nodes[-1], dict) else {}
     stream = next((item for item in reversed(receipt.get("_execution_timeline") or [])
                    if isinstance(item, dict) and item.get("stage") == "stream_finished"), {})
-    from utils.upstream_error import safe_upstream_error
+    from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
     original_http_error = safe_upstream_error(receipt.get("original_upstream_error"))
+    original_response_ids = safe_upstream_response_ids(receipt.get("original_upstream_response_ids"))
     active_error = (original_http_error or stream.get("upstream_error")) if status != "succeeded" else None
     return safe_public_execution({
         "attempt_state": "succeeded" if status == "succeeded" else "ended" if receipt.get("_attempt_finished_at") or status == "failed" else "active",
@@ -295,6 +299,8 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
         **{key: stream[key] for key in ("stream_end", "sse_data_count", "sse_parse_errors", "sse_error_event", "sse_error_category") if key in stream},
         **({"upstream_error": active_error} if active_error else {}),
         **({"upstream_http_status": receipt.get("original_http_status")} if status != "succeeded" else {}),
+        **({"upstream_response_ids": original_response_ids}
+           if status != "succeeded" and original_response_ids else {}),
     })
 
 

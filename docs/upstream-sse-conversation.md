@@ -40,6 +40,9 @@ Conversation SSE 是上游对话链路的流式返回协议。每条 SSE `data:`
 `execution.upstream_error` 返回原因，并在 `execution.upstream_http_status`
 中提供上游 HTTP 状态。正文为空、读取超时或没有可安全展示的详情时，原因字段可缺省；
 调用方仍可显示已知的 HTTP 状态，不能把它解释为“请求未发送”。
+若响应带有格式有效的 `X-Request-Id`/`OpenAI-Request-Id` 或 `CF-Ray`，失败回执的
+`execution.upstream_response_ids` 可选返回净化后的 `request_id`、`cf_ray`；缺失、冲突、
+格式不合法及历史回执均不补填，成功后不再显示。
 
 一般错误详情只帮助展示“出错：原因”，不改变原请求的恢复与防重发判断。
 原生 Chat 文字请求有一项精确例外：对话发送已发生，SSE 建立前明确收到

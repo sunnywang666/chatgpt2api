@@ -246,7 +246,7 @@ python3 examples/image_client.py --env-file .image-client.env chat-recover --sta
 
 原生持久 Chat 文字请求的本地执行等待有界：受理至少15分钟、此后至少3次符合条件的原结果查询仍无法取得结果，且没有活跃执行或恢复领取时，可返回 `failed` / `RESULT_UNRECOVERABLE`，释放给其他独立会话的执行位置。`recovery.upstream_outcome=unknown` 仍表示上游结果尚未确认，不能按“未发送”处理；`recovery.retryable` 仅用于原ID结果查询，不授权再提交模型。保留原请求编号与输入，迟到的准确结果可更新为成功；同会话下一轮仍需原结果确认。网络超时、授权失败、429或查询次数不足不会单独触发此处置。此规则不代表图片/兼容转发/Codex具有相同超时策略。
 
-原生 Chat 对话已发送、SSE 建立前明确返回 HTTP 404 且结构化原因恰为 `Model not found` 时，原回执会明确返回 `failed` / `MODEL_NOT_FOUND` 和上游 `rejected`；错误详情及发送记录保留，不继续无效结果查询。调用方应展示该原因，不能当作未发送或自动换模型重提。这个判断不适用于普通 404、查询失败或网络超时。
+原生 Chat 对话已发送、SSE 建立前明确返回 HTTP 404 且结构化原因恰为 `Model not found` 时，原回执会明确返回 `failed` / `MODEL_NOT_FOUND` 和上游 `rejected`；错误详情及发送记录保留，不继续无效结果查询。调用方应展示该原因，不能当作未发送或自动换模型重提。失败响应若有格式有效的 `X-Request-Id`/`OpenAI-Request-Id` 或 `CF-Ray`，`execution.upstream_response_ids` 可选提供净化后的 `request_id`、`cf_ray`；缺失、冲突、格式不合法和历史回执不补填，成功后隐藏。这个判断不适用于普通 404、查询失败或网络超时。
 
 Chat成功状态是 `succeeded` 且有content；图片任务成功状态仍为 `success`，不要混用。只有实际取得的上游usage才可报告，当前未返回usage时应显示未知。现有公共Chat不提供工具执行或结构化输出保证；应用自行校验模型文本，不把JSON解析失败包装为成功。
 
