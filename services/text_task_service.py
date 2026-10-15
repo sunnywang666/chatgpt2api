@@ -41,6 +41,7 @@ from services.conversation_binding_service import (
 from services.task_store import TaskStore, recovery_control
 from services.request_context import current_request, AdmissionLost
 from services.account_service import account_service
+from utils.upstream_error import safe_upstream_response_ids
 
 
 class TextTaskCapacityError(RuntimeError):
@@ -308,6 +309,10 @@ class TextTaskService:
         detail = safe_upstream_error(receipt.get("original_upstream_error"))
         if detail:
             result["original_upstream_error"] = detail
+        result.pop("original_upstream_response_ids", None)
+        response_ids = safe_upstream_response_ids(receipt.get("original_upstream_response_ids"))
+        if response_ids:
+            result["original_upstream_response_ids"] = response_ids
         if receipt.get("status") == "succeeded":
             # Older successful retries retained their previous active error.
             # Correct the read projection without rewriting original diagnostics.
@@ -1490,6 +1495,16 @@ class TextTaskService:
                 # Success ends the active failure; original_failure_* and the
                 # execution timeline remain available as historical evidence.
                 changes.update(error_code=None, waiting=None, upstream_outcome="completed")
+            if "original_upstream_response_ids" in changes:
+                original_ids = safe_upstream_response_ids(receipt.get("original_upstream_response_ids"))
+                incoming_ids = safe_upstream_response_ids(changes["original_upstream_response_ids"])
+                # A response trace belongs to the original failed HTTP
+                # response. Recovery/read failures are separate observations
+                # and cannot replace it; malformed input is discarded.
+                if original_ids or not incoming_ids:
+                    changes.pop("original_upstream_response_ids")
+                else:
+                    changes["original_upstream_response_ids"] = incoming_ids
             receipt = {**receipt, **changes, "updated_at": self._now()}
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
 
@@ -2702,6 +2717,7 @@ class TextTaskService:
                     "original_upstream_request_stage",
                     "original_upstream_error_form", "original_upstream_rejected_field",
                     "original_upstream_error",
+                    "original_upstream_response_ids",
                 )
                 if (value := getattr(exc, key, None)) is not None and value != ""
             }

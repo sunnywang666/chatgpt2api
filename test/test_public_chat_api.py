@@ -66,22 +66,56 @@ def test_public_get_exposes_sanitized_http_error_without_resubmitting(public_cha
     f.tasks._update(owner, "http-error", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
         original_http_status=404,
         original_upstream_error={"code": "not_found", "message": "Not found; token=secret-value",
-                                 "body": {"private": "must-not-leak"}})
+                                 "body": {"private": "must-not-leak"}},
+        original_upstream_response_ids={"request_id": "req_0123456789abcdef",
+                                        "cf_ray": "0123456789abcdef-SJC"})
     response = f.client.get("/api/chat-requests/http-error", headers=f.headers())
     assert response.status_code == 200
     result = response.json()
     assert result["status"] == "unknown"
     assert result["execution"]["upstream_http_status"] == 404
     assert result["execution"]["upstream_error"] == {"code": "not_found", "message": "Not found; [redacted]"}
+    assert result["execution"]["upstream_response_ids"] == {
+        "request_id": "req_0123456789abcdef", "cf_ray": "0123456789abcdef-SJC",
+    }
     assert "secret-value" not in response.text and "must-not-leak" not in response.text
     f.upstream.assert_not_called()
 
+    other = f.client.get("/api/chat-requests/http-error", headers=f.headers(f.secret_b))
+    assert other.status_code == 404
+    assert "req_0123456789abcdef" not in other.text
+
+    # Public projection revalidates the stored object rather than trusting a
+    # database value written by an older or compromised code path.
+    with f.tasks._db() as db:
+        stored = f.tasks.store.read_receipt(db, "text", owner, "http-error")
+        stored["original_upstream_response_ids"] = {
+            "request_id": "req_0123456789abcdef", "authorization": "PRIVATE_TOKEN",
+        }
+        f.tasks.store.write_receipt(db, "text", owner, "http-error", stored)
+    tampered = f.client.get("/api/chat-requests/http-error", headers=f.headers())
+    assert tampered.status_code == 200
+    assert "upstream_response_ids" not in tampered.json()["execution"]
+    assert "PRIVATE_TOKEN" not in tampered.text
+    f.upstream.assert_not_called()
+
     # A later original-result recovery hides the old active error without
-    # rewriting the stored failure evidence.
+    # rewriting a valid stored response trace.
+    valid_response_ids = {
+        "request_id": "req_0123456789abcdef", "cf_ray": "0123456789abcdef-SJC",
+    }
+    with f.tasks._db() as db:
+        stored = f.tasks.store.read_receipt(db, "text", owner, "http-error")
+        stored["original_upstream_response_ids"] = valid_response_ids
+        f.tasks.store.write_receipt(db, "text", owner, "http-error", stored)
     f.tasks._update(owner, "http-error", status="succeeded", content="original result")
     recovered = f.client.get("/api/chat-requests/http-error", headers=f.headers()).json()
     assert "upstream_error" not in recovered["execution"]
     assert "upstream_http_status" not in recovered["execution"]
+    assert "upstream_response_ids" not in recovered["execution"]
+    with f.tasks._db() as db:
+        stored = f.tasks.store.read_receipt(db, "text", owner, "http-error")
+    assert stored["original_upstream_response_ids"] == valid_response_ids
     f.upstream.assert_not_called()
 
 

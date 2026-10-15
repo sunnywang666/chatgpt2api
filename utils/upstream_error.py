@@ -3,6 +3,58 @@ import re
 import unicodedata
 
 
+_UPSTREAM_RESPONSE_ID_KEYS = frozenset({"request_id", "cf_ray"})
+_UPSTREAM_REQUEST_ID_RE = re.compile(
+    r"(?:req_[A-Za-z0-9_-]{8,96}|[0-9A-Fa-f]{16,64}|[0-9A-Fa-f]{8}"
+    r"-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12})"
+)
+_UPSTREAM_CF_RAY_RE = re.compile(r"[0-9A-Fa-f]{16,32}(?:-[A-Za-z]{3})?")
+
+
+def safe_upstream_response_ids(value: object) -> dict[str, str]:
+    """Keep only recognizable correlation IDs from a failed HTTP response."""
+    if not isinstance(value, dict) or set(value) - _UPSTREAM_RESPONSE_ID_KEYS:
+        return {}
+    result: dict[str, str] = {}
+    request_id = value.get("request_id")
+    if isinstance(request_id, str) and _UPSTREAM_REQUEST_ID_RE.fullmatch(request_id):
+        result["request_id"] = request_id
+    cf_ray = value.get("cf_ray")
+    if isinstance(cf_ray, str) and _UPSTREAM_CF_RAY_RE.fullmatch(cf_ray):
+        result["cf_ray"] = cf_ray
+    return result
+
+
+def upstream_response_ids_from_headers(headers: object) -> dict[str, str]:
+    """Read the two allowlisted response headers without retaining headers."""
+    items = getattr(headers, "items", None)
+    if not callable(items):
+        return {}
+    values = {"request_id": [], "cf_ray": []}
+    names = {
+        "x-request-id": "request_id",
+        "openai-request-id": "request_id",
+        "cf-ray": "cf_ray",
+    }
+    try:
+        pairs = items()
+    except Exception:
+        return {}
+    for name, candidate in pairs:
+        if not isinstance(name, str):
+            continue
+        target = names.get(name.lower())
+        if target is not None:
+            values[target].append(candidate)
+    captured = {}
+    for key, candidates in values.items():
+        # Both recognized request-ID headers are useful only when they agree.
+        # A malformed or conflicting value is no evidence.
+        if candidates and all(isinstance(item, str) for item in candidates) and len(set(candidates)) == 1:
+            captured[key] = candidates[0]
+    return safe_upstream_response_ids(captured)
+
+
 def _safe_text(value: object, limit: int) -> str:
     if not isinstance(value, str):
         return ""

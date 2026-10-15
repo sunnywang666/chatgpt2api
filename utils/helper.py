@@ -13,7 +13,12 @@ from curl_cffi import requests
 from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
-from utils.upstream_error import safe_upstream_error, sse_error_detail
+from utils.upstream_error import (
+    safe_upstream_error,
+    safe_upstream_response_ids,
+    sse_error_detail,
+    upstream_response_ids_from_headers,
+)
 
 BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
@@ -160,11 +165,13 @@ class UpstreamHTTPError(RuntimeError):
         status_code: int,
         body: Any,
         retry_after: int | None = None,
+        response_ids: dict[str, str] | None = None,
     ) -> None:
         self.context = context
         self.status_code = status_code
         self.body = body
         self.retry_after = retry_after
+        self.response_ids = safe_upstream_response_ids(response_ids)
         safe_context = str(context or "upstream").split("?", 1)[0].split("#", 1)[0] or "upstream"
         super().__init__(f"{safe_context} failed: status={status_code}")
 
@@ -254,7 +261,8 @@ def ensure_ok(response: requests.Response, context: str) -> None:
         ra_str = str(retry_after_header).strip()
         if ra_str.isdigit():
             retry_after = int(ra_str)
-    raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after)
+    response_ids = upstream_response_ids_from_headers(getattr(response, "headers", None))
+    raise UpstreamHTTPError(context, response.status_code, body, retry_after=retry_after, response_ids=response_ids)
 
 
 def _stream_exception_detail(exc: Exception) -> dict[str, str]:

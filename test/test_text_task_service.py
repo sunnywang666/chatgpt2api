@@ -409,8 +409,9 @@ class TextTaskTests(unittest.TestCase):
 
     def test_exact_detail_text_model_not_found_is_terminal_without_recovery_or_cursor_read(self):
         from contextlib import nullcontext
+        from requests import Response
         from services.pool_admission import original_turn_ended
-        from utils.helper import UpstreamHTTPError
+        from utils.helper import UpstreamHTTPError, ensure_ok
 
         recovery_reader = mock.Mock(side_effect=AssertionError("model rejection must not be recovered"))
         service = TextTaskService(
@@ -419,7 +420,17 @@ class TextTaskTests(unittest.TestCase):
         )
         body = {**self.body, "model": "fixture-text", "provider_binding_id": "binding-a",
                 "provider_account_identity": "account-a"}
-        upstream = UpstreamHTTPError("/backend-api/conversation", 404, {"detail": "Model not found"})
+        upstream_response = Response()
+        upstream_response.status_code = 404
+        upstream_response._content = json.dumps({"detail": "Model not found"}).encode()
+        upstream_response.headers.update({
+            "X-Request-Id": "req_0123456789abcdef",
+            "CF-Ray": "0123456789abcdef-SJC",
+            "Authorization": "Bearer SECRET_TOKEN",
+        })
+        with self.assertRaises(UpstreamHTTPError) as captured:
+            ensure_ok(upstream_response, "/backend-api/conversation")
+        upstream = captured.exception
         backend = mock.Mock()
         with (
             mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-a"),
@@ -439,12 +450,43 @@ class TextTaskTests(unittest.TestCase):
         self.assertIs(receipt["recovery_retryable"], False)
         self.assertIs(receipt["recovery_requires_new_conversation"], False)
         self.assertEqual(receipt["original_upstream_error"], {"message": "Model not found"})
+        self.assertEqual(receipt["original_upstream_response_ids"], {
+            "request_id": "req_0123456789abcdef", "cf_ray": "0123456789abcdef-SJC",
+        })
         self.assertEqual(receipt["provider_binding_id"], "binding-a")
         self.assertEqual(receipt["provider_account_identity"], "account-a")
         self.assertEqual(receipt["execution"]["send_state"], "attempted")
         self.assertTrue(original_turn_ended("text", receipt))
         recovery_reader.assert_not_called()
         backend.get_conversation_parent_message_id.assert_not_called()
+        restarted = TextTaskService(self.path, recovery_reader=recovery_reader)
+        self.assertEqual(restarted.read("owner", body["client_request_id"])["original_upstream_response_ids"], {
+            "request_id": "req_0123456789abcdef", "cf_ray": "0123456789abcdef-SJC",
+        })
+
+    def test_response_ids_are_revalidated_and_preserved_when_later_recovery_errors_are_recorded(self):
+        service = TextTaskService(self.path, executor=self.queue)
+        service.submit("owner", self.body)
+        response_ids = {"request_id": "req_0123456789abcdef", "cf_ray": "0123456789abcdef-SJC"}
+        service._update(
+            "owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            original_failure_phase="stream_open", original_http_status=429,
+            original_exception_category="http", original_upstream_response_ids=response_ids,
+        )
+        # A later recovery failure changes its own typed evidence only. It must
+        # not replace the original failed-response correlation IDs.
+        service._update(
+            "owner", "attempt-1", recovery_error_code="RECOVERY_READ_FAILED",
+            recovery_last_read_error={"phase": "conversation_detail", "category": "http",
+                                      "http_status": 429, "retry_after_seconds": None,
+                                      "candidate_ref": None},
+        )
+        receipt = service.read("owner", "attempt-1")
+        self.assertEqual(receipt["original_upstream_response_ids"], response_ids)
+        service._update("owner", "attempt-1", original_upstream_response_ids={
+            "request_id": "PRIVATE_TOKEN", "authorization": "SECRET",
+        })
+        self.assertEqual(service.read("owner", "attempt-1")["original_upstream_response_ids"], response_ids)
 
     def test_model_not_found_http_classification_excludes_all_forward_forms(self):
         from services.conversation_binding_service import _is_model_not_found_http_rejection

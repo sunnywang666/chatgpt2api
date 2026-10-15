@@ -27,7 +27,11 @@ from utils.helper import (
     UpstreamHTTPError,
     ensure_ok,
 )
-from utils.upstream_error import safe_upstream_error
+from utils.upstream_error import (
+    safe_upstream_error,
+    safe_upstream_response_ids,
+    upstream_response_ids_from_headers,
+)
 
 
 class _QueuedExecutor:
@@ -143,6 +147,55 @@ def test_successful_sse_is_not_consumed_by_ensure_ok(loopback_server):
     response = _stream(loopback_server + "/sse")
     ensure_ok(response, "/backend-api/conversation")
     assert b"".join(response.iter_content()) == b"data: first SSE payload\n\ndata: [DONE]\n\n"
+
+
+def test_failed_http_response_captures_only_allowlisted_response_ids():
+    from requests import Response
+
+    response = Response()
+    response.status_code = 404
+    response._content = b'{"detail":"Model not found"}'
+    response.headers.update({
+        "X-Request-Id": "req_0123456789abcdef",
+        "CF-Ray": "0123456789abcdef-SJC",
+        "Authorization": "Bearer PRIVATE_TOKEN",
+        "Set-Cookie": "session=PRIVATE_COOKIE",
+        "X-Trace": "PRIVATE_TRACE",
+    })
+    with pytest.raises(UpstreamHTTPError) as raised:
+        ensure_ok(response, "/backend-api/conversation")
+    assert raised.value.response_ids == {
+        "request_id": "req_0123456789abcdef",
+        "cf_ray": "0123456789abcdef-SJC",
+    }
+    assert "PRIVATE" not in json.dumps(raised.value.response_ids)
+
+    no_header_response = Response()
+    no_header_response.status_code = 404
+    no_header_response._content = b'{"detail":"Model not found"}'
+    with pytest.raises(UpstreamHTTPError) as without_ids:
+        ensure_ok(no_header_response, "/backend-api/conversation")
+    assert without_ids.value.response_ids == {}
+
+
+def test_response_id_capture_rejects_malformed_conflicting_and_publicly_tampered_values():
+    assert upstream_response_ids_from_headers({
+        "x-request-id": "req_0123456789abcdef",
+        "openai-request-id": "req_fedcba9876543210",
+        "cf-ray": "0123456789abcdef-SJC",
+    }) == {"cf_ray": "0123456789abcdef-SJC"}
+    assert upstream_response_ids_from_headers({
+        "x-request-id": "PRIVATE_TOKEN",
+        "cf-ray": "not-a-ray",
+    }) == {}
+    assert upstream_response_ids_from_headers({
+        "openai-request-id": "req_0123456789abcdef",
+    }) == {"request_id": "req_0123456789abcdef"}
+    assert safe_upstream_response_ids({
+        "request_id": "req_0123456789abcdef",
+        "authorization": "PRIVATE_TOKEN",
+    }) == {}
+    assert safe_upstream_response_ids({"request_id": "req_0123456789abcdef "}) == {}
 
 
 def test_image_stream_failure_logs_safe_exception_text_and_keeps_structured_details():
