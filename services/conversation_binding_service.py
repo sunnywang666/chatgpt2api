@@ -503,6 +503,41 @@ def _text_http_diagnostic(exc: UpstreamHTTPError) -> dict[str, object]:
     return diagnostic
 
 
+def is_model_not_found_rejection(receipt: object) -> bool:
+    """Recognize only the provider's structured pre-stream model rejection."""
+    if not isinstance(receipt, dict):
+        return False
+    return bool(
+        receipt.get("_route", "chat") == "chat"
+        and receipt.get("_operation", "text") == "text"
+        and not receipt.get("_forward_protocol")
+        and receipt.get("original_failure_phase") == "stream_open"
+        and receipt.get("original_exception_category") == "http"
+        and receipt.get("original_upstream_request_stage") == "conversation"
+        and type(receipt.get("original_http_status")) is int
+        and receipt.get("original_http_status") == 404
+        and receipt.get("original_upstream_error_form") == "detail_text"
+        and safe_upstream_error(receipt.get("original_upstream_error")) == {"message": "Model not found"}
+    )
+
+
+def _is_model_not_found_http_rejection(body: dict, failure_phase: str, exc: UpstreamHTTPError) -> tuple[bool, dict[str, object]]:
+    diagnostic = _text_http_diagnostic(exc)
+    if body.get("_forward") or body.get("_editable") or body.get("_forward_protocol"):
+        return False, diagnostic
+    receipt = {
+        "_route": body.get("_route", "chat"),
+        "_operation": body.get("_operation", "text"),
+        "_forward_protocol": body.get("_forward_protocol"),
+        "original_failure_phase": failure_phase,
+        "original_exception_category": "http",
+        "original_upstream_request_stage": _TEXT_HTTP_REQUEST_STAGES.get(exc.context, "unknown"),
+        "original_http_status": exc.status_code,
+        **diagnostic,
+    }
+    return is_model_not_found_rejection(receipt), diagnostic
+
+
 def _text_failure_category(exc: Exception) -> str:
     if isinstance(exc, UpstreamHTTPError):
         return "http"
@@ -1993,6 +2028,23 @@ class ConversationBindingService:
                                                        code="CHAT_SUPERSEDE_READ_UNAVAILABLE") from exc
                 original_category = _text_failure_category(exc)
                 original_status = exc.status_code if isinstance(exc, UpstreamHTTPError) else None
+                if isinstance(exc, UpstreamHTTPError) and failure_phase == "stream_open":
+                    model_not_found, diagnostic = _is_model_not_found_http_rejection(body, failure_phase, exc)
+                    if model_not_found:
+                        # A structured 404 before SSE is an explicit model
+                        # rejection.  Do not consume an extra cursor GET: no
+                        # upstream turn/result can be recovered from it.
+                        raise ConversationBindingError(
+                            "upstream model was not found",
+                            code="MODEL_NOT_FOUND",
+                            provider_binding_id=binding_id,
+                            provider_account_identity=account_identity,
+                            original_failure_phase=failure_phase,
+                            original_http_status=original_status,
+                            original_exception_category=original_category,
+                            original_upstream_request_stage=_TEXT_HTTP_REQUEST_STAGES.get(exc.context, "unknown"),
+                            **diagnostic,
+                        ) from exc
                 recovered_parent = ""
                 if returned_conversation_id:
                     try:

@@ -155,6 +155,10 @@ def unfinished(kind, receipt):
 def original_turn_ended(kind, receipt):
     if receipt.get("_upstream_terminal") is True:
         return True
+    if kind == "text":
+        from services.conversation_binding_service import is_model_not_found_rejection
+        if receipt.get("status") == "failed" and receipt.get("error_code") == "MODEL_NOT_FOUND":
+            return is_model_not_found_rejection(receipt)
     # Older public Chat code recorded a definitive validation rejection as
     # UNKNOWN. Only its exact model endpoint / pre-SSE HTTP evidence proves
     # that turn ended. Missing stages, timeouts and result age prove nothing.
