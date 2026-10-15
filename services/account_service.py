@@ -2334,7 +2334,14 @@ class AccountService:
                 "revision": self._authorization_revision(account),
             }
 
-    def refresh_codex_observation(self, owner: str, account_ref: str, pool: bool = False) -> dict:
+    def refresh_codex_observation(
+        self,
+        owner: str,
+        account_ref: str,
+        pool: bool = False,
+        *,
+        force_refresh: bool = False,
+    ) -> dict:
         # Resolve only the already selected record. This never imports an account
         # or calls the image/Chat metadata path.
         with self._lock:
@@ -2353,7 +2360,18 @@ class AccountService:
             if self._account_identity(account) != self._codex_identity(credentials):
                 raise CodexAuthorizationAttachError("codex_authorization_invalid_material")
         from services.codex_service import codex_service
-        result = codex_service.refresh_account(token)
+        try:
+            # Keep the ordinary observation call shape intact for existing
+            # callers and test doubles.  The explicit pool-admin operation is
+            # the sole path that may force one attached-Codex refresh.
+            if force_refresh:
+                result = codex_service.refresh_account(token, force_refresh=True)
+            else:
+                result = codex_service.refresh_account(token)
+        except Exception as exc:
+            if force_refresh and getattr(exc, "code", None) == "codex_authorization_refresh_failed":
+                raise CodexAuthorizationAttachError("codex_authorization_refresh_failed") from None
+            raise
         self.codex_login_target(owner, account_ref, pool=pool)
         return result
 

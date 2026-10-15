@@ -247,6 +247,54 @@ class CodexObservationTests(unittest.TestCase):
         self.assertEqual(result["error_code"], "models_auth_required")
         self.assertNotIn("token-a", json.dumps(result))
 
+    def test_forced_observation_refreshes_once_then_reads_models_and_usage_once(self):
+        accounts = FakeAccounts([account()])
+        refreshes = []
+
+        def refresh(token, *, force=False, event=""):
+            refreshes.append((token, force, event))
+            return token
+
+        accounts.refresh_codex_access_token = refresh
+        session = FakeSession(gets=[
+            FakeResponse(payload={"models": [{"slug": "gpt-5.6-codex"}]}),
+            FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 10}}}),
+        ])
+
+        result = CodexService(accounts, SessionFactory([session])).refresh_account(
+            "token-a", force_refresh=True
+        )
+
+        self.assertEqual(result["state"], "observed")
+        self.assertEqual(refreshes, [("token-a", True, "codex_observation")])
+        self.assertEqual([call[0] for call in session.calls], ["GET", "GET"])
+        self.assertEqual([call[1] for call in session.calls], [CODEX_MODELS_URL, CODEX_USAGE_URL])
+
+    def test_failed_forced_refresh_stops_before_metadata_and_preserves_response_rejection(self):
+        accounts = FakeAccounts([account()])
+        service = CodexService(accounts, SessionFactory([]))
+        rejection = {
+            "credential_digest": service._credential_digest(accounts.get_account("token-a")),
+            "failed_at": "2026-10-15T00:00:00+00:00",
+        }
+        accounts.accounts["token-a"]["codex_auth_rejection"] = dict(rejection)
+
+        def refresh(token, *, force=False, event=""):
+            self.assertTrue(force)
+            self.assertEqual(event, "codex_observation")
+            accounts.accounts[token]["last_codex_token_refresh_error"] = "codex_oauth_refresh_failed"
+            accounts.accounts[token]["last_codex_token_refresh_error_at"] = "2026-10-15T00:01:00+00:00"
+            return token
+
+        accounts.refresh_codex_access_token = refresh
+
+        with self.assertRaises(CodexServiceError) as raised:
+            service.refresh_account("token-a", force_refresh=True)
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(raised.exception.code, "codex_authorization_refresh_failed")
+        self.assertEqual(accounts.get_account("token-a")["codex_auth_rejection"], rejection)
+
     def test_empty_usage_is_read_failed_instead_of_fabricated_observed(self):
         accounts = FakeAccounts([account()])
         session = FakeSession(gets=[

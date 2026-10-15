@@ -73,6 +73,13 @@ class CodexObservationTarget(BaseModel):
     account_ref: str = Field(pattern=r"^car_[A-Za-z0-9_-]{43}$")
 
 
+class PoolCodexObservationTarget(CodexObservationTarget):
+    # Only the pool administrator's exact selected-account observation may
+    # force a nested Codex authorization refresh.  Other observation actions
+    # retain their normal, non-forcing behavior.
+    force_refresh: bool = Field(default=False, strict=True)
+
+
 class CodexLoginStart(BaseModel):
     model_config = ConfigDict(extra="forbid")
     client_request_id: str = Field(min_length=36, max_length=36)
@@ -111,13 +118,17 @@ def owner_scope(authorization: str | None, owner: str | None) -> str:
     return owner
 
 
-async def account_operation(handler, *args):
+async def account_operation(handler, *args, **kwargs):
     try:
-        return await run_in_threadpool(handler, *args)
+        return await run_in_threadpool(handler, *args, **kwargs)
     except KeyError:
         raise HTTPException(404, detail={"error": "account not found"}) from None
     except CodexAuthorizationAttachError as exc:
-        status = 404 if exc.code == "codex_authorization_account_not_found" else 409
+        status = (
+            404 if exc.code == "codex_authorization_account_not_found"
+            else 503 if exc.code == "codex_authorization_refresh_failed"
+            else 409
+        )
         raise HTTPException(status, detail={"code": exc.code}) from None
     except ValueError:
         raise HTTPException(409, detail={"error": "account import conflicts with existing account scope or has invalid input"}) from None
@@ -282,8 +293,16 @@ def create_router() -> APIRouter:
         return await account_operation(account_service.refresh_submitted_codex_observation, owner, body.account_ref)
 
     @router.post("/pool/codex-observation")
-    async def refresh_pool_codex_observation(body: CodexObservationTarget, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
+    async def refresh_pool_codex_observation(body: PoolCodexObservationTarget, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):
         owner = owner_scope(authorization, x_workbench_account_owner)
+        if body.force_refresh:
+            return await account_operation(
+                account_service.refresh_codex_observation,
+                owner,
+                body.account_ref,
+                True,
+                force_refresh=True,
+            )
         return await account_operation(account_service.refresh_codex_observation, owner, body.account_ref, True)
 
     @router.post("/codex-login")

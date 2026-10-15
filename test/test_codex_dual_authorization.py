@@ -95,6 +95,18 @@ class CodexDualAuthorizationTests(unittest.TestCase):
             service.refresh_account.assert_called_once_with(primary)
         self.assertEqual(len(self.accounts.list_accounts()), 1)
 
+    def test_pool_observation_forwards_only_explicit_forced_codex_refresh(self):
+        primary = self.add_primary()
+        self.accounts.attach_codex_authorization(credentials("forced-observation"))
+        ref = self.accounts.codex_authorization_ref(self.accounts.get_account(primary))
+        with patch("services.codex_service.codex_service") as service:
+            service.refresh_account.return_value = {"state": "observed", "limits": []}
+            self.accounts.refresh_codex_observation(
+                "workbench:pool-admin", ref, True, force_refresh=True
+            )
+            service.refresh_account.assert_called_once_with(primary, force_refresh=True)
+        self.assertEqual(len(self.accounts.list_accounts()), 1)
+
     def test_chat_only_observation_rejects_before_codex_or_chat_refresh_for_both_scopes(self):
         primary = self.add_primary()
         before = self.accounts.get_account(primary)
