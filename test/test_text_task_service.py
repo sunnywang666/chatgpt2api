@@ -407,6 +407,139 @@ class TextTaskTests(unittest.TestCase):
             self.assertNotIn(secret.encode(), self.path.read_bytes())
             self.assertNotIn(secret, response.text)
 
+    def test_exact_detail_text_model_not_found_is_terminal_without_recovery_or_cursor_read(self):
+        from contextlib import nullcontext
+        from services.pool_admission import original_turn_ended
+        from utils.helper import UpstreamHTTPError
+
+        recovery_reader = mock.Mock(side_effect=AssertionError("model rejection must not be recovered"))
+        service = TextTaskService(
+            self.path, ConversationBindingService().complete_text, self.queue,
+            recovery_reader=recovery_reader,
+        )
+        body = {**self.body, "model": "fixture-text", "provider_binding_id": "binding-a",
+                "provider_account_identity": "account-a"}
+        upstream = UpstreamHTTPError("/backend-api/conversation", 404, {"detail": "Model not found"})
+        backend = mock.Mock()
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="SECRET_TOKEN"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+            mock.patch("services.conversation_binding_service.conversation_events", side_effect=upstream),
+        ):
+            self.assertEqual(service.submit("owner", body)["status"], "queued")
+            self.queue.run()
+
+        receipt = service.read("owner", body["client_request_id"])
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["error_code"], "MODEL_NOT_FOUND")
+        self.assertEqual(receipt["upstream_outcome"], "rejected")
+        self.assertNotEqual(receipt["upstream_outcome"], "not_sent")
+        self.assertIs(receipt["recovery_retryable"], False)
+        self.assertIs(receipt["recovery_requires_new_conversation"], False)
+        self.assertEqual(receipt["original_upstream_error"], {"message": "Model not found"})
+        self.assertEqual(receipt["provider_binding_id"], "binding-a")
+        self.assertEqual(receipt["provider_account_identity"], "account-a")
+        self.assertEqual(receipt["execution"]["send_state"], "attempted")
+        self.assertTrue(original_turn_ended("text", receipt))
+        recovery_reader.assert_not_called()
+        backend.get_conversation_parent_message_id.assert_not_called()
+
+    def test_model_not_found_http_classification_excludes_all_forward_forms(self):
+        from services.conversation_binding_service import _is_model_not_found_http_rejection
+        from utils.helper import UpstreamHTTPError
+        error = UpstreamHTTPError("/backend-api/conversation", 404, {"detail": "Model not found"})
+        for body in ({"_forward_protocol": "responses"}, {"_forward": {"protocol": "responses"}},
+                     {"_editable": True}):
+            with self.subTest(body=body):
+                matches, diagnostic = _is_model_not_found_http_rejection(body, "stream_open", error)
+                self.assertFalse(matches)
+                self.assertEqual(diagnostic["original_upstream_error"], {"message": "Model not found"})
+
+    def test_historical_exact_model_not_found_is_corrected_locally_without_recovery(self):
+        recovery_reader = mock.Mock(side_effect=AssertionError("historical model rejection must not be read"))
+        service = TextTaskService(self.path, executor=self.queue, recovery_reader=recovery_reader)
+        service.submit("owner", self.body)
+        timeline = [
+            {"stage": "accepted", "at": 10.0},
+            {"stage": "send_call_started", "at": 11.0},
+            {"stage": "response_headers_received", "at": 12.0},
+        ]
+        service._update(
+            "owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            upstream_outcome="unknown", provider_binding_id="binding-a", provider_account_identity="account-a",
+            conversation_id="conversation-a", parent_message_id="parent-a", _submission_started=True,
+            _executing=False, _turn_reserved=True, _claim_id="expired-claim", _claim_until=0.0,
+            recovery_attempt=2, recovery_reason="REQUEST_MESSAGE_NOT_FOUND",
+            recovery_error_code="CONVERSATION_BINDING_MISMATCH", recovery_no_result_reads=1,
+            recovery_next_at=9999999999.0, original_failure_phase="stream_open", original_http_status=404,
+            original_exception_category="http", original_upstream_request_stage="conversation",
+            original_upstream_error_form="detail_text", original_upstream_error={"message": "Model not found"},
+            _execution_timeline=timeline,
+        )
+
+        repaired = service.read("owner", "attempt-1")
+        self.assertEqual(repaired["status"], "failed")
+        self.assertEqual(repaired["error_code"], "MODEL_NOT_FOUND")
+        self.assertEqual(repaired["upstream_outcome"], "rejected")
+        self.assertIs(repaired["recovery_retryable"], False)
+        self.assertIs(repaired["recovery_requires_new_conversation"], False)
+        self.assertIsNone(repaired["recovery_next_at"])
+        self.assertEqual(repaired["recovery_attempt"], 2)
+        self.assertEqual(repaired["recovery_reason"], "REQUEST_MESSAGE_NOT_FOUND")
+        self.assertEqual(repaired["provider_binding_id"], "binding-a")
+        self.assertEqual(repaired["provider_account_identity"], "account-a")
+        self.assertEqual(repaired["execution"]["send_state"], "response_received")
+        with service.store.connect() as db:
+            stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        self.assertIsNone(stored["_claim_id"])
+        self.assertIsNone(stored["_claim_until"])
+        self.assertEqual(stored["_execution_timeline"], timeline)
+        self.assertEqual(stored["request_id"], "attempt-1")
+        self.assertEqual(stored["parent_message_id"], "parent-a")
+        self.assertTrue(stored["_input_ref"])
+        recovery_reader.assert_not_called()
+        restarted = TextTaskService(self.path, executor=self.queue, recovery_reader=recovery_reader)
+        self.assertEqual(restarted.read("owner", "attempt-1")["error_code"], "MODEL_NOT_FOUND")
+        recovery_reader.assert_not_called()
+
+    def test_model_not_found_correction_rejects_generic_or_active_receipts(self):
+        service = TextTaskService(self.path, executor=self.queue)
+        base = {
+            "_route": "chat", "_operation": "text", "status": "unknown",
+            "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "_submission_started": True,
+            "_executing": False, "original_failure_phase": "stream_open", "original_http_status": 404,
+            "original_exception_category": "http", "original_upstream_request_stage": "conversation",
+            "original_upstream_error_form": "detail_text", "original_upstream_error": {"message": "Model not found"},
+            "_execution_timeline": [{"stage": "send_call_started", "at": 1.0}],
+        }
+        for change in (
+            {"_forward_protocol": "responses"},
+            {"original_upstream_error_form": "error"},
+            {"original_http_status": 422},
+            {"original_http_status": True},
+            {"original_exception_category": "timeout"},
+            {"_claim_id": "live-claim"},
+            {"_claim_id": "unfenced", "_claim_until": None},
+            {"_claim_id": "future", "_claim_until": 101.0},
+            {"_claim_id": "infinite", "_claim_until": float("inf")},
+            {"_claim_id": "nan", "_claim_until": float("nan")},
+            {"_claim_id": "text", "_claim_until": "0"},
+            {"_recovery_paused": True},
+            {"_recovery_suppressed": True},
+            {"_executing": True},
+            {"original_http_status": 404.0},
+            {"original_upstream_error": {"message": "Model not found in this conversation"}},
+            {"content": "already saved"},
+            {"recovery_claim_id": "live-recovery"},
+            {"status": "succeeded"},
+        ):
+            with self.subTest(change=change):
+                receipt = {**base, **change}
+                self.assertFalse(service._correct_historical_model_not_found(receipt, 100.0))
+                self.assertNotEqual(receipt.get("error_code"), "MODEL_NOT_FOUND")
+
     def test_actual_http_steps_and_response_shapes_survive_original_owner_get(self):
         from contextlib import nullcontext
         from fastapi import FastAPI
@@ -652,7 +785,7 @@ class TextTaskTests(unittest.TestCase):
         failed = service.read("owner", "attempt-1")
         self.assertEqual(failed["status"], "unknown")
         self.assertEqual(failed["recovery_error_code"], "RECOVERY_READ_FAILED")
-        self.assertEqual(failed["recovery_phase"], "read_text_request")
+        self.assertEqual(failed["recovery_phase"], "conversation_detail")
         self.assertEqual(failed["recovery_attempt"], 1)
         self.assertNotIn(b"upstream token=secret", self.path.read_bytes())
 

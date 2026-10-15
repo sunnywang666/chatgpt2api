@@ -520,6 +520,62 @@ class TextTaskService:
         exponent = max(0, min(int(attempt) - 1, 5))
         return min(cls.RECOVERY_MAX_BACKOFF_SECONDS, cls.RECOVERY_BASE_BACKOFF_SECONDS * (2 ** exponent))
 
+    @staticmethod
+    def _provably_expired_execution_claim(receipt, now):
+        claim, deadline = receipt.get("_claim_id"), receipt.get("_claim_until")
+        return bool(
+            isinstance(claim, str) and claim
+            and type(deadline) in (int, float) and math.isfinite(deadline) and deadline <= now
+        )
+
+    @classmethod
+    def _historical_model_not_found(cls, receipt, now):
+        """Return true only for an inactive receipt with a proved model rejection."""
+        from services.conversation_binding_service import is_model_not_found_rejection
+        timeline = receipt.get("_execution_timeline")
+        if (not is_model_not_found_rejection(receipt)
+                or receipt.get("status") not in {"unknown", "failed"}
+                or receipt.get("status") == "failed" and receipt.get("error_code") != "RESULT_UNRECOVERABLE"
+                or "content" in receipt or "result" in receipt
+                or receipt.get("_submission_started") is not True
+                or receipt.get("_executing") is True
+                or receipt.get("_claim_id") is not None and not cls._provably_expired_execution_claim(receipt, now)
+                or receipt.get("recovery_claim_id") is not None
+                or receipt.get("_recovery_paused") is True
+                or receipt.get("_recovery_suppressed") is True
+                or not isinstance(timeline, list)
+                or not any(isinstance(item, dict) and item.get("stage") in {
+                    "send_call_started", "response_headers_received"
+                } for item in timeline)):
+            return False
+        return True
+
+    @classmethod
+    def _correct_historical_model_not_found(cls, receipt, now):
+        if not cls._historical_model_not_found(receipt, now):
+            return False
+        # Keep immutable input, cursor/identity, original diagnostics, timeline,
+        # and prior recovery observations.  This changes only the current local
+        # projection so no future GET can claim a known rejection.
+        receipt.update(
+            status="failed",
+            error_code="MODEL_NOT_FOUND",
+            upstream_outcome="rejected",
+            recovery_retryable=False,
+            recovery_requires_new_conversation=False,
+            recovery_next_at=None,
+            waiting=None,
+            _turn_reserved=False,
+            _executing=False,
+            finished_at=receipt.get("finished_at") or now,
+            updated_at=now,
+        )
+        # Match the existing recovery fence: only a finite, expired executor
+        # lease can be removed, so an old worker cannot finish over this repair.
+        if receipt.get("_claim_id") is not None:
+            receipt.update(_claim_id=None, _claim_until=None)
+        return True
+
     @classmethod
     def _safe_recovery_code(cls, exc):
         code = str(getattr(exc, "code", "")).strip().upper()
@@ -1172,8 +1228,9 @@ class TextTaskService:
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
             if row:
                 previous = json.loads(row[0])
-                ended_wait = self._end_execution_wait(previous, now)
-                if self._end_no_final_recovery(previous, now) or ended_wait:
+                corrected = self._correct_historical_model_not_found(previous, now)
+                ended_wait = False if corrected else self._end_execution_wait(previous, now)
+                if corrected or self._end_no_final_recovery(previous, now) or ended_wait:
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
                                (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
@@ -2648,10 +2705,26 @@ class TextTaskService:
                 )
                 if (value := getattr(exc, key, None)) is not None and value != ""
             }
-            self._update(owner, request_id, **cursor, **diagnostic,
-                         classify_before_send=exc.code != "CONVERSATION_OUTCOME_UNKNOWN",
-                         status="unknown" if exc.code == "CONVERSATION_OUTCOME_UNKNOWN" else "failed",
-                         error_code=exc.code, finished_at=self._now())
+            model_not_found = exc.code == "MODEL_NOT_FOUND"
+            self._update(
+                owner, request_id, **cursor, **diagnostic,
+                classify_before_send=exc.code not in {"CONVERSATION_OUTCOME_UNKNOWN", "MODEL_NOT_FOUND"},
+                status="unknown" if exc.code == "CONVERSATION_OUTCOME_UNKNOWN" else "failed",
+                error_code=exc.code,
+                finished_at=self._now(),
+                **({
+                    # The typed upstream HTTP response proves a send even if a
+                    # legacy caller did not record its send boundary.
+                    "_submission_started": True,
+                    "upstream_outcome": "rejected",
+                    "recovery_retryable": False,
+                    "recovery_requires_new_conversation": False,
+                    "recovery_next_at": None,
+                    "waiting": None,
+                    "_turn_reserved": False,
+                    "_executing": False,
+                } if model_not_found else {}),
+            )
         except Exception:
             self._update(owner, request_id, status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
                          original_failure_phase="runner", original_exception_category="other", finished_at=self._now())
