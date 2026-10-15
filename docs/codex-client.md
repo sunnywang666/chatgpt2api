@@ -265,6 +265,12 @@ its `error_code` and, when known, `upstream_outcome=not_sent` or `rejected`.
 Neither permits the caller to generate a new ID and replay automatically.
 Original inputs and native wire data stay private.
 
+A completed native response without final text (including reasoning-only
+output) is an explicit failed fallback, not a successful text result. A saved
+terminal response whose identity does not match the observed upstream
+response is also rejected. Preserve these receipts and do not start a next
+step or replay them automatically.
+
 To perform the next text step, persist its new ID before calling:
 
 ```http

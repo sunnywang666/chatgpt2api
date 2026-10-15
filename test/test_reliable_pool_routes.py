@@ -573,6 +573,62 @@ def test_codex_fallback_projects_only_completed_sse_response(runtime):
     }) == {"_codex_response_id": "resp-sse-final", "content": "完整终态"}
 
 
+@pytest.mark.parametrize(("wire", "saved_response_id", "code"), [
+    ({"id": "resp-reasoning-only", "status": "completed", "output": [
+        {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
+    ]}, None, "CODEX_FALLBACK_EMPTY_RESPONSE"),
+    ({"id": "resp-actual", "status": "completed", "output": [
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "final"}]},
+    ]}, "resp-expected", "CODEX_FALLBACK_RESPONSE_INVALID"),
+])
+def test_codex_fallback_terminal_invalid_response_fails_without_replay_or_continuation(
+        runtime, monkeypatch, wire, saved_response_id, code):
+    from services.codex_service import CodexService
+    from services.conversation_binding_service import ConversationBindingError
+    from test.test_codex_service import FakeResponse, FakeSession, SessionFactory, observation
+
+    original = {"client_request_id": "rejected-original", "client_conversation_id": "first-gallery",
+                "model": "gpt-5-6-thinking", "messages": [{"role": "user", "content": "describe image"}]}
+    runtime.service.submit("owner", original)
+    runtime.service._update("owner", "rejected-original", status="failed", error_code="MODEL_NOT_FOUND",
+                            upstream_outcome="rejected", _submission_started=True)
+    runtime.accounts.update_account(runtime.account["access_token"], {"codex_observation": observation()})
+    monkeypatch.setattr(runtime.accounts, "refresh_codex_access_token", lambda token, **_kwargs: token)
+    session = FakeSession(post_response=FakeResponse(payload=wire))
+    native = CodexService(runtime.accounts, SessionFactory([session]))
+    runtime.admission.codex = native
+    monkeypatch.setattr("services.codex_service.codex_service", native)
+    account_ref = runtime.accounts.pool_account_ref(runtime.account)
+
+    runtime.service.submit_codex_fallback("owner", "rejected-original", "invalid-child", "gpt-5.6-codex", account_ref)
+    if saved_response_id is not None:
+        with runtime.store.transaction() as db:
+            receipt = runtime.store.read_receipt(db, "text", "owner", "invalid-child")
+            receipt["upstream_response_id"] = saved_response_id
+            runtime.store.write_receipt(db, "text", "owner", "invalid-child", receipt)
+    claimed = runtime.admission.claim_next()
+    assert claimed is not None and claimed.request_id == "invalid-child"
+    runtime.admission.execute(claimed)
+
+    failed = runtime.service.read("owner", "invalid-child")
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == code
+    assert len(session.calls) == 1
+    assert runtime.admission.claim_next() is None
+
+    if code == "CODEX_FALLBACK_EMPTY_RESPONSE":
+        # A pre-fix receipt may have been persisted as succeeded without text;
+        # it must remain unavailable as a continuation parent.
+        runtime.service._update("owner", "invalid-child", status="succeeded", error_code=None,
+                                upstream_outcome="completed", _codex_response_id=wire["id"])
+    with pytest.raises(ConversationBindingError) as unavailable:
+        runtime.service.submit_codex_continue("owner", "invalid-child", "blocked-child",
+                                              [{"role": "user", "content": "continue"}])
+    assert unavailable.value.code == "CODEX_FALLBACK_PARENT_UNAVAILABLE"
+    assert runtime.admission.claim_next() is None
+    assert len(session.calls) == 1
+
+
 def test_native_upstream_sse_limit_keeps_layer_and_cooldown_evidence(runtime, monkeypatch):
     from test.test_codex_service import FakeResponse
     response = FakeResponse(chunks=[b'data: {"type":"response.failed","response":{"id":"response-limited","error":{"code":"rate_limit_exceeded","retry_after_seconds":400}}}\n\n'], content_type="text/event-stream")

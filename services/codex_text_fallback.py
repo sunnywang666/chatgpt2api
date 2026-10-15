@@ -11,6 +11,14 @@ def _reject(code):
     raise ConversationBindingError("Codex fallback cannot use this original request", code=code)
 
 
+class CodexFallbackResponseError(ValueError):
+    """A terminal native response cannot safely become a text-task success."""
+
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
 def _stable(value):
     return isinstance(value, str) and bool(value.strip()) and value == value.strip() and len(value) <= 200
 
@@ -166,9 +174,24 @@ def _completed_response(service, receipt):
             return {}
     if not isinstance(response, dict) or response.get("status") != "completed":
         return {}
-    if receipt.get("_upstream_response_id") and response.get("id") != receipt["_upstream_response_id"]:
-        return {}
+    if receipt.get("upstream_response_id") and response.get("id") != receipt["upstream_response_id"]:
+        raise CodexFallbackResponseError("CODEX_FALLBACK_RESPONSE_INVALID")
     return response
+
+
+def _final_text(response):
+    output = response.get("output") if isinstance(response, dict) else None
+    if not isinstance(output, list):
+        return None
+    text = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                text.append(part["text"])
+    result = "".join(text)
+    return result if result.strip() else None
 
 
 def build_continue_body(store, db, owner, parent_id, client_request_id, messages, step_ref=None):
@@ -193,7 +216,7 @@ def build_continue_body(store, db, owner, parent_id, client_request_id, messages
         _reject("CODEX_FALLBACK_PARENT_UNAVAILABLE")
     if (not isinstance(previous_payload, dict) or not isinstance(previous_payload.get("input"), list)
             or not isinstance(response.get("output"), list) or not isinstance(response.get("id"), str)
-            or response["id"] != parent.get("_codex_response_id")):
+            or response["id"] != parent.get("_codex_response_id") or _final_text(response) is None):
         _reject("CODEX_FALLBACK_PARENT_UNAVAILABLE")
     account_ref = parent.get("_requested_account_ref")
     model = previous_payload.get("model")
@@ -254,15 +277,8 @@ def project_completed_wire(service, receipt):
     response_id = response.get("id")
     output = response.get("output")
     if not isinstance(response_id, str) or not response_id or not isinstance(output, list):
-        return {}
-    text = []
-    for item in output:
-        if not isinstance(item, dict) or item.get("type") != "message":
-            continue
-        for part in item.get("content") or []:
-            if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
-                text.append(part["text"])
-    result = {"_codex_response_id": response_id}
-    if text:
-        result["content"] = "".join(text)
-    return result
+        raise CodexFallbackResponseError("CODEX_FALLBACK_RESPONSE_INVALID")
+    text = _final_text(response)
+    if text is None:
+        raise CodexFallbackResponseError("CODEX_FALLBACK_EMPTY_RESPONSE")
+    return {"_codex_response_id": response_id, "content": text}

@@ -451,8 +451,14 @@ def run(service, owner, request_id, body):
         failed = bool(current.get("_upstream_failed"))
         projection = {}
         if protocol == "codex" and terminal and not failed:
-            from services.codex_text_fallback import project_completed_wire
-            projection = project_completed_wire(service, current)
+            from services.codex_text_fallback import CodexFallbackResponseError, project_completed_wire
+            try:
+                projection = project_completed_wire(service, current)
+            except CodexFallbackResponseError as exc:
+                service._update(owner, request_id, status="failed", error_code=exc.code,
+                                upstream_outcome="completed", _wire_head=head, _turn_reserved=False,
+                                finished_at=service._now())
+                return
         service._update(owner, request_id, status="failed" if failed and terminal else "succeeded" if terminal else "unknown",
                         error_code="codex_response_failed" if failed and terminal else None if terminal else "codex_upstream_outcome_unknown",
                         _wire_head=head, _turn_reserved=not terminal, finished_at=service._now(), **projection)
