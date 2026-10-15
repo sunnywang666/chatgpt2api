@@ -573,6 +573,82 @@ def test_codex_fallback_projects_only_completed_sse_response(runtime):
     }) == {"_codex_response_id": "resp-sse-final", "content": "完整终态"}
 
 
+def test_admin_codex_fallback_options_are_owner_scoped_cached_and_read_only(runtime, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api import ai
+    from services.codex_service import CodexService
+    from test.test_codex_service import FakeSession, SessionFactory, observation
+
+    original = {"client_request_id": "rejected-original", "client_conversation_id": "first-gallery",
+                "model": "gpt-5-6-thinking", "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "SENTINEL-PROMPT"},
+                    {"type": "image_url", "image_url": "data:image/png;base64,SENTINEL-IMAGE"},
+                ]}]}
+    runtime.service.submit("owner", original)
+    runtime.service._update("owner", "rejected-original", status="failed", error_code="MODEL_NOT_FOUND",
+                            upstream_outcome="rejected", _submission_started=True)
+    unknown = {"client_request_id": "unknown-original", "client_conversation_id": "first-gallery",
+               "model": "gpt-5-6-thinking", "messages": [{"role": "user", "content": "unknown"}]}
+    runtime.service.submit("owner", unknown)
+    runtime.service._update("owner", "unknown-original", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                            upstream_outcome="unknown", _submission_started=True)
+    runtime.service.submit("other-owner", {**original, "client_request_id": "other-original"})
+    runtime.service._update("other-owner", "other-original", status="failed", error_code="MODEL_NOT_FOUND",
+                            upstream_outcome="rejected", _submission_started=True)
+
+    runtime.accounts.update_account(runtime.account["access_token"], {"codex_observation": observation()})
+    session = FakeSession()
+    native = CodexService(runtime.accounts, SessionFactory([session]))
+    runtime.admission.codex = native
+    monkeypatch.setattr("services.codex_service.codex_service", native)
+    monkeypatch.setattr(ai, "text_task_service", runtime.service)
+    identity = {"id": "owner", "role": "admin"}
+    monkeypatch.setattr(ai, "require_identity", lambda _token: identity)
+    app = FastAPI()
+    app.include_router(ai.create_router())
+    before_request_store = runtime.store.path.read_bytes()
+    before_accounts = json.dumps(runtime.accounts.list_accounts(), sort_keys=True)
+
+    with TestClient(app) as client:
+        response = client.get("/api/conversation-bindings/text-requests/rejected-original/codex-fallback-options",
+                              headers={"Authorization": "admin"})
+        assert response.status_code == 200
+        result = response.json()
+        assert result["original_request_id"] == "rejected-original"
+        assert result["eligible"] is True
+        assert result["items"]
+        assert set(result["items"][0]) == {"id", "route", "capabilities", "state", "reasoning_efforts", "accounts"}
+        assert result["items"][0]["route"] == "codex"
+        assert set(result["items"][0]["accounts"][0]) <= {
+            "account_ref", "state", "reason", "dispatchable_now", "quota_bucket",
+        }
+        assert "SENTINEL-PROMPT" not in response.text and "SENTINEL-IMAGE" not in response.text
+        assert response.headers["cache-control"] == "private, no-store"
+        assert runtime.store.path.read_bytes() == before_request_store
+        assert json.dumps(runtime.accounts.list_accounts(), sort_keys=True) == before_accounts
+
+        assert client.get("/api/conversation-bindings/text-requests/unknown-original/codex-fallback-options",
+                          headers={"Authorization": "admin"}).status_code == 409
+        assert client.get("/api/conversation-bindings/text-requests/other-original/codex-fallback-options",
+                          headers={"Authorization": "admin"}).status_code == 404
+
+        identity.update(role="user")
+        assert client.get("/api/conversation-bindings/text-requests/rejected-original/codex-fallback-options",
+                          headers={"Authorization": "ordinary"}).status_code == 404
+        identity.update(role="admin")
+
+        account_ref = runtime.accounts.pool_account_ref(runtime.account)
+        runtime.service.submit_codex_fallback("owner", "rejected-original", "existing-child", "gpt-5.6-codex", account_ref)
+        existing = client.get("/api/conversation-bindings/text-requests/rejected-original/codex-fallback-options",
+                              headers={"Authorization": "admin"})
+        assert existing.json() == {"original_request_id": "rejected-original", "eligible": False,
+                                   "reason": "CODEX_FALLBACK_ALREADY_CREATED", "existing_request_id": "existing-child", "items": []}
+
+    assert session.calls == []
+    assert runtime.admission.claim_next() is not None  # The queued child was not dispatched by GET.
+
+
 @pytest.mark.parametrize(("wire", "saved_response_id", "code"), [
     ({"id": "resp-reasoning-only", "status": "completed", "output": [
         {"type": "reasoning", "encrypted_content": "opaque", "summary": []},

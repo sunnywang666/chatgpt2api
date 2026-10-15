@@ -514,6 +514,22 @@ def create_router() -> APIRouter:
         except WorkLifecycleError as exc:
             raise HTTPException(status_code=exc.status, detail={"code": exc.code}) from None
 
+    @router.get("/api/conversation-bindings/text-requests/{request_id}/codex-fallback-options")
+    async def codex_fallback_options(request_id: str, response: Response,
+                                     authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        if identity.get("role") != "admin":
+            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND"})
+        response.headers["Cache-Control"] = "private, no-store"
+        try:
+            return await run_in_threadpool(text_task_service.codex_fallback_options,
+                                           str(identity.get("id") or "anonymous"), request_id)
+        except ConversationBindingError as exc:
+            status = 404 if exc.code == "CODEX_FALLBACK_ORIGINAL_NOT_FOUND" else 409
+            raise HTTPException(status_code=status, detail={"code": "TASK_NOT_FOUND" if status == 404 else exc.code}) from None
+        except WorkLifecycleError as exc:
+            raise HTTPException(status_code=exc.status, detail={"code": exc.code}) from None
+
     @router.post("/api/conversation-bindings/text-requests/{request_id}/codex-continue")
     async def continue_codex_fallback_request(
         request_id: str,

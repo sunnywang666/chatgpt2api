@@ -1965,6 +1965,34 @@ class TextTaskService:
             body = build_body(self.store, db, owner, original_id, client_request_id, model, account_ref, reasoning_effort)
         return self._submit_prepared(owner, body, source=source)
 
+    def codex_fallback_options(self, owner, original_id):
+        """Read validated fallback eligibility and the already-cached Codex catalog."""
+        if self.admission is None:
+            from services.work_lifecycle import WorkLifecycleError
+            raise WorkLifecycleError("CODEX_FALLBACK_ADMISSION_REQUIRED", 503)
+        from services.codex_text_fallback import fallback_options_context
+        with self._db() as db:
+            existing = fallback_options_context(self.store, db, owner, original_id)
+        if existing:
+            return {"original_request_id": original_id, "eligible": False,
+                    "reason": "CODEX_FALLBACK_ALREADY_CREATED", "existing_request_id": existing, "items": []}
+        catalog = self.admission.codex.management_models()
+        items = []
+        for item in catalog.get("items", []):
+            if not isinstance(item, dict) or item.get("route") != "codex":
+                continue
+            accounts = []
+            for account in item.get("accounts", []):
+                if not isinstance(account, dict) or not isinstance(account.get("account_ref"), str):
+                    continue
+                projected = {key: account[key] for key in ("account_ref", "state", "reason", "quota_bucket") if key in account}
+                if "dispatchable_now" in account:
+                    projected["dispatchable_now"] = account["dispatchable_now"]
+                accounts.append(projected)
+            items.append({key: item[key] for key in ("id", "route", "capabilities", "state", "reasoning_efforts") if key in item}
+                         | {"accounts": accounts})
+        return {"original_request_id": original_id, "eligible": True, "items": items}
+
     def submit_codex_continue(self, owner, parent_id, client_request_id, messages, step_ref=None, *, source=None):
         if self.admission is None:
             from services.work_lifecycle import WorkLifecycleError

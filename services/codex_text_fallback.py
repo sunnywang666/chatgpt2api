@@ -112,6 +112,17 @@ def _original_messages(store, db, owner, original_id, original_body):
     return original_body.get("messages")
 
 
+def fallback_options_context(store, db, owner, original_id):
+    """Validate only the retained original input before exposing cached choices."""
+    _original_hash, original_body = _original(store, db, owner, original_id)
+    _responses_input(_original_messages(store, db, owner, original_id, original_body))
+    existing = db.execute(
+        "SELECT id FROM requests WHERE owner=? AND json_extract(receipt,'$._codex_fallback_of')=? LIMIT 1",
+        (owner, original_id),
+    ).fetchone()
+    return existing[0] if existing else None
+
+
 def build_body(store, db, owner, original_id, client_request_id, model, account_ref, reasoning_effort=None):
     if not all(_stable(value) for value in (original_id, client_request_id, model, account_ref)):
         _reject("CODEX_FALLBACK_INVALID")

@@ -212,10 +212,22 @@ Content-Type: application/json
 }
 ```
 
-Select the route from the existing admin management catalog,
-`GET /api/workbench/ai/models` with the existing
-`X-Workbench-Account-Owner` header. This reads saved observations without an
-upstream refresh. Match the approved native model against `items[].id` with
+The internal Worker can select a route through
+`GET /api/conversation-bindings/text-requests/{original_chat_request_id}/codex-fallback-options`
+using the same internal authorization as the fallback POST. No additional
+account-owner header or credential is required. The endpoint verifies the
+same owner's rejected request and complete retained context, then projects
+the existing cached model catalog without an upstream call or state write.
+`eligible=true` describes the original request; account availability is still
+determined by each returned model/account. If a child already exists, the
+response instead has `eligible=false`, `reason=CODEX_FALLBACK_ALREADY_CREATED`,
+`existing_request_id`, and empty `items`; read that child instead of creating
+another. A missing/foreign request returns 404, and an ineligible original or
+missing context returns 409 with the existing specific error code.
+
+The management equivalent remains `GET /api/workbench/ai/models` with its
+existing `X-Workbench-Account-Owner` header. Match the approved native model
+against `items[].id` with
 `route=codex` and `capabilities` containing `responses`, and the approved
 account against that item's `accounts[].account_ref`. Both must be available;
 when `dispatchable_now` is provided, wait until the selected account is ready.
