@@ -73,6 +73,19 @@ and authentication-required observations remain distinct. An uncertain save
 reads back the original submission and must not trigger another import or login.
 Upstream access, refresh and ID tokens are never returned to the browser.
 
+For an existing selected pool account whose Codex bearer was rejected even
+though its recorded expiry is in the future, the internal admin endpoint
+`POST /api/workbench/ai/pool/codex-observation` accepts
+`{"account_ref":"<selected reference>","force_refresh":true}`. It uses the
+live account service to attempt at most one same-identity token renewal, then
+at most one models GET and one usage GET. A recorded renewal failure stops
+before those GETs and returns `503 codex_authorization_refresh_failed`; original
+execution failures remain. The default is `false`, and other observation
+endpoints reject the option. This is a credential mutation, not a read-only
+probe. After a lost response, inspect that same account's saved refresh result
+before deciding any further action; do not repeat the mutation automatically.
+This option is pending deployment with the rejection-fallback candidate.
+
 `examples/codex_client/run-codex.sh` and `examples/codex_client/run-codex.ps1` first request `GET /models`. Discovery accepts native Codex `models[].slug` and OpenAI-compatible `data[].id` responses without changing the provider protocol. Run discovery without a model, then select one exact returned ID before they create an isolated state root and launch Codex.
 
 The state root contains a generated `config.toml` with this custom Responses provider shape:
@@ -177,6 +190,146 @@ The local mock is engineering evidence. A successful real CLI fixture run proves
 
 
 ## Current operational limits
+
+### Internal Chat rejection fallback (candidate)
+
+The Workbench service can move a **confirmed rejected text/vision request with
+complete retained context** to the same account pool's native Codex transport. This is a candidate
+internal API, pending paired consumer deployment and real-account acceptance.
+It does not change the public Codex endpoint's ordinary-key requirement.
+
+An authenticated internal administrator submits:
+
+```http
+POST /api/conversation-bindings/text-requests/{original_chat_request_id}/codex-fallback
+Content-Type: application/json
+
+{
+  "client_request_id": "stable-new-codex-request-id",
+  "model": "<exact eligible native model id>",
+  "account_ref": "<approved pool account reference>",
+  "reasoning_effort": "<optional supported effort>"
+}
+```
+
+The internal Worker can select a route through
+`GET /api/conversation-bindings/text-requests/{original_chat_request_id}/codex-fallback-options`
+using the same internal authorization as the fallback POST. No additional
+account-owner header or credential is required. The endpoint verifies the
+same owner's rejected request and complete retained context, then projects
+the existing cached model catalog without an upstream call or state write.
+`eligible=true` describes the original request; account availability is still
+determined by each returned model/account. If a child already exists, the
+response instead has `eligible=false`, `reason=CODEX_FALLBACK_ALREADY_CREATED`,
+`existing_request_id`, and empty `items`; read that child instead of creating
+another. A missing/foreign request returns 404, and an ineligible original or
+missing context returns 409 with the existing specific error code.
+
+The management equivalent remains `GET /api/workbench/ai/models` with its
+existing `X-Workbench-Account-Owner` header. Match the approved native model
+against `items[].id` with
+`route=codex` and `capabilities` containing `responses`, and the approved
+account against that item's `accounts[].account_ref`. Both must be available;
+when `dispatchable_now` is provided, wait until the selected account is ready.
+Do not translate a Chat display name into a native model ID or select a
+different account when the approved one is unavailable. Persist the selected
+route with the successor. Omit optional reasoning effort unless its support
+has been verified. The service rechecks eligibility at dispatch; catalog
+availability is not proof of a successful generation.
+
+Persist the new request ID in the original business task **before** submission.
+The server reads the same caller's retained private original input; the caller
+cannot replace its prompt or images. Eligibility requires the original receipt
+to be `failed`, `MODEL_NOT_FOUND`, `upstream_outcome=rejected`, with an actual
+upstream submission. The original failed receipt stays intact. A pending,
+unknown, successful, image-generation or native Codex request does not qualify.
+Only one Codex fallback is allowed for an original Chat request; repeating an
+identical submission returns that same durable request, and conflicting IDs or
+parameters are rejected.
+
+Read the successor using
+`GET /api/conversation-bindings/text-requests/{new_client_request_id}`, including
+after a lost POST response. This reads the local durable receipt, not a new
+generation. Complete final text is exposed as `content`. The separate metadata is:
+
+```json
+{
+  "codex_fallback": {
+    "protocol": "codex-responses-v1",
+    "predecessor_request_id": "original-chat-request-id",
+    "parent_request_id": "immediate-predecessor-request-id",
+    "client_conversation_id": "opaque-codex-session-affinity",
+    "model": "selected-native-model-id",
+    "account_ref": "selected-opaque-account-reference",
+    "reasoning_effort": "optional-selected-effort",
+    "response_id": "present-only-after-complete-native-response"
+  }
+}
+```
+
+The first parent's ID equals `predecessor_request_id`; subsequent parents are
+the direct Codex predecessor. Accept business output only when `status` is
+`succeeded`, the metadata matches the persisted request/account/model, a native
+`response_id` is present, and `content` passes the original task's validation.
+SSE deltas alone are not a completed result. `queued`/`running` means wait and
+read this same ID. `unknown` means retain it for investigation; `failed` retains
+its `error_code` and, when known, `upstream_outcome=not_sent` or `rejected`.
+Neither permits the caller to generate a new ID and replay automatically.
+Original inputs and native wire data stay private.
+
+A completed native response without final text (including reasoning-only
+output) is an explicit failed fallback, not a successful text result. A saved
+terminal response whose identity does not match the observed upstream
+response is also rejected. Preserve these receipts and do not start a next
+step or replay them automatically.
+
+To perform the next text step, persist its new ID before calling:
+
+```http
+POST /api/conversation-bindings/text-requests/{successful_codex_parent_id}/codex-continue
+Content-Type: application/json
+
+{
+  "client_request_id": "stable-next-step-id",
+  "messages": [{"role": "user", "content": "The actual next task instruction"}],
+  "step_ref": "optional-next-step-within-the-same-product"
+}
+```
+
+The service inherits the parent's account, model, reasoning choice and session.
+It carries forward the private original input and complete native response
+output, including encrypted reasoning, before appending the new messages.
+It does not rely on upstream storage or interpret a response ID as stored Chat
+history. Only a completed same-owner Codex parent is eligible. One successor
+per parent and exact-input idempotency apply to this endpoint too; a lost POST
+response is resolved with the same GET readback.
+
+When the parent belongs to `product_work`, the fallback retains its original
+product and step. A continuation inherits that product and source; optional
+`step_ref` names the next actual step, while omission retains the current step
+for a clarification. The caller cannot change the product through this API.
+Do not send `step_ref` for a parent without product-work membership. Existing
+product capacity, result-save and close rules still apply. Close archives only
+real Chat conversations belonging to the product; native Codex members do not
+create a fabricated Chat archive target. An unresolved native request still
+prevents the product from being released.
+
+Keep the original Chat continuation/archive cursor separate from this Codex
+receipt. A Codex response ID is not a Chat conversation or parent-message ID.
+Existing account credentials, Chat image generation and Chat archival are not
+changed by this text/vision adapter. Saved Codex authorization, a listed model,
+or an old quota observation does not establish that the selected account can
+complete the actual request.
+
+A Chat continuation requires the original branch's complete retained history.
+The adapter follows same-owner, same-account, same-branch successful local
+receipts back to the first turn, verifies their retained input hashes, and
+preserves original text, image references and completed assistant replies.
+This reconstruction does not query upstream or repeat prior generations.
+Missing input, an ambiguous predecessor or unavailable history returns
+`CODEX_FALLBACK_CONTEXT_UNAVAILABLE`; the adapter does not strip the original
+cursor and treat a continuation tail as a new conversation. This is a blocked
+fallback, not permission to recreate the task without its context.
 
 The reliable-sharing candidate puts accepted native HTTP/SSE requests in the existing durable task store and shared account admission. Supply a stable `X-Client-Request-ID` for a logical request; repeating the same ID and input re-subscribes to the original persisted wire result, while changed input is a conflict. Retain the original session/thread and response IDs. Disconnecting a subscriber does not cancel or replay accepted execution; unsent queued work survives restart and uses newly available matching capacity automatically. New input is never used to reconstruct an UNKNOWN request. See [deployment and recovery boundaries](deployment.md#可靠共用与动态容量候选2026-09-20); this is candidate behavior, not proof of production rollout.
 

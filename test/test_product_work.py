@@ -27,18 +27,20 @@ def runtime(tmp_path):
     images = SimpleNamespace(archive_product_work=archive)
     service = ProductWorkService(text, images, clock=lambda: now[0])
     lifecycle = WorkLifecycleService(text, images, clock=lambda: now[0])
-    def add(rid, *, kind="text", product="P", status=None, conversation=None, source="internal:listing", owner="owner", **extras):
+    def add(rid, *, kind="text", product="P", step=None, status=None, conversation=None, physical=True,
+            source="internal:listing", owner="owner", **extras):
         status = status or ("succeeded" if kind == "text" else "success")
         r = {"request_id" if kind == "text" else "id": rid, "owner_id": owner, "status": status,
              "_source": source, "_sequence": 1, "_input_ref": "original-input", "_submission_started": status != "queued",
              "upstream_outcome": "not_sent" if status == "queued" else "unknown" if status == "unknown" else "completed"}
         if status != "queued":
-            r.update(provider_binding_id="binding", provider_account_identity="account", conversation_id=conversation or rid,
-                     parent_message_id="parent-" + rid)
+            r.update(provider_binding_id="binding", provider_account_identity="account",
+                     conversation_id=(conversation or rid) if physical else None, parent_message_id="parent-" + rid)
         r.update(extras)
         with store.transaction() as db:
             if product:
-                ensure_product_work(store, db, kind, owner, rid, r, {"product_ref": product, "step_ref": rid}, source=source)
+                ensure_product_work(store, db, kind, owner, rid, r,
+                                    {"product_ref": product, "step_ref": step or rid}, source=source)
             if kind == "text":
                 db.execute("INSERT INTO requests VALUES(?,?,?,?)", (owner, rid, "immutable-hash", json.dumps(r)))
             else:
@@ -419,3 +421,67 @@ def test_physical_conversation_without_account_cannot_attach_or_adopt(runtime):
         assert state_snapshot(store, db) == {}
     with locking_product_conversations([]), locking_product_conversations([{"status": "unknown"}]):
         pass
+
+
+def _codex_bridge(*, origin, parent, parent_hash="immutable-hash", fallback=False):
+    return {
+        "_route": "codex", "_operation": "text", "_forward_protocol": "codex",
+        "_codex_fallback_protocol": "codex-responses-v1",
+        "_codex_origin_request_id": origin,
+        "_codex_fallback_input_hash": parent_hash,
+        "_codex_fallback_of" if fallback else "_codex_continue_of": parent,
+    }
+
+
+def test_rejected_chat_codex_successor_preserves_parent_and_archives_only_chat(runtime):
+    service, lifecycle, store, _, calls, _, add = runtime
+    original = add("chat-rejected", step="gallery", status="failed", conversation="chat-cursor",
+                   error_code="MODEL_NOT_FOUND", upstream_outcome="rejected")
+    fallback = add("codex-gallery", step="gallery", physical=False,
+                   **_codex_bridge(origin="chat-rejected", parent="chat-rejected", fallback=True))
+    assert original["status"] == "failed" and original["error_code"] == "MODEL_NOT_FOUND"
+    assert fallback.get("conversation_id") is None
+
+    closing = service.close(IDENTITY, "P")
+    assert closing["state"] == "closing" and closing["archive"] == {"total": 1, "confirmed": 0, "pending": 1}
+    assert lifecycle.process_one()
+    assert calls == [("owner", "chat-rejected", True)]
+    assert service.get(IDENTITY, "P")["state"] == "completed"
+    with store.connect() as db:
+        saved_parent = store.read_receipt(db, "text", "owner", "chat-rejected")
+        saved_child = store.read_receipt(db, "text", "owner", "codex-gallery")
+    assert saved_parent["status"] == "failed" and saved_parent["error_code"] == "MODEL_NOT_FOUND"
+    assert saved_child.get("conversation_id") is None
+
+
+def test_cursorless_rejected_chat_requires_valid_terminal_codex_child_and_allows_new_step(runtime):
+    service, _, _, _, calls, _, add = runtime
+    add("chat-rejected", step="gallery", status="failed", physical=False,
+        error_code="MODEL_NOT_FOUND", upstream_outcome="rejected")
+    fallback = add("codex-gallery", step="gallery", physical=False,
+                   **_codex_bridge(origin="chat-rejected", parent="chat-rejected", fallback=True))
+    add("codex-copy", step="copy", physical=False,
+        **_codex_bridge(origin="chat-rejected", parent="codex-gallery"))
+
+    projection = service.get(IDENTITY, "P")
+    assert [(m["request_id"], m["step_ref"]) for m in projection["members"]] == [
+        ("chat-rejected", "gallery"), ("codex-gallery", "gallery"), ("codex-copy", "copy"),
+    ]
+    completed = service.close(IDENTITY, "P")
+    assert completed["state"] == "completed" and not completed["slot_held"]
+    assert completed["archive"] == {"total": 0, "confirmed": 0, "pending": 0}
+    assert calls == []
+    assert fallback["_codex_fallback_of"] == "chat-rejected"
+
+
+def test_cursorless_rejected_chat_unknown_codex_child_does_not_release_product(runtime):
+    service, _, _, _, calls, _, add = runtime
+    add("chat-rejected", step="gallery", status="failed", physical=False,
+        error_code="MODEL_NOT_FOUND", upstream_outcome="rejected")
+    add("codex-unknown", step="gallery", status="unknown", physical=False,
+        **_codex_bridge(origin="chat-rejected", parent="chat-rejected", fallback=True))
+
+    with pytest.raises(WorkLifecycleError, match="TURN_UNFINISHED"):
+        service.close(IDENTITY, "P")
+    assert service.get(IDENTITY, "P")["state"] == "active"
+    assert calls == []

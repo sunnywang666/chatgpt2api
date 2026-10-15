@@ -55,6 +55,44 @@ class CodexAuthorizationApiTests(unittest.TestCase):
             self.accounts.refresh_codex_observation.assert_called_once_with("workbench:org:boss", ref, pool)
             self.accounts.reset_mock()
 
+    def test_pool_observation_can_force_only_the_selected_codex_refresh(self):
+        ref = "car_" + "C" * 43
+        route = "/api/workbench/ai/pool/codex-observation"
+        self.accounts.refresh_codex_observation.return_value = {"state": "auth_required"}
+
+        response = self.client.post(
+            route,
+            headers=self.trusted,
+            json={"account_ref": ref, "force_refresh": True},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.accounts.refresh_codex_observation.assert_called_once_with(
+            "workbench:org:boss", ref, True, force_refresh=True
+        )
+
+        ordinary = self.client.post(
+            "/api/workbench/ai/codex-observation",
+            headers=self.trusted,
+            json={"account_ref": ref, "force_refresh": True},
+        )
+        self.assertEqual(ordinary.status_code, 422)
+
+    def test_forced_pool_refresh_returns_safe_unavailable_error(self):
+        ref = "car_" + "D" * 43
+        self.accounts.refresh_codex_observation.side_effect = CodexAuthorizationAttachError(
+            "codex_authorization_refresh_failed"
+        )
+
+        response = self.client.post(
+            "/api/workbench/ai/pool/codex-observation",
+            headers=self.trusted,
+            json={"account_ref": ref, "force_refresh": True},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"]["code"], "codex_authorization_refresh_failed")
+
     def test_submitted_observation_forwards_only_owner_and_reference(self):
         ref = "car_" + "B" * 43
         route = "/api/workbench/ai/submitted-codex-observation"

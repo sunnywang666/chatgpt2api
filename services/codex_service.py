@@ -643,9 +643,13 @@ class CodexService:
             except Exception:
                 pass
 
-    def refresh_account(self, access_token: str) -> dict:
+    def refresh_account(self, access_token: str, *, force_refresh: bool = False) -> dict:
         before = self.accounts.get_account(access_token)
-        current_token = self._refresh_authorization(access_token, event="codex_observation")
+        current_token = self._refresh_authorization(
+            access_token,
+            event="codex_observation",
+            force=force_refresh,
+        )
         account = self.accounts.get_account(current_token)
         if account is None:
             raise KeyError("account not found")
@@ -1066,10 +1070,34 @@ class CodexService:
             return str(credentials.get("access_token") or ""), str(credentials.get("account_id") or "")
         return str(account.get("access_token") or ""), str(account.get("account_id") or "")
 
-    def _refresh_authorization(self, token: str, *, event: str) -> str:
+    def _refresh_authorization(self, token: str, *, event: str, force: bool = False) -> str:
         refresh = getattr(self.accounts, "refresh_codex_access_token", None)
         if callable(refresh):
-            return refresh(token, event=event) or token
+            if not force:
+                return refresh(token, event=event) or token
+            before = self.accounts.get_account(token) or {}
+            before_failure = (
+                before.get("last_codex_token_refresh_error"),
+                before.get("last_codex_token_refresh_error_at"),
+            )
+            current_token = refresh(token, force=True, event=event) or token
+            current = self.accounts.get_account(current_token) or self.accounts.get_account(token) or {}
+            after_failure = (
+                current.get("last_codex_token_refresh_error"),
+                current.get("last_codex_token_refresh_error_at"),
+            )
+            # A forced refresh is intended to cure a witnessed authorization
+            # rejection.  Do not test models/usage with the previous bearer
+            # token when this one bounded refresh itself failed.  The account
+            # service records only a safe classification here and retains the
+            # prior Responses rejection separately.
+            if after_failure[0] and after_failure != before_failure:
+                raise CodexServiceError(
+                    503,
+                    "codex_authorization_refresh_failed",
+                    "Codex authorization refresh failed",
+                )
+            return current_token
         return self.accounts.refresh_access_token(token, event=event) or token
 
     def _mark_observation_state(self, token: str, state: str, error_code: str, request_account: dict, request_digest: str) -> None:
