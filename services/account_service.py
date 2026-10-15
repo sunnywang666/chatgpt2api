@@ -1865,6 +1865,25 @@ class AccountService:
                     raise RuntimeError("conversation binding unavailable: selected account changed during refresh")
         return refreshed
 
+    def bound_text_recovery_auth_unavailable(self, binding_id: str) -> bool:
+        """Whether a bound original-result read is locally auth-blocked.
+
+        This is deliberately observational: it neither refreshes credentials
+        nor changes account state.  It lets durable recovery distinguish a
+        known disabled/invalidated bound account from an opaque reader error.
+        """
+        with self._lock:
+            try:
+                access_token = self._bound_token_locked(binding_id)
+            except RuntimeError:
+                return False
+            account = self._accounts.get(access_token) or {}
+            return bool(
+                account.get("managed_disabled")
+                or account.get("status") in {"禁用", "异常"}
+                or account.get("refresh_token_invalidated") is True
+            )
+
     def get_text_access_token(
             self,
             excluded_tokens: set[str] | None = None,

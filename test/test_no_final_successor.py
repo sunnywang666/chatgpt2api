@@ -1,5 +1,8 @@
 """An explicit legacy text continuation keeps the original task and context."""
 from copy import deepcopy
+import json
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
@@ -82,6 +85,100 @@ def test_verified_stopped_retry_cursor_allows_the_single_no_final_successor(task
     assert successor["_supersedes_no_final"] is True
     assert successor["_supersedes_input_hash"]
     assert h.admission.claim_next().request_id == "successor"
+
+
+def test_failed_explicit_read_keeps_qualified_no_final_source_and_sanitizes_error(task):
+    h = no_final(task)
+    h.service.recovery_reader = Mock(side_effect=RuntimeError(
+        "token=secret-value prompt=do-not-persist"
+    ))
+
+    h.service.recover("owner", "old", explicit_ended_recheck=True)
+    original = row(h.service)
+    assert original["_attempt_reason"] == "ORIGINAL_RESULT_NO_FINAL"
+    assert original["recovery_reason"] is None
+    assert original["recovery_error_code"] == "RECOVERY_READ_FAILED"
+    assert original["recovery_last_read_error"] == {
+        "phase": "conversation_detail", "category": "other",
+        "http_status": None, "retry_after_seconds": None, "candidate_ref": None,
+    }
+    assert "secret-value" not in json.dumps(original)
+    assert h.service._no_final_successor_source(original, h.clock())
+
+    accepted = h.service.submit("owner", h.envelope)
+    assert accepted["status"] == "queued"
+    assert h.service.submit("owner", h.envelope) == accepted
+    assert row(h.service, "successor")["_supersedes_no_final"] is True
+    assert not h.sent
+
+
+def test_legacy_detail_free_read_failure_keeps_stopped_no_final_eligibility(task):
+    h = no_final(task)
+    update(h.service, recovery_reason=None, recovery_error_code="RECOVERY_READ_FAILED",
+           recovery_last_read_error=None, recovery_no_result_reads=40)
+    original = row(h.service)
+    assert h.service._no_final_successor_source(original, h.clock())
+
+    accepted = h.service.submit("owner", h.envelope)
+    assert accepted["status"] == "queued"
+    assert row(h.service, "successor")["_supersedes_no_final"] is True
+
+
+def test_legacy_no_final_does_not_create_child_while_bound_account_is_invalidated(task, monkeypatch):
+    h = no_final(task)
+    # This matches the three pre-typed receipts already stopped in production:
+    # durable no-final proof, generic read failure, and no saved error detail.
+    update(h.service, recovery_reason=None, recovery_error_code="RECOVERY_READ_FAILED",
+           recovery_last_read_error=None, recovery_no_result_reads=9)
+    import services.text_task_service as text_module
+    monkeypatch.setattr(text_module.account_service, "bound_text_recovery_auth_unavailable", lambda _binding: True)
+    with pytest.raises(ConversationBindingError) as error:
+        h.service.submit("owner", h.envelope)
+    assert error.value.code == "CHAT_SUPERSEDE_AUTH_REQUIRED"
+    assert row(h.service, "successor") is None and not h.sent
+
+    monkeypatch.setattr(text_module.account_service, "bound_text_recovery_auth_unavailable", lambda _binding: False)
+    assert h.service.submit("owner", h.envelope)["status"] == "queued"
+    assert row(h.service, "successor")["_supersedes_no_final"] is True
+
+
+def test_known_local_bound_auth_failure_is_typed_without_erasing_no_final_proof(task, monkeypatch):
+    h = no_final(task)
+    import services.conversation_binding_service as binding
+    fake_accounts = SimpleNamespace(
+        get_bound_account_identity=lambda _binding: "original-account",
+        get_bound_text_access_token=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("token=secret-value prompt=do-not-persist")
+        ),
+        bound_text_recovery_auth_unavailable=lambda _binding: True,
+    )
+    monkeypatch.setattr(binding, "account_service", fake_accounts)
+    h.service.recovery_reader = binding.ConversationBindingService().read_text_request
+
+    h.service.recover("owner", "old", explicit_ended_recheck=True)
+    original = row(h.service)
+    assert original["recovery_error_code"] == "RECOVERY_AUTH_REQUIRED"
+    assert original["recovery_last_read_error"] == {
+        "phase": "conversation_detail", "category": "other",
+        "http_status": None, "retry_after_seconds": None, "candidate_ref": None,
+    }
+    assert "secret-value" not in json.dumps(original)
+    assert h.service._no_final_successor_source(original, h.clock())
+
+
+@pytest.mark.parametrize("changes", [
+    {"status": "succeeded", "content": "new upstream answer", "error_code": None,
+     "upstream_outcome": "completed"},
+    {"recovery_reason": "REQUEST_CONVERSATION_ADVANCED", "recovery_error_code": None,
+     "recovery_last_read_error": None},
+    {"provider_account_identity": "changed-account"},
+])
+def test_new_success_branch_or_identity_evidence_still_blocks_no_final_successor(task, changes):
+    h = no_final(task)
+    update(h.service, **changes)
+    with pytest.raises(ConversationBindingError):
+        h.service.submit("owner", h.envelope)
+    assert row(h.service, "successor") is None and not h.sent
 
 
 @pytest.mark.parametrize("change", ["mismatched-conversation", "missing-observed-at", "image-source"])
