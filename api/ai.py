@@ -142,6 +142,36 @@ class TextRequestRecoveryRequest(BaseModel):
     allow_unrecoverable_retry: bool = False
 
 
+class CodexTextFallbackRequest(BaseModel):
+    """Only stable execution choices; the original content is server-owned."""
+    model_config = ConfigDict(extra="forbid")
+    client_request_id: str = Field(strict=True, min_length=1, max_length=200)
+    model: str = Field(strict=True, min_length=1, max_length=200)
+    account_ref: str = Field(strict=True, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+    reasoning_effort: str | None = Field(default=None, strict=True, min_length=1, max_length=64)
+
+    @field_validator("client_request_id", "model", "reasoning_effort")
+    @classmethod
+    def stable_value(cls, value):
+        if value is not None and (value != value.strip() or any(ord(char) < 32 for char in value)):
+            raise ValueError("invalid fallback parameter")
+        return value
+
+
+class CodexTextContinueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    client_request_id: str = Field(strict=True, min_length=1, max_length=200)
+    messages: list[dict[str, object]] = Field(min_length=1)
+    step_ref: str | None = Field(default=None, strict=True, min_length=1, max_length=200)
+
+    @field_validator("client_request_id", "step_ref")
+    @classmethod
+    def stable_value(cls, value):
+        if value is not None and (value != value.strip() or any(ord(char) < 32 for char in value)):
+            raise ValueError("invalid continuation request identity")
+        return value
+
+
 class ConversationArchiveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider_binding_id: str = Field(min_length=1)
@@ -455,6 +485,61 @@ def create_router() -> APIRouter:
             body.allow_unrecoverable_retry,
             explicit_ended_recheck=True,
         )
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/codex-fallback")
+    async def fallback_bound_text_request(
+        request_id: str,
+        body: CodexTextFallbackRequest,
+        request: Request,
+        response: Response,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        if identity.get("role") != "admin":
+            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND"})
+        response.headers["Cache-Control"] = "private, no-store"
+        try:
+            return await run_in_threadpool(
+                text_task_service.submit_codex_fallback,
+                str(identity.get("id") or "anonymous"),
+                request_id,
+                body.client_request_id,
+                body.model,
+                body.account_ref,
+                body.reasoning_effort,
+                source=trusted_source(identity, request),
+            )
+        except ConversationBindingError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from None
+        except WorkLifecycleError as exc:
+            raise HTTPException(status_code=exc.status, detail={"code": exc.code}) from None
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/codex-continue")
+    async def continue_codex_fallback_request(
+        request_id: str,
+        body: CodexTextContinueRequest,
+        request: Request,
+        response: Response,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        if identity.get("role") != "admin":
+            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND"})
+        response.headers["Cache-Control"] = "private, no-store"
+        try:
+            return await run_in_threadpool(
+                text_task_service.submit_codex_continue,
+                str(identity.get("id") or "anonymous"),
+                request_id,
+                body.client_request_id,
+                body.messages,
+                body.step_ref,
+                source=trusted_source(identity, request),
+            )
+        except ConversationBindingError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from None
+        except WorkLifecycleError as exc:
+            raise HTTPException(status_code=exc.status, detail={"code": exc.code}) from None
 
     @router.post("/api/conversation-bindings/text-requests/{request_id}/resume-unsent-successor")
     async def resume_unsent_bound_successor(request_id: str, body: ConversationBindingTextRequest,

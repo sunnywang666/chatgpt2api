@@ -129,6 +129,60 @@ def _check_physical(store, db, receipt, key):
             raise WorkLifecycleError("PRODUCT_WORK_CONVERSATION_CONFLICT")
 
 
+def _codex_product_bridge(receipt):
+    forward = receipt.get("_forward_protocol")
+    fallback = receipt.get("_codex_fallback_of")
+    continuation = receipt.get("_codex_continue_of")
+    return bool(
+        receipt.get("_route") == "codex"
+        and forward == "codex"
+        and receipt.get("_codex_fallback_protocol") == "codex-responses-v1"
+        and isinstance(receipt.get("_codex_origin_request_id"), str)
+        and bool(receipt.get("_codex_origin_request_id"))
+        and (bool(fallback) ^ bool(continuation))
+        and isinstance(receipt.get("_codex_fallback_input_hash"), str)
+    )
+
+
+def _codex_bridge_successor(store, db, owner, previous, receipt):
+    rid = previous.get("request_id") or previous.get("id")
+    if not rid or not _codex_product_bridge(receipt):
+        return False
+    saved = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, rid)).fetchone()
+    if not saved or saved[0] != receipt.get("_codex_fallback_input_hash"):
+        return False
+    if receipt.get("_codex_fallback_of") == rid:
+        return bool(
+            previous.get("status") == "failed"
+            and previous.get("error_code") == "MODEL_NOT_FOUND"
+            and previous.get("upstream_outcome") == "rejected"
+            and previous.get("_submission_started") is True
+            and previous.get("_route", "chat") == "chat"
+            and previous.get("_operation", "text") == "text"
+            and not previous.get("_forward_protocol")
+            and receipt.get("_codex_origin_request_id") == rid
+        )
+    return bool(
+        receipt.get("_codex_continue_of") == rid
+        and _codex_product_bridge(previous)
+        and receipt.get("_codex_origin_request_id") == previous.get("_codex_origin_request_id")
+    )
+
+
+def _rejected_chat_replaced(store, db, owner, receipt, members):
+    rid = receipt.get("request_id") or receipt.get("id")
+    return bool(
+        rid
+        and receipt.get("status") == "failed"
+        and receipt.get("error_code") == "MODEL_NOT_FOUND"
+        and receipt.get("upstream_outcome") == "rejected"
+        and receipt.get("_submission_started") is True
+        and receipt.get("_route", "chat") == "chat"
+        and any(_codex_bridge_successor(store, db, owner, receipt, child)
+                for _, child in members if child.get("_codex_fallback_of") == rid)
+    )
+
+
 def _successor(store, db, owner, previous, receipt):
     from services.generation_completion import same_session_retry
     if same_session_retry(previous, receipt):
@@ -146,6 +200,8 @@ def _successor(store, db, owner, previous, receipt):
         saved = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, rid)).fetchone()
         return bool(saved and saved[0] == receipt.get("_supersedes_input_hash")
                     and TextTaskService._supersede_order_link(previous, receipt))
+    if _codex_bridge_successor(store, db, owner, previous, receipt):
+        return True
     return False
 
 
@@ -162,7 +218,7 @@ def ensure_product_work(store, db, kind, owner, request_id, receipt, product_wor
             or receipt.get("_route", receipt.get("route", "chat")) != "chat"
             or receipt.get("_forward_protocol") or receipt.get("_editable_task_id") or receipt.get("_editable_kind")
             or receipt.get("_editable") or receipt.get("_forward")
-            or kind == "text" and receipt.get("_operation", "text") != "text"):
+            or kind == "text" and receipt.get("_operation", "text") != "text") and not _codex_product_bridge(receipt):
         raise WorkLifecycleError("PRODUCT_WORK_LEGACY_REQUIRED")
     owner = str(owner)
     source = source or _source(receipt)
@@ -274,11 +330,13 @@ class ProductWorkService:
         for member, receipt in members:
             if outcome == "cancelled" and _unsent(receipt):
                 continue
-            if _unresolved(receipt, receipts):
+            replaced = _rejected_chat_replaced(self.store, db, member["owner"], receipt, members)
+            if not replaced and _unresolved(receipt, receipts):
                 reasons.add("PRODUCT_WORK_TURN_UNFINISHED")
             status = receipt.get("status")
             if outcome == "completed" and status not in {"succeeded", "success"}:
-                if not (status in {"unknown", "failed", "error"} and not _unresolved(receipt, receipts)
+                if not (replaced
+                        or status in {"unknown", "failed", "error"} and not _unresolved(receipt, receipts)
                         and (receipt.get("upstream_outcome") == "unknown" or receipt.get("upstream_unfinished"))):
                     reasons.add("PRODUCT_WORK_RESULT_REQUIRED")
             if outcome in {"failed", "cancelled"} and status not in {"succeeded", "success", "failed", "error", "cancelled"}:
@@ -402,6 +460,10 @@ class ProductWorkService:
                     previous = targets.get(canonical)
                     if previous is None or receipt.get("_sequence", 0) > previous[1].get("_sequence", 0):
                         targets[canonical] = member, receipt
+                elif _codex_product_bridge(receipt):
+                    continue
+                elif _rejected_chat_replaced(self.store, db, member["owner"], receipt, members):
+                    continue
                 elif (receipt.get("_submission_started") or receipt.get("upstream_submission_started")
                       or receipt.get("upstream_outcome") not in {"not_sent", "not_submitted"}
                       and not (outcome == "cancelled" and receipt.get("status") == "cancelled")):

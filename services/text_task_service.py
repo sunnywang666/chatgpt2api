@@ -321,6 +321,21 @@ class TextTaskService:
         result["recovery_control"] = recovery_control(receipt)
         if receipt.get("_product_work"):
             result["product_work"] = {"protocol": "product-work-v1", **receipt["_product_work"]}
+        if receipt.get("_codex_origin_request_id"):
+            fallback = {
+                "protocol": str(receipt.get("_codex_fallback_protocol") or "codex-responses-v1"),
+                "predecessor_request_id": receipt["_codex_origin_request_id"],
+                "parent_request_id": receipt.get("_codex_continue_of") or receipt.get("_codex_fallback_of"),
+                "client_conversation_id": receipt.get("client_conversation_id"),
+                "model": receipt.get("model"),
+            }
+            if receipt.get("_requested_account_ref"):
+                fallback["account_ref"] = receipt["_requested_account_ref"]
+            if receipt.get("_codex_reasoning_effort"):
+                fallback["reasoning_effort"] = receipt["_codex_reasoning_effort"]
+            if receipt.get("_codex_response_id"):
+                fallback["response_id"] = receipt["_codex_response_id"]
+            result["codex_fallback"] = fallback
         result.pop("recovery_automatic_stopped", None)
         result.pop("recovery_stop_reason", None)
         if (receipt.get("_attempt_finished_at")
@@ -1940,6 +1955,25 @@ class TextTaskService:
             return self._submit_prepared(owner, body, source=source,
                                          _resume_absent_successor=_resume_absent_successor)
 
+    def submit_codex_fallback(self, owner, original_id, client_request_id, model, account_ref, reasoning_effort=None, *, source=None):
+        """Create one native Responses successor from an immutable rejected Chat input."""
+        if self.admission is None:
+            from services.work_lifecycle import WorkLifecycleError
+            raise WorkLifecycleError("CODEX_FALLBACK_ADMISSION_REQUIRED", 503)
+        from services.codex_text_fallback import build_body
+        with self._db() as db:
+            body = build_body(self.store, db, owner, original_id, client_request_id, model, account_ref, reasoning_effort)
+        return self._submit_prepared(owner, body, source=source)
+
+    def submit_codex_continue(self, owner, parent_id, client_request_id, messages, step_ref=None, *, source=None):
+        if self.admission is None:
+            from services.work_lifecycle import WorkLifecycleError
+            raise WorkLifecycleError("CODEX_FALLBACK_ADMISSION_REQUIRED", 503)
+        from services.codex_text_fallback import build_continue_body
+        with self._db() as db:
+            body = build_continue_body(self.store, db, owner, parent_id, client_request_id, messages, step_ref)
+        return self._submit_prepared(owner, body, source=source)
+
     def _submit_prepared(self, owner, body, *, source=None, _resume_absent_successor=False):
         from services.durable_forward import dispatch_model
         from services.workflow_scheduling import normalize_scheduling
@@ -1947,6 +1981,12 @@ class TextTaskService:
             body = {**body, "_scheduling": normalize_scheduling(body["_scheduling"])}
         if body.get("_scheduling") is not None and self.admission is None:
             raise ValueError("SCHEDULING_UNAVAILABLE")
+        codex_product_bridge = (
+            body.get("_route") == "codex"
+            and ((body.get("_forward") or {}).get("protocol") == "codex")
+            and bool(body.get("_codex_origin_request_id"))
+            and (bool(body.get("_codex_fallback_of")) ^ bool(body.get("_codex_continue_of")))
+        )
         if "product_work" in body:
             from services.product_work import normalize_product_work, require_product_source
             from services.work_lifecycle import WorkLifecycleError
@@ -1966,7 +2006,8 @@ class TextTaskService:
                 raise WorkLifecycleError("PRODUCT_WORK_UNAVAILABLE", 503)
             if (body.get("_route", "chat") != "chat" or body.get("_public_session_ref")
                     or body.get("_scheduling") or body.get("_forward") or body.get("_editable")):
-                raise WorkLifecycleError("PRODUCT_WORK_LEGACY_REQUIRED", 400)
+                if not codex_product_bridge:
+                    raise WorkLifecycleError("PRODUCT_WORK_LEGACY_REQUIRED", 400)
 
         request_id, request_hash = self._submission_identity(owner, body)
         receipt = {"request_id": request_id, "client_conversation_id": body["client_conversation_id"],
@@ -2032,6 +2073,28 @@ class TextTaskService:
                 db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
                 schedule = True
             elif not previous:
+                if body.get("_codex_fallback_of"):
+                    from services.codex_text_fallback import validate_prepared
+                    validate_prepared(self.store, db, owner, body)
+                    receipt.update(
+                        _codex_fallback_of=body["_codex_fallback_of"],
+                        _codex_origin_request_id=body["_codex_origin_request_id"],
+                        _codex_fallback_input_hash=body["_codex_fallback_input_hash"],
+                        _codex_fallback_protocol=body["_codex_fallback_protocol"],
+                    )
+                if body.get("_codex_continue_of"):
+                    from services.codex_text_fallback import validate_prepared_continue
+                    validate_prepared_continue(self.store, db, owner, body)
+                    receipt.update(
+                        _codex_continue_of=body["_codex_continue_of"],
+                        _codex_origin_request_id=body["_codex_origin_request_id"],
+                        _codex_fallback_input_hash=body["_codex_fallback_input_hash"],
+                        _codex_fallback_protocol=body["_codex_fallback_protocol"],
+                    )
+                if body.get("_codex_fallback_of") or body.get("_codex_continue_of"):
+                    effort = (((body.get("_forward") or {}).get("payload") or {}).get("reasoning") or {}).get("effort")
+                    if isinstance(effort, str):
+                        receipt["_codex_reasoning_effort"] = effort
                 if body.get("_requested_account_ref") is not None:
                     from services.account_service import account_service
                     accounts = self.admission.accounts if self.admission is not None else account_service
@@ -2064,13 +2127,20 @@ class TextTaskService:
                 prepare_receipt(receipt, body.get("_scheduling"), receipt["_source"])
                 from services.product_work import ensure_product_work
                 product = body.get("product_work")
-                previous_id = receipt.get("_supersedes_request_id") or receipt.get("_previous_request_id") or receipt.get("_completion_of")
+                previous_id = (receipt.get("_supersedes_request_id") or receipt.get("_previous_request_id")
+                               or receipt.get("_completion_of") or receipt.get("_codex_fallback_of")
+                               or receipt.get("_codex_continue_of"))
                 original = self.store.read_receipt(db, "text", owner, previous_id) if previous_id else None
                 if original and original.get("_product_work"):
                     from services.work_lifecycle import WorkLifecycleError
                     if product is not None and product != original["_product_work"]:
-                        raise WorkLifecycleError("PRODUCT_WORK_BINDING_CONFLICT")
-                    product = original["_product_work"]
+                        if (not codex_product_bridge
+                                or product.get("product_ref") != original["_product_work"].get("product_ref")):
+                            raise WorkLifecycleError("PRODUCT_WORK_BINDING_CONFLICT")
+                    else:
+                        product = original["_product_work"]
+                    if not codex_product_bridge and receipt.get("_route") == "codex":
+                        raise WorkLifecycleError("PRODUCT_WORK_LEGACY_REQUIRED", 400)
                     if source is not None and source != original.get("_source"):
                         raise WorkLifecycleError("PRODUCT_WORK_SOURCE_CONFLICT")
                     receipt["_source"] = original["_source"]

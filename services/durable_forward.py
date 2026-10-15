@@ -449,9 +449,13 @@ def run(service, owner, request_id, body):
         current = raw_receipt(service, owner, request_id)
         terminal = protocol != "codex" or current.get("_upstream_terminal") is True
         failed = bool(current.get("_upstream_failed"))
+        projection = {}
+        if protocol == "codex" and terminal and not failed:
+            from services.codex_text_fallback import project_completed_wire
+            projection = project_completed_wire(service, current)
         service._update(owner, request_id, status="failed" if failed and terminal else "succeeded" if terminal else "unknown",
                         error_code="codex_response_failed" if failed and terminal else None if terminal else "codex_upstream_outcome_unknown",
-                        _wire_head=head, _turn_reserved=not terminal, finished_at=service._now())
+                        _wire_head=head, _turn_reserved=not terminal, finished_at=service._now(), **projection)
     except Exception as exc:
         current = raw_receipt(service, owner, request_id)
         code = getattr(exc, "code", None)
