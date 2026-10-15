@@ -488,6 +488,49 @@ class TextTaskTests(unittest.TestCase):
         })
         self.assertEqual(service.read("owner", "attempt-1")["original_upstream_response_ids"], response_ids)
 
+    def test_legacy_recovery_and_success_get_hide_response_ids_but_preserve_history(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+
+        runner = mock.Mock(side_effect=AssertionError("recovery must not resend"))
+        reader = mock.Mock(return_value={
+            "status": "succeeded", "content": "original answer", "conversation_id": "chat",
+            "parent_message_id": "answer-id", "binding_status": "bound",
+        })
+        service = TextTaskService(self.path, runner, self.queue, recovery_reader=reader)
+        service.submit("owner", self.body)
+        response_ids = {"request_id": "req_0123456789abcdef", "cf_ray": "0123456789abcdef-SJC"}
+        service._update(
+            "owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="binding", provider_account_identity="account", conversation_id="chat",
+            original_failure_phase="stream_open", original_http_status=429,
+            original_exception_category="http", original_upstream_response_ids=response_ids,
+        )
+        app = FastAPI()
+        app.include_router(create_router())
+        with (
+            mock.patch("api.ai.text_task_service", service),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
+            TestClient(app) as client,
+        ):
+            recovered = client.post("/api/conversation-bindings/text-requests/attempt-1/recover",
+                                    json={}, headers={"Authorization": "owner"})
+            fetched = client.get("/api/conversation-bindings/text-requests/attempt-1",
+                                 headers={"Authorization": "owner"})
+        for response in (recovered, fetched):
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "succeeded")
+            self.assertEqual(response.json()["content"], "original answer")
+            self.assertNotIn("original_upstream_response_ids", response.json())
+            self.assertNotIn("upstream_response_ids", response.json()["execution"])
+        with service.store.connect() as db:
+            stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        self.assertEqual(stored["original_upstream_response_ids"], response_ids)
+        reader.assert_called_once()
+        runner.assert_not_called()
+        self.assertEqual(len(self.queue.calls), 1)
+
     def test_model_not_found_http_classification_excludes_all_forward_forms(self):
         from services.conversation_binding_service import _is_model_not_found_http_rejection
         from utils.helper import UpstreamHTTPError

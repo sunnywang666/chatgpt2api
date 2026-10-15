@@ -311,7 +311,7 @@ class TextTaskService:
             result["original_upstream_error"] = detail
         result.pop("original_upstream_response_ids", None)
         response_ids = safe_upstream_response_ids(receipt.get("original_upstream_response_ids"))
-        if response_ids:
+        if response_ids and receipt.get("status") != "succeeded":
             result["original_upstream_response_ids"] = response_ids
         if receipt.get("status") == "succeeded":
             # Older successful retries retained their previous active error.
