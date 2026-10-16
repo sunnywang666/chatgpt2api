@@ -1,6 +1,7 @@
 """Opt-in product ownership over original text/image receipts in task_runtime.
 
-A product owns capacity until its durable conversation archives are confirmed.
+A product owns capacity until its durable conversation archives are confirmed,
+except for a proved no-conversation model rejection returned to the queue.
 No result, input hash, request sequence or ordinary work identity is replaced.
 """
 from __future__ import annotations
@@ -270,6 +271,91 @@ def _claims(receipt):
     return bool(receipt.get("_claim_id") and not retired)
 
 
+def _no_saved_result(kind, receipt):
+    """Return whether a rejected original has no result to preserve.
+
+    Presence, rather than truthiness, is deliberate for text receipts: an empty
+    saved response is still evidence that this is no longer the no-conversation
+    rejection case.  Image result references likewise remain protected.
+    """
+    if "content" in receipt or "result" in receipt or "data" in receipt:
+        return False
+    if receipt.get("result_file_ids") or receipt.get("result_sediment_ids"):
+        return False
+    from services.task_store import pending_image_result_ids
+    return not pending_image_result_ids(receipt)
+
+
+def _rejected_without_conversation(kind, receipt):
+    """Recognize the narrow terminal rejection that never obtained a Chat."""
+    from services.conversation_binding_service import is_model_not_found_rejection
+    return bool(
+        kind == "text"
+        and receipt.get("status") == "failed"
+        and receipt.get("error_code") == "MODEL_NOT_FOUND"
+        and receipt.get("upstream_outcome") == "rejected"
+        and receipt.get("_submission_started") is True
+        and not receipt.get("conversation_id")
+        and not _claims(receipt)
+        and not receipt.get("upstream_unfinished")
+        and _no_saved_result(kind, receipt)
+        and is_model_not_found_rejection(receipt)
+    )
+
+
+def release_rejected_product_slots(store, db, receipts=None):
+    """Return only stale no-conversation model rejections to the product queue.
+
+    This runs inside PoolAdmission's existing claim transaction.  It changes
+    only the parent allocation; original receipts, their request IDs, outcome
+    evidence and retired claim IDs remain untouched for a later authorized
+    successor.  `receipts` is the claim transaction's current read set so this
+    check cannot miss an attached queued or UNKNOWN member.
+    """
+    rows = list(store.receipts(db)) if receipts is None else receipts
+    attached = {}
+    for kind, owner, request_id, receipt in rows:
+        key = receipt.get("_product_work_key") if isinstance(receipt, dict) else None
+        if isinstance(key, str):
+            attached.setdefault(key, []).append((kind, owner, request_id, receipt))
+    released = 0
+    for key, parent in state_snapshot(store, db).items():
+        if (not isinstance(parent, dict) or parent.get("key") != key
+                or parent.get("state") != "active" or parent.get("slot_held") is not True
+                or parent.get("results_saved") is not False or parent.get("outcome") is not None
+                or parent.get("cleanup_pending") is not False or parent.get("archive_keys") != []):
+            continue
+        members = parent.get("members")
+        if not isinstance(members, list) or not members:
+            continue
+        expected = set()
+        valid_members = True
+        for member in members:
+            if (not isinstance(member, dict) or member.get("kind") not in {"text", "image"}
+                    or not isinstance(member.get("owner"), str) or not isinstance(member.get("request_id"), str)
+                    or not isinstance(member.get("step_ref"), str)):
+                valid_members = False
+                break
+            expected.add((member["kind"], member["owner"], member["request_id"]))
+        actual = {(kind, owner, request_id) for kind, owner, request_id, _ in attached.get(key, [])}
+        if not valid_members or len(expected) != len(members) or actual != expected:
+            continue
+        receipts = []
+        for kind, owner, request_id, receipt in attached[key]:
+            if (not isinstance(receipt, dict) or receipt.get("_product_work_key") != key
+                    or _source(receipt) != parent.get("source") or owner != parent.get("owner")
+                    or not _rejected_without_conversation(kind, receipt)):
+                receipts = []
+                break
+            receipts.append(receipt)
+        if not receipts:
+            continue
+        parent.update(state="queued", slot_held=False)
+        _save(store, db, parent)
+        released += 1
+    return released
+
+
 def _unsent(receipt):
     return (receipt.get("status") == "queued" and receipt.get("upstream_outcome") in {None, "not_sent", "not_submitted"}
             and not any(receipt.get(k) for k in ("_submission_started", "upstream_submission_started",
@@ -424,7 +510,8 @@ class ProductWorkService:
                     rid, step = member["request_id"], member["step_ref"]
                     parent = ensure_product_work(self.store, db, member["kind"], owner, rid, receipt,
                         {"product_ref": product_ref, "step_ref": step}, source=source)
-                    if not _unsent(receipt) and parent["state"] in {"queued", "active"}:
+                    if (not _unsent(receipt) and not _rejected_without_conversation(member["kind"], receipt)
+                            and parent["state"] in {"queued", "active"}):
                         parent.update(state="active", slot_held=True)
                         _save(self.store, db, parent)
                     self.store.write_receipt(db, member["kind"], owner, rid, receipt)

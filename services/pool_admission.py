@@ -1058,10 +1058,18 @@ class PoolAdmission:
         saving = sum(1 for kind, _, _, r in receipts if r.get("status") == "running"
                      and (kind == "image" or r.get("_operation") == "image")
                      and not image_generation_active(kind, r, True))
+        product_slots = resources["product_parent_slots"]
+        product_parents = [parent for parent in product_state.values() if isinstance(parent, dict)]
+        product_free = (None if product_slots.occupied is None
+                        else max(0, product_slots.capacity - product_slots.occupied))
         return {"accounts": result, "settings": settings, "chat_turn": aggregate("chat_turn"), "image": image_summary, "codex": native,
                 "workflows": {"slots_held": sum(bool(w.get("slot_held")) for w in workflow_state[0].values()),
                               "active_work": sum(w.get("state") == "active" for w in workflow_state[0].values()),
                               "paused_work": sum(w.get("state") == "paused" for w in workflow_state[0].values())},
+                "products": {"slots_total": product_slots.capacity, "slots_held": product_slots.occupied,
+                             "slots_free": product_free,
+                             "queued_products": sum(parent.get("state") == "queued" for parent in product_parents),
+                             "active_products": sum(parent.get("state") == "active" for parent in product_parents)},
                 "queue": {"mode": "durable_original_receipts", "queued": len(queued), "by_source": sources,
                           "by_reason": reasons, "oldest_wait_seconds": oldest,
                           "recovering_original": recovery, "saving_images": saving},
@@ -1222,6 +1230,7 @@ class PoolAdmission:
             bind_waiting_threads(self.store, db, receipts)
             from services.text_task_service import bind_waiting_public_sessions
             bind_waiting_public_sessions(self.store, db, receipts)
+            product_work.release_rejected_product_slots(self.store, db, receipts)
             if self.codex is not None:
                 rows = self._rows()
                 for kind, owner, request_id, r in receipts:

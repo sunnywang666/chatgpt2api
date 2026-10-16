@@ -6,7 +6,7 @@ import json
 import pytest
 
 from services.image_task_service import ImageTaskService
-from services.product_work import record_slot
+from services.product_work import ProductWorkService, record_slot
 from services.text_task_service import TextTaskService
 from test.test_pool_admission import Clock, build
 
@@ -78,6 +78,29 @@ def held_parent(rt, kind, owner, request_id):
         store.write_receipt(db, kind, owner, request_id, row)
 
 
+def rejected_without_conversation(rt, owner, request_id):
+    clock, _, store, _, _, _ = rt
+    with store.transaction() as db:
+        row = store.read_receipt(db, "text", owner, request_id)
+        row.update(status="failed", error_code="MODEL_NOT_FOUND", upstream_outcome="rejected",
+                   _submission_started=True, _executing=False, _turn_reserved=False,
+                   _attempt_finished_at=clock.now, upstream_unfinished=False,
+                   original_failure_phase="stream_open", original_exception_category="http",
+                   original_upstream_request_stage="conversation", original_http_status=404,
+                   original_upstream_error_form="detail_text",
+                   original_upstream_error={"message": "Model not found"})
+        store.write_receipt(db, "text", owner, request_id, row)
+        return row
+
+
+def update_receipt(rt, kind, owner, request_id, **changes):
+    _, _, store, _, _, _ = rt
+    with store.transaction() as db:
+        row = store.read_receipt(db, kind, owner, request_id)
+        row.update(changes)
+        store.write_receipt(db, kind, owner, request_id, row)
+
+
 def test_mixed_text_image_share_one_parent_and_continuation_skips_new_slot(runtime):
     text_submit(runtime, "text")
     image_submit(runtime, "image", step="image")
@@ -104,6 +127,100 @@ def test_new_product_capacity_is_shared_across_sources_and_claim_is_atomic(runti
     queued = "b" if claimed[0].request_id == "a" else "a"
     assert receipt(runtime, "text", "owner-b" if queued == "b" else "owner-a", queued)["status"] == "queued"
     assert admission.claim_next() is None
+
+
+def test_rejected_parent_releases_one_slot_without_rewriting_receipt_and_recovery_reclaims(runtime):
+    _, accounts, _, admission, text, images = runtime
+    accounts.update_account("fixture-token-1", {"managed_disabled": True}, quiet=True)
+    text_submit(runtime, "rejected", product="rejected-product")
+    claimed = admission.claim_next()
+    assert claimed and claimed.request_id == "rejected"
+    original = rejected_without_conversation(runtime, "owner-a", "rejected")
+    original_parent = parent(runtime, original)
+    assert original_parent["state"] == "active" and original_parent["slot_held"] is True
+
+    text_submit(runtime, "waiting", owner="owner-b", source=SOURCE_B, product="waiting-product")
+    # GET is a projection only: it exposes the blocked capacity without
+    # releasing the historical rejection outside the normal claim transaction.
+    snapshot = admission.resource_snapshot()
+    assert snapshot["products"] == {"slots_total": 1, "slots_held": 1, "slots_free": 0,
+                                    "queued_products": 1, "active_products": 1}
+    assert parent(runtime, original) == original_parent
+
+    next_claim = admission.claim_next()
+    assert next_claim and next_claim.request_id == "waiting"
+    assert receipt(runtime, "text", "owner-a", "rejected") == original
+    released_parent = parent(runtime, original)
+    assert released_parent["state"] == "queued" and released_parent["slot_held"] is False
+
+    work = ProductWorkService(text, images, clock=lambda: runtime[0].now)
+    identity = {"id": "owner-a", "role": "admin", "_trusted_source": SOURCE_A}
+    assert work.adopt(identity, "rejected-product", [
+        {"kind": "text", "request_id": "rejected", "step_ref": "rejected"},
+    ])["slot_held"] is False
+
+    text_submit(runtime, "recovery", product="rejected-product", step="recovery")
+    assert work.adopt(identity, "rejected-product", [
+        {"kind": "text", "request_id": "rejected", "step_ref": "rejected"},
+        {"kind": "text", "request_id": "recovery", "step_ref": "recovery"},
+    ])["slot_held"] is False
+    assert admission.claim_next() is None  # The recovered product cannot bypass the one held slot.
+    assert parent(runtime, receipt(runtime, "text", "owner-a", "recovery"))["slot_held"] is False
+
+    accounts.update_account("fixture-token-1", {"managed_disabled": False, "status": "正常"}, quiet=True)
+    recovery = admission.claim_next()
+    assert recovery and recovery.request_id == "recovery"
+    recovered_parent = parent(runtime, receipt(runtime, "text", "owner-a", "recovery"))
+    assert recovered_parent["state"] == "active" and recovered_parent["slot_held"] is True
+
+
+@pytest.mark.parametrize("protected", [
+    "unknown", "physical", "success", "active_lease", "recovery_claim", "legacy_recovery_claim",
+    "unproven_rejection", "queued_mixed",
+])
+def test_rejected_parent_never_releases_when_a_member_or_lease_is_protected(runtime, protected):
+    text_submit(runtime, "rejected", product="protected-product")
+    claimed = runtime[3].claim_next()
+    assert claimed and claimed.request_id == "rejected"
+    rejected_without_conversation(runtime, "owner-a", "rejected")
+
+    if protected == "unknown":
+        update_receipt(runtime, "text", "owner-a", "rejected", status="unknown", upstream_outcome="unknown")
+    elif protected == "physical":
+        update_receipt(runtime, "text", "owner-a", "rejected", conversation_id="physical-conversation",
+                       provider_account_identity="account-0")
+    elif protected == "success":
+        update_receipt(runtime, "text", "owner-a", "rejected", status="succeeded", upstream_outcome="completed",
+                       content="saved original result")
+    elif protected == "active_lease":
+        update_receipt(runtime, "text", "owner-a", "rejected", _executing=True, _turn_reserved=True)
+    elif protected == "recovery_claim":
+        update_receipt(runtime, "text", "owner-a", "rejected", recovery_claim_id="active-recovery")
+    elif protected == "legacy_recovery_claim":
+        update_receipt(runtime, "text", "owner-a", "rejected", _recovery_claim_id="active-recovery")
+    elif protected == "unproven_rejection":
+        update_receipt(runtime, "text", "owner-a", "rejected", original_upstream_error=None)
+    else:
+        text_submit(runtime, "queued-child", product="protected-product", step="recovery")
+        update_receipt(runtime, "text", "owner-a", "queued-child", _ready_at=runtime[0].now + 60)
+
+    runtime[3].claim_next()
+    held = parent(runtime, receipt(runtime, "text", "owner-a", "rejected"))
+    assert held["state"] == "active" and held["slot_held"] is True
+
+
+def test_rejected_parent_never_releases_when_receipt_membership_is_not_bidirectional(runtime):
+    text_submit(runtime, "rejected", product="protected-product")
+    claimed = runtime[3].claim_next()
+    assert claimed and claimed.request_id == "rejected"
+    original = rejected_without_conversation(runtime, "owner-a", "rejected")
+    text_submit(runtime, "unlisted", product="other-product")
+    update_receipt(runtime, "text", "owner-a", "unlisted", _product_work_key=original["_product_work_key"],
+                   _ready_at=runtime[0].now + 60)
+
+    assert runtime[3].claim_next() is None
+    held = parent(runtime, original)
+    assert held["state"] == "active" and held["slot_held"] is True
 
 
 def test_capacity_shrink_and_unknown_parent_block_only_new_products(runtime):
