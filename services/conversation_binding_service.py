@@ -2055,7 +2055,7 @@ class ConversationBindingService:
                             **diagnostic,
                         ) from exc
                 recovered_parent = ""
-                if returned_conversation_id:
+                if returned_conversation_id and body.get("product_work") is None:
                     try:
                         recovered_parent = backend.get_conversation_parent_message_id(
                             returned_conversation_id
