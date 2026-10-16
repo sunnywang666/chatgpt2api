@@ -385,6 +385,62 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertEqual(service.read("other-owner", "attempt-1")["status"], "not_found")
 
+    def test_completed_read_bypasses_writer_and_preserves_original_receipt(self):
+        clock = ManualClock()
+        runner = mock.Mock(side_effect=AssertionError("saved result must not regenerate"))
+        recovery_reader = mock.Mock(side_effect=AssertionError("saved result must not recover"))
+        service = TextTaskService(self.path, runner, self.queue, clock=clock, recovery_reader=recovery_reader)
+        for request_id, recovery_fields in (
+            ("completed", {}),
+            ("completed-with-live-reader", {
+                "recovery_claim_id": "active-reader", "recovery_claimed_at": 950.0,
+                "recovery_lease_until": 1050.0, "recovery_phase": "read_text_request",
+            }),
+        ):
+            with self.subTest(request_id=request_id):
+                service.submit("owner", {**self.body, "client_request_id": request_id})
+                service._update(
+                    "owner", request_id, status="succeeded", content="saved answer",
+                    finished_at=990.0, _executing=False, _turn_reserved=False,
+                    provider_binding_id="original-binding", provider_account_identity="original-account",
+                    conversation_id="original-conversation", parent_message_id="original-answer",
+                    request_message_id="original-message", original_failure_phase="stream_read",
+                    **recovery_fields,
+                )
+                with service.store.connect() as db:
+                    before = service.store.read_receipt(db, "text", "owner", request_id)
+
+                locked, release = threading.Event(), threading.Event()
+
+                def hold_writer():
+                    with service.store.transaction():
+                        locked.set()
+                        release.wait(5)
+
+                writer = threading.Thread(target=hold_writer)
+                writer.start()
+                readers = ThreadPoolExecutor(max_workers=1)
+                try:
+                    self.assertTrue(locked.wait(1))
+                    result = readers.submit(service.read, "owner", request_id).result(timeout=0.5)
+                    self.assertFalse(release.is_set())
+                finally:
+                    release.set()
+                    writer.join(timeout=2)
+                    readers.shutdown(wait=True)
+
+                self.assertEqual(result["status"], "succeeded")
+                self.assertEqual(result["content"], "saved answer")
+                for key in ("request_id", "provider_binding_id", "provider_account_identity",
+                            "conversation_id", "parent_message_id", "request_message_id"):
+                    self.assertEqual(result[key], before[key])
+                with service.store.connect() as db:
+                    self.assertEqual(service.store.read_receipt(db, "text", "owner", request_id), before)
+                self.assertEqual(service.read("other-owner", request_id)["status"], "not_found")
+        runner.assert_not_called()
+        recovery_reader.assert_not_called()
+        self.assertEqual(len(self.queue.calls), 2)
+
     def test_owner_get_projects_only_terminal_pre_send_binding_mismatch_as_not_submitted(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient

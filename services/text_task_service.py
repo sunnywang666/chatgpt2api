@@ -1330,19 +1330,23 @@ class TextTaskService:
         recovery_claim = None
         recovery_target = None
         now = self._now()
-        # A newly accepted original often waits only for shared admission
-        # capacity. Its projection cannot change receipt state or schedule a
-        # recovery, so avoid competing with the admission writer lock. Every
-        # other case deliberately starts the existing write transaction below
-        # and rereads its current receipt before it can make a change.
+        # Queued originals and saved answers that need no maintenance can be
+        # projected without competing with admission for the SQLite writer
+        # lock. Any recovery or completed-lease cleanup still rereads under
+        # the existing write transaction before changing the receipt.
         with self._db() as db:
             snapshot = db.execute(
                 "SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id),
             ).fetchone()
         if snapshot:
-            queued = json.loads(snapshot[0])
-            if self._queued_read_snapshot(queued):
-                return self._public(queued)
+            receipt = json.loads(snapshot[0])
+            completed = (receipt.get("status") == "succeeded"
+                         and isinstance(receipt.get("content"), str) and bool(receipt["content"].strip())
+                         # Probe a copy: an eligible cleanup must be persisted
+                         # transactionally below, never only in the response.
+                         and not self._retire_completed_recovery_claim(dict(receipt), now))
+            if self._queued_read_snapshot(receipt) or completed:
+                return self._public(receipt)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
