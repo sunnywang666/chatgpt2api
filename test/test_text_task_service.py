@@ -2,6 +2,7 @@ import tempfile
 import threading
 import unittest
 import json
+import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
@@ -14,6 +15,7 @@ from services.conversation_binding_service import (
     TextRecoveryReason,
 )
 from services.text_task_service import TextTaskService, ContinuationExecutor
+from services.request_context import AdmissionLost
 
 
 class QueuedExecutor:
@@ -80,6 +82,204 @@ class TextTaskTests(unittest.TestCase):
                 self.assertEqual(stored["provider_account_identity"], "account")
                 self.assertEqual(stored["original_failure_phase"], "stream_read")
                 self.assertTrue(stored["_input_ref"])
+                self.assertIsNone(stored["recovery_claim_id"])
+                self.assertIsNone(stored["recovery_claimed_at"])
+                self.assertIsNone(stored["recovery_lease_until"])
+
+    def test_late_terminal_recovery_preserves_saved_success_and_retires_matching_lease(self):
+        clock = ManualClock()
+        service = TextTaskService(self.path, executor=self.queue, clock=clock)
+        late_results = (
+            ("late-success", {"content": "late answer"}, {}),
+            ("late-failure", {"status": "failed", "error_code": "UPSTREAM_OUTCOME_UNKNOWN"},
+             {"error_code": "UPSTREAM_OUTCOME_UNKNOWN", "recovery_reason": "request_result_incomplete"}),
+        )
+        for request_id, recovered, kwargs in late_results:
+            with self.subTest(result=request_id):
+                service.submit("owner", {**self.body, "client_request_id": request_id,
+                                         "client_conversation_id": request_id + "-session"})
+                service._update(
+                    "owner", request_id, status="succeeded", content="saved answer",
+                    upstream_outcome="completed", original_failure_phase="stream_read",
+                    recovery_claim_id="matching-claim", recovery_claimed_at=900.0,
+                    recovery_lease_until=1030.0,
+                )
+
+                result = service._finish_recovery(
+                    "owner", request_id, "matching-claim", recovered, **kwargs
+                )
+
+                self.assertEqual(result["status"], "succeeded")
+                self.assertEqual(result["content"], "saved answer")
+                with service.store.connect() as db:
+                    stored = service.store.read_receipt(db, "text", "owner", request_id)
+                self.assertEqual(stored["status"], "succeeded")
+                self.assertEqual(stored["content"], "saved answer")
+                self.assertEqual(stored["original_failure_phase"], "stream_read")
+                self.assertIsNone(stored["recovery_claim_id"])
+                self.assertIsNone(stored["recovery_claimed_at"])
+                self.assertIsNone(stored["recovery_lease_until"])
+
+    def test_late_terminal_recovery_does_not_clear_a_newer_lease(self):
+        clock = ManualClock()
+        service = TextTaskService(self.path, executor=self.queue, clock=clock)
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="succeeded", content="saved answer",
+            upstream_outcome="completed", recovery_claim_id="newer-claim",
+            recovery_claimed_at=950.0, recovery_lease_until=1050.0,
+        )
+
+        result = service._finish_recovery(
+            "owner", "attempt-1", "late-claim", {"content": "late answer"}
+        )
+
+        self.assertEqual(result["content"], "saved answer")
+        with service.store.connect() as db:
+            stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        self.assertEqual(stored["status"], "succeeded")
+        self.assertEqual(stored["content"], "saved answer")
+        self.assertEqual(stored["recovery_claim_id"], "newer-claim")
+        self.assertEqual(stored["recovery_claimed_at"], 950.0)
+        self.assertEqual(stored["recovery_lease_until"], 1050.0)
+
+    def test_read_retires_only_fully_proved_completed_recovery_lease(self):
+        clock = ManualClock()
+        recovery_reader = mock.Mock(side_effect=AssertionError("completed receipt must not reread upstream"))
+        service = TextTaskService(self.path, executor=self.queue, clock=clock, recovery_reader=recovery_reader)
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="succeeded", content="saved answer",
+            upstream_outcome="completed", error_code=None, finished_at=900.0,
+            provider_binding_id="binding", provider_account_identity="account",
+            conversation_id="conversation", parent_message_id="parent",
+            original_failure_phase="stream_read", _execution_timeline=[{"stage": "finished", "at": 900.0}],
+            _executing=False, _turn_reserved=False, _claim_id="retired-send", _claim_until=999.0,
+            recovery_claim_id="expired-original-read", recovery_claimed_at=900.0,
+            recovery_lease_until=999.0, recovery_phase="read_text_request",
+        )
+        with service.store.connect() as db:
+            before = service.store.read_receipt(db, "text", "owner", "attempt-1")
+
+        result = service.read("owner", "attempt-1")
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["content"], "saved answer")
+        with service.store.connect() as db:
+            stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        self.assertIsNone(stored["recovery_claim_id"])
+        self.assertIsNone(stored["recovery_claimed_at"])
+        self.assertIsNone(stored["recovery_lease_until"])
+        for key, value in before.items():
+            if key not in {"recovery_claim_id", "recovery_claimed_at", "recovery_lease_until", "updated_at"}:
+                self.assertEqual(stored.get(key), value, key)
+        recovery_reader.assert_not_called()
+
+    def test_read_does_not_retire_unproved_completed_recovery_lease(self):
+        clock = ManualClock()
+        recovery_reader = mock.Mock(side_effect=AssertionError("guarded receipt must not reread upstream"))
+        service = TextTaskService(self.path, executor=self.queue, clock=clock, recovery_reader=recovery_reader)
+        cases = (
+            ("live", {"recovery_lease_until": 1001.0}),
+            ("missing-claimed", {"recovery_claimed_at": None}),
+            ("missing-lease", {"recovery_lease_until": None}),
+            ("nan-claimed", {"recovery_claimed_at": float("nan")}),
+            ("nan-lease", {"recovery_lease_until": float("nan")}),
+            ("inverted", {"recovery_claimed_at": 999.0, "recovery_lease_until": 998.0}),
+            ("empty-content", {"content": ""}),
+            ("missing-finished", {"finished_at": None}),
+            ("nan-finished", {"finished_at": float("nan")}),
+            ("wrong-outcome", {"upstream_outcome": "unknown"}),
+            ("error", {"error_code": "CONVERSATION_OUTCOME_UNKNOWN"}),
+            ("unknown", {"status": "unknown", "upstream_outcome": "unknown", "error_code": "CONVERSATION_OUTCOME_UNKNOWN"}),
+            ("executing", {"_executing": True}),
+            ("reserved", {"_turn_reserved": True}),
+            ("live-send-claim", {"_claim_id": "active-send", "_claim_until": 1001.0}),
+            ("paused", {"_recovery_paused": True}),
+            ("suppressed", {"_recovery_suppressed": True}),
+            ("completion", {"_completion": {"state": "checking_original"}}),
+            ("completion-child", {"_completion_of": "parent"}),
+            ("legacy-recovery", {"_recovery_claim_id": "legacy"}),
+            ("other-phase", {"recovery_phase": "read_image_request"}),
+            ("image-operation", {"_operation": "image"}),
+            ("image-recovery", {"_image_recovery": {"state": "pending"}}),
+        )
+        base = {
+            "status": "succeeded", "content": "saved answer", "upstream_outcome": "completed",
+            "error_code": None, "finished_at": 900.0, "_executing": False, "_turn_reserved": False,
+            "recovery_claim_id": "expired-original-read", "recovery_claimed_at": 900.0,
+            "recovery_lease_until": 999.0, "recovery_phase": "read_text_request",
+        }
+        for name, change in cases:
+            with self.subTest(guard=name):
+                request_id = "guard-" + name
+                service.submit("owner", {**self.body, "client_request_id": request_id,
+                                         "client_conversation_id": request_id + "-session"})
+                with service.store.transaction() as db:
+                    before = service.store.read_receipt(db, "text", "owner", request_id)
+                    before.update({**base, **change})
+                    db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
+                               (json.dumps(before), "owner", request_id))
+
+                service.read("owner", request_id)
+
+                with service.store.connect() as db:
+                    stored = service.store.read_receipt(db, "text", "owner", request_id)
+                self.assertEqual(stored["recovery_claim_id"], before["recovery_claim_id"])
+                for key in ("recovery_claimed_at", "recovery_lease_until"):
+                    if isinstance(before[key], float) and math.isnan(before[key]):
+                        self.assertTrue(math.isnan(stored[key]))
+                    else:
+                        self.assertEqual(stored[key], before[key])
+        recovery_reader.assert_not_called()
+
+    def test_recovery_heartbeat_renewed_before_read_keeps_lease(self):
+        clock = ManualClock()
+        service = TextTaskService(self.path, executor=self.queue, clock=clock)
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="succeeded", content="saved answer",
+            upstream_outcome="completed", finished_at=900.0, _executing=False, _turn_reserved=False,
+            recovery_claim_id="active-original-read", recovery_claimed_at=900.0,
+            recovery_lease_until=999.0, recovery_phase="read_text_request",
+        )
+        with service.store.connect() as db:
+            receipt = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        service._update_recovery_claim(
+            "owner", receipt, recovery_lease_until=1001.0,
+        )
+
+        service.read("owner", "attempt-1")
+
+        with service.store.connect() as db:
+            stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        self.assertEqual(stored["recovery_claim_id"], "active-original-read")
+        self.assertEqual(stored["recovery_lease_until"], 1001.0)
+
+    def test_retired_completed_recovery_claim_cannot_be_heartbeated_or_revived(self):
+        clock = ManualClock()
+        service = TextTaskService(self.path, executor=self.queue, clock=clock)
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="succeeded", content="saved answer",
+            upstream_outcome="completed", finished_at=900.0, _executing=False, _turn_reserved=False,
+            recovery_claim_id="expired-original-read", recovery_claimed_at=900.0,
+            recovery_lease_until=999.0, recovery_phase="read_text_request",
+        )
+        service.read("owner", "attempt-1")
+        with service.store.connect() as db:
+            retired = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        with self.assertRaises(AdmissionLost):
+            service._update_recovery_claim("owner", {**retired, "recovery_claim_id": "expired-original-read"},
+                                           recovery_lease_until=1100.0)
+        late = service._finish_recovery("owner", "attempt-1", "expired-original-read", {"content": "late answer"})
+        self.assertEqual(late["status"], "succeeded")
+        self.assertEqual(late["content"], "saved answer")
+        with service.store.connect() as db:
+            stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        self.assertIsNone(stored["recovery_claim_id"])
+        self.assertIsNone(stored["recovery_lease_until"])
+        self.assertEqual(stored["content"], "saved answer")
 
     def test_successful_queued_retry_clears_active_error_but_keeps_failure_history(self):
         runner = mock.Mock(return_value={"content": "recovered answer"})
