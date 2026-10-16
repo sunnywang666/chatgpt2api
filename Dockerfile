@@ -7,7 +7,11 @@ FROM --platform=$BUILDPLATFORM node:22-alpine AS web-build
 WORKDIR /app/web
 
 COPY web/package.json web/bun.lock ./
-RUN npm install
+# Keep downloads across a failed BuildKit step and bound npm transport retries.
+# Registry, TLS, and proxy selection remain unchanged.
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm install --maxsockets=5 --fetch-retries=5 --fetch-retry-factor=2 \
+      --fetch-retry-mintimeout=1000 --fetch-retry-maxtimeout=30000
 
 COPY VERSION /app/VERSION
 COPY CHANGELOG.md /app/CHANGELOG.md
