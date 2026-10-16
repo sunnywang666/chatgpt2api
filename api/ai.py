@@ -466,6 +466,14 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         return await run_in_threadpool(text_task_service.read, str(identity.get("id") or "anonymous"), request_id)
 
+    @router.get("/api/conversation-bindings/text-requests/{request_id}/snapshot")
+    async def snapshot_bound_text_request(request_id: str, response: Response,
+                                          authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        response.headers["Cache-Control"] = "private, no-store"
+        return await run_in_threadpool(text_task_service.read_snapshot,
+                                       str(identity.get("id") or "anonymous"), request_id)
+
     @router.post("/api/conversation-bindings/text-requests/{request_id}/recovery-control")
     async def control_bound_text_recovery(request_id: str, body: RecoveryControlRequest, response: Response,
                                           authorization: str | None = Header(default=None)):

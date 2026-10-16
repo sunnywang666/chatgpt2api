@@ -380,6 +380,21 @@ def create_router() -> APIRouter:
             result["completion"] = await run_in_threadpool(completion.read, "text", identity, request_id)
         return result
 
+    @router.get("/api/chat-requests/{request_id}/snapshot")
+    async def snapshot_chat_request(
+        request_id: str,
+        response: Response,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = _ordinary_identity(authorization, request)
+        request_id = _validated_request_id(request_id)
+        receipt = await run_in_threadpool(text_task_service.read_snapshot, _owner(identity), request_id)
+        response.headers["Cache-Control"] = "private, no-store"
+        # Project only persisted completion metadata. Selection/reconciliation
+        # belongs to its existing worker, never this observational GET.
+        return _projection(receipt, request_id)
+
     @router.get("/api/chat-requests/{request_id}/work")
     async def read_chat_work(
         request_id: str,

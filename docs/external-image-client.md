@@ -314,6 +314,48 @@ python3 examples/image_client.py --env-file .image-client.env chat-status --stat
 Happy 主循环依据原生 DSH 消息 `source.replayState.response.requestId` 承接，并保留收到的消息指纹和系统/工具版本指纹。截图内多个连续 user 气泡可能是一次请求中的上下文数组，不应据此判断有几次上游发送。图片工具仍有独立持久图片任务；主推理的会话连续不等于把独立图片任务合并成一条图片请求。本增量不改变额度、并发设置、员工权限或原生 Codex 路线。
 
 
+### 状态查询与后台原结果恢复
+
+调度器检查文字任务时，使用 `GET /api/chat-requests/{original_request_id}/snapshot`。
+工作台旧绑定调用者使用 `GET /api/conversation-bindings/text-requests/{original_request_id}/snapshot`。
+两者沿用原认证和 owner 隔离，无请求体或额外参数，返回 `Cache-Control: private, no-store`。
+它们读取原 ID 的已持久化本地回执，不等待上游、不抢恢复 claim、不修改暂停或读取时钟，
+也不触发新生成。公共端返回既有公共回执投影；旧绑定端返回既有绑定回执投影。
+公共端不存在/非本 owner 的 ID 返回 404，旧绑定端返回 `status:not_found`。
+
+```sh
+curl "$SERVER_ROOT/api/chat-requests/$ORIGINAL_REQUEST_ID/snapshot" \
+  -H "Authorization: Bearer $CHATGPT2API_BEARER_TOKEN"
+```
+
+`succeeded` 且有正文时立即保存该原 ID 的结果、接着推进下一步；`queued`、`running`、
+`unknown` 时本次检查结束，释放调用方执行通道，稍后再查本地快照。
+`failed` 保留可查错误与恢复详情；`not_started` 不等于允许自动重发。
+`recovery_control`、公共 `recovery.automatic_stopped` 或旧绑定
+`recovery_automatic_stopped` 指明暂停/停止时，不能用轮询擅自恢复。
+快照包含已持久化的 completion 安全摘要，保留 `replacement_id`/`selected_id`；
+它不运行 completion 的选择或清理，也不把选中后继的成功冒充原请求成功。
+旧绑定端已证实未发送的目录后继仍通过原本地输入/前序证明返回
+`bound_successor_resume_retryable:true`；这只是可执行资格，查询本身不会恢复发送，
+显式恢复入口仍会再次验证原输入与身份。
+
+自动原结果读取仍由 Provider 启动后的 `PoolAdmission` 后台承担：按原 `recovery_next_at`
+和账号读取节奏执行，最多 4 个后台原读，并沿原账号、请求、会话和父消息位置恢复。
+会话级在途去重与持久恢复租约共同防止重复原读；客户端断开快照查询不会取消该恢复。
+暂停、suppression、已结束的自动恢复预算仍生效；没有后台 worker 的单独服务实例不会因为
+读取快照而自行启动恢复。状态为 `active` 也不表示当前一定有原读在途，应同时看 `in_flight`
+及下一次读取时间。现有 completion 授权范围保持不变。
+
+旧普通 GET 和显式 `POST .../{original_request_id}/recover` 为兼容保留原行为，可能同步等候
+上游。它们不应作为短状态检查的失败回退。显式 `/recover` 用于需要重新核对已停止原请求时，
+执行原合同允许的一次受节奏约束的原读，不替代后台定时调度。
+新 `/snapshot` 路径需与调用方配对部署。公共端真正的 owner miss 是 HTTP 404
+`{"detail":{"code":"CHAT_REQUEST_NOT_FOUND","request_id":"原ID"}}`；旧绑定端是 HTTP 200
+`{"request_id":"原ID","status":"not_found"}`。旧服务器的静态页面回退可能让未安装路由
+返回 200 HTML，或通用 404 `{"detail":"Not Found"}`。调用方必须核验 JSON 类型、原请求 ID
+和合法状态；HTML、通用 404 或不符回执结构均为接口未就绪/协议错误，不能据此触发原请求恢复、
+回退到长时间同步 GET，或换请求 ID 重做生成。
+
 ### 已结束等待、仍无最终文字的旧请求
 
 没有工作生命周期或 completion 处理器的原生 Chat 请求，在达到既有无结果预算、释放本地执行占用后，如果原会话仍为 `REQUEST_RESULT_NOT_FOUND` 且没有上游结束证明，会停止自动读取。已保存的原分支读取游标不会让轮询无限继续；该游标仍保留，不能据此自动重发生成。普通状态 GET 和后台扫描不会重新开启查询；原 ID、输入、账号、会话和 `upstream_outcome=unknown` 保留。这也适用于升级前已经重复读取很多次的记录。工具步骤 `finished_successfully` 不代表最终 assistant 回答完成。 旧绑定接口返回 `recovery_automatic_stopped:true`、`recovery_stop_reason:ORIGINAL_RESULT_NO_FINAL`；公共 Chat 回执对应 `recovery.automatic_stopped`／`recovery.stop_reason`。客户端收到此标记应结束自动查询并显示原任务仍缺最终结果；`retryable:true` 仅表示允许显式原读，不表示继续定时查询或重新生成。

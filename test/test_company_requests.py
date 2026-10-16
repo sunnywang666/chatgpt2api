@@ -142,6 +142,37 @@ def test_durable_chat_restart_cookie_renewal_and_old_key_isolation(company, monk
     assert company.client.get(PREFIX + "/api/chat-requests/original-chat", headers=company.headers()).json()["content"] == "answer"
 
 
+def test_company_snapshot_preserves_unknown_and_original_owner(company):
+    assert company.client.post(PREFIX + "/api/chat-requests", headers=company.headers(), json=body()).status_code == 202
+    owner = company_identity("company", "employee", CONNECTOR)["id"]
+    company.text_tasks._update(owner, "original-chat", status="unknown",
+                               error_code="CONVERSATION_OUTCOME_UNKNOWN", provider_binding_id="private-binding",
+                               provider_account_identity="private-account", conversation_id="private-conversation")
+    company.text_tasks.recovery_reader = Mock(side_effect=AssertionError("snapshot must not recover"))
+    with company.text_tasks.store.connect() as db:
+        before = company.text_tasks.store.read_receipt(db, "text", owner, "original-chat")
+    path = PREFIX + "/api/chat-requests/original-chat/snapshot"
+    response = company.client.get(path, headers=company.headers())
+    assert response.status_code == 200, response.text
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert response.json()["status"] == "unknown"
+    assert response.json()["request_id"] == "original-chat"
+    assert "private-binding" not in response.text and "private-account" not in response.text
+    for headers in (company.headers(user="other"), company.headers(org="other"),
+                    company.headers(connector=OTHER_CONNECTOR)):
+        missing = company.client.get(path, headers=headers)
+        assert missing.status_code == 404
+        assert missing.json() == {"detail": {"code": "CHAT_REQUEST_NOT_FOUND", "request_id": "original-chat"}}
+    assert company.client.post(path, headers=company.headers(), json={}).status_code == 404
+    legacy = PREFIX + "/api/conversation-bindings/text-requests/original-chat/snapshot"
+    assert company.client.get(legacy, headers=company.headers()).status_code == 404
+    with company.text_tasks.store.connect() as db:
+        assert company.text_tasks.store.read_receipt(db, "text", owner, "original-chat") == before
+    company.text_tasks.recovery_reader.assert_not_called()
+    company.runner.assert_not_called()
+    assert len(company.queue.calls) == 1
+
+
 def test_company_unknown_submission_is_not_reexecuted_after_restart(company, monkeypatch):
     assert company.client.post(PREFIX + "/api/chat-requests", headers=company.headers(), json=body()).status_code == 202
     owner = company_identity("company", "employee", CONNECTOR)["id"]
