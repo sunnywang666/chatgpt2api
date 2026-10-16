@@ -377,6 +377,9 @@ class TextTaskService:
         from services.public_chat_service import project_text_execution
         from utils.upstream_error import safe_upstream_error
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
+        # A cancellation proof is always recomputed from the request hash and
+        # durable ProductWork parent below. Never echo a persisted projection.
+        result.pop("cancelled_unsent", None)
         # Revalidate owner-scoped HTTP diagnostics on every read.  Receipts can
         # outlive code versions and must never turn arbitrary stored content
         # into a public error message.
@@ -477,6 +480,17 @@ class TextTaskService:
             result["completion"] = {key: completion[key] for key in (
                 "state", "reason", "replacement_id", "selected_id", "max_extra_requests", "conversation_mode",
                 "automatic_empty_retry") if key in completion}
+        return result
+
+    def _public_with_product_cancellation(self, db, owner, request_hash, receipt):
+        result = self._public(receipt)
+        try:
+            from services.product_work import cancelled_unsent_public
+            proof = cancelled_unsent_public(self.store, db, owner, request_hash, receipt)
+        except (OSError, ValueError, TypeError, KeyError):
+            proof = None
+        if proof:
+            result["cancelled_unsent"] = proof
         return result
 
     @staticmethod
@@ -1346,7 +1360,7 @@ class TextTaskService:
             return self._local_read_projection(db, owner, row[0], json.loads(row[1]), self._now())
 
     def _local_read_projection(self, db, owner, request_hash, receipt, now):
-        result = self._public(receipt)
+        result = self._public_with_product_cancellation(db, owner, request_hash, receipt)
         # Keep the existing known-unsent eligibility advertisement. Its local
         # input/predecessor proof is observational; the explicit resume endpoint
         # still revalidates it under a writer before admitting any work.
@@ -1371,16 +1385,18 @@ class TextTaskService:
         # the existing write transaction before changing the receipt.
         with self._db() as db:
             snapshot = db.execute(
-                "SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id),
+                "SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id),
             ).fetchone()
         if snapshot:
-            receipt = json.loads(snapshot[0])
+            receipt = json.loads(snapshot[1])
             completed = (receipt.get("status") == "succeeded"
                          and isinstance(receipt.get("content"), str) and bool(receipt["content"].strip())
                          # Probe a copy: an eligible cleanup must be persisted
                          # transactionally below, never only in the response.
                          and not self._retire_completed_recovery_claim(dict(receipt), now))
             if self._queued_read_snapshot(receipt) or completed:
+                if receipt.get("_product_unsent_cancelled"):
+                    return self.read_snapshot(owner, request_id)
                 return self._public(receipt)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1553,7 +1569,10 @@ class TextTaskService:
                 if lease_started:
                     lease_thread.join(timeout=1)
             return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result
-        result = self._public(json.loads(row[0]))
+        observed = json.loads(row[0])
+        result = self._public(observed)
+        if observed.get("_product_unsent_cancelled"):
+            result = self.read_snapshot(owner, request_id)
         # This advertisement is a local proof only, never an implicit retry or
         # upstream read. The explicit endpoint revalidates it transactionally.
         if self.admission is not None and self._known_unsent_category_successor(json.loads(row[0]), now):

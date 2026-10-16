@@ -187,6 +187,37 @@ def test_product_no_final_successor_allows_authorized_close_and_archives_success
     assert row(h.service) == original_before and len(h.sent) == 1
 
 
+def test_cancelled_later_product_turn_no_longer_blocks_exact_no_final_successor(product_no_final):
+    h = product_no_final
+    later = {**h.service.store.load_input(h.old["_input_ref"]), "client_request_id": "later",
+             "messages": [{"role": "user", "content": "different later business attempt"}],
+             "product_work": {"product_ref": "fixture-product", "step_ref": "later"}}
+    h.service.submit("owner", later, source="internal:content")
+    product, _, _, identity = product_lifecycle(h)
+    cancelled = product.cancel_step(identity, "fixture-product", "later", 1)
+    assert cancelled["cancelled_unsent"]["request_id"] == "later"
+    accepted = h.service.submit("owner", h.envelope, source="internal:content")
+    assert accepted["status"] == "queued" and accepted["supersedes_request_id"] == "old"
+
+
+def test_other_queued_product_turn_still_blocks_exact_no_final_successor_after_cancel(product_no_final):
+    h = product_no_final
+    original_body = h.service.store.load_input(h.old["_input_ref"])
+    h.service.submit("owner", {**original_body, "client_request_id": "later",
+                                 "messages": [{"role": "user", "content": "different later business attempt"}],
+                                 "product_work": {"product_ref": "fixture-product", "step_ref": "later"}},
+                     source="internal:content")
+    product, _, _, identity = product_lifecycle(h)
+    product.cancel_step(identity, "fixture-product", "later", 1)
+    h.service.submit("owner", {**original_body, "client_request_id": "still-queued",
+                                 "messages": [{"role": "user", "content": "independent unsent business turn"}],
+                                 "product_work": {"product_ref": "fixture-product", "step_ref": "blocked"}},
+                     source="internal:content")
+    with pytest.raises(ConversationBindingError, match="cannot advance") as error:
+        h.service.submit("owner", h.envelope, source="internal:content")
+    assert error.value.code == "CHAT_SUPERSEDE_CONFLICT"
+
+
 def test_product_no_final_successor_survives_resume_and_later_cycle(product_no_final):
     h = product_no_final
     original_before, successor = complete_product_no_final_successor(h)

@@ -130,6 +130,7 @@ def test_parent_api_strict_auth_and_durable_close(services, monkeypatch):
     assert caps.json()["product_count_limit"] is None
     assert caps.json()["retained_products_consume_capacity"] is False
     assert caps.json()["resume"] is True
+    assert caps.json()["cancel_unsent_text_step"] is True
     assert caps.headers["cache-control"] == "private, no-store"
     status = client.get("/api/product-works", params={"product_ref": META["product_ref"]}, headers=headers)
     assert status.json()["members"][0]["request_id"] == "text-1"
@@ -144,6 +145,74 @@ def test_parent_api_strict_auth_and_durable_close(services, monkeypatch):
     assert cancel.status_code == 200, cancel.text
     assert cancel.json()["state"] == "cancelled"
     assert text.read("owner", "text-1")["status"] == "cancelled"
+
+
+def test_cancel_step_route_rejects_unauthorized_or_expanded_scope_without_mutation(services, monkeypatch):
+    text, images, service = services
+    text.submit("owner", text_body(), source=IDENTITY["_trusted_source"])
+    identity = [IDENTITY]
+    monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: identity[0])
+    monkeypatch.setattr(product_works, "get_product_work_service", lambda: service)
+    app = FastAPI(); app.include_router(product_works.create_router())
+    client = TestClient(app)
+    headers = {"x-workbench-consumer": "wb-to-ozon"}
+    payload = {"product_ref": META["product_ref"], "request_id": "text-1", "expected_version": 1}
+
+    def saved_rows():
+        with text.store.connect() as db:
+            return (list(db.execute("SELECT * FROM requests ORDER BY owner,id")),
+                    list(db.execute("SELECT * FROM task_runtime ORDER BY name")))
+
+    before = saved_rows()
+    assert client.post("/api/product-works/cancel-step", json=payload).status_code == 403
+    identity[0] = {**IDENTITY, "role": "user"}
+    assert client.post("/api/product-works/cancel-step", headers=headers, json=payload).status_code == 403
+    identity[0] = {**IDENTITY, "id": "other-owner"}
+    assert client.post("/api/product-works/cancel-step", headers=headers, json=payload).status_code == 404
+    identity[0] = IDENTITY
+    for patch in ({"expected_version": True}, {"expected_version": "1"}, {"expected_version": 0},
+                  {"request_id": " text-1"}, {"request_id": "text-1\n"}, {"product_ref": ""},
+                  {"kind": "image"}, {"messages": []}, {"outcome": "cancelled"},
+                  {"provider_account_identity": "other"}, {"supersedes_request_id": "old"}):
+        assert client.post("/api/product-works/cancel-step", headers=headers,
+                           json={**payload, **patch}).status_code == 422
+    for omitted in payload:
+        assert client.post("/api/product-works/cancel-step", headers=headers,
+                           json={k: v for k, v in payload.items() if k != omitted}).status_code == 422
+    stale = client.post("/api/product-works/cancel-step", headers=headers,
+                        json={**payload, "expected_version": 2})
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "PRODUCT_WORK_VERSION_CONFLICT"
+    assert saved_rows() == before
+    text.runner.assert_not_called(); images.generation_handler.assert_not_called()
+
+
+def test_cancel_step_route_returns_same_verified_proof_as_original_read(services, monkeypatch):
+    text, images, service = services
+    text.submit("owner", text_body(), source=IDENTITY["_trusted_source"])
+    text.submit("owner", text_body("text-2", {**META, "step_ref": "another-step"}),
+                source=IDENTITY["_trusted_source"])
+    monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
+    monkeypatch.setattr(product_works, "get_product_work_service", lambda: service)
+    app = FastAPI(); app.include_router(product_works.create_router())
+    client = TestClient(app)
+    headers = {"x-workbench-consumer": "wb-to-ozon"}
+    payload = {"product_ref": META["product_ref"], "request_id": "text-1", "expected_version": 1}
+    response = client.post("/api/product-works/cancel-step", headers=headers, json=payload)
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "private, no-store"
+    state = response.json()
+    proof = state["cancelled_unsent"]
+    assert set(proof) == {"request_id", "product_ref", "parent_version", "request_hash", "cancelled_at",
+                          "code", "upstream_outcome"}
+    assert proof["request_id"] == "text-1" and proof["product_ref"] == META["product_ref"]
+    assert proof["code"] == "PRODUCT_WORK_STEP_CANCELLED" and proof["upstream_outcome"] == "not_sent"
+    assert state["state"] == "queued" and not state["results_saved"]
+    assert {m["request_id"]: m["status"] for m in state["members"]} == {
+        "text-1": "cancelled", "text-2": "queued"}
+    assert text.read("owner", "text-1")["cancelled_unsent"] == proof
+    assert client.post("/api/product-works/cancel-step", headers=headers, json=payload).json() == state
+    text.runner.assert_not_called(); images.generation_handler.assert_not_called()
 
 
 def test_resume_route_requires_source_and_version_and_fences_close(services, monkeypatch):
