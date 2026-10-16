@@ -49,6 +49,7 @@ class CloseProductWork(BaseModel):
     product_ref: str = Field(strict=True, min_length=1, max_length=200)
     results_saved: Literal[True]
     outcome: Literal["completed", "failed", "cancelled"] = "completed"
+    expected_version: int | None = Field(default=None, strict=True, ge=1)
 
     @field_validator("results_saved", mode="before")
     @classmethod
@@ -56,6 +57,12 @@ class CloseProductWork(BaseModel):
         if value is not True:
             raise ValueError("results_saved=true required")
         return value
+
+
+class ResumeProductWork(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_ref: str = Field(strict=True, min_length=1, max_length=200)
+    expected_version: int = Field(strict=True, ge=1)
 
 
 class AdoptMember(BaseModel):
@@ -92,8 +99,12 @@ def create_router():
         except WorkLifecycleError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
         return {"protocol": "product-work-v1", "shared_capacity_scope": "provider",
+                # Keep the legacy account-capacity source for existing callers.
+                # It no longer defines a total number of unfinished products.
                 "capacity_source": "eligible_chat_turn_total", "cross_kind": True,
-                "close_after_archive": True, "adoption": True}
+                "admission_scope": "account_execution", "product_count_limit": None,
+                "retained_products_consume_capacity": False,
+                "close_after_archive": True, "adoption": True, "resume": True}
 
     @router.get("/api/product-works")
     async def status(request: Request, response: Response,
@@ -105,7 +116,14 @@ def create_router():
     async def close(body: CloseProductWork, request: Request, response: Response,
                     authorization: str | None = Header(default=None)):
         return await invoke(request, authorization, response, "close", body.product_ref,
-                            results_saved=body.results_saved, outcome=body.outcome)
+                            results_saved=body.results_saved, outcome=body.outcome,
+                            expected_version=body.expected_version)
+
+    @router.post("/api/product-works/resume")
+    async def resume(body: ResumeProductWork, request: Request, response: Response,
+                     authorization: str | None = Header(default=None)):
+        return await invoke(request, authorization, response, "resume", body.product_ref,
+                            expected_version=body.expected_version)
 
     @router.post("/api/product-works/adopt")
     async def adopt(body: AdoptProductWork, request: Request, response: Response,

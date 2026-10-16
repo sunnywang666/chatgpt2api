@@ -31,10 +31,11 @@ def runtime(tmp_path):
 
 
 
-def text_submit(rt, request_id, *, owner="owner-a", source=SOURCE_A, product="product-a", step=None):
+def text_submit(rt, request_id, *, owner="owner-a", source=SOURCE_A, product="product-a", step=None,
+                conversation=None):
     _, _, _, _, text, _ = rt
     return text.submit(owner, {"client_request_id": request_id,
-        "client_conversation_id": f"session-{request_id}", "model": "fixture-text",
+        "client_conversation_id": conversation or f"session-{request_id}", "model": "fixture-text",
         "messages": [{"role": "user", "content": "synthetic"}],
         **({"product_work": {"product_ref": product, "step_ref": step or request_id}} if product else {})}, source=source)
 
@@ -114,7 +115,7 @@ def test_mixed_text_image_share_one_parent_and_continuation_skips_new_slot(runti
     assert image_parent["state"] == "active" and image_parent["slot_held"]
 
 
-def test_new_product_capacity_is_shared_across_sources_and_claim_is_atomic(runtime):
+def test_actual_chat_capacity_is_shared_across_sources_and_claim_is_atomic(runtime):
     text_submit(runtime, "a", owner="owner-a", source=SOURCE_A, product="a")
     text_submit(runtime, "b", owner="owner-b", source=SOURCE_B, product="b")
     admission = runtime[3]
@@ -140,11 +141,11 @@ def test_rejected_parent_releases_one_slot_without_rewriting_receipt_and_recover
     assert original_parent["state"] == "active" and original_parent["slot_held"] is True
 
     text_submit(runtime, "waiting", owner="owner-b", source=SOURCE_B, product="waiting-product")
-    # GET is a projection only: it exposes the blocked capacity without
+    # GET is a projection only: it reports retained parent identity without
     # releasing the historical rejection outside the normal claim transaction.
     snapshot = admission.resource_snapshot()
-    assert snapshot["products"] == {"slots_total": 1, "slots_held": 1, "slots_free": 0,
-                                    "queued_products": 1, "active_products": 1}
+    assert snapshot["products"] == {"slots_total": None, "slots_held": 1, "slots_free": None,
+                                    "admission_limited": False, "queued_products": 1, "active_products": 1}
     assert parent(runtime, original) == original_parent
 
     next_claim = admission.claim_next()
@@ -164,7 +165,7 @@ def test_rejected_parent_releases_one_slot_without_rewriting_receipt_and_recover
         {"kind": "text", "request_id": "rejected", "step_ref": "rejected"},
         {"kind": "text", "request_id": "recovery", "step_ref": "recovery"},
     ])["slot_held"] is False
-    assert admission.claim_next() is None  # The recovered product cannot bypass the one held slot.
+    assert admission.claim_next() is None  # The only usable Chat account is occupied by "waiting".
     assert parent(runtime, receipt(runtime, "text", "owner-a", "recovery"))["slot_held"] is False
 
     accounts.update_account("fixture-token-1", {"managed_disabled": False, "status": "正常"}, quiet=True)
@@ -223,7 +224,7 @@ def test_rejected_parent_never_releases_when_receipt_membership_is_not_bidirecti
     assert held["state"] == "active" and held["slot_held"] is True
 
 
-def test_capacity_shrink_and_unknown_parent_block_only_new_products(runtime):
+def test_capacity_shrink_blocks_new_work_only_while_actual_chat_is_occupied(runtime):
     text_submit(runtime, "a-first", owner="owner-a", source=SOURCE_A, product="a")
     text_submit(runtime, "b-first", owner="owner-b", source=SOURCE_B, product="b")
     admission = runtime[3]
@@ -233,22 +234,79 @@ def test_capacity_shrink_and_unknown_parent_block_only_new_products(runtime):
     finish(runtime, "text", "owner-b", "b-first")
     text_submit(runtime, "a-next", owner="owner-a", source=SOURCE_A, product="a")
     text_submit(runtime, "new", owner="owner-c", source=SOURCE_B, product="new")
-    # Losing an eligible account lowers the snapshot total below its two held
-    # parents. The existing parent can continue on account-0; a new one cannot.
-    runtime[1].update_account("fixture-token-1", {"managed_disabled": True}, quiet=True)
+    update_receipt(runtime, "text", "owner-c", "new", _ready_at=runtime[0].now + 60)
+    # One eligible Chat account remains. Its active continuation occupies that
+    # actual account capacity, independent of the two retained product parents.
+    first_account = receipt(runtime, "text", "owner-a", "a-first")["provider_account_identity"]
+    disabled_token = "fixture-token-1" if first_account == "account-0" else "fixture-token-0"
+    runtime[1].update_account(disabled_token, {"managed_disabled": True}, quiet=True)
     continuation = admission.claim_next()
     assert continuation and continuation.request_id == "a-next"
     finish(runtime, "text", "owner-a", "a-next")
     assert receipt(runtime, "text", "owner-c", "new")["status"] == "queued"
     assert admission.claim_next() is None
 
-    # An unresolved held parent also remains counted. New work must not infer
-    # its capacity from a free worker or an unrelated source.
+    # UNKNOWN retains both original identity and its actual account occupancy;
+    # removing a product-count cap must not make that account reusable.
     with runtime[2].transaction() as db:
         first_row = runtime[2].read_receipt(db, "text", "owner-a", "a-first")
         first_row.update(status="unknown", upstream_outcome="unknown", _attempt_finished_at=None)
         runtime[2].write_receipt(db, "text", "owner-a", "a-first", first_row)
+    update_receipt(runtime, "text", "owner-c", "new", _ready_at=runtime[0].now)
     assert admission.claim_next() is None
+
+
+def test_retained_product_parents_do_not_block_a_25th_new_product(runtime):
+    """Lifecycle-held parents are identity state, not an admission pool."""
+    admission = runtime[3]
+    for number in range(25):
+        request_id = f"retained-{number}"
+        text_submit(runtime, request_id, product=f"retained-product-{number}")
+        held_parent(runtime, "text", "owner-a", request_id)
+        finish(runtime, "text", "owner-a", request_id)
+
+    snapshot = admission.resource_snapshot()
+    assert snapshot["products"] == {"slots_total": None, "slots_held": 25, "slots_free": None,
+                                    "admission_limited": False, "queued_products": 0, "active_products": 25}
+
+    text_submit(runtime, "new-product", owner="owner-b", source=SOURCE_B, product="new-product")
+    claimed = admission.claim_next()
+    assert claimed and claimed.request_id == "new-product"
+
+
+def test_real_chat_account_capacity_still_queues_a_new_product(runtime):
+    admission = runtime[3]
+    text_submit(runtime, "first", product="first-product")
+    text_submit(runtime, "second", owner="owner-b", source=SOURCE_B, product="second-product")
+    text_submit(runtime, "waiting", owner="owner-c", source=SOURCE_A, product="waiting-product")
+
+    first = admission.claim_next()
+    second = admission.claim_next()
+    assert {first.request_id, second.request_id} == {"first", "second"}
+    assert admission.claim_next() is None
+    assert receipt(runtime, "text", "owner-c", "waiting")["status"] == "queued"
+
+
+def test_chat_cooldown_still_queues_a_new_product(runtime):
+    _, _, _, admission, _, _ = runtime
+    admission._pacing = lambda _account, now: {"next_at": now + 60, "cooldown_until": now + 60}
+    text_submit(runtime, "cooling", product="cooling-product")
+
+    assert admission.claim_next() is None
+    assert receipt(runtime, "text", "owner-a", "cooling")["status"] == "queued"
+
+
+def test_same_product_conversation_members_cannot_start_concurrently(runtime):
+    admission = runtime[3]
+    text_submit(runtime, "first", product="one-product", step="first", conversation="same-conversation")
+    text_submit(runtime, "duplicate", product="one-product", step="duplicate", conversation="same-conversation")
+
+    first = admission.claim_next()
+    assert first and first.request_id == "first"
+    assert admission.claim_next() is None
+    finish(runtime, "text", "owner-a", "first")
+    second = admission.claim_next()
+    assert second and second.request_id == "duplicate"
 
 
 def test_fixed_product_lanes_rotate_with_legacy_without_idling_on_unready_continuation(runtime):

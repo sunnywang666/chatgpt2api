@@ -125,9 +125,15 @@ def test_parent_api_strict_auth_and_durable_close(services, monkeypatch):
     assert client.get("/api/product-works/capabilities").status_code == 403
     caps = client.get("/api/product-works/capabilities", headers=headers)
     assert caps.json()["shared_capacity_scope"] == "provider"
+    assert caps.json()["capacity_source"] == "eligible_chat_turn_total"
+    assert caps.json()["admission_scope"] == "account_execution"
+    assert caps.json()["product_count_limit"] is None
+    assert caps.json()["retained_products_consume_capacity"] is False
+    assert caps.json()["resume"] is True
     assert caps.headers["cache-control"] == "private, no-store"
     status = client.get("/api/product-works", params={"product_ref": META["product_ref"]}, headers=headers)
     assert status.json()["members"][0]["request_id"] == "text-1"
+    assert status.json()["version"] == 1
     for invalid in ({"results_saved": 1}, {"results_saved": False}, {"results_saved": True, "priority": 3}):
         assert client.post("/api/product-works/close", headers=headers,
             json={"product_ref": META["product_ref"], **invalid}).status_code == 422
@@ -138,6 +144,46 @@ def test_parent_api_strict_auth_and_durable_close(services, monkeypatch):
     assert cancel.status_code == 200, cancel.text
     assert cancel.json()["state"] == "cancelled"
     assert text.read("owner", "text-1")["status"] == "cancelled"
+
+
+def test_resume_route_requires_source_and_version_and_fences_close(services, monkeypatch):
+    text, images, service = services
+    text.submit("owner", text_body(), source=IDENTITY["_trusted_source"])
+    # API transport checks use a completed no-conversation parent; actual
+    # archive proof/cursors and concurrency are exercised by service tests.
+    monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
+    monkeypatch.setattr(product_works, "get_product_work_service", lambda: service)
+    app = FastAPI(); app.include_router(product_works.create_router())
+    client = TestClient(app)
+    headers = {"x-workbench-consumer": "wb-to-ozon"}
+    payload = {"product_ref": META["product_ref"], "expected_version": 1}
+    assert client.post("/api/product-works/resume", json=payload).status_code == 403
+    for invalid in ({}, {"expected_version": True}, {"expected_version": "1"},
+                    {"expected_version": 0}, {"expected_version": 1, "priority": 1}):
+        assert client.post("/api/product-works/resume", headers=headers,
+                           json={"product_ref": META["product_ref"], **invalid}).status_code == 422
+    response = client.post("/api/product-works/resume", headers=headers, json=payload)
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "PRODUCT_WORK_RESUME_NOT_COMPLETED"
+    with text.store.transaction() as db:
+        receipt = text.store.read_receipt(db, "text", "owner", "text-1")
+        receipt.update(status="succeeded", content="saved original", upstream_outcome="completed")
+        text.store.write_receipt(db, "text", "owner", "text-1", receipt)
+        parent = text.store.runtime(db, receipt["_product_work_key"])
+        parent.update(state="completed", outcome="completed", results_saved=True, slot_held=False)
+        text.store.set_runtime(db, parent["key"], parent)
+    resumed = client.post("/api/product-works/resume", headers=headers, json=payload)
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["version"] == 2
+    assert resumed.headers["cache-control"] == "private, no-store"
+    assert client.post("/api/product-works/resume", headers=headers, json=payload).json() == resumed.json()
+    for expected, code in ((None, "PRODUCT_WORK_VERSION_REQUIRED"), (1, "PRODUCT_WORK_VERSION_CONFLICT")):
+        closed = client.post("/api/product-works/close", headers=headers, json={
+            "product_ref": META["product_ref"], "results_saved": True,
+            **({"expected_version": expected} if expected is not None else {})})
+        assert closed.status_code == 409
+        assert closed.json()["detail"]["code"] == code
+    text.runner.assert_not_called(); images.generation_handler.assert_not_called()
 
 
 def test_adoption_keeps_successful_original_hash_input_and_generation_count(services):
