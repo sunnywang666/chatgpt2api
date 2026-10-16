@@ -314,6 +314,16 @@ real Chat conversations belonging to the product; native Codex members do not
 create a fabricated Chat archive target. An unresolved native request still
 prevents the product from being released.
 
+A product containing only confirmed `MODEL_NOT_FOUND` rejections can return to
+`queued` without holding a product slot when none of its requests has a Chat
+conversation, a result, or active execution/recovery work. The original failed
+receipts remain unchanged. A later authorized successor keeps the same product
+and must acquire capacity again; releasing the slot does not resend a request
+or mark the business task complete. Products with unknown results, existing
+conversations, or unfinished members retain their protection. The management
+`/api/workbench/ai/pool/resources` response reports this product budget in
+`products`, separately from physical Chat turns and generic `workflows`.
+
 Keep the original Chat continuation/archive cursor separate from this Codex
 receipt. A Codex response ID is not a Chat conversation or parent-message ID.
 Existing account credentials, Chat image generation and Chat archival are not
