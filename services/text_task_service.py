@@ -3625,7 +3625,7 @@ class TextTaskService:
                 result.pop("request_parent_message_id", None)
                 result.pop("_submission_parent_message_id", None)
             self._update(owner, request_id, **{**result, "status": "succeeded", "finished_at": self._now(),
-                                              "_executing": False})
+                                              "_executing": False, "_turn_reserved": False})
             if missing_attempt:
                 self._mark_missing_successor_recovered(owner, request_id, missing_result_source)
             context = current_request.get()

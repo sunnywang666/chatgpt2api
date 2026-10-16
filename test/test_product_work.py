@@ -359,6 +359,51 @@ def test_real_image_admission_retires_execution_but_keeps_claim_identity(tmp_pat
     assert result["state"] == "closing" and result["slot_held"] and result["cleanup_pending"]
 
 
+def test_real_text_admission_retires_turn_and_allows_product_close(tmp_path):
+    from datetime import datetime, timezone
+    from services.request_context import current_request
+    from services.text_task_service import TextTaskService
+    from test.test_pool_admission import build, Clock
+
+    clock = Clock()
+    (tmp_path / "accounts.json").write_text(json.dumps([{
+        "access_token": "fixture-token", "account_id": "upstream", "provider_account_identity": "account",
+        "type": "Plus", "status": "正常", "quota": 99, "source_type": "web",
+        "conversation_binding_ids": ["binding"],
+        "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+    }]))
+    _, store, admission = build(tmp_path, clock)
+
+    def runner(body, on_cursor):
+        current_request.get().before_send()
+        return {"content": "saved normal text result", "upstream_outcome": "completed",
+                "upstream_unfinished": False, "provider_binding_id": "binding",
+                "provider_account_identity": "account", "conversation_id": "conversation",
+                "parent_message_id": "final-parent"}
+
+    text = TextTaskService(store.path, runner=runner, admission=admission, clock=clock)
+    admission.register("text", lambda context, body: text._run(context.owner, context.request_id, body))
+    text.submit("owner", {
+        "client_request_id": "text", "client_conversation_id": "client", "model": "fixture-text",
+        "messages": [{"role": "user", "content": "fixture"}],
+        "product_work": {"product_ref": "P", "step_ref": "text"},
+    }, source="internal:listing")
+
+    context = admission.claim_next()
+    assert context and context.kind == "text"
+    product = ProductWorkService(text, SimpleNamespace(archive_product_work=lambda *args: None), clock=clock)
+    with pytest.raises(WorkLifecycleError, match="TURN_UNFINISHED"):
+        product.close(IDENTITY, "P")
+    admission.execute(context)
+    with store.connect() as db:
+        receipt = store.read_receipt(db, "text", "owner", "text")
+    assert receipt["status"] == "succeeded" and receipt["content"] == "saved normal text result"
+    assert receipt["_claim_id"] == context.claim and receipt["_claim_until"] > clock.now
+    assert receipt["_executing"] is False and receipt["_turn_reserved"] is False
+    result = product.close(IDENTITY, "P")
+    assert result["state"] == "closing" and result["slot_held"] and result["cleanup_pending"]
+
+
 @pytest.mark.parametrize("extra", [{"_forward_protocol": "responses"}, {"_editable_task_id": "file"},
     {"_editable_kind": "spreadsheet"}, {"_editable": {"kind": "file"}}, {"_operation": "image"}])
 def test_adoption_rejects_nonpure_legacy_text(runtime, extra):
