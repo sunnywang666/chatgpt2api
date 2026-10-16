@@ -570,7 +570,7 @@ class PoolAdmission:
         read = getattr(self.accounts, "admission_accounts", None)
         return read() if read else self.accounts.list_accounts()
 
-    def _snapshot(self, rows, receipts, settings, types, now, cursor, workflow_state=None, product_state=None):
+    def _snapshot(self, rows, receipts, settings, types, now, cursor, workflow_state=None, product_state=None, *, db=None):
         from services.text_task_service import TextTaskService
         works, workflow_clocks = workflow_state or ({}, {})
         product_works = product_state or {}
@@ -653,8 +653,26 @@ class PoolAdmission:
                 previous = text_receipts.get(key)
                 # Failed known-unsent successors keep the old order block. A
                 # submitted/unknown successor remains the new blocking head.
-                if (successor.get("status") in {"queued", "running", "unknown", "succeeded"}
-                        or unknown_text_result(successor)) and TextTaskService._supersede_order_link(previous, successor):
+                advances = (successor.get("status") in {"queued", "running", "unknown", "succeeded"}
+                            or unknown_text_result(successor))
+                # A registered model-rejection retry is the sole exception:
+                # its parent is a terminal, typed rejection of the one
+                # validated no-final successor. Its one registered child is
+                # revalidated immediately before send and remains the current
+                # order head while queued, running, unknown, or succeeded.
+                # Keep the root blocked until that exact child exists; never
+                # release it for a failed rejection by itself or another turn.
+                if not advances and db is not None:
+                    retries = successors.get((key[0], request_id), [])
+                    advances = bool(
+                        len(retries) == 1
+                        and (retries[0][1].get("status") in {"queued", "running", "unknown", "succeeded"}
+                             or unknown_text_result(retries[0][1]))
+                        and TextTaskService._no_final_model_rejection_retry(
+                            self.store, db, key[0], retries[0][1], now)
+                        and TextTaskService._supersede_order_link(successor, retries[0][1])
+                    )
+                if advances and TextTaskService._supersede_order_link(previous, successor):
                     released_order_heads.add(key)
         physical_pending = {}
         for kind, owner, request_id, receipt in receipts:
@@ -987,7 +1005,7 @@ class PoolAdmission:
             settings = self._settings()
             workflow_state = workflow_scheduling.state_snapshot(self.store, db)
             product_state = product_work.state_snapshot(self.store, db)
-            snapshot = self._snapshot(rows, receipts, settings, {}, now, {}, workflow_state, product_state)
+            snapshot = self._snapshot(rows, receipts, settings, {}, now, {}, workflow_state, product_state, db=db)
         resources = {r.key: r for r in snapshot.resources}
         result = []
         seen = set()
@@ -1087,7 +1105,8 @@ class PoolAdmission:
         with self._settings_guard(), self.store.connect() as db, self._account_guard():
             rows = self._rows()
             snapshot = self._snapshot(rows, list(self.store.receipts(db)), self._settings(), {}, now, {},
-                                      workflow_scheduling.state_snapshot(self.store, db), product_work.state_snapshot(self.store, db))
+                                      workflow_scheduling.state_snapshot(self.store, db), product_work.state_snapshot(self.store, db),
+                                      db=db)
         resources = {resource.key: resource for resource in snapshot.resources}
         server = resources["codex_server"]
         server_free = None if server.occupied is None else max(0, server.capacity - server.occupied)
@@ -1359,7 +1378,7 @@ class PoolAdmission:
             workflow_state = workflow_scheduling.state_snapshot(self.store, db)
             product_state = product_work.state_snapshot(self.store, db)
             snapshot = self._snapshot(self._rows(), receipts, settings, types, now,
-                                      self.store.runtime(db, "fairness", {}), workflow_state, product_state)
+                                      self.store.runtime(db, "fairness", {}), workflow_state, product_state, db=db)
             selection = choose_next(snapshot, now)
             for deferred in selection.deferred:
                 r = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id)

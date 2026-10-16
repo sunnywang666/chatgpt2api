@@ -86,6 +86,30 @@ def envelope(request_id="successor"):
     return {"client_request_id": request_id, "supersedes_request_id": "old", "client_conversation_id": "session"}
 
 
+def prove_no_final_model_rejection(task):
+    update(task.service, status="failed", error_code="RESULT_UNRECOVERABLE", upstream_outcome="unknown",
+           recovery_reason=None, recovery_error_code="RECOVERY_READ_FAILED",
+           _attempt_reason="ORIGINAL_RESULT_NO_FINAL", _attempt_finished_at=500,
+           recovery_no_result_reads=9, _execution_wait_ended_at=500,
+           _submission_started=True, _executing=False, _turn_reserved=False, _claim_id=None,
+           _claim_until=None, send_count=1)
+    unknown_child = task.service.submit("owner", {
+        **{key: task.body[key] for key in TextTaskService.SUPERSEDE_FIELDS - {"supersedes_request_id"}},
+        "client_request_id": "rejected-parent", "supersedes_request_id": "old",
+        "continue_after_no_final": True,
+    }, source="internal:content")
+    assert unknown_child["supersedes_request_id"] == "old"
+    update(task.service, "rejected-parent", status="failed", error_code="MODEL_NOT_FOUND",
+           upstream_outcome="rejected", _submission_started=True, _executing=False, _turn_reserved=False,
+           request_parent_message_id="actual-no-final-tail",
+           original_failure_phase="stream_open", original_exception_category="http",
+           original_upstream_request_stage="conversation", original_http_status=404,
+           original_upstream_error_form="detail_text",
+           original_upstream_error={"message": "Model not found"})
+    return {"client_request_id": "model-retry", "supersedes_request_id": "rejected-parent",
+            "client_conversation_id": "session"}
+
+
 @pytest.mark.parametrize("cursor", [True, False])
 def test_typed_rejection_creates_frozen_successor_with_or_without_cursor(task, cursor):
     prove_model_rejection(task.service, cursor=cursor, input_lacks_identity=not cursor)
@@ -117,6 +141,132 @@ def test_same_id_reads_frozen_child_after_parent_changes(task):
     with pytest.raises(ConversationBindingError) as error:
         task.service.submit("owner", envelope("other"))
     assert error.value.code == "CHAT_SUPERSEDE_INVALID"
+
+
+def test_model_rejection_after_one_explicit_unknown_successor_can_retry_once(task):
+    """A typed rejection may retry the exact input of one proved UNKNOWN child."""
+    def cursor_runner(body, on_cursor):
+        current_request.get().before_send()
+        # openai_backend_api reports both values from the actual POST tail.
+        # C must retain its frozen submission root in its durable receipt.
+        on_cursor({"request_parent_message_id": body["parent_message_id"],
+                   "_submission_parent_message_id": body["parent_message_id"]})
+        task.sent.append(deepcopy(body))
+        return {"content": "successor answer", "parent_message_id": "new-answer"}
+    task.service.runner = cursor_runner
+    retry = task.service.submit("owner", prove_no_final_model_rejection(task), source="internal:content")
+
+    saved = task.service.store.load_input(receipt(task.service, "model-retry")["_input_ref"])
+    assert retry["supersedes_request_id"] == "rejected-parent"
+    assert saved == {**task.body, "client_request_id": "model-retry", "supersedes_request_id": "rejected-parent"}
+    assert "continue_after_no_final" not in saved
+    child = receipt(task.service, "model-retry")
+    assert "_supersedes_no_final" not in child
+    assert child["request_parent_message_id"] == "previous-answer"
+    assert receipt(task.service, "rejected-parent")["request_parent_message_id"] == "actual-no-final-tail"
+    assert TextTaskService._supersede_order_link(receipt(task.service), receipt(task.service, "rejected-parent"))
+    assert TextTaskService._supersede_order_link(receipt(task.service, "rejected-parent"), child)
+    claim = task.admission.claim_next()
+    assert claim and claim.request_id == "model-retry"
+    task.admission.execute(claim)
+    assert receipt(task.service, "model-retry")["status"] == "succeeded"
+    assert len(task.sent) == 1
+    assert task.sent[-1]["parent_message_id"] == "actual-no-final-tail"
+    finished = receipt(task.service, "model-retry")
+    assert finished["request_parent_message_id"] == "actual-no-final-tail"
+    assert finished["_submission_parent_message_id"] == "previous-answer"
+    task.service.submit("owner", {**task.body, "client_request_id": "after-model-retry",
+                                   "parent_message_id": "new-answer"}, source="internal:content")
+    later = task.admission.claim_next()
+    assert later and later.request_id == "after-model-retry"
+
+
+@pytest.mark.parametrize("changes", [
+    {"status": "succeeded", "content": "late original", "upstream_outcome": "completed"},
+    {"_claim_id": "active", "_claim_until": 2000},
+])
+def test_model_retry_rejects_late_or_busy_no_final_ancestor(task, changes):
+    retry = prove_no_final_model_rejection(task)
+    update(task.service, **changes)
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit("owner", retry, source="internal:content")
+    assert error.value.code == "CHAT_SUPERSEDE_INVALID"
+    assert receipt(task.service, "model-retry") is None
+
+
+def test_model_retry_same_id_is_frozen_and_different_child_conflicts(task):
+    retry = prove_no_final_model_rejection(task)
+    first = task.service.submit("owner", retry, source="internal:content")
+    assert task.service.submit("owner", retry) == first
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit("owner", {**retry, "client_request_id": "other-model-retry"}, source="internal:content")
+    assert error.value.code == "CHAT_SUPERSEDE_CONFLICT"
+
+
+def test_model_retry_cannot_create_another_rejected_successor(task):
+    retry = prove_no_final_model_rejection(task)
+    task.service.submit("owner", retry, source="internal:content")
+    update(task.service, "model-retry", status="failed", error_code="MODEL_NOT_FOUND",
+           upstream_outcome="rejected", _submission_started=True, _executing=False, _turn_reserved=False,
+           original_failure_phase="stream_open", original_exception_category="http",
+           original_upstream_request_stage="conversation", original_http_status=404,
+           original_upstream_error_form="detail_text",
+           original_upstream_error={"message": "Model not found"})
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit("owner", {**retry, "client_request_id": "third-child",
+                                       "supersedes_request_id": "model-retry"}, source="internal:content")
+    assert error.value.code == "CHAT_SUPERSEDE_INVALID"
+    account_ref = task.admission.accounts.pool_account_ref(task.admission.accounts.list_accounts()[0])
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit_codex_fallback("owner", "model-retry", "codex-third", "gpt-5.6-codex", account_ref)
+    assert error.value.code == "CODEX_FALLBACK_ORIGINAL_INELIGIBLE"
+
+
+def test_model_retry_cannot_reserve_a_missing_successor_resend(task):
+    retry = prove_no_final_model_rejection(task)
+    task.service.submit("owner", retry, source="internal:content")
+    update(task.service, "model-retry", status="failed", error_code="RESULT_UNRECOVERABLE",
+           upstream_outcome="unknown", recovery_reason="REQUEST_MESSAGE_NOT_FOUND",
+           _attempt_reason="ORIGINAL_REQUEST_MESSAGE_NOT_FOUND", _attempt_finished_at=500,
+           _execution_wait_ended_at=500, _submission_started=True, _executing=False, _turn_reserved=False)
+    saved = task.service.store.load_input(receipt(task.service, "model-retry")["_input_ref"])
+    envelope = {key: saved[key] for key in TextTaskService.SUPERSEDE_FIELDS}
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.resume_missing_successor("owner", "model-retry", envelope)
+    assert error.value.code == "CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE"
+
+
+@pytest.mark.parametrize("parent_id,changes", [
+    ("old", {"status": "succeeded", "content": "late root", "upstream_outcome": "completed"}),
+    ("rejected-parent", {"status": "succeeded", "content": "late parent", "upstream_outcome": "completed",
+                         "parent_message_id": "late-parent-answer"}),
+])
+def test_consumed_model_retry_stays_closed_after_ancestor_state_changes(task, parent_id, changes):
+    retry = prove_no_final_model_rejection(task)
+    task.service.submit("owner", retry, source="internal:content")
+    update(task.service, "model-retry", status="failed", error_code="MODEL_NOT_FOUND",
+           upstream_outcome="rejected", _submission_started=True, _executing=False, _turn_reserved=False,
+           original_failure_phase="stream_open", original_exception_category="http",
+           original_upstream_request_stage="conversation", original_http_status=404,
+           original_upstream_error_form="detail_text",
+           original_upstream_error={"message": "Model not found"})
+    update(task.service, parent_id, **changes)
+    account_ref = task.admission.accounts.pool_account_ref(task.admission.accounts.list_accounts()[0])
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit_codex_fallback("owner", "model-retry", "codex-third", "gpt-5.6-codex", account_ref)
+    assert error.value.code == "CODEX_FALLBACK_ORIGINAL_INELIGIBLE"
+
+
+def test_model_retry_rechecks_ancestor_before_send(task):
+    retry = prove_no_final_model_rejection(task)
+    task.service.submit("owner", retry, source="internal:content")
+    claim = task.admission.claim_next()
+    assert claim and claim.request_id == "model-retry"
+    update(task.service, status="succeeded", content="late original", upstream_outcome="completed")
+    task.admission.execute(claim)
+    child = receipt(task.service, "model-retry")
+    assert not task.sent
+    assert child["upstream_outcome"] == "not_sent"
 
 
 @pytest.mark.parametrize("changes, code", [
@@ -244,6 +394,71 @@ def test_physical_rejected_successor_rechecks_original_cursor_before_send(task, 
     assert child["status"] == "failed" and child["error_code"] == "CHAT_SUPERSEDE_ORIGINAL_FOUND"
     assert child["upstream_outcome"] == "not_sent"
     assert "send" not in bound_chat.calls
+
+
+@pytest.mark.parametrize("change, expected", [
+    ("root_late_final", "CHAT_SUPERSEDE_CURSOR_CHANGED"),
+    ("rejected_user_appears", "CHAT_SUPERSEDE_ORIGINAL_FOUND"),
+    ("tail_content_changes", "CHAT_SUPERSEDE_CURSOR_CHANGED"),
+])
+def test_model_retry_bound_guard_rechecks_root_tail_and_rejected_parent(task, bound_chat, monkeypatch,
+                                                                         change, expected):
+    """The C POST reuses the binding layer's R→tail preflight, not P's cursor."""
+    retry = prove_no_final_model_rejection(task)
+    root = receipt(task.service)
+    rejected = receipt(task.service, "rejected-parent")
+
+    def node(message_id, parent, children, role, content, *, end=None, channel=None):
+        return {"parent": parent, "children": children, "message": {
+            "id": message_id, "author": {"role": role}, "status": "finished_successfully",
+            "end_turn": end, "channel": channel, "content": content,
+        }}
+    bound_chat.document = {
+        "conversation_id": "original-chat", "current_node": "actual-no-final-tail", "is_archived": False,
+        "mapping": {
+            root["request_message_id"]: node(
+                root["request_message_id"], "previous-answer", ["no-final-code"], "user",
+                {"content_type": "text", "parts": ["original input"]}),
+            "no-final-code": node(
+                "no-final-code", root["request_message_id"], ["actual-no-final-tail"], "assistant",
+                {"content_type": "code", "text": "inspect input"}, end=False, channel="analysis"),
+            "actual-no-final-tail": node(
+                "actual-no-final-tail", "no-final-code", [], "tool",
+                {"content_type": "multimodal_text", "parts": ["retained tool context"]}, end=False),
+        },
+    }
+    import services.conversation_binding_service as binding_module
+    backend_type = binding_module.OpenAIBackendAPI
+    original_get = backend_type._get_conversation
+
+    def get_with_preflight_send(self, chat, _send=None):
+        return original_get(self, chat)
+    monkeypatch.setattr(backend_type, "_get_conversation", get_with_preflight_send)
+
+    def guarded_events(backend, **kwargs):
+        if change == "root_late_final":
+            bound_chat.document["mapping"][root["request_message_id"]]["children"].append("late-final")
+            bound_chat.document["mapping"]["late-final"] = node(
+                "late-final", root["request_message_id"], [], "assistant",
+                {"content_type": "text", "parts": ["late answer"]}, end=True)
+        elif change == "rejected_user_appears":
+            bound_chat.document["mapping"][rejected["request_message_id"]] = node(
+                rejected["request_message_id"], "actual-no-final-tail", [], "user",
+                {"content_type": "text", "parts": ["rejected request"]})
+        else:
+            bound_chat.document["mapping"]["actual-no-final-tail"]["message"]["content"] = {
+                "content_type": "multimodal_text", "parts": ["changed tool context"]}
+        backend.text_pre_send_check(None)
+        bound_chat.calls.append("send")
+        yield {"type": "conversation.delta", "conversation_id": "original-chat", "delta": "answer"}
+
+    monkeypatch.setattr(binding_module, "conversation_events", guarded_events)
+    task.service.runner = bound_chat.service.complete_text
+    task.service.submit("owner", retry, source="internal:content")
+    task.admission.execute(task.admission.claim_next())
+    child = receipt(task.service, "model-retry")
+    assert child["status"] == "failed" and child["error_code"] == expected
+    assert child["upstream_outcome"] == "not_sent" and "send" not in bound_chat.calls
 
 
 def test_rejected_successor_rejects_local_bound_auth_unavailable_before_insert(task, monkeypatch):

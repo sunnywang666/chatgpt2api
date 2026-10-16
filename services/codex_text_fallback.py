@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 
 from services.conversation_binding_service import ConversationBindingError
 
@@ -97,6 +98,8 @@ def _original(store, db, owner, original_id):
         original_body = store.load_input(receipt["_input_ref"])
         from services.text_task_service import TextTaskService
         if TextTaskService._submission_identity(owner, original_body) != (original_id, request_hash):
+            _reject("CODEX_FALLBACK_ORIGINAL_INELIGIBLE")
+        if TextTaskService._no_final_model_rejection_retry(store, db, owner, receipt, time.time()):
             _reject("CODEX_FALLBACK_ORIGINAL_INELIGIBLE")
     except (OSError, ValueError, TypeError, KeyError):
         _reject("CODEX_FALLBACK_CONTEXT_UNAVAILABLE")
