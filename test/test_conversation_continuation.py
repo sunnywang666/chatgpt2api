@@ -1108,6 +1108,148 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         )
         self.assertEqual(captured.exception.conversation_id, "conversation-1")
 
+    def test_product_work_text_reads_its_exact_request_after_stale_gallery_delta(self) -> None:
+        document = {
+            "conversation_id": "conversation-1",
+            "current_node": "later-user",
+            "mapping": {
+                "request-user": {
+                    "parent": None,
+                    "message": {"id": "request-user", "author": {"role": "user"}},
+                },
+                "original-answer": {
+                    "parent": "request-user",
+                    "message": {
+                        "id": "original-answer", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True, "channel": "final",
+                        "content": {"content_type": "text", "parts": ["correct copy"]},
+                    },
+                },
+                "later-user": {
+                    "parent": "original-answer",
+                    "message": {"id": "later-user", "author": {"role": "user"}},
+                },
+                "later-answer": {
+                    "parent": "later-user",
+                    "message": {
+                        "id": "later-answer", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True, "channel": "final",
+                        "content": {"content_type": "text", "parts": ["later answer"]},
+                    },
+                },
+            },
+        }
+
+        class FakeBackend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.reads = 0
+                self.parent_reads = 0
+
+            def _get_conversation(self, conversation_id: str) -> dict:
+                self.test_case.assertEqual(conversation_id, "conversation-1")
+                self.reads += 1
+                return document
+
+            def get_conversation_parent_message_id(self, conversation_id: str) -> str:
+                self.test_case.assertEqual(conversation_id, "conversation-1")
+                self.parent_reads += 1
+                return "later-user"
+
+            def close(self) -> None:
+                pass
+
+        FakeBackend.test_case = self
+        backend = FakeBackend("token-a")
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                       return_value="account-opaque-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                       return_value="token-a"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                       return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.account_service.mark_text_used"),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+            mock.patch("services.conversation_binding_service.conversation_events", return_value=iter([
+                {"type": "conversation.delta", "conversation_id": "conversation-1", "delta": "old gallery text"},
+            ])),
+        ):
+            result = ConversationBindingService().complete_text({
+                "provider_binding_id": "cb-account-a",
+                "provider_account_identity": "account-opaque-a",
+                "client_conversation_id": "product-conversation-1",
+                "_request_message_id": "request-user",
+                "product_work": {"product_ref": "product-1", "step_ref": "copy"},
+                "messages": [{"role": "user", "content": "write copy"}],
+            })
+
+        self.assertEqual(result["content"], "correct copy")
+        self.assertEqual(result["parent_message_id"], "original-answer")
+        self.assertEqual(backend.reads, 1)
+        self.assertEqual(backend.parent_reads, 0)
+
+    def test_product_work_text_keeps_missing_or_ambiguous_original_unknown(self) -> None:
+        def complete(document):
+            class FakeBackend:
+                def __init__(self, access_token: str) -> None:
+                    self.access_token = access_token
+                    self.reads = 0
+
+                def _get_conversation(self, conversation_id: str) -> dict:
+                    self.reads += 1
+                    return document
+
+                def get_conversation_parent_message_id(self, _conversation_id: str) -> str:
+                    return "unrelated-parent"
+
+                def close(self) -> None:
+                    pass
+
+            backend = FakeBackend("token-a")
+            with (
+                mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                           return_value="account-opaque-a"),
+                mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                           return_value="token-a"),
+                mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                           return_value=nullcontext()),
+                mock.patch("services.conversation_binding_service.account_service.mark_text_used") as mark_used,
+                mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+                mock.patch("services.conversation_binding_service.conversation_events", return_value=iter([
+                    {"type": "conversation.delta", "conversation_id": "conversation-1", "delta": "old gallery text"},
+                ])),
+            ):
+                with self.assertRaises(ConversationBindingError) as captured:
+                    ConversationBindingService().complete_text({
+                        "provider_binding_id": "cb-account-a",
+                        "provider_account_identity": "account-opaque-a",
+                        "client_conversation_id": "product-conversation-1",
+                        "_request_message_id": "request-user",
+                        "product_work": {"product_ref": "product-1", "step_ref": "copy"},
+                        "messages": [{"role": "user", "content": "write copy"}],
+                    })
+            self.assertEqual(captured.exception.code, "CONVERSATION_OUTCOME_UNKNOWN")
+            self.assertEqual(backend.reads, 1)
+            mark_used.assert_not_called()
+
+        complete({
+            "conversation_id": "conversation-1", "current_node": "later-user",
+            "mapping": {
+                "later-user": {"parent": None, "message": {"id": "later-user", "author": {"role": "user"}}},
+            },
+        })
+        complete({
+            "conversation_id": "conversation-1", "current_node": "answer-b",
+            "mapping": {
+                "request-user": {"parent": None, "message": {"id": "request-user", "author": {"role": "user"}}},
+                **{node_id: {"parent": "request-user", "message": {
+                    "id": node_id, "author": {"role": "assistant"}, "status": "finished_successfully",
+                    "end_turn": True, "channel": "final",
+                    "content": {"content_type": "text", "parts": [text]},
+                }} for node_id, text in (("answer-a", "branch A"), ("answer-b", "branch B"))},
+            },
+        })
+
 
 class TextResultRecoveryTests(unittest.TestCase):
     cursor = {

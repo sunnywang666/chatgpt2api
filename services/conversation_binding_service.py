@@ -1967,7 +1967,8 @@ class ConversationBindingService:
                         provider_account_identity=account_identity,
                         conversation_id=returned_conversation_id,
                     )
-                if body.get("_public_session_ref") or body.get("_supersedes_request_message_id"):
+                if (body.get("_public_session_ref") or body.get("_supersedes_request_message_id")
+                        or body.get("product_work") is not None):
                     # Neither a socket EOF nor the conversation's latest answer
                     # proves our turn finished. Use this request's unique branch.
                     failure_phase = "cursor_read"
