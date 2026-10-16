@@ -452,6 +452,101 @@ def _missing_node_chain(store, db, parent, receipt, members, now):
     return {"original": original, "rejected": rejected, "continue": receipt, "image": image}
 
 
+def _no_final_successor_chain(store, db, parent, receipt, members, now):
+    """Return the one terminal direct successor which resolves a stopped root.
+
+    This is deliberately a lifecycle proof, not a call to the send-time
+    supersede validator.  Close and archive must re-read the frozen inputs,
+    hashes, ownership and live controls after the successor has completed.
+    """
+    from services.category_directory_derivation import derive_retained_input
+    from services.conversation_binding_service import ConversationBindingError
+    from services.text_task_service import TextTaskService
+
+    successor_id = receipt.get("request_id")
+    original_id = receipt.get("_supersedes_request_id")
+    if (not isinstance(successor_id, str) or not successor_id
+            or not isinstance(original_id, str) or not original_id or successor_id == original_id
+            or receipt.get("_supersedes_no_final") is not True
+            or receipt.get("status") != "succeeded"
+            or receipt.get("upstream_outcome") != "completed"
+            or not isinstance(receipt.get("content"), str) or not receipt["content"].strip()
+            or receipt.get("upstream_unfinished")):
+        return None
+    original_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                              (parent["owner"], original_id)).fetchone()
+    successor_row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                               (parent["owner"], successor_id)).fetchone()
+    if not original_row or not successor_row or receipt.get("_supersedes_input_hash") != original_row[0]:
+        return None
+    try:
+        original = json.loads(original_row[1])
+        original_body = store.load_input(original["_input_ref"])
+        successor_body = store.load_input(receipt["_input_ref"])
+        original_identity = TextTaskService._submission_identity(parent["owner"], original_body)
+        successor_identity = TextTaskService._submission_identity(parent["owner"], successor_body)
+    except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
+        return None
+    if (original.get("request_id") != original_id
+            or original.get("status") != "failed"
+            or original.get("error_code") != "RESULT_UNRECOVERABLE"
+            or original.get("upstream_outcome") != "unknown"
+            or original.get("_supersedes_request_id")
+            or original.get("_supersedes_no_final") is True
+            or original.get("_upstream_terminal")
+            or original.get("upstream_unfinished")
+            or any(key in original for key in ("content", "result", "data"))
+            or original.get("result_file_ids") or original.get("result_sediment_ids")
+            or not TextTaskService._no_final_successor_source(original, now)
+            or original_identity != (original_id, original_row[0])
+            or successor_identity != (successor_id, successor_row[0])):
+        return None
+    controls = ("_executing", "_turn_reserved", "recovery_claim_id", "_recovery_claim_id",
+                "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of")
+    if (any(_claims(item) or any(item.get(key) for key in controls) for item in (original, receipt))
+            or _unresolved(receipt, [row for _, row in members])):
+        return None
+    keys = ("_product_work_key", "provider_binding_id", "provider_account_identity",
+            "client_conversation_id", "conversation_id")
+    if (any(any(item.get(key) != original.get(key) or not item.get(key) for key in keys)
+            for item in (receipt,))
+            or any(item.get("_product_work_key") != parent["key"] for item in (original, receipt))
+            or not (_source(original) == _source(receipt) == parent["source"])):
+        return None
+    if (type(original.get("_sequence")) is not int or type(receipt.get("_sequence")) is not int
+            or original["_sequence"] <= 0 or receipt["_sequence"] <= original["_sequence"]
+            or not TextTaskService._supersede_order_link(original, receipt)):
+        return None
+    if (original_body.get("supersedes_request_id") or original_body.get("continue_after_no_final") is not None
+            or original_body.get("derived_input") is not None):
+        return None
+    audit = receipt.get("_derived_input")
+    if audit is not None:
+        if not isinstance(audit, dict) or audit.get("kind") != "attributes_required_only_v4":
+            return None
+        try:
+            expected_body, expected_audit = derive_retained_input(
+                original_body, successor_id, original_id, {"kind": audit["kind"]}, no_final=True)
+        except (ConversationBindingError, ValueError, TypeError, KeyError):
+            return None
+        if audit != {**expected_audit, "original_input_hash": original_row[0]} or successor_body != expected_body:
+            return None
+    elif successor_body != {**original_body, "client_request_id": successor_id,
+                            "supersedes_request_id": original_id, "continue_after_no_final": True}:
+        return None
+    children = db.execute(
+        "SELECT id FROM requests WHERE owner=? AND "
+        "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?)",
+        (parent["owner"], original_id, original_id),
+    ).fetchall()
+    if len(children) != 1 or children[0][0] != successor_id:
+        return None
+    member_ids = {(member["kind"], row.get("request_id") or row.get("id")) for member, row in members}
+    if not {("text", original_id), ("text", successor_id)} <= member_ids:
+        return None
+    return {"original": original, "successor": receipt}
+
+
 class ProductWorkService:
     def __init__(self, text_service, image_service, *, clock=time.time):
         self.text, self.images, self.store, self.clock = text_service, image_service, text_service.store, clock
@@ -557,12 +652,23 @@ class ProductWorkService:
             waived.update(chain[name]["request_id"] for name in ("original", "rejected"))
         return waived
 
+    def _no_final_successor_waivers(self, db, parent, members):
+        waived = set()
+        now = float(self.clock())
+        for _, receipt in members:
+            chain = _no_final_successor_chain(self.store, db, parent, receipt, members, now)
+            if chain:
+                waived.add(chain["original"]["request_id"])
+        return waived
+
     def archive_turns_ready(self, db, child, members):
-        """Apply the exact R/P exception after the generic archive recheck."""
+        """Apply exact resolved-history exceptions after the generic recheck."""
         parent = self.store.runtime(db, child["_product_archive_parent"])
         if not parent:
             return False
-        waived = self._missing_node_waivers(db, parent, self._members(db, parent))
+        owned = self._members(db, parent)
+        waived = self._missing_node_waivers(db, parent, owned)
+        waived.update(self._no_final_successor_waivers(db, parent, owned))
         return not any(_blocked(receipt, members=members) and receipt.get("request_id") not in waived
                        for receipt in members)
 
@@ -576,6 +682,7 @@ class ProductWorkService:
         for chain in chains.values():
             waived.update(chain[name]["request_id"] for name in ("original", "rejected"))
             valid_continues.add(chain["continue"]["request_id"])
+        waived.update(self._no_final_successor_waivers(db, parent, members))
         from services.text_task_service import TextTaskService
         for member, receipt in members:
             if outcome == "cancelled" and _unsent(receipt):

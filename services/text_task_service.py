@@ -1044,8 +1044,13 @@ class TextTaskService:
                 or receipt.get("error_code") != "RESULT_UNRECOVERABLE"
                 or receipt.get("upstream_outcome") != "unknown"
                 or stop_reason is None
-                or reason == TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value
-                and (receipt.get("_work_key") or receipt.get("_product_work_key"))
+                # A generic work owner retains its original completion
+                # contract. Product ownership has its own durable parent and
+                # may stop polling the exact no-result original after the
+                # qualified-read budget; that stop neither closes nor archives
+                # the product work.
+                or (reason == TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value
+                    and receipt.get("_work_key"))
                 or not all(isinstance(receipt.get(key), str) and receipt[key].strip() for key in (
                     "request_message_id", "provider_binding_id", "provider_account_identity",
                     "client_conversation_id", "conversation_id"))

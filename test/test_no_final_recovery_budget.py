@@ -67,6 +67,57 @@ def test_no_final_budget_stops_normal_reads_and_survives_restart(legacy):
         assert tasks._no_final_successor_source(stopped, clock())
 
 
+def test_product_owned_no_final_budget_preserves_parent_and_members(tmp_path):
+    from services.product_work import ProductWorkService, state_snapshot
+    from services.work_lifecycle import WorkLifecycleError
+
+    clock = ManualClock()
+    reader = Mock(return_value={"status": "unknown", "recovery_reason": "REQUEST_RESULT_NOT_FOUND"})
+    _, store, admission = build(tmp_path, clock)
+    tasks = TextTaskService(store.path, clock=clock, executor=QueuedExecutor(),
+                            recovery_reader=reader, admission=admission)
+    metadata = {"product_ref": "batch/product/revision", "step_ref": "title"}
+    tasks.submit("owner", {"client_request_id": "original", "client_conversation_id": "session",
+                            "messages": [{"role": "user", "content": "original input"}],
+                            "product_work": metadata}, source="internal:content")
+    tasks._update("owner", "original", status="unknown", upstream_outcome="unknown",
+                  error_code="CONVERSATION_OUTCOME_UNKNOWN", provider_binding_id="binding",
+                  provider_account_identity="account", conversation_id="chat", parent_message_id="parent",
+                  request_parent_message_id="parent", _submission_started=True,
+                  _last_sent_sequence=0, _executing=False, _claim_id=None, _claim_until=None)
+    before = raw(tasks)
+    with tasks.store.connect() as db:
+        parent_before = state_snapshot(tasks.store, db)[before["_product_work_key"]]
+
+    exhaust(tasks, clock)
+    stopped = raw(tasks)
+    with tasks.store.connect() as db:
+        parent_after = state_snapshot(tasks.store, db)[before["_product_work_key"]]
+
+    assert reader.call_count == 3
+    assert stopped["_attempt_reason"] == "ORIGINAL_RESULT_NO_FINAL"
+    assert stopped["status"] == "failed" and stopped["upstream_outcome"] == "unknown"
+    assert stopped["_product_work_key"] == before["_product_work_key"]
+    assert stopped["_product_work"] == before["_product_work"] == metadata
+    assert parent_after == parent_before
+    assert parent_after["state"] == "queued"
+    assert parent_after["members"] == [{"kind": "text", "owner": "owner", "request_id": "original",
+                                        "step_ref": "title"}]
+    product = ProductWorkService(tasks, object(), clock=clock)
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_TURN_UNFINISHED"):
+        product.close({"id": "owner", "role": "admin", "_trusted_source": "internal:content"},
+                      "batch/product/revision", results_saved=True)
+    restarted = TextTaskService(tasks.path, clock=clock, executor=QueuedExecutor(), recovery_reader=reader)
+    clock.advance(100000)
+    result = restarted.read("owner", "original")
+    assert result["recovery_automatic_stopped"] is True
+    assert result["recovery_stop_reason"] == "ORIGINAL_RESULT_NO_FINAL"
+    assert reader.call_count == 3
+    with tasks.store.connect() as db:
+        assert state_snapshot(tasks.store, db)[before["_product_work_key"]] == parent_before
+        assert len(list(tasks.store.receipts(db))) == 1
+
+
 def test_existing_unbounded_receipt_is_closed_without_one_more_upstream_read(legacy):
     tasks, clock, reader = legacy
     clock.advance(10000)
@@ -107,7 +158,7 @@ def test_explicit_recheck_adopts_late_final_without_new_submission(legacy):
 
 
 @pytest.mark.parametrize("guard", [
-    {"_work_key": "work"}, {"_product_work_key": "product"},
+    {"_work_key": "work"},
     {"_completion": {"state": "checking_original"}}, {"_completion_of": "other"},
     {"_upstream_terminal": True}, {"recovery_claim_id": "live"}, {"_claim_id": "live"},
     {"_executing": True}, {"_forward_protocol": "responses"}, {"_recovery_paused": True},
