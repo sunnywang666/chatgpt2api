@@ -130,6 +130,33 @@ def test_actual_chat_capacity_is_shared_across_sources_and_claim_is_atomic(runti
     assert admission.claim_next() is None
 
 
+@pytest.mark.parametrize("claim_first", [False, True])
+def test_cancel_step_and_real_admission_cannot_both_win(runtime, claim_first):
+    from services.work_lifecycle import WorkLifecycleError
+    clock, _, store, admission, text, images = runtime
+    text_submit(runtime, "withdraw")
+    service = ProductWorkService(text, images, clock=clock)
+    identity = {"id": "owner-a", "role": "admin", "_trusted_source": SOURCE_A}
+    if claim_first:
+        claim = admission.claim_next()
+        assert claim and claim.request_id == "withdraw"
+        original = receipt(runtime, "text", "owner-a", "withdraw")
+        with pytest.raises(WorkLifecycleError, match="CANCEL_STEP_NOT_UNSENT"):
+            service.cancel_step(identity, "product-a", "withdraw", 1)
+        assert receipt(runtime, "text", "owner-a", "withdraw") == original
+    else:
+        service.cancel_step(identity, "product-a", "withdraw", 1)
+        assert admission.claim_next() is None
+        restarted = TextTaskService(store.path, admission=admission, clock=clock)
+        result = restarted.submit("owner-a", {
+            "client_request_id": "withdraw", "client_conversation_id": "session-withdraw", "model": "fixture-text",
+            "messages": [{"role": "user", "content": "synthetic"}],
+            "product_work": {"product_ref": "product-a", "step_ref": "withdraw"}}, source=SOURCE_A)
+        assert result["status"] == "cancelled"
+        assert restarted.read_snapshot("owner-a", "withdraw")["cancelled_unsent"]
+        assert admission.claim_next() is None
+
+
 def test_rejected_parent_releases_one_slot_without_rewriting_receipt_and_recovery_reclaims(runtime):
     _, accounts, _, admission, text, images = runtime
     accounts.update_account("fixture-token-1", {"managed_disabled": True}, quiet=True)

@@ -49,6 +49,34 @@
 表示不适用，`slots_held` 仅统计保留归属的商品。调用方不能据这些商品统计自行拦截提交，
 应按原回执的等待状态和账号执行资源判断。
 
+### 取消一条确定未发送的商品文字步骤
+
+内部能力 `cancel_unsent_text_step=true` 表示支持 `POST /api/product-works/cancel-step`。
+调用方先按原业务任务确认这一步确实不再需要，再读取当前商品版本，提交以下三个字段：
+
+```json
+{"product_ref":"org/batch/product/rev1","request_id":"original-queued-request-id","expected_version":1}
+```
+
+接口仅供原可信 Workbench 来源使用，不对普通 API Key 开放，不接受提示词、替代关系、
+账号或会话字段。Provider 在同一数据库事务内核对商品版本、调用方与成员归属、保留输入及
+原请求 hash，并确认它仍在本地排队且从未发送、无活动领取或恢复工作。已发送、结果未知、
+被暂停或已进入其它恢复流程的请求不能借此取消。领取先完成则取消拒绝；取消先完成则不能再领取。
+
+成功只把指定回执改为 `cancelled/not_sent`，保留原输入、成员、序号及商品父任务。
+原 `UNKNOWN` 请求仍须沿其恢复合同处理，不能整商品取消，也不能把取消当成结果已保存。
+同一版本的同一取消可重读，即使该周期后来已经关闭；商品接续进入新版本后，旧版本的取消提交仍拒绝。
+重复提交原 ID、重启和接续不会把该 ID 重新排队。
+
+成功响应及原文字回执提供经过重新核验的 `cancelled_unsent`：`request_id`、`product_ref`、
+`parent_version`、`request_hash`、`cancelled_at`、`code=PRODUCT_WORK_STEP_CANCELLED`、
+`upstream_outcome=not_sent`。调用方须核对该证明和原业务记录后，才可退役自己保存的对应排队尝试；
+不能只凭 `status=cancelled` 忽略未完成任务。证明不返回提示词或私密输入路径。
+
+后续正常关闭与归档会重新核对取消证明；通过核验的未发送成员不要求成功结果，也不作为归档游标。
+实际成功结果仍须保存，归档仍使用真正执行过的原会话位置。其它排队、未知或证据变化的成员继续阻止关闭。
+上线须与调用方的原尝试退役逻辑配对，单独部署接口不代表业务已经解堵。
+
 ### 已完成商品沿原会话接续
 
 能力响应 `resume=true` 表示支持以下接续；沿用原可信 Workbench 来源和原 `product_ref`，

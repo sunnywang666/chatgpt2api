@@ -373,6 +373,12 @@ curl "$SERVER_ROOT/api/chat-requests/$ORIGINAL_REQUEST_ID/snapshot" \
 [内部恢复说明](deployment.md#已发送后继节点缺失时同一请求的一次性恢复)。这不是普通 API 客户端的自动重试入口；
 `automatic_stopped` 也不授权生成新请求。原结果查询和新模型执行应分别处理。
 
+内部商品任务若另有一条确认不再需要且从未发送的文字步骤，受信任的 Workbench 调用方可使用
+[`cancel-step` 合同](deployment.md#取消一条确定未发送的商品文字步骤) 单独取消它。
+该操作保留全部历史与父任务，不取消已发送或结果未知的原请求；普通 API Key 不提供此入口。
+调用方须核验原回执的 `cancelled_unsent` 证明后退役对应的本地尝试，随后继续原结果恢复、保存及归档。
+一次“暂未找到回复”不能当作确定空回复，也不能当作该请求从未发送的证据。
+
 ### Advanced account selection (separate from default setup)
 
 Automatic account routing remains the default. For an advanced ordinary Chat text or image-input request, an application may copy an opaque `account_ref` from a text model's public `accounts` directory and include it in `POST /api/chat-requests`:

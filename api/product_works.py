@@ -65,6 +65,20 @@ class ResumeProductWork(BaseModel):
     expected_version: int = Field(strict=True, ge=1)
 
 
+class CancelUnsentTextStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_ref: str = Field(strict=True, min_length=1, max_length=200)
+    request_id: str = Field(strict=True, min_length=1, max_length=200)
+    expected_version: int = Field(strict=True, ge=1)
+
+    @field_validator("product_ref", "request_id")
+    @classmethod
+    def stable_ref(cls, value):
+        if value != value.strip() or any(ord(c) < 32 for c in value):
+            raise ValueError("invalid product reference")
+        return value
+
+
 class AdoptMember(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["text", "image"]
@@ -104,7 +118,8 @@ def create_router():
                 "capacity_source": "eligible_chat_turn_total", "cross_kind": True,
                 "admission_scope": "account_execution", "product_count_limit": None,
                 "retained_products_consume_capacity": False,
-                "close_after_archive": True, "adoption": True, "resume": True}
+                "close_after_archive": True, "adoption": True, "resume": True,
+                "cancel_unsent_text_step": True}
 
     @router.get("/api/product-works")
     async def status(request: Request, response: Response,
@@ -118,6 +133,12 @@ def create_router():
         return await invoke(request, authorization, response, "close", body.product_ref,
                             results_saved=body.results_saved, outcome=body.outcome,
                             expected_version=body.expected_version)
+
+    @router.post("/api/product-works/cancel-step")
+    async def cancel_step(body: CancelUnsentTextStep, request: Request, response: Response,
+                          authorization: str | None = Header(default=None)):
+        return await invoke(request, authorization, response, "cancel_step", body.product_ref,
+                            body.request_id, body.expected_version)
 
     @router.post("/api/product-works/resume")
     async def resume(body: ResumeProductWork, request: Request, response: Response,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from contextlib import ExitStack, contextmanager
 
@@ -73,6 +74,159 @@ def _source(receipt):
     return receipt.get("_scheduling_owner") or receipt.get("_source")
 
 
+_CANCELLED_UNSENT_STEP = "_product_unsent_cancelled"
+
+
+def _cancel_unsent_eligible(receipt):
+    """Keep this narrow: it is a local withdrawal before any model turn."""
+    if not _unsent(receipt):
+        return False
+    if receipt.get("_submission_started") is not False or receipt.get("_turn_reserved") is not False:
+        return False
+    if receipt.get("_work_key") or any(receipt.get(key) for key in (
+            "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of",
+            "_retry_cursor", "_same_session_retry_of", "_previous_request_id",
+            "_terminal_empty_correction_of", "_forward_protocol", "_forward")):
+        return False
+    if any(key.startswith(("_supersedes", "_codex", "recovery_", "_recovery")) for key in receipt):
+        return False
+    timeline = receipt.get("_execution_timeline")
+    if timeline is not None and (not isinstance(timeline, list)
+                                 or any(not isinstance(item, dict) or item.get("stage") != "accepted" for item in timeline)):
+        return False
+    if any(key in receipt for key in ("content", "result", "data", "result_file_ids", "result_sediment_ids",
+                                      "response_id", "original_upstream_response_ids", "original_upstream_error",
+                                      "original_http_status", "original_exception_category", "original_failure_phase",
+                                      "original_upstream_request_stage", "finished_at")):
+        return False
+    return not any(receipt.get(key) for key in (
+        "_attempt_started_at", "_attempt_finished_at", "_last_sent_sequence", "_send_sequence",
+        "_attempt_reason", "upstream_submission_started", "_upstream_terminal",
+        "_execution_wait_ended_at"))
+
+
+def _input_matches_cancelled_member(store, owner, member, receipt, request_hash):
+    """Check only fields that the immutable original actually supplied."""
+    try:
+        from services.conversation_binding_service import ConversationBindingError
+        from services.text_task_service import TextTaskService
+        body = store.load_input(receipt["_input_ref"])
+        if TextTaskService._submission_identity(owner, body) != (member["request_id"], request_hash):
+            return False
+    except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
+        return False
+    metadata = receipt.get("_product_work")
+    if body.get("product_work") != metadata:
+        return False
+    for field in ("provider_binding_id", "provider_account_identity", "client_conversation_id",
+                  "conversation_id", "parent_message_id"):
+        if field in body and body[field] != receipt.get(field):
+            return False
+    return True
+
+
+def _closed_cancellation_cycle(store, db, parent, member, version):
+    """A cancelled step remains a resolved historical member after resume."""
+    closures = [row for row in parent.get("previous_closures", [])
+                if isinstance(row, dict) and row.get("version") == version]
+    if len(closures) != 1:
+        return False
+    closure = closures[0]
+    if closure.get("outcome") != "completed" or closure.get("results_saved") is not True:
+        return False
+    members = closure.get("members")
+    current = {(item.get("kind"), item.get("owner"), item.get("request_id")): item
+               for item in parent.get("members", []) if isinstance(item, dict)}
+    if (not isinstance(members, list) or not members or sum(item == member for item in members) != 1
+            or any(not isinstance(item, dict)
+                   or current.get((item.get("kind"), item.get("owner"), item.get("request_id"))) != item
+                   for item in members)):
+        return False
+    keys = closure.get("archive_keys")
+    if not isinstance(keys, list) or any(not isinstance(key, str) for key in keys):
+        return False
+    originals = {}
+    for item in members:
+        receipt = store.read_receipt(db, item["kind"], item["owner"], item["request_id"])
+        if not receipt:
+            return False
+        originals[(item["kind"], item["owner"], item["request_id"])] = receipt
+    for key in keys:
+        child = store.runtime(db, key)
+        archive = (child or {}).get("archive") or {}
+        original = originals.get(((child or {}).get("kind"), (child or {}).get("owner"),
+                                  (child or {}).get("last_request_id")))
+        if (not child or child.get("key") != key
+                or child.get("_product_archive_parent") != parent["key"]
+                or child.get("_product_archive_version", 1) != version or child.get("version") != version
+                or archive.get("version") != version or archive.get("status") != "confirmed"
+                or archive.get("desired") is not True or archive.get("claim")
+                or archive.get("request_id") != child.get("last_request_id") or not original
+                or any(not original.get(field) or child.get("target", {}).get(field) != original[field]
+                       for field in ("provider_binding_id", "provider_account_identity", "conversation_id"))):
+            return False
+    return True
+
+
+def _cancelled_unsent_step(store, db, parent, member, receipt, *, allow_historical=True):
+    """Revalidate the one durable local cancellation proof before consuming it."""
+    proof = receipt.get(_CANCELLED_UNSENT_STEP)
+    if not isinstance(proof, dict) or set(proof) != {"parent_key", "parent_version", "request_hash", "cancelled_at"}:
+        return False
+    version = parent.get("version", 1)
+    if (member.get("kind") != "text" or member.get("owner") != parent.get("owner")
+            or member.get("request_id") != receipt.get("request_id")
+            or receipt.get("_product_work_key") != parent.get("key")
+            or _source(receipt) != parent.get("source")
+            or receipt.get("_product_work") != {"product_ref": parent.get("product_ref"), "step_ref": member.get("step_ref")}
+            or receipt.get("status") != "cancelled"
+            or receipt.get("error_code") != "PRODUCT_WORK_STEP_CANCELLED"
+            or receipt.get("upstream_outcome") != "not_sent"
+            or receipt.get("upstream_unfinished") is not False
+            or proof.get("parent_key") != parent.get("key")
+            or type(proof.get("parent_version")) is not int
+            or not isinstance(proof.get("request_hash"), str) or not proof["request_hash"]
+            or type(proof.get("cancelled_at")) not in (int, float)
+            or not math.isfinite(proof["cancelled_at"])):
+        return False
+    proof_version = proof["parent_version"]
+    if proof_version != version:
+        if not allow_historical or proof_version > version or not _closed_cancellation_cycle(
+                store, db, parent, member, proof_version):
+            return False
+    row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                     (member["owner"], member["request_id"])).fetchone()
+    if not row or row[0] != proof["request_hash"]:
+        return False
+    if not _input_matches_cancelled_member(store, member["owner"], member, receipt, row[0]):
+        return False
+    original = dict(receipt)
+    original.pop(_CANCELLED_UNSENT_STEP, None)
+    original.pop("error_code", None)
+    original["status"] = "queued"
+    return _cancel_unsent_eligible(original)
+
+
+def cancelled_unsent_public(store, db, owner, request_hash, receipt):
+    """Return the small caller-verifiable cancellation record, or nothing."""
+    key = receipt.get("_product_work_key")
+    parent = store.runtime(db, key) if isinstance(key, str) else None
+    if not parent or parent.get("owner") != owner:
+        return None
+    member = next((item for item in parent.get("members", [])
+                   if item.get("kind") == "text" and item.get("owner") == owner
+                   and item.get("request_id") == receipt.get("request_id")), None)
+    if not member or not _cancelled_unsent_step(store, db, parent, member, receipt):
+        return None
+    proof = receipt[_CANCELLED_UNSENT_STEP]
+    if proof["request_hash"] != request_hash:
+        return None
+    return {"request_id": receipt["request_id"], "product_ref": parent["product_ref"],
+            "parent_version": proof["parent_version"], "request_hash": proof["request_hash"],
+            "cancelled_at": proof["cancelled_at"], "code": "PRODUCT_WORK_STEP_CANCELLED",
+            "upstream_outcome": "not_sent"}
+
+
 def _key(source, owner, ref):
     raw = json.dumps([source, owner, ref], separators=(",", ":"))
     return "product_work:" + hashlib.sha256(raw.encode()).hexdigest()
@@ -103,6 +257,14 @@ def before_send(store, db, receipt):
         for _, _, _, other in store.receipts(db):
             if other.get("_product_work_key") and _same_conversation(receipt, other):
                 raise WorkLifecycleError("PRODUCT_WORK_REQUIRED")
+    if parent:
+        member = next((item for item in parent.get("members", [])
+                       if item.get("kind") == "text" and item.get("owner") == parent.get("owner")
+                       and item.get("request_id") == receipt.get("request_id")), None)
+        if receipt.get(_CANCELLED_UNSENT_STEP):
+            if not member or not _cancelled_unsent_step(store, db, parent, member, receipt):
+                raise WorkLifecycleError("PRODUCT_WORK_CANCEL_STEP_PROOF_INVALID")
+            raise WorkLifecycleError("PRODUCT_WORK_STEP_CANCELLED")
     if parent and (parent["state"] != "active" or not parent.get("slot_held")):
         raise WorkLifecycleError("PRODUCT_WORK_NOT_ACTIVE")
     if parent:
@@ -246,6 +408,16 @@ def ensure_product_work(store, db, kind, owner, request_id, receipt, product_wor
             raise WorkLifecycleError("PRODUCT_WORK_NOT_ACTIVE")
         same_step = [m for m in parent["members"] if m["step_ref"] == member["step_ref"]]
         if same_step:
+            while same_step:
+                old = same_step[-1]
+                previous = store.read_receipt(db, old["kind"], old["owner"], old["request_id"])
+                if (old["kind"] == "text" and previous
+                        and _cancelled_unsent_step(store, db, parent, old, previous)):
+                    same_step.pop()
+                    continue
+                break
+            if not same_step:
+                raise WorkLifecycleError("PRODUCT_WORK_STEP_CONFLICT")
             old = same_step[-1]
             previous = store.read_receipt(db, old["kind"], old["owner"], old["request_id"])
             if old["kind"] != kind or not previous or not _successor(store, db, owner, previous, receipt):
@@ -669,6 +841,10 @@ class ProductWorkService:
         owned = self._members(db, parent)
         waived = self._missing_node_waivers(db, parent, owned)
         waived.update(self._no_final_successor_waivers(db, parent, owned))
+        for member, receipt in owned:
+            if receipt.get(_CANCELLED_UNSENT_STEP) and not _cancelled_unsent_step(
+                    self.store, db, parent, member, receipt):
+                return False
         return not any(_blocked(receipt, members=members) and receipt.get("request_id") not in waived
                        for receipt in members)
 
@@ -685,6 +861,12 @@ class ProductWorkService:
         waived.update(self._no_final_successor_waivers(db, parent, members))
         from services.text_task_service import TextTaskService
         for member, receipt in members:
+            cancelled_unsent = _cancelled_unsent_step(self.store, db, parent, member, receipt)
+            if receipt.get(_CANCELLED_UNSENT_STEP) and not cancelled_unsent:
+                reasons.add("PRODUCT_WORK_TURN_UNFINISHED")
+                continue
+            if cancelled_unsent:
+                continue
             if outcome == "cancelled" and _unsent(receipt):
                 continue
             # A registered C is never an ordinary successful tail.  If one of
@@ -721,18 +903,74 @@ class ProductWorkService:
         reasons = self._reasons(db, parent, members)
         if parent["state"] == "closing" and confirmed != len(archives):
             reasons.append("PRODUCT_WORK_ARCHIVE_PENDING")
+        projected_members = []
+        for member, receipt in members:
+            item = {"kind": member["kind"], "request_id": member["request_id"],
+                    "step_ref": member["step_ref"], "status": receipt.get("status")}
+            if member["kind"] == "text" and receipt.get(_CANCELLED_UNSENT_STEP):
+                row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                                 (member["owner"], member["request_id"])).fetchone()
+                if row:
+                    proof = cancelled_unsent_public(self.store, db, member["owner"], row[0], receipt)
+                    if proof:
+                        item["cancelled_unsent"] = proof
+            projected_members.append(item)
         return {"protocol": "product-work-v1", "product_ref": parent["product_ref"], "state": parent["state"],
                 "version": parent.get("version", 1),
                 "slot_held": bool(parent["slot_held"]), "results_saved": bool(parent.get("results_saved")),
                 "outcome": parent.get("outcome"), "cleanup_pending": bool(parent.get("cleanup_pending")),
-                "members": [{"kind": m["kind"], "request_id": m["request_id"], "step_ref": m["step_ref"],
-                             "status": r.get("status")} for m, r in members],
+                "members": projected_members,
                 "archive": {"total": len(archives), "confirmed": confirmed, "pending": len(archives) - confirmed},
                 "blocked_reasons": sorted(set(reasons))}
 
     def get(self, identity, product_ref):
         with self.store.transaction() as db:
             return self._projection(db, self._load(db, identity, product_ref))
+
+    def cancel_step(self, identity, product_ref, request_id, expected_version):
+        if type(expected_version) is not int or expected_version < 1:
+            raise WorkLifecycleError("PRODUCT_WORK_VERSION_INVALID", 400)
+        _ref(request_id)
+        with self.store.transaction() as db:
+            parent = self._load(db, identity, product_ref)
+            version = parent.get("version", 1)
+            if version != expected_version:
+                raise WorkLifecycleError("PRODUCT_WORK_VERSION_CONFLICT")
+            members = self._members(db, parent)
+            selected = next(((member, receipt) for member, receipt in members
+                             if member["kind"] == "text" and member["request_id"] == request_id), None)
+            if not selected:
+                raise WorkLifecycleError("PRODUCT_WORK_REQUEST_NOT_FOUND", 404)
+            member, receipt = selected
+            if _cancelled_unsent_step(self.store, db, parent, member, receipt, allow_historical=False):
+                result = self._projection(db, parent)
+                row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                                 (member["owner"], member["request_id"])).fetchone()
+                proof = cancelled_unsent_public(self.store, db, member["owner"], row[0], receipt) if row else None
+                if proof:
+                    result["cancelled_unsent"] = proof
+                return result
+            if parent.get("state") not in {"queued", "active"}:
+                raise WorkLifecycleError("PRODUCT_WORK_NOT_ACTIVE")
+            if receipt.get(_CANCELLED_UNSENT_STEP):
+                raise WorkLifecycleError("PRODUCT_WORK_CANCEL_STEP_PROOF_INVALID")
+            if not _cancel_unsent_eligible(receipt):
+                raise WorkLifecycleError("PRODUCT_WORK_CANCEL_STEP_NOT_UNSENT")
+            if (receipt.get("request_id") != member["request_id"]
+                    or receipt.get("_product_work") != {"product_ref": parent["product_ref"], "step_ref": member["step_ref"]}):
+                raise WorkLifecycleError("PRODUCT_WORK_CANCEL_STEP_INPUT_INVALID")
+            row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                             (member["owner"], member["request_id"])).fetchone()
+            if not row or not _input_matches_cancelled_member(self.store, member["owner"], member, receipt, row[0]):
+                raise WorkLifecycleError("PRODUCT_WORK_CANCEL_STEP_INPUT_INVALID") from None
+            receipt.update(status="cancelled", error_code="PRODUCT_WORK_STEP_CANCELLED",
+                           upstream_outcome="not_sent", upstream_unfinished=False,
+                           **{_CANCELLED_UNSENT_STEP: {"parent_key": parent["key"], "parent_version": version,
+                                                       "request_hash": row[0], "cancelled_at": float(self.clock())}})
+            self.store.write_receipt(db, "text", member["owner"], member["request_id"], receipt)
+            result = self._projection(db, parent)
+            result["cancelled_unsent"] = cancelled_unsent_public(self.store, db, member["owner"], row[0], receipt)
+            return result
 
     def resume(self, identity, product_ref, expected_version):
         """Reopen a saved, archived product without sending or reserving a turn.
@@ -893,6 +1131,8 @@ class ProductWorkService:
                     if not chain:
                         continue
                     member, receipt = image_members[("image", chain["image"]["id"])]
+                if _cancelled_unsent_step(self.store, db, parent, member, receipt):
+                    continue
                 if _unsent(receipt) and outcome == "cancelled":
                     receipt.update(status="cancelled", error_code="PRODUCT_WORK_CANCELLED")
                     self.store.write_receipt(db, member["kind"], member["owner"], member["request_id"], receipt)
