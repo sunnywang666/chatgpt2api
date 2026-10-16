@@ -8,10 +8,13 @@ import pytest
 from pydantic import ValidationError
 
 from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
+from services.product_work import ProductWorkService
 from services.request_context import current_request
+from services.text_task_service import TextTaskService
+from services.work_lifecycle import WorkLifecycleError, WorkLifecycleService
 from test.test_explicit_unknown_successor import task, row, update
 from test.test_bound_text_archive import bound_chat
-from test.test_pool_admission import build
+from test.test_pool_admission import Clock, build
 
 
 def no_final(h):
@@ -21,6 +24,61 @@ def no_final(h):
     h.old = row(h.service)
     h.envelope["continue_after_no_final"] = True
     return h
+
+
+@pytest.fixture
+def product_no_final(tmp_path):
+    (tmp_path / "accounts.json").write_text(json.dumps([{"access_token": "fixture",
+        "account_id": "physical", "provider_account_identity": "original-account",
+        "conversation_binding_ids": ["original-binding"], "type": "Plus", "status": "正常",
+        "quota": 99, "source_type": "web"}]))
+    clock = Clock()
+    _, store, admission = build(tmp_path, clock)
+    sent = []
+    def runner(body, on_cursor):
+        current_request.get().before_send()
+        sent.append(deepcopy(body))
+        return {"content": "successful explicit successor", "parent_message_id": "successor-answer"}
+    service = TextTaskService(store.path, runner=runner, clock=clock, admission=admission)
+    admission.register("text", lambda ctx, body: service._run(ctx.owner, ctx.request_id, body))
+    metadata = {"product_ref": "fixture-product", "step_ref": "title"}
+    body = {"client_request_id": "old", "client_conversation_id": "product-session",
+        "provider_binding_id": "original-binding", "provider_account_identity": "original-account",
+        "conversation_id": "original-chat", "parent_message_id": "previous-answer", "model": "fixture-text",
+        "messages": [{"role": "user", "content": "original retained instructions"}], "product_work": metadata}
+    service.submit("owner", body, source="internal:content")
+    update(service, status="failed", error_code="RESULT_UNRECOVERABLE", upstream_outcome="unknown",
+           recovery_reason="REQUEST_RESULT_NOT_FOUND", recovery_no_result_reads=3,
+           _attempt_reason="ORIGINAL_RESULT_NO_FINAL", _attempt_finished_at=clock(),
+           _execution_wait_ended_at=clock(), _submission_started=True, _last_sent_sequence=0,
+           _executing=False, _claim_id=None, _claim_until=None, _turn_reserved=False, send_count=1)
+    envelope = {k: v for k, v in body.items() if k in service.SUPERSEDE_FIELDS}
+    envelope.update(client_request_id="successor", supersedes_request_id="old", continue_after_no_final=True)
+    return SimpleNamespace(service=service, admission=admission, clock=clock, sent=sent,
+                           envelope=envelope, old=row(service), root=tmp_path)
+
+
+def complete_product_no_final_successor(h):
+    h.service.submit("owner", h.envelope, source="internal:content")
+    context = h.admission.claim_next()
+    assert context and context.request_id == "successor"
+    h.admission.execute(context)
+    h.admission.update_claim(context, _claim_id=None, _claim_until=0, _turn_reserved=False)
+    return row(h.service), row(h.service, "successor")
+
+
+def product_lifecycle(h):
+    calls = []
+    def archive(owner, request_id, archived):
+        calls.append((owner, request_id, archived))
+        with h.service.store.connect() as db:
+            receipt = h.service.store.read_receipt(db, "text", owner, request_id)
+        return {"request_id": request_id, "conversation_id": receipt["conversation_id"], "archived": archived}
+    text = SimpleNamespace(store=h.service.store, admission=None, archive_product_work=archive)
+    product = ProductWorkService(text, SimpleNamespace(archive_product_work=archive), clock=h.clock)
+    lifecycle = WorkLifecycleService(text, SimpleNamespace(archive_product_work=archive), clock=h.clock)
+    identity = {"id": "owner", "role": "admin", "_trusted_source": "internal:content"}
+    return product, lifecycle, calls, identity
 
 
 def graph(h):
@@ -85,6 +143,174 @@ def test_verified_stopped_retry_cursor_allows_the_single_no_final_successor(task
     assert successor["_supersedes_no_final"] is True
     assert successor["_supersedes_input_hash"]
     assert h.admission.claim_next().request_id == "successor"
+
+
+def test_no_final_successor_keeps_unrelated_queued_turn_ahead(task):
+    h = no_final(task)
+    # A distinct queued request in the same conversation is never skipped by
+    # an explicit no-final successor, even though the original is stopped.
+    # The successful single-successor path is covered by the preceding test.
+    h.service.submit("owner", {**h.body, "client_request_id": "unrelated-queued",
+                               "parent_message_id": "unrelated-parent"})
+    with pytest.raises(ConversationBindingError) as error:
+        h.service.submit("owner", h.envelope)
+    assert error.value.code == "CHAT_SUPERSEDE_CONFLICT"
+    assert row(h.service, "successor") is None
+    assert row(h.service, "unrelated-queued")["status"] == "queued"
+    assert row(h.service) == h.old and not h.sent
+
+
+def test_product_no_final_successor_allows_authorized_close_and_archives_successor(product_no_final):
+    h = product_no_final
+    original_before = row(h.service)
+    with h.service.store.connect() as db:
+        original_hash = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", ("owner", "old")).fetchone()[0]
+
+    original, successor = complete_product_no_final_successor(h)
+    with h.service.store.connect() as db:
+        successor_hash = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", ("owner", "successor")).fetchone()[0]
+    assert original == original_before
+    assert successor["status"] == "succeeded" and successor["upstream_outcome"] == "completed"
+    assert successor.get("upstream_unfinished") is not True and successor["content"] == "successful explicit successor"
+    assert successor["_product_work_key"] == original["_product_work_key"]
+    assert h.service.store.load_input(original["_input_ref"])["client_request_id"] == "old"
+    assert h.service.store.load_input(successor["_input_ref"])["client_request_id"] == "successor"
+    assert original_hash == successor["_supersedes_input_hash"] and successor_hash
+
+    product, lifecycle, calls, identity = product_lifecycle(h)
+
+    closing = product.close(identity, "fixture-product", results_saved=True)
+    assert closing["state"] == "closing" and closing["results_saved"]
+    assert lifecycle.process_one()
+    assert product.get(identity, "fixture-product")["state"] == "completed"
+    assert calls == [("owner", "successor", True)]
+    assert row(h.service) == original_before and len(h.sent) == 1
+
+
+def test_product_no_final_successor_survives_resume_and_later_cycle(product_no_final):
+    h = product_no_final
+    original_before, successor = complete_product_no_final_successor(h)
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    assert lifecycle.process_one()
+    assert product.get(identity, "fixture-product")["state"] == "completed"
+
+    restarted = ProductWorkService(lifecycle.text, lifecycle.images, clock=h.clock)
+    assert restarted.resume(identity, "fixture-product", expected_version=1)["state"] == "active"
+    original_body = h.service.store.load_input(original_before["_input_ref"])
+    h.service.submit("owner", {**original_body, "client_request_id": "v2-normal",
+                                 "parent_message_id": successor["parent_message_id"],
+                                 "product_work": {"product_ref": "fixture-product", "step_ref": "v2-normal"}},
+                     source="internal:content")
+    context = h.admission.claim_next()
+    assert context and context.request_id == "v2-normal"
+    h.admission.execute(context)
+    h.admission.update_claim(context, _claim_id=None, _claim_until=0, _turn_reserved=False)
+
+    closing = restarted.close(identity, "fixture-product", results_saved=True, expected_version=2)
+    assert closing["state"] == "closing" and closing["version"] == 2
+    assert lifecycle.process_one()
+    result = restarted.get(identity, "fixture-product")
+    assert result["state"] == "completed" and result["version"] == 2
+    assert calls == [("owner", "successor", True), ("owner", "v2-normal", True)]
+    assert row(h.service) == original_before
+
+
+def test_product_no_final_v4_successor_rederives_then_closes_and_archives(product_no_final):
+    from test.test_required_attributes_successor import KIND, fields, prompt
+
+    h = product_no_final
+    original_body = h.service.store.load_input(row(h.service)["_input_ref"])
+    original_body.update(model="gpt-5-6-instant", thinking_effort="standard", messages=[{
+        "role": "user", "content": [
+            {"type": "text", "text": prompt(fields())},
+            {"type": "text", "text": '{"image_ref":"actual-image-not-source-1"}'},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}},
+            {"type": "text", "text": '{"image_ref":"another-original-image"}'},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,RUZH"}},
+        ],
+    }])
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        original.update(_input_ref=h.service.store.save_input(original_body), model="gpt-5-6-instant",
+                        thinking_effort="standard")
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id=?",
+                   (TextTaskService._submission_identity("owner", original_body)[1], "owner", "old"))
+    h.envelope["derived_input"] = {"kind": KIND}
+
+    original, successor = complete_product_no_final_successor(h)
+    assert successor["_derived_input"]["kind"] == KIND
+    assert successor["model"] == "gpt-5-6-thinking"
+    assert h.service.store.load_input(successor["_input_ref"])["thinking_effort"] == "high"
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    assert lifecycle.process_one()
+    assert product.get(identity, "fixture-product")["state"] == "completed"
+    assert calls == [("owner", "successor", True)]
+    assert row(h.service) == original
+
+
+def test_product_no_final_successor_rejects_tampered_retained_input_hash(product_no_final):
+    h = product_no_final
+    complete_product_no_final_successor(h)
+    with h.service.store.transaction() as db:
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id=?", ("tampered", "owner", "successor"))
+    product, _, calls, identity = product_lifecycle(h)
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_TURN_UNFINISHED"):
+        product.close(identity, "fixture-product", results_saved=True)
+    assert calls == []
+
+
+@pytest.mark.parametrize("request_id,changes", [
+    ("old", {"_recovery_paused": True}),
+    ("old", {"_claim_id": "active", "_executing": True}),
+    ("successor", {"status": "failed", "upstream_outcome": "unknown"}),
+    ("successor", {"provider_account_identity": "different-account"}),
+    ("successor", {"_product_work_key": "different-product"}),
+    ("successor", {"_derived_input": {"kind": "attributes_required_only_v4", "original_input_hash": "fake"}}),
+])
+def test_product_no_final_successor_requires_unchanged_exact_proof(product_no_final, request_id, changes):
+    h = product_no_final
+    complete_product_no_final_successor(h)
+    with h.service.store.transaction() as db:
+        receipt = h.service.store.read_receipt(db, "text", "owner", request_id)
+        receipt.update(changes)
+        h.service.store.write_receipt(db, "text", "owner", request_id, receipt)
+    product, _, calls, identity = product_lifecycle(h)
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_"):
+        product.close(identity, "fixture-product", results_saved=True)
+    assert calls == []
+
+
+def test_product_no_final_successor_rejects_second_registered_fallback(product_no_final):
+    h = product_no_final
+    original, successor = complete_product_no_final_successor(h)
+    with h.service.store.transaction() as db:
+        fallback = {**successor, "request_id": "fallback", "_codex_fallback_of": "old",
+                    "_supersedes_request_id": None, "_sequence": successor["_sequence"] + 1}
+        db.execute("INSERT INTO requests VALUES(?,?,?,?)",
+                   ("owner", "fallback", "fallback-hash", json.dumps(fallback)))
+    product, _, calls, identity = product_lifecycle(h)
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_TURN_UNFINISHED"):
+        product.close(identity, "fixture-product", results_saved=True)
+    assert row(h.service) == original and calls == []
+
+
+def test_product_no_final_archive_rechecks_late_original_change(product_no_final):
+    h = product_no_final
+    original, _ = complete_product_no_final_successor(h)
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    with h.service.store.transaction() as db:
+        changed = h.service.store.read_receipt(db, "text", "owner", "old")
+        changed["_recovery_paused"] = True
+        h.service.store.write_receipt(db, "text", "owner", "old", changed)
+    assert not lifecycle.process_one()
+    result = product.get(identity, "fixture-product")
+    assert result["state"] == "closing" and result["slot_held"] and result["archive"]["pending"] == 1
+    assert row(h.service)["_recovery_paused"] is True and row(h.service)["_input_ref"] == original["_input_ref"]
+    assert calls == []
 
 
 def test_failed_explicit_read_keeps_qualified_no_final_source_and_sanitizes_error(task):

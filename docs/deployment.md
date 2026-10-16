@@ -252,7 +252,9 @@ Provider 从 P 的保留输入派生 C，核对 R/P 的唯一关系、原 hash�
 
 #### 已发送但无最终回答的显式原会话后继
 
-同一内部接口的七个身份字段可额外带 `continue_after_no_final: true`。此模式仅用于旧公司原生文字请求已经以 `ORIGINAL_RESULT_NO_FINAL` 停止自动恢复、至少三次有效读取仍为 `REQUEST_RESULT_NOT_FOUND`，且无工作生命周期、completion、暂停或活跃领取的情况；客户端不能替换提示词、模型或身份。已保存的 text `_retry_cursor` 不代表活动领取：仅当它是精确绑定同一原 `conversation_id`、`request_message_id` 的完整空分支观测，才可保留并走这一显式后继；错锚、缺字段或 image-source 游标仍拒绝。只有下面的 `attributes_required_only_v4` 封闭升级可与此标志合用；旧 `category_directory_parent_v1` 仍不可合用。默认省略时继续使用原消息缺失分支，不自动开启重试。
+仅有商品归属（`_product_work_key`）的原请求也使用既有无结果读取预算；达到预算且本地执行等待已结束时，可以停止自动查询。商品父任务、成员、原输入和 `UNKNOWN` 均保留，不自动关闭、归档或新发生成。旧式 `_work_key` 生命周期、completion、活动领取、暂停以及仍在生成或身份不符等证据继续阻止这一出口。调用方必须区分“可再查原结果”和“可新发请求”：前者的 `recovery_retryable` 不能单独授权新生成；已有无替代关系的排队请求仍须核对，不因停止标记而跳过。
+
+同一内部接口的七个身份字段可额外带 `continue_after_no_final: true`。此模式仅用于旧公司原生文字请求已经以 `ORIGINAL_RESULT_NO_FINAL` 停止自动恢复、至少三次有效读取仍为 `REQUEST_RESULT_NOT_FOUND`，且没有旧式 `_work_key` 生命周期、completion、暂停或活跃领取的情况；商品归属仍保留。客户端不能替换提示词、模型或身份。已保存的 text `_retry_cursor` 不代表活动领取：仅当它是精确绑定同一原 `conversation_id`、`request_message_id` 的完整空分支观测，才可保留并走这一显式后继；错锚、缺字段或 image-source 游标仍拒绝。只有下面的 `attributes_required_only_v4` 封闭升级可与此标志合用；旧 `category_directory_parent_v1` 仍不可合用。默认省略时继续使用原消息缺失分支，不自动开启重试。
 
 已经合格停止的 no-final 事实与最近一次结果读取错误分开处理。显式原结果重查因连接、限流或其它读取错误失败，不会清除原停止事实；历史 `RECOVERY_READ_FAILED` 未保存安全详情的回执也保留此接续资格。后来读到的成功结果、原消息缺失、活动或变化的分支、身份不匹配等明确新证据仍拒绝，受理、admission 和实际发送前的原请求/分支校验不变。
 
@@ -263,6 +265,8 @@ Provider 从 P 的保留输入派生 C，核对 R/P 的唯一关系、原 hash�
 Provider 保存唯一幂等后继，复用原输入、原账号和原 Chat。worker 首次读取必须证明当前尾节点是原 user 本身且没有后代，或原 user 后只有已完成的 assistant code / tool 唯一链，没有最终回答；原 user 必须已完成、身份和父节点匹配。发送前再次读取，要求尾节点和整条链的内容、角色、完成状态一致。迟到 final、分叉、新 user、运行中的步骤、归档或内容变化均拒发。实际发送父节点是已观察的原 user 或 tool 尾节点，原提交父节点和旧 UNKNOWN 收据不改写；新回执只认新请求的回答。两次读取之间的内容比较只存在内存，不保存私密上下文副本。此模式仍有 GET/POST 间上游迟到的风险，不等同上游取消或 exactly-once。
 
 原回执已收回迟到结果时返回 `CHAT_SUPERSEDE_ORIGINAL_FOUND`；若答案只在发送前的上游图中出现，后继以 `CHAT_SUPERSEDE_CURSOR_CHANGED` / `not_sent` 拒发。调用方可在原授权内对原 ID 显式恢复读取一次，采用可核验的原答案；不能把任意游标变化当成已有答案，也不能换新 ID 再生成。补发仍失败或结果不明时保留同一后继，不递归补发。消费端须等支持原 user 叶节点的 Provider 实际部署后才启用此路径，旧版本的拒发回执不自动重排。
+
+商品收尾可以识别这条已登记的直接 no-final 后继，但必须重新核对唯一关系、双方保留输入及哈希、原账号/会话/来源/商品归属、执行顺序和当前控制状态。后继须已有非空、明确完成的文字；普通输入须等于原保留输入加既有接续字段，`attributes_required_only_v4` 须通过原派生规则重算。调用方仍须确认结果已保存，再使用原 close/archive 流程；归档执行及确认时再次验证。原 UNKNOWN 回执不改成成功、不删除；停止轮询本身、未登记的新请求、失败/未知后继、其它未完成成员或证据变化均不能据此结束商品工作。
 
 #### 旧属性任务的限定 v4 / High 升级
 
