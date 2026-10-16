@@ -313,21 +313,29 @@ class TextTaskService:
         claimed_at = receipt.get("recovery_claimed_at")
         lease_until = receipt.get("recovery_lease_until")
         execution_claim = receipt.get("_claim_id")
+        finished_at = receipt.get("finished_at")
+        if not finite(now):
+            return False
         if not (
             receipt.get("status") == "succeeded"
             and receipt.get("upstream_outcome") == "completed"
             and not receipt.get("error_code")
             and isinstance(receipt.get("content"), str) and bool(receipt["content"])
-            and finite(receipt.get("finished_at"))
+            and finite(finished_at) and 0 < finished_at <= now
             and receipt.get("_executing") is False
             and receipt.get("_turn_reserved") is False
             and not receipt.get("_completion") and not receipt.get("_completion_of")
             and not receipt.get("_recovery_paused") and not receipt.get("_recovery_suppressed")
-            and not receipt.get("_recovery_claim_id")
-            and receipt.get("_operation") != "image" and not receipt.get("_image_recovery")
+            and receipt.get("_recovery_claim_id") is None
+            and receipt.get("_recovery_claim_until") is None
+            and (receipt.get("upstream_unfinished") is None or receipt.get("upstream_unfinished") is False)
+            and receipt.get("recovery_error_code") is None and receipt.get("recovery_reason") is None
+            and receipt.get("_route") == "chat" and receipt.get("_operation") == "text"
+            and receipt.get("_forward_protocol") is None and receipt.get("_forward") is None
+            and not receipt.get("_image_recovery")
             and receipt.get("recovery_phase") == "read_text_request"
             and isinstance(claim_id, str) and bool(claim_id)
-            and finite(claimed_at) and finite(lease_until) and finite(now)
+            and finite(claimed_at) and finite(lease_until)
             and claimed_at <= lease_until <= now
             and (not execution_claim or finite(receipt.get("_claim_until"))
                  and receipt["_claim_until"] <= now)
