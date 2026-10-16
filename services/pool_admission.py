@@ -617,17 +617,11 @@ class PoolAdmission:
         from services.text_task_service import TextTaskService
         works, workflow_clocks = workflow_state or ({}, {})
         product_works = product_state or {}
-        product_states = {"queued", "active", "closing", "completed", "failed", "cancelled"}
         # Product parents are opt-in and intentionally separate from generic
         # work rows: one product may contain both text and image originals.
-        # A malformed persisted parent makes only a new product claim unsafe;
-        # a previously held parent remains governed by its own send guard.
-        product_state_unknown = any(
-            not isinstance(parent, dict)
-            or parent.get("key") != key
-            or parent.get("state") not in product_states
-            or not isinstance(parent.get("slot_held"), bool)
-            for key, parent in product_works.items())
+        # Retained parents track ownership/closeout, not generation capacity.
+        # Validate each request's own parent below; an unrelated unfinished or
+        # malformed parent must not consume another product's account turns.
         # A verified empty upstream turn may have one explicitly accepted
         # correction in the same public Chat session. Its UNKNOWN receipt must
         # remain intact for recovery, but it cannot remain the session's order
@@ -847,7 +841,6 @@ class PoolAdmission:
                     product_fair_group = "product-continuation"
                 elif valid_parent and parent.get("state") == "queued" and parent.get("slot_held") is False:
                     product_fair_group = "product-new"
-                    product_needs = (Need("product_parent_slots"),)
                 else:
                     # Do not dispatch a closed, mismatched, or otherwise
                     # invalid parent while preserving its original receipt.
@@ -908,7 +901,6 @@ class PoolAdmission:
                      "codex_server": Resource("codex_server", int(settings.get("codex_max_concurrency", 4)), codex_used, now)}
         resources.update({resource.key: resource for resource in thread_resources})
         offers = []
-        eligible_product_turns = set()
         scoped_extra_turn = None
         trial = settings.get("temporary_chat_second_slot")
         trial_active = (isinstance(trial, dict)
@@ -952,8 +944,6 @@ class PoolAdmission:
                 ready = max(now, float(pace.get("cooldown_until") or 0))
             new = Resource(turn_key, chat_capacity, None if unknown_unbound else occupied.get(turn_key, 0), ready)
             resources[turn_key] = new
-            if not disabled and chat_saved and paid and identity_counts.get(identity) == 1:
-                eligible_product_turns.add(turn_key)
             previous = resources.get(image_key)
             resources[image_key] = Resource(image_key, min(previous.capacity, image_slots) if previous else image_slots,
                                            None if unknown_unbound else occupied.get(image_key, 0), now)
@@ -993,14 +983,6 @@ class PoolAdmission:
                     if isinstance(limit, dict) and limit.get("feature_name") == model and limit.get("remaining") == 0:
                         enabled = False
                 offers.append(Offer(identity, "chat", model, request.operation, needs, enabled=bool(enabled)))
-        # A single opt-in product parent consumes one durable budget unit,
-        # derived from this same account snapshot. It is deliberately neither
-        # a free-turn count nor a worker limit, and no source gets its own pool.
-        product_capacity = sum(resources[key].capacity for key in eligible_product_turns)
-        product_occupied = None if (unknown_unbound or product_state_unknown) else sum(
-            bool(parent.get("slot_held")) for parent in product_works.values())
-        resources["product_parent_slots"] = Resource(
-            "product_parent_slots", product_capacity, product_occupied, now)
         if self.text_workers is None:
             # Execution threads follow the same usable physical account turns.
             # The retained-input memory ceiling still bounds all work; image
@@ -1158,16 +1140,16 @@ class PoolAdmission:
         saving = sum(1 for kind, _, _, r in receipts if r.get("status") == "running"
                      and (kind == "image" or r.get("_operation") == "image")
                      and not image_generation_active(kind, r, True))
-        product_slots = resources["product_parent_slots"]
         product_parents = [parent for parent in product_state.values() if isinstance(parent, dict)]
-        product_free = (None if product_slots.occupied is None
-                        else max(0, product_slots.capacity - product_slots.occupied))
         return {"accounts": result, "settings": settings, "chat_turn": aggregate("chat_turn"), "image": image_summary, "codex": native,
                 "workflows": {"slots_held": sum(bool(w.get("slot_held")) for w in workflow_state[0].values()),
                               "active_work": sum(w.get("state") == "active" for w in workflow_state[0].values()),
                               "paused_work": sum(w.get("state") == "paused" for w in workflow_state[0].values())},
-                "products": {"slots_total": product_slots.capacity, "slots_held": product_slots.occupied,
-                             "slots_free": product_free,
+                # Legacy slot fields remain readable, but only slots_held is
+                # a lifecycle count. There is no product-count admission cap.
+                "products": {"admission_limited": False, "slots_total": None,
+                             "slots_held": sum(parent.get("slot_held") is True for parent in product_parents),
+                             "slots_free": None,
                              "queued_products": sum(parent.get("state") == "queued" for parent in product_parents),
                              "active_products": sum(parent.get("state") == "active" for parent in product_parents)},
                 "queue": {"mode": "durable_original_receipts", "queued": len(queued), "by_source": sources,

@@ -309,20 +309,34 @@ product and step. A continuation inherits that product and source; optional
 `step_ref` names the next actual step, while omission retains the current step
 for a clarification. The caller cannot change the product through this API.
 Do not send `step_ref` for a parent without product-work membership. Existing
-product capacity, result-save and close rules still apply. Close archives only
+account execution limits, result-save and close rules still apply. Retained
+products have no total-count admission limit: saving, archive closeout and human
+waiting do not reserve generation capacity. Close archives only
 real Chat conversations belonging to the product; native Codex members do not
 create a fabricated Chat archive target. An unresolved native request still
 prevents the product from being released.
 
 A product containing only confirmed `MODEL_NOT_FOUND` rejections can return to
-`queued` without holding a product slot when none of its requests has a Chat
+`queued` without active product ownership when none of its requests has a Chat
 conversation, a result, or active execution/recovery work. The original failed
 receipts remain unchanged. A later authorized successor keeps the same product
 and must acquire capacity again; releasing the slot does not resend a request
 or mark the business task complete. Products with unknown results, existing
 conversations, or unfinished members retain their protection. The management
-`/api/workbench/ai/pool/resources` response reports this product budget in
+`/api/workbench/ai/pool/resources` response reports these lifecycle counts in
 `products`, separately from physical Chat turns and generic `workflows`.
+`products.admission_limited=false` and null `slots_total`/`slots_free` mean
+there is no product-count budget; `slots_held` is only retained ownership.
+
+After a product has completed with saved results and confirmed archives, callers
+can use the [versioned product resume API](deployment.md#已完成商品沿原会话接续)
+to add a new step to that original product. Probe `capabilities.resume` first,
+GET its current `version`, then POST `/api/product-works/resume` with
+`product_ref` and `expected_version`. Resume does not send or reserve capacity.
+New Chat steps keep the exact original account/conversation cursor; the bound
+send restores an archived conversation before sending. Closing a resumed
+product requires its returned `expected_version`. Failed/cancelled products
+and unresolved originals cannot be reopened through this endpoint.
 
 Keep the original Chat continuation/archive cursor separate from this Codex
 receipt. A Codex response ID is not a Chat conversation or parent-message ID.

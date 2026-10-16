@@ -31,6 +31,60 @@
 
 本节对应原 `AI-POOL-STAGED-20260917` 的可靠共用增量；需求检查日期为2026-09-20，采用 Connection 原长期页及当前接管卡当日“调度及设置方案”。代码基于 Provider `35a4def7d02dd760f412bc27aa0653e4403f3812`，附件仅提供纯准入选择器与日志分析参考。下述为待协调独审、集成与正式发布的工程行为，不能当作现役生产验收。
 
+### 商品记录与账号执行容量（2026-10-16）
+
+商品记录不再参与总量准入限制。超过 24 个商品等待保存、归档或人工处理时，
+新的独立商品仍可使用空闲账号执行资源；账号并发、模型额度、节拍或冷却不足时，
+原请求继续在现有队列等待。同商品步骤去重、同会话顺序、UNKNOWN 保护和本机执行器限制不变。
+
+`product_work.slot_held` 保留为旧协议的商品归属状态，直到正常关闭及归档完成；
+它不再占用一个生成名额。升级不清空旧商品、原请求或结果，也不自动归档、重发。
+调用方仍须保存原结果后执行原关闭/归档流程。
+
+`GET /api/product-works/capabilities` 保留 `capacity_source=eligible_chat_turn_total`
+以兼容现有调用方的能力检查，该值仅表示共用账号池的容量来源，不再表示商品数量上限。
+新增 `admission_scope=account_execution`、`product_count_limit=null` 和
+`retained_products_consume_capacity=false` 明确这一语义。
+资源快照的 `products.admission_limited=false`；旧 `slots_total`、`slots_free` 为 `null`
+表示不适用，`slots_held` 仅统计保留归属的商品。调用方不能据这些商品统计自行拦截提交，
+应按原回执的等待状态和账号执行资源判断。
+
+### 已完成商品沿原会话接续
+
+能力响应 `resume=true` 表示支持以下接续；沿用原可信 Workbench 来源和原 `product_ref`，
+不是失败任务重跑接口，也不更改原请求。`GET /api/product-works?product_ref=...`
+公开当前 `version`（旧记录为 1）。只有 `state=completed`、原结果已保存、归档全部确认且
+没有未解决的执行或恢复工作时，才能提交：
+
+```json
+POST /api/product-works/resume
+{"product_ref":"org/batch/product/rev1","expected_version":1}
+```
+
+成功返回同一商品 `state=active, version=2, results_saved=false`。接口只改原商品生命周期，
+不调用上游、不解除归档、不预占账号执行位；旧结果、请求、会话绑定和关闭记录全部保留。
+调用方保存返回版本，再以新的 `client_request_id`、新的 `step_ref` 和原会话的完整绑定/游标
+提交正常后续步骤。原账号有资源时才派发；已有绑定的文字发送流程会先核实原游标并解除归档，
+恢复未确认则不发送。原账号满额或冷却时等待原账号，不因别的账号空闲迁移会话。
+
+同一个 `expected_version=1` 重试只返回它已创建的第 2 轮，即使第 2 轮也完成了，也不会
+自动再开一轮。确需第 3 轮须先 GET 当前版本，再明确提交 `expected_version=2`。
+未来版本或更早的过期版本返回 HTTP 409 `PRODUCT_WORK_VERSION_CONFLICT`。
+未完成、正在关闭、失败、取消的商品返回 `PRODUCT_WORK_RESUME_NOT_COMPLETED`；
+原归档证明不全返回 `PRODUCT_WORK_ARCHIVE_PENDING`；原结果或未解决回执的错误继续明确返回。
+
+新一轮结果保存后，关闭须带本轮版本：
+
+```json
+POST /api/product-works/close
+{"product_ref":"org/batch/product/rev1","expected_version":2,"results_saved":true,"outcome":"completed"}
+```
+
+接续后的商品漏传版本返回 HTTP 409 `PRODUCT_WORK_VERSION_REQUIRED`，版本不符返回
+`PRODUCT_WORK_VERSION_CONFLICT`。未接续的第 1 轮仍兼容旧的无版本 close。
+归档使用本轮最新成功游标；旧 close、旧归档执行和迟到回调不能关闭本轮。
+调用方应消费原结果并保存本轮关闭回执，不把重新变为 active 当成重新生成成功。
+
 ### 同一资源账与动态派发
 
 `PoolAdmission` 每秒重读原账号存储、原任务回执、原节拍文件和现有设置。普通 Key、公司登录、内部 Chat/图片调用及原生 Codex HTTP/SSE 都从原文本或图片任务进入同一准入事务。保存成功的新账号及恢复账号自动参与符合其授权、模型及额度的下一次选择，原等待无需换 Key、重启或重提。重复上游账号按原节拍身份去重，不增加容量。

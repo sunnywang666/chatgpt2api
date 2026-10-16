@@ -466,7 +466,10 @@ class WorkLifecycleService:
                                       request_key=work["owner"] + ":" + request_id, work_key=work["key"]):
                     if work.get("_product_archive_parent"):
                         service = self.text if work["kind"] == "text" else self.images
-                        result = service.archive_product_work(work["owner"], request_id, archive["desired"])
+                        from services.product_work import locking_product_conversations
+                        with locking_product_conversations([work["target"]]):
+                            check_and_renew_archive()
+                            result = service.archive_product_work(work["owner"], request_id, archive["desired"])
                         valid = (result.get("request_id") == request_id
                                  and result.get("conversation_id") == work["target"]["conversation_id"])
                     elif work["kind"] == "text":

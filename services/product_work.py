@@ -1,7 +1,9 @@
 """Opt-in product ownership over original text/image receipts in task_runtime.
 
-A product owns capacity until its durable conversation archives are confirmed,
+A product retains ownership until its durable conversation archives are confirmed,
 except for a proved no-conversation model rejection returned to the queue.
+The legacy slot_held flag tracks that ownership, not a generation-capacity unit.
+Each actual request is admitted against account resources by PoolAdmission.
 No result, input hash, request sequence or ordinary work identity is replaced.
 """
 from __future__ import annotations
@@ -546,6 +548,7 @@ class ProductWorkService:
         if parent["state"] == "closing" and confirmed != len(archives):
             reasons.append("PRODUCT_WORK_ARCHIVE_PENDING")
         return {"protocol": "product-work-v1", "product_ref": parent["product_ref"], "state": parent["state"],
+                "version": parent.get("version", 1),
                 "slot_held": bool(parent["slot_held"]), "results_saved": bool(parent.get("results_saved")),
                 "outcome": parent.get("outcome"), "cleanup_pending": bool(parent.get("cleanup_pending")),
                 "members": [{"kind": m["kind"], "request_id": m["request_id"], "step_ref": m["step_ref"],
@@ -556,6 +559,67 @@ class ProductWorkService:
     def get(self, identity, product_ref):
         with self.store.transaction() as db:
             return self._projection(db, self._load(db, identity, product_ref))
+
+    def resume(self, identity, product_ref, expected_version):
+        """Reopen a saved, archived product without sending or reserving a turn.
+
+        The physical lock is shared with archive execution and attachment. A
+        delayed archive worker must revalidate its old parent version under
+        that lock before it can touch the original conversation.
+        """
+        if type(expected_version) is not int or expected_version < 1:
+            raise WorkLifecycleError("PRODUCT_WORK_VERSION_INVALID", 400)
+
+        def scope(db, parent):
+            receipts = [receipt for _, receipt in self._members(db, parent)]
+            return _physical_lock_keys(receipts), [tuple(receipt.get(k) for k in (
+                "provider_binding_id", "client_conversation_id", "provider_account_identity", "conversation_id"))
+                for receipt in receipts]
+
+        with self.store.connect() as db:
+            expected_scope = scope(db, self._load(db, identity, product_ref))
+        lock_receipts = [{"provider_account_identity": account, "conversation_id": conversation}
+                         for account, conversation in expected_scope[0]]
+        with locking_product_conversations(lock_receipts):
+            with self.store.transaction() as db:
+                parent = self._load(db, identity, product_ref)
+                version = parent.get("version", 1)
+                # A repeated request observes its already-created cycle even
+                # after that cycle closes. It must never reopen it again.
+                if version == expected_version + 1 and parent.get("resumed_from_version") == expected_version:
+                    return self._projection(db, parent)
+                if version != expected_version:
+                    raise WorkLifecycleError("PRODUCT_WORK_VERSION_CONFLICT")
+                if parent["state"] != "completed" or parent.get("outcome") != "completed":
+                    raise WorkLifecycleError("PRODUCT_WORK_RESUME_NOT_COMPLETED")
+                if parent.get("results_saved") is not True:
+                    raise WorkLifecycleError("PRODUCT_WORK_RESULTS_SAVE_REQUIRED")
+                if scope(db, parent) != expected_scope:
+                    raise WorkLifecycleError("PRODUCT_WORK_BINDING_CHANGED")
+                members = self._members(db, parent)
+                reasons = self._reasons(db, parent, members, "completed")
+                if reasons:
+                    raise WorkLifecycleError(reasons[0])
+                keys = parent.get("archive_keys", [])
+                archives = [self.store.runtime(db, key) for key in keys]
+                if (parent.get("cleanup_pending") or parent.get("slot_held")
+                        or not keys and any(r.get("conversation_id") for _, r in members)
+                        or any(not row or row.get("_product_archive_parent") != parent["key"]
+                               or row.get("_product_archive_version", 1) != version
+                               or row.get("archive", {}).get("status") != "confirmed"
+                               or row.get("archive", {}).get("desired") is not True
+                               or row.get("archive", {}).get("claim")
+                               for row in archives)):
+                    raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_PENDING")
+                parent.setdefault("previous_closures", []).append({"version": version, **{
+                    key: parent.get(key) for key in ("outcome", "results_saved", "results_saved_at",
+                                                     "archive_keys", "updated_at")}})
+                parent.update(version=version + 1, resumed_from_version=version, state="active",
+                              slot_held=True, results_saved=False, outcome=None, cleanup_pending=False,
+                              archive_keys=[], updated_at=float(self.clock()))
+                parent.pop("results_saved_at", None)
+                _save(self.store, db, parent)
+                return self._projection(db, parent)
 
     def adopt(self, identity, product_ref, members):
         source, owner = require_product_source(identity), str(identity["id"])
@@ -618,13 +682,20 @@ class ProductWorkService:
                     self.store.write_receipt(db, member["kind"], owner, rid, receipt)
                 return self._projection(db, parent)
 
-    def close(self, identity, product_ref, results_saved=True, outcome="completed"):
+    def close(self, identity, product_ref, results_saved=True, outcome="completed", expected_version=None):
         if outcome not in {"completed", "failed", "cancelled"}:
             raise WorkLifecycleError("PRODUCT_WORK_OUTCOME_INVALID", 400)
         if results_saved is not True:
             raise WorkLifecycleError("PRODUCT_WORK_RESULTS_SAVE_REQUIRED", 400)
+        if expected_version is not None and (type(expected_version) is not int or expected_version < 1):
+            raise WorkLifecycleError("PRODUCT_WORK_VERSION_INVALID", 400)
         with self.store.transaction() as db:
             parent = self._load(db, identity, product_ref)
+            version = parent.get("version", 1)
+            if expected_version is None and version > 1:
+                raise WorkLifecycleError("PRODUCT_WORK_VERSION_REQUIRED")
+            if expected_version is not None and expected_version != version:
+                raise WorkLifecycleError("PRODUCT_WORK_VERSION_CONFLICT")
             if parent.get("outcome"):
                 if parent["outcome"] != outcome or parent["results_saved"] != results_saved:
                     raise WorkLifecycleError("PRODUCT_WORK_CLOSE_CONFLICT")
@@ -683,13 +754,17 @@ class ProductWorkService:
             parent.update(state="closing", outcome=outcome, results_saved=True, results_saved_at=now,
                           cleanup_pending=bool(targets), updated_at=now)
             for canonical, (member, receipt) in targets.items():
-                digest = hashlib.sha256(json.dumps([parent["key"], canonical]).encode()).hexdigest()
+                archive_identity = [parent["key"], canonical]
+                if version > 1:
+                    archive_identity.append(version)
+                digest = hashlib.sha256(json.dumps(archive_identity).encode()).hexdigest()
                 key = "work:product_archive:" + digest
                 child = {"key": key, "_product_archive_parent": parent["key"], "kind": member["kind"],
+                         "_product_archive_version": version,
                          "owner": member["owner"], "last_request_id": member["request_id"], "work_ref": canonical[1],
                          "target": {k: receipt.get(k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id")},
-                         "state": "completed", "slot_held": False, "version": 1, "updated_at": now,
-                         "archive": {"status": "pending", "desired": True, "version": 1, "request_id": member["request_id"],
+                         "state": "completed", "slot_held": False, "version": version, "updated_at": now,
+                         "archive": {"status": "pending", "desired": True, "version": version, "request_id": member["request_id"],
                                      "requested_at": now, "next_at": now, "attempts": 0}}
                 self.store.set_runtime(db, key, child)
                 parent["archive_keys"].append(key)
@@ -704,7 +779,8 @@ class ProductWorkService:
 
     def load_archive_target(self, db, child):
         parent = self.store.runtime(db, child["_product_archive_parent"])
-        if not parent or parent["state"] != "closing" or child["key"] not in parent["archive_keys"]:
+        if (not parent or parent["state"] != "closing" or child["key"] not in parent["archive_keys"]
+                or child.get("_product_archive_version", 1) != parent.get("version", 1)):
             raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_CONFLICT")
         members = self._members(db, parent)
         reasons = self._reasons(db, parent, members, parent["outcome"])
@@ -725,7 +801,8 @@ class ProductWorkService:
 
     def archive_confirmed(self, db, child):
         parent = self.store.runtime(db, child["_product_archive_parent"])
-        if not parent or parent["state"] != "closing":
+        if (not parent or parent["state"] != "closing" or child["key"] not in parent["archive_keys"]
+                or child.get("_product_archive_version", 1) != parent.get("version", 1)):
             return
         if all((self.store.runtime(db, key) or {}).get("archive", {}).get("status") == "confirmed"
                for key in parent["archive_keys"]):
