@@ -1206,6 +1206,133 @@ class ImageTaskServiceTests(unittest.TestCase):
                 self.assertEqual(receipt["recovery_status"], "request_message_id_required")
                 thread.assert_not_called()
 
+    def test_exact_receipt_read_does_not_wait_for_unrelated_sqlite_writer(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "images.json"
+            service = self.make_service(path)
+            service.submit_generation(OWNER, client_task_id="completed", prompt="done", model="gpt-image-2", size=None)
+            wait_for_task(service, OWNER, "completed", "success")
+            with service.store.connect() as db:
+                original_receipt = service.store.read_receipt(db, "image", "owner-1", "completed")
+
+            reads = []
+            original_read = service.store.read_receipt
+            def read_receipt(db, kind, owner, task_id):
+                reads.append((kind, owner, task_id))
+                return original_read(db, kind, owner, task_id)
+
+            writer = service.store._connect()
+            done = threading.Event()
+            result = {}
+            list_all_done = threading.Event()
+            list_all_result = {}
+            list_all_reader = None
+            with mock.patch.object(service.store, "read_receipt", side_effect=read_receipt):
+                try:
+                    writer.execute("BEGIN IMMEDIATE")
+
+                    def query():
+                        result.update(service.list_tasks(OWNER, ["completed", "missing", "completed"]))
+                        done.set()
+
+                    reader = threading.Thread(target=query)
+                    reader.start()
+                    self.assertTrue(done.wait(1), "exact completed receipt read waited for an unrelated writer")
+                    self.assertEqual(reads, [
+                        ("image", "owner-1", "completed"),
+                        ("image", "owner-1", "missing"),
+                        ("image", "owner-1", "completed"),
+                    ])
+                    self.assertEqual([item["id"] for item in result["items"]], ["completed", "completed"])
+                    self.assertEqual(result["missing_ids"], ["missing"])
+
+                    def list_all():
+                        list_all_result.update(service.list_tasks(OWNER, []))
+                        list_all_done.set()
+
+                    list_all_reader = threading.Thread(target=list_all)
+                    list_all_reader.start()
+                    self.assertTrue(list_all_done.wait(1), "list-all receipt read waited for an unrelated writer")
+                    self.assertEqual([item["id"] for item in list_all_result["items"]], ["completed"])
+                finally:
+                    writer.rollback()
+                    writer.close()
+                    reader.join(timeout=2)
+                    if list_all_reader is not None:
+                        list_all_reader.join(timeout=2)
+            self.assertFalse(reader.is_alive())
+            self.assertIsNotNone(list_all_reader)
+            self.assertFalse(list_all_reader.is_alive())
+            with service.store.connect() as db:
+                self.assertEqual(service.store.read_receipt(db, "image", "owner-1", "completed"), original_receipt)
+            self.assertEqual(service.list_tasks(OTHER_OWNER, ["completed"]), {
+                "items": [], "missing_ids": ["completed"],
+            })
+
+    def test_due_exact_receipt_cleanup_rereads_newer_state_before_delete(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "images.json"
+            service = self.make_service(path)
+            service.submit_generation(OWNER, client_task_id="old", prompt="done", model="gpt-image-2", size=None)
+            wait_for_task(service, OWNER, "old", "success")
+            with service._transaction():
+                service._tasks["owner-1:old"]["updated_at"] = "2020-01-01 00:00:00"
+                service._save_locked(task_key="owner-1:old")
+
+            original_snapshot = service._list_snapshot
+            def snapshot_then_complete(owner, requested_ids):
+                snapshot = original_snapshot(owner, requested_ids)
+                with service.store.transaction() as db:
+                    current = service.store.read_receipt(db, "image", "owner-1", "old")
+                    current["updated_at"] = "2099-01-01 00:00:00"
+                    service.store.write_receipt(db, "image", "owner-1", "old", current)
+                return snapshot
+
+            with mock.patch.object(service, "_list_snapshot", side_effect=snapshot_then_complete):
+                result = service.list_tasks(OWNER, ["old"])
+            self.assertEqual(result["missing_ids"], [])
+            self.assertEqual(result["items"][0]["id"], "old")
+            self.assertEqual(result["items"][0]["updated_at"], "2099-01-01 00:00:00")
+
+            with service._transaction():
+                service._tasks["owner-1:old"]["updated_at"] = "2020-01-01 00:00:00"
+                service._save_locked(task_key="owner-1:old")
+            self.assertEqual(service.list_tasks(OWNER, ["old"]), {
+                "items": [], "missing_ids": ["old"],
+            })
+
+    def test_due_exact_cleanup_batches_requested_receipts_in_one_keyed_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "images.json"
+            service = self.make_service(path)
+            for task_id in ("old", "fresh"):
+                service.submit_generation(OWNER, client_task_id=task_id, prompt="done", model="gpt-image-2", size=None)
+                wait_for_task(service, OWNER, task_id, "success")
+            with service._transaction():
+                service._tasks["owner-1:old"]["updated_at"] = "2020-01-01 00:00:00"
+                service._tasks["owner-1:fresh"]["updated_at"] = "2099-01-01 00:00:00"
+                service._save_locked(task_key="owner-1:old")
+                service._save_locked(task_key="owner-1:fresh")
+
+            statements = []
+            original_connect = service.store._connect
+            def traced_connect():
+                db = original_connect()
+                db.set_trace_callback(statements.append)
+                return db
+
+            original_transaction = service.store.transaction
+            with (
+                mock.patch.object(service.store, "_connect", side_effect=traced_connect),
+                mock.patch.object(service.store, "transaction", wraps=original_transaction) as transaction,
+            ):
+                result = service.list_tasks(OWNER, ["old", "fresh", "old"])
+
+            self.assertEqual(transaction.call_count, 1)
+            self.assertEqual([item["id"] for item in result["items"]], ["fresh"])
+            self.assertEqual(result["missing_ids"], ["old", "old"])
+            self.assertNotIn("SELECT task_key,receipt FROM image_requests", statements)
+
     def test_request_owned_model_is_durable_and_cannot_change_on_duplicate_submit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             captured = []
@@ -3306,7 +3433,10 @@ class ImageTaskServiceTests(unittest.TestCase):
                         "status": "success",
                         "mode": "generate",
                         "data": [{"url": "https://example.test/already-finished.png"}],
-                        "updated_at": "2026-09-14 18:58:00",
+                        # This sibling must survive retention for the
+                        # non-rotation assertion below; the test is about
+                        # original-request identity, not expiry behavior.
+                        "updated_at": "2099-01-01 00:00:00",
                     },
                 ]}),
                 encoding="utf-8",

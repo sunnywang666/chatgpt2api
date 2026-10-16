@@ -691,64 +691,118 @@ class GenerationCompletionService:
                 for kind, owner, rid, row in candidates:
                     dispatch(kind, owner, rid, lambda o, r, k=kind: self.advance(k, o, r), row)
 
+    def _selection_needs_write(self, db, kind, owner, request_id, root, child):
+        """Check the local reconciliation performed by _select without writing."""
+        state = root["_completion"]
+        if not state.get("selected_id") and (
+                (not child or not child.get("_submission_started")) and successful(kind, root)
+                or successful(kind, child)):
+            return True
+        if not child or state.get("selected_id") != request_id or child.get("_submission_started"):
+            return False
+        if (child.get("status") in {"queued", "running"}
+                or child.get("status") in {"failed", "error"} and child.get("upstream_outcome") == "not_sent"):
+            cancelled = {"status": "failed" if kind == "text" else "error",
+                         "error_code": "COMPLETION_ORIGINAL_RECOVERED", "upstream_outcome": "not_sent",
+                         "upstream_unfinished": False, "_turn_reserved": False,
+                         "_claim_id": None, "_claim_until": 0, "_executing": False}
+            if any(key not in child or child[key] != value for key, value in cancelled.items()):
+                return True
+            # A previously cancelled replacement may still have a provisional
+            # slot to release. Preserve that cleanup, but do not rewrite a slot
+            # that is already released or is protected by a submitted member.
+            if child.get("_work_key"):
+                work = self.store.runtime(db, child["_work_key"])
+                if work and work.get("slot_held") is not False:
+                    members = (r for _, _, _, r in self.store.receipts(db)
+                               if r.get("_work_key") == child["_work_key"])
+                    if not any(r.get("_submission_started") or r.get("upstream_outcome") == "unknown"
+                               for r in members):
+                        return True
+        if (child.get("error_code") == "COMPLETION_ORIGINAL_RECOVERED"
+                and child.get("upstream_outcome") == "not_sent"
+                and child.get("_work_key") and child.get("_work_key") == root.get("_work_key")):
+            work = self.store.runtime(db, root["_work_key"])
+            if work and work.get("last_request_id") == state.get("replacement_id"):
+                return True
+        return False
+
     def read(self, kind, identity, request_id):
         owner = str(identity["id"])
-        with self.store.transaction() as db:
+        # Root, replacement and work must come from one local snapshot. The
+        # common unchanged read never acquires SQLite's writer lock, including
+        # UNKNOWN completions that have no new evidence to reconcile.
+        with self.store.connect() as db:
+            db.execute("BEGIN")
             root = self._root(db, kind, owner, request_id)
             state = root.get("_completion")
             if not state:
                 raise CompletionError("COMPLETION_NOT_REQUESTED", 404)
+            child_id = state.get("replacement_id")
+            child = self.store.read_receipt(db, kind, owner, child_id) if child_id else None
+            if not self._selection_needs_write(db, kind, owner, request_id, root, child):
+                return self._read_result(db, kind, owner, request_id, root, child)
+        # Real selection/cancellation/slot cleanup still rereads current state
+        # under the original transaction; never persist the earlier snapshot.
+        with self.store.transaction() as db:
+            root = self._root(db, kind, owner, request_id)
+            if not root.get("_completion"):
+                raise CompletionError("COMPLETION_NOT_REQUESTED", 404)
             child = self._select(db, kind, owner, request_id, root)
             self.store.write_receipt(db, kind, owner, request_id, root)
-            selected = root if state.get("selected_id") == request_id else child if state.get("selected_id") else None
-            ended = kind == "text" and bool(self.text._verified_terminal_empty(root))
-            result = {"protocol": "generation-completion-v1", "kind": kind, "original_id": request_id,
-                      **{k: state[k] for k in ("state", "reason", "started_at", "next_at", "replacement_id", "selected_id",
-                                              "selected_at", "max_extra_requests", "conversation_mode", "results_saved", "work") if k in state},
-                      "original_status": root.get("status"), "replacement_status": (child or {}).get("status"),
-                      "stop": {"capability": "unsupported", "confirmed": False},
-                      "original_turn_ended": bool(ended or successful(kind, root)),
-                      "original_attempt_state": "ended" if root.get("_attempt_finished_at") else "active",
-                      "empty_response_confirmed": bool(kind == "text" and self.text._verified_retryable_empty(root)),
-                      "original_cleanup": "pending" if unresolved(root) and not ended else "not_required"}
-            if state.get("state") in {"result_ready", "completed"}:
-                result.pop("reason", None)
-            same_retry = bool(child and kind == "text" and child.get("_terminal_empty_correction_of") == request_id
-                              and child.get("_work_key") == root.get("_work_key")
-                              and self.text._verified_retryable_empty(root))
-            same_retry = same_retry or bool(child and same_session_retry(root, child))
-            local_receipt = child or root
-            empty_released = (kind == "text" and local_receipt.get("_turn_reserved") is False
-                              and self.text._verified_retryable_empty(local_receipt))
-            result["local_reservation"] = ("released" if local_receipt.get("_attempt_finished_at") or empty_released or same_retry and successful(kind, child)
-                                            else "transferred" if same_retry and child.get("status") in {"queued", "running", "unknown"}
-                                            else "held" if unresolved(root) and not ended else "released")
-            if same_retry and not ended and successful(kind, child) and state.get("state") == "completed":
-                result["original_cleanup"] = "completed"
-            if child and state.get("selected_id") == request_id:
-                result["replacement_cleanup"] = "pending" if unresolved(child) or child.get("status") == "running" else "not_required"
-            if child and child.get("waiting"):
-                result["waiting"] = {key: child["waiting"][key] for key in ("reasons", "next_check_at") if key in child["waiting"]}
-            if root.get("_work_key"):
-                from services.work_lifecycle import _projection
-                original_work = self.store.runtime(db, root["_work_key"])
-                if original_work:
-                    result["original_work"] = _projection(original_work)
-                    if original_work.get("cleanup_pending"):
-                        result["original_cleanup"] = "pending"
-            if selected and selected.get("_work_key"):
-                from services.work_lifecycle import _projection
-                work = self.store.runtime(db, selected["_work_key"])
-                if work:
-                    result["work"] = _projection(work)
-            if selected and kind == "text":
-                from services.public_chat_service import project_public_chat_receipt
-                result["result"] = project_public_chat_receipt(self.text._public(selected))
-            elif selected:
-                # The caller downloads from the selected ID through the existing
-                # authenticated image route; private URLs/bindings stay private.
-                result["result"] = {"id": state["selected_id"], "status": selected["status"], "image_count": len(selected.get("data") or [])}
-            return result
+            return self._read_result(db, kind, owner, request_id, root, child)
+
+    def _read_result(self, db, kind, owner, request_id, root, child):
+        state = root["_completion"]
+        selected = root if state.get("selected_id") == request_id else child if state.get("selected_id") else None
+        ended = kind == "text" and bool(self.text._verified_terminal_empty(root))
+        result = {"protocol": "generation-completion-v1", "kind": kind, "original_id": request_id,
+                  **{k: state[k] for k in ("state", "reason", "started_at", "next_at", "replacement_id", "selected_id",
+                                          "selected_at", "max_extra_requests", "conversation_mode", "results_saved", "work") if k in state},
+                  "original_status": root.get("status"), "replacement_status": (child or {}).get("status"),
+                  "stop": {"capability": "unsupported", "confirmed": False},
+                  "original_turn_ended": bool(ended or successful(kind, root)),
+                  "original_attempt_state": "ended" if root.get("_attempt_finished_at") else "active",
+                  "empty_response_confirmed": bool(kind == "text" and self.text._verified_retryable_empty(root)),
+                  "original_cleanup": "pending" if unresolved(root) and not ended else "not_required"}
+        if state.get("state") in {"result_ready", "completed"}:
+            result.pop("reason", None)
+        same_retry = bool(child and kind == "text" and child.get("_terminal_empty_correction_of") == request_id
+                          and child.get("_work_key") == root.get("_work_key")
+                          and self.text._verified_retryable_empty(root))
+        same_retry = same_retry or bool(child and same_session_retry(root, child))
+        local_receipt = child or root
+        empty_released = (kind == "text" and local_receipt.get("_turn_reserved") is False
+                          and self.text._verified_retryable_empty(local_receipt))
+        result["local_reservation"] = ("released" if local_receipt.get("_attempt_finished_at") or empty_released or same_retry and successful(kind, child)
+                                        else "transferred" if same_retry and child.get("status") in {"queued", "running", "unknown"}
+                                        else "held" if unresolved(root) and not ended else "released")
+        if same_retry and not ended and successful(kind, child) and state.get("state") == "completed":
+            result["original_cleanup"] = "completed"
+        if child and state.get("selected_id") == request_id:
+            result["replacement_cleanup"] = "pending" if unresolved(child) or child.get("status") == "running" else "not_required"
+        if child and child.get("waiting"):
+            result["waiting"] = {key: child["waiting"][key] for key in ("reasons", "next_check_at") if key in child["waiting"]}
+        if root.get("_work_key"):
+            from services.work_lifecycle import _projection
+            original_work = self.store.runtime(db, root["_work_key"])
+            if original_work:
+                result["original_work"] = _projection(original_work)
+                if original_work.get("cleanup_pending"):
+                    result["original_cleanup"] = "pending"
+        if selected and selected.get("_work_key"):
+            from services.work_lifecycle import _projection
+            work = self.store.runtime(db, selected["_work_key"])
+            if work:
+                result["work"] = _projection(work)
+        if selected and kind == "text":
+            from services.public_chat_service import project_public_chat_receipt
+            result["result"] = project_public_chat_receipt(self.text._public(selected))
+        elif selected:
+            # The caller downloads from the selected ID through the existing
+            # authenticated image route; private URLs/bindings stay private.
+            result["result"] = {"id": state["selected_id"], "status": selected["status"], "image_count": len(selected.get("data") or [])}
+        return result
 
     def rework(self, kind, identity, request_id, selected_id):
         current = self.read(kind, identity, request_id)

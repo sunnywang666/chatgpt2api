@@ -845,24 +845,29 @@ class ImageTaskService:
                 self._save_locked()
 
     @contextmanager
-    def _transaction(self, *, task_key: str | None = None):
+    def _transaction(self, *, task_key: str | None = None, task_keys: list[str] | None = None):
         with self._lock:
             if getattr(self._transaction_local, "db", None) is not None:
                 yield self._transaction_local.db
                 return
+            if task_key is not None and task_keys is not None:
+                raise ValueError("task_key and task_keys are mutually exclusive")
+            keys = [task_key] if task_key is not None else task_keys
             with self.store.transaction() as db:
                 self._transaction_local.db = db
                 try:
-                    if task_key is None:
+                    if keys is None:
                         self._tasks = {key: json.loads(raw) for key, raw in db.execute("SELECT task_key,receipt FROM image_requests")}
                     else:
-                        # A progress update needs only its current durable
-                        # receipt, not every historical image's base64 bytes.
-                        row = db.execute("SELECT receipt FROM image_requests WHERE task_key=?", (task_key,)).fetchone()
-                        if row is None:
-                            self._tasks.pop(task_key, None)
-                        else:
-                            self._tasks[task_key] = json.loads(row[0])
+                        # A progress update or expired-receipt cleanup needs
+                        # only its current durable receipts, not every
+                        # historical image's base64 bytes.
+                        for key in dict.fromkeys(keys):
+                            row = db.execute("SELECT receipt FROM image_requests WHERE task_key=?", (key,)).fetchone()
+                            if row is None:
+                                self._tasks.pop(key, None)
+                            else:
+                                self._tasks[key] = json.loads(row[0])
                     yield db
                 finally:
                     self._transaction_local.db = None
@@ -983,26 +988,78 @@ class ImageTaskService:
     def list_tasks(self, identity: dict[str, object], task_ids: list[str]) -> dict[str, Any]:
         owner = _owner_id(identity)
         requested_ids = [_clean(task_id) for task_id in task_ids if _clean(task_id)]
-        with self._transaction():
-            if self._cleanup_locked():
-                self._save_locked()
-            items = []
-            missing_ids = []
-            for task_id in requested_ids:
-                task = self._tasks.get(_task_key(owner, task_id))
+        snapshot = self._list_snapshot(owner, requested_ids)
+        cutoff = self._retention_cutoff()
+
+        if requested_ids:
+            # A normal receipt read must not wait on an unrelated scheduler or
+            # completion writer.  The owner/task-key lookup also avoids
+            # decoding every historical image receipt for a status poll.
+            if any(task is not None and self._receipt_expired(task, cutoff) for task in snapshot):
+                return self._list_requested_after_cleanup(owner, requested_ids)
+            return self._public_list_snapshot(requested_ids, snapshot)
+
+        # List-all maintenance is triggered by a due receipt visible to this
+        # owner.  Only then acquire the writer and reread before deleting;
+        # unrelated owners no longer make this caller wait for opportunistic
+        # cleanup.
+        if any(self._receipt_expired(task, cutoff) for task in snapshot):
+            with self._transaction():
+                if self._cleanup_locked():
+                    self._save_locked()
+                snapshot = [task for task in self._tasks.values() if task.get("owner_id") == owner]
+        return self._public_list_snapshot([], snapshot)
+
+    def _list_snapshot(self, owner: str, requested_ids: list[str]) -> list[dict[str, Any] | None]:
+        """Read the requested owner receipts without acquiring SQLite's writer lock."""
+        with self.store.connect() as db:
+            # Keep a multi-ID result coherent with the former transaction
+            # semantics, but use a deferred read transaction so a held writer
+            # cannot delay normal receipt/status reads.
+            db.execute("BEGIN")
+            if requested_ids:
+                return [self.store.read_receipt(db, "image", owner, task_id) for task_id in requested_ids]
+            return [
+                json.loads(raw)
+                for (raw,) in db.execute(
+                    "SELECT receipt FROM image_requests WHERE json_extract(receipt, '$.owner_id')=?",
+                    (owner,),
+                )
+            ]
+
+    @staticmethod
+    def _public_list_snapshot(requested_ids: list[str], snapshot: list[dict[str, Any] | None]) -> dict[str, Any]:
+        if requested_ids:
+            items, missing_ids = [], []
+            for task_id, task in zip(requested_ids, snapshot):
                 if task is None:
                     missing_ids.append(task_id)
                 else:
                     items.append(_public_task(task))
-            if not requested_ids:
-                items = [
-                    _public_task(task)
-                    for task in self._tasks.values()
-                    if task.get("owner_id") == owner
-                ]
-                items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-                missing_ids = []
             return {"items": items, "missing_ids": missing_ids}
+        items = [_public_task(task) for task in snapshot if task is not None]
+        items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        return {"items": items, "missing_ids": []}
+
+    def _list_requested_after_cleanup(self, owner: str, requested_ids: list[str]) -> dict[str, Any]:
+        """Reread due receipts under the writer before deciding whether to remove them."""
+        snapshot: list[dict[str, Any] | None] = []
+        keys = [_task_key(owner, task_id) for task_id in requested_ids]
+        # A mixed expired/fresh request is one receipt query from the caller's
+        # perspective.  Reload all requested keys in one writer transaction
+        # so its response cannot combine separately committed versions.
+        with self._transaction(task_keys=keys) as db:
+            for key in keys:
+                task = self._tasks.get(key)
+                if task is not None and self._receipt_expired(task, self._retention_cutoff()):
+                    # The task-key transaction has just reread this exact
+                    # receipt, so a concurrent completion cannot be removed
+                    # based on the older read snapshot.
+                    self._tasks.pop(key, None)
+                    db.execute("DELETE FROM image_requests WHERE task_key=?", (key,))
+                    task = None
+                snapshot.append(task)
+        return self._public_list_snapshot(requested_ids, snapshot)
 
     def continuation_cursor(self, identity, task_id, anchors):
         """Read a refused image's current completed context, without recovering it."""
