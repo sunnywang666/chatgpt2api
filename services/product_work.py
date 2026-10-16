@@ -485,9 +485,75 @@ class ProductWorkService:
                 chains[receipt["request_id"]] = chain
         return chains
 
+    def _confirmed_archives(self, db, parent, version, keys, members):
+        """Read confirmed child receipts tied to this cycle's original members."""
+        if not isinstance(keys, list) or any(not isinstance(key, str) for key in keys):
+            return None
+        originals = {(m["kind"], m["owner"], m["request_id"]): r for m, r in members}
+        archives = []
+        for key in keys:
+            row = self.store.runtime(db, key)
+            if not row:
+                return None
+            archive = row.get("archive") or {}
+            original = originals.get((row.get("kind"), row.get("owner"), row.get("last_request_id")))
+            if (row.get("key") != key or row.get("_product_archive_parent") != parent["key"]
+                    or row.get("_product_archive_version", 1) != version or row.get("version") != version
+                    or archive.get("version") != version or archive.get("status") != "confirmed"
+                    or archive.get("desired") is not True or archive.get("claim")
+                    or archive.get("request_id") != row.get("last_request_id") or not original
+                    or any(not original.get(k) or row.get("target", {}).get(k) != original[k] for k in (
+                        "provider_binding_id", "provider_account_identity", "conversation_id"))):
+                return None
+            archives.append(row)
+        return archives
+
+    def _closed_missing_node_chains(self, db, parent, members):
+        """Revalidate resolved historical chains within their confirmed cycle.
+
+        A later step may legitimately advance the same conversation after
+        resume. It must not erase the prior closure's R/P resolution proof,
+        nor let that old A4 cursor override the new step's archive target.
+        Only member identities are saved; all evidence/claims are reread now.
+        """
+        chains = {}
+        current = {(m["kind"], m["owner"], m["request_id"]): (m, r) for m, r in members}
+        for closure in parent.get("previous_closures", []):
+            version = closure.get("version")
+            saved_members, keys = closure.get("members"), closure.get("archive_keys")
+            if (type(version) is not int or not 1 <= version < parent.get("version", 1)
+                    or closure.get("outcome") != "completed" or closure.get("results_saved") is not True
+                    or not isinstance(saved_members, list) or not saved_members
+                    or not isinstance(keys, list) or not keys):
+                continue
+            previous = []
+            for member in saved_members:
+                if not isinstance(member, dict):
+                    break
+                found = current.get(tuple(member.get(k) for k in ("kind", "owner", "request_id")))
+                if not found or found[0] != member:
+                    break
+                previous.append(found)
+            if len(previous) != len(saved_members):
+                continue
+            archives = self._confirmed_archives(db, parent, version, keys, previous)
+            if archives is None:
+                continue
+            for request_id, chain in self._missing_node_chains(db, parent, previous).items():
+                image = chain["image"]
+                if any(row.get("kind") == "image" and row.get("last_request_id") == image["id"]
+                       and row.get("owner") == parent["owner"]
+                       and all(row.get("target", {}).get(k) == image.get(k) for k in (
+                           "provider_binding_id", "provider_account_identity", "conversation_id"))
+                       for row in archives):
+                    chains[request_id] = chain
+        return chains
+
     def _missing_node_waivers(self, db, parent, members):
         waived = set()
-        for chain in self._missing_node_chains(db, parent, members).values():
+        chains = self._missing_node_chains(db, parent, members)
+        chains.update(self._closed_missing_node_chains(db, parent, members))
+        for chain in chains.values():
             waived.update(chain[name]["request_id"] for name in ("original", "rejected"))
         return waived
 
@@ -504,6 +570,7 @@ class ProductWorkService:
         reasons = set()
         receipts = [r for _, r in members]
         chains = self._missing_node_chains(db, parent, members)
+        chains.update(self._closed_missing_node_chains(db, parent, members))
         waived = set()
         valid_continues = set()
         for chain in chains.values():
@@ -601,19 +668,15 @@ class ProductWorkService:
                 if reasons:
                     raise WorkLifecycleError(reasons[0])
                 keys = parent.get("archive_keys", [])
-                archives = [self.store.runtime(db, key) for key in keys]
+                archives = self._confirmed_archives(db, parent, version, keys, members)
                 if (parent.get("cleanup_pending") or parent.get("slot_held")
                         or not keys and any(r.get("conversation_id") for _, r in members)
-                        or any(not row or row.get("_product_archive_parent") != parent["key"]
-                               or row.get("_product_archive_version", 1) != version
-                               or row.get("archive", {}).get("status") != "confirmed"
-                               or row.get("archive", {}).get("desired") is not True
-                               or row.get("archive", {}).get("claim")
-                               for row in archives)):
+                        or archives is None):
                     raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_PENDING")
                 parent.setdefault("previous_closures", []).append({"version": version, **{
                     key: parent.get(key) for key in ("outcome", "results_saved", "results_saved_at",
-                                                     "archive_keys", "updated_at")}})
+                                                     "archive_keys", "updated_at")},
+                    "members": [dict(member) for member in parent["members"]]})
                 parent.update(version=version + 1, resumed_from_version=version, state="active",
                               slot_held=True, results_saved=False, outcome=None, cleanup_pending=False,
                               archive_keys=[], updated_at=float(self.clock()))
