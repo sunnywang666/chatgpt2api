@@ -7,7 +7,7 @@ import pytest
 from services.task_store import TaskStore
 from services.work_lifecycle import WorkLifecycleError, WorkLifecycleService
 from services.product_work import (ProductWorkService, normalize_product_work, ensure_product_work,
-                                   record_slot, before_send, state_snapshot)
+                                   record_slot, before_send, state_snapshot, _claims)
 
 IDENTITY = {"id": "owner", "role": "admin", "_trusted_source": "internal:listing"}
 
@@ -100,6 +100,20 @@ def test_claim_or_unknown_blocks_without_mutation(runtime, extra):
     assert service.get(IDENTITY, "P")["state"] == "active"
     with store.connect() as db:
         assert store.read_receipt(db, "text", "owner", "text") == original
+
+
+def test_retired_recovery_claim_stops_blocking_without_closing_parent(runtime):
+    service, _, store, _, _, _, add = runtime
+    receipt = add("text", recovery_claim_id="expired-reader", recovery_claimed_at=900.0,
+                  recovery_lease_until=999.0, _executing=False, _turn_reserved=False)
+    assert _claims(receipt)
+    with store.transaction() as db:
+        current = store.read_receipt(db, "text", "owner", "text")
+        current.update(recovery_claim_id=None, recovery_claimed_at=None, recovery_lease_until=None)
+        db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
+                   (json.dumps(current), "owner", "text"))
+    assert not _claims(current)
+    assert service.get(IDENTITY, "P")["state"] == "active"
 
 
 def test_cancel_unsent_atomic_and_cannot_send_or_join_after_close(runtime):

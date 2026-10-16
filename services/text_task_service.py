@@ -306,6 +306,50 @@ class TextTaskService:
         )
 
     @staticmethod
+    def _retire_completed_recovery_claim(receipt, now):
+        """Retire only a fully proved, expired original-read recovery lease."""
+        finite = lambda value: type(value) in (int, float) and math.isfinite(value)
+        claim_id = receipt.get("recovery_claim_id")
+        claimed_at = receipt.get("recovery_claimed_at")
+        lease_until = receipt.get("recovery_lease_until")
+        execution_claim = receipt.get("_claim_id")
+        finished_at = receipt.get("finished_at")
+        if not finite(now):
+            return False
+        if not (
+            receipt.get("status") == "succeeded"
+            and receipt.get("upstream_outcome") == "completed"
+            and not receipt.get("error_code")
+            and isinstance(receipt.get("content"), str) and bool(receipt["content"])
+            and finite(finished_at) and 0 < finished_at <= now
+            and receipt.get("_executing") is False
+            and receipt.get("_turn_reserved") is False
+            and not receipt.get("_completion") and not receipt.get("_completion_of")
+            and not receipt.get("_recovery_paused") and not receipt.get("_recovery_suppressed")
+            and receipt.get("_recovery_claim_id") is None
+            and receipt.get("_recovery_claim_until") is None
+            and (receipt.get("upstream_unfinished") is None or receipt.get("upstream_unfinished") is False)
+            and receipt.get("recovery_error_code") is None and receipt.get("recovery_reason") is None
+            and receipt.get("_route") == "chat" and receipt.get("_operation") == "text"
+            and receipt.get("_forward_protocol") is None and receipt.get("_forward") is None
+            and not receipt.get("_image_recovery")
+            and receipt.get("recovery_phase") == "read_text_request"
+            and isinstance(claim_id, str) and bool(claim_id)
+            and finite(claimed_at) and finite(lease_until)
+            and claimed_at <= lease_until <= now
+            and (not execution_claim or finite(receipt.get("_claim_until"))
+                 and receipt["_claim_until"] <= now)
+        ):
+            return False
+        receipt.update(
+            recovery_claim_id=None,
+            recovery_claimed_at=None,
+            recovery_lease_until=None,
+            updated_at=now,
+        )
+        return True
+
+    @staticmethod
     def _public_not_submitted(receipt):
         """Whether this terminal receipt proves the upstream text turn was not sent.
 
@@ -1031,7 +1075,19 @@ class TextTaskService:
                 current.get("status") == "failed" and current.get("error_code") == "CHAT_RESPONSE_NOT_TEXT"
             ):
                 # A late read cannot roll back an authoritative terminal
-                # result, even if another writer did not clear the lease.
+                # result. Retire only this reader's still-current recovery
+                # lease; a late reader must never clear a newer worker's.
+                current_claim = current.get("recovery_claim_id")
+                if current_claim and current_claim == claim_id:
+                    current = {
+                        **current,
+                        "recovery_claim_id": None,
+                        "recovery_claimed_at": None,
+                        "recovery_lease_until": None,
+                        "updated_at": now,
+                    }
+                    db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
+                               (json.dumps(current), owner, request_id, row[0]))
                 return self._public(current)
             if current.get("recovery_claim_id") != claim_id:
                 return self._public(current)
@@ -1297,6 +1353,10 @@ class TextTaskService:
                 if corrected or self._end_no_final_recovery(previous, now) or ended_wait:
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
                                (json.dumps(previous), owner, request_id))
+                    row = (json.dumps(previous),)
+                if self._retire_completed_recovery_claim(previous, now):
+                    db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
+                               (json.dumps(previous), owner, request_id, row[0]))
                     row = (json.dumps(previous),)
                 if previous.get("_recovery_suppressed") is True:
                     # An explicit operator stop preserves the original
