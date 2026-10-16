@@ -177,6 +177,50 @@ def test_native_codex_uses_original_durable_claim_and_exact_payload(runtime, mon
     assert len(session.calls) == 1
 
 
+@pytest.mark.parametrize("status", [400, 404])
+def test_native_codex_http_rejection_persists_safe_receipt_across_restart(runtime, monkeypatch, status):
+    from test.test_codex_service import FakeResponse
+
+    runtime.accounts.update_account(runtime.account["access_token"], {"refresh_token": "fixture-refresh"})
+    response = FakeResponse(status=status, payload={"error": {
+        "code": "invalid_request_error",
+        "type": "invalid_request_error",
+        "param": "input[0].content",
+        "message": "Model is unavailable fixture-only-token fixture-refresh physical-account",
+    }})
+    response.headers["x-request-id"] = "req_0123456789abcdef"
+    native, session, who, payload = native_runtime(runtime, monkeypatch, response)
+
+    runtime.admission.execute(runtime.admission.claim_next())
+    stored = durable_forward.raw_receipt(runtime.service, who["id"], "original-wire")
+    assert stored["status"] == "unknown"
+    assert stored["error_code"] == "codex_request_rejected"
+    assert stored["original_http_status"] == status
+    assert stored["original_upstream_error"]["code"] == "invalid_request_error"
+    assert stored["original_upstream_error"]["type"] == "invalid_request_error"
+    assert "param" not in stored["original_upstream_error"]
+    assert stored["original_upstream_response_ids"] == {"request_id": "req_0123456789abcdef"}
+    assert len(session.calls) == 1
+    for secret in ("fixture-only-token", "fixture-refresh", "physical-account"):
+        assert secret not in json.dumps(stored)
+
+    ordinary = asyncio.run(durable_forward.respond(who, payload, request(), "codex", service=runtime.service))
+    ordinary_body = json.loads(ordinary.body)
+    assert ordinary.status_code == 409
+    assert ordinary_body["error"]["code"] == "codex_request_rejected"
+    assert ordinary_body["error"]["message"] == stored["original_upstream_error"]["message"]
+    for secret in ("fixture-only-token", "fixture-refresh", "physical-account"):
+        assert secret not in ordinary.body.decode()
+    assert len(session.calls) == 1
+
+    from services.text_task_service import TextTaskService
+    restarted = TextTaskService(runtime.store.path)
+    restarted_receipt = restarted.read(who["id"], "original-wire")
+    assert restarted_receipt["original_http_status"] == status
+    assert restarted_receipt["original_upstream_error"] == stored["original_upstream_error"]
+    assert restarted_receipt["original_upstream_response_ids"] == stored["original_upstream_response_ids"]
+
+
 def test_selected_native_codex_receipt_binds_exact_account_before_final_post(runtime, monkeypatch):
     """The public ref is persisted privately; the controlled upstream never sees it."""
     from services.codex_service import CodexService

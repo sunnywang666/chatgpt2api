@@ -13,6 +13,7 @@ from fastapi.responses import Response, StreamingResponse
 from api.support import require_identity
 from api.key_policy import require_codex_policy, require_codex_endpoint
 from services.codex_service import MAX_REQUEST_BYTES, CodexHTTPResponse, CodexServiceError, codex_service
+from utils.upstream_error import safe_upstream_error
 
 
 def _ordinary_identity(authorization: str | None) -> dict:
@@ -23,9 +24,10 @@ def _ordinary_identity(authorization: str | None) -> dict:
 
 
 def _error(exc: CodexServiceError) -> HTTPException:
+    upstream_message = safe_upstream_error(getattr(exc, "original_upstream_error", None)).get("message")
     return HTTPException(
         status_code=exc.status_code,
-        detail={"error": {"code": exc.code, "message": str(exc)}, "rate_limit": exc.rate_limit},
+        detail={"error": {"code": exc.code, "message": upstream_message or str(exc)}, "rate_limit": exc.rate_limit},
     )
 
 

@@ -142,6 +142,19 @@ class CodexApiTests(unittest.TestCase):
         self.assertEqual(response.json()["detail"]["error"]["code"], "codex_upstream_outcome_unknown")
         self.assertNotIn("private prompt", response.text)
 
+    def test_service_error_uses_sanitized_upstream_reason_without_changing_generic_code(self):
+        self.service.error = CodexServiceError(
+            400, "codex_request_rejected", "The Codex request was rejected",
+            original_upstream_error={"code": "invalid_request_error", "message": "Model is unavailable"},
+        )
+        response = self.client.post(
+            "/codex/v1/responses", headers=AUTH, json={"model": "gpt-5.6-codex", "input": []}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"]["error"], {
+            "code": "codex_request_rejected", "message": "Model is unavailable",
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

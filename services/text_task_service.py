@@ -275,6 +275,37 @@ class TextTaskService:
             yield db
 
     @staticmethod
+    def _queued_read_snapshot(receipt):
+        """Whether a queued original can be projected without a write lease.
+
+        Keep this deliberately narrower than the ordinary queued state. A
+        caller may only skip ``BEGIN IMMEDIATE`` once the receipt proves that
+        it has durable input but no send, execution, or recovery state which a
+        read could correct or advance.
+        """
+        outcome = receipt.get("upstream_outcome")
+        return bool(
+            receipt.get("status") == "queued"
+            and isinstance(receipt.get("_input_ref"), str) and bool(receipt["_input_ref"])
+            and receipt.get("_submission_started") is False
+            and receipt.get("_turn_reserved") is False
+            and receipt.get("_executing") is not True
+            and receipt.get("_claim_id") is None
+            and receipt.get("recovery_claim_id") is None
+            and receipt.get("_last_sent_sequence") is None
+            and type(receipt.get("send_count", 0)) is int and receipt.get("send_count", 0) == 0
+            and outcome in (None, "not_sent", "not_submitted")
+            and receipt.get("error_code") is None
+            and not receipt.get("upstream_unfinished")
+            and not any(receipt.get(field) for field in (
+                "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of",
+            ))
+            and all(receipt.get(field) is None for field in (
+                "recovery_next_at", "_attempt_finished_at", "_execution_wait_ended_at",
+            ))
+        )
+
+    @staticmethod
     def _public_not_submitted(receipt):
         """Whether this terminal receipt proves the upstream text turn was not sent.
 
@@ -1243,6 +1274,19 @@ class TextTaskService:
         recovery_claim = None
         recovery_target = None
         now = self._now()
+        # A newly accepted original often waits only for shared admission
+        # capacity. Its projection cannot change receipt state or schedule a
+        # recovery, so avoid competing with the admission writer lock. Every
+        # other case deliberately starts the existing write transaction below
+        # and rereads its current receipt before it can make a change.
+        with self._db() as db:
+            snapshot = db.execute(
+                "SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id),
+            ).fetchone()
+        if snapshot:
+            queued = json.loads(snapshot[0])
+            if self._queued_read_snapshot(queued):
+                return self._public(queued)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()

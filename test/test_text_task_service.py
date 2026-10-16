@@ -139,6 +139,39 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(len(self.queue.calls), 0)
         self.assertEqual(restarted.read("other-owner", "attempt-1")["status"], "not_found")
 
+    def test_queued_unsent_read_bypasses_a_concurrent_sqlite_writer(self):
+        recovery_reader = mock.Mock(side_effect=AssertionError("queued receipt must not recover"))
+        service = TextTaskService(self.path, executor=self.queue, recovery_reader=recovery_reader)
+        service.submit("owner", self.body)
+        with service.store.connect() as db:
+            before = service.store.read_receipt(db, "text", "owner", "attempt-1")
+
+        locked, release = threading.Event(), threading.Event()
+
+        def hold_writer():
+            with service.store.transaction():
+                locked.set()
+                release.wait(2)
+
+        writer = threading.Thread(target=hold_writer)
+        writer.start()
+        self.assertTrue(locked.wait(1))
+        try:
+            with ThreadPoolExecutor(max_workers=1) as readers:
+                result = readers.submit(service.read, "owner", "attempt-1").result(timeout=0.5)
+        finally:
+            release.set()
+            writer.join(timeout=2)
+
+        self.assertEqual(result["request_id"], "attempt-1")
+        self.assertEqual(result["status"], "queued")
+        recovery_reader.assert_not_called()
+        self.assertEqual(len(self.queue.calls), 1)
+        with service.store.connect() as db:
+            after = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        self.assertEqual(after, before)
+        self.assertEqual(service.read("other-owner", "attempt-1")["status"], "not_found")
+
     def test_owner_get_projects_only_terminal_pre_send_binding_mismatch_as_not_submitted(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient

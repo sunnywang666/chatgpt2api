@@ -1212,7 +1212,18 @@ class PoolAdmission:
                 probes = 0
                 for account in self._rows():
                     projection = self.codex.account_projection(account)
-                    if projection.get("authorization_status") != "saved" or account.get("managed_disabled"):
+                    # A normal pool/Web account can already have a verified
+                    # Codex observation without separately stored Codex
+                    # credentials.  Once that observation expires, keep its
+                    # queued original on the same account's ordinary bounded
+                    # observation path.  Do not turn a Chat-only account with
+                    # no prior Codex evidence into a new probe candidate.
+                    cached_observation = isinstance(account.get("codex_observation"), dict) and bool(
+                        projection.get("observed_at")
+                    )
+                    if (account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}
+                            or projection.get("state") == "auth_required"
+                            or (projection.get("authorization_status") != "saved" and not cached_observation)):
                         continue
                     if self.codex._observation_fresh(projection) and projection.get("state") != "unknown":
                         continue

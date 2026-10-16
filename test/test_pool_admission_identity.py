@@ -50,9 +50,11 @@ def runtime(tmp_path, monkeypatch):
     return open_runtime
 
 
-def submit(rt, name="original", *, session="original-session", previous=None):
+def submit(rt, name="original", *, session="original-session", previous=None, model="gpt-5.6-codex", account_ref=None):
     identity = {"id": "ordinary-key", "role": "user"}
-    payload = {"model": "gpt-5.6-codex", "input": [], "reasoning": {"effort": "high"}}
+    payload = {"model": model, "input": [], "reasoning": {"effort": "high"}}
+    if account_ref is not None:
+        payload["account_ref"] = account_ref
     if previous:
         payload["previous_response_id"] = previous
     request = SimpleNamespace(headers={"x-client-request-id": name, "session-id": session})
@@ -123,6 +125,121 @@ def test_new_codex_only_account_automatically_serves_existing_full_pool_wait(run
         assert held.receipt()["_claim_id"] == held.claim
     finally:
         rt.admission.stop()
+
+
+def test_queued_web_codex_observation_renews_on_same_account_without_new_authorization(runtime, monkeypatch):
+    """A stale, already observed Web account must not strand its native queue."""
+    from test.test_codex_service import observation
+
+    row = legacy(
+        source_type="web",
+        type="Plus",
+        provider_account_identity="original-account",
+        codex_observation=observation(
+            minutes_ago=10,
+            models=[{"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol", "reasoning_efforts": ["high"]}],
+        ),
+    )
+    sibling = legacy(
+        "fresh-sibling",
+        source_type="web",
+        type="Plus",
+        provider_account_identity="sibling-account",
+        codex_observation=observation(
+            models=[{"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol", "reasoning_efforts": ["high"]}],
+        ),
+    )
+    rt = runtime([row, sibling])
+    refreshes = []
+
+    def ordinary_refresh(token, **kwargs):
+        refreshes.append((token, kwargs))
+        return token
+
+    monkeypatch.setattr(rt.accounts, "refresh_codex_access_token", ordinary_refresh)
+    selected_ref = rt.accounts.pool_account_ref(rt.accounts.get_account("fixture-codex-a"))
+    submit(rt, "queued-sol", session="saved-selection", model="gpt-5.6-sol", account_ref=selected_ref)
+    observation_session = FakeSession(gets=[
+        FakeResponse(payload={"models": [{"slug": "gpt-5.6-sol", "supported_reasoning_efforts": ["high"]}]}),
+        FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 0}}}),
+    ])
+    rt.factory.sessions.append(observation_session)
+
+    context = rt.admission.claim_next()
+
+    assert context is not None
+    assert context.request_id == "queued-sol"
+    assert context.selected_account()["provider_account_identity"] == "original-account"
+    receipt = raw_receipt(rt.service, "ordinary-key", "queued-sol")
+    assert receipt["model"] == "gpt-5.6-sol"
+    assert receipt["provider_account_identity"] == "original-account"
+    assert refreshes == [("fixture-codex-a", {"event": "codex_observation"})]
+    assert [call[0] for call in observation_session.calls] == ["GET", "GET"]
+
+
+@pytest.mark.parametrize("state", ["auth_required", "disabled", "unobserved"])
+def test_queued_web_codex_never_probes_unrenewable_selection(runtime, monkeypatch, state):
+    """No Codex evidence, a rejection, or a disabled account stays fail-closed."""
+    from test.test_codex_service import observation
+
+    row = legacy(
+        source_type="web",
+        type="Plus",
+        provider_account_identity="original-account",
+        codex_observation=observation(minutes_ago=10),
+    )
+    if state == "auth_required":
+        row["codex_observation"]["state"] = "auth_required"
+    elif state == "disabled":
+        row["managed_disabled"] = True
+    else:
+        row.pop("codex_observation")
+    rt = runtime([row])
+    refreshes = []
+    monkeypatch.setattr(rt.accounts, "refresh_codex_access_token", lambda token, **kwargs: refreshes.append((token, kwargs)))
+    selected_ref = rt.accounts.pool_account_ref(rt.accounts.get_account("fixture-codex-a"))
+    submit(rt, "blocked-selection", model="gpt-5.6-codex", account_ref=selected_ref)
+
+    assert rt.admission.claim_next() is None
+    receipt = raw_receipt(rt.service, "ordinary-key", "blocked-selection")
+    assert receipt["status"] == "queued"
+    assert receipt["_requested_account_identity"] == "original-account"
+    assert refreshes == [] and rt.factory.sessions == []
+
+
+def test_queued_web_codex_refresh_failure_retains_selected_original(runtime, monkeypatch):
+    """A failed observation remains queued; it cannot drift to a fresh sibling."""
+    from test.test_codex_service import observation
+
+    stale = legacy(
+        source_type="web",
+        type="Plus",
+        provider_account_identity="original-account",
+        codex_observation=observation(minutes_ago=10),
+    )
+    sibling = legacy(
+        "fresh-sibling",
+        source_type="web",
+        type="Plus",
+        provider_account_identity="sibling-account",
+        codex_observation=observation(),
+    )
+    rt = runtime([stale, sibling])
+    refreshes = []
+    monkeypatch.setattr(rt.accounts, "refresh_codex_access_token", lambda token, **kwargs: refreshes.append((token, kwargs)) or token)
+    selected_ref = rt.accounts.pool_account_ref(rt.accounts.get_account("fixture-codex-a"))
+    submit(rt, "failed-refresh", model="gpt-5.6-codex", account_ref=selected_ref)
+    observation_session = FakeSession(gets=[FakeResponse(status=503, payload={})])
+    rt.factory.sessions.append(observation_session)
+
+    assert rt.admission.claim_next() is None
+    receipt = raw_receipt(rt.service, "ordinary-key", "failed-refresh")
+    assert receipt["status"] == "queued"
+    assert receipt["model"] == "gpt-5.6-codex"
+    assert receipt["_requested_account_identity"] == "original-account"
+    assert receipt.get("provider_account_identity") is None
+    assert refreshes == [("fixture-codex-a", {"event": "codex_observation"})]
+    assert [call[0] for call in observation_session.calls] == ["GET"]
 
 
 def test_restart_and_other_worker_token_rotation_keep_response_and_session_owner(runtime):
