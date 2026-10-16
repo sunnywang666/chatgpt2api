@@ -345,10 +345,13 @@ class WorkLifecycleService:
                             and float(a.get("claim_until") or 0) <= now):
                         try:
                             if candidate.get("_product_archive_parent"):
-                                receipt, current, members = self._product_service().load_archive_target(db, candidate)
+                                product = self._product_service()
+                                receipt, current, members = product.load_archive_target(db, candidate)
+                                blocked = not product.archive_turns_ready(db, candidate, members)
                             else:
                                 receipt, current, members = self._load(db, candidate["kind"], {"id": candidate["owner"]}, a["request_id"])
-                            if current["version"] != a["version"] or any(_blocked(r, members=members) for r in members):
+                                blocked = any(_blocked(r, members=members) for r in members)
+                            if current["version"] != a["version"] or blocked:
                                 raise WorkLifecycleError("WORK_TURN_UNFINISHED")
                         except WorkLifecycleError as exc:
                             a.update(status="unknown", error_code=exc.code, next_at=now + 60)
@@ -484,6 +487,15 @@ class WorkLifecycleService:
                 if (not current or current["version"] != work["version"]
                         or (current.get("archive") or {}).get("claim") != claim):
                     return True
+                if not error_code and current.get("_product_archive_parent"):
+                    # The upstream archive may already have succeeded.  If the
+                    # exact historical chain changed while that I/O was in
+                    # flight, retain an unknown intent and the product slot;
+                    # never claim confirmation or replay a write from here.
+                    try:
+                        self._product_service().load_archive_target(db, current)
+                    except WorkLifecycleError as exc:
+                        error_code = exc.code
                 updated = current["archive"]
                 updated.update(claim=None, claim_until=None, error_code=error_code)
                 if error_code:

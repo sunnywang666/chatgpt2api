@@ -1,0 +1,154 @@
+"""Lifecycle close/archive coverage for the one missing-node continuation chain."""
+from copy import deepcopy
+from types import SimpleNamespace
+
+import pytest
+
+from services.product_work import ProductWorkService, ensure_product_work
+from services.image_task_service import ImageTaskService
+from services.request_context import current_request
+from services.work_lifecycle import WorkLifecycleError, WorkLifecycleService
+from test.test_rejected_chat_successor import (
+    missing_node_model_rejection_with_queued_image,
+    task,
+)
+
+
+IDENTITY = {"id": "owner", "role": "admin", "_trusted_source": "internal:content"}
+PRODUCT = {"product_ref": "fixture-product", "step_ref": "text"}
+
+
+def _chain(task):
+    """Build R/P/C/A4 and execute C plus ordinary retained A4 locally."""
+    with task.service.store.transaction() as db:
+        root = task.service.store.read_receipt(db, "text", "owner", "old")
+        ensure_product_work(task.service.store, db, "text", "owner", "old", root, PRODUCT,
+                            source="internal:content")
+        task.service.store.write_receipt(db, "text", "owner", "old", root)
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    task.service.submit("owner", envelope, source="internal:content")
+    context = task.admission.claim_next()
+    assert context and context.request_id == "missing-model-retry"
+    task.admission.execute(context)
+    # The local runner stands in for the bound transport's terminal handoff.
+    # Product closure deliberately waits for that execution lease to end.
+    task.admission.update_claim(context, _claim_id=None, _claim_until=0, _turn_reserved=False)
+    seen_image_parents = []
+    def generation(payload):
+        current_request.get().before_send()
+        seen_image_parents.append(payload["parent_message_id"])
+        return {"data": [{"url": "https://fixture.invalid/image.png"}],
+                "_provider_binding_id": "original-binding",
+                "_provider_account_identity": "original-account",
+                "_conversation_id": "original-chat", "_parent_message_id": "a4-final"}
+    images = ImageTaskService(task.root / "image_tasks.json", store=task.service.store,
+                              admission=task.admission, generation_handler=generation)
+    task.admission.register("image", lambda ctx, body: images._run_task(
+        ctx.owner + ":" + ctx.request_id, body["mode"], body["payload"], body["identity"], body["payload"]["model"]))
+    image_context = task.admission.claim_next()
+    assert image_context and image_context.request_id == "queued-image"
+    task.admission.execute(image_context)
+    task.admission.update_claim(image_context, _claim_id=None, _claim_until=0, _turn_reserved=False)
+    with task.service.store.transaction() as db:
+        continued = task.service.store.read_receipt(db, "text", "owner", "missing-model-retry")
+        image = task.service.store.read_receipt(db, "image", "owner", "queued-image")
+        assert continued["status"] == "succeeded" and continued["upstream_outcome"] == "completed"
+        assert image["status"] == "success" and image.get("_image_thread_terminal") is not True
+        assert image["parent_message_id"] == "a4-final" and image["binding_status"] == "bound"
+        assert image["_missing_node_retry_request_parent_message_id"] == continued["parent_message_id"]
+        assert seen_image_parents == [continued["parent_message_id"]]
+    calls, fail = [], [False]
+    def archive(owner, request_id, archived):
+        calls.append((owner, request_id, archived))
+        if fail[0]:
+            raise RuntimeError("archive readback unavailable")
+        with task.service.store.connect() as db:
+            receipt = task.service.store.read_receipt(db, "image", owner, request_id)
+        return {"request_id": request_id, "conversation_id": receipt["conversation_id"], "archived": archived}
+    text = SimpleNamespace(store=task.service.store, admission=None, archive_product_work=archive)
+    images = SimpleNamespace(archive_product_work=archive)
+    product = ProductWorkService(text, images, clock=lambda: 1000)
+    lifecycle = WorkLifecycleService(text, images, clock=lambda: 1000)
+    with task.service.store.transaction() as db:
+        parent = product._load(db, IDENTITY, "fixture-product")
+        members = product._members(db, parent)
+        chains = product._missing_node_chains(db, parent, members)
+        assert chains
+    return product, lifecycle, calls, fail
+
+
+def test_completed_missing_node_chain_closes_archives_a4_and_releases_slot(task):
+    product, lifecycle, calls, _ = _chain(task)
+
+    closing = product.close(IDENTITY, "fixture-product", results_saved=True)
+    assert closing["state"] == "closing" and closing["results_saved"] and closing["slot_held"]
+    assert lifecycle.process_one()
+    completed = product.get(IDENTITY, "fixture-product")
+    assert completed["state"] == "completed" and not completed["slot_held"]
+    assert calls == [("owner", "queued-image", True)]
+
+
+@pytest.mark.parametrize("kind, request_id, changes", [
+    ("text", "old", {"_recovery_paused": True}),
+    ("text", "missing-parent", {"_claim_id": "late-claim"}),
+    ("text", "old", {"status": "succeeded", "upstream_outcome": "completed", "content": "late root"}),
+    ("text", "missing-parent", {"status": "succeeded", "upstream_outcome": "completed", "content": "late rejection"}),
+    ("text", "missing-model-retry", {"content": ""}),
+    ("image", "queued-image", {"status": "queued", "upstream_outcome": "not_sent"}),
+])
+def test_missing_node_chain_requires_exact_terminal_evidence(task, kind, request_id, changes):
+    product, _, calls, _ = _chain(task)
+    with task.service.store.transaction() as db:
+        receipt = task.service.store.read_receipt(db, kind, "owner", request_id)
+        receipt.update(changes)
+        task.service.store.write_receipt(db, kind, "owner", request_id, receipt)
+
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_"):
+        product.close(IDENTITY, "fixture-product", results_saved=True)
+    assert calls == []
+
+
+def test_missing_node_chain_requires_saved_results_and_no_external_member(task):
+    product, _, calls, _ = _chain(task)
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_RESULTS_SAVE_REQUIRED"):
+        product.close(IDENTITY, "fixture-product", results_saved=False)
+    with task.service.store.transaction() as db:
+        image = task.service.store.read_receipt(db, "image", "owner", "queued-image")
+        external = deepcopy(image)
+        external.update(id="other-member", owner_id="other", _product_work_key="product_work:external")
+        task.service.store.write_receipt(db, "image", "other", "other-member", external)
+
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_CONVERSATION_CONFLICT"):
+        product.close(IDENTITY, "fixture-product", results_saved=True)
+    assert calls == []
+
+
+def test_archive_commit_rechecks_chain_and_keeps_slot_on_late_change(task):
+    product, lifecycle, calls, _ = _chain(task)
+    product.close(IDENTITY, "fixture-product", results_saved=True)
+    def changed_archive(owner, request_id, archived):
+        with task.service.store.transaction() as db:
+            root = task.service.store.read_receipt(db, "text", owner, "old")
+            root["_recovery_suppressed"] = True
+            task.service.store.write_receipt(db, "text", owner, "old", root)
+        calls.append((owner, request_id, archived))
+        with task.service.store.connect() as db:
+            image = task.service.store.read_receipt(db, "image", owner, request_id)
+        return {"request_id": request_id, "conversation_id": image["conversation_id"], "archived": archived}
+    lifecycle.images.archive_product_work = changed_archive
+
+    assert lifecycle.process_one()
+    result = product.get(IDENTITY, "fixture-product")
+    assert result["state"] == "closing" and result["slot_held"]
+    assert result["archive"]["pending"] == 1 and calls == [("owner", "queued-image", True)]
+
+
+def test_archive_failure_keeps_missing_node_chain_slot_held(task):
+    product, lifecycle, calls, fail = _chain(task)
+    product.close(IDENTITY, "fixture-product", results_saved=True)
+    fail[0] = True
+
+    assert lifecycle.process_one()
+    result = product.get(IDENTITY, "fixture-product")
+    assert result["state"] == "closing" and result["slot_held"]
+    assert result["archive"]["pending"] == 1 and calls == [("owner", "queued-image", True)]

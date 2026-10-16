@@ -386,6 +386,70 @@ def _unresolved(receipt, members):
     return _blocked(receipt, members=members)
 
 
+def _missing_node_chain(store, db, parent, receipt, members, now):
+    """Return the one terminal R/P/C/A4 chain which can retire R and P.
+
+    The text service owns the immutable request/input/hash proof.  Product
+    lifecycle adds only the live terminal-result and ownership constraints
+    needed before an UNKNOWN historical root can stop blocking close/archive.
+    """
+    from services.text_task_service import TextTaskService
+
+    if (receipt.get("status") != "succeeded"
+            or receipt.get("upstream_outcome") != "completed"
+            or not isinstance(receipt.get("content"), str) or not receipt["content"].strip()
+            or not TextTaskService._missing_node_model_rejection_retry_consumed(
+                store, db, parent["owner"], receipt)):
+        return None
+    parent_id = receipt.get("_supersedes_request_id")
+    rejected = store.read_receipt(db, "text", parent["owner"], parent_id)
+    original_id = rejected.get("_supersedes_request_id") if rejected else None
+    original = store.read_receipt(db, "text", parent["owner"], original_id) if isinstance(original_id, str) else None
+    image_id = receipt.get(TextTaskService.MISSING_NODE_RETRY_FIELD)
+    image = store.read_receipt(db, "image", parent["owner"], image_id) if isinstance(image_id, str) else None
+    if not (original and rejected and image
+            and TextTaskService._rejected_missing_node_successor_source(
+                store, db, parent["owner"], rejected, now)):
+        return None
+    chain = (original, rejected, receipt, image)
+    keys = ("_product_work_key", "provider_binding_id", "provider_account_identity",
+            "client_conversation_id", "conversation_id")
+    if any(any(item.get(key) != original.get(key) or not item.get(key) for key in keys) for item in chain):
+        return None
+    if any(item.get("_product_work_key") != parent["key"] for item in chain):
+        return None
+    if (image.get("status") != "success" or image.get("upstream_outcome") != "generated"
+            or image.get("upstream_unfinished") is not False or image.get("binding_status") != "bound"
+            or not isinstance(image.get("data"), list) or not image["data"]
+            or not isinstance(image.get("parent_message_id"), str) or not image["parent_message_id"]
+            or image.get("_missing_node_retry_request_parent_message_id") != receipt.get("parent_message_id")):
+        return None
+    # Do not turn this narrow exception into a generic cleanup of paused,
+    # claimed, completion-owned, or later-mutated historical work.
+    controls = ("_executing", "_turn_reserved", "_claim_id", "recovery_claim_id", "_recovery_claim_id",
+                "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of")
+    if any(any(item.get(key) for key in controls) for item in chain):
+        return None
+    sequence = [item.get("_sequence") for item in chain]
+    if not all(type(value) is int and value > 0 for value in sequence) or not sequence[0] < sequence[1] < sequence[3] < sequence[2]:
+        return None
+    member_ids = {(member["kind"], row.get("request_id") or row.get("id")) for member, row in members}
+    expected_ids = {("text", original_id), ("text", parent_id),
+                    ("text", receipt.get("request_id")), ("image", image_id)}
+    if not expected_ids <= member_ids:
+        return None
+    # C is intentionally newer than A4 because A4 was queued first.  A later
+    # member would make that historical ordering ambiguous, so keep close
+    # blocked rather than silently archiving an older cursor.
+    for member, other in members:
+        kind = member["kind"]
+        other_id = other.get("request_id") or other.get("id")
+        if (kind, other_id) not in expected_ids and _same_conversation(other, receipt):
+            if type(other.get("_sequence")) is not int or other["_sequence"] > receipt["_sequence"]:
+                return None
+    return {"original": original, "rejected": rejected, "continue": receipt, "image": image}
+
+
 class ProductWorkService:
     def __init__(self, text_service, image_service, *, clock=time.time):
         self.text, self.images, self.store, self.clock = text_service, image_service, text_service.store, clock
@@ -410,18 +474,55 @@ class ProductWorkService:
             result.append((member, receipt))
         return result
 
+    def _missing_node_chains(self, db, parent, members):
+        chains = {}
+        now = float(self.clock())
+        for _, receipt in members:
+            chain = _missing_node_chain(self.store, db, parent, receipt, members, now)
+            if chain:
+                chains[receipt["request_id"]] = chain
+        return chains
+
+    def _missing_node_waivers(self, db, parent, members):
+        waived = set()
+        for chain in self._missing_node_chains(db, parent, members).values():
+            waived.update(chain[name]["request_id"] for name in ("original", "rejected"))
+        return waived
+
+    def archive_turns_ready(self, db, child, members):
+        """Apply the exact R/P exception after the generic archive recheck."""
+        parent = self.store.runtime(db, child["_product_archive_parent"])
+        if not parent:
+            return False
+        waived = self._missing_node_waivers(db, parent, self._members(db, parent))
+        return not any(_blocked(receipt, members=members) and receipt.get("request_id") not in waived
+                       for receipt in members)
+
     def _reasons(self, db, parent, members, outcome=None):
         reasons = set()
         receipts = [r for _, r in members]
+        chains = self._missing_node_chains(db, parent, members)
+        waived = set()
+        valid_continues = set()
+        for chain in chains.values():
+            waived.update(chain[name]["request_id"] for name in ("original", "rejected"))
+            valid_continues.add(chain["continue"]["request_id"])
+        from services.text_task_service import TextTaskService
         for member, receipt in members:
             if outcome == "cancelled" and _unsent(receipt):
                 continue
+            # A registered C is never an ordinary successful tail.  If one of
+            # its R/P/A4 facts changes later, retain the product rather than
+            # silently choosing the normal max-sequence archive target.
+            if (receipt.get(TextTaskService.MISSING_NODE_RETRY_FIELD)
+                    and receipt.get("request_id") not in valid_continues):
+                reasons.add("PRODUCT_WORK_TURN_UNFINISHED")
             replaced = _rejected_chat_replaced(self.store, db, member["owner"], receipt, members)
-            if not replaced and _unresolved(receipt, receipts):
+            if not replaced and receipt.get("request_id") not in waived and _unresolved(receipt, receipts):
                 reasons.add("PRODUCT_WORK_TURN_UNFINISHED")
             status = receipt.get("status")
             if outcome == "completed" and status not in {"succeeded", "success"}:
-                if not (replaced
+                if not (replaced or receipt.get("request_id") in waived
                         or status in {"unknown", "failed", "error"} and not _unresolved(receipt, receipts)
                         and (receipt.get("upstream_outcome") == "unknown" or receipt.get("upstream_unfinished"))):
                     reasons.add("PRODUCT_WORK_RESULT_REQUIRED")
@@ -533,7 +634,24 @@ class ProductWorkService:
             if reasons:
                 raise WorkLifecycleError(reasons[0])
             targets = {}
+            chains = self._missing_node_chains(db, parent, members)
+            chain_member_ids = set()
+            special_canonicals = set()
+            image_members = {(member["kind"], member["request_id"]): (member, receipt)
+                             for member, receipt in members}
+            for chain in chains.values():
+                chain_member_ids.update(("text", chain[name]["request_id"])
+                                        for name in ("original", "rejected", "continue"))
+                chain_member_ids.add(("image", chain["image"]["id"]))
+                special_canonicals.add((chain["image"]["provider_account_identity"],
+                                        chain["image"]["conversation_id"]))
             for member, receipt in members:
+                identity = member["kind"], member["request_id"]
+                if identity in chain_member_ids:
+                    chain = chains.get(receipt.get("request_id"))
+                    if not chain:
+                        continue
+                    member, receipt = image_members[("image", chain["image"]["id"])]
                 if _unsent(receipt) and outcome == "cancelled":
                     receipt.update(status="cancelled", error_code="PRODUCT_WORK_CANCELLED")
                     self.store.write_receipt(db, member["kind"], member["owner"], member["request_id"], receipt)
@@ -544,8 +662,14 @@ class ProductWorkService:
                         raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_REQUIRED")
                     canonical = next((key for key, (_, other) in targets.items() if _same_conversation(receipt, other)),
                                      (account, conversation))
+                    if canonical in special_canonicals and receipt.get("id") != next(
+                            (chain["image"]["id"] for chain in chains.values()
+                             if (chain["image"]["provider_account_identity"], chain["image"]["conversation_id"]) == canonical),
+                            None):
+                        continue
                     previous = targets.get(canonical)
-                    if previous is None or receipt.get("_sequence", 0) > previous[1].get("_sequence", 0):
+                    if (canonical in special_canonicals or previous is None
+                            or receipt.get("_sequence", 0) > previous[1].get("_sequence", 0)):
                         targets[canonical] = member, receipt
                 elif _codex_product_bridge(receipt):
                     continue
@@ -586,6 +710,14 @@ class ProductWorkService:
         reasons = self._reasons(db, parent, members, parent["outcome"])
         if reasons:
             raise WorkLifecycleError(reasons[0])
+        if not self.archive_turns_ready(db, child, [receipt for _, receipt in members]):
+            raise WorkLifecycleError("WORK_TURN_UNFINISHED")
+        for chain in self._missing_node_chains(db, parent, members).values():
+            image = chain["image"]
+            if (child["target"].get("provider_account_identity") == image["provider_account_identity"]
+                    and child["target"].get("conversation_id") == image["conversation_id"]
+                    and (child["kind"], child["last_request_id"]) != ("image", image["id"])):
+                raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
         receipt = self.store.read_receipt(db, child["kind"], child["owner"], child["last_request_id"])
         if not receipt or any(receipt.get(k) != v for k, v in child["target"].items()):
             raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")

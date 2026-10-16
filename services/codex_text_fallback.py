@@ -101,6 +101,13 @@ def _original(store, db, owner, original_id):
             _reject("CODEX_FALLBACK_ORIGINAL_INELIGIBLE")
         if TextTaskService._no_final_model_rejection_retry(store, db, owner, receipt, time.time()):
             _reject("CODEX_FALLBACK_ORIGINAL_INELIGIBLE")
+        # C is already the one consumed, bound retry after a missing-node
+        # chain.  The frozen R/P/C inputs and roots stay decisive even if an
+        # ancestor later changes state; C cannot start a fallback D.
+        if TextTaskService._missing_node_model_rejection_retry_consumed(store, db, owner, receipt):
+            _reject("CODEX_FALLBACK_ORIGINAL_INELIGIBLE")
+        if receipt.get(TextTaskService.MISSING_NODE_RETRY_FIELD):
+            _reject("CODEX_FALLBACK_ORIGINAL_INELIGIBLE")
     except (OSError, ValueError, TypeError, KeyError):
         _reject("CODEX_FALLBACK_CONTEXT_UNAVAILABLE")
     return request_hash, original_body

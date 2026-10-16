@@ -1689,6 +1689,8 @@ class TextTaskService:
     SUPERSEDE_FIELDS = frozenset({"supersedes_request_id", "client_request_id", "provider_binding_id",
         "provider_account_identity", "client_conversation_id", "conversation_id", "parent_message_id"})
     REJECTED_SUPERSEDE_FIELDS = frozenset({"supersedes_request_id", "client_request_id", "client_conversation_id"})
+    MISSING_NODE_RETRY_FIELD = "continue_before_queued_image_id"
+    MISSING_NODE_RETRY_FIELDS = REJECTED_SUPERSEDE_FIELDS | frozenset({MISSING_NODE_RETRY_FIELD})
 
     @staticmethod
     def _rejected_chat_successor_source(receipt, *, allow_no_final_successor=False):
@@ -1784,6 +1786,308 @@ class TextTaskService:
         return len(children) == 1 and children[0][0] == parent_id
 
     @classmethod
+    def _rejected_missing_node_successor_source(cls, store, db, owner, receipt, now):
+        """Recognize the one rejected child of one stopped missing-node root.
+
+        This is deliberately separate from ``_rejected_no_final_successor_source``:
+        a missing original user node is not evidence of a no-final result
+        branch.  It can only support one typed-rejection retry when every
+        durable identity in R -> P still proves the exact original branch.
+        """
+        if (not cls._rejected_chat_successor_source(receipt, allow_no_final_successor=True)
+                or receipt.get("_supersedes_no_final") is True
+                or receipt.get(cls.MISSING_NODE_RETRY_FIELD) is not None):
+            return False
+        parent_id = receipt.get("request_id")
+        original_id = receipt.get("_supersedes_request_id")
+        if (not isinstance(parent_id, str) or not parent_id
+                or not isinstance(original_id, str) or not original_id or parent_id == original_id):
+            return False
+        original_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                  (owner, original_id)).fetchone()
+        parent_row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                                (owner, parent_id)).fetchone()
+        if not original_row or not parent_row or receipt.get("_supersedes_input_hash") != original_row[0]:
+            return False
+        try:
+            original = json.loads(original_row[1])
+            original_body = store.load_input(original["_input_ref"])
+            parent_body = store.load_input(receipt["_input_ref"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        if (original.get("request_id") != original_id
+                or original.get("status") != "failed"
+                or original.get("error_code") != "RESULT_UNRECOVERABLE"
+                or original.get("upstream_outcome") != "unknown"
+                or original.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND"
+                or original.get("_attempt_reason") != "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"
+                or original.get("_supersedes_request_id")
+                or original.get("_supersedes_no_final") is True
+                or original.get("_derived_input")
+                or original.get("_upstream_terminal")
+                or original.get("_executing") is not False
+                or original.get("_turn_reserved") is not False
+                or original.get("upstream_unfinished")
+                or any(original.get(key) for key in (
+                    "_recovery_paused", "_recovery_suppressed", "_work_key", "_completion", "_completion_of",
+                ))
+                or any(key in original for key in ("content", "result", "data"))
+                or original.get("result_file_ids") or original.get("result_sediment_ids")
+                or type(original.get("_attempt_finished_at")) not in (int, float)
+                or not math.isfinite(original["_attempt_finished_at"])
+                or original["_attempt_finished_at"] > now
+                or type(original.get("_execution_wait_ended_at")) not in (int, float)
+                or not math.isfinite(original["_execution_wait_ended_at"])
+                or original["_execution_wait_ended_at"] > now
+                or type(original.get("recovery_no_result_reads")) is not int
+                or original["recovery_no_result_reads"] < cls.UNRECOVERABLE_QUALIFIED_READS
+                or cls._submission_identity(owner, original_body) != (original_id, original_row[0])):
+            return False
+        for claim_key, until_key in (("_claim_id", "_claim_until"),
+                                     ("recovery_claim_id", "recovery_lease_until"),
+                                     ("_recovery_claim_id", "_recovery_claim_until")):
+            until = original.get(until_key)
+            if (original.get(claim_key) and (type(until) not in (int, float)
+                                             or not math.isfinite(until) or until > now)):
+                return False
+            if until is not None and (type(until) not in (int, float) or not math.isfinite(until)):
+                return False
+        if (original_body.get("supersedes_request_id") or original_body.get("continue_after_no_final") is not None
+                or original_body.get("derived_input") is not None
+                or original_body.get(cls.MISSING_NODE_RETRY_FIELD) is not None):
+            return False
+        expected_parent = {**original_body, "client_request_id": parent_id,
+                           "supersedes_request_id": original_id}
+        if (parent_body != expected_parent
+                or cls._submission_identity(owner, parent_body) != (parent_id, parent_row[0])
+                or not cls._supersede_order_link(original, receipt)):
+            return False
+        children = db.execute(
+            "SELECT id FROM requests WHERE owner=? AND "
+            "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?)",
+            (owner, original_id, original_id),
+        ).fetchall()
+        return len(children) == 1 and children[0][0] == parent_id
+
+    @classmethod
+    def _queued_image_for_missing_node_retry(cls, store, db, owner, original, successor, now):
+        """Return the one unchanged queued image explicitly bound to C, if safe."""
+        image_id = successor.get(cls.MISSING_NODE_RETRY_FIELD)
+        if not isinstance(image_id, str) or not image_id or len(image_id) > 200:
+            return None
+        image = store.read_receipt(db, "image", owner, image_id)
+        if not image:
+            return None
+        exact = ("_product_work_key", "provider_binding_id", "provider_account_identity",
+                 "client_conversation_id", "conversation_id")
+        if (any(not isinstance(original.get(key), str) or not original[key]
+                or image.get(key) != original[key] for key in exact)
+                or type(original.get("_sequence")) is not int
+                or type(image.get("_sequence")) is not int
+                or image["_sequence"] <= original["_sequence"]
+                or image.get("status") != "queued"
+                or image.get("upstream_outcome") not in (None, "not_sent", "not_submitted")
+                or image.get("_submission_started") is not False
+                or image.get("upstream_submission_started") not in (None, False)
+                or image.get("_turn_reserved") is not False
+                or image.get("_executing") is True
+                or image.get("_claim_id") is not None
+                or image.get("recovery_claim_id") is not None
+                or image.get("_last_sent_sequence") is not None
+                or type(image.get("send_count", 0)) is not int or image.get("send_count", 0) != 0
+                or image.get("request_message_id")
+                or image.get("result_file_ids") or image.get("result_sediment_ids") or image.get("data")
+                or image.get("upstream_unfinished")
+                or image.get("error_code") is not None
+                or any(image.get(key) for key in ("_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of"))
+                or not isinstance(image.get("_input_ref"), str) or not image["_input_ref"]):
+            return None
+        try:
+            from services.image_task_service import _request_hash
+            frozen = store.load_input(image["_input_ref"])
+            payload = frozen["payload"]
+            image_identity = frozen["identity"]
+        except (ImportError, OSError, ValueError, TypeError, KeyError):
+            return None
+        if (not isinstance(payload, dict) or not isinstance(image_identity, dict)
+                or frozen.get("mode") != image.get("mode")
+                or image_identity.get("role") != "admin"
+                or image_identity.get("_trusted_source") != image.get("_source")
+                or image.get("request_hash") != _request_hash(image["mode"], payload)
+                or any(payload.get(key) != image.get(key) for key in exact[1:])):
+            return None
+        from services.pool_admission import unfinished
+        for kind, other_owner, other_id, other in store.receipts(db):
+            if (other_owner != owner
+                    or (kind == "text" and other_id in {original.get("request_id"), successor.get("request_id")})
+                    or (kind == "image" and other_id == image_id)):
+                continue
+            same_conversation = all(other.get(key) == original.get(key) for key in exact[1:])
+            if same_conversation and unfinished(kind, other):
+                return None
+        return image
+
+    @classmethod
+    def _missing_node_model_rejection_retry(cls, store, db, owner, receipt, now):
+        """Validate C as the sole queued retry of typed rejected P after missing R."""
+        parent_id = receipt.get("_supersedes_request_id")
+        request_id = receipt.get("request_id")
+        image_id = receipt.get(cls.MISSING_NODE_RETRY_FIELD)
+        # This runs while the pool builds every queue view.  Keep ordinary
+        # rejected/no-final rows on the constant-time path; only C can carry
+        # the marker that warrants receipt/input traversal.
+        if (not isinstance(image_id, str) or not image_id
+                or not isinstance(parent_id, str) or not parent_id
+                or not isinstance(request_id, str) or not request_id):
+            return False
+        parent_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                (owner, parent_id)).fetchone()
+        if not parent_row or receipt.get("_supersedes_input_hash") != parent_row[0]:
+            return False
+        try:
+            parent = json.loads(parent_row[1])
+            parent_body = store.load_input(parent["_input_ref"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        if not cls._rejected_missing_node_successor_source(store, db, owner, parent, now):
+            return False
+        original_id = parent.get("_supersedes_request_id")
+        original = store.read_receipt(db, "text", owner, original_id) if isinstance(original_id, str) else None
+        if not original or cls._queued_image_for_missing_node_retry(store, db, owner, original, receipt, now) is None:
+            return False
+        row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+        expected = cls._rejected_successor_body(
+            parent, parent_body, parent_id, request_id, receipt.get("client_conversation_id"),
+            missing_node_retry=True, queued_image_id=receipt.get(cls.MISSING_NODE_RETRY_FIELD),
+        )
+        if not expected:
+            return False
+        if isinstance(receipt.get("_input_ref"), str):
+            try:
+                body = store.load_input(receipt["_input_ref"])
+            except (OSError, ValueError, TypeError, KeyError):
+                return False
+            if body != expected:
+                return False
+        elif any(receipt.get(key) != expected.get(key) for key in (
+                "provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id",
+                "client_conversation_id", cls.MISSING_NODE_RETRY_FIELD)):
+            return False
+        children = db.execute(
+            "SELECT id FROM requests WHERE owner=? AND "
+            "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?)",
+            (owner, parent_id, parent_id),
+        ).fetchall()
+        return bool((row is None or cls._submission_identity(owner, expected) == (request_id, row[0]))
+                    and ((row is None and not children) or (len(children) == 1 and children[0][0] == request_id))
+                    and cls._supersede_order_link(parent, receipt))
+
+    @classmethod
+    def _missing_node_model_rejection_retry_consumed(cls, store, db, owner, receipt):
+        """Recognize a registered R -> P -> C missing-node retry structurally.
+
+        This deliberately ignores live status, claims, recovery fields, and
+        cursor movement.  Once the immutable inputs and submission roots show
+        that C was registered, later observations of R/P cannot turn C into a
+        new rejected request eligible for another successor or Codex fallback.
+        """
+        parent_id = receipt.get("_supersedes_request_id")
+        request_id = receipt.get("request_id")
+        image_id = receipt.get(cls.MISSING_NODE_RETRY_FIELD)
+        if (not isinstance(parent_id, str) or not parent_id
+                or not isinstance(request_id, str) or not request_id
+                or not isinstance(image_id, str) or not image_id):
+            return False
+        parent_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                (owner, parent_id)).fetchone()
+        if not parent_row or receipt.get("_supersedes_input_hash") != parent_row[0]:
+            return False
+        try:
+            parent = json.loads(parent_row[1])
+        except (TypeError, ValueError):
+            return False
+        original_id = parent.get("_supersedes_request_id")
+        if (parent.get("_supersedes_no_final") is True
+                or not isinstance(original_id, str) or not original_id):
+            return False
+        original_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                  (owner, original_id)).fetchone()
+        if not original_row or parent.get("_supersedes_input_hash") != original_row[0]:
+            return False
+        try:
+            original = json.loads(original_row[1])
+            original_body = store.load_input(original["_input_ref"])
+            parent_body = store.load_input(parent["_input_ref"])
+            body = store.load_input(receipt["_input_ref"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        image = store.read_receipt(db, "image", owner, image_id)
+        if not image:
+            return False
+        try:
+            from services.image_task_service import _request_hash
+            image_body = store.load_input(image["_input_ref"])
+            image_payload = image_body["payload"]
+            image_identity = image_body["identity"]
+        except (ImportError, OSError, ValueError, TypeError, KeyError):
+            return False
+        row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+        root_children = db.execute(
+            "SELECT id FROM requests WHERE owner=? AND "
+            "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?)",
+            (owner, original_id, original_id),
+        ).fetchall()
+        parent_children = db.execute(
+            "SELECT id FROM requests WHERE owner=? AND "
+            "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?)",
+            (owner, parent_id, parent_id),
+        ).fetchall()
+        expected_parent = {**original_body, "client_request_id": parent_id,
+                           "supersedes_request_id": original_id}
+        expected = {**deepcopy(parent_body), "client_request_id": request_id,
+                    "supersedes_request_id": parent_id,
+                    cls.MISSING_NODE_RETRY_FIELD: image_id}
+        return bool(
+            row
+            and original.get("request_id") == original_id
+            and original.get("_supersedes_request_id") is None
+            and original.get("_supersedes_no_final") is not True
+            and original.get("_derived_input") is None
+            and cls._submission_identity(owner, original_body) == (original_id, original_row[0])
+            and parent.get("request_id") == parent_id
+            and parent_body == expected_parent
+            and cls._submission_identity(owner, parent_body) == (parent_id, parent_row[0])
+            and receipt.get("_supersedes_input_hash") == parent_row[0]
+            and body == expected
+            and cls._submission_identity(owner, body) == (request_id, row[0])
+            and parent.get("_supersedes_request_message_id") == original.get("request_message_id")
+            and parent.get("_submission_parent_message_id") == original_body.get("parent_message_id")
+            and receipt.get("_supersedes_request_message_id") == parent.get("request_message_id")
+            and receipt.get("_submission_parent_message_id") == parent_body.get("parent_message_id")
+            and all(parent.get(key) == receipt.get(key) == original_body.get(key) for key in (
+                "provider_binding_id", "provider_account_identity", "conversation_id", "client_conversation_id"))
+            and len(root_children) == 1 and root_children[0][0] == parent_id
+            and len(parent_children) == 1 and parent_children[0][0] == request_id
+            # A4 is identified by its owner-local receipt and immutable input,
+            # never by a later queued/running/terminal status.  This lets the
+            # lifecycle retain the relation after A4 has been claimed while
+            # still refusing a changed task or a same-id task from another owner.
+            and image.get("id") == image_id and image.get("owner_id") == owner
+            and isinstance(image_payload, dict) and isinstance(image_identity, dict)
+            and image_body.get("mode") == image.get("mode")
+            and image_identity.get("role") == "admin"
+            and image_identity.get("_trusted_source") == image.get("_source")
+            and image.get("request_hash") == _request_hash(image["mode"], image_payload)
+            and image.get("_product_work_key") == original.get("_product_work_key") == parent.get("_product_work_key") == receipt.get("_product_work_key")
+            and all(image.get(key) == original_body.get(key) for key in (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"))
+            and all(image_payload.get(key) == image.get(key) for key in (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"))
+            and all(type(item.get("_sequence")) is int for item in (original, parent, image, receipt))
+            and original["_sequence"] < parent["_sequence"] < image["_sequence"] < receipt["_sequence"]
+        )
+
+    @classmethod
     def _no_final_model_rejection_retry(cls, store, db, owner, receipt, now):
         """Recognize an already-registered no-final model-retry lineage.
 
@@ -1851,13 +2155,19 @@ class TextTaskService:
 
     @classmethod
     def _rejected_successor_body(cls, original, retained, previous_id, request_id, client_conversation_id,
-                                 *, model_rejection_retry=False):
+                                 *, model_rejection_retry=False, missing_node_retry=False,
+                                 queued_image_id=None):
         """Freeze a Chat retry to the rejected original's exact identity/input."""
-        if (not cls._rejected_chat_successor_source(original, allow_no_final_successor=model_rejection_retry)
-                or (not model_rejection_retry and (retained.get("supersedes_request_id")
+        if (not cls._rejected_chat_successor_source(
+                    original, allow_no_final_successor=model_rejection_retry or missing_node_retry)
+                or (not model_rejection_retry and not missing_node_retry and (retained.get("supersedes_request_id")
                                                     or retained.get("derived_input") is not None
                                                     or retained.get("continue_after_no_final") is not None))
                 or (model_rejection_retry and retained.get("continue_after_no_final") is not True)
+                or (missing_node_retry and (retained.get("derived_input") is not None
+                                             or retained.get("continue_after_no_final") is not None
+                                             or retained.get(cls.MISSING_NODE_RETRY_FIELD) is not None))
+                or (missing_node_retry and not isinstance(queued_image_id, str))
                 or retained.get("client_conversation_id") != client_conversation_id
                 or original.get("client_conversation_id") != client_conversation_id):
             return None
@@ -1879,9 +2189,12 @@ class TextTaskService:
         frozen = deepcopy(retained)
         if model_rejection_retry:
             frozen.pop("continue_after_no_final", None)
-        return {**frozen, **bound, "client_request_id": request_id,
-                "supersedes_request_id": previous_id,
-                "client_conversation_id": client_conversation_id}
+        result = {**frozen, **bound, "client_request_id": request_id,
+                  "supersedes_request_id": previous_id,
+                  "client_conversation_id": client_conversation_id}
+        if missing_node_retry:
+            result[cls.MISSING_NODE_RETRY_FIELD] = queued_image_id
+        return result
 
     def submission_input(self, owner, body):
         """Resolve an explicit internal reference; callers cannot replace original content."""
@@ -1897,7 +2210,8 @@ class TextTaskService:
             conflict = "CONVERSATION_REQUEST_CONFLICT" if existing else "CHAT_SUPERSEDE_INVALID"
             def reject():
                 raise ConversationBindingError("original successor input cannot be changed", code=conflict)
-            rejected_minimal = set(body) == self.REJECTED_SUPERSEDE_FIELDS
+            missing_node_retry = set(body) == self.MISSING_NODE_RETRY_FIELDS
+            rejected_minimal = set(body) == self.REJECTED_SUPERSEDE_FIELDS or missing_node_retry
             if rejected_minimal:
                 if (not owner or any(not isinstance(body.get(key), str) or not body[key].strip()
                                      or body[key] != body[key].strip() for key in self.REJECTED_SUPERSEDE_FIELDS)
@@ -1914,7 +2228,13 @@ class TextTaskService:
                         saved = self.store.load_input(saved_receipt["_input_ref"])
                         if (saved_receipt.get("_supersedes_request_id") != body["supersedes_request_id"]
                                 or self._submission_identity(owner, saved) != (request_id, existing[0])
-                                or saved.get("client_conversation_id") != body["client_conversation_id"]):
+                                or saved.get("client_conversation_id") != body["client_conversation_id"]
+                                # The image is part of C's immutable four-field
+                                # identity.  A same ID is a read only when it
+                                # names this exact frozen image continuation.
+                                or bool(saved.get(self.MISSING_NODE_RETRY_FIELD)) != missing_node_retry
+                                or (missing_node_retry and saved.get(self.MISSING_NODE_RETRY_FIELD)
+                                    != body.get(self.MISSING_NODE_RETRY_FIELD))):
                             reject()
                         # A same-ID retry is a read of its frozen child. Its
                         # parent can legitimately become terminal after submit.
@@ -1923,14 +2243,33 @@ class TextTaskService:
                     retained = self.store.load_input(original["_input_ref"])
                     if self._submission_identity(owner, retained) != (body["supersedes_request_id"], original_row[0]):
                         reject()
-                    direct_rejection = self._rejected_chat_successor_source(original)
+                    missing_node_parent = self._rejected_missing_node_successor_source(
+                        self.store, db, owner, original, self._now())
+                    # A typed rejection P after a missing R has exactly one
+                    # continuation shape: C must bind its own queued image.
+                    # Do not let that P re-enter the historic direct-rejection
+                    # envelope with the fourth field silently omitted.
+                    if missing_node_parent and not missing_node_retry:
+                        reject()
+                    direct_rejection = (not missing_node_retry
+                                        and self._rejected_chat_successor_source(original)
+                                        and not missing_node_parent)
                     model_rejection_retry = (not direct_rejection and self._rejected_no_final_successor_source(
                         self.store, db, owner, original, self._now()))
-                    if not (direct_rejection or model_rejection_retry):
+                    missing_node_model_retry = (not direct_rejection and not model_rejection_retry and missing_node_retry
+                        and missing_node_parent)
+                    if not (direct_rejection or model_rejection_retry or missing_node_model_retry):
+                        reject()
+                    # Conversely, an explicit image marker cannot be attached
+                    # to an ordinary direct/no-final rejection: it has no A4
+                    # ordering contract and must never be silently dropped.
+                    if missing_node_retry and not missing_node_model_retry:
                         reject()
                     expected = self._rejected_successor_body(
                         original, retained, body["supersedes_request_id"], request_id, body["client_conversation_id"],
                         model_rejection_retry=model_rejection_retry,
+                        missing_node_retry=missing_node_model_retry,
+                        queued_image_id=body.get(self.MISSING_NODE_RETRY_FIELD),
                     )
                     if expected is None:
                         reject()
@@ -2041,7 +2380,10 @@ class TextTaskService:
         model_rejection_retry = (not direct_rejected_model
                                   and TextTaskService._rejected_no_final_successor_source(
                                       store, db, owner, previous, now))
-        rejected_model = direct_rejected_model or model_rejection_retry
+        missing_node_model_retry = (not direct_rejected_model and not model_rejection_retry
+            and successor.get(TextTaskService.MISSING_NODE_RETRY_FIELD) is not None
+            and TextTaskService._rejected_missing_node_successor_source(store, db, owner, previous, now))
+        rejected_model = direct_rejected_model or model_rejection_retry or missing_node_model_retry
         if (not rejected_model and (not isinstance(previous.get("request_message_id"), str)
                                     or not previous["request_message_id"])
                 or not TextTaskService._supersede_order_link(previous, successor, rejected_model=rejected_model)):
@@ -2077,6 +2419,9 @@ class TextTaskService:
             reject("CHAT_SUPERSEDE_AUTH_REQUIRED")
         if row[0] != successor.get("_supersedes_input_hash"):
             reject("CHAT_SUPERSEDE_INVALID")
+        if (successor.get(TextTaskService.MISSING_NODE_RETRY_FIELD) is not None
+                and not TextTaskService._missing_node_model_rejection_retry(store, db, owner, successor, now)):
+            reject("CHAT_SUPERSEDE_INVALID")
         try:
             original_body = store.load_input(previous["_input_ref"])
             identity = TextTaskService._submission_identity(owner, original_body)
@@ -2107,7 +2452,9 @@ class TextTaskService:
         if rejected_model:
             expected = TextTaskService._rejected_successor_body(previous, original_body, previous_id,
                                                                  successor.get("request_id"), successor.get("client_conversation_id"),
-                                                                 model_rejection_retry=model_rejection_retry)
+                                                                 model_rejection_retry=model_rejection_retry,
+                                                                 missing_node_retry=missing_node_model_retry,
+                                                                 queued_image_id=successor.get(TextTaskService.MISSING_NODE_RETRY_FIELD))
             if expected is None:
                 reject("CHAT_SUPERSEDE_INVALID")
             if isinstance(successor.get("_input_ref"), str):
@@ -2191,7 +2538,10 @@ class TextTaskService:
         direct_rejected_model = self._rejected_chat_successor_source(original)
         model_rejection_retry = (not direct_rejected_model and self._rejected_no_final_successor_source(
             self.store, db, owner, original, self._now()))
-        rejected_model = direct_rejected_model or model_rejection_retry
+        missing_node_model_retry = (not direct_rejected_model and not model_rejection_retry
+            and self.MISSING_NODE_RETRY_FIELD in body
+            and self._rejected_missing_node_successor_source(self.store, db, owner, original, self._now()))
+        rejected_model = direct_rejected_model or model_rejection_retry or missing_node_model_retry
         if rejected_model:
             try:
                 retained = self.store.load_input(original["_input_ref"])
@@ -2200,6 +2550,8 @@ class TextTaskService:
             expected = self._rejected_successor_body(
                 original, retained, previous_id, body["client_request_id"], body["client_conversation_id"],
                 model_rejection_retry=model_rejection_retry,
+                missing_node_retry=missing_node_model_retry,
+                queued_image_id=body.get(self.MISSING_NODE_RETRY_FIELD),
             )
             if expected is None or body != expected:
                 reject("CHAT_SUPERSEDE_INVALID")
@@ -2222,6 +2574,8 @@ class TextTaskService:
                 reject("CHAT_SUPERSEDE_INVALID")
         receipt.update({k: body.get(k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id")})
         receipt.update(_supersedes_request_id=previous_id, _supersedes_input_hash=row[0])
+        if missing_node_model_retry:
+            receipt[self.MISSING_NODE_RETRY_FIELD] = body[self.MISSING_NODE_RETRY_FIELD]
         if rejected_model:
             if original.get("conversation_id"):
                 receipt.update(_supersedes_request_message_id=original.get("request_message_id"),
@@ -2247,8 +2601,11 @@ class TextTaskService:
                 # unrelated unfinished turn, but the retired original itself
                 # remains an UNKNOWN audit record and must not block this one
                 # bounded retry.
-                if (model_rejection_retry and kind == "text"
+                if ((model_rejection_retry or missing_node_model_retry) and kind == "text"
                         and other_id == original.get("_supersedes_request_id")):
+                    continue
+                if (missing_node_model_retry and kind == "image"
+                        and other_id == receipt.get(self.MISSING_NODE_RETRY_FIELD)):
                     continue
                 if kind == "text" and self._completed_historical_successor(db, owner, other_id, other, original, self._now()):
                     continue
@@ -2856,9 +3213,10 @@ class TextTaskService:
         body = self.store.load_input(receipt.get("_input_ref"))
         if (not isinstance(body, dict) or self._submission_identity(owner, body) != (request_id, request_hash)
                 or any(body.get(key) != envelope[key] for key in self.SUPERSEDE_FIELDS)
-                or "derived_input" in body):
+                or "derived_input" in body or self.MISSING_NODE_RETRY_FIELD in body):
             raise ConversationBindingError("retained successor input changed", code="CHAT_MISSING_SUCCESSOR_INPUT_UNAVAILABLE")
-        if self._no_final_model_rejection_retry(self.store, db, owner, receipt, now):
+        if (self._no_final_model_rejection_retry(self.store, db, owner, receipt, now)
+                or receipt.get(self.MISSING_NODE_RETRY_FIELD)):
             raise ConversationBindingError("model-rejection retry has no missing-successor resend",
                                            code="CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE")
         parent = receipt.get("_submission_parent_message_id")
@@ -3141,9 +3499,13 @@ class TextTaskService:
                 with self.store.transaction() as db:
                     previous = self._validate_supersede(self.store, db, owner, receipt, self._now())
                     no_final_original = None
+                    missing_node_original = None
                     if (previous.get("_supersedes_no_final") is True
                             and self._rejected_chat_successor_source(previous, allow_no_final_successor=True)):
                         no_final_original = self.store.read_receipt(
+                            db, "text", owner, previous.get("_supersedes_request_id"))
+                    if self._missing_node_model_rejection_retry(self.store, db, owner, receipt, self._now()):
+                        missing_node_original = self.store.read_receipt(
                             db, "text", owner, previous.get("_supersedes_request_id"))
                 # A pre-conversation MODEL_NOT_FOUND retry has no upstream
                 # message to guard. It still revalidates the frozen original
@@ -3176,6 +3538,12 @@ class TextTaskService:
                     # frozen retained input.
                     body.update(_missing_successor_no_final_predecessor=no_final_original,
                                 _missing_successor_expected_tail=actual_parent)
+                if missing_node_original:
+                    root_user = missing_node_original.get("request_message_id")
+                    if not isinstance(root_user, str) or not root_user:
+                        raise ConversationBindingError("missing-node retry root is unavailable",
+                                                       code="CHAT_SUPERSEDE_INVALID")
+                    body["_missing_node_retry_root_request_message_id"] = root_user
                 if missing_attempt and receipt.get("_supersedes_no_final"):
                     expected_tail = receipt.get("request_parent_message_id")
                     if not isinstance(expected_tail, str) or not expected_tail:
