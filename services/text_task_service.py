@@ -1661,7 +1661,7 @@ class TextTaskService:
     REJECTED_SUPERSEDE_FIELDS = frozenset({"supersedes_request_id", "client_request_id", "client_conversation_id"})
 
     @staticmethod
-    def _rejected_chat_successor_source(receipt):
+    def _rejected_chat_successor_source(receipt, *, allow_no_final_successor=False):
         """Only a proved pre-conversation model rejection can start this path."""
         from services.conversation_binding_service import is_model_not_found_rejection
         return bool(
@@ -1676,19 +1676,158 @@ class TextTaskService:
             and receipt.get("_turn_reserved") is False
             and not any(receipt.get(key) for key in (
                 "recovery_claim_id", "_recovery_claim_id", "_recovery_paused", "_recovery_suppressed",
-                "upstream_unfinished", "_codex_fallback_of", "_supersedes_request_id",
+                "upstream_unfinished", "_codex_fallback_of",
             ))
+            and (allow_no_final_successor or not receipt.get("_supersedes_request_id"))
             and not any(key in receipt for key in ("content", "result", "data"))
             and not receipt.get("result_file_ids") and not receipt.get("result_sediment_ids")
             and is_model_not_found_rejection(receipt)
         )
 
     @classmethod
-    def _rejected_successor_body(cls, original, retained, previous_id, request_id, client_conversation_id):
+    def _rejected_no_final_successor_source(cls, store, db, owner, receipt, now):
+        """Recognize one typed rejection of one proved no-final successor.
+
+        The model retry is deliberately not a general successor-of-successor
+        feature.  Its rejected parent must be the sole, server-registered,
+        explicit no-final child of an original UNKNOWN receipt, with both
+        retained inputs and hashes still proving that exact relationship.
+        """
+        if (not cls._rejected_chat_successor_source(receipt, allow_no_final_successor=True)
+                or receipt.get("_supersedes_no_final") is not True):
+            return False
+        parent_id = receipt.get("request_id")
+        original_id = receipt.get("_supersedes_request_id")
+        if (not isinstance(parent_id, str) or not parent_id
+                or not isinstance(original_id, str) or not original_id or parent_id == original_id):
+            return False
+        original_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                  (owner, original_id)).fetchone()
+        parent_row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                                (owner, parent_id)).fetchone()
+        if not original_row or not parent_row or receipt.get("_supersedes_input_hash") != original_row[0]:
+            return False
+        try:
+            original = json.loads(original_row[1])
+            original_body = store.load_input(original["_input_ref"])
+            parent_body = store.load_input(receipt["_input_ref"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        if (original.get("request_id") != original_id
+                or original.get("status") != "failed"
+                or original.get("error_code") != "RESULT_UNRECOVERABLE"
+                or original.get("upstream_outcome") != "unknown"
+                or original.get("_supersedes_request_id")
+                or original.get("_derived_input")
+                or original.get("_upstream_terminal")
+                or original.get("_executing") is not False
+                or original.get("_turn_reserved") is not False
+                or original.get("upstream_unfinished")
+                or any(key in original for key in ("content", "result", "data"))
+                or original.get("result_file_ids") or original.get("result_sediment_ids")
+                or not cls._no_final_successor_source(original, now)
+                or cls._submission_identity(owner, original_body) != (original_id, original_row[0])):
+            return False
+        for claim_key, until_key in (("_claim_id", "_claim_until"),
+                                     ("recovery_claim_id", "recovery_lease_until"),
+                                     ("_recovery_claim_id", "_recovery_claim_until")):
+            until = original.get(until_key)
+            if (original.get(claim_key) and (type(until) not in (int, float)
+                                             or not math.isfinite(until) or until > now)):
+                return False
+            if until is not None and (type(until) not in (int, float) or not math.isfinite(until)):
+                return False
+        if (original_body.get("supersedes_request_id") or original_body.get("continue_after_no_final") is not None
+                or original_body.get("derived_input") is not None):
+            return False
+        expected_parent = {**original_body, "client_request_id": parent_id,
+                           "supersedes_request_id": original_id, "continue_after_no_final": True}
+        if (parent_body != expected_parent
+                or cls._submission_identity(owner, parent_body) != (parent_id, parent_row[0])
+                or not cls._supersede_order_link(original, receipt)):
+            return False
+        children = db.execute(
+            "SELECT id FROM requests WHERE owner=? AND "
+            "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?)",
+            (owner, original_id, original_id),
+        ).fetchall()
+        return len(children) == 1 and children[0][0] == parent_id
+
+    @classmethod
+    def _no_final_model_rejection_retry(cls, store, db, owner, receipt, now):
+        """Recognize an already-registered no-final model-retry lineage.
+
+        This is intentionally structural rather than live eligibility.  Once C
+        exists, a later result or claim on R/P must stop further fallbacks and
+        missing-node resends; it must never make the consumed C look like a
+        fresh standalone model rejection.
+        """
+        parent_id = receipt.get("_supersedes_request_id")
+        request_id = receipt.get("request_id")
+        if not isinstance(parent_id, str) or not parent_id or not isinstance(request_id, str) or not request_id:
+            return False
+        parent_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                (owner, parent_id)).fetchone()
+        if not parent_row or receipt.get("_supersedes_input_hash") != parent_row[0]:
+            return False
+        try:
+            parent = json.loads(parent_row[1])
+        except (TypeError, ValueError):
+            return False
+        original_id = parent.get("_supersedes_request_id")
+        if (parent.get("_supersedes_no_final") is not True
+                or not isinstance(original_id, str) or not original_id):
+            return False
+        original_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                  (owner, original_id)).fetchone()
+        if not original_row or parent.get("_supersedes_input_hash") != original_row[0]:
+            return False
+        try:
+            original = json.loads(original_row[1])
+            original_body = store.load_input(original["_input_ref"])
+            parent_body = store.load_input(parent["_input_ref"])
+            body = store.load_input(receipt["_input_ref"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+        expected_parent = {**original_body, "client_request_id": parent_id,
+                           "supersedes_request_id": original_id, "continue_after_no_final": True}
+        expected = {**deepcopy(parent_body), "client_request_id": request_id,
+                    "supersedes_request_id": parent_id}
+        expected.pop("continue_after_no_final", None)
+        return bool(
+            row
+            and original.get("request_id") == original_id
+            and original.get("_supersedes_request_id") is None
+            and original.get("_derived_input") is None
+            and cls._submission_identity(owner, original_body) == (original_id, original_row[0])
+            and parent.get("request_id") == parent_id
+            and parent_body == expected_parent
+            and cls._submission_identity(owner, parent_body) == (parent_id, parent_row[0])
+            and receipt.get("_supersedes_input_hash") == parent_row[0]
+            and body == expected
+            and cls._submission_identity(owner, body) == (request_id, row[0])
+            # Do not use live cursor fields here. A late upstream result may
+            # advance R/P after C was registered; these links are instead the
+            # durable frozen inputs and their receipt-time submission roots.
+            and parent.get("_supersedes_input_hash") == original_row[0]
+            and parent.get("_supersedes_request_message_id") == original.get("request_message_id")
+            and parent.get("_submission_parent_message_id") == original_body.get("parent_message_id")
+            and receipt.get("_supersedes_request_message_id") == parent.get("request_message_id")
+            and receipt.get("_submission_parent_message_id") == parent_body.get("parent_message_id")
+            and all(parent.get(key) == receipt.get(key) == original_body.get(key) for key in (
+                "provider_binding_id", "provider_account_identity", "conversation_id", "client_conversation_id"))
+        )
+
+    @classmethod
+    def _rejected_successor_body(cls, original, retained, previous_id, request_id, client_conversation_id,
+                                 *, model_rejection_retry=False):
         """Freeze a Chat retry to the rejected original's exact identity/input."""
-        if (not cls._rejected_chat_successor_source(original)
-                or retained.get("supersedes_request_id") or retained.get("derived_input") is not None
-                or retained.get("continue_after_no_final") is not None
+        if (not cls._rejected_chat_successor_source(original, allow_no_final_successor=model_rejection_retry)
+                or (not model_rejection_retry and (retained.get("supersedes_request_id")
+                                                    or retained.get("derived_input") is not None
+                                                    or retained.get("continue_after_no_final") is not None))
+                or (model_rejection_retry and retained.get("continue_after_no_final") is not True)
                 or retained.get("client_conversation_id") != client_conversation_id
                 or original.get("client_conversation_id") != client_conversation_id):
             return None
@@ -1707,7 +1846,10 @@ class TextTaskService:
             bound.update(conversation_id=conversation, parent_message_id=parent)
         elif retained.get("conversation_id") not in {None, ""} or retained.get("parent_message_id") not in {None, ""}:
             return None
-        return {**deepcopy(retained), **bound, "client_request_id": request_id,
+        frozen = deepcopy(retained)
+        if model_rejection_retry:
+            frozen.pop("continue_after_no_final", None)
+        return {**frozen, **bound, "client_request_id": request_id,
                 "supersedes_request_id": previous_id,
                 "client_conversation_id": client_conversation_id}
 
@@ -1751,8 +1893,14 @@ class TextTaskService:
                     retained = self.store.load_input(original["_input_ref"])
                     if self._submission_identity(owner, retained) != (body["supersedes_request_id"], original_row[0]):
                         reject()
+                    direct_rejection = self._rejected_chat_successor_source(original)
+                    model_rejection_retry = (not direct_rejection and self._rejected_no_final_successor_source(
+                        self.store, db, owner, original, self._now()))
+                    if not (direct_rejection or model_rejection_retry):
+                        reject()
                     expected = self._rejected_successor_body(
                         original, retained, body["supersedes_request_id"], request_id, body["client_conversation_id"],
+                        model_rejection_retry=model_rejection_retry,
                     )
                     if expected is None:
                         reject()
@@ -1802,9 +1950,13 @@ class TextTaskService:
             return expected
 
     @staticmethod
-    def _supersede_order_link(previous, successor):
+    def _supersede_order_link(previous, successor, *, rejected_model=None):
         """A server-registered successor releases only its own predecessor's order head."""
-        rejected_model = TextTaskService._rejected_chat_successor_source(previous)
+        if rejected_model is None:
+            rejected_model = (TextTaskService._rejected_chat_successor_source(previous)
+                              or previous.get("_supersedes_no_final") is True
+                              and TextTaskService._rejected_chat_successor_source(
+                                  previous, allow_no_final_successor=True))
         audit = successor.get("_derived_input") or {}
         attributes_upgrade = isinstance(audit, dict) and audit.get("kind") == "attributes_required_only_v4"
         model_upgrade = bool(attributes_upgrade
@@ -1855,10 +2007,14 @@ class TextTaskService:
         previous = json.loads(row[1])
         if previous.get("status") == "succeeded" or previous.get("_upstream_terminal"):
             reject("CHAT_SUPERSEDE_ORIGINAL_FOUND")
-        rejected_model = TextTaskService._rejected_chat_successor_source(previous)
+        direct_rejected_model = TextTaskService._rejected_chat_successor_source(previous)
+        model_rejection_retry = (not direct_rejected_model
+                                  and TextTaskService._rejected_no_final_successor_source(
+                                      store, db, owner, previous, now))
+        rejected_model = direct_rejected_model or model_rejection_retry
         if (not rejected_model and (not isinstance(previous.get("request_message_id"), str)
                                     or not previous["request_message_id"])
-                or not TextTaskService._supersede_order_link(previous, successor)):
+                or not TextTaskService._supersede_order_link(previous, successor, rejected_model=rejected_model)):
             reject("CHAT_SUPERSEDE_INVALID")
         for claim_key, until_key in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until")):
             until = previous.get(until_key)
@@ -1881,8 +2037,6 @@ class TextTaskService:
                 or previous.get("_recovery_suppressed") or previous.get("_supersedes_request_id")
                 or type(previous.get("_execution_wait_ended_at")) not in (int, float)
                 or not math.isfinite(previous["_execution_wait_ended_at"]))):
-            reject("CHAT_SUPERSEDE_INVALID")
-        if rejected_model and not TextTaskService._rejected_chat_successor_source(previous):
             reject("CHAT_SUPERSEDE_INVALID")
         if ((rejected_model or successor.get("_supersedes_no_final") is True)
                 and account_service.bound_text_recovery_auth_unavailable(
@@ -1922,7 +2076,8 @@ class TextTaskService:
                 reject("CHAT_DERIVED_INPUT_INVALID")
         if rejected_model:
             expected = TextTaskService._rejected_successor_body(previous, original_body, previous_id,
-                                                                 successor.get("request_id"), successor.get("client_conversation_id"))
+                                                                 successor.get("request_id"), successor.get("client_conversation_id"),
+                                                                 model_rejection_retry=model_rejection_retry)
             if expected is None:
                 reject("CHAT_SUPERSEDE_INVALID")
             if isinstance(successor.get("_input_ref"), str):
@@ -2003,7 +2158,10 @@ class TextTaskService:
         if not row:
             reject("CHAT_SUPERSEDE_INVALID")
         original = json.loads(row[1])
-        rejected_model = self._rejected_chat_successor_source(original)
+        direct_rejected_model = self._rejected_chat_successor_source(original)
+        model_rejection_retry = (not direct_rejected_model and self._rejected_no_final_successor_source(
+            self.store, db, owner, original, self._now()))
+        rejected_model = direct_rejected_model or model_rejection_retry
         if rejected_model:
             try:
                 retained = self.store.load_input(original["_input_ref"])
@@ -2011,6 +2169,7 @@ class TextTaskService:
                 reject("CHAT_SUPERSEDE_INVALID")
             expected = self._rejected_successor_body(
                 original, retained, previous_id, body["client_request_id"], body["client_conversation_id"],
+                model_rejection_retry=model_rejection_retry,
             )
             if expected is None or body != expected:
                 reject("CHAT_SUPERSEDE_INVALID")
@@ -2053,6 +2212,14 @@ class TextTaskService:
             same_chat = (other.get("provider_account_identity") == receipt.get("provider_account_identity")
                          and other.get("conversation_id") == receipt.get("conversation_id"))
             if unfinished(kind, other) and (same_chat or other.get("client_conversation_id") == body.get("client_conversation_id")):
+                # The rejected parent is the only registered no-final child
+                # of this exact original.  Its model retry cannot bypass an
+                # unrelated unfinished turn, but the retired original itself
+                # remains an UNKNOWN audit record and must not block this one
+                # bounded retry.
+                if (model_rejection_retry and kind == "text"
+                        and other_id == original.get("_supersedes_request_id")):
+                    continue
                 if kind == "text" and self._completed_historical_successor(db, owner, other_id, other, original, self._now()):
                     continue
                 reject("CHAT_SUPERSEDE_CONFLICT")
@@ -2661,6 +2828,9 @@ class TextTaskService:
                 or any(body.get(key) != envelope[key] for key in self.SUPERSEDE_FIELDS)
                 or "derived_input" in body):
             raise ConversationBindingError("retained successor input changed", code="CHAT_MISSING_SUCCESSOR_INPUT_UNAVAILABLE")
+        if self._no_final_model_rejection_retry(self.store, db, owner, receipt, now):
+            raise ConversationBindingError("model-rejection retry has no missing-successor resend",
+                                           code="CHAT_MISSING_SUCCESSOR_NOT_RESUMABLE")
         parent = receipt.get("_submission_parent_message_id")
         if not isinstance(parent, str) or not parent:
             # Old receipts can use the public parent only when there is no
@@ -2860,6 +3030,10 @@ class TextTaskService:
         return self._public(updated)
 
     def _run(self, owner, request_id, body):
+        # A model-rejection recovery keeps the rejected predecessor's frozen
+        # root in its durable receipt, even though this one upstream attempt
+        # is sent from that predecessor's verified no-final tail.
+        preserve_submission_parent = False
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
@@ -2896,7 +3070,7 @@ class TextTaskService:
                                                       missing_attempt["request_message_id"], cursor)
                 cursor = {k: v for k, v in cursor.items()
                           if k not in {"request_parent_message_id", "_submission_parent_message_id"}}
-            if receipt.get("_supersedes_no_final") and not missing_attempt:
+            if (receipt.get("_supersedes_no_final") or preserve_submission_parent) and not missing_attempt:
                 # The immutable predecessor link keeps its submitted root;
                 # request_parent_message_id records the actual fresh tool tail.
                 cursor = {k: v for k, v in cursor.items() if k != "_submission_parent_message_id"}
@@ -2936,6 +3110,11 @@ class TextTaskService:
             if receipt.get("_supersedes_request_id"):
                 with self.store.transaction() as db:
                     previous = self._validate_supersede(self.store, db, owner, receipt, self._now())
+                    no_final_original = None
+                    if (previous.get("_supersedes_no_final") is True
+                            and self._rejected_chat_successor_source(previous, allow_no_final_successor=True)):
+                        no_final_original = self.store.read_receipt(
+                            db, "text", owner, previous.get("_supersedes_request_id"))
                 # A pre-conversation MODEL_NOT_FOUND retry has no upstream
                 # message to guard. It still revalidates the frozen original
                 # and bound identity above, then starts a new conversation.
@@ -2945,6 +3124,28 @@ class TextTaskService:
                     guard_message_id = (receipt["request_message_id"] if missing_attempt
                                         else previous["request_message_id"])
                     body = {**body, "_supersedes_request_message_id": guard_message_id}
+                if (previous.get("_supersedes_no_final") is True
+                        and self._rejected_chat_successor_source(previous, allow_no_final_successor=True)):
+                    actual_parent = previous.get("request_parent_message_id")
+                    if not isinstance(actual_parent, str) or not actual_parent:
+                        raise ConversationBindingError("model-rejection retry cursor is unavailable",
+                                                       code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+                    # The durable retry body remains the rejected parent's
+                    # frozen input.  A no-final predecessor may have sent from
+                    # a later verified tail, so use that cursor only in this
+                    # execution copy after the full chain revalidation above.
+                    body = {**body, "parent_message_id": actual_parent}
+                    preserve_submission_parent = True
+                    if not no_final_original:
+                        raise ConversationBindingError("model-rejection ancestor is unavailable",
+                                                       code="CHAT_SUPERSEDE_INVALID")
+                    # Reuse the binding layer's no-final resend guard.  It
+                    # checks R's full user/tool tail, P's absence, and C's
+                    # absence both at the initial GET and the pre-send GET;
+                    # this is execution-only state and never changes C's
+                    # frozen retained input.
+                    body.update(_missing_successor_no_final_predecessor=no_final_original,
+                                _missing_successor_expected_tail=actual_parent)
                 if missing_attempt and receipt.get("_supersedes_no_final"):
                     expected_tail = receipt.get("request_parent_message_id")
                     if not isinstance(expected_tail, str) or not expected_tail:

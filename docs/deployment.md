@@ -160,7 +160,9 @@
 
 首请求被拒、尚未创建物理 Chat 时，无须虚构 conversation_id 或 parent_message_id：沿原绑定、原账号创建会话。已有物理 Chat 的继续请求被拒时，沿原物理会话和提交父节点，发送前按原账号节拍检查旧请求未出现、父节点未变化。原结果迟到、身份变化、账号不可用、暂停或领取仍在进行时，不能凭本接口绕过原校验。
 
-一个原请求最多登记一个 Chat 或 Codex 后继，任何状态均计入；不会因后继失败再获得一次。重复同一新 ID、同一参数只返回该回执，不重排或再次生成；原请求仍符合拒绝条件时，换新 ID 争用或已有 Codex 后继均返回 `CHAT_SUPERSEDE_CONFLICT`。响应和后续 GET 通过 `supersedes_request_id` 关联原失败；不提供派生提示词 kind 或另一个重试额度标志。queued 仅表示已受理，调用方继续查询同一新 ID，不能当作已发出或已成功。新后继沿原商品重新取得容量，旧错误与原始输入保留。
+明确拒绝也可能发生在一条已合法登记的 no-final 后继上。仅对“原始 no-final 请求 → 唯一直接后继明确 MODEL_NOT_FOUND 拒绝”这一层关系，允许用上述三字段接口登记一次拒绝恢复；Provider 在原事务内核对两层回执、原输入 hash、绑定、游标和 no-final 证据。原始两条存储记录中的前序关系、输入及 `continue_after_no_final` 保留不改；新恢复由服务端继承内容并关联被拒请求，不再要求执行一次 no-final 续写。调用方不能传入或改写这些内部信息。缺失或不匹配的祖先、派生输入、更多层后继、迟到结果、活动领取均不能凭这一例外放行；此次拒绝恢复本身不能再追加下一次恢复。
+
+一个符合条件的明确拒绝请求最多登记一个 Chat 或 Codex 后继，任何状态均计入；不会因这次恢复失败再获得一次。上述 no-final 链的最后一次恢复不能再建立 Chat/Codex 后继，也不能用 `resume_missing_successor` 在同一 ID 下新增上游尝试；查询原结果与迟到结果恢复仍可进行。重复同一新 ID、同一参数只返回该回执，不重排或再次生成；原请求仍符合拒绝条件时，换新 ID 争用或已有 Codex 后继均返回 `CHAT_SUPERSEDE_CONFLICT`。响应和后续 GET 通过 `supersedes_request_id` 关联原失败；不提供派生提示词 kind 或另一个重试额度标志。queued 仅表示已受理，调用方继续查询同一新 ID，不能当作已发出或已成功。新后继沿原商品重新取得容量，旧错误与原始输入保留。
 
 额外请求字段由接口校验返回 HTTP 422；完整旧七身份字段虽然是 UNKNOWN 的有效格式，对此类明确拒绝仍返回 HTTP 409 `CHAT_SUPERSEDE_INVALID`。原账号授权不可用时返回 `CHAT_SUPERSEDE_AUTH_REQUIRED`，不保存新后继，不刷新凭据或换号。登记前原请求已成功或不再满足拒绝条件时拒绝新建；已登记后、发送前发现原成功或原 user 节点出现，新回执为 `failed/not_sent`、`CHAT_SUPERSEDE_ORIGINAL_FOUND`；原游标变化则为 `CHAT_SUPERSEDE_CURSOR_CHANGED`。此时查询并处理原结果，不换新 ID 再试。
 
