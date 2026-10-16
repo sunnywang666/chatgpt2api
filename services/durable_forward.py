@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from fastapi.responses import Response, StreamingResponse
 
 from services.request_context import AdmissionLost, current_request, trusted_source
+from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
 
 
 FORWARDED_HEADERS = {"session-id", "thread-id", "x-client-request-id", "originator", "version", "user-agent", "openai-beta",
@@ -481,15 +482,28 @@ def run(service, owner, request_id, body):
         else:
             code = code or ("PROVIDER_EXECUTION_FAILED" if not_sent else "CONVERSATION_OUTCOME_UNKNOWN")
         from services.protocol.error_response import anthropic_error_response, openai_error_response
-        detail = exc.detail if isinstance(exc, HTTPException) else {"error": {"code": code, "message": code}}
+        upstream_error = safe_upstream_error(getattr(exc, "original_upstream_error", None))
+        upstream_message = upstream_error.get("message")
+        detail = (exc.detail if isinstance(exc, HTTPException)
+                  else {"error": {"code": code, "message": upstream_message or code}})
         formatter = anthropic_error_response if protocol == "anthropic_v1_messages" else openai_error_response
         wire_error = formatter(detail, status_code)
         error_headers = {key.lower(): value for key, value in (getattr(exc, "headers", None) or {}).items()
                          if key.lower() == "retry-after"}
+        diagnostic = {}
+        original_http_status = getattr(exc, "original_http_status", None)
+        if type(original_http_status) is int and 300 <= original_http_status <= 599:
+            diagnostic["original_http_status"] = original_http_status
+        if upstream_error:
+            diagnostic["original_upstream_error"] = upstream_error
+        original_response_ids = safe_upstream_response_ids(getattr(exc, "original_upstream_response_ids", None))
+        if original_response_ids:
+            diagnostic["original_upstream_response_ids"] = original_response_ids
         service._update(owner, request_id, status="failed" if not_sent or known_rejection else "unknown",
                         error_code=code, _turn_reserved=not (not_sent or known_rejection),
                         _wire_error_status=status_code, _wire_error_payload=json.loads(wire_error.body), _wire_error_headers=error_headers,
-                        upstream_outcome="not_sent" if not_sent else "rejected" if known_rejection else "unknown", finished_at=service._now())
+                        upstream_outcome="not_sent" if not_sent else "rejected" if known_rejection else "unknown", finished_at=service._now(),
+                        **diagnostic)
     finally:
         if call is not None and not deferred:
             receipt = raw_receipt(service, owner, request_id)

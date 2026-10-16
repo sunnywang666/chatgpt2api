@@ -23,6 +23,8 @@ from curl_cffi import requests
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
+from utils.helper import UpstreamHTTPError, ensure_ok
+from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
 
 
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -61,10 +63,26 @@ _RETURNED_HEADERS = {
 
 
 class CodexServiceError(RuntimeError):
-    def __init__(self, status_code: int, code: str, message: str):
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        *,
+        original_http_status: int | None = None,
+        original_upstream_error: dict[str, str] | None = None,
+        original_upstream_response_ids: dict[str, str] | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.original_http_status = (
+            original_http_status
+            if type(original_http_status) is int and 300 <= original_http_status <= 599
+            else None
+        )
+        self.original_upstream_error = safe_upstream_error(original_upstream_error)
+        self.original_upstream_response_ids = safe_upstream_response_ids(original_upstream_response_ids)
         self.rate_limit = ({"layer": "provider_capacity", "origin": "local_guard", "phase": "admission",
                             "retry_after_seconds": None, "cooldown_until": None}
                            if status_code == 429 and code == "codex_busy" else None)
@@ -76,6 +94,70 @@ class CodexHTTPResponse:
     headers: dict[str, str]
     body: bytes | None = None
     stream: Iterable[bytes] | None = None
+
+
+def _known_account_credential_values(account: object) -> frozenset[str]:
+    """Return only credential values already selected for this Codex request."""
+    if not isinstance(account, dict):
+        return frozenset()
+    sources = [account]
+    credentials = account.get("codex_credentials")
+    if isinstance(credentials, dict):
+        sources.append(credentials)
+    values = {
+        value.strip()
+        for source in sources
+        for key in ("access_token", "refresh_token", "id_token", "account_id")
+        if isinstance((value := source.get(key)), str) and value.strip()
+    }
+    return frozenset(values)
+
+
+def _safe_account_upstream_error(value: object, account: object) -> dict[str, str]:
+    """Remove selected-account credential values before generic error cleanup."""
+    if not isinstance(value, dict):
+        return {}
+    secrets = _known_account_credential_values(account)
+    candidate = {}
+    for key in ("code", "type", "message"):
+        text = value.get(key)
+        if not isinstance(text, str):
+            continue
+        for secret in sorted(secrets, key=len, reverse=True):
+            text = text.replace(secret, "[redacted]")
+        candidate[key] = text
+    return safe_upstream_error(candidate)
+
+
+def _safe_account_response_ids(value: object, account: object) -> dict[str, str]:
+    secrets = _known_account_credential_values(account)
+    return {
+        key: identifier
+        for key, identifier in safe_upstream_response_ids(value).items()
+        if not any(secret in identifier for secret in secrets)
+    }
+
+
+def _explicit_upstream_error_detail(body: object, account: object) -> dict[str, str]:
+    """Capture named JSON error envelopes without retaining an arbitrary body."""
+    if not isinstance(body, dict):
+        return {}
+    error = body.get("error")
+    if isinstance(error, dict):
+        return _safe_account_upstream_error(error, account)
+    if isinstance(error, str):
+        return _safe_account_upstream_error({"message": error}, account)
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        nested = detail.get("error")
+        if isinstance(nested, dict):
+            return _safe_account_upstream_error(nested, account)
+        if isinstance(nested, str):
+            return _safe_account_upstream_error({"message": nested}, account)
+        return _safe_account_upstream_error(detail, account)
+    if isinstance(detail, str):
+        return _safe_account_upstream_error({"message": detail}, account)
+    return {}
 
 
 class ManagedCodexStream:
@@ -1411,13 +1493,29 @@ class CodexService:
                 stream=True,
             )
             if response.status_code < 200 or response.status_code >= 300:
-                evidence = self._record_limit(response, "http_429", token=token) if response.status_code == 429 else None
                 try:
-                    response.close()
-                except Exception:
-                    pass
+                    ensure_ok(response, "codex_responses")
+                except UpstreamHTTPError as upstream_error:
+                    # For stream=True failures ensure_ok drains no more than 4KiB
+                    # for one second and cancels stalled transfers without calling
+                    # Response.close on the active stream task.
+                    original_http_status = upstream_error.status_code
+                    original_upstream_error = _explicit_upstream_error_detail(upstream_error.body, account)
+                    original_upstream_response_ids = _safe_account_response_ids(upstream_error.response_ids, account)
+                else:  # pragma: no cover - status was checked immediately above
+                    original_http_status = response.status_code
+                    original_upstream_error = {}
+                    original_upstream_response_ids = {}
+                evidence = self._record_limit(response, "http_429", token=token) if response.status_code == 429 else None
                 error = self._safe_upstream_error(response.status_code, token, affinity, post=True,
                                                   request_account=account, request_digest=request_digest)
+                error.original_http_status = (
+                    original_http_status
+                    if type(original_http_status) is int and 300 <= original_http_status <= 599
+                    else None
+                )
+                error.original_upstream_error = safe_upstream_error(original_upstream_error)
+                error.original_upstream_response_ids = safe_upstream_response_ids(original_upstream_response_ids)
                 if evidence:
                     error.rate_limit = evidence
                 raise error

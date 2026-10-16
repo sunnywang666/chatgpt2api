@@ -62,7 +62,7 @@ def _safe_text(value: object, limit: int) -> str:
     value = value[:8192]
     value = re.sub(r"```[\s\S]*?(?:```|$)", "[redacted]", value)
     value = re.sub(r"(?i)(?:https?://|data:)[^\s<>\"']+", "[redacted]", value)
-    value = re.sub(r"(?i)\b(?:authorization|cookie|set-cookie|access[_ -]?token|refresh[_ -]?token|token|api[_ -]?key|password|secret)\b[\"']?\s*[:=]\s*[^\n,;]+", "[redacted]", value)
+    value = re.sub(r"(?i)\b(?:authorization|cookie|set-cookie|access[_ -]?token|refresh[_ -]?token|token|api[_ -]?key|password|secret|account[_ -]?id)\b[\"']?\s*[:=]\s*[^\n,;]+", "[redacted]", value)
     value = re.sub(r"(?i)\b(?:bearer|basic)\s+\S+", "[redacted]", value)
     value = re.sub(r"\b(?:sk-|eyJ)[A-Za-z0-9_.-]+", "[redacted]", value)
     value = re.sub(r"\b[A-Za-z0-9_.+/-]{32,}\b", "[redacted]", value)

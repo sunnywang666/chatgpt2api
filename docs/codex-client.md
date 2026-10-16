@@ -347,6 +347,22 @@ A Codex upstream 401 keeps that credential in `auth_required`, including after a
 
 The candidate serves HTTP Responses and SSE only; WebSocket transport and Codex Desktop are not yet accepted. Account observations expire after five minutes and are refreshed with bounded read-only probes. A missing/failed observation is not zero remaining quota. Upstream use remains subject to the account's real limits and availability; this service adds no budget, top-up, or internal token allocation.
 
+Queued native requests can refresh an existing stale Codex observation on their
+selected Web/Chat pool account through those ordinary probes. Separate saved
+Codex credentials are not required for this refresh when the account already
+has an observation. Disabled, authorization-required and never-observed Chat
+accounts are not newly probed by this path. A failed refresh keeps the original
+request queued with its account and model selection intact.
+
+For a future non-2xx native POST, the owner receipt retains
+`original_http_status`, a bounded, sanitized `original_upstream_error` when the
+upstream provides a complete JSON `error` or `detail` envelope, and allowlisted
+`original_upstream_response_ids` when available. The ordinary error response
+uses the same safe message while keeping its existing error code. HTML,
+truncated bodies and raw credentials are not stored as error details. These
+diagnostics do not change retry eligibility, reconstruct missing historical
+errors, or turn an existing UNKNOWN receipt into a confirmed rejection.
+
 A pending or unknown session is retained and rejected with `codex_session_outcome_unknown` on continuation. A POST HTTP 408, like a transport timeout or 5xx, has an unknown outcome and is never automatically replayed. A terminal SSE response already parsed before client disconnect remains terminal. Do not create another session to replay the uncertain request. There is not yet an operator UI for resolving that receipt. This candidate keeps up to 256 session bindings and 256 response-owner references per account in the existing account record; it never evicts a prior owner to accept new work. `codex_binding_capacity` requires operator handling and is a storage protection, not an allowance of requests or tokens. Long-term retention/archival handling remains a release consideration.
 
 `codex_limited` means the selected upstream reported a limit. Existing sessions stay on their original account; a new independent session may use another eligible account. `codex_auth_required` means the upstream rejected the account credential with HTTP 401; inspect its authorization and refresh state before an authorized refresh or re-import. It does not prove that the credential merely expired. `codex_access_denied` means upstream HTTP 403: inspect account access and the request conditions instead of repeatedly refreshing the token. These two errors are returned as HTTP 503 by the service because its ordinary caller key has already authenticated; they do not mean that the caller key needs replacing. Neither condition permits replaying an uncertain request. These operational limits must be considered alongside the pending real-upstream and Windows checks before calling the service generally available.
