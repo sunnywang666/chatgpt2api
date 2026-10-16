@@ -277,3 +277,48 @@ def test_fixed_product_lanes_rotate_with_legacy_without_idling_on_unready_contin
     text_submit(runtime, "legacy-ready", product=None)
     selected = admission.claim_next()
     assert selected and selected.request_id == "legacy-ready"
+
+
+def test_rejected_chat_successor_reclaims_released_product_slot(runtime):
+    """The three-field Chat retry is a new product admission after release."""
+    clock, _, store, admission, text, _ = runtime
+    text_submit(runtime, "rejected", product="rejected-product")
+    claimed = admission.claim_next()
+    assert claimed and claimed.request_id == "rejected"
+    with store.transaction() as db:
+        original = store.read_receipt(db, "text", "owner-a", "rejected")
+        retained = text.store.load_input(original["_input_ref"])
+        original.update(status="failed", error_code="MODEL_NOT_FOUND", upstream_outcome="rejected",
+                        _submission_started=True, _executing=False, _turn_reserved=False,
+                        provider_binding_id="binding-0", provider_account_identity="account-0",
+                        conversation_id=None, parent_message_id=None,
+                        original_failure_phase="stream_open", original_exception_category="http",
+                        original_upstream_request_stage="conversation", original_http_status=404,
+                        original_upstream_error_form="detail_text",
+                        original_upstream_error={"message": "Model not found"})
+        original["_input_ref"] = text.store.save_input(retained)
+        store.write_receipt(db, "text", "owner-a", "rejected", original)
+
+    text_submit(runtime, "waiting", owner="owner-b", source=SOURCE_B, product="waiting-product")
+    waiting = admission.claim_next()
+    assert waiting and waiting.request_id == "waiting"
+    released = parent(runtime, receipt(runtime, "text", "owner-a", "rejected"))
+    assert released["state"] == "queued" and released["slot_held"] is False
+
+    successor = text.submit("owner-a", {
+        "client_request_id": "chat-successor", "supersedes_request_id": "rejected",
+        "client_conversation_id": "session-rejected",
+    }, source=SOURCE_A)
+    assert successor["product_work"]["product_ref"] == "rejected-product"
+    work = ProductWorkService(text, runtime[5], clock=lambda: clock.now)
+    parent_after_adopt = work.adopt({"id": "owner-a", "role": "admin", "_trusted_source": SOURCE_A},
+        "rejected-product", [
+            {"kind": "text", "request_id": "rejected", "step_ref": "rejected"},
+            {"kind": "text", "request_id": "chat-successor", "step_ref": "rejected"},
+        ])
+    assert parent_after_adopt["slot_held"] is False
+    finish(runtime, "text", "owner-b", "waiting")
+    retried = admission.claim_next()
+    assert retried and retried.request_id == "chat-successor"
+    reclaimed = parent(runtime, receipt(runtime, "text", "owner-a", "chat-successor"))
+    assert reclaimed["state"] == "active" and reclaimed["slot_held"] is True

@@ -144,6 +144,28 @@
 
 无数据库迁移、新服务或配置变化。发布需先 Provider、后使用此字段的内部消费者。接受后继之前可回退旧镜像；一旦已受理后继，**不得直接降级为不识别此合同的版本**：应保留识别此合同的运行版本处理在途/等待及原 ID 读回，或由发布负责人核定只暂停新提交的回退方案，保留原数据库和输入。不能删除后继或清空 UNKNOWN 来回退。
 
+#### 明确 MODEL_NOT_FOUND 拒绝后的原 Chat 重试
+
+同一内部 `POST /api/conversation-bindings/text` 接受以下三个字段。它只适用于原回执已保存完整 `stream_open/http/conversation`、HTTP 404 与 `Model not found` 明确拒绝证据的原生 Chat 文字请求；不是 UNKNOWN 恢复，也不把已开始提交的旧请求改成未发送。
+
+```json
+{
+  "supersedes_request_id": "original-rejected-request",
+  "client_request_id": "one-persisted-retry-id",
+  "client_conversation_id": "original-client-session"
+}
+```
+
+调用方先在原业务任务中保存固定重试 ID，之后始终使用这三个值。禁止提供 messages、model、thinking_effort、账号、物理会话、product_work、derived_input 或 continue_after_no_final。Provider 从原私密输入继承完整文字、图片、模型与业务来源，核对原 hash；不使用调用方新版提示词重建原任务。原输入未指定、但派发回执已确定的账号和绑定沿用该回执；输入与回执矛盾时拒绝，不重新挑号。
+
+首请求被拒、尚未创建物理 Chat 时，无须虚构 conversation_id 或 parent_message_id：沿原绑定、原账号创建会话。已有物理 Chat 的继续请求被拒时，沿原物理会话和提交父节点，发送前按原账号节拍检查旧请求未出现、父节点未变化。原结果迟到、身份变化、账号不可用、暂停或领取仍在进行时，不能凭本接口绕过原校验。
+
+一个原请求最多登记一个 Chat 或 Codex 后继，任何状态均计入；不会因后继失败再获得一次。重复同一新 ID、同一参数只返回该回执，不重排或再次生成；原请求仍符合拒绝条件时，换新 ID 争用或已有 Codex 后继均返回 `CHAT_SUPERSEDE_CONFLICT`。响应和后续 GET 通过 `supersedes_request_id` 关联原失败；不提供派生提示词 kind 或另一个重试额度标志。queued 仅表示已受理，调用方继续查询同一新 ID，不能当作已发出或已成功。新后继沿原商品重新取得容量，旧错误与原始输入保留。
+
+额外请求字段由接口校验返回 HTTP 422；完整旧七身份字段虽然是 UNKNOWN 的有效格式，对此类明确拒绝仍返回 HTTP 409 `CHAT_SUPERSEDE_INVALID`。原账号授权不可用时返回 `CHAT_SUPERSEDE_AUTH_REQUIRED`，不保存新后继，不刷新凭据或换号。登记前原请求已成功或不再满足拒绝条件时拒绝新建；已登记后、发送前发现原成功或原 user 节点出现，新回执为 `failed/not_sent`、`CHAT_SUPERSEDE_ORIGINAL_FOUND`；原游标变化则为 `CHAT_SUPERSEDE_CURSOR_CHANGED`。此时查询并处理原结果，不换新 ID 再试。
+
+此分支只扩展内部消费者合同；普通 API、旧七字段 UNKNOWN/no-final 后继和图片请求的规则不变。Provider 上线并完成接口核验后，消费者才能启用。回退必须保留能识别已登记后继的版本，不删除新旧回执或原输入。
+
 #### 已发送但无最终回答的显式原会话后继
 
 同一内部接口的七个身份字段可额外带 `continue_after_no_final: true`。此模式仅用于旧公司原生文字请求已经以 `ORIGINAL_RESULT_NO_FINAL` 停止自动恢复、至少三次有效读取仍为 `REQUEST_RESULT_NOT_FOUND`，且无工作生命周期、completion、暂停或活跃领取的情况；客户端不能替换提示词、模型或身份。已保存的 text `_retry_cursor` 不代表活动领取：仅当它是精确绑定同一原 `conversation_id`、`request_message_id` 的完整空分支观测，才可保留并走这一显式后继；错锚、缺字段或 image-source 游标仍拒绝。只有下面的 `attributes_required_only_v4` 封闭升级可与此标志合用；旧 `category_directory_parent_v1` 仍不可合用。默认省略时继续使用原消息缺失分支，不自动开启重试。

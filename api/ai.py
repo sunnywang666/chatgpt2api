@@ -132,7 +132,10 @@ class ConversationBindingTextRequest(BaseModel):
                 raise ValueError("derived input requires an original request")
             if self.messages is None:
                 raise ValueError("messages are required")
-        elif self.model_fields_set != (TextTaskService.SUPERSEDE_FIELDS | ({"derived_input"} if self.derived_input is not None else set()) | ({"continue_after_no_final"} if no_final else set())):
+        elif self.model_fields_set not in (
+                TextTaskService.REJECTED_SUPERSEDE_FIELDS,
+                TextTaskService.SUPERSEDE_FIELDS | ({"derived_input"} if self.derived_input is not None else set()) | ({"continue_after_no_final"} if no_final else set()),
+        ):
             raise ValueError("explicit successor requires only original binding and request identities")
         return self
 
