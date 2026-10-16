@@ -2,7 +2,8 @@
 import copy
 import json
 import time
-from contextlib import nullcontext
+import threading
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
@@ -1038,3 +1039,116 @@ def test_original_only_policy_does_not_cancel_existing_successor(failed_unsent_i
     with pytest.raises(CompletionError, match="COMPLETION_POLICY_CONFLICT"):
         service.start("image", IDENTITY, "repair-image", original_only=True)
     assert row(service, "image", "repair-image") == before
+
+
+@pytest.mark.parametrize("kind", ["text", "image"])
+@pytest.mark.parametrize("completion_state", ["result_ready", "completed", "checking_original"])
+def test_unchanged_completion_reads_do_not_wait_for_sqlite_writer(setup, kind, completion_state):
+    service, admission, calls = setup
+    rid = "old-0"
+    if kind == "image":
+        service.images.submit_generation(IDENTITY, client_task_id=rid, prompt="retained image",
+                                         model="gpt-image-2", size=None)
+    ready = completion_state != "checking_original"
+    completion = {"state": completion_state, "started_at": 1000, "next_at": None}
+    if ready:
+        completion.update(selected_id=rid, selected_at=2000, results_saved=completion_state == "completed")
+    content = {"content": "saved original"} if kind == "text" else {"data": [{"b64_json": "c2F2ZWQ="}]}
+    patch_row(service, kind, rid, status=("succeeded" if kind == "text" else "success") if ready else "unknown",
+              _completion=completion, **(content if ready else {}))
+    before = row(service, kind, rid)
+    service.text.recovery_reader = Mock(side_effect=AssertionError("query must not recover upstream"))
+    service.images.resume_poll = Mock(side_effect=AssertionError("query must not resume image polling"))
+    locked, release = threading.Event(), threading.Event()
+    def hold_writer():
+        with service.store.transaction():
+            locked.set()
+            release.wait(5)
+    writer = threading.Thread(target=hold_writer)
+    writer.start()
+    readers = ThreadPoolExecutor(max_workers=1)
+    try:
+        assert locked.wait(1)
+        result = readers.submit(service.read, kind, IDENTITY, rid).result(timeout=0.5)
+        assert not release.is_set()
+    finally:
+        release.set()
+        writer.join(timeout=2)
+        readers.shutdown(wait=True)
+    assert result["state"] == completion_state
+    assert result.get("selected_id") == (rid if ready else None)
+    assert row(service, kind, rid) == before
+    with pytest.raises(CompletionError, match="COMPLETION_REQUEST_NOT_FOUND"):
+        service.read(kind, {**IDENTITY, "id": "other-owner"}, rid)
+    service.text.recovery_reader.assert_not_called()
+    service.images.resume_poll.assert_not_called()
+    assert calls == []
+
+
+def test_already_cancelled_replacement_read_is_pure_and_preserves_work(setup):
+    service, admission, calls = setup
+    ended_original(service)
+    child_id = service.start("text", IDENTITY, "old-0")["replacement_id"]
+    patch_row(service, status="succeeded", content="saved original", upstream_outcome="completed")
+    # The first read must still cancel the unsent replacement and fix the work
+    # pointer transactionally. Only the subsequent unchanged read is pure.
+    result = service.read("text", IDENTITY, "old-0")
+    assert result["selected_id"] == "old-0"
+    original, child = row(service), row(service, request_id=child_id)
+    assert child["error_code"] == "COMPLETION_ORIGINAL_RECOVERED"
+    with service.store.connect() as db:
+        work = service.store.runtime(db, original["_work_key"])
+    with patch.object(service.store, "transaction", side_effect=AssertionError("unchanged read took writer")):
+        assert service.read("text", IDENTITY, "old-0") == result
+    assert row(service) == original and row(service, request_id=child_id) == child
+    with service.store.connect() as db:
+        assert service.store.runtime(db, original["_work_key"]) == work
+    assert calls == []
+
+
+def test_completion_reconciliation_rereads_state_after_read_snapshot(setup):
+    service, admission, calls = setup
+    patch_row(service, status="succeeded", content="saved original",
+              _completion={"state": "checking_original", "next_at": 3000})
+    transaction = service.store.transaction
+    @contextmanager
+    def completed_before_writer():
+        # Another worker commits after the read snapshot closes and before
+        # this request obtains the writer. The fallback must see that commit.
+        with transaction() as db:
+            current = service.store.read_receipt(db, "text", "owner", "old-0")
+            current["_completion"] = {"state": "completed", "next_at": None,
+                                      "selected_id": "old-0", "selected_at": 2900,
+                                      "results_saved": True}
+            service.store.write_receipt(db, "text", "owner", "old-0", current)
+        with transaction() as db:
+            yield db
+    with patch.object(service.store, "transaction", side_effect=completed_before_writer):
+        result = service.read("text", IDENTITY, "old-0")
+    assert result["state"] == "completed" and result["results_saved"] is True
+    assert row(service)["_completion"]["selected_at"] == 2900
+    assert calls == []
+
+
+@pytest.mark.parametrize("submitted_member", [False, True])
+def test_cancelled_replacement_pending_slot_cleanup_respects_submitted_member(setup, submitted_member):
+    service, admission, calls = setup
+    ended_original(service)
+    child_id = service.start("text", IDENTITY, "old-0")["replacement_id"]
+    patch_row(service, status="succeeded", content="saved original", upstream_outcome="completed")
+    service.read("text", IDENTITY, "old-0")
+    patch_row(service, _submission_started=submitted_member)
+    original, child = row(service), row(service, request_id=child_id)
+    with service.store.transaction() as db:
+        work = service.store.runtime(db, original["_work_key"])
+        work.update(slot_held=True, last_request_id="old-0")
+        service.store.set_runtime(db, work["key"], work)
+    guard = patch.object(service.store, "transaction", side_effect=AssertionError("protected slot was rewritten")) \
+        if submitted_member else nullcontext()
+    with guard:
+        result = service.read("text", IDENTITY, "old-0")
+    assert result["selected_id"] == "old-0"
+    with service.store.connect() as db:
+        assert service.store.runtime(db, original["_work_key"])["slot_held"] is submitted_member
+    assert row(service) == original and row(service, request_id=child_id) == child
+    assert calls == []
