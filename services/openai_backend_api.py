@@ -568,17 +568,22 @@ class OpenAIBackendAPI:
                 raise RuntimeError("only string or list message content is supported")
             text_parts: list[str] = []
             image_inputs: list[tuple[bytes, str]] = []
+            ordered_parts: list[tuple[str, Any]] = []
             for part in content:
                 if not isinstance(part, dict):
                     continue
                 part_type = str(part.get("type") or "")
                 if part_type == "text":
-                    text_parts.append(str(part.get("text") or ""))
+                    text = str(part.get("text") or "")
+                    text_parts.append(text)
+                    if text:
+                        ordered_parts.append(("text", text))
                 elif part_type == "image":
                     data = part.get("data")
                     mime = str(part.get("mime") or "image/png")
                     if isinstance(data, (bytes, bytearray)):
                         image_inputs.append((bytes(data), mime))
+                        ordered_parts.append(("image", len(image_inputs) - 1))
             if not image_inputs:
                 conversation_messages.append({
                     "id": new_uuid(),
@@ -595,7 +600,11 @@ class OpenAIBackendAPI:
                 b64 = base64.b64encode(data).decode("ascii")
                 uploaded.append(self._upload_image(f"data:{mime};base64,{b64}", f"image_{idx}.{extension}"))
             parts: list[Any] = []
-            for ref in uploaded:
+            for part_kind, part_value in ordered_parts:
+                if part_kind == "text":
+                    parts.append(part_value)
+                    continue
+                ref = uploaded[part_value]
                 parts.append({
                     "content_type": "image_asset_pointer",
                     "asset_pointer": f"file-service://{ref['file_id']}",
@@ -603,9 +612,6 @@ class OpenAIBackendAPI:
                     "height": ref["height"],
                     "size_bytes": ref["file_size"],
                 })
-            text = "".join(text_parts)
-            if text:
-                parts.append(text)
             conversation_messages.append({
                 "id": new_uuid(),
                 "author": {"role": role},
