@@ -1022,8 +1022,26 @@ class CodexRelayTests(unittest.TestCase):
         self.assertNotIn("type", error.original_upstream_error)
         self.assertEqual(error.original_upstream_response_ids, {})
         persisted = json.dumps(vars(error))
-        for secret in ("web-access", "web-refresh", "web-account", "codex-access", "codex-refresh", "0123456789abcdef"):
+        secrets = ("web-access", "web-refresh", "web-account", "codex-access", "codex-refresh", "0123456789abcdef")
+        for secret in secrets:
             self.assertNotIn(secret, persisted)
+
+        for secret in secrets:
+            response = FakeResponse(status=400, payload={"error": {"message": "rejected"}})
+            response.headers["x-request-id"] = f"req_{secret}_trace"
+            session = FakeSession(post_response=response)
+            service = CodexService(FakeAccounts([selected]), SessionFactory([session]))
+            with self.assertRaises(CodexServiceError) as embedded:
+                service.submit(self.identity, {"model": "gpt-5.6-codex", "input": []}, self.headers)
+            self.assertEqual(embedded.exception.original_upstream_response_ids, {})
+
+        response = FakeResponse(status=400, payload={"error": {"message": "rejected"}})
+        response.headers["cf-ray"] = "a0123456789abcdef-SJC"
+        session = FakeSession(post_response=response)
+        service = CodexService(FakeAccounts([selected]), SessionFactory([session]))
+        with self.assertRaises(CodexServiceError) as embedded_cf_ray:
+            service.submit(self.identity, {"model": "gpt-5.6-codex", "input": []}, self.headers)
+        self.assertEqual(embedded_cf_ray.exception.original_upstream_response_ids, {})
 
     def test_upstream_408_keeps_actual_status_while_outcome_stays_unknown(self):
         session = FakeSession(post_response=FakeResponse(status=408, payload={"detail": "request timeout"}))

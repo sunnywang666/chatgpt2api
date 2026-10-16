@@ -346,6 +346,7 @@ class PoolAdmission:
         self._next_codex_probe = 0.0
         self._next_image_probe = 0.0
         self._image_probe_index = 0
+        self._codex_probe_index = 0
 
     def register(self, kind, handler):
         self.handlers[kind] = handler
@@ -1183,6 +1184,85 @@ class PoolAdmission:
             if probes >= 3:
                 break
 
+    def _queued_codex_probe_accounts(self, rows, queued):
+        """Return exact native-original accounts that may need observation.
+
+        A selected or already-bound original must only ever observe its own
+        account.  Resolve the same anchors as the later claim-time binding
+        check, but leave conflicts alone for that transaction to reject; a
+        metadata probe must not turn an invalid anchor into a fallback choice.
+        """
+        by_identity = {}
+        for account in rows:
+            identity = account.get("provider_account_identity")
+            if isinstance(identity, str) and identity:
+                by_identity.setdefault(identity, []).append(account)
+        targeted = []
+        has_unbound = False
+        for owner, receipt in queued:
+            anchors = []
+            invalid = False
+            constrained = False
+            account_ref = receipt.get("_requested_account_ref")
+            if account_ref is not None and account_ref != "":
+                constrained = True
+                matches = [account for account in rows if self.accounts.pool_account_ref(account) == account_ref] if isinstance(account_ref, str) else []
+                if isinstance(account_ref, str) and len(matches) == 1:
+                    anchors.append(matches[0].get("provider_account_identity"))
+                else:
+                    invalid = True
+            for key in ("_requested_account_identity", "provider_account_identity"):
+                identity = receipt.get(key)
+                if identity is not None and identity != "":
+                    constrained = True
+                    matches = by_identity.get(identity, []) if isinstance(identity, str) else []
+                    if isinstance(identity, str) and len(matches) == 1:
+                        anchors.append(identity)
+                    else:
+                        invalid = True
+            affinity = receipt.get("client_conversation_id")
+            if affinity is not None and affinity != "":
+                matches = ([account for account in rows if affinity in (account.get("codex_affinities") or {})]
+                           if isinstance(affinity, str) else [])
+                if matches:
+                    constrained = True
+                    if len(matches) == 1:
+                        anchors.append(matches[0].get("provider_account_identity"))
+                    else:
+                        invalid = True
+                elif not isinstance(affinity, str):
+                    constrained = True
+                    invalid = True
+            previous = receipt.get("_previous_response_id")
+            if previous is not None and previous != "":
+                constrained = True
+                digest = hashlib.sha256(previous.encode()).hexdigest() if isinstance(previous, str) else None
+                owner_digest = hashlib.sha256(owner.encode()).hexdigest()
+                matches = ([
+                    account for account in rows
+                    if (account.get("codex_response_ids", {}).get(digest) or {}).get("owner") == owner_digest
+                ] if digest is not None else [])
+                if digest is not None and len(matches) == 1:
+                    anchors.append(matches[0].get("provider_account_identity"))
+                else:
+                    invalid = True
+            if not constrained:
+                has_unbound = True
+                continue
+            identities = {identity for identity in anchors if isinstance(identity, str) and identity}
+            if invalid or len(identities) != 1:
+                continue
+            identity = next(iter(identities))
+            if not any(account.get("provider_account_identity") == identity for account in targeted):
+                targeted.append(by_identity[identity][0])
+        if not has_unbound:
+            return targeted
+        # An unrelated unbound original still needs normal pool discovery.
+        # Prioritize exact originals first, then keep every remaining account
+        # in the bounded round-robin so one invalid/failed selection cannot
+        # block independent work on the same queue.
+        return targeted + [account for account in rows if account not in targeted]
+
     def claim_next(self):
         self._refresh_waiting_image_capabilities()
         # Catalog lookup may perform a metadata read; never do that under the
@@ -1203,14 +1283,22 @@ class PoolAdmission:
                 types[model] = set()
         if self.codex is not None:
             with self.store.connect() as db:
-                native_models = {r.get("model") for _, _, _, r in self._metadata_receipts(db, ("queued",))
-                                 if r.get("status") == "queued" and r.get("_route") == "codex"}
+                native_queued = [(owner, r) for _, owner, _, r in self._metadata_receipts(db, ("queued",))
+                                 if r.get("status") == "queued" and r.get("_route") == "codex"]
+                native_models = {r.get("model") for _, r in native_queued}
             # Reuse the existing bounded metadata refresh, outside the claim
             # transaction. This never sends a model request.
             if native_models and float(self.clock()) >= self._next_codex_probe:
                 self._next_codex_probe = float(self.clock()) + 30
                 probes = 0
-                for account in self._rows():
+                with self._account_guard():
+                    probe_rows = [dict(account) for account in self._rows()]
+                candidates = self._queued_codex_probe_accounts(probe_rows, native_queued)
+                start = self._codex_probe_index % max(1, len(candidates))
+                scanned = 0
+                for offset in range(len(candidates)):
+                    account = candidates[(start + offset) % len(candidates)]
+                    scanned += 1
                     projection = self.codex.account_projection(account)
                     # A normal pool/Web account can already have a verified
                     # Codex observation without separately stored Codex
@@ -1233,6 +1321,8 @@ class PoolAdmission:
                     probes += 1
                     if probes >= 3:
                         break
+                if candidates:
+                    self._codex_probe_index = (start + scanned) % len(candidates)
         with self._settings_guard(), self.store.transaction() as db, self._account_guard():
             now = float(self.clock())
             receipts = list(self.store.receipts(db))

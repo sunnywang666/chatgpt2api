@@ -177,6 +177,120 @@ def test_queued_web_codex_observation_renews_on_same_account_without_new_authori
     assert [call[0] for call in observation_session.calls] == ["GET", "GET"]
 
 
+def test_queued_web_codex_selected_account_probes_before_unrelated_stale_accounts(runtime, monkeypatch):
+    """A selected original cannot be starved by unrelated stale Web rows."""
+    from test.test_codex_service import observation
+
+    rows = [
+        legacy(
+            f"unrelated-{index}", source_type="web", type="Plus",
+            provider_account_identity=f"unrelated-account-{index}",
+            codex_observation=observation(minutes_ago=10),
+        )
+        for index in range(3)
+    ]
+    selected = legacy(
+        "selected-original", source_type="web", type="Plus",
+        provider_account_identity="selected-original-account",
+        codex_observation=observation(
+            minutes_ago=10,
+            models=[{"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol", "reasoning_efforts": ["high"]}],
+        ),
+    )
+    rt = runtime([*rows, selected])
+    refreshes = []
+    monkeypatch.setattr(rt.accounts, "refresh_codex_access_token",
+                        lambda token, **kwargs: refreshes.append((token, kwargs)) or token)
+    selected_ref = rt.accounts.pool_account_ref(rt.accounts.get_account("selected-original"))
+    submit(rt, "selected-queued", model="gpt-5.6-sol", account_ref=selected_ref)
+    selected_session = FakeSession(gets=[
+        FakeResponse(payload={"models": [{"slug": "gpt-5.6-sol", "supported_reasoning_efforts": ["high"]}]}),
+        FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 0}}}),
+    ])
+    rt.factory.sessions.append(selected_session)
+
+    context = rt.admission.claim_next()
+
+    assert context is not None
+    assert context.request_id == "selected-queued"
+    assert context.selected_account()["provider_account_identity"] == "selected-original-account"
+    assert refreshes == [("selected-original", {"event": "codex_observation"})]
+    assert [call[0] for call in selected_session.calls] == ["GET", "GET"]
+
+
+def test_queued_web_codex_probe_rotates_across_four_selected_stale_accounts(runtime, monkeypatch):
+    """Three failed selected observations cannot permanently skip the fourth."""
+    from test.test_codex_service import observation
+
+    rows = [
+        legacy(
+            f"selected-{index}", source_type="web", type="Plus",
+            provider_account_identity=f"selected-account-{index}",
+            codex_observation=observation(minutes_ago=10),
+        )
+        for index in range(4)
+    ]
+    rt = runtime(rows)
+    refreshes = []
+    monkeypatch.setattr(rt.accounts, "refresh_codex_access_token",
+                        lambda token, **kwargs: refreshes.append((token, kwargs)) or token)
+    for index in range(4):
+        selected_ref = rt.accounts.pool_account_ref(rt.accounts.get_account(f"selected-{index}"))
+        submit(rt, f"selected-{index}-queued", session=f"selected-{index}-session", account_ref=selected_ref)
+    rt.factory.sessions.extend([
+        *(FakeSession(gets=[FakeResponse(status=503, payload={})]) for _ in range(3)),
+        FakeSession(gets=[
+            FakeResponse(payload={"models": [{"slug": "gpt-5.6-codex", "supported_reasoning_efforts": ["high"]}]}),
+            FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 0}}}),
+        ]),
+        *(FakeSession(gets=[FakeResponse(status=503, payload={})]) for _ in range(2)),
+    ])
+
+    assert rt.admission.claim_next() is None
+    rt.clock.now += 30
+    context = rt.admission.claim_next()
+
+    assert context is not None
+    assert context.request_id == "selected-3-queued"
+    assert context.selected_account()["provider_account_identity"] == "selected-account-3"
+    assert [token for token, _ in refreshes] == ["selected-0", "selected-1", "selected-2", "selected-3", "selected-0", "selected-1"]
+
+
+def test_queued_web_codex_failed_selection_does_not_block_unbound_original_probe(runtime, monkeypatch):
+    """A selected failure leaves ordinary discovery available to another original."""
+    from test.test_codex_service import observation
+
+    selected = legacy(
+        "selected", source_type="web", type="Plus", provider_account_identity="selected-account",
+        codex_observation=observation(minutes_ago=10),
+    )
+    unbound = legacy(
+        "unbound", source_type="web", type="Plus", provider_account_identity="unbound-account",
+        codex_observation=observation(minutes_ago=10),
+    )
+    rt = runtime([selected, unbound])
+    refreshes = []
+    monkeypatch.setattr(rt.accounts, "refresh_codex_access_token",
+                        lambda token, **kwargs: refreshes.append((token, kwargs)) or token)
+    selected_ref = rt.accounts.pool_account_ref(rt.accounts.get_account("selected"))
+    submit(rt, "selected-queued", account_ref=selected_ref)
+    submit(rt, "unbound-queued", session="unbound-session")
+    rt.factory.sessions.extend([
+        FakeSession(gets=[FakeResponse(status=503, payload={})]),
+        FakeSession(gets=[
+            FakeResponse(payload={"models": [{"slug": "gpt-5.6-codex", "supported_reasoning_efforts": ["high"]}]}),
+            FakeResponse(payload={"rate_limit": {"primary_window": {"used_percent": 0}}}),
+        ]),
+    ])
+
+    context = rt.admission.claim_next()
+
+    assert context is not None
+    assert context.request_id == "unbound-queued"
+    assert context.selected_account()["provider_account_identity"] == "unbound-account"
+    assert [token for token, _ in refreshes] == ["selected", "unbound"]
+
+
 @pytest.mark.parametrize("state", ["auth_required", "disabled", "unobserved"])
 def test_queued_web_codex_never_probes_unrenewable_selection(runtime, monkeypatch, state):
     """No Codex evidence, a rejection, or a disabled account stays fail-closed."""

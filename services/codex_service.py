@@ -134,7 +134,7 @@ def _safe_account_response_ids(value: object, account: object) -> dict[str, str]
     return {
         key: identifier
         for key, identifier in safe_upstream_response_ids(value).items()
-        if identifier not in secrets
+        if not any(secret in identifier for secret in secrets)
     }
 
 
