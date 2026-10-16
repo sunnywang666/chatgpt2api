@@ -117,8 +117,8 @@ def fallback_options_context(store, db, owner, original_id):
     _original_hash, original_body = _original(store, db, owner, original_id)
     _responses_input(_original_messages(store, db, owner, original_id, original_body))
     existing = db.execute(
-        "SELECT id FROM requests WHERE owner=? AND json_extract(receipt,'$._codex_fallback_of')=? LIMIT 1",
-        (owner, original_id),
+        "SELECT id FROM requests WHERE owner=? AND (json_extract(receipt,'$._codex_fallback_of')=? OR json_extract(receipt,'$._supersedes_request_id')=?) LIMIT 1",
+        (owner, original_id, original_id),
     ).fetchone()
     return existing[0] if existing else None
 
@@ -152,8 +152,8 @@ def validate_prepared(store, db, owner, body):
     if body != expected:
         _reject("CODEX_FALLBACK_INVALID")
     other = db.execute(
-        "SELECT id FROM requests WHERE owner=? AND json_extract(receipt,'$._codex_fallback_of')=? AND id<>? LIMIT 1",
-        (owner, original_id, body["client_request_id"]),
+        "SELECT id FROM requests WHERE owner=? AND id<>? AND (json_extract(receipt,'$._codex_fallback_of')=? OR json_extract(receipt,'$._supersedes_request_id')=?) LIMIT 1",
+        (owner, body["client_request_id"], original_id, original_id),
     ).fetchone()
     if other:
         _reject("CODEX_FALLBACK_CONFLICT")
