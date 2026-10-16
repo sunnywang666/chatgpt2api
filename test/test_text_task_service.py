@@ -1,5 +1,6 @@
 import tempfile
 import threading
+import time
 import unittest
 import json
 import math
@@ -477,6 +478,164 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(owner.json()["parent_message_id"], "parent-a")
         self.assertEqual(other.status_code, 200, other.text)
         self.assertEqual(other.json(), {"request_id": "attempt-1", "status": "not_found"})
+
+    def test_bound_snapshot_is_observational_and_explicit_recovery_remains_available(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from api.ai import create_router
+
+        runner = mock.Mock(side_effect=AssertionError("snapshot must not submit"))
+        reader = mock.Mock(return_value={
+            "status": "succeeded", "content": "original answer", "conversation_id": "chat",
+            "parent_message_id": "answer-id", "binding_status": "bound",
+        })
+        service = TextTaskService(self.path, runner, self.queue, recovery_reader=reader)
+        service.submit("owner", self.body)
+        service._update(
+            "owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="binding", provider_account_identity="account", conversation_id="chat",
+            _completion={"state": "checking_original", "reason": "ORIGINAL_READ", "private": "never-public"},
+        )
+        app = FastAPI()
+        app.include_router(create_router())
+        with (
+            mock.patch("api.ai.text_task_service", service),
+            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
+            TestClient(app) as client,
+        ):
+            snapshot = client.get("/api/conversation-bindings/text-requests/attempt-1/snapshot",
+                                  headers={"Authorization": "owner"})
+            other = client.get("/api/conversation-bindings/text-requests/attempt-1/snapshot",
+                               headers={"Authorization": "other"})
+            missing = client.get("/api/conversation-bindings/text-requests/missing/snapshot",
+                                 headers={"Authorization": "owner"})
+            recovered = client.post("/api/conversation-bindings/text-requests/attempt-1/recover",
+                                    json={}, headers={"Authorization": "owner"})
+            legacy = client.get("/api/conversation-bindings/text-requests/attempt-1",
+                                headers={"Authorization": "owner"})
+
+        self.assertEqual(snapshot.status_code, 200, snapshot.text)
+        self.assertEqual(snapshot.headers["cache-control"], "private, no-store")
+        self.assertEqual(snapshot.json()["status"], "unknown")
+        self.assertEqual(snapshot.json()["completion"], {"state": "checking_original", "reason": "ORIGINAL_READ"})
+        self.assertNotIn("never-public", snapshot.text)
+        self.assertEqual(other.status_code, 200, other.text)
+        self.assertEqual(other.json(), {"request_id": "attempt-1", "status": "not_found"})
+        self.assertEqual(missing.status_code, 200, missing.text)
+        self.assertEqual(missing.json(), {"request_id": "missing", "status": "not_found"})
+        self.assertEqual(recovered.status_code, 200, recovered.text)
+        self.assertEqual(legacy.status_code, 200, legacy.text)
+        self.assertEqual(recovered.json()["content"], "original answer")
+        self.assertEqual(legacy.json()["content"], "original answer")
+        reader.assert_called_once()
+        runner.assert_not_called()
+
+    def test_snapshot_reads_all_terminal_and_control_states_while_sqlite_writer_is_held(self):
+        runner = mock.Mock(side_effect=AssertionError("snapshot must not submit"))
+        reader = mock.Mock(side_effect=AssertionError("snapshot must not recover"))
+        service = TextTaskService(self.path, runner, self.queue, recovery_reader=reader)
+        cases = {
+            "unknown": {"status": "unknown", "error_code": "CONVERSATION_OUTCOME_UNKNOWN"},
+            "failed": {"status": "failed", "error_code": "RESULT_UNRECOVERABLE"},
+            "running": {"status": "running"},
+            "succeeded": {"status": "succeeded", "content": "saved answer"},
+            "paused": {"status": "unknown", "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "_recovery_paused": True},
+            "stopped": {"status": "unknown", "error_code": "CONVERSATION_OUTCOME_UNKNOWN", "_recovery_suppressed": True,
+                        "_completion": {"state": "needs_attention", "reason": "STOPPED", "private": "hidden"}},
+            "budget-ended": {"status": "failed", "error_code": "RESULT_UNRECOVERABLE",
+                             "upstream_outcome": "unknown", "_attempt_finished_at": 1000.0,
+                             "_attempt_reason": "ORIGINAL_RESULT_NO_FINAL"},
+        }
+        for request_id, changes in cases.items():
+            service.submit("owner", {**self.body, "client_request_id": request_id,
+                                     "client_conversation_id": request_id + "-session"})
+            service._update("owner", request_id, **changes)
+        with service.store.connect() as db:
+            before = {
+                request_id: db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", ("owner", request_id)).fetchone()[0]
+                for request_id in cases
+            }
+
+        writer = service.store._connect()
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            with ThreadPoolExecutor(max_workers=len(cases)) as pool:
+                snapshots = {
+                    request_id: pool.submit(service.read_snapshot, "owner", request_id)
+                    for request_id in cases
+                }
+                results = {request_id: future.result(timeout=1) for request_id, future in snapshots.items()}
+        finally:
+            writer.rollback()
+            writer.close()
+
+        self.assertEqual({request_id: result["status"] for request_id, result in results.items()}, {
+            request_id: changes["status"] for request_id, changes in cases.items()
+        })
+        self.assertEqual(results["succeeded"]["content"], "saved answer")
+        self.assertEqual(results["paused"]["recovery_control"]["state"], "paused")
+        self.assertEqual(results["stopped"]["recovery_control"]["state"], "stopped")
+        self.assertIs(results["budget-ended"]["recovery_automatic_stopped"], True)
+        self.assertEqual(results["stopped"]["completion"], {"state": "needs_attention", "reason": "STOPPED"})
+        self.assertNotIn("hidden", json.dumps(results))
+        self.assertEqual(service.read_snapshot("other", "unknown"), {"request_id": "unknown", "status": "not_found"})
+        with service.store.connect() as db:
+            after = {
+                request_id: db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", ("owner", request_id)).fetchone()[0]
+                for request_id in cases
+            }
+        self.assertEqual(after, before)
+        runner.assert_not_called()
+        reader.assert_not_called()
+
+    def test_snapshot_does_not_block_pool_background_original_read(self):
+        from services.pool_admission import PoolAdmission
+
+        runner = mock.Mock(side_effect=AssertionError("original generation must not run"))
+        started, release = threading.Event(), threading.Event()
+        calls = []
+        def original_read(receipt):
+            calls.append(receipt["request_id"])
+            started.set()
+            self.assertTrue(release.wait(2))
+            return {"status": "succeeded", "content": "recovered original", "conversation_id": "chat",
+                    "parent_message_id": "answer", "binding_status": "bound"}
+
+        service = TextTaskService(self.path, runner, self.queue, recovery_reader=original_read)
+        accounts = mock.Mock(spec=["list_accounts"])
+        accounts.list_accounts.return_value = []
+        admission = PoolAdmission(service.store, accounts)
+        service.admission = admission
+        admission.recoveries["text"] = service.read
+        service.submit("owner", self.body)
+        service._update("owner", "attempt-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                        upstream_outcome="unknown", provider_binding_id="binding", provider_account_identity="account",
+                        conversation_id="chat", recovery_next_at=0)
+        try:
+            admission.recover_one(background=True)
+            self.assertTrue(started.wait(1))
+            with service.store.connect() as db:
+                blocked = service.store.read_receipt(db, "text", "owner", "attempt-1")
+            lease = {key: blocked.get(key) for key in (
+                "recovery_claim_id", "recovery_claimed_at", "recovery_lease_until", "_claim_id", "_claim_until",
+            )}
+            admission.recover_one(background=True)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                snapshots = [pool.submit(service.read_snapshot, "owner", "attempt-1") for _ in range(4)]
+                self.assertEqual([future.result(timeout=1)["status"] for future in snapshots], ["unknown"] * 4)
+            with service.store.connect() as db:
+                still_blocked = service.store.read_receipt(db, "text", "owner", "attempt-1")
+            self.assertEqual({key: still_blocked.get(key) for key in lease}, lease)
+            self.assertEqual(calls, ["attempt-1"])
+        finally:
+            release.set()
+        deadline = time.time() + 2
+        while time.time() < deadline and service.read_snapshot("owner", "attempt-1")["status"] != "succeeded":
+            time.sleep(0.01)
+        self.assertEqual(service.read_snapshot("owner", "attempt-1")["status"], "succeeded")
+        self.assertEqual(service.read_snapshot("owner", "attempt-1")["content"], "recovered original")
+        self.assertEqual(calls, ["attempt-1"])
+        runner.assert_not_called()
 
     def test_public_not_submitted_projection_rejects_inflight_sent_unknown_and_unproven_receipts(self):
         base = {

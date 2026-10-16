@@ -73,10 +73,11 @@ def test_image_tool_compatibility_rejects_incomplete_or_foreign_branches(bad):
     assert exc.value.code == ("CHAT_SUPERSEDE_ORIGINAL_FOUND" if bad == "original_present" else "CHAT_SUPERSEDE_CURSOR_CHANGED")
 
 
-def test_read_advertises_only_verified_no_send_and_never_resumes(task, bound_chat):
+@pytest.mark.parametrize("reader", ["read", "read_snapshot"])
+def test_read_advertises_only_verified_no_send_and_never_resumes(task, bound_chat, reader):
     h = failed_successor(task, bound_chat)
     before = deepcopy(row(h.service, "successor"))
-    result = h.service.read("owner", "successor")
+    result = getattr(h.service, reader)("owner", "successor")
     assert result["bound_successor_resume_retryable"] is True
     assert result["upstream_outcome"] == "not_submitted" and result["upstream_submission_started"] is False
     h.service.submit("owner", h.envelope)
@@ -153,11 +154,12 @@ def test_changed_envelope_cannot_resume(task, bound_chat, field):
     assert h.admission.claim_next() is None
 
 
-def test_original_hash_tamper_disables_advertisement_and_resume(task, bound_chat):
+@pytest.mark.parametrize("reader", ["read", "read_snapshot"])
+def test_original_hash_tamper_disables_advertisement_and_resume(task, bound_chat, reader):
     h = failed_successor(task, bound_chat)
     with h.service.store.transaction() as db:
         db.execute("UPDATE requests SET request_hash='changed' WHERE id='old'")
-    assert "bound_successor_resume_retryable" not in h.service.read("owner", "successor")
+    assert "bound_successor_resume_retryable" not in getattr(h.service, reader)("owner", "successor")
     with pytest.raises(ConversationBindingError): h.service.resume_unsent_successor("owner", "successor", h.envelope)
 
 

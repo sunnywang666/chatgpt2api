@@ -58,6 +58,41 @@ def test_get_cannot_reopen_exhausted_no_final_recovery(public_chat, reason, stop
     f.upstream.assert_not_called()
 
 
+def test_public_snapshot_is_owner_scoped_observational_and_projects_persisted_completion(public_chat):
+    f = public_chat
+    owner = f.key_a["id"]
+    assert f.client.post("/api/chat-requests", headers=f.headers(), json=request_body()).status_code == 202
+    f.tasks._update(
+        owner, "chat-1", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+        original_http_status=404,
+        original_upstream_error={"code": "not_found", "message": "secret-token=private"},
+        _completion={"state": "checking_original", "reason": "ORIGINAL_READ", "max_extra_requests": 1,
+                     "private": "must-not-leak"},
+    )
+    completion = Mock(side_effect=AssertionError("snapshot must not reconcile completion"))
+    f.tasks.admission = SimpleNamespace(generation_completion=SimpleNamespace(read=completion))
+    response = f.client.get("/api/chat-requests/chat-1/snapshot", headers=f.headers())
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "private, no-store"
+    snapshot = response.json()
+    assert snapshot["status"] == "unknown"
+    assert snapshot["completion"] == {"state": "checking_original", "reason": "ORIGINAL_READ", "max_extra_requests": 1}
+    assert snapshot["execution"]["upstream_http_status"] == 404
+    assert snapshot["execution"]["upstream_error"]["code"] == "not_found"
+    assert "must-not-leak" not in response.text and "secret-token" not in response.text
+    completion.assert_not_called()
+    assert f.client.get("/api/chat-requests/chat-1/snapshot", headers=f.headers(f.secret_b)).status_code == 404
+    assert f.client.get("/api/chat-requests/missing/snapshot", headers=f.headers()).status_code == 404
+    assert f.client.get("/api/chat-requests/chat-1/snapshot", headers=f.headers(f.admin_secret)).status_code == 403
+
+    f.tasks._update(owner, "chat-1", status="succeeded", content="persisted public answer")
+    saved = f.client.get("/api/chat-requests/chat-1/snapshot", headers=f.headers())
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["status"] == "succeeded"
+    assert saved.json()["content"] == "persisted public answer"
+    completion.assert_not_called()
+
+
 def test_public_get_exposes_sanitized_http_error_without_resubmitting(public_chat):
     f = public_chat
     owner = f.key_a["id"]

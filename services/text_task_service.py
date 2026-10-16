@@ -1324,6 +1324,36 @@ class TextTaskService:
     def restore_public_session(self, owner: str, request_id: str) -> dict[str, object]:
         return self.set_public_session_archived(owner, request_id, False)
 
+    def read_snapshot(self, owner: str, request_id: str):
+        """Return the persisted original without joining its recovery work.
+
+        PoolAdmission owns automatic original-result recovery independently of
+        HTTP polling. In particular, UNKNOWN and failed snapshots must neither
+        acquire the writer lock nor claim an upstream read or reopen a stopped
+        attempt. Explicit recovery keeps using read/recover below.
+        """
+        with self._db() as db:
+            db.execute("BEGIN")
+            row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                             (owner, request_id)).fetchone()
+            if row is None:
+                return {"request_id": request_id, "status": "not_found"}
+            return self._local_read_projection(db, owner, row[0], json.loads(row[1]), self._now())
+
+    def _local_read_projection(self, db, owner, request_hash, receipt, now):
+        result = self._public(receipt)
+        # Keep the existing known-unsent eligibility advertisement. Its local
+        # input/predecessor proof is observational; the explicit resume endpoint
+        # still revalidates it under a writer before admitting any work.
+        if self.admission is not None and self._known_unsent_category_successor(receipt, now):
+            try:
+                self._validated_unsent_successor_input(db, owner, request_hash, receipt, now)
+                result.update(bound_successor_resume_retryable=True, upstream_outcome="not_submitted",
+                              upstream_submission_started=False)
+            except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
+                pass
+        return result
+
     def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False,
              _explicit_ended_recheck: bool = False):
         from services.pool_admission import unknown_text_result
@@ -1526,11 +1556,7 @@ class TextTaskService:
                 with self._db() as db:
                     current = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
                     if current:
-                        current_receipt = json.loads(current[1])
-                        self._validated_unsent_successor_input(db, owner, current[0], current_receipt, self._now())
-                        result = self._public(current_receipt)
-                        result.update(bound_successor_resume_retryable=True, upstream_outcome="not_submitted",
-                                      upstream_submission_started=False)
+                        result = self._local_read_projection(db, owner, current[0], json.loads(current[1]), self._now())
             except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
                 pass
         return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result

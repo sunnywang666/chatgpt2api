@@ -26,6 +26,7 @@ def allowed_route(method: str, path: str) -> bool:
     if method == "GET":
         return path in {"/session", "/v1/models", "/api/image-tasks"} or bool(
             re.fullmatch(rf"/api/chat-requests/{_ID}", path)
+            or re.fullmatch(rf"/api/chat-requests/{_ID}/snapshot", path)
             or re.fullmatch(rf"/api/chat-requests/{_ID}/work", path)
             or re.fullmatch(rf"/api/image-tasks/{_ID}/images/[0-9]+", path)
             or re.fullmatch(rf"/api/image-tasks/{_ID}/work", path)
