@@ -2,6 +2,7 @@
 from copy import deepcopy
 import json
 import multiprocessing
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,8 +12,9 @@ from pydantic import ValidationError
 
 from api.ai import ConversationBindingTextRequest
 from services.conversation_binding_service import ConversationBindingError
-from services.request_context import current_request
+from services.request_context import AdmissionLost, current_request
 from services.text_task_service import TextTaskService
+from services.image_task_service import ImageTaskService
 from test.test_pool_admission import Clock, build, claim_worker
 from test.test_bound_text_archive import bound_chat
 
@@ -60,7 +62,8 @@ def task(tmp_path):
     (tmp_path / "accounts.json").write_text(json.dumps([{
         "access_token": "fixture", "account_id": "physical", "provider_account_identity": "original-account",
         "conversation_binding_ids": ["original-binding"], "type": "Plus", "status": "正常", "quota": 99,
-        "source_type": "web",
+        "source_type": "web", "limits_progress": [{"feature_name": "image_gen", "remaining": 9}],
+        "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
     }]))
     clock = Clock()
     _, store, admission = build(tmp_path, clock)
@@ -108,6 +111,199 @@ def prove_no_final_model_rejection(task):
            original_upstream_error={"message": "Model not found"})
     return {"client_request_id": "model-retry", "supersedes_request_id": "rejected-parent",
             "client_conversation_id": "session"}
+
+
+def missing_node_model_rejection_with_queued_image(task, *, image_changes=None):
+    """Build R -> P -> C locally; C is the only image-linked retry shape."""
+    rewrite_input(task.service, "old", {**task.body, "product_work": {"product_ref": "fixture-product", "step_ref": "text"}})
+    update(task.service, status="failed", error_code="RESULT_UNRECOVERABLE", upstream_outcome="unknown",
+           recovery_reason="REQUEST_MESSAGE_NOT_FOUND",
+           _attempt_reason="ORIGINAL_REQUEST_MESSAGE_NOT_FOUND", _attempt_finished_at=500,
+           recovery_no_result_reads=9, _execution_wait_ended_at=500,
+           _submission_started=True, _executing=False, _turn_reserved=False,
+           _claim_id=None, _claim_until=None, send_count=1)
+    task.service.submit("owner", {
+        **{key: task.body[key] for key in TextTaskService.SUPERSEDE_FIELDS - {"supersedes_request_id"}},
+        "client_request_id": "missing-parent", "supersedes_request_id": "old",
+    }, source="internal:content")
+    update(task.service, "missing-parent", status="failed", error_code="MODEL_NOT_FOUND",
+           upstream_outcome="rejected", _submission_started=True, _executing=False, _turn_reserved=False,
+           original_failure_phase="stream_open", original_exception_category="http",
+           original_upstream_request_stage="conversation", original_http_status=404,
+           original_upstream_error_form="detail_text", original_upstream_error={"message": "Model not found"})
+    parent = receipt(task.service, "missing-parent")
+    update(task.service, _product_work_key=parent["_product_work_key"])
+    images = ImageTaskService(task.root / "image_tasks.json", admission=task.admission, store=task.service.store)
+    images.submit_generation(
+        {"id": "owner", "role": "admin", "external_image_client": True, "_trusted_source": "internal:content"},
+        client_task_id="queued-image", prompt="fixture only", model="gpt-image-2", size=None,
+        provider_binding_id=parent["provider_binding_id"], provider_account_identity=parent["provider_account_identity"],
+        client_conversation_id=parent["client_conversation_id"], conversation_id=parent["conversation_id"],
+        parent_message_id=parent["parent_message_id"], retain_conversation=True,
+        product_work={"product_ref": "fixture-product", "step_ref": "image"},
+    )
+    with task.service.store.transaction() as db:
+        image = task.service.store.read_receipt(db, "image", "owner", "queued-image")
+        image.update(image_changes or {})
+        task.service.store.write_receipt(db, "image", "owner", "queued-image", image)
+    return {"client_request_id": "missing-model-retry", "supersedes_request_id": "missing-parent",
+            "client_conversation_id": "session", "continue_before_queued_image_id": "queued-image"}
+
+
+def test_missing_node_rejected_child_can_link_only_its_queued_unsent_image(task):
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    accepted = task.service.submit("owner", envelope, source="internal:content")
+    retry = receipt(task.service, "missing-model-retry")
+    with task.service.store.connect() as db:
+        image = task.service.store.read_receipt(db, "image", "owner", "queued-image")
+    assert accepted["status"] == "queued"
+    assert retry[TextTaskService.MISSING_NODE_RETRY_FIELD] == "queued-image"
+    assert retry["_sequence"] > image["_sequence"]  # persisted receipts are never reordered
+    context = task.admission.claim_next()
+    assert context.request_id == "missing-model-retry"  # A4 cannot claim ahead of its linked C.
+    task.admission.execute(context)  # Exercises the admission before-send revalidation.
+    assert receipt(task.service, "missing-model-retry")["status"] == "succeeded"
+    next_context = task.admission.claim_next()
+    with task.service.store.connect() as db:
+        queued_image = task.service.store.read_receipt(db, "image", "owner", "queued-image")
+    assert next_context is not None, queued_image
+    assert next_context.request_id == "queued-image"  # A4 resumes only after C is terminal.
+    # The image's final admission guard must release only this proved R/P
+    # chain.  It exercises the successor-success gate rather than merely the
+    # planner's next-item ordering.
+    next_context.before_send()
+    with task.service.store.connect() as db:
+        assert task.service.store.read_receipt(db, "image", "owner", "queued-image")["_submission_started"] is True
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit("owner", {**envelope, "client_request_id": "second-missing-model-retry"},
+                            source="internal:content")
+    assert error.value.code == "CHAT_SUPERSEDE_INVALID"
+
+
+def test_missing_node_parent_cannot_use_three_fields_or_rebind_its_image(task):
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit("owner", {key: value for key, value in envelope.items()
+                                       if key != TextTaskService.MISSING_NODE_RETRY_FIELD}, source="internal:content")
+    assert error.value.code == "CHAT_SUPERSEDE_INVALID"
+    accepted = task.service.submit("owner", envelope, source="internal:content")
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit("owner", {**envelope, TextTaskService.MISSING_NODE_RETRY_FIELD: "other-image"},
+                            source="internal:content")
+    assert error.value.code == "CONVERSATION_REQUEST_CONFLICT"
+    assert task.service.submit("owner", envelope, source="internal:content") == accepted
+
+
+def test_missing_node_late_root_change_blocks_a4_before_send(task):
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    task.service.submit("owner", envelope, source="internal:content")
+    retry = task.admission.claim_next()
+    task.admission.execute(retry)
+    assert receipt(task.service, "missing-model-retry")["status"] == "succeeded"
+    # Structural linkage keeps the queue order durable, but a late root state
+    # must still fence the actual image send rather than letting A4 overtake.
+    update(task.service, status="succeeded", upstream_outcome="completed", content="late root result")
+    image = task.admission.claim_next()
+    assert image and image.request_id == "queued-image"
+    with pytest.raises(AdmissionLost):
+        image.before_send()
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+def test_missing_node_failed_c_keeps_a4_behind_unknown_root(task, status):
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    task.service.submit("owner", envelope, source="internal:content")
+    update(task.service, "missing-model-retry", status=status, upstream_outcome="not_sent",
+           _submission_started=False, _executing=False, _turn_reserved=False)
+    assert task.admission.claim_next() is None
+
+
+def test_missing_node_a4_execution_uses_c_terminal_parent_without_mutating_frozen_input(task):
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    task.service.submit("owner", envelope, source="internal:content")
+    retry = task.admission.claim_next()
+    task.admission.execute(retry)
+    assert receipt(task.service, "missing-model-retry")["parent_message_id"] == "new-answer"
+    image = task.admission.claim_next()
+    observed = []
+    def run_image(_context, body):
+        current_request.get().before_send()
+        observed.append(deepcopy(body["payload"]))
+    task.admission.register("image", run_image)
+    task.admission.execute(image)
+    assert observed and observed[0]["parent_message_id"] == "new-answer"
+    with task.service.store.connect() as db:
+        saved = task.service.store.read_receipt(db, "image", "owner", "queued-image")
+        frozen = task.service.store.load_input(saved["_input_ref"])
+    assert frozen["payload"]["parent_message_id"] == "previous-answer"
+    assert saved["_missing_node_retry_request_parent_message_id"] == "new-answer"
+    assert saved["request_parent_message_id"] == "new-answer"
+
+
+@pytest.mark.parametrize("changes", [
+    {"_recovery_paused": True}, {"_recovery_suppressed": True}, {"_work_key": "owned-work"},
+    {"_completion": {"state": "pending"}}, {"_completion_of": "other"},
+    {"_claim_id": "live", "_claim_until": 1100},
+])
+def test_missing_node_root_live_blockers_refuse_c(task, changes):
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    update(task.service, **changes)
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit("owner", envelope, source="internal:content")
+    assert error.value.code == "CHAT_SUPERSEDE_INVALID"
+
+
+def test_missing_node_retry_rejects_changed_image_frozen_input(task):
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    with task.service.store.transaction() as db:
+        image = task.service.store.read_receipt(db, "image", "owner", "queued-image")
+        frozen = task.service.store.load_input(image["_input_ref"])
+        frozen["payload"] = {**frozen["payload"], "prompt": "changed after acceptance"}
+        image["_input_ref"] = task.service.store.save_input(frozen)
+        task.service.store.write_receipt(db, "image", "owner", "queued-image", image)
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit("owner", envelope, source="internal:content")
+    assert error.value.code == "CHAT_SUPERSEDE_INVALID"
+
+
+def test_missing_node_retry_rejects_other_unfinished_same_conversation(task):
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    with task.service.store.transaction() as db:
+        other = task.service.store.read_receipt(db, "image", "owner", "queued-image")
+        other.update(id="unrelated-pending", _sequence=other["_sequence"] + 1)
+        task.service.store.write_receipt(db, "image", "owner", "unrelated-pending", other)
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit("owner", envelope, source="internal:content")
+    assert error.value.code == "CHAT_SUPERSEDE_INVALID"
+
+
+def test_missing_node_retry_revalidates_root_before_send_and_same_id_is_idempotent(task):
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    task.service.submit("owner", envelope, source="internal:content")
+    # A restart/control replay can only read back this C; it cannot create D.
+    assert task.service.submit("owner", envelope, source="internal:content")["request_id"] == "missing-model-retry"
+    context = task.admission.claim_next()
+    assert context.request_id == "missing-model-retry"
+    update(task.service, status="succeeded", content="late root result")
+    with pytest.raises(ConversationBindingError):
+        context.before_send()
+    assert receipt(task.service, "missing-model-retry")["_submission_started"] is False
+    with task.service.store.connect() as db:
+        retry = task.service.store.read_receipt(db, "text", "owner", "missing-model-retry")
+        assert TextTaskService._missing_node_model_rejection_retry_consumed(
+            task.service.store, db, "owner", retry)
+
+
+@pytest.mark.parametrize("changes", [
+    {"_submission_started": True}, {"request_message_id": "already-started"},
+    {"status": "error", "upstream_unfinished": True}, {"provider_binding_id": "foreign-binding"},
+])
+def test_missing_node_retry_rejects_changed_or_started_linked_image(task, changes):
+    envelope = missing_node_model_rejection_with_queued_image(task, image_changes=changes)
+    with pytest.raises(ConversationBindingError) as error:
+        task.service.submit("owner", envelope, source="internal:content")
+    assert error.value.code == "CHAT_SUPERSEDE_INVALID"
+    assert receipt(task.service, "missing-model-retry") is None
 
 
 @pytest.mark.parametrize("cursor", [True, False])

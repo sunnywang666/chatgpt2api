@@ -168,6 +168,27 @@
 
 此分支只扩展内部消费者合同；普通 API、旧七字段 UNKNOWN/no-final 后继和图片请求的规则不变。Provider 上线并完成接口核验后，消费者才能启用。回退必须保留能识别已登记后继的版本，不删除新旧回执或原输入。
 
+##### 原消息缺失的后继被拒，且自身图片仍在排队
+
+对“已停止恢复的原消息缺失请求 R → 唯一已登记、明确 `MODEL_NOT_FOUND` 的后继 P”，若同一商品、账号和会话已有一条确定未发送的图片排在后面，内部调用方可用下面四个字段登记一次 C。`supersedes_request_id` 必须指向 P，不能再给 R 建第二个直接后继。这个分支不接受 `continue_after_no_final`；缺失原消息与存在原消息但无最终答案是不同的证据。
+
+```json
+{
+  "supersedes_request_id": "existing-rejected-successor-P",
+  "client_request_id": "one-persisted-child-C",
+  "client_conversation_id": "original-client-session",
+  "continue_before_queued_image_id": "existing-unsent-image-id"
+}
+```
+
+Provider 从 P 的保留输入派生 C，核对 R/P 的唯一关系、原 hash、绑定及固定父消息。该图片引用只允许 C 在自己的这条未发送图片之前执行，不改原 sequence，也不允许跳过其他未完成任务。创建、领取及发送前重复核对同一关系；图片已领取、发送、结果不明、身份或输入变化时不放行。原 R/P 及失败证据全部保留，R 的 `UNKNOWN` 不改成成功或未发送。
+
+发送复用原来的两次会话读取，核对 R/P/C 三个用户消息都未出现、固定终态父节点及其上下文未变化。查到迟到节点或结果时停止 C，沿原结果处理；不因此次接续申请丢弃旧答案。C 一经登记就消费这次机会，即使 R/P 后来改变状态，C 也不能再建立 Chat/Codex 后继或通过 missing-successor 接口换上游消息 ID。丢失响应和重启后只查同一 C；没有上游原子去重保证，不能宣称不存在潜在重复风险。
+
+这仍然可能发起一次新生成，不是找回旧结果。调用方必须先在原业务任务持久登记 C，并配对传递图片引用、校验和保存结果，才能启用；仅部署 Provider 不代表原业务已接通。普通 Key、公网 Chat、Happy、其他 UNKNOWN 和生成并发配置不变。发布后以原任务的文字保存、原图片结果及归档分别验收；已受理 C 后的回退版本必须认识此关系，不能直接降级后放任原图片越过 C。
+
+该商品的完成仍要求 C 有非空终态文字、原 A4 有成功图片结果，以及调用方确认结果已保存。只有这条完整且身份、输入和归属均一致的关系，才能在保留 R/P 失败记录的同时结束商品工作；普通后继成功不会解除其他 `UNKNOWN`。归档使用实际最后执行的 A4 会话位置，不能按登记先后错误地选中 C；归档前再次核对原关系，确认归档后才释放商品占用。迟到结果、活跃领取、暂停、外部会话成员或归档失败都不能被“新文字成功”掩盖。
+
 #### 已发送但无最终回答的显式原会话后继
 
 同一内部接口的七个身份字段可额外带 `continue_after_no_final: true`。此模式仅用于旧公司原生文字请求已经以 `ORIGINAL_RESULT_NO_FINAL` 停止自动恢复、至少三次有效读取仍为 `REQUEST_RESULT_NOT_FOUND`，且无工作生命周期、completion、暂停或活跃领取的情况；客户端不能替换提示词、模型或身份。已保存的 text `_retry_cursor` 不代表活动领取：仅当它是精确绑定同一原 `conversation_id`、`request_message_id` 的完整空分支观测，才可保留并走这一显式后继；错锚、缺字段或 image-source 游标仍拒绝。只有下面的 `attributes_required_only_v4` 封闭升级可与此标志合用；旧 `category_directory_parent_v1` 仍不可合用。默认省略时继续使用原消息缺失分支，不自动开启重试。

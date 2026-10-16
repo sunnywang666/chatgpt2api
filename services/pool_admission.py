@@ -10,6 +10,7 @@ from services.image_thread import bind_waiting_threads, predecessor_state
 
 from contextlib import nullcontext
 import hashlib
+import json
 import math
 import threading
 import time
@@ -27,6 +28,48 @@ def reset_unsent_image_attempt(kind, receipt):
         # Queue/cooldown time is outside a not-yet-sent active attempt.
         receipt.update(active_attempt_started_at=None,
                        active_attempt_deadline_at=None, started_ts=None)
+
+
+def _missing_node_retry_image_parent(store, db, owner, image_id, now):
+    """Return C's only safe terminal parent for its linked A4, if any.
+
+    This is intentionally a narrow database lookup rather than an all-receipt
+    scan: routine image sends do not need to decode unrelated text receipts.
+    An existing marker is authoritative.  If it no longer proves the exact
+    live R -> P -> C chain, A4 must fail closed instead of falling back to its
+    stale frozen parent.
+    """
+    from services.text_task_service import TextTaskService
+    rows = db.execute(
+        "SELECT receipt FROM requests WHERE owner=? AND "
+        "json_extract(receipt,'$.continue_before_queued_image_id')=?",
+        (owner, image_id),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise AdmissionLost("missing-node image continuation is ambiguous")
+    try:
+        candidate = json.loads(rows[0][0])
+    except (TypeError, ValueError):
+        raise AdmissionLost("missing-node image continuation is invalid")
+    parent_id = candidate.get("_supersedes_request_id")
+    parent = (store.read_receipt(db, "text", owner, parent_id)
+              if isinstance(parent_id, str) else None)
+    parent_message_id = candidate.get("parent_message_id")
+    if (candidate.get(TextTaskService.MISSING_NODE_RETRY_FIELD) != image_id
+            or candidate.get("status") != "succeeded"
+            or candidate.get("upstream_outcome") != "completed"
+            or not isinstance(candidate.get("content"), str) or not candidate["content"].strip()
+            or not isinstance(parent_message_id, str) or not parent_message_id
+            or not isinstance(parent, dict)
+            or not TextTaskService._missing_node_model_rejection_retry_consumed(store, db, owner, candidate)
+            or not TextTaskService._rejected_missing_node_successor_source(store, db, owner, parent, now)):
+        raise AdmissionLost("missing-node image continuation changed before send")
+    root_id = parent.get("_supersedes_request_id")
+    if not isinstance(root_id, str) or not root_id:
+        raise AdmissionLost("missing-node image continuation is invalid")
+    return parent_message_id, parent_id, root_id
 
 
 def record_unsent_failure(context, receipt, at, error_type=None, reason=None):
@@ -668,12 +711,38 @@ class PoolAdmission:
                         len(retries) == 1
                         and (retries[0][1].get("status") in {"queued", "running", "unknown", "succeeded"}
                              or unknown_text_result(retries[0][1]))
-                        and TextTaskService._no_final_model_rejection_retry(
-                            self.store, db, key[0], retries[0][1], now)
+                        and (TextTaskService._no_final_model_rejection_retry(
+                                self.store, db, key[0], retries[0][1], now)
+                             or TextTaskService._missing_node_model_rejection_retry(
+                                self.store, db, key[0], retries[0][1], now)
+                             or TextTaskService._missing_node_model_rejection_retry_consumed(
+                                self.store, db, key[0], retries[0][1]))
                         and TextTaskService._supersede_order_link(successor, retries[0][1])
                     )
                 if advances and TextTaskService._supersede_order_link(previous, successor):
                     released_order_heads.add(key)
+        missing_node_image_links = {}
+        if db is not None:
+            from services.text_task_service import TextTaskService
+            for (owner, request_id), receipt in text_receipts.items():
+                image_id = receipt.get(TextTaskService.MISSING_NODE_RETRY_FIELD)
+                live_link = (receipt.get("status") in {"queued", "running", "unknown"}
+                             and isinstance(image_id, str) and image_id
+                             and TextTaskService._missing_node_model_rejection_retry(
+                                 self.store, db, owner, receipt, now))
+                # Once C has positively succeeded, late observations on R/P
+                # must not revive their UNKNOWN queue barrier.  This is the
+                # durable four-receipt proof, deliberately separate from live
+                # eligibility. Failed/cancelled C never releases A4.
+                completed_link = (receipt.get("status") == "succeeded"
+                                  and receipt.get("upstream_outcome") == "completed"
+                                  and isinstance(receipt.get("content"), str) and bool(receipt["content"].strip())
+                                  and TextTaskService._missing_node_model_rejection_retry_consumed(
+                                      self.store, db, owner, receipt))
+                if live_link or completed_link:
+                    missing_node_image_links[(owner, request_id)] = image_id
+        image_retry_predecessors = {(owner, image_id): request_id
+                                    for (owner, request_id), image_id in missing_node_image_links.items()}
         physical_pending = {}
         for kind, owner, request_id, receipt in receipts:
             key = physical_conversation_key(receipt)
@@ -794,11 +863,22 @@ class PoolAdmission:
                 thread_resources.append(Resource(physical, 1, active_physical, now))
                 physical_needs = (Need(physical),)
                 predecessors = [item for item in members if (item[1], item[2]) != (owner, request_id)
-                                and int(item[3].get("_sequence") or 0) < int(r.get("_sequence") or 0)]
+                                and int(item[3].get("_sequence") or 0) < int(r.get("_sequence") or 0)
+                                and not (missing_node_image_links.get((owner, request_id)) == item[2]
+                                         and item[0] == "image")]
                 if predecessors:
                     order = "conversation_order:" + hashlib.sha256((kind + "\0" + owner + "\0" + request_id).encode()).hexdigest()
                     thread_resources.append(Resource(order, 0, 0, now))
                     physical_needs += (Need(order),)
+            retry_predecessor = image_retry_predecessors.get((owner, request_id)) if kind == "image" else None
+            if retry_predecessor:
+                retry = text_receipts.get((owner, retry_predecessor)) or {}
+                terminal = (retry.get("status") in {"succeeded", "failed", "cancelled"}
+                            and not unresolved_result("text", retry))
+                dependency = "missing_node_retry:" + hashlib.sha256(
+                    (owner + "\0" + retry_predecessor + "\0" + request_id).encode()).hexdigest()
+                thread_resources.append(Resource(dependency, int(terminal), 0, now))
+                physical_needs += (Need(dependency),)
             # Legacy pending rows still protect their conversation order, but
             # cannot execute without a durable input reference.
             scheduling = r.get("_scheduling") or {}
@@ -810,6 +890,7 @@ class PoolAdmission:
                 bool(r.get("_input_ref")), state=state,
                 bound_account=str(r.get("_requested_account_identity") or r.get("provider_account_identity") or "") or None,
                 order_group=(None if (owner, request_id) in released_order_heads
+                             or (owner, request_id) in missing_node_image_links
                              else str(r.get("client_conversation_id") or "") or None),
                 # `source` is the trusted, stable caller.  The planner scopes
                 # this workflow ID to that source, so workflows cannot gain a
@@ -1665,9 +1746,16 @@ class PoolAdmission:
                 binding, blocked = predecessor_state(r, owned)
                 if blocked or any(r.get(k) != v for k, v in binding.items()):
                     raise AdmissionLost("original image thread predecessor changed before send")
+            missing_node_image_id = None
+            missing_node_completed_predecessors = set()
             if context.kind == "text" and r.get("_supersedes_request_id"):
                 from services.text_task_service import TextTaskService
                 TextTaskService._validate_supersede(self.store, db, context.owner, r, now)
+                if r.get(TextTaskService.MISSING_NODE_RETRY_FIELD):
+                    if not TextTaskService._missing_node_model_rejection_retry(
+                            self.store, db, context.owner, r, now):
+                        raise AdmissionLost("missing-node retry ordering changed before send")
+                    missing_node_image_id = r[TextTaskService.MISSING_NODE_RETRY_FIELD]
                 missing_attempt = TextTaskService._missing_successor_attempt(r)
                 if "_missing_successor_resume" in r and missing_attempt is None:
                     raise AdmissionLost("missing-successor resend marker is invalid")
@@ -1677,6 +1765,22 @@ class PoolAdmission:
                     r["_missing_successor_resume"] = {
                         **missing_attempt, "state": "submitted", "submitted_at": now,
                     }
+            elif context.kind == "image":
+                # A4 may send only after its exact C completed successfully.
+                # The structural proof identifies the two historical text
+                # barriers R/P that this one image is permitted to pass; no
+                # unrelated UNKNOWN receipt is released.
+                missing_node_link = _missing_node_retry_image_parent(
+                    self.store, db, context.owner, context.request_id, now,
+                )
+                if missing_node_link:
+                    parent_message_id, parent_id, root_id = missing_node_link
+                    missing_node_completed_predecessors.update({parent_id, root_id})
+                    saved_parent = r.get("_missing_node_retry_request_parent_message_id")
+                    if saved_parent is not None and saved_parent != parent_message_id:
+                        raise AdmissionLost("missing-node image continuation parent changed before send")
+                    r.update(_missing_node_retry_request_parent_message_id=parent_message_id,
+                             request_parent_message_id=parent_message_id)
             if context.kind == "text" and r.get("_public_session_ref") and r.get("_previous_request_id") and not r.get("_terminal_empty_correction_of") and not r.get("_same_session_retry_of"):
                 previous = self.store.read_receipt(db, "text", context.owner, r["_previous_request_id"]) or {}
                 if (r.get("_public_previous_waiting") or previous.get("status") != "succeeded"
@@ -1691,7 +1795,13 @@ class PoolAdmission:
                 statuses=("queued", "not_started", "running", "unknown", "failed", "error"),
                 include_upstream_unfinished=True)) if physical or needs_image_capacity else ()
             if physical:
-                for other_kind, _, _, other in occupancy:
+                for other_kind, other_owner, other_id, other in occupancy:
+                    if (context.kind == "text" and other_kind == "image"
+                            and other.get("id") == missing_node_image_id):
+                        continue
+                    if (context.kind == "image" and other_kind == "text" and other_owner == context.owner
+                            and other_id in missing_node_completed_predecessors):
+                        continue
                     if (other_kind != context.kind and physical_conversation_key(other) == physical
                             and unfinished(other_kind, other)
                             and (other.get("status") == "running" or unresolved_result(other_kind, other)
@@ -1802,6 +1912,30 @@ class PoolAdmission:
                 self.update_claim(context, status="failed" if context.kind == "text" else "error",
                                   error_code="TASK_INPUT_UNAVAILABLE", _turn_reserved=False, upstream_unfinished=False)
                 return
+            missing_node_retry_parent = None
+            if context.kind == "image":
+                # Resolve C's output parent for the in-memory A4 execution
+                # copy. The durable input remains unchanged and was hashed
+                # above; this receipt metadata is rechecked by before_send at
+                # the real network edge before the bound-image protocol reads
+                # the conversation.
+                with self.store.transaction() as db:
+                    current = self.store.read_receipt(db, "image", context.owner, context.request_id)
+                    if not current or current.get("_claim_id") != context.claim:
+                        raise AdmissionLost("original task claim expired")
+                    link = _missing_node_retry_image_parent(
+                        self.store, db, context.owner, context.request_id, float(self.clock()),
+                    )
+                    if link:
+                        missing_node_retry_parent = link[0]
+                        saved_parent = current.get("_missing_node_retry_request_parent_message_id")
+                        if saved_parent is not None and saved_parent != missing_node_retry_parent:
+                            raise AdmissionLost("missing-node image continuation parent changed before execution")
+                        current.update(_missing_node_retry_request_parent_message_id=missing_node_retry_parent,
+                                       request_parent_message_id=missing_node_retry_parent)
+                        self.store.write_receipt(db, "image", context.owner, context.request_id, current)
+                        r.update(_missing_node_retry_request_parent_message_id=missing_node_retry_parent,
+                                 request_parent_message_id=missing_node_retry_parent)
             payload = body["payload"] if context.kind == "image" else body
             if context.kind == "image" and r.get("_same_session_retry_of"):
                 from services.generation_completion import same_session_retry
@@ -1822,6 +1956,8 @@ class PoolAdmission:
                 payload.update({k: r[k] for k in ("_image_thread", "_image_thread_predecessor_message",
                     "_image_thread_predecessor_result_ids", "conversation_id", "parent_message_id") if r.get(k)})
                 self.update_claim(context, _image_thread_request_parent=r.get("parent_message_id") or None)
+            if missing_node_retry_parent:
+                payload["parent_message_id"] = missing_node_retry_parent
             payload["_admission_claim"] = context.claim
             payload["_request_message_id"] = r.get("request_message_id")
             with executing(context):

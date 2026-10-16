@@ -104,6 +104,8 @@ class ConversationBindingTextRequest(BaseModel):
     client_conversation_id: str
     client_request_id: str | None = Field(default=None, min_length=1, max_length=200)
     supersedes_request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    continue_before_queued_image_id: str | None = Field(default=None, min_length=1, max_length=200,
+                                                        exclude_if=lambda value: value is None)
     derived_input: dict[str, object] | None = Field(default=None, exclude_if=lambda value: value is None)
     continue_after_no_final: bool | None = Field(default=None, strict=True, exclude_if=lambda value: value is None)
     product_work: ProductWorkInput | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -121,12 +123,16 @@ class ConversationBindingTextRequest(BaseModel):
     @model_validator(mode="after")
     def original_or_successor(self):
         no_final = "continue_after_no_final" in self.model_fields_set
+        queued_image = "continue_before_queued_image_id" in self.model_fields_set
         attributes_upgrade = self.derived_input == {"kind": "attributes_required_only_v4"}
         if attributes_upgrade and not no_final:
             raise ValueError("attributes upgrade requires explicit no-final continuation")
         if no_final and (self.continue_after_no_final is not True or not self.supersedes_request_id
                          or self.derived_input is not None and not attributes_upgrade):
             raise ValueError("no-final continuation requires an explicit original-request successor")
+        if queued_image and (not self.continue_before_queued_image_id or not self.supersedes_request_id
+                             or no_final or self.derived_input is not None):
+            raise ValueError("queued-image continuation requires its own explicit rejected successor")
         if self.supersedes_request_id is None:
             if self.derived_input is not None:
                 raise ValueError("derived input requires an original request")
@@ -134,6 +140,7 @@ class ConversationBindingTextRequest(BaseModel):
                 raise ValueError("messages are required")
         elif self.model_fields_set not in (
                 TextTaskService.REJECTED_SUPERSEDE_FIELDS,
+                TextTaskService.MISSING_NODE_RETRY_FIELDS,
                 TextTaskService.SUPERSEDE_FIELDS | ({"derived_input"} if self.derived_input is not None else set()) | ({"continue_after_no_final"} if no_final else set()),
         ):
             raise ValueError("explicit successor requires only original binding and request identities")

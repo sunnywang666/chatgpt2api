@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import time
@@ -1606,6 +1607,65 @@ class ConversationBindingService:
             reject("CHAT_SUPERSEDE_CURSOR_CHANGED")
 
     @staticmethod
+    def _check_missing_node_model_retry(document, conversation_id, parent_message_id,
+                                        root_user, rejected_user, retry_user):
+        """Fence C beside an absent R -> P chain without treating R as no-final.
+
+        The normal supersede check supplies the fixed terminal parent/current
+        node proof for R.  P and C must also be absent by both mapping key and
+        embedded message identity on the very same document.  Callers run this
+        once before restoration and again at the final send preflight.
+        """
+        ConversationBindingService._check_superseded_original(
+            document, conversation_id, parent_message_id, root_user,
+        )
+        mapping = document.get("mapping") if isinstance(document, dict) else None
+        for user in (rejected_user, retry_user):
+            if not ConversationBindingService._missing_successor_node_absent(mapping, user):
+                raise ConversationBindingError("missing-node retry already appeared",
+                                               code="CHAT_SUPERSEDE_ORIGINAL_FOUND")
+        # The two existing GETs must agree on more than a stable node ID. A
+        # rewritten ancestor can keep `current_node` unchanged while changing
+        # the context that C would extend. Fingerprint the complete validated
+        # root-to-terminal branch; callers compare it before the POST without
+        # adding another upstream read.
+        branch, node_id, seen = [], parent_message_id, set()
+        while True:
+            if node_id in seen:
+                raise ConversationBindingError("original conversation context is invalid",
+                                               code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
+            seen.add(node_id)
+            node = mapping.get(node_id)
+            if not isinstance(node, dict):
+                raise ConversationBindingError("original conversation context is unavailable",
+                                               code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
+            message = node.get("message") if isinstance(node, dict) else None
+            parent = node.get("parent")
+            # Conversation mappings may start at a synthetic null-message
+            # root. It is valid only as the final sentinel, never as an
+            # intermediate part of the parent context.
+            if message is None and parent is None:
+                branch.append({"id": node_id, "parent": None, "children": node.get("children"),
+                               "message": None})
+                break
+            if not isinstance(message, dict) or message.get("id") != node_id:
+                raise ConversationBindingError("original conversation context is unavailable",
+                                               code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
+            if parent is not None and not isinstance(parent, str):
+                raise ConversationBindingError("original conversation context is invalid",
+                                               code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
+            branch.append({"id": node_id, "parent": parent, "children": node.get("children"),
+                           "message": message})
+            if parent is None:
+                break
+            node_id = parent
+        try:
+            return hashlib.sha256(json.dumps(branch, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        except (TypeError, ValueError):
+            raise ConversationBindingError("original conversation context is invalid",
+                                           code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
+
+    @staticmethod
     def _no_final_successor_tail(document, original):
         """Accept the unchanged original user leaf or completed code/tool context.
 
@@ -1788,14 +1848,25 @@ class ConversationBindingService:
             if body.get("_public_session_ref") or body.get("_supersedes_request_message_id"):
                 backend.text_cursor_callback = on_cursor
             missing_no_final_context = None
+            missing_node_context = None
             if body.get("_supersedes_request_message_id"):
                 def check_original(send):
+                    nonlocal missing_node_context
                     try:
                         fresh = backend._get_conversation(conversation_id, _send=send)
                     except Exception as exc:
                         raise ConversationBindingError("original conversation read is temporarily unavailable",
                                                        code="CHAT_SUPERSEDE_READ_UNAVAILABLE") from exc
-                    if body.get("_missing_successor_no_final_predecessor"):
+                    if body.get("_missing_node_retry_root_request_message_id"):
+                        fresh_context = self._check_missing_node_model_retry(
+                            fresh, conversation_id, parent_message_id,
+                            body["_missing_node_retry_root_request_message_id"],
+                            body["_supersedes_request_message_id"], backend.text_request_message_id,
+                        )
+                        if fresh_context != missing_node_context:
+                            raise ConversationBindingError("original missing-node context changed",
+                                                           code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+                    elif body.get("_missing_successor_no_final_predecessor"):
                         if self._check_missing_successor_no_final(
                                 fresh, conversation_id, body["_missing_successor_no_final_predecessor"],
                                 body["_supersedes_request_message_id"], backend.text_request_message_id,
@@ -1889,7 +1960,13 @@ class ConversationBindingService:
                                     "original successor appeared before resend",
                                     code="CHAT_SUPERSEDE_CURSOR_CHANGED",
                                 )
-                        if body.get("_missing_successor_no_final_predecessor"):
+                        if body.get("_missing_node_retry_root_request_message_id"):
+                            missing_node_context = self._check_missing_node_model_retry(
+                                document, conversation_id, parent_message_id,
+                                body["_missing_node_retry_root_request_message_id"],
+                                body["_supersedes_request_message_id"], backend.text_request_message_id,
+                            )
+                        elif body.get("_missing_successor_no_final_predecessor"):
                             missing_no_final_context = self._check_missing_successor_no_final(
                                 document, conversation_id, body["_missing_successor_no_final_predecessor"],
                                 body["_supersedes_request_message_id"], backend.text_request_message_id,
