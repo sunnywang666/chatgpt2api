@@ -27,6 +27,15 @@ This is an engineering client for the persistent task API. The existing public s
 `/api/conversation-bindings/text-requests/{request_id}/recovery-control`，仍按原认证身份归属。
 公司入口沿现有公司会话转发同一操作，不需要员工提供 Key。
 
+临时暂停后需要安全恢复的调用者，应保存控制响应中的 `recovery_control.version`。
+例如暂停响应版本为 `1`，恢复时发送 `{"state":"active","expected_version":1}`。
+服务在同一事务内核对版本并写入；期间若有人再次操作（包括再次暂停），返回
+`409 RECOVERY_CONTROL_CONFLICT` 及当前控制状态，不写入，也不唤醒读取。
+发生冲突应保留当前状态，不能换成不带条件的请求强行恢复。
+旧的只带 `state` 的调用仍可用，但不能用于保证只撤销自己那次临时暂停。
+尚无控制版本的旧回执按版本 `0` 处理；每个成功控制请求都会递增版本，普通结果保存不会递增。
+`expected_version` 必须省略或传非负整数，不能传 `null`、字符串或布尔值。
+
 独立客户端复用原状态文件：
 
 ```sh
@@ -40,7 +49,7 @@ python3 examples/image_client.py --env-file .image-client.env recovery-resume --
   文字公开回执位于 `recovery.control`，图片及内部文字回执位于 `recovery_control`。
 - `pausing` / `in_flight=true` 表示已有本地操作仍在途，不能宣称它已经取消。它可结束并保存原结果，
   后续读取不会再启动。当前已开始的有界读取可能包含多次上游 HTTP；暂停不是中途断网。
-- 状态持久化、重复操作幂等。恢复不发送模型请求、不清空原输入/结果/错误/UNKNOWN、不绕过
+- 状态持久化、重复操作保持相同状态（控制版本仍递增）。恢复不发送模型请求、不清空原输入/结果/错误/UNKNOWN、不绕过
   `Retry-After` 和已有退避，也不解除工作流暂停或其他停止标记。
   请求恢复到 active 时，若仍有内部停止标记，返回 `state=stopped, operator_stopped=true`，客户端明确报未恢复。
   请求暂停时，`paused/pausing` 表示本次暂停意图，`operator_stopped=true` 同时说明还存在另一个停止范围。

@@ -35,9 +35,17 @@ def recovery_control(receipt):
     in_flight = bool(receipt.get("recovery_claim_id") or receipt.get("_executing")
                      or receipt.get("status") == "running")
     stopped = receipt.get("_recovery_suppressed") is True
+    version = receipt.get("_recovery_control_version", 0)
     return {"state": "pausing" if paused and in_flight else "paused" if paused else "stopped" if stopped else "active",
             "in_flight": in_flight,
-            "operator_stopped": stopped}
+            "operator_stopped": stopped,
+            "version": version if type(version) is int and version >= 0 else None}
+
+
+class RecoveryControlConflict(Exception):
+    def __init__(self, control):
+        super().__init__("Recovery control changed; no update was applied")
+        self.control = control
 
 
 def _pack(value):
@@ -67,17 +75,26 @@ def _unpack(value):
 
 
 class TaskStore:
-    def set_recovery_paused(self, kind, owner, request_id, paused):
+    def set_recovery_paused(self, kind, owner, request_id, paused, expected_version=None):
         # Serialize with both original-result claim paths. Never touch leases,
         # outcome, retry times, original input, or conversation/slot protection.
         with self.transaction() as db:
             receipt = self.read_receipt(db, kind, owner, request_id)
             if receipt is None:
                 return None
+            control = recovery_control(receipt)
+            version = control["version"]
+            if version is None or (expected_version is not None and (
+                    type(expected_version) is not int or expected_version != version)):
+                raise RecoveryControlConflict(control)
             if (receipt.get("_recovery_paused") is True) != paused:
                 receipt["_recovery_paused"] = paused
                 receipt["_recovery_control_updated_at"] = time.time()
-                self.write_receipt(db, kind, owner, request_id, receipt)
+            # Even a repeated pause is a new operator decision: a previous
+            # conditional restore must not undo it. Other receipt writes do
+            # not advance this control-only version.
+            receipt["_recovery_control_version"] = version + 1
+            self.write_receipt(db, kind, owner, request_id, receipt)
             return recovery_control(receipt)
 
     def __init__(self, path: Path):

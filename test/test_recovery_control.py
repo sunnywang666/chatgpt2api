@@ -13,6 +13,7 @@ from services.conversation_binding_service import ConversationBindingService
 from services.image_task_service import ImageTaskService
 from services.pool_admission import unfinished, unknown_text_result
 from services.text_task_service import TextTaskService
+from services.task_store import RecoveryControlConflict, TaskStore
 from test.test_company_requests import company, CONNECTOR
 from test.test_unknown_turn_recovery import migration, document
 
@@ -43,7 +44,10 @@ def test_pause_restart_resume_preserves_identity_protection_and_other_scopes(tmp
     assert {k:v for k,v in paused.items() if not k.startswith("_recovery_")} == original
     assert text.store.set_recovery_paused("text", "other", "old-0", False) is None
     assert text.store.set_recovery_paused("text", "owner", "old-0", True)["state"] == "paused"
-    assert raw(text) == paused  # idempotence, including timestamp
+    repeated = raw(text)
+    assert repeated.pop("_recovery_control_version") == paused["_recovery_control_version"] + 1
+    assert repeated == {k: v for k, v in paused.items() if k != "_recovery_control_version"}
+    paused = raw(text)  # state and timestamp are idempotent; each command advances the version
     restarted = TextTaskService(text.store.path, admission=admission, clock=admission.clock,
                                 recovery_reader=reader, runner=Mock())
     admission.clock.now = 3000
@@ -236,3 +240,94 @@ def test_private_image_admin_control_and_body_limit(company):
     assert company.client.post(path, headers=headers, json={"state":"active", "padding":"a"*1100}).status_code == 413
     assert company.client.post(path, headers={**headers,"X-Workbench-Image-Client":"1"}, json={"state":"active"}).status_code == 403
     assert raw(company.images,"image",owner,"legacy-image")["_recovery_paused"] is True
+
+
+def seed_control_receipt(store, kind, owner, receipt):
+    with store.transaction() as db:
+        if kind == "text":
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)", (owner, "original", "original-hash", json.dumps(receipt)))
+        else:
+            store.write_receipt(db, kind, owner, "original", receipt)
+
+
+@pytest.mark.parametrize("kind", ["text", "image"])
+def test_conditional_restore_does_not_override_a_later_same_state_command(tmp_path, kind):
+    store = TaskStore(tmp_path / "tasks.sqlite")
+    original = {"status": "unknown", "content": "original", "recovery_next_at": 2000,
+                "recovery_claim_id": "original-claim", "_turn_reserved": True,
+                "_input_ref": "original-input", "conversation_id": "original-conversation"}
+    seed_control_receipt(store, kind, "owner", original)
+    paused = store.set_recovery_paused(kind, "owner", "original", True, expected_version=0)
+    assert paused["version"] == 1 and paused["state"] == "pausing"
+    # A legacy caller repeats pause while the first caller holds version 1.
+    peer = TaskStore(store.path)
+    assert peer.set_recovery_paused(kind, "owner", "original", True)["version"] == 2
+    with store.connect() as db:
+        before = store.read_receipt(db, kind, "owner", "original")
+    with pytest.raises(RecoveryControlConflict) as error:
+        store.set_recovery_paused(kind, "owner", "original", False, expected_version=1)
+    assert error.value.control["version"] == 2
+    with store.connect() as db:
+        assert store.read_receipt(db, kind, "owner", "original") == before
+    restarted = TaskStore(store.path)
+    assert restarted.set_recovery_paused(kind, "owner", "original", False, expected_version=2)["version"] == 3
+    with store.connect() as db:
+        restored = store.read_receipt(db, kind, "owner", "original")
+    assert {k: v for k, v in restored.items() if not k.startswith("_recovery_")} == original
+
+
+def test_competing_control_commands_compare_and_write_atomically(tmp_path):
+    store = TaskStore(tmp_path / "tasks.sqlite")
+    seed_control_receipt(store, "text", "owner", {"status": "unknown"})
+    def change():
+        try:
+            return TaskStore(store.path).set_recovery_paused("text", "owner", "original", True, expected_version=0)
+        except RecoveryControlConflict:
+            return "conflict"
+    with ThreadPoolExecutor(2) as workers:
+        outcomes = list(workers.map(lambda _: change(), range(2)))
+    assert outcomes.count("conflict") == 1
+    assert [v["version"] for v in outcomes if isinstance(v, dict)] == [1]
+
+
+@pytest.mark.parametrize("kind", ["text", "image"])
+def test_company_control_conflict_does_not_mutate_or_wake(company, kind):
+    owner = company_identity("company", "employee", CONNECTOR)["id"]
+    service = company.text_tasks if kind == "text" else company.images
+    seed_control_receipt(service.store, kind, owner, {"status": "unknown"})
+    service.admission = Mock()
+    path = PREFIX + f"/api/{'chat-requests' if kind == 'text' else 'image-tasks'}/original/recovery-control"
+    paused = company.client.post(path, headers=company.headers(), json={"state": "paused", "expected_version": 0})
+    assert paused.status_code == 200 and paused.json()["recovery_control"]["version"] == 1
+    before = raw(service, kind, owner, "original")
+    stale = company.client.post(path, headers=company.headers(), json={"state": "active", "expected_version": 0})
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "RECOVERY_CONTROL_CONFLICT"
+    assert stale.json()["detail"]["recovery_control"]["version"] == 1
+    assert raw(service, kind, owner, "original") == before
+    service.admission.wake.assert_not_called()
+    assert company.client.post(path, headers=company.headers(user="other"),
+                               json={"state": "active", "expected_version": 1}).status_code == 404
+    resumed = company.client.post(path, headers=company.headers(), json={"state": "active", "expected_version": 1})
+    assert resumed.status_code == 200 and resumed.json()["recovery_control"]["version"] == 2
+    service.admission.wake.assert_called_once()
+
+
+@pytest.mark.parametrize("value", [None, True, False, -1, 1.0, "1"])
+def test_control_expected_version_rejects_ambiguous_values(value):
+    from pydantic import ValidationError
+    from api.recovery_control import RecoveryControlRequest
+    with pytest.raises(ValidationError):
+        RecoveryControlRequest(state="active", expected_version=value)
+    assert RecoveryControlRequest(state="active").expected_version is None
+
+
+@pytest.mark.parametrize("version", [None, True, -1, "1"])
+def test_invalid_stored_version_never_resets_control(tmp_path, version):
+    store = TaskStore(tmp_path / "tasks.sqlite")
+    original = {"status": "unknown", "_recovery_paused": True, "_recovery_control_version": version}
+    seed_control_receipt(store, "text", "owner", original)
+    with pytest.raises(RecoveryControlConflict):
+        store.set_recovery_paused("text", "owner", "original", False)
+    with store.connect() as db:
+        assert store.read_receipt(db, "text", "owner", "original") == original
