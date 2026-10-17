@@ -1725,6 +1725,78 @@ class ConversationBindingService:
             previous_role, node_id = role, next_nodes[0]
 
     @staticmethod
+    def _native_no_final_prefix(document, conversation_id, prefix):
+        """Verify the immutable R -> P(absent) -> N prefix beside N's live tail.
+
+        N is a real submitted user node, so this is intentionally not the
+        missing-successor fence.  It proves the root path still reaches N's
+        recorded actual parent with no late R branch or P node.
+        """
+        def reject(code="CHAT_SUPERSEDE_CURSOR_CHANGED"):
+            raise ConversationBindingError("native no-final prefix changed", code=code)
+        if not isinstance(prefix, dict) or not isinstance(document, dict):
+            reject("CHAT_SUPERSEDE_READ_UNAVAILABLE")
+        root_user = prefix.get("root_request_message_id")
+        root_parent = prefix.get("root_parent_message_id")
+        rejected_user = prefix.get("rejected_request_message_id")
+        native_user = prefix.get("native_request_message_id")
+        native_parent = prefix.get("native_parent_message_id")
+        if (not all(isinstance(value, str) and value for value in (
+                root_user, root_parent, rejected_user, native_user, native_parent))
+                or len({root_user, rejected_user, native_user}) != 3
+                or document.get("conversation_id") != conversation_id
+                or document.get("is_archived") is not False):
+            reject()
+        mapping = document.get("mapping")
+        if not isinstance(mapping, dict):
+            reject("CHAT_SUPERSEDE_READ_UNAVAILABLE")
+        if not ConversationBindingService._missing_successor_node_absent(mapping, rejected_user):
+            reject("CHAT_SUPERSEDE_ORIGINAL_FOUND")
+        if native_user not in mapping or native_parent not in mapping or root_user not in mapping:
+            reject()
+        children = {}
+        for key, node in mapping.items():
+            if not isinstance(node, dict):
+                reject()
+            parent = node.get("parent")
+            if parent is not None and not isinstance(parent, str):
+                reject()
+            children.setdefault(parent, []).append(key)
+        node_id, seen, previous_role, context = root_user, set(), None, []
+        while True:
+            if node_id in seen or node_id not in mapping:
+                reject()
+            seen.add(node_id)
+            node = mapping[node_id]
+            message = node.get("message")
+            if (not isinstance(message, dict) or message.get("id") != node_id
+                    or not isinstance(message.get("author"), dict)
+                    or message.get("status") != "finished_successfully"):
+                reject()
+            role = message["author"].get("role")
+            if node_id == root_user:
+                if role != "user" or node.get("parent") != root_parent:
+                    reject()
+            elif role == "assistant":
+                content = message.get("content")
+                if (previous_role not in {"user", "tool"} or message.get("end_turn") is not False
+                        or message.get("channel") not in {None, "analysis"}
+                        or not isinstance(content, dict) or content.get("content_type") != "code"):
+                    reject()
+            elif role != "tool" or previous_role != "assistant" or message.get("end_turn") is True:
+                reject()
+            context.append(deepcopy({key: message.get(key) for key in
+                ("id", "author", "recipient", "channel", "content", "status", "end_turn")}))
+            next_nodes = children.get(node_id, [])
+            if len(next_nodes) != 1 or (node.get("children") or []) != next_nodes:
+                reject()
+            if node_id == native_parent:
+                if role not in {"user", "tool"} or next_nodes[0] != native_user:
+                    reject()
+                return context
+            previous_role, node_id = role, next_nodes[0]
+
+    @staticmethod
     def _check_missing_successor_no_final(document, conversation_id, predecessor,
                                           original_successor_user, replacement_user, expected_tail):
         """Fence a resend beside a stopped no-final successor.
@@ -1848,6 +1920,7 @@ class ConversationBindingService:
             if body.get("_public_session_ref") or body.get("_supersedes_request_message_id"):
                 backend.text_cursor_callback = on_cursor
             missing_no_final_context = None
+            native_no_final_prefix_context = None
             missing_node_context = None
             if body.get("_supersedes_request_message_id"):
                 def check_original(send):
@@ -1871,6 +1944,12 @@ class ConversationBindingService:
                                 fresh, conversation_id, body["_missing_successor_no_final_predecessor"],
                                 body["_supersedes_request_message_id"], backend.text_request_message_id,
                                 body["_missing_successor_expected_tail"]) != missing_no_final_context:
+                            raise ConversationBindingError("original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+                    elif body.get("_native_no_final_prefix"):
+                        if self._native_no_final_prefix(
+                                fresh, conversation_id, body["_native_no_final_prefix"]) != native_no_final_prefix_context:
+                            raise ConversationBindingError("native no-final prefix changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+                        if self._no_final_successor_tail(fresh, body["_supersedes_no_final_original"]) != no_final_context:
                             raise ConversationBindingError("original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
                     elif body.get("_supersedes_no_final_original"):
                         if self._no_final_successor_tail(fresh, body["_supersedes_no_final_original"]) != no_final_context:
@@ -1977,6 +2056,14 @@ class ConversationBindingService:
                             # no-final continuation without reusing its user
                             # node or accepting a changed context.
                             parent_message_id = missing_no_final_context[0]
+                            if on_cursor:
+                                on_cursor({"request_parent_message_id": parent_message_id})
+                        elif body.get("_native_no_final_prefix"):
+                            native_no_final_prefix_context = self._native_no_final_prefix(
+                                document, conversation_id, body["_native_no_final_prefix"])
+                            no_final_context = self._no_final_successor_tail(
+                                document, body["_supersedes_no_final_original"])
+                            parent_message_id = no_final_context[0]
                             if on_cursor:
                                 on_cursor({"request_parent_message_id": parent_message_id})
                         elif body.get("_supersedes_no_final_original"):
