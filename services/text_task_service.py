@@ -1083,10 +1083,17 @@ class TextTaskService:
         """
         if type(now) not in (int, float) or not math.isfinite(now) or now <= 0:
             return False
+        # Historical interrupted Chat attempts persisted status/error without
+        # this newer field. Only that exact missing-field shape is compatible;
+        # explicit null/conflicting outcomes remain ineligible. The original
+        # observation, idle/lease and budget evidence below is still mandatory.
+        unresolved_outcome = (receipt.get("upstream_outcome") == "unknown"
+                              or "upstream_outcome" not in receipt
+                              and receipt.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN")
         if (not cls._bounded_chat_wait(receipt)
                 or receipt.get("status") != "unknown"
                 or receipt.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
-                or receipt.get("upstream_outcome") != "unknown"
+                or not unresolved_outcome
                 or receipt.get("_attempt_finished_at") is not None
                 or receipt.get("_submission_started") is not True
                 or type(receipt.get("_turn_reserved")) is not bool

@@ -341,8 +341,56 @@ def stalled(service, admission, backend):
     return result
 
 
-def test_stalled_original_releases_local_capacity_without_losing_late_original_result(tmp_path, monkeypatch):
+def remove_legacy_outcome(service, stored_outcome):
+    if not stored_outcome:
+        with service.store.transaction() as db:
+            receipt = service.store.read_receipt(db, "text", "owner", "old-0")
+            receipt.pop("upstream_outcome")
+            service.store.write_receipt(db, "text", "owner", "old-0", receipt)
+
+
+def test_actual_submitted_exception_without_outcome_can_finish_stalled_local_wait(tmp_path):
+    service, admission, backend, _ = migration(tmp_path, count=0)
+    service.submit("owner", {"client_request_id": "old-0", "client_conversation_id": "client-0",
+                             "model": "fixture-text", "parent_message_id": "parent",
+                             "messages": [{"role": "user", "content": "original input"}]})
+    def interrupted(context, body):
+        context.before_send()
+        admission.update_claim(context, conversation_id="conversation-0")
+        raise ConnectionError("synthetic interrupted original stream")
+    admission.register("text", interrupted)
+    admission.execute(admission.claim_next())
+    original = saved(service)
+    assert original["status"] == "unknown"
+    assert original["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN"
+    assert "upstream_outcome" not in original
+    assert original["_submission_started"] is True and original["_executing"] is False
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    calls = []
+    def incomplete(row):
+        calls.append(row["request_id"])
+        doc = document(row)
+        doc["mapping"][doc["current_node"]]["message"].update(status="in_progress", end_turn=False)
+        return ConversationBindingService._read_text_request_result(backend, row, document=doc)
+    service.recovery_reader = incomplete
+    admission.clock.now = original["_claim_until"] + 1
+    for _ in range(4):
+        service.read("owner", "old-0")
+        admission.clock.now += 301
+    row = saved(service)
+    assert row["status"] == "unknown" and "upstream_outcome" not in row
+    assert row["_result_no_progress_reads"] == 3
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert row["request_message_id"] == original["request_message_id"]
+    assert calls == ["old-0"] * 4 and backend.mock_calls == []
+    waiter(service, "same-conversation-next", "client-0")
+    assert admission.claim_next() is None
+
+
+@pytest.mark.parametrize("stored_outcome", [True, False])
+def test_stalled_original_releases_local_capacity_without_losing_late_original_result(tmp_path, monkeypatch, stored_outcome):
     service, admission, backend, legacy = migration(tmp_path)
+    remove_legacy_outcome(service, stored_outcome)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False,
           _execution_timeline=[{"stage": "send_call_started", "at": 3},
                                {"stage": "response_headers_received", "at": 4},
@@ -360,6 +408,7 @@ def test_stalled_original_releases_local_capacity_without_losing_late_original_r
     assert "_execution_wait_ended_at" not in row
     assert row["_turn_reserved"] is True
     assert row["recovery_no_result_reads"] == 0
+    assert ("upstream_outcome" in row) is stored_outcome
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
     execution = project_public_chat_receipt(result)["execution"]
     assert execution["phase"] == "stalled"
@@ -392,8 +441,10 @@ def test_stalled_original_releases_local_capacity_without_losing_late_original_r
 
 
 @pytest.mark.parametrize("turn_reserved", [True, False])
-def test_stalled_original_keeps_same_conversation_blocked_but_claims_independent_work(tmp_path, turn_reserved):
+@pytest.mark.parametrize("stored_outcome", [True, False])
+def test_stalled_original_keeps_same_conversation_blocked_but_claims_independent_work(tmp_path, turn_reserved, stored_outcome):
     service, admission, backend, _ = migration(tmp_path)
+    remove_legacy_outcome(service, stored_outcome)
     patch(service, _submission_started=True, _turn_reserved=turn_reserved, _executing=False)
     stalled(service, admission, backend)
     assert saved(service)["_turn_reserved"] is turn_reserved
@@ -406,8 +457,10 @@ def test_stalled_original_keeps_same_conversation_blocked_but_claims_independent
     assert admission.claim_next().request_id == "independent-next"
 
 
-def test_stalled_original_progress_reholds_capacity_before_an_independent_claim_can_send(tmp_path):
+@pytest.mark.parametrize("stored_outcome", [True, False])
+def test_stalled_original_progress_reholds_capacity_before_an_independent_claim_can_send(tmp_path, stored_outcome):
     service, admission, backend, _ = migration(tmp_path)
+    remove_legacy_outcome(service, stored_outcome)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
     stalled(service, admission, backend)
     waiter(service, "independent-next", "independent")
@@ -427,8 +480,10 @@ def test_stalled_original_progress_reholds_capacity_before_an_independent_claim_
     assert candidate["status"] == "queued" and candidate["_submission_started"] is False
 
 
-def test_stalled_original_allows_an_independent_claim_to_send_while_capacity_stays_released(tmp_path):
+@pytest.mark.parametrize("stored_outcome", [True, False])
+def test_stalled_original_allows_an_independent_claim_to_send_while_capacity_stays_released(tmp_path, stored_outcome):
     service, admission, backend, _ = migration(tmp_path)
+    remove_legacy_outcome(service, stored_outcome)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
     stalled(service, admission, backend)
     waiter(service, "independent-next", "independent")
@@ -440,6 +495,31 @@ def test_stalled_original_allows_an_independent_claim_to_send_while_capacity_sta
     assert candidate["status"] == "running" and candidate["_submission_started"] is True
 
 
+@pytest.mark.parametrize("conflict", [None, "completed", "rejected", "not_sent", "not_submitted", "", False])
+def test_stalled_legacy_compatibility_does_not_override_explicit_outcomes(tmp_path, conflict):
+    service, admission, backend, _ = migration(tmp_path)
+    remove_legacy_outcome(service, False)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    patch(service, upstream_outcome=conflict)
+    before = saved(service)
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(before, admission.clock.now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    assert saved(service) == before
+
+
+@pytest.mark.parametrize("error_code", [None, "RESULT_UNRECOVERABLE", "MODEL_NOT_FOUND"])
+def test_stalled_missing_outcome_requires_the_original_unknown_error(tmp_path, error_code):
+    service, admission, backend, _ = migration(tmp_path)
+    remove_legacy_outcome(service, False)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+    patch(service, error_code=error_code)
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved(service), admission.clock.now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+
+
 @pytest.mark.parametrize("case", [
     "local_executor", "live_send_lease", "malformed_send_lease", "orphaned_send_lease",
     "active_recovery", "legacy_recovery_claim", "legacy_recovery_lease", "missing_identity", "missing_observation", "short_read_count",
@@ -448,8 +528,10 @@ def test_stalled_original_allows_an_independent_claim_to_send_while_capacity_sta
     "nan_observation_time", "early_wait_marker_later_now", "future_wait_end", "future_last_checked",
     "future_started", "future_progress",
 ])
-def test_stalled_local_capacity_boundary_fails_closed_without_complete_idle_evidence(tmp_path, case):
+@pytest.mark.parametrize("stored_outcome", [True, False])
+def test_stalled_local_capacity_boundary_fails_closed_without_complete_idle_evidence(tmp_path, case, stored_outcome):
     service, admission, backend, _ = migration(tmp_path)
+    remove_legacy_outcome(service, stored_outcome)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
     stalled(service, admission, backend)
     baseline = saved(service)
