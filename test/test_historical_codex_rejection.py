@@ -81,6 +81,20 @@ class HistoricalCodexRejectionTests(unittest.TestCase):
         self.assertEqual(stored["_execution_timeline"], before["_execution_timeline"])
         self.assertTrue(stored["_input_ref"])
 
+    def test_exact_historical_codex_rejection_is_projected_by_snapshot_without_writing(self):
+        before = self._receipt("synthetic-snapshot-rejection")
+
+        with mock.patch.object(self.service.store, "write_receipt", side_effect=AssertionError("snapshot wrote")):
+            public = self.service.read_snapshot("owner", "synthetic-snapshot-rejection")
+
+        self.assertEqual(public["status"], "failed")
+        self.assertEqual(public["error_code"], "codex_request_rejected")
+        self.assertEqual(public["upstream_outcome"], "rejected")
+        self.recovery_reader.assert_not_called()
+        with self.service.store.connect() as db:
+            stored = self.service.store.read_receipt(db, "text", "owner", "synthetic-snapshot-rejection")
+        self.assertEqual(stored, before)
+
     def test_historical_codex_rejection_leaves_partial_missing_or_live_evidence_unknown(self):
         missing_output = "f" * 32 + ".bin"
         cases = {
@@ -103,6 +117,51 @@ class HistoricalCodexRejectionTests(unittest.TestCase):
                 self.assertEqual(stored["_turn_reserved"], before["_turn_reserved"])
                 self.assertEqual(stored["_claim_id"], before["_claim_id"])
                 self.assertEqual(stored["_wire_output"], before["_wire_output"])
+        self.recovery_reader.assert_not_called()
+
+    def test_snapshot_requires_each_native_codex_rejection_identity_and_evidence(self):
+        cases = {
+            "route": {"_route": "chat"},
+            "operation": {"_operation": "image"},
+            "protocol": {"_forward_protocol": "chat"},
+            "status": {"status": "failed"},
+            "error-code": {"error_code": "other"},
+            "outcome": {"upstream_outcome": "rejected"},
+            "not-submitted": {"_submission_started": False},
+            "not-terminal": {"_upstream_terminal": False},
+            "not-reserved": {"_turn_reserved": False},
+            "executing": {"_executing": True},
+            "live-claim": {"_claim_until": 101.0},
+            "recovery-claim": {"recovery_claim_id": "live"},
+            "paused": {"_recovery_paused": True},
+            "suppressed": {"_recovery_suppressed": True},
+            "wire-head": {"_wire_head": "present"},
+            "wire-size": {"_wire_size": 1},
+            "partial-wire": {"wire": b"nonempty private wire", "_wire_size": 0},
+            "missing-wire": {"output_ref": "f" * 32 + ".bin"},
+            "response-id": {"_codex_response_id": "resp_synthetic"},
+            "saved-content": {"content": "must-not-project"},
+            "timeout": {"_wire_error_status": 408},
+            "rate-limited": {"_wire_error_status": 429},
+            "error-code-evidence": {"_wire_error_payload": {"error": {"code": "other", "type": "invalid_request_error"}}},
+            "error-type-evidence": {"_wire_error_payload": {"error": {"code": "codex_request_rejected", "type": "other"}}},
+            "timeline": {"_execution_timeline": [{"stage": "task_finished", "at": 5.0}]},
+        }
+        for name, changes in cases.items():
+            with self.subTest(case=name):
+                request_id = "synthetic-snapshot-guard-" + name
+                before = self._receipt(request_id, **changes)
+                with mock.patch.object(self.service.store, "write_receipt", side_effect=AssertionError("snapshot wrote")):
+                    public = self.service.read_snapshot("owner", request_id)
+                # A rejected predicate receives the unaltered receipt
+                # projection. Every normal candidate remains UNKNOWN; the two
+                # status/outcome counterfactuals likewise prove snapshot did
+                # not synthesize a replacement terminal state.
+                self.assertEqual(public["status"], before["status"])
+                self.assertEqual(public["upstream_outcome"], before["upstream_outcome"])
+                with self.service.store.connect() as db:
+                    stored = self.service.store.read_receipt(db, "text", "owner", request_id)
+                self.assertEqual(stored, before)
         self.recovery_reader.assert_not_called()
 
 
