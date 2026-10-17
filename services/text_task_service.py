@@ -1073,13 +1073,87 @@ class TextTaskService:
                 and receipt.get("_recovery_paused") is not True)
 
     @classmethod
+    def _qualified_stalled_incomplete_capacity_boundary(cls, receipt, now):
+        """Return whether an observed stagnant original frees only account capacity.
+
+        This is a read-only planner predicate. It does not establish an upstream
+        terminal result, alter the receipt, release its physical conversation,
+        or change recovery cadence. A fresh original observation that progresses
+        clears the persisted wait marker before this predicate is consulted.
+        """
+        if type(now) not in (int, float) or not math.isfinite(now) or now <= 0:
+            return False
+        if (not cls._bounded_chat_wait(receipt)
+                or receipt.get("status") != "unknown"
+                or receipt.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
+                or receipt.get("upstream_outcome") != "unknown"
+                or receipt.get("_attempt_finished_at") is not None
+                or receipt.get("_submission_started") is not True
+                or type(receipt.get("_turn_reserved")) is not bool
+                or receipt.get("_executing") is not False
+                or receipt.get("recovery_claim_id") is not None
+                or receipt.get("recovery_lease_until") is not None):
+            return False
+        if (receipt.get("_recovery_claim_id") is not None
+                or receipt.get("_recovery_claim_until") is not None):
+            return False
+        if (receipt.get("_upstream_terminal") is not None and receipt.get("_upstream_terminal") is not False
+                or any(receipt.get(field) is not None and receipt.get(field) is not False
+                       for field in ("_recovery_suppressed", "_recovery_paused", "_forward_protocol"))):
+            return False
+        # Old durable Chat rows omitted route/operation; preserve that existing
+        # Chat/text default while rejecting any explicit incompatible value.
+        if receipt.get("_route", "chat") != "chat" or receipt.get("_operation", "text") != "text":
+            return False
+        if any(type(receipt.get(field)) is not str
+               or not 1 <= len(receipt[field]) <= 300
+               or receipt[field] != receipt[field].strip()
+               for field in ("request_id", "request_message_id", "provider_binding_id",
+                             "provider_account_identity", "client_conversation_id",
+                             "conversation_id", "model")):
+            return False
+        claim_id, claim_until = receipt.get("_claim_id"), receipt.get("_claim_until")
+        if claim_id is None:
+            if claim_until is not None:
+                return False
+        elif (not isinstance(claim_id, str) or not claim_id
+              or type(claim_until) not in (int, float) or not math.isfinite(claim_until)
+              or claim_until > now):
+            return False
+        observation = cls._safe_result_observation(receipt.get("_original_result_observation"), receipt)
+        wait_ended = receipt.get("_result_wait_ended_at")
+        started = receipt.get("_result_observation_started_at")
+        last_progress = receipt.get("_result_last_progress_at")
+        last_checked = receipt.get("_result_last_checked_at")
+        reads = receipt.get("_result_no_progress_reads")
+        if (observation is None
+                or type(wait_ended) not in (int, float) or not math.isfinite(wait_ended) or wait_ended <= 0
+                or type(started) not in (int, float) or not math.isfinite(started) or started <= 0
+                or last_progress is not None and (type(last_progress) not in (int, float)
+                                                   or not math.isfinite(last_progress) or last_progress <= 0)
+                or type(last_checked) not in (int, float) or not math.isfinite(last_checked) or last_checked <= 0
+                or type(reads) is not int or reads < cls.UNRECOVERABLE_QUALIFIED_READS):
+            return False
+        progress = last_progress if last_progress is not None else started
+        if not (started <= progress <= wait_ended <= last_checked <= now):
+            return False
+        # A later snapshot clock cannot rehabilitate an early/stale marker:
+        # the marker itself must have been recorded after the existing window.
+        if (wait_ended - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS
+                or now - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS):
+            return False
+        return True
+
+    @classmethod
     def _end_execution_wait(cls, receipt, now, *, observed=False):
         """End local waiting, not the upstream turn or its original-ID recovery.
 
-        The existing age and qualified-read policy bounds Chat execution
-        occupancy. A timeout, failed GET or arbitrary failed receipt alone
-        cannot do so. Persist this decision so later failed reads and restart
-        cannot reopen a released slot.
+        The existing age and qualified-read policy ends foreground waiting.
+        A timeout, failed GET or arbitrary failed receipt alone cannot do so.
+        An incomplete-result marker is not proof of an ended upstream turn;
+        local capacity is assessed separately from its persisted strict
+        observation evidence. Persist this decision across later failed reads
+        and restart.
         """
         if not cls._bounded_chat_wait(receipt) or receipt.get("_execution_wait_ended_at") is not None:
             return False
@@ -1103,9 +1177,10 @@ class TextTaskService:
             return False  # A legacy executor without a lease cannot be fenced.
         if receipt.get("recovery_reason") == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value:
             # A stale upstream label can end the foreground result wait, but
-            # is never evidence to release the account turn. Only a fresh,
-            # validated original GET may make this decision, not a timer/read
-            # of old stored observations. Keep UNKNOWN and the original lease.
+            # does not prove the upstream turn ended. The foreground marker
+            # keeps UNKNOWN and the original lease; a separate planner-only
+            # predicate may free local account capacity only after strict,
+            # persisted original-observation evidence.
             progress = receipt.get("_result_last_progress_at") or receipt.get("_result_observation_started_at")
             reads = receipt.get("_result_no_progress_reads")
             if (not observed or receipt.get("_result_wait_ended_at") is not None
@@ -1348,6 +1423,11 @@ class TextTaskService:
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}
+            if observed and changed:
+                # A verified original-branch change puts the local account
+                # boundary back on hold. It does not alter UNKNOWN, the
+                # original turn, or recovery timing.
+                updated.pop("_result_wait_ended_at", None)
             # A process can die after sending and persisting its cursor. Once
             # the original result is recovered, fence only its expired sending
             # lease; otherwise the stale execution flag prevents completion.

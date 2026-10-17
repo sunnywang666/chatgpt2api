@@ -8,6 +8,7 @@ import pytest
 
 from services.conversation_binding_service import ConversationBindingService
 from services.public_chat_service import project_public_chat_receipt
+from services.request_context import AdmissionLost
 from services.text_task_service import TextTaskService
 from test.test_expired_execution_wait import saved, patch, waiter
 from test.test_unknown_turn_recovery import document, migration
@@ -340,13 +341,18 @@ def stalled(service, admission, backend):
     return result
 
 
-def test_stalled_original_ends_wait_persistently_without_release_resend_or_lost_late_result(tmp_path):
+def test_stalled_original_releases_local_capacity_without_losing_late_original_result(tmp_path, monkeypatch):
     service, admission, backend, legacy = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False,
           _execution_timeline=[{"stage": "send_call_started", "at": 3},
                                {"stage": "response_headers_received", "at": 4},
                                {"stage": "first_output", "at": 5}, {"stage": "task_finished", "at": 20}])
     result = stalled(service, admission, backend)
+    # Match the admission clock while projecting an expired persisted send
+    # lease; production uses the same wall-clock domain for both paths.
+    patch(service, _claim_id="expired-send", _claim_until=admission.clock.now - 1)
+    monkeypatch.setattr("services.public_chat_service.time.time", lambda: admission.clock.now)
+    result = service.read("owner", "old-0")
     row = saved(service)
     assert result["status"] == "unknown"
     assert row["_result_no_progress_reads"] == 3
@@ -354,9 +360,7 @@ def test_stalled_original_ends_wait_persistently_without_release_resend_or_lost_
     assert "_execution_wait_ended_at" not in row
     assert row["_turn_reserved"] is True
     assert row["recovery_no_result_reads"] == 0
-    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
-    waiter(service, "next", "client-0")
-    assert admission.claim_next() is None
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
     execution = project_public_chat_receipt(result)["execution"]
     assert execution["phase"] == "stalled"
     assert execution["wait_state"] == "ended"
@@ -365,7 +369,7 @@ def test_stalled_original_ends_wait_persistently_without_release_resend_or_lost_
     assert execution["upstream_outcome"] == "unknown"
     assert execution["observation_started_at"] < execution["last_checked_at"]
     assert "last_progress_at" not in execution  # First empty observation is not real progress.
-    assert execution["resources"] == {"local_worker": "idle", "account_turn": "held", "conversation": "protected"}
+    assert execution["resources"] == {"local_worker": "idle", "account_turn": "released", "conversation": "protected"}
     restarted = TextTaskService(service.path, admission=admission, clock=admission.clock,
                                 recovery_reader=incomplete_reader(backend))
     assert restarted.read("owner", "old-0")["execution"] == execution
@@ -380,10 +384,165 @@ def test_stalled_original_ends_wait_persistently_without_release_resend_or_lost_
     assert result["status"] == "succeeded" and result["content"] == "late original result"
     assert result["execution"]["wait_state"] == "completed"
     assert result["execution"]["resources"]["account_turn"] == "released"
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
     for key in ("request_id", "request_message_id", "provider_account_identity", "conversation_id"):
         assert saved(service)[key] == legacy[0][key]
     assert saved(service)["_result_wait_ended_at"] == row["_result_wait_ended_at"]
     assert backend.mock_calls == []  # The reader receives controlled GET documents; no model POST.
+
+
+@pytest.mark.parametrize("turn_reserved", [True, False])
+def test_stalled_original_keeps_same_conversation_blocked_but_claims_independent_work(tmp_path, turn_reserved):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=turn_reserved, _executing=False)
+    stalled(service, admission, backend)
+    assert saved(service)["_turn_reserved"] is turn_reserved
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    # The physical conversation/order resource remains occupied independently
+    # of whether this historical receipt stored turn reservation as true/false.
+    waiter(service, "same-conversation-next", "client-0")
+    assert admission.claim_next() is None
+    waiter(service, "independent-next", "independent")
+    assert admission.claim_next().request_id == "independent-next"
+
+
+def test_stalled_original_progress_reholds_capacity_before_an_independent_claim_can_send(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    waiter(service, "independent-next", "independent")
+    context = admission.claim_next()
+    assert context and context.request_id == "independent-next"
+    service.recovery_reader = incomplete_reader(
+        backend, lambda _doc, message: message["content"].update(parts=["verified new text"]),
+    )
+    admission.clock.now = saved(service)["recovery_next_at"] + 1
+    admission.update_claim(context, _claim_until=admission.clock.now + admission.CLAIM_SECONDS)
+    assert service.read("owner", "old-0")["status"] == "unknown"
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved(service), admission.clock.now)
+    with pytest.raises(AdmissionLost, match="account capacity changed"):
+        context.before_send()
+    with service.store.connect() as db:
+        candidate = service.store.read_receipt(db, "text", "owner", "independent-next")
+    assert candidate["status"] == "queued" and candidate["_submission_started"] is False
+
+
+def test_stalled_original_allows_an_independent_claim_to_send_while_capacity_stays_released(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    waiter(service, "independent-next", "independent")
+    context = admission.claim_next()
+    assert context and context.request_id == "independent-next"
+    context.before_send()
+    with service.store.connect() as db:
+        candidate = service.store.read_receipt(db, "text", "owner", "independent-next")
+    assert candidate["status"] == "running" and candidate["_submission_started"] is True
+
+
+@pytest.mark.parametrize("case", [
+    "local_executor", "live_send_lease", "malformed_send_lease", "orphaned_send_lease",
+    "active_recovery", "legacy_recovery_claim", "legacy_recovery_lease", "missing_identity", "missing_observation", "short_read_count",
+    "missing_turn_reservation", "deleted_turn_reservation", "deleted_executing",
+    "fake_turn_reservation", "fake_submission_flag",
+    "nan_observation_time", "early_wait_marker_later_now", "future_wait_end", "future_last_checked",
+    "future_started", "future_progress",
+])
+def test_stalled_local_capacity_boundary_fails_closed_without_complete_idle_evidence(tmp_path, case):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    baseline = saved(service)
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(baseline, admission.clock.now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    observed = baseline
+    if case == "local_executor":
+        changes = {"_executing": True}
+    elif case == "live_send_lease":
+        changes = {"_claim_id": "live-send", "_claim_until": admission.clock.now + 1}
+    elif case == "malformed_send_lease":
+        changes = {"_claim_id": "missing-lease", "_claim_until": None}
+    elif case == "orphaned_send_lease":
+        changes = {"_claim_id": None, "_claim_until": admission.clock.now - 1}
+    elif case == "active_recovery":
+        changes = {"recovery_claim_id": "live-recovery", "recovery_lease_until": admission.clock.now + 1}
+    elif case == "legacy_recovery_claim":
+        changes = {"_recovery_claim_id": "legacy-recovery"}
+    elif case == "legacy_recovery_lease":
+        changes = {"_recovery_claim_until": admission.clock.now + 1}
+    elif case == "missing_identity":
+        changes = {"provider_binding_id": None}
+    elif case == "missing_observation":
+        changes = {"_original_result_observation": None}
+    elif case == "short_read_count":
+        changes = {"_result_no_progress_reads": 2}
+    elif case == "missing_turn_reservation":
+        changes = {"_turn_reserved": None}
+    elif case in {"deleted_turn_reservation", "deleted_executing"}:
+        changes = {}
+    elif case == "fake_turn_reservation":
+        changes = {"_turn_reserved": 0}
+    elif case == "fake_submission_flag":
+        changes = {"_submission_started": 1}
+    elif case == "nan_observation_time":
+        changes = {"_result_last_checked_at": float("nan")}
+    elif case == "early_wait_marker_later_now":
+        changes = {"_result_wait_ended_at": observed["_result_observation_started_at"] + 899}
+    elif case == "future_wait_end":
+        changes = {"_result_wait_ended_at": admission.clock.now + 1}
+    elif case == "future_last_checked":
+        changes = {"_result_last_checked_at": admission.clock.now + 1}
+    elif case == "future_started":
+        changes = {"_result_observation_started_at": admission.clock.now + 1}
+    else:
+        changes = {"_result_last_progress_at": admission.clock.now + 1}
+    patch(service, **changes)
+    if case in {"deleted_turn_reservation", "deleted_executing"}:
+        field = "_turn_reserved" if case == "deleted_turn_reservation" else "_executing"
+        with service.store.transaction() as db:
+            receipt = service.store.read_receipt(db, "text", "owner", "old-0")
+            receipt.pop(field, None)
+            service.store.write_receipt(db, "text", "owner", "old-0", receipt)
+    receipt = saved(service)
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(receipt, admission.clock.now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    waiter(service, "independent-next", "independent")
+    assert admission.claim_next() is None
+
+
+def test_stalled_capacity_boundary_reholds_on_verified_progress_and_late_success_survives_restart(tmp_path):
+    service, admission, backend, legacy = migration(tmp_path)
+    # Migration data predates the explicit idle markers; this capacity scenario
+    # supplies the stored flags required by the strict production predicate.
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    admission.clock.now = saved(service)["recovery_next_at"] + 1
+    service.recovery_reader = incomplete_reader(
+        backend, lambda _doc, message: message["content"].update(parts=["new verified text"]),
+    )
+    result = service.read("owner", "old-0")
+    row = saved(service)
+    assert result["status"] == "unknown"
+    assert row["_result_last_progress_at"] == admission.clock.now
+    assert row.get("_result_wait_ended_at") is None
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    waiter(service, "independent-next", "independent")
+    assert admission.claim_next() is None
+    restarted = TextTaskService(service.path, admission=admission, clock=admission.clock,
+                                recovery_reader=incomplete_reader(backend))
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    def complete(original):
+        doc = document(original)
+        doc["mapping"]["final-user-0"]["message"]["content"]["parts"] = ["late original result"]
+        return ConversationBindingService._read_text_request_result(backend, original, document=doc)
+    restarted.recovery_reader = complete
+    admission.clock.now = row["recovery_next_at"] + 1
+    result = restarted.read("owner", "old-0")
+    assert result["status"] == "succeeded" and result["content"] == "late original result"
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    for key in ("request_id", "request_message_id", "provider_account_identity", "conversation_id"):
+        assert saved(restarted)[key] == legacy[0][key]
 
 
 def test_only_original_branch_content_progress_resets_clock_not_heartbeat_or_unrelated_nodes(tmp_path):

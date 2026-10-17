@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Any
 
 from services.model_service import model_catalog_service
@@ -257,8 +258,11 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
              else "queued" if status in {"queued", "not_started"}
              else "receiving" if response else "sending" if send_state == "attempted"
              else "preparing" if status == "running" else "unknown")
-    turn_active = (status == "running" or unknown_text_result(receipt)) and not original_turn_ended("text", receipt) and not released_wait
     from services.text_task_service import TextTaskService
+    stalled_local_capacity_released = TextTaskService._qualified_stalled_incomplete_capacity_boundary(receipt, time.time())
+    turn_active = ((status == "running" or unknown_text_result(receipt))
+                   and not original_turn_ended("text", receipt)
+                   and not released_wait and not stalled_local_capacity_released)
     empty_local_released = (receipt.get("_turn_reserved") is False
                             and TextTaskService._verified_retryable_empty(receipt))
     accounted = turn_active and not receipt.get("_attempt_finished_at") and not empty_local_released and (unknown_text_result(receipt) or receipt.get("_turn_reserved", True))
