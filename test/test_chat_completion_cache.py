@@ -157,8 +157,10 @@ class ChatCompletionCacheTests(unittest.TestCase):
                 "model": "gpt-5-6-thinking", "reasoning": {"effort": "high"}, "input": "responses",
             })
 
-        self.assertEqual(chat_backend.session.post.call_args.kwargs["json"]["thinking_effort"], "extended")
-        self.assertEqual(response_backend.session.post.call_args.kwargs["json"]["thinking_effort"], "extended")
+        chat_payload = json.loads(chat_backend.session.post.call_args.kwargs["data"])
+        response_payload = json.loads(response_backend.session.post.call_args.kwargs["data"])
+        self.assertEqual(chat_payload["thinking_effort"], "extended")
+        self.assertEqual(response_payload["thinking_effort"], "extended")
 
     def test_repeated_stream_text_completion_replays_cached_chunks(self) -> None:
         calls = 0

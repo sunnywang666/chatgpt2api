@@ -218,6 +218,15 @@ class TextTaskService:
         TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
         TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
     })
+    _RECONCILED_QUEUED_SUCCESSOR = "_reconciled_queued_successor"
+    _RECONCILE_LINK_FIELDS = (
+        "_supersedes_request_id", "_previous_request_id", "_completion_of",
+        "_same_session_retry_of", "_terminal_empty_correction_of",
+        "_codex_fallback_of", "_codex_continue_of", "_codex_rejected_retry_of",
+        "_codex_origin_request_id", "_codex_response_id", "_previous_response_id",
+        "_missing_successor_resume", "continue_before_queued_image_id",
+        "_derived_input", "_supersedes_no_final",
+    )
     _VALID_CONVERSATION_REASONS = frozenset({
         TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
         TextRecoveryReason.REQUEST_PARENT_MISMATCH.value,
@@ -2514,6 +2523,62 @@ class TextTaskService:
                 reject()
             return expected
 
+    @classmethod
+    def _validate_reconciled_queued_successor(cls, store, db, owner, successor, previous, previous_hash, original_body, now):
+        """Revalidate the frozen, pre-accepted queued child at both send guards."""
+        def reject():
+            raise ConversationBindingError("queued successor reconciliation is no longer valid",
+                                           code="CHAT_QUEUED_SUCCESSOR_NOT_RECONCILABLE")
+        request_id = successor.get("request_id")
+        row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                         (owner, request_id)).fetchone()
+        if not row:
+            reject()
+        try:
+            stored = json.loads(row[1])
+            body = store.load_input(successor.get("_input_ref"))
+        except (OSError, ValueError, TypeError, KeyError):
+            reject()
+        if (stored.get("request_id") != request_id
+                or cls._submission_identity(owner, body) != (request_id, row[0])
+                or cls._submission_identity(owner, original_body) != (previous.get("request_id"), previous_hash)
+                or body != {**original_body, "client_request_id": request_id}
+                or "supersedes_request_id" in body):
+            reject()
+        required = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
+                    "conversation_id", "_source", "_scheduling_owner", "model")
+        if any(not previous.get(key) or successor.get(key) != previous.get(key) for key in required):
+            reject()
+        if previous.get("_source") != "internal:listing" or previous.get("_scheduling_owner") != "internal:listing":
+            reject()
+        sequence = (previous.get("_sequence"), successor.get("_sequence"))
+        if (any(type(value) is not int or value <= 0 for value in sequence)
+                or not sequence[0] < sequence[1]):
+            reject()
+        if (previous.get("_route", "chat") != "chat" or previous.get("_operation", "text") != "text"
+                or previous.get("_forward_protocol") or previous.get("_public_session_ref")
+                or previous.get("_expected_sends") != 1
+                or previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
+                or previous.get("upstream_outcome") != "unknown"
+                or previous.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND"
+                or previous.get("_attempt_reason") != "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"
+                or previous.get("_submission_started") is not True
+                or type(previous.get("_attempt_finished_at")) not in (int, float)
+                or not math.isfinite(previous["_attempt_finished_at"])
+                or type(previous.get("_execution_wait_ended_at")) not in (int, float)
+                or not math.isfinite(previous["_execution_wait_ended_at"])
+                or previous.get("_executing") or previous.get("_turn_reserved")
+                or previous.get("_upstream_terminal") or previous.get("_recovery_paused")
+                or previous.get("_recovery_suppressed") or previous.get("_work_key")
+                or previous.get("_completion") or previous.get("_completion_of")
+                or previous.get("_supersedes_request_id")
+                or any(previous.get(key) is not None for key in ("content", "result", "data"))):
+            reject()
+        for claim, until in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until"),
+                             ("_recovery_claim_id", "_recovery_claim_until")):
+            if previous.get(claim) or previous.get(until) is not None:
+                reject()
+
     @staticmethod
     def _supersede_order_link(previous, successor, *, rejected_model=None):
         """A server-registered successor releases only its own predecessor's order head."""
@@ -2629,6 +2694,12 @@ class TextTaskService:
             reject("CHAT_SUPERSEDE_INVALID")
         if identity != (previous_id, row[0]):
             reject("CHAT_SUPERSEDE_INVALID")
+        if successor.get(TextTaskService._RECONCILED_QUEUED_SUCCESSOR) is True:
+            TextTaskService._validate_reconciled_queued_successor(
+                store, db, owner, successor, previous, row[0], original_body, now,
+            )
+        elif TextTaskService._RECONCILED_QUEUED_SUCCESSOR in successor:
+            reject("CHAT_SUPERSEDE_INVALID")
         if successor.get("_derived_input"):
             attributes_upgrade = successor["_derived_input"].get("kind") == "attributes_required_only_v4"
             if attributes_upgrade:
@@ -2680,6 +2751,151 @@ class TextTaskService:
         if other:
             reject("CHAT_SUPERSEDE_CONFLICT")
         return previous
+
+    def reconcile_queued_successor(self, owner, request_id, original_request_id, cursor, *, source, dry_run=True):
+        """Attach one proven, accepted-but-unsent listing receipt to its original.
+
+        The retained child input is never rebuilt.  This narrow repair exists for
+        an internal listing grant that was accepted before its Provider lineage
+        metadata was recorded; normal callers must use ``submit`` instead.
+        """
+        def reject(code="CHAT_QUEUED_SUCCESSOR_NOT_RECONCILABLE"):
+            raise ConversationBindingError("queued successor cannot be reconciled", code=code)
+        if source != "internal:listing" or type(dry_run) is not bool:
+            reject()
+        fields = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
+                  "conversation_id", "parent_message_id")
+        if (not isinstance(original_request_id, str) or not original_request_id
+                or original_request_id == request_id or set(cursor) != set(fields)
+                or any(not isinstance(cursor.get(key), str) or not cursor[key].strip() for key in fields)):
+            reject()
+        with self._db() as db:
+            if dry_run:
+                db.execute("BEGIN")
+            else:
+                db.execute("BEGIN IMMEDIATE")
+            try:
+                child_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                       (owner, request_id)).fetchone()
+                parent_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                        (owner, original_request_id)).fetchone()
+                if not child_row or not parent_row:
+                    reject()
+                child = json.loads(child_row[1])
+                parent = json.loads(parent_row[1])
+                existing = child.get(self._RECONCILED_QUEUED_SUCCESSOR)
+                if existing is True:
+                    # A lost HTTP acknowledgement may be retried after this
+                    # queued child has sent and its live receipt cursor has
+                    # advanced.  Verify the retained immutable inputs and
+                    # the relation that was already committed, rather than
+                    # treating the acknowledgement as a new reconciliation.
+                    try:
+                        parent_body = self.store.load_input(parent.get("_input_ref"))
+                        child_body = self.store.load_input(child.get("_input_ref"))
+                    except (OSError, ValueError, TypeError, KeyError):
+                        reject("CHAT_QUEUED_SUCCESSOR_CONFLICT")
+                    if (child.get("request_id") != request_id or parent.get("request_id") != original_request_id
+                            or self._submission_identity(owner, parent_body) != (original_request_id, parent_row[0])
+                            or self._submission_identity(owner, child_body) != (request_id, child_row[0])
+                            or child_body != {**parent_body, "client_request_id": request_id}
+                            or "supersedes_request_id" in child_body
+                            or any(parent_body.get(key) != cursor[key] or child_body.get(key) != cursor[key]
+                                   for key in fields)
+                            or child.get("_supersedes_request_id") != original_request_id
+                            or child.get("_supersedes_input_hash") != parent_row[0]
+                            or child.get("_supersedes_request_message_id") != parent.get("request_message_id")
+                            or child.get("_submission_parent_message_id") != parent_body.get("parent_message_id")):
+                        reject("CHAT_QUEUED_SUCCESSOR_CONFLICT")
+                    result = {"request_id": request_id, "original_request_id": original_request_id,
+                              "type": "queued_successor_reconciliation", "eligible": True,
+                              "reconciled": True, "dry_run": dry_run}
+                    db.execute("ROLLBACK")
+                    return result
+                if existing is not None or any(child.get(key) for key in self._RECONCILE_LINK_FIELDS):
+                    reject("CHAT_QUEUED_SUCCESSOR_CONFLICT")
+                if any(child.get(key) != cursor[key] or parent.get(key) != cursor[key] for key in fields):
+                    reject()
+                if (child.get("request_id") != request_id or parent.get("request_id") != original_request_id
+                        or child.get("status") != "queued" or child.get("_submission_started") is not False
+                        or child.get("_executing") not in (None, False) or child.get("_turn_reserved") is not False
+                        or child.get("_last_sent_sequence") is not None
+                        or child.get("send_count") is not None and (
+                            type(child.get("send_count")) is not int or child["send_count"] != 0)
+                        or child.get("error_code") is not None or child.get("upstream_outcome") not in (None, "")
+                        or child.get("upstream_unfinished") not in (None, False)
+                        or any(child.get(key) is not None for key in ("content", "result", "data"))
+                        or any(child.get(key) for key in ("_upstream_terminal", "_recovery_paused", "_recovery_suppressed"))):
+                    reject()
+                timeline = child.get("_execution_timeline")
+                sent_stages = {"send_guard_passed", "send_call_started", "response_headers_received", "first_output", "task_finished"}
+                if (not isinstance(timeline, list) or len(timeline) != 1
+                        or not isinstance(timeline[0], dict) or timeline[0].get("stage") != "accepted"
+                        or any(not isinstance(item, dict) or item.get("stage") in sent_stages for item in timeline)):
+                    reject()
+                if any(child.get(key) is not None for key in (
+                    "_attempt_finished_at", "_execution_wait_ended_at", "recovery_next_at", "recovery_lease_until",
+                    "recovery_reason", "recovery_phase", "recovery_error_code", "recovery_last_read_error",
+                    "recovery_retry_after_seconds",
+                )):
+                    reject()
+                for claim, until in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until"),
+                                     ("_recovery_claim_id", "_recovery_claim_until")):
+                    if child.get(claim) or child.get(until) is not None:
+                        reject()
+                if (any(not parent.get(key) or child.get(key) != parent.get(key) for key in (
+                        "provider_binding_id", "provider_account_identity", "client_conversation_id",
+                        "conversation_id", "_source", "_scheduling_owner", "model"))):
+                    reject()
+                if parent.get("_source") != source or parent.get("_scheduling_owner") != source:
+                    reject()
+                sequence = (parent.get("_sequence"), child.get("_sequence"))
+                if (any(type(value) is not int or value <= 0 for value in sequence)
+                        or not sequence[0] < sequence[1]):
+                    reject()
+                children = db.execute(
+                    "SELECT id FROM requests WHERE owner=? AND "
+                    "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?) LIMIT 1",
+                    (owner, original_request_id, original_request_id),
+                ).fetchone()
+                child_children = db.execute(
+                    "SELECT 1 FROM requests WHERE owner=? AND "
+                    "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?) LIMIT 1",
+                    (owner, request_id, request_id),
+                ).fetchone()
+                if children or child_children:
+                    reject("CHAT_QUEUED_SUCCESSOR_CONFLICT")
+                from services.pool_admission import physical_conversation_key, unfinished
+                physical = physical_conversation_key(parent)
+                if not physical:
+                    reject()
+                for kind, other_owner, other_id, other in self.store.receipts(db):
+                    if (other_owner == owner and other_id not in {request_id, original_request_id}
+                            and physical_conversation_key(other) == physical and unfinished(kind, other)):
+                        reject("CHAT_QUEUED_SUCCESSOR_CONFLICT")
+                candidate = {
+                    **child,
+                    "_supersedes_request_id": original_request_id,
+                    "_supersedes_input_hash": parent_row[0],
+                    "_supersedes_request_message_id": parent.get("request_message_id"),
+                    "_submission_parent_message_id": parent.get("_submission_parent_message_id") or parent.get("parent_message_id"),
+                    self._RECONCILED_QUEUED_SUCCESSOR: True,
+                }
+                self._validate_supersede(self.store, db, owner, candidate, self._now())
+                result = {"request_id": request_id, "original_request_id": original_request_id,
+                          "type": "queued_successor_reconciliation", "eligible": True,
+                          "reconciled": not dry_run, "dry_run": dry_run}
+                if dry_run:
+                    db.execute("ROLLBACK")
+                    return result
+                candidate["updated_at"] = self._now()
+                self.store.write_receipt(db, "text", owner, request_id, candidate)
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
+        if self.admission is not None:
+            self.admission.wake()
+        return result
 
     @staticmethod
     def _no_final_successor_source(previous, now):

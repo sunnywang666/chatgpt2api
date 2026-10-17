@@ -623,7 +623,10 @@ def _text_failure_category(exc: Exception) -> str:
 
 # Only typed, bounded evidence is persisted. Exception text, response bodies,
 # URLs, tokens and conversation titles must never enter a recovery diagnostic.
-_READ_PHASES = frozenset({"conversation_list", "conversation_detail", "matched_conversation"})
+_READ_PHASES = frozenset({
+    "conversation_list", "conversation_detail", "matched_conversation",
+    "read_image_request", "resolve_image_download", "download_image", "save_image_result",
+})
 _READ_CATEGORIES = frozenset({"http", "timeout", "transport", "parse", "other"})
 _READ_CODES = frozenset({"RECOVERY_READ_FAILED", "CONVERSATION_BINDING_CONTRACT_INVALID",
                          "CONVERSATION_BINDING_MISMATCH"})
