@@ -3166,6 +3166,15 @@ class TextTaskService:
             and all(isinstance(receipt.get(key), str) and receipt[key] for key in
                 ("_input_ref", "_supersedes_request_id", "request_id", "request_message_id")))
 
+    @staticmethod
+    def _strict_successor_sequence(previous, successor):
+        """Keep a plain no-final resume on its original, ordered lineage."""
+        parent_sequence = previous.get("_sequence")
+        child_sequence = successor.get("_sequence")
+        return (type(parent_sequence) is int and parent_sequence > 0
+                and type(child_sequence) is int and child_sequence > 0
+                and parent_sequence < child_sequence)
+
     def _validated_unsent_successor_input(self, db, owner, request_hash, receipt, now):
         plain_no_final = self._known_unsent_no_final_successor(receipt, now)
         if not plain_no_final and not self._known_unsent_category_successor(receipt, now):
@@ -3174,7 +3183,8 @@ class TextTaskService:
         if self._submission_identity(owner, body) != (receipt["request_id"], request_hash):
             raise ConversationBindingError("retained successor input changed", code="CONVERSATION_REQUEST_CONFLICT")
         previous = self._validate_supersede(self.store, db, owner, receipt, now)
-        if plain_no_final and not self._no_final_successor_source(previous, now):
+        if plain_no_final and (not self._strict_successor_sequence(previous, receipt)
+                               or not self._no_final_successor_source(previous, now)):
             raise ConversationBindingError("original no-final proof is unavailable", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
         if previous.get("_recovery_paused") or previous.get("_recovery_suppressed"):
             raise ConversationBindingError("original recovery is paused", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")

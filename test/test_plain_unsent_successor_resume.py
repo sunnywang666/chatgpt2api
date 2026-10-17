@@ -88,6 +88,25 @@ def test_plain_no_final_resume_rejects_missing_proof_or_any_send_ambiguity(task,
     assert "send" not in bound_chat.calls
 
 
+@pytest.mark.parametrize(("parent_sequence", "child_sequence"), [
+    (1, 0), (1, "2"), (1, True), (2, 2), (3, 2),
+])
+def test_plain_no_final_resume_requires_strict_existing_sequence_lineage(
+        task, bound_chat, parent_sequence, child_sequence):
+    h = failed_plain_no_final_successor(task, bound_chat)
+    update(h.service, "old", _sequence=parent_sequence)
+    update(h.service, "successor", _sequence=child_sequence)
+    before = deepcopy(row(h.service, "successor"))
+
+    with pytest.raises(ConversationBindingError) as error:
+        h.service.resume_unsent_successor("owner", "successor", h.envelope)
+
+    assert error.value.code == "CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE"
+    assert row(h.service, "successor") == before
+    assert h.admission.claim_next() is None
+    assert "send" not in bound_chat.calls
+
+
 def test_plain_no_final_resume_repeats_fresh_tail_guard_before_send(task, bound_chat):
     h = failed_plain_no_final_successor(task, bound_chat)
     h.service.resume_unsent_successor("owner", "successor", h.envelope)
@@ -173,3 +192,31 @@ def test_plain_no_final_resume_endpoint_requires_admin_and_accepts_exact_envelop
         first = client.post(url, json=h.envelope, headers={"Authorization": "internal"})
         assert first.status_code == 200 and first.json()["status"] == "queued"
         assert client.post(url, json=h.envelope, headers={"Authorization": "internal"}).json() == first.json()
+
+
+def test_plain_no_final_resume_endpoint_rejects_invalid_sequence_without_requeue(task, bound_chat, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    import api.ai as api
+
+    h = failed_plain_no_final_successor(task, bound_chat)
+    update(h.service, "successor", _sequence=0)
+    before = deepcopy(row(h.service, "successor"))
+    app = FastAPI()
+    app.include_router(api.create_router())
+    monkeypatch.setattr(api, "text_task_service", h.service)
+    monkeypatch.setattr(api, "require_identity", lambda _token: {"id": "owner", "role": "admin"})
+    monkeypatch.setattr(api, "require_chat_text_policy", lambda _: None)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/conversation-bindings/text-requests/successor/resume-unsent-successor",
+            json=h.envelope,
+            headers={"Authorization": "internal"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE"
+    assert row(h.service, "successor") == before
+    assert h.admission.claim_next() is None
+    assert "send" not in bound_chat.calls
