@@ -1440,7 +1440,14 @@ class TextTaskService:
                              (owner, request_id)).fetchone()
             if row is None:
                 return {"request_id": request_id, "status": "not_found"}
-            return self._local_read_projection(db, owner, row[0], json.loads(row[1]), self._now())
+            receipt = json.loads(row[1])
+            # Match ``read``'s strictly evidenced native-Codex rejection
+            # projection without changing the stored original. Snapshot is an
+            # observational GET: the predicate may read the retained empty
+            # wire file, but it never claims recovery or writes this receipt.
+            now = self._now()
+            self._correct_historical_codex_request_rejection(receipt, now)
+            return self._local_read_projection(db, owner, row[0], receipt, now)
 
     def _local_read_projection(self, db, owner, request_hash, receipt, now):
         result = self._public_with_product_cancellation(db, owner, request_hash, receipt)
