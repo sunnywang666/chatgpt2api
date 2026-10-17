@@ -1435,7 +1435,9 @@ class TextTaskService:
         # Keep the existing known-unsent eligibility advertisement. Its local
         # input/predecessor proof is observational; the explicit resume endpoint
         # still revalidates it under a writer before admitting any work.
-        if self.admission is not None and self._known_unsent_category_successor(receipt, now):
+        if self.admission is not None and (
+                self._known_unsent_category_successor(receipt, now)
+                or self._known_unsent_no_final_successor(receipt, now)):
             try:
                 self._validated_unsent_successor_input(db, owner, request_hash, receipt, now)
                 result.update(bound_successor_resume_retryable=True, upstream_outcome="not_submitted",

@@ -44,6 +44,57 @@ def request_hash(service, request_id):
         ).fetchone()[0]
 
 
+def test_plain_no_final_snapshot_advertises_only_verified_known_unsent(task, bound_chat):
+    h = failed_plain_no_final_successor(task, bound_chat)
+    before = deepcopy(row(h.service, "successor"))
+
+    result = h.service.read_snapshot("owner", "successor")
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "CHAT_SUPERSEDE_CURSOR_CHANGED"
+    assert result["bound_successor_resume_retryable"] is True
+    assert result["upstream_outcome"] == "not_submitted"
+    assert result["upstream_submission_started"] is False
+    assert result["supersedes_request_id"] == "old"
+    assert result["continue_after_no_final"] is True
+    assert result.get("derived_input") is None
+    assert row(h.service, "successor") == before
+    assert h.admission.claim_next() is None
+    assert "send" not in bound_chat.calls
+
+
+@pytest.mark.parametrize("changes", [
+    {"send_count": 1},
+    {"_recovery_paused": True},
+])
+def test_plain_no_final_snapshot_does_not_advertise_sent_or_paused_successor(
+        task, bound_chat, changes):
+    h = failed_plain_no_final_successor(task, bound_chat)
+    update(h.service, "successor", **changes)
+    before = deepcopy(row(h.service, "successor"))
+
+    result = h.service.read_snapshot("owner", "successor")
+
+    assert "bound_successor_resume_retryable" not in result
+    assert row(h.service, "successor") == before
+    assert h.admission.claim_next() is None
+    assert "send" not in bound_chat.calls
+
+
+def test_plain_no_final_snapshot_does_not_advertise_when_original_identity_changed(task, bound_chat):
+    h = failed_plain_no_final_successor(task, bound_chat)
+    with h.service.store.transaction() as db:
+        db.execute("UPDATE requests SET request_hash='changed' WHERE owner=? AND id=?", ("owner", "old"))
+    before = deepcopy(row(h.service, "successor"))
+
+    result = h.service.read_snapshot("owner", "successor")
+
+    assert "bound_successor_resume_retryable" not in result
+    assert row(h.service, "successor") == before
+    assert h.admission.claim_next() is None
+    assert "send" not in bound_chat.calls
+
+
 def test_plain_no_final_unsent_successor_resumes_once_without_changing_frozen_identity(task, bound_chat):
     h = failed_plain_no_final_successor(task, bound_chat)
     before = deepcopy(row(h.service, "successor"))
