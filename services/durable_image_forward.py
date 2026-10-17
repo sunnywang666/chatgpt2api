@@ -224,7 +224,23 @@ def recover(service, owner, receipt):
     context = _RecoveryContext(service, owner, receipt)
     with executing(context):
         context.set_phase("read_image_request")
-        return _recover(service, owner, receipt, context)
+        try:
+            return _recover(service, owner, receipt, context)
+        except Exception as exc:
+            # The text recovery boundary persists generic read failures. Carry
+            # the already-safe operation phase across that boundary so a
+            # download failure is not relabelled as conversation_detail.
+            from services.conversation_binding_service import ConversationBindingError
+            if isinstance(exc, ConversationBindingError):
+                raise
+            evidence = {**service._generic_recovery_read_error(exc), "phase": context.phase}
+            failure_code, _ = service._recovery_failure(exc)
+            wrapped = ConversationBindingError(
+                "original image recovery read failed",
+                code=failure_code,
+                recovery_read_error=evidence,
+            )
+            raise wrapped from exc
 
 
 def _recover(service, owner, receipt, context):

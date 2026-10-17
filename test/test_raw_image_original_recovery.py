@@ -311,6 +311,9 @@ def test_recovery_429_keeps_original_request_and_distinguishes_account_from_down
     receipt = original(runtime)
     assert receipt["recovery_error_code"] == "RECOVERY_RATE_LIMITED"
     assert receipt["recovery_phase"] == stage and receipt["recovery_retry_after_seconds"] == 123
+    assert receipt["recovery_last_read_error"]["phase"] == stage
+    assert receipt["recovery_last_read_error"]["category"] == "http"
+    assert receipt["recovery_last_read_error"]["http_status"] == 429
     assert receipt["recovery_next_at"] == runtime.clock.now + 123
     if stage != "download_image":
         assert receipt["rate_limit"]["layer"] == "upstream_chatgpt"
@@ -324,6 +327,32 @@ def test_recovery_429_keeps_original_request_and_distinguishes_account_from_down
     assert len(observed.sends) == 1
     observed.before_read = observed.before_resolve = observed.before_download = None
     assert recover(runtime)["status"] == "succeeded"
+    assert len(observed.sends) == 1
+
+
+@pytest.mark.parametrize("kind,code,category", [
+    ("connection", "RECOVERY_TRANSPORT_FAILED", "transport"),
+    ("timeout", "RECOVERY_READ_FAILED", "timeout"),
+    ("invalid_delay", "RECOVERY_RATE_LIMITED", "http"),
+])
+def test_image_recovery_preserves_typed_failure_without_exception_text(runtime, monkeypatch, kind, code, category):
+    from utils.helper import UpstreamHTTPError
+    observed = fixture_upstream(runtime, monkeypatch)
+    execute(runtime, "openai_v1_image_generations")
+    def fail(*args):
+        if kind == "connection":
+            raise ConnectionError("PRIVATE_TRANSPORT_ERROR")
+        if kind == "timeout":
+            raise TimeoutError("PRIVATE_TRANSPORT_ERROR")
+        raise UpstreamHTTPError("read_image_request", 429, "PRIVATE_TRANSPORT_ERROR", retry_after=float("inf"))
+    observed.before_read = fail
+    assert recover(runtime)["status"] == "unknown"
+    receipt = original(runtime)
+    assert receipt["recovery_error_code"] == code
+    assert receipt["recovery_last_read_error"]["phase"] == "read_image_request"
+    assert receipt["recovery_last_read_error"]["category"] == category
+    assert receipt["recovery_retry_after_seconds"] is None
+    assert "PRIVATE_TRANSPORT_ERROR" not in json.dumps(receipt)
     assert len(observed.sends) == 1
 
 
