@@ -418,6 +418,72 @@ _TEXT_422_FIELDS = frozenset({
 })
 
 
+class NoFinalGuardPhase(str, Enum):
+    INITIAL_NO_FINAL_TAIL = "initial_no_final_tail"
+    PRE_SEND_NO_FINAL_TAIL = "pre_send_no_final_tail"
+    CONTEXT_CHANGED = "context_changed"
+
+
+class NoFinalGuardReason(str, Enum):
+    ARCHIVED = "archived"
+    CONVERSATION = "conversation"
+    MAPPING = "mapping"
+    MISSING_USER = "missing_user"
+    PARENT = "parent"
+    NODE_STATUS = "node_status"
+    BRANCH = "branch"
+    ROLE = "role"
+    TOOL = "tool"
+    CURRENT_NODE = "current_node"
+
+
+_NO_FINAL_GUARD_PHASES = frozenset(item.value for item in NoFinalGuardPhase)
+_NO_FINAL_GUARD_REASONS = frozenset(item.value for item in NoFinalGuardReason)
+_NO_FINAL_GUARD_MESSAGES = {
+    NoFinalGuardReason.ARCHIVED.value: "Conversation archive state does not permit continuation",
+    NoFinalGuardReason.CONVERSATION.value: "Conversation identity could not be verified",
+    NoFinalGuardReason.MAPPING.value: "Conversation mapping is unavailable",
+    NoFinalGuardReason.MISSING_USER.value: "Original user node is unavailable",
+    NoFinalGuardReason.PARENT.value: "Original parent changed",
+    NoFinalGuardReason.NODE_STATUS.value: "Conversation node is not complete",
+    NoFinalGuardReason.BRANCH.value: "Conversation branch changed",
+    NoFinalGuardReason.ROLE.value: "Conversation role chain changed",
+    NoFinalGuardReason.TOOL.value: "Conversation tool chain changed",
+    NoFinalGuardReason.CURRENT_NODE.value: "Conversation cursor changed",
+}
+
+
+def safe_no_final_guard_diagnostic(value):
+    """Accept only a fixed, content-free no-final guard diagnostic."""
+    if (not isinstance(value, dict) or set(value) != {"phase", "reason"}
+            or not isinstance(value.get("phase"), str) or not isinstance(value.get("reason"), str)
+            or value["phase"] not in _NO_FINAL_GUARD_PHASES
+            or value["reason"] not in _NO_FINAL_GUARD_REASONS
+            or (value["phase"] == NoFinalGuardPhase.CONTEXT_CHANGED.value
+                and value["reason"] != NoFinalGuardReason.CURRENT_NODE.value)):
+        return None
+    return {"phase": value["phase"], "reason": value["reason"]}
+
+
+def public_no_final_guard_diagnostic(value, error_code, status):
+    """Project one validated private guard diagnostic without upstream data."""
+    diagnostic = safe_no_final_guard_diagnostic(value)
+    if (diagnostic is None or status != "failed"
+            or error_code != "CHAT_SUPERSEDE_CURSOR_CHANGED"):
+        return None
+    return {"code": error_code, **diagnostic, "message": _NO_FINAL_GUARD_MESSAGES[diagnostic["reason"]]}
+
+
+def safe_public_no_final_guard_diagnostic(value, error_code, status):
+    """Revalidate the public form instead of trusting a persisted projection."""
+    if not isinstance(value, dict) or set(value) != {"code", "phase", "reason", "message"}:
+        return None
+    expected = public_no_final_guard_diagnostic(
+        {"phase": value.get("phase"), "reason": value.get("reason")}, error_code, status,
+    )
+    return expected if expected is not None and value == expected else None
+
+
 def _text_422_field(value: object) -> str:
     if not isinstance(value, str) or len(value) > 96:
         return ""
@@ -620,6 +686,7 @@ class ConversationBindingError(RuntimeError):
         original_upstream_rejected_field: str = "",
         original_upstream_error: dict[str, str] | None = None,
         original_upstream_response_ids: dict[str, str] | None = None,
+        no_final_guard: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -668,6 +735,7 @@ class ConversationBindingError(RuntimeError):
             safe_upstream_response_ids(original_upstream_response_ids)
             if is_stream_open_http else {}
         )
+        self.no_final_guard = safe_no_final_guard_diagnostic(no_final_guard)
 
 
 class ConversationBindingService:
@@ -1666,61 +1734,71 @@ class ConversationBindingService:
                                            code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
 
     @staticmethod
-    def _no_final_successor_tail(document, original):
+    def _no_final_successor_tail(document, original, *, phase=NoFinalGuardPhase.INITIAL_NO_FINAL_TAIL.value):
         """Accept the unchanged original user leaf or completed code/tool context.
 
         The task service has already required a stopped no-final attempt and
         reserved its only successor. This does not prove upstream cancellation
         or erase the original UNKNOWN receipt.
         """
-        def reject():
+        def reject(reason):
             raise ConversationBindingError("original no-final branch cannot be continued",
-                                           code="CHAT_SUPERSEDE_CURSOR_CHANGED")
-        if (not isinstance(document, dict) or document.get("conversation_id") != original.get("conversation_id")
-                or document.get("is_archived") is not False or not isinstance(document.get("mapping"), dict)):
-            reject()
+                                           code="CHAT_SUPERSEDE_CURSOR_CHANGED",
+                                           no_final_guard={"phase": phase, "reason": reason})
+        if not isinstance(document, dict) or document.get("conversation_id") != original.get("conversation_id"):
+            reject(NoFinalGuardReason.CONVERSATION.value)
+        if document.get("is_archived") is not False:
+            reject(NoFinalGuardReason.ARCHIVED.value)
+        if not isinstance(document.get("mapping"), dict):
+            reject(NoFinalGuardReason.MAPPING.value)
         mapping = document["mapping"]
         user = original.get("request_message_id")
         expected = original.get("request_parent_message_id") or original.get("_submission_parent_message_id")
-        if not user or not expected or user not in mapping or any(not isinstance(x, dict) for x in mapping.values()):
-            reject()
+        if not user or user not in mapping:
+            reject(NoFinalGuardReason.MISSING_USER.value)
+        if not expected:
+            reject(NoFinalGuardReason.PARENT.value)
+        if any(not isinstance(x, dict) for x in mapping.values()):
+            reject(NoFinalGuardReason.MAPPING.value)
         children = {}
         for key, node in mapping.items():
             parent = node.get("parent")
             if parent is not None and not isinstance(parent, str):
-                reject()
+                reject(NoFinalGuardReason.PARENT.value)
             children.setdefault(parent, []).append(key)
         node_id, seen, previous_role, context = user, set(), None, []
         while True:
             if node_id in seen:
-                reject()
+                reject(NoFinalGuardReason.BRANCH.value)
             seen.add(node_id)
             node = mapping[node_id]
             message = node.get("message")
             if (not isinstance(message, dict) or message.get("id") != node_id
-                    or not isinstance(message.get("author"), dict)
-                    or message.get("status") != "finished_successfully"):
-                reject()
+                    or not isinstance(message.get("author"), dict)):
+                reject(NoFinalGuardReason.MAPPING.value)
+            if message.get("status") != "finished_successfully":
+                reject(NoFinalGuardReason.NODE_STATUS.value)
             role = message["author"].get("role")
             if node_id == user:
                 if role != "user" or node.get("parent") != expected:
-                    reject()
+                    reject(NoFinalGuardReason.ROLE.value if role != "user" else NoFinalGuardReason.PARENT.value)
             elif role == "assistant":
                 content = message.get("content")
                 if (previous_role not in {"user", "tool"} or message.get("end_turn") is not False
                         or message.get("channel") not in {None, "analysis"}
                         or not isinstance(content, dict) or content.get("content_type") != "code"):
-                    reject()
+                    reject(NoFinalGuardReason.TOOL.value)
             elif role != "tool" or previous_role != "assistant" or message.get("end_turn") is True:
-                reject()
+                reject(NoFinalGuardReason.TOOL.value)
             context.append(deepcopy({k: message.get(k) for k in
                 ("id", "author", "recipient", "channel", "content", "status", "end_turn")}))
             next_nodes = children.get(node_id, [])
             if len(next_nodes) > 1 or (node.get("children") or []) != next_nodes:
-                reject()
+                reject(NoFinalGuardReason.BRANCH.value)
             if not next_nodes:
                 if (node_id != user and role != "tool") or document.get("current_node") != node_id:
-                    reject()
+                    reject(NoFinalGuardReason.ROLE.value if node_id != user and role != "tool"
+                           else NoFinalGuardReason.CURRENT_NODE.value)
                 return node_id, context
             previous_role, node_id = role, next_nodes[0]
 
@@ -1798,7 +1876,8 @@ class ConversationBindingService:
 
     @staticmethod
     def _check_missing_successor_no_final(document, conversation_id, predecessor,
-                                          original_successor_user, replacement_user, expected_tail):
+                                          original_successor_user, replacement_user, expected_tail, *,
+                                          phase=NoFinalGuardPhase.INITIAL_NO_FINAL_TAIL.value):
         """Fence a resend beside a stopped no-final successor.
 
         The predecessor's proved tool chain supplies the live tail.  The
@@ -1812,9 +1891,13 @@ class ConversationBindingService:
         if not ConversationBindingService._missing_successor_node_absent(mapping, original_successor_user):
             raise ConversationBindingError("original successor appeared", code="CHAT_SUPERSEDE_ORIGINAL_FOUND")
         ConversationBindingService._check_missing_successor_replacement_absent(document, replacement_user)
-        tail, context = ConversationBindingService._no_final_successor_tail(document, predecessor)
+        tail, context = ConversationBindingService._no_final_successor_tail(document, predecessor, phase=phase)
         if document.get("conversation_id") != conversation_id or tail != expected_tail:
-            raise ConversationBindingError("original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+            raise ConversationBindingError(
+                "original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED",
+                no_final_guard={"phase": NoFinalGuardPhase.CONTEXT_CHANGED.value,
+                                "reason": NoFinalGuardReason.CURRENT_NODE.value},
+            )
         return tail, context
 
     @staticmethod
@@ -1943,17 +2026,34 @@ class ConversationBindingService:
                         if self._check_missing_successor_no_final(
                                 fresh, conversation_id, body["_missing_successor_no_final_predecessor"],
                                 body["_supersedes_request_message_id"], backend.text_request_message_id,
-                                body["_missing_successor_expected_tail"]) != missing_no_final_context:
-                            raise ConversationBindingError("original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+                                body["_missing_successor_expected_tail"],
+                                phase=NoFinalGuardPhase.PRE_SEND_NO_FINAL_TAIL.value) != missing_no_final_context:
+                            raise ConversationBindingError(
+                                "original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED",
+                                no_final_guard={"phase": NoFinalGuardPhase.CONTEXT_CHANGED.value,
+                                                "reason": NoFinalGuardReason.CURRENT_NODE.value},
+                            )
                     elif body.get("_native_no_final_prefix"):
                         if self._native_no_final_prefix(
                                 fresh, conversation_id, body["_native_no_final_prefix"]) != native_no_final_prefix_context:
                             raise ConversationBindingError("native no-final prefix changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
-                        if self._no_final_successor_tail(fresh, body["_supersedes_no_final_original"]) != no_final_context:
-                            raise ConversationBindingError("original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+                        if self._no_final_successor_tail(
+                                fresh, body["_supersedes_no_final_original"],
+                                phase=NoFinalGuardPhase.PRE_SEND_NO_FINAL_TAIL.value) != no_final_context:
+                            raise ConversationBindingError(
+                                "original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED",
+                                no_final_guard={"phase": NoFinalGuardPhase.CONTEXT_CHANGED.value,
+                                                "reason": NoFinalGuardReason.CURRENT_NODE.value},
+                            )
                     elif body.get("_supersedes_no_final_original"):
-                        if self._no_final_successor_tail(fresh, body["_supersedes_no_final_original"]) != no_final_context:
-                            raise ConversationBindingError("original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
+                        if self._no_final_successor_tail(
+                                fresh, body["_supersedes_no_final_original"],
+                                phase=NoFinalGuardPhase.PRE_SEND_NO_FINAL_TAIL.value) != no_final_context:
+                            raise ConversationBindingError(
+                                "original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED",
+                                no_final_guard={"phase": NoFinalGuardPhase.CONTEXT_CHANGED.value,
+                                                "reason": NoFinalGuardReason.CURRENT_NODE.value},
+                            )
                     else:
                         self._check_superseded_original(fresh, conversation_id, parent_message_id,
                                                         body["_supersedes_request_message_id"])
@@ -2049,7 +2149,8 @@ class ConversationBindingService:
                             missing_no_final_context = self._check_missing_successor_no_final(
                                 document, conversation_id, body["_missing_successor_no_final_predecessor"],
                                 body["_supersedes_request_message_id"], backend.text_request_message_id,
-                                body["_missing_successor_expected_tail"])
+                                body["_missing_successor_expected_tail"],
+                                phase=NoFinalGuardPhase.INITIAL_NO_FINAL_TAIL.value)
                             # Keep the frozen submission root in the durable
                             # receipt, but send from the freshly verified live
                             # no-final tail.  This mirrors the original

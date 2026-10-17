@@ -29,6 +29,9 @@ def failed_plain_no_final_successor(task, bound_chat):
     assert failed["status"] == "failed"
     assert failed["error_code"] == "CHAT_SUPERSEDE_CURSOR_CHANGED"
     assert failed["upstream_outcome"] == "not_sent"
+    assert failed["_no_final_guard"] == {
+        "phase": "initial_no_final_tail", "reason": "current_node",
+    }
     assert failed["_supersedes_no_final"] is True
     assert failed.get("_derived_input") is None
     assert "send" not in bound_chat.calls
@@ -57,10 +60,71 @@ def test_plain_no_final_snapshot_advertises_only_verified_known_unsent(task, bou
     assert result["upstream_submission_started"] is False
     assert result["supersedes_request_id"] == "old"
     assert result["continue_after_no_final"] is True
+    assert result["no_final_guard"] == {
+        "code": "CHAT_SUPERSEDE_CURSOR_CHANGED",
+        "phase": "initial_no_final_tail",
+        "reason": "current_node",
+        "message": "Conversation cursor changed",
+    }
     assert result.get("derived_input") is None
     assert row(h.service, "successor") == before
     assert h.admission.claim_next() is None
     assert "send" not in bound_chat.calls
+
+
+def test_plain_no_final_pre_send_context_change_has_distinct_safe_phase(task, bound_chat, monkeypatch):
+    import services.conversation_binding_service as module
+
+    h = failed_plain_no_final_successor(task, bound_chat)
+    h.service.resume_unsent_successor("owner", "successor", h.envelope)
+    original_get = module.OpenAIBackendAPI._get_conversation
+    # The tail remains eligible at the initial read, then changes immediately
+    # before the actual pre-send guard.
+    def events(backend, **_kwargs):
+        bound_chat.document["mapping"]["code"]["message"]["channel"] = "analysis"
+        backend.text_pre_send_check(None)
+        yield from ()
+    def read(backend, conversation_id, **_kwargs):
+        return original_get(backend, conversation_id)
+    monkeypatch.setattr(module.OpenAIBackendAPI, "_get_conversation", read)
+    monkeypatch.setattr(module, "conversation_events", events)
+    h.admission.execute(h.admission.claim_next())
+
+    failed = row(h.service, "successor")
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "CHAT_SUPERSEDE_CURSOR_CHANGED"
+    assert failed["_no_final_guard"] == {
+        "phase": "context_changed", "reason": "current_node",
+    }
+    assert h.service.read_snapshot("owner", "successor")["no_final_guard"]["phase"] == "context_changed"
+    assert "send" not in bound_chat.calls
+
+
+@pytest.mark.parametrize("diagnostic", [
+    {"phase": "initial_no_final_tail", "reason": "untrusted-secret", "message": "private graph value"},
+    {"phase": [], "reason": "current_node"},
+    {"phase": "initial_no_final_tail", "reason": {}},
+    {"phase": "context_changed", "reason": "archived"},
+])
+def test_plain_no_final_public_guard_diagnostic_rejects_untrusted_storage(task, bound_chat, diagnostic):
+    h = failed_plain_no_final_successor(task, bound_chat)
+    update(h.service, "successor", _no_final_guard=diagnostic)
+
+    result = h.service.read_snapshot("owner", "successor")
+
+    assert "no_final_guard" not in result
+    assert "untrusted-secret" not in str(result)
+    assert "private graph value" not in str(result)
+
+
+def test_plain_no_final_public_guard_diagnostic_hides_stale_or_mismatched_error(task, bound_chat):
+    h = failed_plain_no_final_successor(task, bound_chat)
+    failed = row(h.service, "successor")
+    stale = {**failed, "status": "succeeded", "error_code": "CHAT_SUPERSEDE_CURSOR_CHANGED"}
+    mismatched = {**failed, "error_code": "CHAT_SUPERSEDE_READ_UNAVAILABLE"}
+
+    assert "no_final_guard" not in h.service._public(stale)
+    assert "no_final_guard" not in h.service._public(mismatched)
 
 
 @pytest.mark.parametrize("changes", [
@@ -108,6 +172,9 @@ def test_plain_no_final_unsent_successor_resumes_once_without_changing_frozen_id
     queued = row(h.service, "successor")
     assert queued["_bound_successor_resume_count"] == 1
     assert queued["_bound_successor_resume_failure"]["error_code"] == "CHAT_SUPERSEDE_CURSOR_CHANGED"
+    assert queued["_bound_successor_resume_failure"]["_no_final_guard"] == {
+        "phase": "initial_no_final_tail", "reason": "current_node",
+    }
     for key in ("request_id", "request_message_id", "_input_ref", "_supersedes_request_id",
                 "_supersedes_input_hash", "_supersedes_no_final", "_sequence"):
         assert queued[key] == before[key]
@@ -170,6 +237,9 @@ def test_plain_no_final_resume_repeats_fresh_tail_guard_before_send(task, bound_
     assert failed["status"] == "failed"
     assert failed["error_code"] == "CHAT_SUPERSEDE_CURSOR_CHANGED"
     assert failed["upstream_outcome"] == "not_sent"
+    assert failed["_no_final_guard"] == {
+        "phase": "initial_no_final_tail", "reason": "current_node",
+    }
     assert failed["_submission_parent_message_id"] == "previous-answer"
     assert h.service.store.load_input(failed["_input_ref"])["parent_message_id"] == "previous-answer"
     assert "send" not in bound_chat.calls
@@ -211,6 +281,8 @@ def test_plain_no_final_resume_sends_once_from_the_verified_tail_and_preserves_o
     assert succeeded["status"] == "succeeded" and succeeded["content"] == "synthetic answer", {
         key: succeeded.get(key) for key in ("status", "error_code", "upstream_outcome", "waiting", "_ready_at", "_submission_started")
     }
+    assert succeeded.get("_no_final_guard") is None
+    assert "no_final_guard" not in h.service.read_snapshot("owner", "successor")
     assert succeeded["_bound_successor_resume_count"] == 1
     for key in ("request_id", "request_message_id", "_input_ref", "_supersedes_request_id",
                 "_supersedes_input_hash", "_supersedes_no_final", "_sequence"):

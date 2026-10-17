@@ -57,7 +57,6 @@ def test_get_cannot_reopen_exhausted_no_final_recovery(public_chat, reason, stop
     assert reader.call_count == 1
     f.upstream.assert_not_called()
 
-
 def test_public_snapshot_is_owner_scoped_observational_and_projects_persisted_completion(public_chat):
     f = public_chat
     owner = f.key_a["id"]
@@ -134,6 +133,7 @@ def test_public_get_exposes_sanitized_http_error_without_resubmitting(public_cha
     assert "PRIVATE_TOKEN" not in tampered.text
     f.upstream.assert_not_called()
 
+
     # A later original-result recovery hides the old active error without
     # rewriting a valid stored response trace.
     valid_response_ids = {
@@ -151,6 +151,44 @@ def test_public_get_exposes_sanitized_http_error_without_resubmitting(public_cha
     with f.tasks._db() as db:
         stored = f.tasks.store.read_receipt(db, "text", owner, "http-error")
     assert stored["original_upstream_response_ids"] == valid_response_ids
+    f.upstream.assert_not_called()
+
+
+def test_public_get_projects_only_valid_active_no_final_guard_diagnostic(public_chat):
+    f = public_chat
+    owner = f.key_a["id"]
+    f.tasks.submit(owner, {"client_request_id": "no-final-guard", "client_conversation_id": "guard-session",
+                           "messages": [{"role": "user", "content": "retained input"}]})
+    f.tasks._update(
+        owner, "no-final-guard", status="failed", error_code="CHAT_SUPERSEDE_CURSOR_CHANGED",
+        upstream_outcome="not_sent", _no_final_guard={
+            "phase": "initial_no_final_tail", "reason": "current_node",
+        },
+    )
+    response = f.client.get("/api/chat-requests/no-final-guard", headers=f.headers())
+    assert response.status_code == 200
+    assert response.json()["no_final_guard"] == {
+        "code": "CHAT_SUPERSEDE_CURSOR_CHANGED", "phase": "initial_no_final_tail",
+        "reason": "current_node", "message": "Conversation cursor changed",
+    }
+    with f.tasks._db() as db:
+        stored = f.tasks.store.read_receipt(db, "text", owner, "no-final-guard")
+        stored["_no_final_guard"] = {"phase": [], "reason": "current_node", "message": "private graph"}
+        f.tasks.store.write_receipt(db, "text", owner, "no-final-guard", stored)
+    redacted = f.client.get("/api/chat-requests/no-final-guard", headers=f.headers())
+    assert "no_final_guard" not in redacted.json()
+    assert "private graph" not in redacted.text
+    from services.public_chat_service import project_public_chat_receipt
+    forged = project_public_chat_receipt({
+        "request_id": "no-final-guard", "status": "failed",
+        "error_code": "CHAT_SUPERSEDE_CURSOR_CHANGED",
+        "no_final_guard": {
+            "code": "CHAT_SUPERSEDE_CURSOR_CHANGED", "phase": "initial_no_final_tail",
+            "reason": "current_node", "message": "private graph",
+        },
+    })
+    assert "no_final_guard" not in forged
+    assert "private graph" not in str(forged)
     f.upstream.assert_not_called()
 
 
