@@ -2250,6 +2250,84 @@ class TextTaskService:
         )
 
     @classmethod
+    def _native_no_final_successor_source(cls, store, db, owner, receipt, now, *, successor_id, successor_sequence):
+        """Return the proved R -> P -> N chain eligible for one native N -> C continuation.
+
+        ``N`` is already a submitted model-retry whose user node exists but
+        has no final answer.  This is deliberately narrower than the
+        structural lineage recognizer: registration and execution must still
+        reject a late R result, a live N claim, or a second direct child.
+        """
+        if (not isinstance(successor_id, str) or not successor_id
+                or receipt.get("_supersedes_no_final") is True
+                or not cls._no_final_model_rejection_retry(store, db, owner, receipt, now)):
+            return None
+        parent_id = receipt.get("_supersedes_request_id")
+        parent_row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, parent_id)).fetchone()
+        if not parent_row:
+            return None
+        try:
+            parent = json.loads(parent_row[0])
+        except (TypeError, ValueError):
+            return None
+        if (not cls._rejected_no_final_successor_source(store, db, owner, parent, now)
+                or any(parent.get(key) for key in ("_claim_id", "recovery_claim_id", "_recovery_claim_id",
+                                                   "_work_key", "_completion", "_completion_of",
+                                                   "_recovery_paused", "_recovery_suppressed"))
+                or any(parent.get(key) is not None for key in ("_claim_until", "recovery_lease_until",
+                                                               "_recovery_claim_until"))):
+            return None
+        parent_children = db.execute(
+            "SELECT id FROM requests WHERE owner=? AND "
+            "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?)",
+            (owner, parent_id, parent_id),
+        ).fetchall()
+        if len(parent_children) != 1 or parent_children[0][0] != receipt.get("request_id"):
+            return None
+        original_id = parent.get("_supersedes_request_id")
+        original = store.read_receipt(db, "text", owner, original_id) if isinstance(original_id, str) else None
+        if not original:
+            return None
+        if (receipt.get("status") != "failed"
+                or receipt.get("error_code") != "RESULT_UNRECOVERABLE"
+                or receipt.get("upstream_outcome") != "unknown"
+                or receipt.get("recovery_reason") != "REQUEST_RESULT_NOT_FOUND"
+                or not cls._no_final_successor_source(receipt, now)
+                or receipt.get("_submission_started") is not True
+                or receipt.get("_upstream_terminal")
+                or receipt.get("_derived_input")
+                or receipt.get("_public_session_ref") or receipt.get("_public_route")
+                or receipt.get("_forward") or receipt.get("_forward_protocol")
+                or receipt.get("_executing") is not False or receipt.get("_turn_reserved") is not False
+                or any(key in receipt for key in ("content", "result", "data"))
+                or receipt.get("result_file_ids") or receipt.get("result_sediment_ids")
+                or any(receipt.get(key) for key in ("_work_key", "_completion", "_completion_of",
+                                                    "_recovery_paused", "_recovery_suppressed"))):
+            return None
+        for claim_key, until_key in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until"),
+                                     ("_recovery_claim_id", "_recovery_claim_until")):
+            if receipt.get(claim_key) or receipt.get(until_key) is not None:
+                return None
+        root_parent = original.get("request_parent_message_id") or original.get("_submission_parent_message_id")
+        native_parent = receipt.get("request_parent_message_id")
+        if not all(isinstance(value, str) and value for value in (
+                original.get("request_message_id"), root_parent, parent.get("request_message_id"),
+                receipt.get("request_message_id"), native_parent)):
+            return None
+        children = db.execute(
+            "SELECT id FROM requests WHERE owner=? AND "
+            "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?)",
+            (owner, receipt["request_id"], receipt["request_id"]),
+        ).fetchall()
+        if children and (len(children) != 1 or children[0][0] != successor_id):
+            return None
+        sequence = (original.get("_sequence"), parent.get("_sequence"), receipt.get("_sequence"), successor_sequence)
+        if (any(type(value) is not int or value <= 0 for value in sequence)
+                or not (sequence[0] < sequence[1] < sequence[2] < sequence[3])):
+            return None
+        return {"original": original, "parent": parent}
+
+    @classmethod
     def _rejected_successor_body(cls, original, retained, previous_id, request_id, client_conversation_id,
                                  *, model_rejection_retry=False, missing_node_retry=False,
                                  queued_image_id=None):
@@ -2479,6 +2557,10 @@ class TextTaskService:
         missing_node_model_retry = (not direct_rejected_model and not model_rejection_retry
             and successor.get(TextTaskService.MISSING_NODE_RETRY_FIELD) is not None
             and TextTaskService._rejected_missing_node_successor_source(store, db, owner, previous, now))
+        native_no_final_retry = (successor.get("_supersedes_no_final") is True
+            and TextTaskService._native_no_final_successor_source(
+                store, db, owner, previous, now, successor_id=successor.get("request_id"),
+                successor_sequence=successor.get("_sequence")))
         rejected_model = direct_rejected_model or model_rejection_retry or missing_node_model_retry
         if (not rejected_model and (not isinstance(previous.get("request_message_id"), str)
                                     or not previous["request_message_id"])
@@ -2498,7 +2580,7 @@ class TextTaskService:
                 reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
         if previous.get("_executing") or previous.get("_turn_reserved"):
             reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
-        if (not rejected_model and (previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
+        if (not rejected_model and not native_no_final_retry and (previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
                 or previous.get("upstream_outcome") != "unknown"
                 or (not TextTaskService._no_final_successor_source(previous, now)
                     if successor.get("_supersedes_no_final") else previous.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND")
@@ -2637,6 +2719,20 @@ class TextTaskService:
         missing_node_model_retry = (not direct_rejected_model and not model_rejection_retry
             and self.MISSING_NODE_RETRY_FIELD in body
             and self._rejected_missing_node_successor_source(self.store, db, owner, original, self._now()))
+        native_sequence = None
+        native_no_final_source = None
+        if body.get("continue_after_no_final") is True:
+            acceptance_sequence = self.store.runtime(db, "acceptance_sequence", 0)
+            native_sequence = (acceptance_sequence + 1
+                               if type(acceptance_sequence) is int and acceptance_sequence >= 0 else None)
+            native_no_final_source = self._native_no_final_successor_source(
+                self.store, db, owner, original, self._now(), successor_id=body.get("client_request_id"),
+                successor_sequence=native_sequence)
+        native_no_final_retry = bool(native_no_final_source)
+        if native_no_final_retry:
+            # The transaction owns the next sequence; retain this exact value
+            # for the candidate revalidation and final insert below.
+            receipt["_sequence"] = native_sequence
         rejected_model = direct_rejected_model or model_rejection_retry or missing_node_model_retry
         if rejected_model:
             try:
@@ -2650,6 +2746,15 @@ class TextTaskService:
                 queued_image_id=body.get(self.MISSING_NODE_RETRY_FIELD),
             )
             if expected is None or body != expected:
+                reject("CHAT_SUPERSEDE_INVALID")
+        elif native_no_final_retry:
+            try:
+                retained = self.store.load_input(original["_input_ref"])
+            except (OSError, ValueError, TypeError, KeyError):
+                reject("CHAT_SUPERSEDE_INVALID")
+            expected = {**retained, "client_request_id": body["client_request_id"],
+                        "supersedes_request_id": previous_id, "continue_after_no_final": True}
+            if body != expected:
                 reject("CHAT_SUPERSEDE_INVALID")
         elif "derived_input" in body:
             from services.category_directory_derivation import derive_retained_input
@@ -2700,12 +2805,18 @@ class TextTaskService:
                 if ((model_rejection_retry or missing_node_model_retry) and kind == "text"
                         and other_id == original.get("_supersedes_request_id")):
                     continue
+                if (native_no_final_retry and kind == "text" and other_id in {
+                        original.get("_supersedes_request_id"),
+                        native_no_final_source["parent"].get("_supersedes_request_id"),
+                }):
+                    continue
                 if (missing_node_model_retry and kind == "image"
                         and other_id == receipt.get(self.MISSING_NODE_RETRY_FIELD)):
                     continue
                 if kind == "text" and self._completed_historical_successor(db, owner, other_id, other, original, self._now()):
                     continue
                 reject("CHAT_SUPERSEDE_CONFLICT")
+        return native_sequence if native_no_final_retry else None
 
     @classmethod
     def _completed_historical_successor(cls, db, owner, previous_id, previous, original, now):
@@ -3038,12 +3149,15 @@ class TextTaskService:
                             and body["provider_account_identity"] != receipt["_requested_account_identity"]):
                         raise ConversationBindingError("account selection conflicts with binding",
                                                        code="CHAT_ACCOUNT_SELECTION_CONFLICT")
-                self._prepare_supersede(db, owner, body, receipt)
+                expected_native_sequence = self._prepare_supersede(db, owner, body, receipt)
                 self._continue_public_session(db, owner, body, receipt)
                 from services.generation_completion import attach_replacement
                 attach_replacement(self.store, db, "text", owner, request_id, body, receipt)
+                assigned_sequence = self.store.next_sequence(db)
+                if expected_native_sequence is not None and assigned_sequence != expected_native_sequence:
+                    raise ConversationBindingError("native no-final acceptance order changed", code="CHAT_SUPERSEDE_INVALID")
                 receipt.update({"_input_ref": self.store.save_input(body),
-                                "_sequence": self.store.next_sequence(db),
+                                "_sequence": assigned_sequence,
                                 "_source": source or "key:" + owner,
                                 "_input_bytes": _retained_size(body),
                                 "_turn_reserved": False,
@@ -3645,6 +3759,9 @@ class TextTaskService:
                     previous = self._validate_supersede(self.store, db, owner, receipt, self._now())
                     no_final_original = None
                     missing_node_original = None
+                    native_no_final_chain = self._native_no_final_successor_source(
+                        self.store, db, owner, previous, self._now(), successor_id=receipt["request_id"],
+                        successor_sequence=receipt.get("_sequence"))
                     if (previous.get("_supersedes_no_final") is True
                             and self._rejected_chat_successor_source(previous, allow_no_final_successor=True)):
                         no_final_original = self.store.read_receipt(
@@ -3683,6 +3800,15 @@ class TextTaskService:
                     # frozen retained input.
                     body.update(_missing_successor_no_final_predecessor=no_final_original,
                                 _missing_successor_expected_tail=actual_parent)
+                if native_no_final_chain:
+                    root, rejected = native_no_final_chain["original"], native_no_final_chain["parent"]
+                    body["_native_no_final_prefix"] = {
+                        "root_request_message_id": root["request_message_id"],
+                        "root_parent_message_id": root.get("request_parent_message_id") or root.get("_submission_parent_message_id"),
+                        "rejected_request_message_id": rejected["request_message_id"],
+                        "native_request_message_id": previous["request_message_id"],
+                        "native_parent_message_id": previous["request_parent_message_id"],
+                    }
                 if missing_node_original:
                     root_user = missing_node_original.get("request_message_id")
                     if not isinstance(root_user, str) or not root_user:

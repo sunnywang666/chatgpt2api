@@ -625,7 +625,7 @@ def _missing_node_chain(store, db, parent, receipt, members, now):
 
 
 def _no_final_successor_chain(store, db, parent, receipt, members, now):
-    """Return the one terminal direct successor which resolves a stopped root.
+    """Return the one terminal successor which resolves a proved no-final chain.
 
     This is deliberately a lifecycle proof, not a call to the send-time
     supersede validator.  Close and archive must re-read the frozen inputs,
@@ -659,11 +659,21 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
         successor_identity = TextTaskService._submission_identity(parent["owner"], successor_body)
     except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
         return None
+    ancestors = []
+    if original.get("_supersedes_request_id"):
+        try:
+            native_chain = TextTaskService._native_no_final_successor_source(
+                store, db, parent["owner"], original, now,
+                successor_id=successor_id, successor_sequence=receipt.get("_sequence"))
+        except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
+            return None
+        if not native_chain:
+            return None
+        ancestors = [native_chain["original"], native_chain["parent"]]
     if (original.get("request_id") != original_id
             or original.get("status") != "failed"
             or original.get("error_code") != "RESULT_UNRECOVERABLE"
             or original.get("upstream_outcome") != "unknown"
-            or original.get("_supersedes_request_id")
             or original.get("_supersedes_no_final") is True
             or original.get("_upstream_terminal")
             or original.get("upstream_unfinished")
@@ -675,26 +685,28 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
         return None
     controls = ("_executing", "_turn_reserved", "recovery_claim_id", "_recovery_claim_id",
                 "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of")
-    if (any(_claims(item) or any(item.get(key) for key in controls) for item in (original, receipt))
+    chain_members = [*ancestors, original, receipt]
+    if (any(_claims(item) or any(item.get(key) for key in controls) for item in chain_members)
             or _unresolved(receipt, [row for _, row in members])):
         return None
     keys = ("_product_work_key", "provider_binding_id", "provider_account_identity",
             "client_conversation_id", "conversation_id")
     if (any(any(item.get(key) != original.get(key) or not item.get(key) for key in keys)
-            for item in (receipt,))
-            or any(item.get("_product_work_key") != parent["key"] for item in (original, receipt))
-            or not (_source(original) == _source(receipt) == parent["source"])):
+            for item in chain_members)
+            or any(item.get("_product_work_key") != parent["key"] for item in chain_members)
+            or any(_source(item) != parent["source"] for item in chain_members)):
         return None
     if (type(original.get("_sequence")) is not int or type(receipt.get("_sequence")) is not int
             or original["_sequence"] <= 0 or receipt["_sequence"] <= original["_sequence"]
             or not TextTaskService._supersede_order_link(original, receipt)):
         return None
-    if (original_body.get("supersedes_request_id") or original_body.get("continue_after_no_final") is not None
+    if ((original_body.get("supersedes_request_id") and not ancestors)
+            or original_body.get("continue_after_no_final") is not None
             or original_body.get("derived_input") is not None):
         return None
     audit = receipt.get("_derived_input")
     if audit is not None:
-        if not isinstance(audit, dict) or audit.get("kind") != "attributes_required_only_v4":
+        if ancestors or not isinstance(audit, dict) or audit.get("kind") != "attributes_required_only_v4":
             return None
         try:
             expected_body, expected_audit = derive_retained_input(
@@ -714,9 +726,22 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
     if len(children) != 1 or children[0][0] != successor_id:
         return None
     member_ids = {(member["kind"], row.get("request_id") or row.get("id")) for member, row in members}
-    if not {("text", original_id), ("text", successor_id)} <= member_ids:
+    if not {("text", item["request_id"]) for item in chain_members} <= member_ids:
         return None
-    return {"original": original, "successor": receipt}
+    if ancestors:
+        if any(not TextTaskService._supersede_order_link(previous, successor)
+               for previous, successor in zip(chain_members, chain_members[1:])):
+            return None
+        member_refs = {member["request_id"]: member for member, _ in members if member["kind"] == "text"}
+        for item in chain_members:
+            member = member_refs.get(item["request_id"])
+            if not member:
+                return None
+            metadata = {"product_ref": parent["product_ref"],
+                        "step_ref": member["step_ref"]}
+            if item.get("_product_work") != metadata or original_body.get("product_work") != metadata:
+                return None
+    return {"original": original, "successor": receipt, "resolved": [*ancestors, original]}
 
 
 class ProductWorkService:
@@ -830,7 +855,7 @@ class ProductWorkService:
         for _, receipt in members:
             chain = _no_final_successor_chain(self.store, db, parent, receipt, members, now)
             if chain:
-                waived.add(chain["original"]["request_id"])
+                waived.update(item["request_id"] for item in chain["resolved"])
         return waived
 
     def archive_turns_ready(self, db, child, members):
