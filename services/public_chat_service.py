@@ -324,6 +324,12 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
     error_code = receipt.get("error_code")
     if isinstance(error_code, str) and error_code:
         result["error_code"] = error_code
+    from services.conversation_binding_service import safe_public_no_final_guard_diagnostic
+    no_final_guard = safe_public_no_final_guard_diagnostic(
+        receipt.get("no_final_guard"), error_code, result["status"],
+    )
+    if no_final_guard is not None:
+        result["no_final_guard"] = no_final_guard
     for field in ("waiting", "rate_limit"):
         if isinstance(receipt.get(field), dict):
             result[field] = receipt[field]

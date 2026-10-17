@@ -30,7 +30,9 @@ from services.conversation_binding_service import (
     RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
     RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
+    public_no_final_guard_diagnostic,
     safe_scan_failures,
+    safe_no_final_guard_diagnostic,
     safe_recovery_read_error,
     TURN_END_EVIDENCE_FIELD,
     conversation_binding_service,
@@ -395,6 +397,16 @@ class TextTaskService:
             # Older successful retries retained their previous active error.
             # Correct the read projection without rewriting original diagnostics.
             result.update(error_code=None, waiting=None, upstream_outcome="completed")
+        # A persisted public-looking value is never trusted. The diagnostic is
+        # emitted only for the matching active error code from a fixed private
+        # enum record, so a later successful or unrelated receipt cannot leak
+        # a stale failure explanation.
+        result.pop("no_final_guard", None)
+        no_final_guard = public_no_final_guard_diagnostic(
+            receipt.get("_no_final_guard"), receipt.get("error_code"), receipt.get("status"),
+        )
+        if no_final_guard is not None:
+            result["no_final_guard"] = no_final_guard
         result.pop("execution", None)
         result["recovery_control"] = recovery_control(receipt)
         if receipt.get("_product_work"):
@@ -1742,7 +1754,7 @@ class TextTaskService:
             if changes.get("status") == "succeeded":
                 # Success ends the active failure; original_failure_* and the
                 # execution timeline remain available as historical evidence.
-                changes.update(error_code=None, waiting=None, upstream_outcome="completed")
+                changes.update(error_code=None, waiting=None, upstream_outcome="completed", _no_final_guard=None)
             if "original_upstream_response_ids" in changes:
                 original_ids = safe_upstream_response_ids(receipt.get("original_upstream_response_ids"))
                 incoming_ids = safe_upstream_response_ids(changes["original_upstream_response_ids"])
@@ -3373,8 +3385,13 @@ class TextTaskService:
             except (OSError, ValueError, TypeError, KeyError):
                 raise ConversationBindingError("retained successor input unavailable", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE") from None
             updated = dict(receipt)
-            updated["_bound_successor_resume_failure"] = {key: receipt[key] for key in (
+            failure = {key: receipt[key] for key in (
                 "status", "error_code", "upstream_outcome", "finished_at", "updated_at", "_execution_timeline") if key in receipt}
+            guard = safe_no_final_guard_diagnostic(receipt.get("_no_final_guard"))
+            if guard is not None:
+                failure["_no_final_guard"] = guard
+            updated["_bound_successor_resume_failure"] = failure
+            updated.pop("_no_final_guard", None)
             for key in ("error_code", "upstream_outcome", "finished_at", "waiting", "_ready_at", "_claim_id", "_claim_until"):
                 updated.pop(key, None)
             updated.update(status="queued", boot=self.boot, updated_at=self._now(),
@@ -3949,6 +3966,8 @@ class TextTaskService:
                 transient = exc.code in {"CHAT_SUPERSEDE_READ_UNAVAILABLE", "CHAT_SUPERSEDE_PREDECESSOR_BUSY"}
                 changes = {"error_code": exc.code, "upstream_outcome": "not_sent", "_turn_reserved": False,
                            "_executing": False, "_claim_id": None, "_claim_until": None}
+                guard = safe_no_final_guard_diagnostic(getattr(exc, "no_final_guard", None))
+                changes["_no_final_guard"] = guard
                 if transient and self.admission is not None:
                     changes.update(status="queued", _ready_at=self._now()+self.RECOVERY_BASE_BACKOFF_SECONDS,
                                    waiting={"reason": "superseded_original_unverified"})
