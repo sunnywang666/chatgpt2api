@@ -209,6 +209,20 @@ class MissingSuccessorResumeRequest(ConversationArchiveRequest):
     supersedes_request_id: str = Field(min_length=1, max_length=200)
 
 
+class ReconcileQueuedSuccessorRequest(ConversationArchiveRequest):
+    """References only durable IDs and the existing bound cursor."""
+    client_request_id: str = Field(strict=True, min_length=1, max_length=200)
+    original_request_id: str = Field(strict=True, min_length=1, max_length=200)
+    dry_run: bool = Field(default=True, strict=True)
+
+    @field_validator("client_request_id", "original_request_id")
+    @classmethod
+    def stable_value(cls, value):
+        if value != value.strip() or any(ord(char) < 32 for char in value):
+            raise ValueError("invalid reconciliation request identity")
+        return value
+
+
 class AnthropicMessageRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str | None = None
@@ -654,6 +668,30 @@ def create_router() -> APIRouter:
                 str(identity.get("id") or "anonymous"), request_id, body.model_dump(mode="python"))
         except ConversationBindingError as exc:
             raise HTTPException(409, detail={"code": exc.code}) from exc
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/reconcile-queued-successor")
+    async def reconcile_queued_bound_successor(request_id: str, body: ReconcileQueuedSuccessorRequest,
+                                               request: Request, response: Response,
+                                               authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization, request=request)
+        source = trusted_source(identity, request)
+        if identity.get("role") != "admin" or source != "internal:listing":
+            raise HTTPException(404, detail={"code": "TASK_NOT_FOUND"})
+        response.headers["Cache-Control"] = "private, no-store"
+        if body.client_request_id != request_id:
+            raise HTTPException(409, detail={"code": "CHAT_QUEUED_SUCCESSOR_NOT_RECONCILABLE"})
+        try:
+            cursor = body.model_dump(mode="python", include={
+                "provider_binding_id", "provider_account_identity", "client_conversation_id",
+                "conversation_id", "parent_message_id",
+            })
+            return await run_in_threadpool(
+                text_task_service.reconcile_queued_successor,
+                str(identity.get("id") or "anonymous"), request_id, body.original_request_id, cursor,
+                source=source, dry_run=body.dry_run,
+            )
+        except ConversationBindingError as exc:
+            raise HTTPException(409, detail={"code": exc.code}) from None
 
     @router.post("/api/conversation-bindings/text")
     async def continue_bound_text(

@@ -233,6 +233,16 @@ resume 进入第 2 轮。取消商品总量限制可独立发布并继续兼容�
 
 无数据库迁移、新服务或配置变化。发布需先 Provider、后使用此字段的内部消费者。接受后继之前可回退旧镜像；一旦已受理后继，**不得直接降级为不识别此合同的版本**：应保留识别此合同的运行版本处理在途/等待及原 ID 读回，或由发布负责人核定只暂停新提交的回退方案，保留原数据库和输入。不能删除后继或清空 UNKNOWN 来回退。
 
+#### 已受理、尚未发送请求的后继关系补登记
+
+当内部 listing 已依据原业务授权创建排队请求，但漏记与原缺失消息的后继关系时，可用 `POST /api/conversation-bindings/text-requests/{queued_id}/reconcile-queued-successor` 补登记。此入口仅限 admin 且可信来源为 `internal:listing`。调用方先核对原授权与来源；它不是新建请求或普遍重试入口。
+
+请求包含 `client_request_id`（须与路径一致）、`original_request_id`、上述五个原绑定/游标字段，以及严格布尔 `dry_run`（缺省 `true`）。禁止传入提示词、模型或新输入。只读预检返回 `eligible=true, reconciled=false`；显式 `dry_run=false` 才在原事务写入既有后继关系。两者都返回 `type=queued_successor_reconciliation` 及原排队/前驱 ID，调用方须独立保存这一类型的登记回执，不能把它当成生成结果或伪造为其他恢复回执。
+
+首次登记要求排队请求只有 accepted 时间线、完全无发送痕迹、领取、结果或恢复工作；前驱仍须满足原缺失消息合同。两份持久输入及各自 hash 必须核对通过，完整输入仅允许 `client_request_id` 不同。登记保留排队请求 ID、消息、输入、hash、顺序及原 UNKNOWN 回执；正常调度和两个发送前检查继续生效，不绕过账号容量或原节点查验。
+
+登记响应丢失时，重复相同调用只返回已登记的事实，不再写入、唤醒或发送；即使排队请求之后执行完、当前游标已前移，也按冻结输入核对原游标。首次预检不适用或冲突返回 409；来源/角色不匹配返回 404；请求格式错误返回 422。登记后不得降级到不认识此标记的旧版本处理该请求；保留原数据，由发布负责人安排兼容回退。真实业务完成仍须按该排队请求取回、保存和归档结果。
+
 #### 明确 MODEL_NOT_FOUND 拒绝后的原 Chat 重试
 
 同一内部 `POST /api/conversation-bindings/text` 接受以下三个字段。它只适用于原回执已保存完整 `stream_open/http/conversation`、HTTP 404 与 `Model not found` 明确拒绝证据的原生 Chat 文字请求；不是 UNKNOWN 恢复，也不把已开始提交的旧请求改成未发送。
