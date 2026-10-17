@@ -159,6 +159,10 @@ def test_failed_stream_keeps_prefix_and_logs_once_without_claiming_upstream_reco
     reader.assert_not_called()
     assert len(calls) == len(closed) == 1
     assert runtime.admission.claim_next() is None
+    stored = durable_forward.raw_receipt(runtime.service, WHO["id"], "original-wire")
+    assert stored["status"] == "unknown"
+    assert stored["_wire_size"] > 0
+    assert stored["_turn_reserved"] is True
     logs = runtime.logs.list(type="call")
     assert len(logs) == 1 and logs[0]["detail"]["status"] == "failed"
     assert "NEVER_LOG_UPSTREAM_SECRET" not in json.dumps(logs)

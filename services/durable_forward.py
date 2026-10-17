@@ -472,7 +472,13 @@ def run(service, owner, request_id, body):
                 "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}):
             deferred = True
             raise
-        known_rejection = code in {"codex_limited", "codex_auth_required", "codex_permission_denied", "invalid_codex_request"}
+        # CodexService assigns this code only after receiving an explicit,
+        # non-ambiguous 4xx response and marks its admission turn terminal.
+        # Reconcile that receipt here; do not infer the same outcome from a
+        # status-like string: timeouts and transport failures must remain
+        # recoverable UNKNOWN results.
+        known_rejection = code in {"codex_limited", "codex_auth_required", "codex_permission_denied",
+                                   "invalid_codex_request", "codex_request_rejected"}
         raw_status = getattr(exc, "status_code", 503)
         status_code = raw_status if type(raw_status) is int and 400 <= raw_status <= 599 else 503
         if isinstance(exc, HTTPException) and not_sent:
@@ -500,7 +506,8 @@ def run(service, owner, request_id, body):
         if original_response_ids:
             diagnostic["original_upstream_response_ids"] = original_response_ids
         service._update(owner, request_id, status="failed" if not_sent or known_rejection else "unknown",
-                        error_code=code, _turn_reserved=not (not_sent or known_rejection),
+                        error_code=code,
+                        _turn_reserved=not (not_sent or known_rejection),
                         _wire_error_status=status_code, _wire_error_payload=json.loads(wire_error.body), _wire_error_headers=error_headers,
                         upstream_outcome="not_sent" if not_sent else "rejected" if known_rejection else "unknown", finished_at=service._now(),
                         **diagnostic)

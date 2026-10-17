@@ -169,6 +169,11 @@ def test_native_codex_uses_original_durable_claim_and_exact_payload(runtime, mon
     runtime.admission.execute(claimed)
     original = runtime.service.read(who["id"], "original-wire")
     assert original["status"] == "succeeded"
+    stored = durable_forward.raw_receipt(runtime.service, who["id"], "original-wire")
+    assert stored["upstream_outcome"] == "completed"
+    assert stored["_upstream_terminal"] is True
+    assert stored["_turn_reserved"] is False
+    assert stored["_wire_size"] > 0
     assert json.loads(session.calls[0][2]["data"]) == payload
     assert original["provider_account_identity"] == "account-0"
     assert runtime.admission.resource_snapshot()["codex"]["inflight"] == 0
@@ -193,8 +198,11 @@ def test_native_codex_http_rejection_persists_safe_receipt_across_restart(runtim
 
     runtime.admission.execute(runtime.admission.claim_next())
     stored = durable_forward.raw_receipt(runtime.service, who["id"], "original-wire")
-    assert stored["status"] == "unknown"
+    assert stored["status"] == "failed"
     assert stored["error_code"] == "codex_request_rejected"
+    assert stored["upstream_outcome"] == "rejected"
+    assert stored["_upstream_terminal"] is True
+    assert stored["_turn_reserved"] is False
     assert stored["original_http_status"] == status
     assert stored["original_upstream_error"]["code"] == "invalid_request_error"
     assert stored["original_upstream_error"]["type"] == "invalid_request_error"
@@ -206,7 +214,7 @@ def test_native_codex_http_rejection_persists_safe_receipt_across_restart(runtim
 
     ordinary = asyncio.run(durable_forward.respond(who, payload, request(), "codex", service=runtime.service))
     ordinary_body = json.loads(ordinary.body)
-    assert ordinary.status_code == 409
+    assert ordinary.status_code == 400
     assert ordinary_body["error"]["code"] == "codex_request_rejected"
     assert ordinary_body["error"]["message"] == stored["original_upstream_error"]["message"]
     for secret in ("fixture-only-token", "fixture-refresh", "physical-account"):
@@ -219,6 +227,31 @@ def test_native_codex_http_rejection_persists_safe_receipt_across_restart(runtim
     assert restarted_receipt["original_http_status"] == status
     assert restarted_receipt["original_upstream_error"] == stored["original_upstream_error"]
     assert restarted_receipt["original_upstream_response_ids"] == stored["original_upstream_response_ids"]
+    assert restarted_receipt["upstream_outcome"] == "rejected"
+    restarted_raw = durable_forward.raw_receipt(restarted, who["id"], "original-wire")
+    assert restarted_raw["_upstream_terminal"] is True
+    assert restarted_raw["_turn_reserved"] is False
+
+
+def test_native_codex_timeout_keeps_original_turn_unknown_and_reserved(runtime, monkeypatch):
+    from test.test_codex_service import FakeResponse
+
+    native, session, who, payload = native_runtime(
+        runtime, monkeypatch, FakeResponse(status=408, payload={"detail": "request timeout"}),
+    )
+    runtime.admission.execute(runtime.admission.claim_next())
+
+    stored = durable_forward.raw_receipt(runtime.service, who["id"], "original-wire")
+    assert stored["status"] == "unknown"
+    assert stored["error_code"] == "codex_upstream_outcome_unknown"
+    assert stored["upstream_outcome"] == "unknown"
+    assert stored.get("_upstream_terminal") is not True
+    assert stored["_turn_reserved"] is True
+    assert len(session.calls) == 1
+
+    repeated = asyncio.run(durable_forward.respond(who, payload, request(), "codex", service=runtime.service))
+    assert repeated.status_code == 409
+    assert len(session.calls) == 1
 
 
 def test_selected_native_codex_receipt_binds_exact_account_before_final_post(runtime, monkeypatch):
