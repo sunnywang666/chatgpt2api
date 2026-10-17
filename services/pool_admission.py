@@ -780,7 +780,14 @@ class PoolAdmission:
                           and math.isfinite(r["_execution_wait_ended_at"]))
             empty_local_released = (kind == "text" and r.get("_turn_reserved") is False
                                     and TextTaskService._verified_retryable_empty(r))
+            # A bounded, observed no-progress result leaves the original
+            # UNKNOWN receipt and physical/order barriers intact. It only stops
+            # consuming this account's local execution slot while no worker or
+            # recovery lease is active.
+            stalled_local_capacity_released = (kind == "text"
+                                               and TextTaskService._qualified_stalled_incomplete_capacity_boundary(r, now))
             turn_active = (active and not original_turn_ended(kind, r) and not wait_ended and not empty_local_released
+                           and not stalled_local_capacity_released
                            and (owner, request_id) not in transferred_empty_turns)
             if status == "running" and r.get("_executing") and float(r.get("_claim_until") or 0) > now:
                 active_bytes += int(r.get("_input_bytes") or 0)
