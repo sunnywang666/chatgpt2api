@@ -685,6 +685,76 @@ class TextTaskService:
             receipt.update(_claim_id=None, _claim_until=None)
         return True
 
+    def _historical_codex_request_rejection(self, receipt, now):
+        """Recognize one inactive native-Codex 4xx receipt with no wire bytes."""
+        wire_error = receipt.get("_wire_error_payload")
+        error = wire_error.get("error") if isinstance(wire_error, dict) else None
+        timeline = receipt.get("_execution_timeline")
+        if (
+            receipt.get("_route") != "codex"
+            or receipt.get("_operation") != "text"
+            or receipt.get("_forward_protocol") != "codex"
+            or receipt.get("status") != "unknown"
+            or receipt.get("error_code") != "codex_request_rejected"
+            or receipt.get("upstream_outcome") != "unknown"
+            or receipt.get("_submission_started") is not True
+            or receipt.get("_upstream_terminal") is not True
+            or receipt.get("_turn_reserved") is not True
+            or receipt.get("_executing") is not False
+            or not self._provably_expired_execution_claim(receipt, now)
+            or receipt.get("recovery_claim_id") is not None
+            or receipt.get("_recovery_claim_id") is not None
+            or receipt.get("recovery_lease_until") is not None
+            or receipt.get("_recovery_claim_until") is not None
+            or receipt.get("_recovery_paused") is True
+            or receipt.get("_recovery_suppressed") is True
+            or receipt.get("_wire_head") is not None
+            or type(receipt.get("_wire_size")) is not int
+            or receipt["_wire_size"] != 0
+            or not isinstance(receipt.get("_wire_output"), str)
+            or receipt.get("_codex_response_id")
+            or any(field in receipt for field in ("content", "result", "data", "result_file_ids", "result_sediment_ids"))
+            or type(receipt.get("_wire_error_status")) is not int
+            or not 400 <= receipt["_wire_error_status"] < 500
+            or receipt["_wire_error_status"] in {408, 429}
+            or not isinstance(error, dict)
+            or error.get("code") != "codex_request_rejected"
+            or error.get("type") != "invalid_request_error"
+            or not isinstance(timeline, list)
+            or not {"upstream_terminal", "task_finished"}.issubset(
+                item.get("stage") for item in timeline if isinstance(item, dict)
+            )
+        ):
+            return False
+        try:
+            with self.store.output_file(receipt["_wire_output"]) as handle:
+                return handle.read(1) == b""
+        except (OSError, TypeError, ValueError):
+            # A missing, unsafe, or unreadable private file is not evidence of
+            # an empty response, so leave the original outcome untouched.
+            return False
+
+    def _correct_historical_codex_request_rejection(self, receipt, now):
+        if not self._historical_codex_request_rejection(receipt, now):
+            return False
+        # Keep the immutable input, upstream error, response identifiers, and
+        # execution history. This only reconciles the stale local projection;
+        # it never reads or resends upstream work.
+        receipt.update(
+            status="failed",
+            upstream_outcome="rejected",
+            recovery_retryable=False,
+            recovery_requires_new_conversation=False,
+            recovery_next_at=None,
+            waiting=None,
+            _turn_reserved=False,
+            _executing=False,
+            finished_at=receipt.get("finished_at") or now,
+            updated_at=now,
+        )
+        receipt.update(_claim_id=None, _claim_until=None)
+        return True
+
     @classmethod
     def _safe_recovery_code(cls, exc):
         code = str(getattr(exc, "code", "")).strip().upper()
@@ -1404,6 +1474,8 @@ class TextTaskService:
             if row:
                 previous = json.loads(row[0])
                 corrected = self._correct_historical_model_not_found(previous, now)
+                if not corrected:
+                    corrected = self._correct_historical_codex_request_rejection(previous, now)
                 ended_wait = False if corrected else self._end_execution_wait(previous, now)
                 if corrected or self._end_no_final_recovery(previous, now) or ended_wait:
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
@@ -3061,19 +3133,55 @@ class TextTaskService:
             and all(isinstance(receipt.get(key), str) and receipt[key] for key in
                 ("_input_ref", "_supersedes_request_id", "request_id", "request_message_id")))
 
+    @staticmethod
+    def _known_unsent_no_final_successor(receipt, now):
+        """Recognize one stopped plain no-final child that never sent.
+
+        This remains separate from the category-derived predicate: an absent
+        derivation is not evidence that an arbitrary cursor-changed row is
+        safe to resume.  The original is revalidated transactionally below,
+        then the normal runner repeats its live no-final tail check before
+        any upstream send.
+        """
+        timeline = receipt.get("_execution_timeline")
+        if (not isinstance(timeline, list) or not timeline
+                or any(not isinstance(item, dict) or item.get("stage") not in {"accepted", "execution_claimed"} for item in timeline)
+                or receipt.get("_last_sent_sequence") is not None
+                or type(receipt.get("send_count", 0)) is not int or receipt.get("send_count", 0) != 0
+                or type(receipt.get("_bound_successor_resume_count", 0)) is not int
+                or receipt.get("_bound_successor_resume_count", 0) != 0):
+            return False
+        for claim, until in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until")):
+            expires = receipt.get(until)
+            if (expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires) or expires > now)
+                    or receipt.get(claim) and expires is None):
+                return False
+        return bool(receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
+            and not receipt.get("_public_session_ref") and not receipt.get("_forward_protocol")
+            and receipt.get("status") == "failed" and receipt.get("error_code") == "CHAT_SUPERSEDE_CURSOR_CHANGED"
+            and receipt.get("upstream_outcome") == "not_sent"
+            and all(receipt.get(key) is False for key in ("_submission_started", "_turn_reserved", "_executing"))
+            and not any(receipt.get(key) for key in ("_recovery_paused", "_recovery_suppressed", "_execution_wait_ended_at", "_attempt_finished_at"))
+            and receipt.get("_derived_input") is None and receipt.get("_supersedes_no_final") is True
+            and all(isinstance(receipt.get(key), str) and receipt[key] for key in
+                ("_input_ref", "_supersedes_request_id", "request_id", "request_message_id")))
+
     def _validated_unsent_successor_input(self, db, owner, request_hash, receipt, now):
-        if not self._known_unsent_category_successor(receipt, now):
+        plain_no_final = self._known_unsent_no_final_successor(receipt, now)
+        if not plain_no_final and not self._known_unsent_category_successor(receipt, now):
             raise ConversationBindingError("successor is not known unsent", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
         body = self.store.load_input(receipt["_input_ref"])
         if self._submission_identity(owner, body) != (receipt["request_id"], request_hash):
             raise ConversationBindingError("retained successor input changed", code="CONVERSATION_REQUEST_CONFLICT")
         previous = self._validate_supersede(self.store, db, owner, receipt, now)
+        if plain_no_final and not self._no_final_successor_source(previous, now):
+            raise ConversationBindingError("original no-final proof is unavailable", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
         if previous.get("_recovery_paused") or previous.get("_recovery_suppressed"):
             raise ConversationBindingError("original recovery is paused", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
         return body
 
     def resume_unsent_successor(self, owner, request_id, envelope):
-        """Resume a proved-unsent category row, or accept a still-absent v4 ID.
+        """Resume a proved-unsent category or plain no-final row, or a still-absent v4 ID.
 
         No original outcome or identity is rewritten. The normal runner repeats
         its original-node checks at both the read and final send boundaries.
@@ -3089,9 +3197,12 @@ class TextTaskService:
             # Reuse that transaction, immutable derivation and fresh send guard.
             # Existing rows are only returned, including UNKNOWN/failed rows.
             return self.submit(owner, envelope, _resume_absent_successor=True)
-        if (set(envelope) != self.SUPERSEDE_FIELDS | {"derived_input"}
-                or envelope.get("client_request_id") != request_id
-                or envelope.get("derived_input") != {"kind": "category_directory_parent_v1"}):
+        category_envelope = (set(envelope) == self.SUPERSEDE_FIELDS | {"derived_input"}
+            and envelope.get("derived_input") == {"kind": "category_directory_parent_v1"})
+        plain_no_final_envelope = (set(envelope) == self.SUPERSEDE_FIELDS | {"continue_after_no_final"}
+            and envelope.get("continue_after_no_final") is True)
+        if (envelope.get("client_request_id") != request_id
+                or not (category_envelope or plain_no_final_envelope)):
             raise ConversationBindingError("original successor envelope required", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
         expanded = self.submission_input(owner, envelope)
         identity = self._submission_identity(owner, expanded)
