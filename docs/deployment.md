@@ -322,11 +322,15 @@ Provider 只识别保留的 Workbench 类目专用提示词：单 user 消息、
 
 新回执的 `derived_input` 返回 `kind`、`original_input_hash`、`directory_sha256`、`category_count` 和 `text_utf8_bytes`。原 hash 由 Provider 从原 DB 记录绑定，无须客户端提供。目录指纹为 SHA256(UTF8(JSON.stringify(rows)))，其中 rows 按原序列保留全部重复叶，每行为 `[descriptionCategoryId,typeId,name,descriptionCategoryName ?? null,categoryPath]`；消费者可从冻结 recovery_request 重算并对照。派生请求保存自己的输入和 hash，并复用普通后继的唯一性、幂等及发送前原分支检查；旧输入及 hash 不改写。
 
-#### 原类目后继已证实未发送时的一次性恢复
+#### 原后继已证实未发送时的一次性恢复
 
 仅 admin/Content 可显式调用 `POST /api/conversation-bindings/text-requests/{request_id}/resume-unsent-successor`，body 是该后继原七身份字段及 `derived_input:{"kind":"category_directory_parent_v1"}`，URL ID 必须与 `client_request_id` 相同。禁止替换 messages、账号、会话、父节点或原请求引用；不新建后继 ID 或授权记录。运行实例必须具备持久 admission；缺失时 GET 不显示可恢复标志，显式接口拒绝且不消费一次性重排额度。
 
-本地校验要求原后继为 `failed/CHAT_SUPERSEDE_CURSOR_CHANGED/not_sent`、提交/占位/执行标记明确为 false、没有发送序列或发送时间线、无有效 claim/人工暂停、保留派生输入及双方 hash/绑定全部相符。GET 仅在全部本地校验通过时返回 `bound_successor_resume_retryable:true`、`upstream_outcome:not_submitted`、`upstream_submission_started:false`；此标志不证明上游父节点当前可用。GET、普通 submit 和 recover 均不重排。
+普通 `continue_after_no_final` 后继也可使用同一入口，但必须已经保存为 no-final 后继且没有派生输入。body 只能是原七身份字段和 `continue_after_no_final:true`，不能添加 `derived_input` 来伪装成类目恢复。原后继必须明确未发送，保留输入与双方 hash 仍通过原接续校验，原前继仍符合 no-final 条件；模型、提示词、账号和原物理游标均不改写。普通游标冲突、已发送后继、来源不明或缺少原输入不能套用此分支。
+
+类目分支的本地校验要求原后继为 `failed/CHAT_SUPERSEDE_CURSOR_CHANGED/not_sent`、提交/占位/执行标记明确为 false、没有发送序列或发送时间线、无有效 claim/人工暂停、保留派生输入及双方 hash/绑定全部相符。仅此类目分支的 GET 在全部本地校验通过时返回 `bound_successor_resume_retryable:true`、`upstream_outcome:not_submitted`、`upstream_submission_started:false`；此标志不证明上游父节点当前可用。GET、普通 submit 和 recover 均不重排。
+
+普通 no-final 分支保留原普通输入；其余未发送、领取、暂停、唯一后继和单次重排检查相同。该分支仅支持 admin 显式恢复，不新增 GET 的 `bound_successor_resume_retryable` 标志。真正发送前仍执行原 no-final 的两次上游分支检查，只临时使用核验得到的当前尾节点；若出现迟到答案、分叉、活动节点或两次观测不一致，则拒绝发送。HTTP 200 / queued 只表示受理，调用方仍须沿原已登记请求保存最终结果。
 
 显式调用在原 SQLite 事务中最多重排一次，保留原 request/message ID、input/hash、唯一后继关系和失败快照。并发或重启后的同 ID 同参数调用只返回同一回执；恢复后再次失败不会获得第二次重排。资格不足返回 HTTP409 `CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE`，身份变化仍返回原冲突错误。
 
