@@ -403,7 +403,8 @@ class TextTaskService:
             fallback = {
                 "protocol": str(receipt.get("_codex_fallback_protocol") or "codex-responses-v1"),
                 "predecessor_request_id": receipt["_codex_origin_request_id"],
-                "parent_request_id": receipt.get("_codex_continue_of") or receipt.get("_codex_fallback_of"),
+                "parent_request_id": (receipt.get("_codex_continue_of") or receipt.get("_codex_rejected_retry_of")
+                                      or receipt.get("_codex_fallback_of")),
                 "client_conversation_id": receipt.get("client_conversation_id"),
                 "model": receipt.get("model"),
             }
@@ -3018,6 +3019,16 @@ class TextTaskService:
             body = build_continue_body(self.store, db, owner, parent_id, client_request_id, messages, step_ref)
         return self._submit_prepared(owner, body, source=source)
 
+    def submit_codex_rejected_retry(self, owner, parent_id, client_request_id, *, source=None):
+        """Durably register the one explicit retry of an empty-wire Codex rejection."""
+        if self.admission is None:
+            from services.work_lifecycle import WorkLifecycleError
+            raise WorkLifecycleError("CODEX_FALLBACK_ADMISSION_REQUIRED", 503)
+        from services.codex_text_fallback import build_rejected_retry_body
+        with self._db() as db:
+            body = build_rejected_retry_body(self.store, db, owner, parent_id, client_request_id)
+        return self._submit_prepared(owner, body, source=source)
+
     def _submit_prepared(self, owner, body, *, source=None, _resume_absent_successor=False):
         from services.durable_forward import dispatch_model
         from services.workflow_scheduling import normalize_scheduling
@@ -3025,11 +3036,17 @@ class TextTaskService:
             body = {**body, "_scheduling": normalize_scheduling(body["_scheduling"])}
         if body.get("_scheduling") is not None and self.admission is None:
             raise ValueError("SCHEDULING_UNAVAILABLE")
+        codex_markers = (
+            body.get("_codex_fallback_of"), body.get("_codex_continue_of"), body.get("_codex_rejected_retry_of"),
+        )
+        if any(codex_markers) and self.admission is None:
+            from services.work_lifecycle import WorkLifecycleError
+            raise WorkLifecycleError("CODEX_FALLBACK_ADMISSION_REQUIRED", 503)
         codex_product_bridge = (
             body.get("_route") == "codex"
             and ((body.get("_forward") or {}).get("protocol") == "codex")
             and bool(body.get("_codex_origin_request_id"))
-            and (bool(body.get("_codex_fallback_of")) ^ bool(body.get("_codex_continue_of")))
+            and sum(bool(marker) for marker in codex_markers) == 1
         )
         if "product_work" in body:
             from services.product_work import normalize_product_work, require_product_source
@@ -3135,7 +3152,16 @@ class TextTaskService:
                         _codex_fallback_input_hash=body["_codex_fallback_input_hash"],
                         _codex_fallback_protocol=body["_codex_fallback_protocol"],
                     )
-                if body.get("_codex_fallback_of") or body.get("_codex_continue_of"):
+                if body.get("_codex_rejected_retry_of"):
+                    from services.codex_text_fallback import validate_prepared_rejected_retry
+                    validate_prepared_rejected_retry(self.store, db, owner, body)
+                    receipt.update(
+                        _codex_rejected_retry_of=body["_codex_rejected_retry_of"],
+                        _codex_origin_request_id=body["_codex_origin_request_id"],
+                        _codex_fallback_input_hash=body["_codex_fallback_input_hash"],
+                        _codex_fallback_protocol=body["_codex_fallback_protocol"],
+                    )
+                if any(codex_markers):
                     effort = (((body.get("_forward") or {}).get("payload") or {}).get("reasoning") or {}).get("effort")
                     if isinstance(effort, str):
                         receipt["_codex_reasoning_effort"] = effort
@@ -3176,7 +3202,7 @@ class TextTaskService:
                 product = body.get("product_work")
                 previous_id = (receipt.get("_supersedes_request_id") or receipt.get("_previous_request_id")
                                or receipt.get("_completion_of") or receipt.get("_codex_fallback_of")
-                               or receipt.get("_codex_continue_of"))
+                               or receipt.get("_codex_continue_of") or receipt.get("_codex_rejected_retry_of"))
                 original = self.store.read_receipt(db, "text", owner, previous_id) if previous_id else None
                 if original and original.get("_product_work"):
                     from services.work_lifecycle import WorkLifecycleError

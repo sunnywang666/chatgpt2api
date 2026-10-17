@@ -385,6 +385,10 @@ def run(service, owner, request_id, body):
     try:
         if protocol == "codex":
             from services.codex_service import codex_service
+            from services.request_context import current_request
+            context = current_request.get()
+            if context is not None:
+                context.expected_codex_rejected_retry = body.get("_codex_rejected_retry_of")
             result = codex_service.submit(spec["identity"], spec["payload"], spec["headers"], compact=spec["compact"])
             status, headers = result.status_code, result.headers
             stream = result.stream is not None

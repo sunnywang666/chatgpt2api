@@ -22,6 +22,7 @@ from curl_cffi import requests
 
 from services.account_service import account_service
 from services.config import config
+from services.conversation_binding_service import ConversationBindingError
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok
 from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
@@ -1554,6 +1555,19 @@ class CodexService:
                 self._capacity.release()
             elif not token:
                 self._capacity.release()
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            raise
+        except ConversationBindingError:
+            # A pre-send binding/lineage fence is deterministic local evidence,
+            # not an uncertain Codex transport attempt.  Preserve its code so
+            # durable_forward records this queued request as failed/not_sent.
+            if token and token in self._inflight:
+                self._release_account(token, affinity, known_terminal=True)
+            self._capacity.release()
             if session is not None:
                 try:
                     session.close()

@@ -298,13 +298,14 @@ def _codex_product_bridge(receipt):
     forward = receipt.get("_forward_protocol")
     fallback = receipt.get("_codex_fallback_of")
     continuation = receipt.get("_codex_continue_of")
+    rejected_retry = receipt.get("_codex_rejected_retry_of")
     return bool(
         receipt.get("_route") == "codex"
         and forward == "codex"
         and receipt.get("_codex_fallback_protocol") == "codex-responses-v1"
         and isinstance(receipt.get("_codex_origin_request_id"), str)
         and bool(receipt.get("_codex_origin_request_id"))
-        and (bool(fallback) ^ bool(continuation))
+        and sum(bool(marker) for marker in (fallback, continuation, rejected_retry)) == 1
         and isinstance(receipt.get("_codex_fallback_input_hash"), str)
     )
 
@@ -326,6 +327,14 @@ def _codex_bridge_successor(store, db, owner, previous, receipt):
             and previous.get("_operation", "text") == "text"
             and not previous.get("_forward_protocol")
             and receipt.get("_codex_origin_request_id") == rid
+        )
+    if receipt.get("_codex_rejected_retry_of") == rid:
+        return bool(
+            previous.get("_codex_fallback_of")
+            and not previous.get("_codex_continue_of")
+            and not previous.get("_codex_rejected_retry_of")
+            and _codex_product_bridge(previous)
+            and receipt.get("_codex_origin_request_id") == previous.get("_codex_origin_request_id")
         )
     return bool(
         receipt.get("_codex_continue_of") == rid
@@ -744,6 +753,67 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
     return {"original": original, "successor": receipt, "resolved": [*ancestors, original]}
 
 
+def _codex_rejected_retry_chain(store, db, parent, receipt, members):
+    """Return P/D/E only after the registered retry has a saved final result."""
+    retry_id = receipt.get("request_id")
+    rejected_id = receipt.get("_codex_rejected_retry_of")
+    controls = ("_executing", "_turn_reserved", "recovery_claim_id", "_recovery_claim_id",
+                "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of",
+                "upstream_unfinished")
+    leases = ("recovery_claimed_at", "recovery_lease_until", "_recovery_claim_until")
+    if (not isinstance(retry_id, str) or not retry_id or not isinstance(rejected_id, str) or not rejected_id
+            or receipt.get("status") != "succeeded" or receipt.get("upstream_outcome") != "completed"
+            or not isinstance(receipt.get("content"), str) or not receipt["content"].strip()
+            or _claims(receipt) or any(receipt.get(key) for key in controls)
+            or any(receipt.get(key) is not None for key in leases)
+            or _unresolved(receipt, [row for _, row in members])):
+        return None
+    row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (parent["owner"], retry_id)).fetchone()
+    if not row:
+        return None
+    try:
+        from services.conversation_binding_service import ConversationBindingError
+        from services.codex_text_fallback import validate_prepared_rejected_retry
+        from services.text_task_service import TextTaskService
+        body = store.load_input(receipt["_input_ref"])
+        if TextTaskService._submission_identity(parent["owner"], body) != (retry_id, row[0]):
+            return None
+        validate_prepared_rejected_retry(store, db, parent["owner"], body, receipt=receipt)
+        rejected = store.read_receipt(db, "text", parent["owner"], rejected_id)
+        original_id = rejected.get("_codex_fallback_of") if rejected else None
+        original = store.read_receipt(db, "text", parent["owner"], original_id) if isinstance(original_id, str) else None
+    except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
+        return None
+    chain = (original, rejected, receipt)
+    if (not all(isinstance(item, dict) for item in chain)
+            or any(item.get("_product_work_key") != parent["key"] or _source(item) != parent["source"] for item in chain)
+            or any(_claims(item) or any(item.get(key) for key in controls)
+                   or any(item.get(key) is not None for key in leases) for item in chain)
+            or any(item.get("_product_work") != {"product_ref": parent["product_ref"], "step_ref":
+                                                   next((member["step_ref"] for member, row in members
+                                                         if row.get("request_id") == item.get("request_id")), None)}
+                   for item in chain)):
+        return None
+    try:
+        for item in chain:
+            row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                             (parent["owner"], item["request_id"])).fetchone()
+            saved = store.load_input(item["_input_ref"])
+            if not row or TextTaskService._submission_identity(parent["owner"], saved) != (item["request_id"], row[0]):
+                return None
+            if saved.get("product_work") != item.get("_product_work"):
+                return None
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    sequence = [item.get("_sequence") for item in chain]
+    if not all(type(value) is int and value > 0 for value in sequence) or not sequence[0] < sequence[1] < sequence[2]:
+        return None
+    member_ids = {(member["kind"], row.get("request_id") or row.get("id")) for member, row in members}
+    if not {("text", item["request_id"]) for item in chain} <= member_ids:
+        return None
+    return {"original": original, "rejected": rejected, "retry": receipt, "resolved": [original, rejected]}
+
+
 class ProductWorkService:
     def __init__(self, text_service, image_service, *, clock=time.time):
         self.text, self.images, self.store, self.clock = text_service, image_service, text_service.store, clock
@@ -858,6 +928,14 @@ class ProductWorkService:
                 waived.update(item["request_id"] for item in chain["resolved"])
         return waived
 
+    def _codex_rejected_retry_waivers(self, db, parent, members):
+        waived = set()
+        for _, receipt in members:
+            chain = _codex_rejected_retry_chain(self.store, db, parent, receipt, members)
+            if chain:
+                waived.update(item["request_id"] for item in chain["resolved"])
+        return waived
+
     def archive_turns_ready(self, db, child, members):
         """Apply exact resolved-history exceptions after the generic recheck."""
         parent = self.store.runtime(db, child["_product_archive_parent"])
@@ -866,6 +944,7 @@ class ProductWorkService:
         owned = self._members(db, parent)
         waived = self._missing_node_waivers(db, parent, owned)
         waived.update(self._no_final_successor_waivers(db, parent, owned))
+        waived.update(self._codex_rejected_retry_waivers(db, parent, owned))
         for member, receipt in owned:
             if receipt.get(_CANCELLED_UNSENT_STEP) and not _cancelled_unsent_step(
                     self.store, db, parent, member, receipt):
@@ -884,6 +963,7 @@ class ProductWorkService:
             waived.update(chain[name]["request_id"] for name in ("original", "rejected"))
             valid_continues.add(chain["continue"]["request_id"])
         waived.update(self._no_final_successor_waivers(db, parent, members))
+        waived.update(self._codex_rejected_retry_waivers(db, parent, members))
         from services.text_task_service import TextTaskService
         for member, receipt in members:
             cancelled_unsent = _cancelled_unsent_step(self.store, db, parent, member, receipt)
