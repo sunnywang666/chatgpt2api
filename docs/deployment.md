@@ -257,6 +257,20 @@ resume 进入第 2 轮。取消商品总量限制可独立发布并继续兼容�
 
 此分支只扩展内部消费者合同；普通 API、旧七字段 UNKNOWN/no-final 后继和图片请求的规则不变。Provider 上线并完成接口核验后，消费者才能启用。回退必须保留能识别已登记后继的版本，不删除新旧回执或原输入。
 
+#### 空 wire 的 Codex 明确拒绝：一次受控重试
+
+仅内部管理员可调用 `POST /api/conversation-bindings/text-requests/{D}/codex-rejected-retry`，请求体严格只有：
+
+```json
+{"client_request_id":"new-codex-retry-id"}
+```
+
+该入口只接受已发送并已终结的原生 Codex fallback D：`failed/codex_request_rejected/rejected`，保存的 wire 必须确实为空，且保留的 HTTP 400 `invalid_request_error/codex_request_rejected` 证据完整。D、其 Chat 原始拒绝 P 都必须没有活动领取、恢复租约、暂停、结果或 completion 控制；任一普通超时、UNKNOWN、非空 wire、迟到结果或已有子项均拒绝。调用方不能传业务内容、模型、账号、会话、商品或错误信息。
+
+Provider 先在事务内登记唯一 E，继承 D 的保留 payload、model、account pool ref、已解析 Codex account、client/session、商品归属和来源；仅 `x-client-request-id` 改为 E 的 ID。登记后才交给原 admission/runner。网络发送边界会再次从保存输入重建并验证 P/D：D 的新结果、领取、暂停、租约、账户映射或链路变化都会阻止发送，并将 E 终结为 `failed/not_sent`，不能新建 F 或自动重排。D 的拒绝 wire/错误始终保留。
+
+只有 E 已保存非空 completed 结果、P/D/E 的保留输入 hash、来源、商品步骤、顺序和当前控制状态仍全部一致时，ProductWork 才能将 P/D 视为已由 E 解决并按原 close/archive 流程收束。E 失败、UNKNOWN、空结果或证据变化不解除旧链阻塞，也不提供下一次 Codex 重试。
+
 ##### 原消息缺失的后继被拒，且自身图片仍在排队
 
 对“已停止恢复的原消息缺失请求 R → 唯一已登记、明确 `MODEL_NOT_FOUND` 的后继 P”，若同一商品、账号和会话已有一条确定未发送的图片排在后面，内部调用方可用下面四个字段登记一次 C。`supersedes_request_id` 必须指向 P，不能再给 R 建第二个直接后继。这个分支不接受 `continue_after_no_final`；缺失原消息与存在原消息但无最终答案是不同的证据。

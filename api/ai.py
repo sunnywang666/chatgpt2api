@@ -182,6 +182,19 @@ class CodexTextContinueRequest(BaseModel):
         return value
 
 
+class CodexRejectedRetryRequest(BaseModel):
+    """The retry request ID is the only caller-owned value."""
+    model_config = ConfigDict(extra="forbid")
+    client_request_id: str = Field(strict=True, min_length=1, max_length=200)
+
+    @field_validator("client_request_id")
+    @classmethod
+    def stable_value(cls, value):
+        if value != value.strip() or any(ord(char) < 32 for char in value):
+            raise ValueError("invalid rejected retry parameter")
+        return value
+
+
 class ConversationArchiveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     provider_binding_id: str = Field(min_length=1)
@@ -568,6 +581,31 @@ def create_router() -> APIRouter:
                 body.client_request_id,
                 body.messages,
                 body.step_ref,
+                source=trusted_source(identity, request),
+            )
+        except ConversationBindingError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from None
+        except WorkLifecycleError as exc:
+            raise HTTPException(status_code=exc.status, detail={"code": exc.code}) from None
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/codex-rejected-retry")
+    async def retry_rejected_codex_fallback_request(
+        request_id: str,
+        body: CodexRejectedRetryRequest,
+        request: Request,
+        response: Response,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        if identity.get("role") != "admin":
+            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND"})
+        response.headers["Cache-Control"] = "private, no-store"
+        try:
+            return await run_in_threadpool(
+                text_task_service.submit_codex_rejected_retry,
+                str(identity.get("id") or "anonymous"),
+                request_id,
+                body.client_request_id,
                 source=trusted_source(identity, request),
             )
         except ConversationBindingError as exc:

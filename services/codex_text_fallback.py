@@ -290,6 +290,180 @@ def validate_prepared_continue(store, db, owner, body):
         _reject("CODEX_FALLBACK_CONFLICT")
 
 
+def _rejected_retry_parent(store, db, owner, parent_id):
+    """Return the one fully proved rejected native fallback eligible for one new send."""
+    if not _stable(parent_id):
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, parent_id)).fetchone()
+    if not row:
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    parent_hash, raw = row
+    parent = json.loads(raw)
+    wire_error = parent.get("_wire_error_payload")
+    error = wire_error.get("error") if isinstance(wire_error, dict) else None
+    from services.product_work import _claims
+    if (
+        parent.get("status") != "failed"
+        or parent.get("error_code") != "codex_request_rejected"
+        or parent.get("upstream_outcome") != "rejected"
+        or parent.get("_route") != "codex"
+        or parent.get("_operation") != "text"
+        or parent.get("_forward_protocol") != "codex"
+        or parent.get("_submission_started") is not True
+        or parent.get("_upstream_terminal") is not True
+        or parent.get("_turn_reserved") is not False
+        or parent.get("_executing") is not False
+        or _claims(parent)
+        or any(parent.get(key) for key in (
+            "recovery_claim_id", "_recovery_claim_id", "_recovery_paused", "_recovery_suppressed",
+            "upstream_unfinished", "_completion", "_completion_of", "_codex_continue_of",
+            "_codex_rejected_retry_of", "_codex_response_id",
+        ))
+        or any(parent.get(key) is not None for key in (
+            "recovery_claimed_at", "recovery_lease_until", "_recovery_claim_until",
+        ))
+        or parent.get("_wire_head") is not None
+        or type(parent.get("_wire_size")) is not int
+        or parent["_wire_size"] != 0
+        or not isinstance(parent.get("_wire_output"), str)
+        or any(field in parent for field in ("content", "result", "data", "result_file_ids", "result_sediment_ids"))
+        or parent.get("_wire_error_status") != 400
+        or not isinstance(error, dict)
+        or error.get("code") != "codex_request_rejected"
+        or error.get("type") != "invalid_request_error"
+        or not _stable(parent.get("_codex_fallback_of"))
+        or not _stable(parent.get("_codex_origin_request_id"))
+        or parent.get("_codex_fallback_protocol") != "codex-responses-v1"
+    ):
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    try:
+        with store.output_file(parent["_wire_output"]) as handle:
+            if handle.read(1) != b"":
+                _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+        saved = store.load_input(parent["_input_ref"])
+        from services.text_task_service import TextTaskService
+        if TextTaskService._submission_identity(owner, saved) != (parent_id, parent_hash):
+            _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+        payload = ((saved.get("_forward") or {}).get("payload") or {})
+        reasoning = payload.get("reasoning") if isinstance(payload, dict) else None
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+        expected_parent = build_body(store, db, owner, parent["_codex_fallback_of"], parent_id,
+                                     saved.get("model"), saved.get("_requested_account_ref"), effort)
+    except (OSError, ValueError, TypeError, KeyError):
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    if saved != expected_parent:
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    original_id = parent["_codex_fallback_of"]
+    original = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, original_id)).fetchone()
+    if not original:
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    original_hash, original_raw = original
+    original_receipt = json.loads(original_raw)
+    forward = saved.get("_forward") or {}
+    headers = forward.get("headers") or {}
+    if (parent.get("_codex_origin_request_id") != original_id
+            or parent.get("_codex_fallback_input_hash") != original_hash
+            or parent.get("model") != saved.get("model")
+            or parent.get("client_conversation_id") != saved.get("client_conversation_id")
+            or parent.get("_requested_account_ref") != saved.get("_requested_account_ref")
+            or headers.get("x-client-request-id") != parent_id
+            or not _stable(headers.get("session-id"))
+            or any(key in original_receipt for key in (
+                "content", "result", "data", "result_file_ids", "result_sediment_ids"))
+            or _claims(original_receipt)
+            or any(original_receipt.get(key) for key in (
+                "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of",
+                "upstream_unfinished"))
+            or any(original_receipt.get(key) is not None for key in (
+                "recovery_claimed_at", "recovery_lease_until", "_recovery_claim_until"))):
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    siblings = db.execute(
+        "SELECT id FROM requests WHERE owner=? AND "
+        "(json_extract(receipt,'$._codex_fallback_of')=? OR json_extract(receipt,'$._supersedes_request_id')=?)",
+        (owner, parent["_codex_fallback_of"], parent["_codex_fallback_of"]),
+    ).fetchall()
+    if len(siblings) != 1 or siblings[0][0] != parent_id:
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    return parent_hash, parent, saved
+
+
+def build_rejected_retry_body(store, db, owner, parent_id, client_request_id):
+    """Register one explicit retry of a proved empty-wire Codex rejection."""
+    if not all(_stable(value) for value in (parent_id, client_request_id)):
+        _reject("CODEX_REJECTED_RETRY_INVALID")
+    parent_hash, parent, saved = _rejected_retry_parent(store, db, owner, parent_id)
+    forward = saved.get("_forward") or {}
+    payload, headers = forward.get("payload"), forward.get("headers")
+    session_id = headers.get("session-id") if isinstance(headers, dict) else None
+    account_identity = parent.get("_requested_account_identity")
+    if (not isinstance(payload, dict) or not _stable(saved.get("model"))
+            or not _stable(saved.get("_requested_account_ref")) or not _stable(session_id)
+            or not _stable(account_identity)):
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    body = _native_body(owner, parent_id, client_request_id, saved["model"], saved["_requested_account_ref"], payload,
+                        marker="_codex_rejected_retry_of", origin_id=parent["_codex_origin_request_id"],
+                        parent_hash=parent_hash, session_id=session_id)
+    # TextTaskService compares this fixed identity to the current pool-ref
+    # resolution before durable registration.  A remapped account therefore
+    # cannot turn D -> E into a different Codex account attempt.
+    body["provider_account_identity"] = account_identity
+    if saved.get("product_work") is not None:
+        body["product_work"] = saved["product_work"]
+    return body
+
+
+def validate_prepared_rejected_retry(store, db, owner, body, *, receipt=None):
+    if receipt is not None:
+        # The runner selects its account and lineage from the durable receipt.
+        # Proving the retained body alone must not authorize a changed receipt.
+        expected_receipt = {key: body.get(key) for key in (
+            "_codex_rejected_retry_of", "_codex_origin_request_id", "_codex_fallback_input_hash",
+            "_codex_fallback_protocol", "_codex_fallback_of", "_codex_continue_of",
+            "model", "client_conversation_id", "_requested_account_ref", "_route", "_operation",
+        )}
+        expected_receipt.update(
+            request_id=body.get("client_request_id"),
+            _requested_account_identity=body.get("provider_account_identity"),
+            provider_account_identity=body.get("provider_account_identity"),
+            _forward_protocol=(body.get("_forward") or {}).get("protocol"),
+        )
+        if any(receipt.get(key) != value for key, value in expected_receipt.items()):
+            _reject("CODEX_REJECTED_RETRY_INVALID")
+    parent_id = body.get("_codex_rejected_retry_of")
+    expected = build_rejected_retry_body(store, db, owner, parent_id, body.get("client_request_id"))
+    if body != expected:
+        _reject("CODEX_REJECTED_RETRY_INVALID")
+    other = db.execute(
+        "SELECT id FROM requests WHERE owner=? AND id<>? AND ("
+        "json_extract(receipt,'$._codex_rejected_retry_of')=? OR "
+        "json_extract(receipt,'$._codex_continue_of')=? OR "
+        "json_extract(receipt,'$._codex_fallback_of')=? OR "
+        "json_extract(receipt,'$._supersedes_request_id')=?) LIMIT 1",
+        (owner, body["client_request_id"], parent_id, parent_id, parent_id, parent_id),
+    ).fetchone()
+    if other:
+        _reject("CODEX_REJECTED_RETRY_CONFLICT")
+
+
+def validate_rejected_retry_before_send(store, db, owner, receipt):
+    """Rebuild E at the network edge so a changed D/P cannot be resent."""
+    request_id = receipt.get("request_id")
+    parent_id = receipt.get("_codex_rejected_retry_of")
+    if not _stable(request_id) or not _stable(parent_id):
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+    if not row:
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+    try:
+        saved = store.load_input(receipt["_input_ref"])
+        from services.text_task_service import TextTaskService
+        if TextTaskService._submission_identity(owner, saved) != (request_id, row[0]):
+            _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+        validate_prepared_rejected_retry(store, db, owner, saved, receipt=receipt)
+    except (OSError, ValueError, TypeError, KeyError):
+        _reject("CODEX_REJECTED_RETRY_PARENT_UNAVAILABLE")
+
+
 def project_completed_wire(service, receipt):
     """Project only a fully saved native terminal response; never SSE deltas."""
     if not receipt.get("_codex_origin_request_id"):

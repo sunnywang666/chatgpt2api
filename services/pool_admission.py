@@ -1747,6 +1747,14 @@ class PoolAdmission:
                     r["_missing_successor_resume"] = {
                         **missing_attempt, "state": "submitted", "submitted_at": now,
                     }
+            if context.kind == "text" and (r.get("_codex_rejected_retry_of")
+                                           or getattr(context, "expected_codex_rejected_retry", None)):
+                from services.codex_text_fallback import validate_rejected_retry_before_send
+                # This is evidence invalidation, not a transient capacity
+                # race: durable_forward records it as failed/not_sent.  Do
+                # not convert the binding error into AdmissionLost, which
+                # would requeue E forever after D has a late result.
+                validate_rejected_retry_before_send(self.store, db, context.owner, r)
             elif context.kind == "image":
                 # A4 may send only after its exact C completed successfully.
                 # The structural proof identifies the two historical text
