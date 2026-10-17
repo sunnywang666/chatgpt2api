@@ -1848,6 +1848,46 @@ class PoolAdmission:
                 if any(isinstance(limit, dict) and limit.get("feature_name") == r.get("model") and limit.get("remaining") == 0
                        for limit in selected.get("limits_progress") or []):
                     raise AdmissionLost("original model quota is unavailable before send")
+            if (context.kind == "text" and r.get("_operation", "text") != "image"
+                    and r.get("_route", "chat") == "chat"):
+                # A claimed independent request can wait while a stalled
+                # original's next exact-ID read makes verified progress. Reuse
+                # the normal snapshot inside this send transaction so that
+                # progress re-holds its account slot before this request posts.
+                # Do not decode completed image payloads merely to recheck a
+                # Chat turn. The status/unfinished filter is the scheduler's
+                # existing active-occupancy set; completed text continuations
+                # still join it when they can transfer an original turn.
+                capacity_receipts = list(self.store.receipts(
+                    db, statuses=("queued", "not_started", "running", "unknown", "failed", "error"),
+                    include_pending_completion=True, include_upstream_unfinished=True,
+                ))
+                seen = {(kind, owner, request_id) for kind, owner, request_id, _ in capacity_receipts}
+                for owner, request_id, raw in db.execute(
+                        "SELECT owner,id,receipt FROM requests WHERE json_extract(receipt,'$.status')='succeeded' "
+                        "AND (json_type(receipt,'$._same_session_retry_of') IS NOT NULL "
+                        "OR json_type(receipt,'$._terminal_empty_correction_of') IS NOT NULL)"):
+                    key = ("text", owner, request_id)
+                    if key not in seen:
+                        capacity_receipts.append(("text", owner, request_id, json.loads(raw)))
+                        seen.add(key)
+                snapshot = self._snapshot(
+                    self._rows(), capacity_receipts, self._settings(), {}, now,
+                    self.store.runtime(db, "fairness", {}),
+                    workflow_scheduling.state_snapshot(self.store, db),
+                    product_work.state_snapshot(self.store, db), db=db,
+                )
+                resources = {resource.key: resource for resource in snapshot.resources}
+                turn = resources.get("chat_turn:" + account_clock_key(selected))
+                capacity = turn.capacity if turn is not None else 0
+                # The marker was fully revalidated above. _snapshot sees this
+                # request already claimed, so preserve its existing scoped
+                # second-slot allowance while still rejecting a newly re-held
+                # original that would make the account exceed that allowance.
+                if marker is not None:
+                    capacity = max(capacity, 2)
+                if turn is None or turn.occupied is None or turn.occupied > capacity:
+                    raise AdmissionLost("original Chat account capacity changed before send")
             # A parent always needs its durable product guard. A legacy
             # receipt can conflict with a product parent only when it has a
             # proven physical conversation identity; do not decode unrelated

@@ -8,6 +8,7 @@ import pytest
 
 from services.conversation_binding_service import ConversationBindingService
 from services.public_chat_service import project_public_chat_receipt
+from services.request_context import AdmissionLost
 from services.text_task_service import TextTaskService
 from test.test_expired_execution_wait import saved, patch, waiter
 from test.test_unknown_turn_recovery import document, migration
@@ -405,9 +406,43 @@ def test_stalled_original_keeps_same_conversation_blocked_but_claims_independent
     assert admission.claim_next().request_id == "independent-next"
 
 
+def test_stalled_original_progress_reholds_capacity_before_an_independent_claim_can_send(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    waiter(service, "independent-next", "independent")
+    context = admission.claim_next()
+    assert context and context.request_id == "independent-next"
+    service.recovery_reader = incomplete_reader(
+        backend, lambda _doc, message: message["content"].update(parts=["verified new text"]),
+    )
+    admission.clock.now = saved(service)["recovery_next_at"] + 1
+    admission.update_claim(context, _claim_until=admission.clock.now + admission.CLAIM_SECONDS)
+    assert service.read("owner", "old-0")["status"] == "unknown"
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved(service), admission.clock.now)
+    with pytest.raises(AdmissionLost, match="account capacity changed"):
+        context.before_send()
+    with service.store.connect() as db:
+        candidate = service.store.read_receipt(db, "text", "owner", "independent-next")
+    assert candidate["status"] == "queued" and candidate["_submission_started"] is False
+
+
+def test_stalled_original_allows_an_independent_claim_to_send_while_capacity_stays_released(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    waiter(service, "independent-next", "independent")
+    context = admission.claim_next()
+    assert context and context.request_id == "independent-next"
+    context.before_send()
+    with service.store.connect() as db:
+        candidate = service.store.read_receipt(db, "text", "owner", "independent-next")
+    assert candidate["status"] == "running" and candidate["_submission_started"] is True
+
+
 @pytest.mark.parametrize("case", [
     "local_executor", "live_send_lease", "malformed_send_lease", "orphaned_send_lease",
-    "active_recovery", "missing_identity", "missing_observation", "short_read_count",
+    "active_recovery", "legacy_recovery_claim", "legacy_recovery_lease", "missing_identity", "missing_observation", "short_read_count",
     "missing_turn_reservation", "deleted_turn_reservation", "deleted_executing",
     "fake_turn_reservation", "fake_submission_flag",
     "nan_observation_time", "early_wait_marker_later_now", "future_wait_end", "future_last_checked",
@@ -431,6 +466,10 @@ def test_stalled_local_capacity_boundary_fails_closed_without_complete_idle_evid
         changes = {"_claim_id": None, "_claim_until": admission.clock.now - 1}
     elif case == "active_recovery":
         changes = {"recovery_claim_id": "live-recovery", "recovery_lease_until": admission.clock.now + 1}
+    elif case == "legacy_recovery_claim":
+        changes = {"_recovery_claim_id": "legacy-recovery"}
+    elif case == "legacy_recovery_lease":
+        changes = {"_recovery_claim_until": admission.clock.now + 1}
     elif case == "missing_identity":
         changes = {"provider_binding_id": None}
     elif case == "missing_observation":

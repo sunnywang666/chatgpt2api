@@ -170,6 +170,23 @@ class AdmissionTests(unittest.TestCase):
         self.assertTrue(self.read("image", "happy", "new-independent")["_submission_started"])
         self.assertEqual(self.read("image", "happy", "old-saved"), saved)
 
+    def test_chat_send_capacity_guard_does_not_decode_unrelated_saved_images(self):
+        self.submit("new-independent")
+        context = self.admission.claim_next()
+        marker = "unrelated-saved-image-must-stay-on-disk"
+        saved = {"id": "old-saved", "owner_id": "happy", "status": "success",
+                 "data": [{"b64_json": marker * 10000}], "upstream_unfinished": False}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "happy", "old-saved", saved)
+        loads = json.loads
+        def guarded_decode(raw):
+            self.assertNotIn(marker, raw)
+            return loads(raw)
+        with patch("services.task_store.json.loads", side_effect=guarded_decode):
+            context.before_send()
+        self.assertTrue(self.read("text", "happy", "new-independent")["_submission_started"])
+        self.assertEqual(self.read("image", "happy", "old-saved"), saved)
+
     def test_send_guard_preserves_legacy_unfinished_image_capacity(self):
         self.image("new-image")
         context = self.admission.claim_next()

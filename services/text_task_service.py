@@ -1094,6 +1094,9 @@ class TextTaskService:
                 or receipt.get("recovery_claim_id") is not None
                 or receipt.get("recovery_lease_until") is not None):
             return False
+        if (receipt.get("_recovery_claim_id") is not None
+                or receipt.get("_recovery_claim_until") is not None):
+            return False
         if (receipt.get("_upstream_terminal") is not None and receipt.get("_upstream_terminal") is not False
                 or any(receipt.get(field) is not None and receipt.get(field) is not False
                        for field in ("_recovery_suppressed", "_recovery_paused", "_forward_protocol"))):
