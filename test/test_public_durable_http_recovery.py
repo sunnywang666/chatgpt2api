@@ -462,12 +462,17 @@ def test_http_stalled_original_cli_restart_and_late_save_without_another_send(tm
         assert _http(port, key, "POST", "/api/chat-requests", body)[0] == 202
         def ended():
             receipt = _http(port, key, "GET", "/api/chat-requests/stalled-original")[1]
-            return receipt if receipt.get("execution", {}).get("phase") == "stalled" else None
+            execution = receipt.get("execution", {})
+            # The original stays recoverable while idle account capacity is
+            # released. An active recovery lease can briefly hold it again.
+            return receipt if (execution.get("phase") == "stalled"
+                               and execution.get("resources", {}).get("account_turn") == "released") else None
         receipt = _wait(ended)
         execution = receipt["execution"]
         assert receipt["status"] == "unknown" and execution["wait_state"] == "ended"
         assert execution["send_state"] == "response_received"
-        assert execution["resources"]["account_turn"] == "held"
+        assert execution["resources"]["account_turn"] == "released"
+        assert execution["resources"]["conversation"] == "protected"
         assert receipt["recovery"]["reason"] == "REQUEST_RESULT_INCOMPLETE"
         assert _http(port, key, "POST", "/api/chat-requests", body)[1]["status"] == "unknown"
     with _server(tmp_path, "stalled") as (port, key, _):
