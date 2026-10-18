@@ -16,7 +16,9 @@ import threading
 import time
 import uuid
 
-from services.admission_planner import Need, Resource, Offer, RequestRef, WaitingRequest, Snapshot, choose_next, fairness_lane
+from services.admission_planner import (Need, Resource, Offer, OfferDiagnostic,
+                                        RequestRef, WaitingRequest, Snapshot,
+                                        choose_next, fairness_lane)
 from services.request_context import AdmissionLost, executing, safe_account_ref
 from services.task_store import TaskStore, pending_image_result_ids
 from services import workflow_scheduling, product_work
@@ -101,6 +103,120 @@ def account_clock_key(account):
     # of that upstream identity share both its turn and image constraints.
     identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
     return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def _waiting_diagnostic_key(namespace, value):
+    """Return a stable receipt-local pseudonym without exposing pool keys."""
+    return hashlib.sha256((namespace + "\0" + value).encode()).hexdigest()[:24]
+
+
+_WAITING_RESOURCE_FAMILIES = frozenset({
+    "execution_input_bytes", "chat_executor", "image_executor", "codex_server",
+    "chat_turn", "image", "codex_turn", "image_thread", "public_chat_previous",
+    "completion_work", "product_parent_state", "conversation_turn",
+    "conversation_order", "missing_node_retry", "work_turn", "workflow_slots",
+})
+_WAITING_ELIGIBILITY_CODES = frozenset({
+    "account_disabled", "source_not_authorized", "paid_plan_required",
+    "identity_not_unique", "model_plan_not_allowed", "model_account_not_allowed",
+    "model_limit_zero", "matching_offer_missing",
+})
+_WAITING_RESOURCE_BLOCKERS = frozenset({
+    "occupancy_unknown", "resource_full", "availability_time_unknown",
+    "account_or_shared_pacing",
+})
+WAITING_DIAGNOSTIC_MAX_ACCOUNT_ENTRIES = 32
+WAITING_DIAGNOSTIC_MAX_RESOURCE_ENTRIES = 64
+WAITING_DIAGNOSTIC_MAX_JSON_BYTES = 16 * 1024
+
+
+def _waiting_resource_family(resource):
+    # Resource names are internal and may include a hashed account or request
+    # suffix.  An unknown prefix is deliberately not exposed as a new channel.
+    family = resource.split(":", 1)[0]
+    return family if family in _WAITING_RESOURCE_FAMILIES else "other"
+
+
+def waiting_admission_diagnostics(observed_at, snapshot_revision, offer_diagnostics):
+    """Redact planner diagnostics before attaching them to a receipt.
+
+    The planner is allowed to use stable account/resource identities so it can
+    select correctly. Waiting receipts must never retain those raw identities,
+    credentials, input, or another receipt's payload.
+    """
+    accounts = {}
+    resources = {}
+    for offer in offer_diagnostics:
+        if not isinstance(offer, OfferDiagnostic):
+            continue
+        account_key = _waiting_diagnostic_key("account", offer.account)
+        eligibility = set(offer.ineligible_reasons) & _WAITING_ELIGIBILITY_CODES
+        if eligibility:
+            accounts.setdefault(account_key, set()).update(eligibility)
+        for block in offer.resource_blocks:
+            blockers = set(block.blockers) & _WAITING_RESOURCE_BLOCKERS
+            if not blockers:
+                continue
+            resource_key = _waiting_diagnostic_key("resource", block.resource)
+            key = (account_key, resource_key, block.required_units)
+            entry = resources.setdefault(key, {
+                "account_key": account_key,
+                "resource_key": resource_key,
+                "family": _waiting_resource_family(block.resource),
+                "capacity": block.capacity,
+                "occupied_known": block.occupied is not None,
+                "required_units": block.required_units,
+                "next_at_known": block.next_at is not None,
+                "blockers": set(),
+            })
+            if block.occupied is not None:
+                entry["occupied"] = block.occupied
+            if block.next_at is not None:
+                entry["next_at"] = block.next_at
+            entry["blockers"].update(blockers)
+    account_entries = [
+        {"account_key": account_key, "failed_checks": sorted(checks)}
+        for account_key, checks in sorted(accounts.items())
+    ]
+    resource_entries = [
+        {**entry, "blockers": sorted(entry["blockers"])}
+        for _, entry in sorted(resources.items())
+    ]
+    if not account_entries and not resource_entries:
+        return None
+    # Snapshot revisions are generated UUID hex values. Do not turn an adapter
+    # test value or future opaque identifier into an unbounded receipt field.
+    revision = (snapshot_revision if isinstance(snapshot_revision, str)
+                and len(snapshot_revision) == 32
+                and all(char in "0123456789abcdef" for char in snapshot_revision)
+                else "unknown")
+    omitted_accounts = max(0, len(account_entries) - WAITING_DIAGNOSTIC_MAX_ACCOUNT_ENTRIES)
+    omitted_resources = max(0, len(resource_entries) - WAITING_DIAGNOSTIC_MAX_RESOURCE_ENTRIES)
+    account_entries = account_entries[:WAITING_DIAGNOSTIC_MAX_ACCOUNT_ENTRIES]
+    resource_entries = resource_entries[:WAITING_DIAGNOSTIC_MAX_RESOURCE_ENTRIES]
+
+    def projection():
+        result = {"observed_at": observed_at, "snapshot_revision": revision}
+        if account_entries:
+            result["account_eligibility"] = account_entries
+        if resource_entries:
+            result["resource_limits"] = resource_entries
+        if omitted_accounts or omitted_resources:
+            result.update(truncated=True,
+                          omitted_account_eligibility=omitted_accounts,
+                          omitted_resource_limits=omitted_resources)
+        return result
+
+    # Keep the durable representation bounded as well as its entry counts.
+    # Prefer retaining account qualification evidence; remove resource entries
+    # first because they are more numerous per account.
+    while resource_entries and len(json.dumps(projection(), ensure_ascii=False, separators=(",", ":")).encode()) > WAITING_DIAGNOSTIC_MAX_JSON_BYTES:
+        resource_entries.pop()
+        omitted_resources += 1
+    while account_entries and len(json.dumps(projection(), ensure_ascii=False, separators=(",", ":")).encode()) > WAITING_DIAGNOSTIC_MAX_JSON_BYTES:
+        account_entries.pop()
+        omitted_accounts += 1
+    return projection()
 
 
 def physical_conversation_key(receipt):
@@ -972,24 +1088,48 @@ class PoolAdmission:
                                         (Need(codex_key), Need("codex_server")), enabled=bool(eligible),
                                         preference=0 if decision.get("quota_bucket") == "gpt-reserve" else 1))
                     continue
+                ineligible = []
+                if disabled:
+                    ineligible.append("account_disabled")
+                if not chat_saved:
+                    ineligible.append("source_not_authorized")
+                if not paid:
+                    ineligible.append("paid_plan_required")
+                if identity_counts.get(identity) != 1:
+                    ineligible.append("identity_not_unique")
                 enabled = not disabled and chat_saved and paid and identity_counts.get(identity) == 1
                 if request.operation == "image":
                     from utils.helper import is_codex_image_model, split_image_model
                     required_plan, _ = split_image_model(model)
+                    model_plan_allowed = (not required_plan
+                                          or plan == self.accounts._normalize_account_type(required_plan))
+                    model_account_allowed = not is_codex_image_model(model)
                     enabled = enabled and image_capacity(account, settings, model) > 0 and not is_codex_image_model(model)
                     if required_plan:
-                        enabled = enabled and plan == self.accounts._normalize_account_type(required_plan)
+                        enabled = enabled and model_plan_allowed
+                    if not model_plan_allowed:
+                        ineligible.append("model_plan_not_allowed")
+                    if not model_account_allowed:
+                        ineligible.append("model_account_not_allowed")
                     needs = (Need(turn_key), Need(image_key))
                 else:
                     route = types.get(model, set())
-                    enabled = enabled and plan in getattr(route, "account_types", route) and self._model_account_matches(account, route)
+                    model_plan_allowed = plan in getattr(route, "account_types", route)
+                    model_account_allowed = self._model_account_matches(account, route)
+                    enabled = enabled and model_plan_allowed and model_account_allowed
+                    if not model_plan_allowed:
+                        ineligible.append("model_plan_not_allowed")
+                    if not model_account_allowed:
+                        ineligible.append("model_account_not_allowed")
                     needs = (Need(turn_key),)
                 # Explicit per-model exhausted observations apply only to that
                 # model. Unknown limits are not invented as an extra balance.
                 for limit in account.get("limits_progress") or []:
                     if isinstance(limit, dict) and limit.get("feature_name") == model and limit.get("remaining") == 0:
                         enabled = False
-                offers.append(Offer(identity, "chat", model, request.operation, needs, enabled=bool(enabled)))
+                        ineligible.append("model_limit_zero")
+                offers.append(Offer(identity, "chat", model, request.operation, needs, enabled=bool(enabled),
+                                    ineligible_reasons=tuple(dict.fromkeys(ineligible))))
         if self.text_workers is None:
             # Execution threads follow the same usable physical account turns.
             # The retained-input memory ceiling still bounds all work; image
@@ -1475,6 +1615,10 @@ class PoolAdmission:
                             reason = "model_not_supported"
                         reasons.append("image_" + reason)
                 r["waiting"] = {"reasons": reasons, "next_check_at": deferred.next_at}
+                diagnostics = waiting_admission_diagnostics(snapshot.observed_at, snapshot.revision,
+                                                            deferred.offer_diagnostics)
+                if diagnostics is not None:
+                    r["waiting"]["admission_diagnostics"] = diagnostics
                 previous_id = (r.get("_image_thread") or {}).get("previous_task_id")
                 if previous_id and r.get("_image_thread_waiting_reason"):
                     # Same-owner original receipt is the recovery entry. This is

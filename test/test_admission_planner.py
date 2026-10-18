@@ -107,6 +107,34 @@ class PlannerTests(unittest.TestCase):
         snap = replace(snap,offers=tuple(replace(o,enabled=False) for o in snap.offers))
         self.assertIsNone(choose_next(snap,100).dispatch)
 
+    def test_disabled_offer_diagnostics_do_not_evaluate_new_combined_needs(self):
+        snap = fixture(requests=[replace(request(), needs=(Need('account-0:turn'),))])
+        snap = replace(snap, offers=tuple(replace(offer, enabled=False) for offer in snap.offers))
+
+        out = choose_next(snap, 100)
+
+        self.assertIsNone(out.dispatch)
+        self.assertEqual(out.deferred[0].reasons, ('no_matching_account',))
+
+    def test_offer_preference_and_rotation_keep_dispatch_order(self):
+        snap = fixture(2, interval=0)
+        preferred = tuple(replace(offer, preference=1 if offer.account == 'account-0' else 0)
+                          for offer in snap.offers)
+
+        self.assertEqual(choose_next(replace(snap, offers=preferred), 100).dispatch.account, 'account-1')
+        self.assertEqual(choose_next(replace(snap, last_account='account-0'), 100).dispatch.account, 'account-1')
+
+    def test_missing_bound_offer_diagnostic_does_not_infer_account_failure(self):
+        snap = fixture(requests=[request(account='absent-account')])
+
+        out = choose_next(snap, 100)
+
+        self.assertIsNone(out.dispatch)
+        self.assertIsNone(out.next_wake_at)
+        self.assertEqual(out.deferred[0].reasons, ('bound_account_unavailable',))
+        self.assertEqual(out.deferred[0].offer_diagnostics, (
+            OfferDiagnostic('absent-account', ('matching_offer_missing',)),))
+
     def test_restore_account_wakes_same_request(self):
         snap = fixture()
         disabled = replace(snap,offers=tuple(replace(o,enabled=False) for o in snap.offers))
@@ -118,6 +146,35 @@ class PlannerTests(unittest.TestCase):
         out = choose_next(snap,100)
         self.assertIsNone(out.dispatch)
         self.assertIn('occupancy_unknown',out.deferred[0].reasons)
+
+    def test_deferred_keeps_per_offer_resource_evidence(self):
+        snap = fixture(2)
+        snap = resource_update(snap, 'account-0:image', occupied=4)
+        snap = resource_update(snap, 'account-1:turn', next_at=130)
+
+        out = choose_next(snap, 100)
+
+        self.assertIsNone(out.dispatch)
+        self.assertEqual(out.next_wake_at, 130)
+        diagnostics = {item.account: item for item in out.deferred[0].offer_diagnostics}
+        full = next(block for block in diagnostics['account-0'].resource_blocks
+                    if block.resource == 'account-0:image')
+        paced = next(block for block in diagnostics['account-1'].resource_blocks
+                     if block.resource == 'account-1:turn')
+        self.assertEqual((full.capacity, full.occupied, full.required_units, full.next_at), (4, 4, 1, 0))
+        self.assertEqual(full.blockers, ('resource_full',))
+        self.assertEqual((paced.capacity, paced.occupied, paced.required_units, paced.next_at), (1, 0, 1, 130))
+        self.assertEqual(paced.blockers, ('account_or_shared_pacing',))
+
+    def test_unknown_occupancy_diagnostic_remains_unknown(self):
+        snap = resource_update(fixture(), 'account-0:image', occupied=None)
+
+        out = choose_next(snap, 100)
+
+        image = next(block for block in out.deferred[0].offer_diagnostics[0].resource_blocks
+                     if block.resource == 'account-0:image')
+        self.assertIsNone(image.occupied)
+        self.assertEqual(image.blockers, ('occupancy_unknown',))
 
     def test_shrink_under_active_occupancy_does_not_dispatch(self):
         snap = resource_update(fixture(),'account-0:image',capacity=1,occupied=3)

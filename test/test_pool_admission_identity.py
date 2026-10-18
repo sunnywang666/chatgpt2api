@@ -97,6 +97,21 @@ def test_legacy_codex_without_image_identity_is_read_only_and_executes(runtime, 
     assert json.loads(sent.calls[0][2]["data"]) == payload
 
 
+def test_unavailable_web_codex_observation_keeps_generic_waiting_reason(runtime):
+    rt = runtime([account("fixture-web-codex", source_type="web")])
+    # A Web account can carry a persisted Codex observation. Its local
+    # eligibility may be false for quota, cooldown, freshness, or model facts;
+    # waiting diagnostics must not guess that it is a source/auth/model error.
+    rt.native._eligible_account = lambda *_args, **_kwargs: None
+    submit(rt, "web-codex-wait")
+
+    assert rt.admission.claim_next() is None
+
+    receipt = rt.service.read("ordinary-key", "web-codex-wait")
+    assert receipt["waiting"]["reasons"] == ["no_matching_account"]
+    assert "admission_diagnostics" not in receipt["waiting"]
+
+
 def test_new_codex_only_account_automatically_serves_existing_full_pool_wait(runtime):
     rt = runtime([legacy()])
     submit(rt, "held")

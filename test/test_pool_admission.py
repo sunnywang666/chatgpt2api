@@ -1303,6 +1303,124 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn("private original input", json.dumps(snapshot))
         self.assertNotIn("fixture-token", json.dumps(snapshot))
 
+    def test_waiting_diagnostics_redact_account_eligibility_failures(self):
+        cases = (
+            ("disabled", lambda: self.rows[0].update(managed_disabled=True), "account_disabled"),
+            ("source", lambda: self.rows[0].update(source_type="codex"), "source_not_authorized"),
+            ("plan", lambda: self.rows[0].update(type="Free"), "paid_plan_required"),
+            ("identity", lambda: self.rows.append({**self.rows[0], "account_id": "duplicate-upstream",
+                                                     "access_token": "fixture-token-duplicate"}), "identity_not_unique"),
+            ("model-plan", lambda: setattr(self.admission, "model_types", lambda _model: ModelRoute(
+                account_types=frozenset({"Pro"}), account_identities=frozenset({"account-0"}))), "model_plan_not_allowed"),
+            ("model-account", lambda: setattr(self.admission, "model_types", lambda _model: ModelRoute(
+                account_types=frozenset({"Plus"}), account_identities=frozenset({"other-account"}))), "model_account_not_allowed"),
+            ("limit", lambda: self.rows[0].update(limits_progress=[{"feature_name": "fixture-text", "remaining": 0}]), "model_limit_zero"),
+        )
+        for name, configure, expected in cases:
+            with self.subTest(name=name):
+                self.write_accounts(1)
+                self.admission.model_types = lambda _: {"Plus"}
+                configure()
+                (self.root / "accounts.json").write_text(json.dumps(self.rows))
+                self.submit("diagnostic-" + name, provider_account_identity="account-0", provider_binding_id="binding-0")
+
+                self.assertIsNone(self.admission.claim_next())
+
+                waiting = self.read("text", "happy", "diagnostic-" + name)["waiting"]
+                details = waiting["admission_diagnostics"]
+                checks = {check for item in details["account_eligibility"] for check in item["failed_checks"]}
+                self.assertIn(expected, checks)
+                serialized = json.dumps(details)
+                self.assertNotIn("account-0", serialized)
+                self.assertNotIn("fixture-token", serialized)
+                self.assertNotIn("private original input", serialized)
+                self.assertIn("snapshot_revision", details)
+
+    def test_waiting_diagnostics_preserve_missing_bound_offer_fact(self):
+        self.submit("missing-offer", provider_account_identity="absent-account",
+                    provider_binding_id="absent-binding")
+
+        self.assertIsNone(self.admission.claim_next())
+
+        waiting = self.read("text", "happy", "missing-offer")["waiting"]
+        self.assertEqual(waiting["reasons"], ["bound_account_unavailable"])
+        details = waiting["admission_diagnostics"]
+        self.assertEqual(details["account_eligibility"][0]["failed_checks"], ["matching_offer_missing"])
+        self.assertNotIn("absent-account", json.dumps(details))
+
+    def test_waiting_diagnostics_report_redacted_resource_limit(self):
+        self.submit("running", provider_account_identity="account-0", provider_binding_id="binding-0")
+        running = self.admission.claim_next()
+        running.before_send()
+        self.submit("waiting-resource", provider_account_identity="account-0", provider_binding_id="binding-0")
+
+        self.assertIsNone(self.admission.claim_next())
+
+        waiting = self.read("text", "happy", "waiting-resource")["waiting"]
+        details = waiting["admission_diagnostics"]
+        turn = next(item for item in details["resource_limits"] if item["family"] == "chat_turn")
+        self.assertEqual((turn["capacity"], turn["occupied"], turn["required_units"]), (1, 1, 1))
+        self.assertEqual(turn["blockers"], ["resource_full"])
+        self.assertTrue(turn["occupied_known"])
+        serialized = json.dumps(details)
+        self.assertNotIn("account-0", serialized)
+        self.assertNotIn("fixture-token", serialized)
+        self.assertNotIn("private original input", serialized)
+
+    def test_waiting_diagnostic_unknown_resource_family_is_redacted(self):
+        from services.admission_planner import OfferDiagnostic, ResourceBlock
+        from services.pool_admission import waiting_admission_diagnostics
+
+        details = waiting_admission_diagnostics(1000, "fixture-snapshot", (
+            OfferDiagnostic("private-account", resource_blocks=(ResourceBlock(
+                "private-resource:fixture-secret", 1, None, 1, None,
+                ("occupancy_unknown", "unapproved-blocker")),)),
+            OfferDiagnostic("private-account", ineligible_reasons=(
+                "account_disabled", "unapproved-check")),
+        ))
+
+        resource = details["resource_limits"][0]
+        self.assertEqual(resource["family"], "other")
+        self.assertEqual(resource["blockers"], ["occupancy_unknown"])
+        self.assertEqual(details["account_eligibility"][0]["failed_checks"], ["account_disabled"])
+        serialized = json.dumps(details)
+        self.assertNotIn("private-account", serialized)
+        self.assertNotIn("private-resource", serialized)
+        self.assertNotIn("fixture-secret", serialized)
+
+    def test_waiting_diagnostic_projection_is_bounded_after_persistence(self):
+        from services.pool_admission import (WAITING_DIAGNOSTIC_MAX_ACCOUNT_ENTRIES,
+                                             WAITING_DIAGNOSTIC_MAX_JSON_BYTES,
+                                             WAITING_DIAGNOSTIC_MAX_RESOURCE_ENTRIES,
+                                             waiting_admission_diagnostics)
+        from services.admission_planner import OfferDiagnostic, ResourceBlock
+
+        self.write_accounts(1000)
+        for row in self.rows:
+            row["managed_disabled"] = True
+        (self.root / "accounts.json").write_text(json.dumps(self.rows))
+        self.submit("bounded-diagnostics")
+
+        self.assertIsNone(self.admission.claim_next())
+
+        stored = self.read("text", "happy", "bounded-diagnostics")["waiting"]["admission_diagnostics"]
+        self.assertEqual(len(stored["account_eligibility"]), WAITING_DIAGNOSTIC_MAX_ACCOUNT_ENTRIES)
+        self.assertEqual(stored["omitted_account_eligibility"], 1000 - WAITING_DIAGNOSTIC_MAX_ACCOUNT_ENTRIES)
+        self.assertTrue(stored["truncated"])
+        self.assertLessEqual(len(json.dumps(stored, ensure_ascii=False, separators=(",", ":")).encode()),
+                             WAITING_DIAGNOSTIC_MAX_JSON_BYTES)
+
+        resource_details = waiting_admission_diagnostics(1000, "a" * 32, tuple(
+            OfferDiagnostic("account-" + str(index), resource_blocks=(ResourceBlock(
+                "chat_turn:resource-" + str(index), 1, 1, 1, 1000,
+                ("resource_full",)),))
+            for index in range(1000)
+        ))
+        self.assertEqual(len(resource_details["resource_limits"]), WAITING_DIAGNOSTIC_MAX_RESOURCE_ENTRIES)
+        self.assertEqual(resource_details["omitted_resource_limits"], 1000 - WAITING_DIAGNOSTIC_MAX_RESOURCE_ENTRIES)
+        self.assertLessEqual(len(json.dumps(resource_details, ensure_ascii=False, separators=(",", ":")).encode()),
+                             WAITING_DIAGNOSTIC_MAX_JSON_BYTES)
+
     def test_slow_image_saves_have_bounded_local_workers_without_holding_generation(self):
         self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 1, "codex_max_concurrency": 4}
         for name in ("save-a", "save-b"):
