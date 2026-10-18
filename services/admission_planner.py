@@ -98,6 +98,10 @@ class Offer:
     needs: tuple[Need, ...]
     enabled: bool = True
     preference: int = 0          # server-owned, only after source/request fairness
+    # The adapter may retain why an otherwise matching account was excluded.
+    # This stays in the in-process snapshot; the adapter is responsible for
+    # publishing only its redacted projection on the original receipt.
+    ineligible_reasons: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for value in (self.account, self.route, self.model, self.operation):
@@ -106,6 +110,10 @@ class Offer:
             raise InvalidSnapshot('invalid account offer')
         _unique_needs(self.needs)
         _integer(self.preference)
+        if (not isinstance(self.ineligible_reasons, tuple)
+                or any(not isinstance(reason, str) or not reason for reason in self.ineligible_reasons)
+                or len(set(self.ineligible_reasons)) != len(self.ineligible_reasons)):
+            raise InvalidSnapshot('invalid account offer diagnostics')
 
     @property
     def key(self) -> tuple[str, str, str, str]:
@@ -197,6 +205,52 @@ class Deferred:
     ref: RequestRef
     reasons: tuple[str, ...]
     next_at: float | None
+    offer_diagnostics: tuple['OfferDiagnostic', ...] = ()
+
+
+@dataclass(frozen=True)
+class ResourceBlock:
+    """One observed resource constraint for a candidate offer.
+
+    These are private planner facts. The durable adapter hashes the account and
+    resource identifiers before they leave this snapshot.
+    """
+    resource: str
+    capacity: int
+    occupied: int | None
+    required_units: int
+    next_at: float | None
+    blockers: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _name(self.resource)
+        _integer(self.capacity)
+        if self.occupied is not None:
+            _integer(self.occupied)
+        _integer(self.required_units, minimum=1)
+        if self.next_at is not None:
+            _number(self.next_at)
+        if (not isinstance(self.blockers, tuple)
+                or not self.blockers
+                or any(not isinstance(blocker, str) or not blocker for blocker in self.blockers)
+                or len(set(self.blockers)) != len(self.blockers)):
+            raise InvalidSnapshot('invalid resource diagnostics')
+
+
+@dataclass(frozen=True)
+class OfferDiagnostic:
+    account: str
+    ineligible_reasons: tuple[str, ...] = ()
+    resource_blocks: tuple[ResourceBlock, ...] = ()
+
+    def __post_init__(self) -> None:
+        _name(self.account)
+        if (not isinstance(self.ineligible_reasons, tuple)
+                or any(not isinstance(reason, str) or not reason for reason in self.ineligible_reasons)
+                or len(set(self.ineligible_reasons)) != len(self.ineligible_reasons)
+                or not isinstance(self.resource_blocks, tuple)
+                or any(not isinstance(block, ResourceBlock) for block in self.resource_blocks)):
+            raise InvalidSnapshot('invalid offer diagnostics')
 
 
 @dataclass(frozen=True)
@@ -293,50 +347,76 @@ def choose_next(snapshot: Snapshot, now: float) -> Selection:
                 wakeups.append(wake)
             return None
 
-        matches = [o for o in offers if o.enabled
-                   and (o.route, o.model, o.operation) ==
-                       (request.route, request.model, request.operation)
-                   and (request.bound_account is None or request.bound_account == o.account)]
+        candidates = [o for o in offers
+                      if (o.route, o.model, o.operation) ==
+                      (request.route, request.model, request.operation)
+                      and (request.bound_account is None or request.bound_account == o.account)]
+        matches = [o for o in candidates if o.enabled]
         account_order = _rotate([o.account for o in matches], snapshot.last_account)
         position = {name: i for i, name in enumerate(account_order)}
         matches.sort(key=lambda o: (o.preference, position[o.account]))
         possible_wakeups: list[float] = []
+        offer_diagnostics: list[OfferDiagnostic] = []
+        if not candidates and request.bound_account:
+            # This only establishes the absence of a matching offer in this
+            # snapshot, not why an account or model is unavailable.
+            offer_diagnostics.append(OfferDiagnostic(
+                request.bound_account, ('matching_offer_missing',)))
+        for offer in candidates:
+            if not offer.enabled and offer.ineligible_reasons:
+                offer_diagnostics.append(OfferDiagnostic(offer.account, offer.ineligible_reasons))
         if not matches:
             reasons.add('bound_account_unavailable' if request.bound_account else 'no_matching_account')
+        # Keep this exact sorted match order for both dispatch and diagnostics.
+        # Disabled offers are eligibility-only evidence: evaluating their needs
+        # would make a diagnostic path change the former selection/raise
+        # behavior for malformed or duplicate demand combinations.
         for offer in matches:
             needs = request.needs + offer.needs
             _unique_needs(needs)
             blockers: set[str] = set()
             future_times: list[float] = []
             reservations: list[tuple[str, float]] = []
+            resource_blocks: list[ResourceBlock] = []
             for need in needs:
                 resource = resources[need.resource]
+                resource_blockers: set[str] = set()
                 if resource.occupied is None:
                     blockers.add('occupancy_unknown')
+                    resource_blockers.add('occupancy_unknown')
                 elif resource.occupied + need.units > resource.capacity:
                     blockers.add('resource_full')
+                    resource_blockers.add('resource_full')
                 elif (snapshot.scoped_extra_turn is not None
                       and need.resource == snapshot.scoped_extra_turn[1]
                       and resource.occupied >= 1
                       and request.ref != snapshot.scoped_extra_turn[0]):
                     blockers.add('resource_full')
+                    resource_blockers.add('resource_full')
                 if resource.next_at is None:
                     blockers.add('availability_time_unknown')
+                    resource_blockers.add('availability_time_unknown')
                 elif resource.next_at > now:
                     blockers.add('account_or_shared_pacing')
+                    resource_blockers.add('account_or_shared_pacing')
                     future_times.append(resource.next_at)
                 if resource.interval:
                     reservations.append((resource.key, now + resource.interval))
+                if resource_blockers:
+                    resource_blocks.append(ResourceBlock(
+                        resource.key, resource.capacity, resource.occupied,
+                        need.units, resource.next_at, tuple(sorted(resource_blockers))))
             if not blockers:
                 return Dispatch(request.ref, offer.account, request.source,
                                 snapshot.revision, needs, tuple(reservations), now)
             reasons.update(blockers)
+            offer_diagnostics.append(OfferDiagnostic(offer.account, resource_blocks=tuple(resource_blocks)))
             # When occupancy is full/unknown, a release/readback is needed.
             # A guessed timer cannot promise that an in-flight job is done.
             if blockers <= {'account_or_shared_pacing'} and future_times:
                 possible_wakeups.append(max(future_times))
         wake = min(possible_wakeups) if possible_wakeups else None
-        deferred.append(Deferred(request.ref, tuple(sorted(reasons)), wake))
+        deferred.append(Deferred(request.ref, tuple(sorted(reasons)), wake, tuple(offer_diagnostics)))
         if wake is not None:
             wakeups.append(wake)
         return None
