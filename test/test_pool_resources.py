@@ -100,6 +100,53 @@ class PoolResourceTests(unittest.TestCase):
         with patch("services.pool_resources.config", self.config):
             self.assertEqual(resource_snapshot(accounts, tasks, codex)["image"]["slots_free"], 2)
 
+    def test_admission_projection_skips_legacy_durable_scan_without_changing_merged_payload(self):
+        rows = [{"source_type": "web", "access_token": "synthetic-chat", "type": "Plus", "status": "正常",
+                 "provider_account_identity": "a", "image_inflight": 1,
+                 "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+                 "limits_progress": [{"feature_name": "image_gen", "remaining": 3}]}]
+        accounts = Mock()
+        accounts.list_accounts.return_value = rows
+        accounts._is_image_account_available.return_value = True
+        tasks = Mock()
+        tasks.resource_occupancy.side_effect = AssertionError("admission payload already owns durable occupancy")
+        shared = {
+            "accounts": [{"image": {"capacity": 2}}],
+            "settings": {"revision": 4, "image_account_concurrency": 2, "codex_max_concurrency": 3},
+            "image": {"slots_total": 2, "inflight": 1, "slots_free": 1, "dispatchable_now": 0},
+            "codex": {"slots_total": 0, "slots_free": 0},
+            "queue": {"mode": "durable_original_receipts", "queued": 843},
+        }
+        tasks.admission.resource_snapshot.return_value = shared
+        codex = Mock()
+        codex.resource_snapshot.return_value = {"legacy": "discarded"}
+
+        with patch("services.pool_resources.config", self.config):
+            result = resource_snapshot(accounts, tasks, codex)
+
+        observed_at = result.pop("observed_at")
+        self.assertIsNotNone(datetime.fromisoformat(observed_at))
+        self.assertEqual(result, {
+            **shared,
+            "image": {"remaining": 3, "known_remaining": 3, "observed_accounts": 1, "total_accounts": 1,
+                      "eligible_accounts": 1, "slots_total": 2, "slots_free": 1, "slots_free_min": 1,
+                      "slots_free_max": 1, "process_inflight": 1, "durable_inflight": 1,
+                      "occupancy_uncertain": False, "inflight": 1, "dispatchable_now": 0},
+        })
+        tasks.resource_occupancy.assert_not_called()
+
+    def test_legacy_projection_still_reads_durable_occupancy(self):
+        accounts = Mock()
+        accounts.list_accounts.return_value = []
+        tasks = Mock()
+        tasks.admission = None
+        tasks.resource_occupancy.return_value = {"by_account": {}, "unattributed": 0}
+
+        with patch("services.pool_resources.config", self.config):
+            resource_snapshot(accounts, tasks, Mock())
+
+        tasks.resource_occupancy.assert_called_once_with()
+
     def test_image_slots_use_fresh_image_evidence_not_generic_quota(self):
         rows = [{"source_type": "web", "access_token": "synthetic", "type": "Plus",
                  "status": "正常", "quota": 999, "provider_account_identity": "a",
