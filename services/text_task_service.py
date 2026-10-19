@@ -1083,13 +1083,16 @@ class TextTaskService:
         """
         if type(now) not in (int, float) or not math.isfinite(now) or now <= 0:
             return False
-        # Historical interrupted Chat attempts persisted status/error without
-        # this newer field. Only that exact missing-field shape is compatible;
-        # explicit null/conflicting outcomes remain ineligible. The original
-        # observation, idle/lease and budget evidence below is still mandatory.
+        # Interrupted Chat attempts can lack this field or retain not_sent
+        # from an earlier attempt despite crossing the durable send boundary.
+        # Only the exact sent-UNKNOWN shape is compatible; null and other
+        # outcomes remain ineligible. All observation/lease/age checks below
+        # still apply, without rewriting the receipt or ending its recovery.
         unresolved_outcome = (receipt.get("upstream_outcome") == "unknown"
-                              or "upstream_outcome" not in receipt
-                              and receipt.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN")
+                              or receipt.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+                              and ("upstream_outcome" not in receipt
+                                   or receipt.get("upstream_outcome") == "not_sent"
+                                   and receipt.get("_submission_started") is True))
         if (not cls._bounded_chat_wait(receipt)
                 or receipt.get("status") != "unknown"
                 or receipt.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
@@ -1869,6 +1872,15 @@ class TextTaskService:
                 else:
                     changes["original_upstream_response_ids"] = incoming_ids
             receipt = {**receipt, **changes, "updated_at": self._now()}
+            if (changes.get("status") == "unknown"
+                    and receipt.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+                    and receipt.get("_submission_started") is True
+                    and receipt.get("_route", "chat") == "chat"
+                    and receipt.get("_operation", "text") == "text" and not receipt.get("_forward_protocol")
+                    and receipt.get("upstream_outcome") == "not_sent"):
+                # Preserve the uncertain original, not an earlier unsent
+                # attempt's label. Terminal and claim guards already passed.
+                receipt["upstream_outcome"] = "unknown"
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (json.dumps(receipt), owner, request_id))
 
     @staticmethod

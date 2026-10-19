@@ -2047,6 +2047,12 @@ class PoolAdmission:
             workflow_scheduling.before_send(self.store, db, r, now)
             if r.get("_supersedes_request_id"):
                 r.update(upstream_outcome="unknown", error_code=None, waiting=None)
+            elif (context.kind == "text" and r.get("_route", "chat") == "chat"
+                  and r.get("_operation", "text") == "text" and not r.get("_forward_protocol")
+                  and r.get("upstream_outcome") == "not_sent"):
+                # All send guards passed. A prior unsent attempt no longer
+                # describes this attempt once its durable send boundary opens.
+                r["upstream_outcome"] = "unknown"
             timeline = list(r.get("_execution_timeline") or [])
             timeline.append({"stage": "send_guard_passed", "at": now, **send_observation})
             r.update(_submission_started=True, _last_sent_sequence=sequence, _turn_reserved=True,

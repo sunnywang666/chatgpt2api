@@ -495,7 +495,7 @@ def test_stalled_original_allows_an_independent_claim_to_send_while_capacity_sta
     assert candidate["status"] == "running" and candidate["_submission_started"] is True
 
 
-@pytest.mark.parametrize("conflict", [None, "completed", "rejected", "not_sent", "not_submitted", "", False])
+@pytest.mark.parametrize("conflict", [None, "completed", "rejected", "not_submitted", "", False])
 def test_stalled_legacy_compatibility_does_not_override_explicit_outcomes(tmp_path, conflict):
     service, admission, backend, _ = migration(tmp_path)
     remove_legacy_outcome(service, False)
