@@ -10,7 +10,11 @@ def resource_snapshot(accounts, image_tasks, codex) -> dict:
     rows = [row for row in accounts.list_accounts()
             if chat_projection(row)["authorization_status"] == "saved"]
     settings = config.resource_settings()
-    durable = image_tasks.resource_occupancy()
+    # Admission owns the durable image occupancy in its shared snapshot.  Its
+    # result below replaces every field derived from this legacy scan, so do
+    # not decode all saved image receipts twice for the normal admission path.
+    durable = (image_tasks.resource_occupancy() if admission is None
+               else {"by_account": {}, "unattributed": 0})
     held = durable["by_account"]
     known = []
     observed = 0
