@@ -1269,7 +1269,7 @@ class ImageTaskServiceTests(unittest.TestCase):
                 "items": [], "missing_ids": ["completed"],
             })
 
-    def test_due_exact_receipt_cleanup_rereads_newer_state_before_delete(self):
+    def test_old_exact_receipt_read_preserves_receipt_without_writer_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "images.json"
             service = self.make_service(path)
@@ -1279,59 +1279,46 @@ class ImageTaskServiceTests(unittest.TestCase):
                 service._tasks["owner-1:old"]["updated_at"] = "2020-01-01 00:00:00"
                 service._save_locked(task_key="owner-1:old")
 
-            original_snapshot = service._list_snapshot
-            def snapshot_then_complete(owner, requested_ids):
-                snapshot = original_snapshot(owner, requested_ids)
-                with service.store.transaction() as db:
-                    current = service.store.read_receipt(db, "image", "owner-1", "old")
-                    current["updated_at"] = "2099-01-01 00:00:00"
-                    service.store.write_receipt(db, "image", "owner-1", "old", current)
-                return snapshot
-
-            with mock.patch.object(service, "_list_snapshot", side_effect=snapshot_then_complete):
+            original_transaction = service.store.transaction
+            with mock.patch.object(service.store, "transaction", wraps=original_transaction) as transaction:
                 result = service.list_tasks(OWNER, ["old"])
             self.assertEqual(result["missing_ids"], [])
             self.assertEqual(result["items"][0]["id"], "old")
-            self.assertEqual(result["items"][0]["updated_at"], "2099-01-01 00:00:00")
+            self.assertEqual(result["items"][0]["updated_at"], "2020-01-01 00:00:00")
+            transaction.assert_not_called()
 
-            with service._transaction():
-                service._tasks["owner-1:old"]["updated_at"] = "2020-01-01 00:00:00"
-                service._save_locked(task_key="owner-1:old")
-            self.assertEqual(service.list_tasks(OWNER, ["old"]), {
-                "items": [], "missing_ids": ["old"],
-            })
+            with service.store.connect() as db:
+                self.assertEqual(service.store.read_receipt(db, "image", "owner-1", "old")["status"], "success")
 
-    def test_due_exact_cleanup_batches_requested_receipts_in_one_keyed_transaction(self):
+    def test_old_success_and_error_receipts_survive_restart_and_duplicate_submit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "images.json"
-            service = self.make_service(path)
-            for task_id in ("old", "fresh"):
-                service.submit_generation(OWNER, client_task_id=task_id, prompt="done", model="gpt-image-2", size=None)
-                wait_for_task(service, OWNER, task_id, "success")
+            calls = []
+
+            def handler(payload):
+                calls.append(payload["prompt"])
+                return {"data": [{"url": "http://example.test/image.png"}]}
+
+            service = self.make_service(path, handler)
+            request = {"client_task_id": "old-success", "prompt": "done", "model": "gpt-image-2", "size": None}
+            service.submit_generation(OWNER, **request)
+            wait_for_task(service, OWNER, "old-success", "success")
             with service._transaction():
-                service._tasks["owner-1:old"]["updated_at"] = "2020-01-01 00:00:00"
-                service._tasks["owner-1:fresh"]["updated_at"] = "2099-01-01 00:00:00"
-                service._save_locked(task_key="owner-1:old")
-                service._save_locked(task_key="owner-1:fresh")
+                success = service._tasks["owner-1:old-success"]
+                success["updated_at"] = "2020-01-01 00:00:00"
+                error = {**success, "id": "old-error", "status": "error", "data": [],
+                         "error_code": "IMAGE_GENERATION_FAILED", "error": "known terminal failure"}
+                service._tasks["owner-1:old-error"] = error
+                service._save_locked(task_key="owner-1:old-success")
+                service._save_locked(task_key="owner-1:old-error")
 
-            statements = []
-            original_connect = service.store._connect
-            def traced_connect():
-                db = original_connect()
-                db.set_trace_callback(statements.append)
-                return db
-
-            original_transaction = service.store.transaction
-            with (
-                mock.patch.object(service.store, "_connect", side_effect=traced_connect),
-                mock.patch.object(service.store, "transaction", wraps=original_transaction) as transaction,
-            ):
-                result = service.list_tasks(OWNER, ["old", "fresh", "old"])
-
-            self.assertEqual(transaction.call_count, 1)
-            self.assertEqual([item["id"] for item in result["items"]], ["fresh"])
-            self.assertEqual(result["missing_ids"], ["old", "old"])
-            self.assertNotIn("SELECT task_key,receipt FROM image_requests", statements)
+            restarted = self.make_service(path, handler)
+            historical = restarted.list_tasks(OWNER, ["old-success", "old-error"])
+            self.assertEqual([item["id"] for item in historical["items"]], ["old-success", "old-error"])
+            self.assertEqual([item["status"] for item in historical["items"]], ["success", "error"])
+            duplicate = restarted.submit_generation(OWNER, **request)
+            self.assertEqual(duplicate["id"], "old-success")
+            self.assertEqual(calls, ["done"])
 
     def test_request_owned_model_is_durable_and_cannot_change_on_duplicate_submit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
