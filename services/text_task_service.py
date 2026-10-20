@@ -1100,9 +1100,7 @@ class TextTaskService:
                 or receipt.get("_attempt_finished_at") is not None
                 or receipt.get("_submission_started") is not True
                 or type(receipt.get("_turn_reserved")) is not bool
-                or receipt.get("_executing") is not False
-                or receipt.get("recovery_claim_id") is not None
-                or receipt.get("recovery_lease_until") is not None):
+                or receipt.get("_executing") is not False):
             return False
         if (receipt.get("_recovery_claim_id") is not None
                 or receipt.get("_recovery_claim_until") is not None):
@@ -1147,6 +1145,21 @@ class TextTaskService:
         progress = last_progress if last_progress is not None else started
         if not (started <= progress <= wait_ended <= last_checked <= now):
             return False
+        recovery_id = receipt.get("recovery_claim_id")
+        recovery_at = receipt.get("recovery_claimed_at")
+        recovery_until = receipt.get("recovery_lease_until")
+        if any(value is not None for value in (recovery_id, recovery_at, recovery_until)):
+            # Only the current read of this already-qualified original is
+            # exempt. A successor read, partial claim, or expired lease cannot
+            # establish that the ongoing work is this read-only operation.
+            if (type(recovery_id) is not str or not recovery_id.strip()
+                    or recovery_id != recovery_id.strip() or len(recovery_id) > 300
+                    or receipt.get("recovery_phase") != "read_text_request"
+                    or "_missing_successor_resume" in receipt
+                    or type(recovery_at) not in (int, float) or not math.isfinite(recovery_at)
+                    or type(recovery_until) not in (int, float) or not math.isfinite(recovery_until)
+                    or not (last_checked <= recovery_at <= now < recovery_until)):
+                return False
         # A later snapshot clock cannot rehabilitate an early/stale marker:
         # the marker itself must have been recorded after the existing window.
         if (wait_ended - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS
