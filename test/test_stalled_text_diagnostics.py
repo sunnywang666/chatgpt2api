@@ -794,3 +794,132 @@ def test_pure_text_observation_upgrade_preserves_progress_clock(tmp_path):
     assert row["_result_observation_started_at"] == original["_result_observation_started_at"]
     assert row["_result_last_progress_at"] is None
     assert row["_result_no_progress_reads"] == 1
+
+
+@pytest.mark.parametrize("failure, expected_code", [
+    (lambda: ConversationBindingError("bounded read unavailable", code="RECOVERY_READ_FAILED"),
+     "RECOVERY_READ_FAILED"),
+    (lambda: type("RateLimitError", (RuntimeError,), {"status_code": 429})("rate limited"),
+     "RECOVERY_RATE_LIMITED"),
+])
+def test_stalled_capacity_boundary_survives_later_transient_original_read_failure(
+        tmp_path, failure, expected_code):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    before = saved(service)
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(before, admission.clock.now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+
+    def unavailable(_receipt):
+        raise failure()
+
+    service.recovery_reader = unavailable
+    admission.clock.now = before["recovery_next_at"] + 1
+    result = service.read("owner", "old-0")
+    after = saved(service)
+
+    assert result["status"] == "unknown"
+    assert after["recovery_error_code"] == expected_code
+    assert after["recovery_reason"] == "REQUEST_RESULT_INCOMPLETE"
+    assert after["recovery_claim_id"] is None
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(after, admission.clock.now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert backend.mock_calls == []
+
+
+def test_stalled_recovery_fences_expired_execution_after_fresh_original_observation(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    before = saved(service)
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(before, admission.clock.now)
+
+    patch(service, _executing=True, _claim_id="expired-original-send",
+          _claim_until=admission.clock.now - 1)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+
+    service.recovery_reader = incomplete_reader(backend)
+    admission.clock.now = saved(service)["recovery_next_at"] + 1
+    service.read("owner", "old-0")
+    after = saved(service)
+
+    assert after["status"] == "unknown"
+    assert after["_executing"] is False
+    assert after["_claim_id"] is None and after["_claim_until"] is None
+    assert after["_result_no_progress_reads"] > before["_result_no_progress_reads"]
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(after, admission.clock.now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert backend.mock_calls == []
+
+
+def test_stalled_recovery_failure_does_not_fence_expired_sender_without_observation(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    before = saved(service)
+    patch(service, _executing=True, _claim_id="expired-original-send",
+          _claim_until=admission.clock.now - 1)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+
+    def rate_limited(_receipt):
+        raise type("RateLimitError", (RuntimeError,), {"status_code": 429})("rate limited")
+
+    service.recovery_reader = rate_limited
+    admission.clock.now = before["recovery_next_at"] + 1
+    service.read("owner", "old-0")
+    after = saved(service)
+
+    assert after["recovery_error_code"] == "RECOVERY_RATE_LIMITED"
+    assert after["_executing"] is True
+    assert after["_claim_id"] == "expired-original-send"
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    assert backend.mock_calls == []
+
+
+@pytest.mark.parametrize("claim_id, claim_until", [
+    ("live-original-send", 10_000),
+    (None, None),
+])
+def test_stalled_recovery_does_not_fence_live_or_malformed_sender_lease(
+        tmp_path, claim_id, claim_until):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    before = saved(service)
+    if claim_until is not None:
+        claim_until = admission.clock.now + 1_000
+    patch(service, _executing=True, _claim_id=claim_id, _claim_until=claim_until)
+
+    service.recovery_reader = incomplete_reader(backend)
+    admission.clock.now = before["recovery_next_at"] + 1
+    service.read("owner", "old-0")
+    after = saved(service)
+
+    assert after["_executing"] is True
+    assert after["_claim_id"] == claim_id and after["_claim_until"] == claim_until
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    assert backend.mock_calls == []
+
+
+def test_read_failure_does_not_restore_missing_stalled_reason_or_release_capacity(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
+    stalled(service, admission, backend)
+    before = saved(service)
+    patch(service, recovery_reason=None)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+
+    def unavailable(_receipt):
+        raise ConnectionError("transient read failure")
+
+    service.recovery_reader = unavailable
+    admission.clock.now = before["recovery_next_at"] + 1
+    service.read("owner", "old-0")
+    after = saved(service)
+
+    assert after["recovery_reason"] is None
+    assert after["recovery_error_code"] == "RECOVERY_TRANSPORT_FAILED"
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(after, admission.clock.now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    assert backend.mock_calls == []
