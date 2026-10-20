@@ -5,28 +5,89 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Full merged source commit to publish
+        required: true
+        type: string
 
 env:
   IMAGE_NAME: chatgpt2api
 
+concurrency:
+  group: provider-publish-${{ inputs.source_ref || github.sha }}
+  cancel-in-progress: false
+
 jobs:
   docker:
-    runs-on: ubuntu-latest
+    if: ${{ github.repository == 'sunnywang666/chatgpt2api' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))) }}
+    runs-on: ${{ fromJSON(format('["self-hosted","linux","x64","hugsweet-company-publisher","run-{0}-{1}"]', github.run_id, github.run_attempt)) }}
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Resolve authorized source
+        id: source
+        shell: bash
+        env:
+          REQUESTED_SOURCE: ${{ inputs.source_ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source_sha="$DISPATCH_SHA"
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$REQUESTED_SOURCE" =~ ^[a-f0-9]{40}$ ]] || {
+              echo 'source_ref must be a full commit SHA' >&2; exit 1;
+            }
+            comparison="$(curl --fail --silent --show-error --connect-timeout 15 --max-time 60 \
+              -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/sunnywang666/chatgpt2api/compare/$REQUESTED_SOURCE...$DISPATCH_SHA")"
+            test "$(jq -r '.base_commit.sha' <<< "$comparison")" = "$REQUESTED_SOURCE"
+            case "$(jq -r '.status' <<< "$comparison")" in
+              ahead|identical) ;;
+              *) echo 'source_ref must already be merged into the dispatched main commit' >&2; exit 1 ;;
+            esac
+            source_sha="$REQUESTED_SOURCE"
+          fi
+          [[ "$source_sha" =~ ^[a-f0-9]{40}$ ]]
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact authorized source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify checkout and read job proxy
+        id: proxy
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -n "${HUGSWEET_PUBLISHER_PROXY:-}"
+          test -n "${HUGSWEET_PUBLISHER_NO_PROXY:-}"
+          echo "url=$HUGSWEET_PUBLISHER_PROXY" >> "$GITHUB_OUTPUT"
+          echo "bypass=$HUGSWEET_PUBLISHER_NO_PROXY" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
+        if: ${{ github.event_name == 'push' }}
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            env.HTTP_PROXY=${{ steps.proxy.outputs.url }}
+            env.HTTPS_PROXY=${{ steps.proxy.outputs.url }}
+            "env.NO_PROXY=${{ steps.proxy.outputs.bypass }}"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -43,19 +104,64 @@ jobs:
           tags: |
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=ref,event=tag
-            type=sha
+            type=sha,enable=${{ github.event_name == 'push' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=sha-${{ steps.source.outputs.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+
+      - name: Resolve existing exact-source image
+        id: existing
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          IMAGE_REF: ghcr.io/sunnywang666/chatgpt2api:sha-${{ steps.source.outputs.sha }}
+          HTTP_PROXY: ${{ steps.proxy.outputs.url }}
+          HTTPS_PROXY: ${{ steps.proxy.outputs.url }}
+          NO_PROXY: ${{ steps.proxy.outputs.bypass }}
+        run: |
+          set -euo pipefail
+          result_dir="$(mktemp -d)"
+          trap 'rm -rf "$result_dir"' EXIT
+          if docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Manifest}}' >"$result_dir/manifest.json" 2>"$result_dir/error"; then
+            digest="$(jq -er '.digest | select(type == "string" and test("^sha256:[a-f0-9]{64}$"))' "$result_dir/manifest.json")"
+            printf 'exists=true\ndigest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          elif grep -Eiq 'manifest_unknown|manifest unknown' "$result_dir/error" || grep -Fq -- "$IMAGE_REF: not found" "$result_dir/error"; then
+            printf 'exists=false\ndigest=\n' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Registry read failed; refusing an unverified rebuild' >&2
+            cat "$result_dir/error" >&2
+            exit 1
+          fi
 
       - name: Build and push image
+        id: build
+        if: ${{ github.event_name == 'push' || steps.existing.outputs.exists == 'false' }}
         uses: docker/build-push-action@v6
+        env:
+          HTTP_PROXY: ${{ steps.proxy.outputs.url }}
+          HTTPS_PROXY: ${{ steps.proxy.outputs.url }}
+          NO_PROXY: ${{ steps.proxy.outputs.bypass }}
         with:
           context: .
           file: ./Dockerfile
           target: app
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ github.event_name == 'push' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: |
+            HTTP_PROXY=${{ steps.proxy.outputs.url }}
+            HTTPS_PROXY=${{ steps.proxy.outputs.url }}
+            NO_PROXY=${{ steps.proxy.outputs.bypass }}
+      - name: Print immutable image reference
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          IMAGE_DIGEST: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "provider=ghcr.io/sunnywang666/chatgpt2api@$IMAGE_DIGEST"
+          echo "source_sha=$SOURCE_SHA"
