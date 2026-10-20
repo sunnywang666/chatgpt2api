@@ -24,7 +24,7 @@ from services.public_chat_service import (
     require_public_reasoning_effort,
     require_public_text_model,
 )
-from services.text_task_service import text_task_service
+from services.text_task_service import TextRecoveryLeaseBusy, text_task_service
 from services.work_lifecycle import WorkLifecycleError, get_work_lifecycle_service
 
 
@@ -466,13 +466,19 @@ def create_router() -> APIRouter:
             response.status_code = 202 if result["status"] in {"queued", "running"} else 200
             response.headers["Cache-Control"] = "private, no-store"
             return result
-        receipt = await run_in_threadpool(
-            text_task_service.recover,
-            owner,
-            request_id,
-            False,
-            explicit_ended_recheck=True,
-        )
+        try:
+            receipt = await run_in_threadpool(
+                text_task_service.recover,
+                owner,
+                request_id,
+                False,
+                explicit_ended_recheck=True,
+            )
+        except TextRecoveryLeaseBusy as exc:
+            raise HTTPException(status_code=503, headers={"Cache-Control": "private, no-store"}, detail={
+                "code": "TEXT_RECOVERY_LEASE_BUSY", "retryable": True,
+                "lease_acquired": False, "upstream_read_started": False,
+            }) from exc
         response.headers["Cache-Control"] = "private, no-store"
         return _projection(receipt, request_id)
 

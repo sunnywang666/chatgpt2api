@@ -23,7 +23,7 @@ from services.conversation_binding_service import (
     conversation_binding_service,
 )
 from services.editable_file_task_service import editable_file_task_service
-from services.text_task_service import TextTaskService, text_task_service
+from services.text_task_service import TextRecoveryLeaseBusy, TextTaskService, text_task_service
 from services.log_service import LoggedCall
 from services.public_chat_service import PublicChatContractError, project_public_models
 from services.protocol import (
@@ -523,13 +523,19 @@ def create_router() -> APIRouter:
         authorization: str | None = Header(default=None),
     ):
         identity = require_identity(authorization)
-        return await run_in_threadpool(
-            text_task_service.recover,
-            str(identity.get("id") or "anonymous"),
-            request_id,
-            body.allow_unrecoverable_retry,
-            explicit_ended_recheck=True,
-        )
+        try:
+            return await run_in_threadpool(
+                text_task_service.recover,
+                str(identity.get("id") or "anonymous"),
+                request_id,
+                body.allow_unrecoverable_retry,
+                explicit_ended_recheck=True,
+            )
+        except TextRecoveryLeaseBusy as exc:
+            raise HTTPException(status_code=503, detail={
+                "code": "TEXT_RECOVERY_LEASE_BUSY", "retryable": True,
+                "lease_acquired": False, "upstream_read_started": False,
+            }) from exc
 
     @router.post("/api/conversation-bindings/text-requests/{request_id}/codex-fallback")
     async def fallback_bound_text_request(

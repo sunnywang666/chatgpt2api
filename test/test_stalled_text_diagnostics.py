@@ -1,17 +1,87 @@
 """A stagnant original turn ends result waiting, never ownership or recovery."""
 import copy
 import json
+import sqlite3
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
+from unittest.mock import Mock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from api import ai
 from services.conversation_binding_service import ConversationBindingService
 from services.public_chat_service import project_public_chat_receipt
 from services.request_context import AdmissionLost
 from services.text_task_service import TextTaskService
 from test.test_expired_execution_wait import saved, patch, waiter
 from test.test_unknown_turn_recovery import document, migration
+
+
+def test_explicit_recovery_reports_real_sqlite_writer_contention_without_claim(tmp_path, monkeypatch):
+    service, _, backend, _ = migration(tmp_path)
+    before = saved(service)
+    def read_original(row):
+        doc = document(row)
+        doc["mapping"][doc["current_node"]]["message"]["content"]["parts"] = ["original answer"]
+        return ConversationBindingService._read_text_request_result(backend, row, document=doc)
+    reader = Mock(side_effect=read_original)
+    service.recovery_reader = reader
+    connect = service.store._connect
+
+    def short_busy_timeout():
+        db = connect()
+        db.execute("PRAGMA busy_timeout=10")
+        return db
+
+    monkeypatch.setattr(service.store, "_connect", short_busy_timeout)
+    monkeypatch.setattr(ai, "text_task_service", service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_args, **_kwargs: {"id": "owner"})
+    app = FastAPI()
+    app.include_router(ai.create_router())
+    client = TestClient(app)
+    with sqlite3.connect(service.store.path) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        response = client.post("/api/conversation-bindings/text-requests/old-0/recover", json={})
+        assert response.status_code == 503
+        assert response.json()["detail"] == {
+            "code": "TEXT_RECOVERY_LEASE_BUSY", "retryable": True,
+            "lease_acquired": False, "upstream_read_started": False,
+        }
+        assert saved(service) == before
+        reader.assert_not_called()
+        backend._get_conversation.assert_not_called()
+    response = client.post("/api/conversation-bindings/text-requests/old-0/recover", json={})
+    assert response.status_code == 200
+    assert response.json()["status"] == "succeeded"
+    assert response.json()["content"] == "original answer"
+    assert reader.call_count == 1
+    assert saved(service)["request_message_id"] == before["request_message_id"]
+
+
+def test_explicit_recovery_does_not_translate_other_database_errors(tmp_path, monkeypatch):
+    service, _, _, _ = migration(tmp_path)
+    original_db = service._db
+    calls = 0
+
+    @contextmanager
+    def failing_db():
+        nonlocal calls
+        calls += 1
+        with original_db() as db:
+            if calls == 2:
+                class BrokenBegin:
+                    def execute(self, _sql):
+                        raise sqlite3.OperationalError("disk I/O error")
+                yield BrokenBegin()
+            else:
+                yield db
+
+    monkeypatch.setattr(service, "_db", failing_db)
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        service.recover("owner", "old-0")
 
 
 def mixed_chain(doc):
