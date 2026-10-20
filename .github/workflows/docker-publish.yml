@@ -165,3 +165,90 @@ jobs:
           [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
           echo "provider=ghcr.io/sunnywang666/chatgpt2api@$IMAGE_DIGEST"
           echo "source_sha=$SOURCE_SHA"
+
+      - name: Smoke test immutable Provider image
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          EXPECTED_REVISION: ${{ steps.source.outputs.sha }}
+          IMAGE_DIGEST: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_REVISION" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$RUN_ID" =~ ^[0-9]+$ && "$RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          IMAGE_REF="ghcr.io/sunnywang666/chatgpt2api@$IMAGE_DIGEST"
+          NAME="provider-smoke-$RUN_ID-$RUN_ATTEMPT"
+          CID=''
+          # Called by the EXIT trap.
+          # shellcheck disable=SC2329
+          cleanup() {
+            local status=$?
+            trap - EXIT
+            if [[ -n "$CID" ]]; then
+              if ! docker rm -f "$CID" >/dev/null; then
+                echo 'Failed to remove this smoke container' >&2
+                status=1
+              fi
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          docker pull --platform linux/amd64 "$IMAGE_REF"
+          IMAGE_JSON="$(docker image inspect "$IMAGE_REF")"
+          export IMAGE_JSON IMAGE_REF EXPECTED_REVISION
+          python3 - <<'PY'
+          import json, os
+          image = json.loads(os.environ['IMAGE_JSON'])[0]
+          if image.get('Architecture') != 'amd64' or image.get('Os') != 'linux':
+              raise SystemExit('image platform mismatch')
+          if image.get('Config', {}).get('Labels', {}).get('org.opencontainers.image.revision') != os.environ['EXPECTED_REVISION']:
+              raise SystemExit('image revision label mismatch')
+          PY
+          CID="$(docker create --name "$NAME" --platform linux/amd64 --network none \
+            --entrypoint /app/.venv/bin/uvicorn "$IMAGE_REF" \
+            main:app --host 0.0.0.0 --port 80 --access-log)"
+          CONTAINER_JSON="$(docker inspect "$CID")"
+          export CONTAINER_JSON
+          python3 - <<'PY'
+          import json, os
+          image = json.loads(os.environ['IMAGE_JSON'])[0]
+          container = json.loads(os.environ['CONTAINER_JSON'])[0]
+          if container.get('Config', {}).get('Image') != os.environ['IMAGE_REF']:
+              raise SystemExit('container image reference mismatch')
+          if container.get('Image') != image.get('Id'):
+              raise SystemExit('container image ID mismatch')
+          if container.get('HostConfig', {}).get('NetworkMode') != 'none':
+              raise SystemExit('container network mode mismatch')
+          if container.get('Mounts') != []:
+              raise SystemExit('unexpected business/data mount')
+          PY
+          docker start "$CID" >/dev/null
+          for ((attempt=0; attempt<30; attempt++)); do
+            if HEALTH=$(docker exec -i "$CID" /app/.venv/bin/python - <<'PY'
+          import json, urllib.request
+          r = urllib.request.urlopen('http://127.0.0.1/health?format=json', timeout=3)
+          body = r.read().decode()
+          if r.status != 200 or not body:
+              raise SystemExit('health HTTP/status/body check failed')
+          data = json.loads(body)
+          storage = data['storage']['health']
+          backend = data['storage']['backend']
+          if storage.get('status') != 'healthy':
+              raise SystemExit('storage health is not healthy')
+          if storage.get('backend') != 'json' or backend.get('type') != 'json':
+              raise SystemExit('unexpected storage backend')
+          print(json.dumps({'http_status': r.status, 'storage_health': storage['status'],
+                            'storage_backend': backend['type'], 'pool_status': data['status'],
+                            'pool_healthy': data['healthy']}, sort_keys=True))
+          PY
+            ); then
+              printf '%s\n' "$HEALTH"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "$CID" >&2 || true
+          exit 1
