@@ -1288,6 +1288,14 @@ class TextTaskService:
             if current.get("recovery_claim_id") != claim_id:
                 return self._public(current)
             if error_code:
+                # A transient recovery failure does not disprove a persisted,
+                # validated incomplete original observation. Keep only that
+                # narrow reason so the strict planner boundary can continue to
+                # protect the original while releasing its idle local slot.
+                if (recovery_reason is None
+                        and current.get("recovery_reason")
+                        == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value):
+                    recovery_reason = TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
                 attempt = max(1, int(current.get("recovery_attempt", 1)))
                 qualified_reads = int(current.get("recovery_no_result_reads") or 0)
                 coverage_version = (recovered or {}).get(
@@ -1443,14 +1451,21 @@ class TextTaskService:
             # lease; otherwise the stale execution flag prevents completion.
             # Keep a live or unverifiable lease and all original send evidence.
             old_claim_until = current.get("_claim_until")
-            if (updated.get("status") == "succeeded"
-                    and current.get("_submission_started") is True
-                    and current.get("_executing") is True
-                    and isinstance(current.get("_claim_id"), str)
-                    and current["_claim_id"]
-                    and type(old_claim_until) in (int, float)
-                    and math.isfinite(old_claim_until)
-                    and old_claim_until <= now):
+            expired_execution = (
+                current.get("_submission_started") is True
+                and current.get("_executing") is True
+                and isinstance(current.get("_claim_id"), str)
+                and bool(current["_claim_id"])
+                and type(old_claim_until) in (int, float)
+                and math.isfinite(old_claim_until)
+                and old_claim_until <= now
+            )
+            if ((updated.get("status") == "succeeded" or observed)
+                    and expired_execution):
+                # The current recovery claim completed a fresh, validated
+                # original-result observation after the sender's lease expired.
+                # Fence that stale local executor; retain UNKNOWN and every
+                # original identity/result-recovery anchor.
                 updated.update(_claim_id=None, _claim_until=None, _executing=False)
             self._end_execution_wait(updated, now, observed=observed)
             self._end_no_final_recovery(updated, now)
@@ -1676,7 +1691,14 @@ class TextTaskService:
                         "recovery_lease_until": now + self.RECOVERY_LEASE_SECONDS,
                         "recovery_error_code": None,
                         "recovery_phase": "read_text_request",
-                        "recovery_reason": None,
+                        # Retain only a proven incomplete-result reason while
+                        # this reader runs. A later transient read error has no
+                        # contrary evidence about that original observation.
+                        "recovery_reason": (
+                            previous.get("recovery_reason")
+                            if previous.get("recovery_reason")
+                            == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value else None
+                        ),
                         "updated_at": now,
                     }
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
