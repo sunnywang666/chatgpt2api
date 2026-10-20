@@ -50,6 +50,10 @@ class TextTaskCapacityError(RuntimeError):
     pass
 
 
+class TextRecoveryLeaseBusy(RuntimeError):
+    """The original-result read could not obtain its local write transaction."""
+
+
 def bind_waiting_public_sessions(store, db, receipts):
     """Resolve accepted successor cursors only from a successful original turn."""
     owned = {(owner, request_id): receipt for kind, owner, request_id, receipt in receipts if kind == "text"}
@@ -1593,7 +1597,7 @@ class TextTaskService:
         return result
 
     def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False,
-             _explicit_ended_recheck: bool = False):
+             _explicit_ended_recheck: bool = False, _explicit_recovery: bool = False):
         from services.pool_admission import unknown_text_result
         recovery_claim = None
         recovery_target = None
@@ -1618,7 +1622,13 @@ class TextTaskService:
                     return self.read_snapshot(owner, request_id)
                 return self._public(receipt)
         with self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, "sqlite_errorcode", None)
+                if _explicit_recovery and code is not None and (code & 0xff) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    raise TextRecoveryLeaseBusy() from exc
+                raise
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
             if row:
                 previous = json.loads(row[0])
@@ -1819,6 +1829,7 @@ class TextTaskService:
             owner, request_id,
             allow_unrecoverable_retry=bool(allow_unrecoverable_retry),
             _explicit_ended_recheck=explicit_ended_recheck,
+            _explicit_recovery=True,
         )
 
     def _authorize_unrecoverable(self, owner, request_id, observed):

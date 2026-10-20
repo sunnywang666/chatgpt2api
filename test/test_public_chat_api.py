@@ -4,6 +4,7 @@ import base64
 import asyncio
 import io
 import json
+import sqlite3
 import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -24,6 +25,56 @@ from services.text_task_service import (
     TextTaskCapacityError,
     TextTaskService,
 )
+
+
+def test_public_recovery_real_sqlite_contention_preserves_original(public_chat, monkeypatch):
+    from services.conversation_binding_service import ConversationBindingService
+    from test.test_unknown_turn_recovery import document
+
+    f = public_chat
+    owner = f.key_a["id"]
+    f.tasks.submit(owner, {"client_request_id": "locked-original", "client_conversation_id": "original-session", "model": "gpt-text",
+                           "messages": [{"role": "user", "content": "original input"}]})
+    f.tasks._update(owner, "locked-original", status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                    upstream_outcome="unknown", provider_binding_id="binding", provider_account_identity="account",
+                    conversation_id="original-chat", request_message_id="original-message",
+                    request_parent_message_id="parent", _submission_started=True, _executing=False,
+                    _claim_id=None, _turn_reserved=False)
+    with f.tasks.store.connect() as db:
+        before = f.tasks.store.read_receipt(db, "text", owner, "locked-original")
+
+    def read_original(row):
+        doc = document(row)
+        doc["mapping"][doc["current_node"]]["message"]["content"]["parts"] = ["original answer"]
+        return ConversationBindingService._read_text_request_result(Mock(), row, document=doc)
+    reader = Mock(side_effect=read_original)
+    f.tasks.recovery_reader = reader
+    connect = f.tasks.store._connect
+    def short_busy_timeout():
+        db = connect()
+        db.execute("PRAGMA busy_timeout=10")
+        return db
+    monkeypatch.setattr(f.tasks.store, "_connect", short_busy_timeout)
+    path = "/api/chat-requests/locked-original/recover"
+    with sqlite3.connect(f.tasks.store.path) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        response = f.client.post(path, headers=f.headers(), json={})
+        assert response.status_code == 503
+        assert response.headers["cache-control"] == "private, no-store"
+        assert response.json()["detail"] == {"code": "TEXT_RECOVERY_LEASE_BUSY", "retryable": True,
+                                             "lease_acquired": False, "upstream_read_started": False}
+        with f.tasks.store.connect() as db:
+            assert f.tasks.store.read_receipt(db, "text", owner, "locked-original") == before
+        reader.assert_not_called()
+        f.upstream.assert_not_called()
+    response = f.client.post(path, headers=f.headers(), json={})
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json()["status"] == "succeeded"
+    assert response.json()["content"] == "original answer"
+    assert reader.call_count == 1
+    assert reader.call_args.args[0]["request_message_id"] == "original-message"
+    f.upstream.assert_not_called()
 
 
 @pytest.mark.parametrize("reason,stop_reason,work", [
