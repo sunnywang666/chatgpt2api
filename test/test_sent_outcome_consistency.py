@@ -148,7 +148,7 @@ def test_sent_unknown_history_with_stale_not_sent_releases_only_account_capacity
 
 @pytest.mark.parametrize("case, changes", [
     ("missing_stall_evidence", {"_result_no_progress_reads": 2}),
-    ("active_recovery_lease", {"recovery_claim_id": "active", "recovery_lease_until": 999999}),
+    ("incomplete_recovery_lease", {"recovery_claim_id": "active", "recovery_lease_until": 999999}),
     ("truly_unsent", {"_submission_started": False}),
     ("missing_unknown_error", {"error_code": "RESULT_UNRECOVERABLE"}),
     ("not_sent_failure", {"status": "failed"}),
@@ -156,11 +156,23 @@ def test_sent_unknown_history_with_stale_not_sent_releases_only_account_capacity
 ])
 def test_stale_not_sent_compatibility_keeps_all_other_stalled_guards(tmp_path, case, changes):
     service, admission, backend, _ = historical_stalled_not_sent(tmp_path)
-    if case == "active_recovery_lease":
+    if case == "incomplete_recovery_lease":
         changes = {**changes, "recovery_lease_until": admission.clock.now + 1}
     update_receipt(service, **changes)
     saved = receipt(service)
 
     assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved, admission.clock.now)
     assert saved["upstream_outcome"] == changes.get("upstream_outcome", "not_sent")
+    assert backend.mock_calls == []
+
+
+def test_stale_not_sent_qualified_original_read_lease_keeps_capacity_released(tmp_path):
+    service, admission, backend, _ = historical_stalled_not_sent(tmp_path)
+    now = admission.clock.now
+    update_receipt(service, recovery_claim_id="read-claim", recovery_claimed_at=now,
+                   recovery_lease_until=now + 10, recovery_phase="read_text_request")
+    saved = receipt(service)
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved, now)
+    assert saved["upstream_outcome"] == "not_sent" and saved["status"] == "unknown"
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
     assert backend.mock_calls == []

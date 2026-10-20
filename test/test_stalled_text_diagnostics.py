@@ -495,6 +495,104 @@ def test_stalled_original_allows_an_independent_claim_to_send_while_capacity_sta
     assert candidate["status"] == "running" and candidate["_submission_started"] is True
 
 
+@pytest.mark.parametrize("progress", [False, True])
+def test_stalled_original_read_lease_releases_capacity_but_keeps_conversation_protected(tmp_path, progress):
+    service, admission, backend, original = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+    admission.clock.now = saved(service)["recovery_next_at"] + 1
+    entered, release = Event(), Event()
+
+    def read(row):
+        entered.set()
+        assert release.wait(5)
+        mutate = (lambda _doc, message: message["content"].update(parts=["new text"])) if progress else None
+        return incomplete_reader(backend, mutate)(row)
+
+    service.recovery_reader = read
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(service.read, "owner", "old-0")
+        try:
+            assert entered.wait(5)
+            row = saved(service)
+            assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(row, admission.clock.now)
+            assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+            assert row["status"] == "unknown"
+            for key in ("request_id", "request_message_id", "conversation_id", "provider_account_identity"):
+                assert row[key] == original[0][key]
+            waiter(service, "same-next", "client-0")
+            assert admission.claim_next() is None
+            waiter(service, "independent-next", "independent")
+            context = admission.claim_next()
+            assert context and context.request_id == "independent-next"
+            context.before_send()
+        finally:
+            release.set()
+        assert pending.result(5)["status"] == "unknown"
+    row = saved(service)
+    assert row["recovery_claim_id"] is None and row["recovery_lease_until"] is None
+    assert (row.get("_result_wait_ended_at") is None) is progress
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(row, admission.clock.now) is (not progress)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == (2 if progress else 1)
+    assert backend.mock_calls == []
+
+
+@pytest.mark.parametrize("changes", [
+    {"recovery_claim_id": " "},
+    {"recovery_claimed_at": None},
+    {"recovery_claimed_at": float("nan")},
+    {"recovery_claimed_at": 1},
+    {"recovery_claimed_at": 9999999999},
+    {"recovery_lease_until": float("inf")},
+    {"recovery_lease_until": 1},
+    {"recovery_phase": "other"},
+    {"_recovery_claim_id": "legacy"},
+    {"_executing": True},
+])
+def test_stalled_read_lease_requires_complete_current_idle_evidence(tmp_path, changes):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+    now = admission.clock.now
+    patch(service, recovery_claim_id="read-claim", recovery_claimed_at=now,
+          recovery_lease_until=now + 10, recovery_phase="read_text_request")
+    patch(service, **changes)
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved(service), now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+
+
+@pytest.mark.parametrize("marker", ["submitted", "reserved", "malformed"])
+def test_stalled_successor_read_lease_cannot_use_original_read_exception(tmp_path, marker):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+    now = admission.clock.now
+    original_id = saved(service)["request_message_id"]
+    successor = {"version": 1, "attempt": 1, "state": marker,
+                 "request_message_id": "new-attempt", "original_request_message_id": original_id,
+                 "submission_parent_message_id": "parent", "prior": {}}
+    if marker == "malformed":
+        successor = {"state": "submitted"}
+    patch(service, recovery_claim_id="read-claim", recovery_claimed_at=now,
+          recovery_lease_until=now + 10, recovery_phase="read_text_request",
+          _missing_successor_resume=successor)
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved(service), now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+
+
+def test_stalled_read_claim_cannot_predate_last_observation(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+    wait_ended = saved(service)["_result_wait_ended_at"]
+    admission.clock.now += 10
+    patch(service, _result_last_checked_at=admission.clock.now,
+          recovery_claim_id="read-claim", recovery_claimed_at=wait_ended + 1,
+          recovery_lease_until=admission.clock.now + 10, recovery_phase="read_text_request")
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved(service), admission.clock.now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+
+
 @pytest.mark.parametrize("conflict", [None, "completed", "rejected", "not_submitted", "", False])
 def test_stalled_legacy_compatibility_does_not_override_explicit_outcomes(tmp_path, conflict):
     service, admission, backend, _ = migration(tmp_path)
