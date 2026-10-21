@@ -27,7 +27,7 @@ def compact_json(value):
 
 
 def derive_retained_input(original, request_id, previous_id, parameters, *, no_final=False):
-    """Only the two closed transforms exist; their original-result proofs differ."""
+    """Only closed transforms exist; their original-result proofs differ."""
     from services.required_attributes_derivation import KIND as ATTRIBUTES_KIND, derive_required_attributes_input
     from services.combined_copy_derivation import KIND as COMBINED_KIND, derive_combined_copy_input
     if parameters == {"kind": ATTRIBUTES_KIND} and no_final is True:

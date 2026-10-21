@@ -6,6 +6,7 @@ identical evidence sets; preparation rows and their indexes are never merged.
 """
 from copy import deepcopy
 import json
+import math
 
 from services.category_directory_derivation import TEXT_BUDGET, compact_json
 from services.conversation_binding_service import ConversationBindingError
@@ -28,8 +29,16 @@ def _object(pairs):
     return result
 
 
+def _finite_number(value):
+    number = float(value)
+    if not math.isfinite(number):
+        reject()
+    return number
+
+
 def _json(value):
-    return json.loads(value, object_pairs_hook=_object, parse_constant=lambda _: reject())
+    return json.loads(value, object_pairs_hook=_object, parse_float=_finite_number,
+                      parse_constant=lambda _: reject())
 
 
 # This is the exact legacy supplemental prompt produced before compact
@@ -50,34 +59,69 @@ LEGACY_BOUNDARY = '\nFrozen attribute preparations: '
 # restores the inline evidence fields through their compact set reference.
 COMPACT_SUFFIX = (LEGACY_SUFFIX + '\n'
     'Each frozen attribute preparation below references evidence_set_index. Resolve that exact evidence set and treat its source_attributes, source_images, source_title and source_description as the corresponding inline branch fields before applying every instruction above. Evidence-set sharing is lossless storage only: it does not merge preparations, variants, branches, schemas, or category_attributes output rows.')
+LEGACY_MARKER = "Each preparation_index identifies one frozen store/variant/category schema below."
+NEW_COMPACT_MARKER = "Each preparation_index points to one branch_set_index."
+FROZEN_MARKER = "Frozen attribute preparations: "
+COMPACT_EVIDENCE_MARKER = "Frozen evidence sets: "
 
 
-def _content(original):
+def _content_or_none(original):
     messages = original.get("messages")
     if (not isinstance(messages, list) or len(messages) != 1 or not isinstance(messages[0], dict)
             or set(messages[0]) != {"role", "content"} or messages[0].get("role") != "user"):
-        reject()
+        return None
     content = messages[0].get("content")
     if (not isinstance(content, list) or not content or not isinstance(content[0], dict)
             or set(content[0]) != {"type", "text"} or content[0].get("type") != "text"
             or not isinstance(content[0].get("text"), str)):
-        reject()
+        return None
     for part in content[1:]:
         if not isinstance(part, dict):
-            reject()
+            return None
         if part.get("type") == "text":
             if set(part) != {"type", "text"} or not isinstance(part.get("text"), str):
-                reject()
+                return None
         elif part.get("type") == "image_url":
             image = part.get("image_url")
             if set(part) != {"type", "image_url"} or not isinstance(image, dict) or set(image) != {"url"} or not isinstance(image.get("url"), str):
-                reject()
+                return None
         else:
-            reject()
+            return None
     return content
 
 
-def _branches(instruction):
+def is_legacy_combined_copy_input(original):
+    """Cheap, never-throw eligibility recognizer for the first-send wrapper.
+
+    It intentionally does no JSON parsing, duplicate-key validation, transform,
+    or size calculation.  A legacy-looking malformed value returns ``True`` so
+    the wrapper enters its guarded strict transform and fails before sending.
+    Ordinary and newer compact contracts return ``False`` unchanged.
+    """
+    try:
+        if original.get("model") != MODEL or original.get("thinking_effort") != EFFORT:
+            return False
+        content = _content_or_none(original)
+        if content is None:
+            return False
+        text = content[0]["text"]
+        if (FROZEN_MARKER not in text or NEW_COMPACT_MARKER in text
+                or COMPACT_EVIDENCE_MARKER in text):
+            return False
+        if text.lstrip().startswith("{"):
+            # The current JSON payload serializes its frozen object inside the
+            # string field, so these quotes are escaped in the outer text.
+            # Keep it out of the strict legacy path without parsing any JSON.
+            if '\\"preparations\\"' in text and '\\"branch_sets\\"' in text and '\\"evidence_sets\\"' in text:
+                return False
+            return '"category_attribute_instructions"' in text and (
+                LEGACY_MARKER in text or LEGACY_BOUNDARY in text)
+        return LEGACY_MARKER in text
+    except Exception:
+        return False
+
+
+def _branches(instruction, *, allow_empty_main=False):
     if instruction.count(LEGACY_BOUNDARY) != 1:
         reject()
     prefix, encoded = instruction.split(LEGACY_BOUNDARY, 1)
@@ -85,7 +129,7 @@ def _branches(instruction):
         reject()
     # Preserve the existing copy task exactly; only remove the known suffix.
     main = prefix[:-len(LEGACY_SUFFIX)]
-    if not main:
+    if not main and not allow_empty_main:
         reject()
     try:
         rows = _json(encoded)
@@ -120,25 +164,73 @@ def _branches(instruction):
     return main, compact, evidence_sets
 
 
-def compact_retained_messages(original):
-    """Return compacted messages and safe proof data without changing request identity.
+def _compact_instruction(instruction, *, allow_empty_main=False):
+    main, preparations, evidence_sets = _branches(instruction, allow_empty_main=allow_empty_main)
+    return (main + COMPACT_SUFFIX + "\nFrozen evidence sets: " + compact_json(evidence_sets)
+            + "\nFrozen attribute preparations: " + compact_json(preparations)), preparations, evidence_sets
 
-    This is deliberately usable by a separate, first-send execution wrapper:
-    it neither creates a successor nor changes the retained input's hash.
+
+def _json_envelope_instruction(text):
+    """Return a compactable JSON-envelope instruction, or None for pass-through.
+
+    An object-form frozen payload is the newer contract and deliberately stays
+    untouched.  A malformed field that claims the legacy boundary is rejected
+    rather than falling through to an upstream send.
     """
-    if original.get("model") != MODEL or original.get("thinking_effort") != EFFORT:
-        reject()
-    content = _content(original)
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        return None
     try:
-        main, preparations, evidence_sets = _branches(content[0]["text"])
-        prompt = (main + COMPACT_SUFFIX + "\nFrozen evidence sets: " + compact_json(evidence_sets)
-                  + "\nFrozen attribute preparations: " + compact_json(preparations))
-        messages = deepcopy(original["messages"])
-        messages[0]["content"][0]["text"] = prompt
-        text_parts = [part for part in messages[0]["content"] if part["type"] == "text"]
-        text_bytes = len(compact_json({"messages": [{"role": "user", "content": text_parts}]}).encode("utf-8"))
-    except (TypeError, ValueError, KeyError, UnicodeError):
+        envelope = _json(text)
+    except (TypeError, ValueError, UnicodeError):
+        if "category_attribute_instructions" in text or LEGACY_BOUNDARY in text:
+            reject()
+        return None
+    if not isinstance(envelope, dict) or "category_attribute_instructions" not in envelope:
+        return None
+    instruction = envelope["category_attribute_instructions"]
+    if not isinstance(instruction, str):
         reject()
+    if LEGACY_BOUNDARY not in instruction:
+        return None
+    try:
+        frozen = _json(instruction.split(LEGACY_BOUNDARY, 1)[1])
+    except (TypeError, ValueError, UnicodeError):
+        reject()
+    if isinstance(frozen, dict):
+        return None
+    if not isinstance(frozen, list):
+        reject()
+    compact, preparations, evidence_sets = _compact_instruction(instruction, allow_empty_main=True)
+    updated = deepcopy(envelope)
+    updated["category_attribute_instructions"] = compact
+    return compact_json(updated), preparations, evidence_sets
+
+
+def recognize_compact_retained_messages(original):
+    """Return ``(messages, audit)`` only for an exact legacy combined-copy input.
+
+    ``None`` means an ordinary or newer JSON request must pass through
+    unchanged.  A request that claims the legacy field/boundary but is malformed
+    raises ``ConversationBindingError`` so a caller cannot accidentally send it.
+    """
+    if not is_legacy_combined_copy_input(original):
+        return None
+    content = _content_or_none(original)
+    if content is None:  # defensive: recognizer remains non-throwing
+        return None
+    instruction = content[0]["text"]
+    envelope = _json_envelope_instruction(instruction)
+    if envelope is None:
+        if LEGACY_BOUNDARY not in instruction:
+            return None
+        compact, preparations, evidence_sets = _compact_instruction(instruction)
+    else:
+        compact, preparations, evidence_sets = envelope
+    messages = deepcopy(original["messages"])
+    messages[0]["content"][0]["text"] = compact
+    text_parts = [part for part in messages[0]["content"] if part["type"] == "text"]
+    text_bytes = len(compact_json({"messages": [{"role": "user", "content": text_parts}]}).encode("utf-8"))
     if text_bytes > TEXT_BUDGET:
         reject("CHAT_DERIVED_INPUT_TOO_LARGE")
     return messages, {"kind": KIND, "original_model": MODEL, "original_thinking_effort": EFFORT,
@@ -146,6 +238,23 @@ def compact_retained_messages(original):
                       "evidence_set_count": len(evidence_sets),
                       "image_count": sum(part["type"] == "image_url" for part in content),
                       "text_utf8_bytes": text_bytes}
+
+
+def compact_retained_messages(original):
+    """Return compacted messages and safe proof data without changing request identity.
+
+    This is deliberately usable by a separate, first-send execution wrapper:
+    it neither creates a successor nor changes the retained input's hash.
+    """
+    try:
+        result = recognize_compact_retained_messages(original)
+    except ConversationBindingError:
+        raise
+    except (TypeError, ValueError, UnicodeError):
+        reject()
+    if result is None:
+        reject()
+    return result
 
 
 def derive_combined_copy_input(original, request_id, previous_id, parameters):

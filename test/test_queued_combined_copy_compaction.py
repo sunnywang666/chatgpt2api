@@ -57,6 +57,22 @@ def queued_copy_body(request_id="queued-copy", *, rows=None):
     }
 
 
+def queued_json_copy_body(request_id="queued-json-copy", *, rows=None, frozen=None):
+    rows = rows or branches()
+    frozen = compact_json(rows) if frozen is None else compact_json(frozen)
+    envelope = {
+        "copy_contract": "fixture-original-contract",
+        "category_attribute_instructions": LEGACY_SUFFIX + LEGACY_BOUNDARY + frozen,
+    }
+    return {
+        "client_request_id": request_id,
+        "client_conversation_id": "batch-837-json-copy",
+        "model": MODEL,
+        "thinking_effort": EFFORT,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": compact_json(envelope)}]}],
+    }
+
+
 class QueuedCombinedCopyCompactionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -135,23 +151,37 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
         self.assertIsNone(restarted.claim_next())
         self.assertEqual(len(self.sent), 1)
 
+    def test_first_send_compacts_the_observed_json_envelope_without_rewriting_it(self):
+        body = queued_json_copy_body(rows=branches(50))
+        self.submit(body)
+        before = self.store.load_input(self.receipt("queued-json-copy")["_input_ref"])
+        before_hash = self.stored_hash("queued-json-copy")
+
+        self.admission.execute(self.claim())
+
+        sent = self.sent[0]
+        self.assertNotEqual(sent["messages"], before["messages"])
+        envelope = json.loads(sent["messages"][0]["content"][0]["text"])
+        compact = envelope["category_attribute_instructions"]
+        evidence = json.loads(compact.split("\nFrozen evidence sets: ", 1)[1].split("\nFrozen attribute preparations: ", 1)[0])
+        preparations = json.loads(compact.rsplit("\nFrozen attribute preparations: ", 1)[1])
+        self.assertEqual(envelope["copy_contract"], "fixture-original-contract")
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual([row["preparation_index"] for row in preparations], list(range(50)))
+        after = self.receipt("queued-json-copy")
+        self.assertEqual(self.store.load_input(after["_input_ref"]), before)
+        self.assertEqual(self.stored_hash("queued-json-copy"), before_hash)
+        self.assertTrue(any(item.get("stage") == "retained_input_compacted" for item in after["_execution_timeline"]))
+
     def test_nonlegacy_or_noncopy_requests_keep_their_original_execution_body(self):
         cases = (
             ("ordinary", {"model": "fixture-text", "thinking_effort": "standard"}),
             ("wrong-source", {"model": MODEL, "thinking_effort": EFFORT}),
-            ("already-compact", {"model": MODEL, "thinking_effort": EFFORT}),
         )
         for request_id, updates in cases:
             with self.subTest(request_id=request_id):
                 body = queued_copy_body(request_id)
                 body.update(updates)
-                if request_id == "already-compact":
-                    original = body["messages"][0]["content"][0]["text"]
-                    body["messages"][0]["content"][0]["text"] = original.replace(
-                        "Each preparation_index identifies one frozen store/variant/category schema below.",
-                        "Each preparation_index points to one branch_set_index.",
-                        1,
-                    )
                 source = "key:admin" if request_id == "wrong-source" else "internal:listing"
                 self.text.submit("admin", body, source=source)
                 self.admission.execute(self.claim())
@@ -159,6 +189,19 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
                 self.assertEqual(sent["messages"], body["messages"])
                 self.assertFalse(any(item.get("stage") == "retained_input_compacted"
                                      for item in self.receipt(request_id)["_execution_timeline"]))
+
+    def test_new_json_compact_envelope_passes_through_unchanged(self):
+        body = queued_json_copy_body("new-json", frozen={
+            "preparations": [{"preparation_index": 0, "branch_set_index": 0}],
+            "branch_sets": [{"branch_set_index": 0}],
+            "evidence_sets": [{"evidence_set_index": 0}],
+        })
+        self.submit(body)
+        self.admission.execute(self.claim())
+
+        self.assertEqual(self.sent[0]["messages"], body["messages"])
+        self.assertFalse(any(item.get("stage") == "retained_input_compacted"
+                             for item in self.receipt("new-json")["_execution_timeline"]))
 
     def test_existing_send_marker_and_lost_claim_do_not_receive_compaction(self):
         self.submit()
@@ -199,6 +242,34 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["upstream_outcome"], "not_sent")
         self.assertFalse(failed["_submission_started"])
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(self.admission.claim_next())
+
+    def test_overflowing_json_number_stops_before_send_without_requeue(self):
+        body = queued_json_copy_body()
+        text = body["messages"][0]["content"][0]["text"]
+        body["messages"][0]["content"][0]["text"] = '{"opaque_number":1e999,' + text[1:]
+        self.submit(body)
+        self.admission.execute(self.claim())
+
+        failed = self.receipt("queued-json-copy")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["upstream_outcome"], "not_sent")
+        self.assertEqual(failed["error_code"], "CHAT_DERIVED_INPUT_UNSUPPORTED")
+        self.assertEqual(self.sent, [])
+        self.assertIsNone(self.admission.claim_next())
+
+    def test_invalid_unicode_envelope_stops_before_send_without_requeue(self):
+        body = queued_json_copy_body()
+        text = body["messages"][0]["content"][0]["text"]
+        body["messages"][0]["content"][0]["text"] = '{"opaque_text":"\\ud800",' + text[1:]
+        self.submit(body)
+        self.admission.execute(self.claim())
+
+        failed = self.receipt("queued-json-copy")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["upstream_outcome"], "not_sent")
+        self.assertEqual(failed["error_code"], "CHAT_DERIVED_INPUT_UNSUPPORTED")
         self.assertEqual(self.sent, [])
         self.assertIsNone(self.admission.claim_next())
 

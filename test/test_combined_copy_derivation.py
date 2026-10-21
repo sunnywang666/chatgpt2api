@@ -7,7 +7,9 @@ from pydantic import ValidationError
 
 from services.category_directory_derivation import compact_json
 from services.combined_copy_derivation import (KIND, LEGACY_BOUNDARY, LEGACY_SUFFIX, MODEL, EFFORT,
-                                                compact_retained_messages, derive_combined_copy_input)
+                                                compact_retained_messages, derive_combined_copy_input,
+                                                is_legacy_combined_copy_input,
+                                                recognize_compact_retained_messages)
 from services.conversation_binding_service import ConversationBindingError
 from services.request_context import current_request
 from services.text_task_service import TextTaskService
@@ -25,8 +27,13 @@ def branch(index, *, category="Ring", variant="one", evidence=None):
             "schema": [{"attribute_id": index + 1, "name": "Color", "required": True}], **evidence}
 
 
-def legacy_prompt(rows):
-    return "Keep the original copy text and response contract exactly." + LEGACY_SUFFIX + LEGACY_BOUNDARY + compact_json(rows)
+def legacy_prompt(rows, *, json_envelope=True):
+    instruction = LEGACY_SUFFIX + LEGACY_BOUNDARY + compact_json(rows)
+    if not json_envelope:
+        return "Keep the original copy text and response contract exactly." + instruction
+    return compact_json({"task": "copy", "source_facts": {"title": "Synthetic fixture", "count": 2},
+                         "keep_nested": {"enabled": True, "labels": ["a", "b"]},
+                         "category_attribute_instructions": instruction})
 
 
 def install(h, rows=None):
@@ -51,6 +58,8 @@ def install(h, rows=None):
 
 def compacted(body):
     text = body["messages"][0]["content"][0]["text"]
+    if text.lstrip().startswith("{"):
+        text = json.loads(text)["category_attribute_instructions"]
     evidence = json.loads(text.split("\nFrozen evidence sets: ", 1)[1].split("\nFrozen attribute preparations: ", 1)[0])
     preparations = json.loads(text.rsplit("\nFrozen attribute preparations: ", 1)[1])
     return evidence, preparations
@@ -83,6 +92,56 @@ def test_pure_message_compactor_has_no_identity_or_input_side_effect(task):
     assert all(key not in messages[0] for key in ("client_request_id", "supersedes_request_id", "derived_input"))
 
 
+def test_json_envelope_compacts_only_the_known_instruction_field(task):
+    h = install(task); before = deepcopy(h.body)
+    messages, proof = compact_retained_messages(h.body)
+    original, changed = json.loads(before["messages"][0]["content"][0]["text"]), json.loads(messages[0]["content"][0]["text"])
+    assert {key: value for key, value in changed.items() if key != "category_attribute_instructions"} == {
+        key: value for key, value in original.items() if key != "category_attribute_instructions"}
+    assert changed["category_attribute_instructions"].startswith(LEGACY_SUFFIX)
+    assert proof["preparation_count"] == 2 and before == h.body
+
+
+def test_plain_legacy_form_remains_supported(task):
+    h = install(task)
+    body = deepcopy(h.body)
+    body["messages"][0]["content"][0]["text"] = legacy_prompt([branch(0)], json_envelope=False)
+    messages, proof = compact_retained_messages(body)
+    assert messages[0]["content"][0]["text"].startswith("Keep the original copy text")
+    assert proof["preparation_count"] == 1
+
+
+def test_new_json_contract_passes_through_recognizer_without_compaction(task):
+    h = install(task); body = deepcopy(h.body)
+    payload = json.loads(body["messages"][0]["content"][0]["text"])
+    payload["category_attribute_instructions"] = LEGACY_SUFFIX + LEGACY_BOUNDARY + compact_json({
+        "preparations": [], "branch_sets": [], "evidence_sets": []})
+    body["messages"][0]["content"][0]["text"] = compact_json(payload)
+    assert is_legacy_combined_copy_input(body) is False
+    assert recognize_compact_retained_messages(body) is None
+    with pytest.raises(ConversationBindingError): compact_retained_messages(body)
+
+
+def test_our_compact_output_passes_through_lightweight_recognizer(task):
+    h = install(task)
+    messages, _ = compact_retained_messages(h.body)
+    body = {**h.body, "messages": messages}
+    assert is_legacy_combined_copy_input(body) is False
+    assert recognize_compact_retained_messages(body) is None
+
+
+def test_lightweight_recognizer_never_parses_ordinary_json_but_marks_malformed_legacy(task):
+    h = install(task); body = deepcopy(h.body)
+    body["messages"][0]["content"][0]["text"] = '{"ordinary":1,"ordinary":2}'
+    assert is_legacy_combined_copy_input(body) is False
+    malformed = deepcopy(h.body)
+    text = malformed["messages"][0]["content"][0]["text"]
+    malformed["messages"][0]["content"][0]["text"] = ('{"category_attribute_instructions":"x",'
+        '"category_attribute_instructions":"' + text.replace('"', '\\"') + '"}')
+    assert is_legacy_combined_copy_input(malformed) is True
+    with pytest.raises(ConversationBindingError): compact_retained_messages(malformed)
+
+
 def test_different_evidence_never_merges_or_reindexes_preparations(task):
     second = branch(1, evidence={"source_attributes": [{"source_attribute_index": 0, "name": "color", "values": ["blue"]}],
                                  "source_images": [{"image_ref": "source-b", "url": "asset://b"}],
@@ -102,6 +161,8 @@ def test_compact_prompt_retains_legacy_omission_and_evidence_rules_verbatim(task
     h = install(task)
     messages, _ = compact_retained_messages(h.body)
     text = messages[0]["content"][0]["text"]
+    if text.lstrip().startswith("{"):
+        text = json.loads(text)["category_attribute_instructions"]
     assert LEGACY_SUFFIX in text
     assert "Omit nonmatching alternative branches." in text
     assert "translate a nonnumeric dictionary label only to an offered valid option" in text
@@ -111,16 +172,29 @@ def test_compact_prompt_retains_legacy_omission_and_evidence_rules_verbatim(task
     assert "evidence_set_index" in text and "lossless storage only" in text
 
 
-@pytest.mark.parametrize("change", ["model", "effort", "suffix", "extra_row_key", "bad_index", "bad_content", "duplicate_json"])
+@pytest.mark.parametrize("change", ["model", "effort", "suffix", "extra_row_key", "bad_index", "bad_content", "duplicate_json", "duplicate_envelope_key"])
 def test_unrecognized_or_malformed_legacy_input_rejects_closed(task, change):
     h = install(task); body = deepcopy(h.body); text = body["messages"][0]["content"][0]["text"]
     if change == "model": body["model"] = "gpt-5-6-instant"
     elif change == "effort": body["thinking_effort"] = "standard"
     elif change == "suffix": body["messages"][0]["content"][0]["text"] = text.replace("Fill only", "Also summarize and Fill only", 1)
-    elif change == "extra_row_key": body["messages"][0]["content"][0]["text"] = text[:-1] + ',"new_instruction":true}]'
-    elif change == "bad_index": body["messages"][0]["content"][0]["text"] = text.replace('"preparation_index":1', '"preparation_index":4')
+    elif change == "extra_row_key":
+        payload = json.loads(text); ci = payload["category_attribute_instructions"]
+        payload["category_attribute_instructions"] = ci[:-1] + ',"new_instruction":true}]'
+        body["messages"][0]["content"][0]["text"] = compact_json(payload)
+    elif change == "bad_index":
+        payload = json.loads(text)
+        payload["category_attribute_instructions"] = payload["category_attribute_instructions"].replace(
+            '"preparation_index":1', '"preparation_index":4')
+        body["messages"][0]["content"][0]["text"] = compact_json(payload)
     elif change == "bad_content": body["messages"][0]["content"].append({"type": "audio", "audio": "x"})
-    else: body["messages"][0]["content"][0]["text"] = text.replace('"preparation_index":0', '"preparation_index":0,"preparation_index":0', 1)
+    elif change == "duplicate_json":
+        payload = json.loads(text); ci = payload["category_attribute_instructions"]
+        payload["category_attribute_instructions"] = ci.replace('"preparation_index":0', '"preparation_index":0,"preparation_index":0', 1)
+        body["messages"][0]["content"][0]["text"] = compact_json(payload)
+    else:
+        body["messages"][0]["content"][0]["text"] = ('{"category_attribute_instructions":"x",'
+            '"category_attribute_instructions":"' + text.replace('"', '\\"') + '"}')
     with pytest.raises(ConversationBindingError):
         derive_combined_copy_input(body, "successor", "old", {"kind": KIND})
 

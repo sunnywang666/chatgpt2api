@@ -45,29 +45,13 @@ _COMBINED_COPY_RESULT_FIELDS = frozenset({
 
 
 def _recognizes_legacy_combined_copy(body):
-    """Recognize the old supplemental marker without attempting a transform.
+    """Use the derivation module's exact legacy recognizer.
 
-    The strict helper validates a recognised legacy prompt.  This shallow
-    check deliberately leaves unrelated copy work on its existing path, even
-    when it happens to use the same source and model.
+    This is a non-throwing, non-transforming scope check.  The strict helper
+    remains inside the controlled pre-send path below.
     """
-    if body.get("model") != _COMBINED_COPY_MODEL or body.get("thinking_effort") != _COMBINED_COPY_EFFORT:
-        return False
-    messages = body.get("messages")
-    if not isinstance(messages, list) or len(messages) != 1 or not isinstance(messages[0], dict):
-        return False
-    content = messages[0].get("content")
-    if not isinstance(content, list) or not content or not isinstance(content[0], dict):
-        return False
-    prompt = content[0].get("text")
-    if not isinstance(prompt, str):
-        return False
-    # The compacted syntax has its own contract and must never be compacted a
-    # second time.  A legacy marker with malformed rows still reaches the
-    # strict helper and fails before the model send.
-    return ("Each preparation_index identifies one frozen store/variant/category schema below." in prompt
-            and "\nFrozen evidence sets: " not in prompt
-            and "\nFrozen attribute preparations: " in prompt)
+    from services.combined_copy_derivation import is_legacy_combined_copy_input
+    return is_legacy_combined_copy_input(body)
 
 
 def _legacy_combined_copy_scope(context, receipt, body):
