@@ -5,7 +5,7 @@ import multiprocessing
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -275,6 +275,37 @@ def test_missing_node_retry_rejects_other_unfinished_same_conversation(task):
     with pytest.raises(ConversationBindingError) as error:
         task.service.submit("owner", envelope, source="internal:content")
     assert error.value.code == "CHAT_SUPERSEDE_INVALID"
+
+
+def test_missing_node_snapshot_reuses_one_receipt_index_and_preserves_image_guard(task):
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    task.service.submit("owner", envelope, source="internal:content")
+    original_validate = TextTaskService._missing_node_model_rejection_retry
+    # `_snapshot` consults C once for both order-head and A4 linkage
+    # projections.  Its supplied transaction index must prevent the helper
+    # from independently decoding all historical receipts again.
+    with patch.object(TextTaskService, "_missing_node_model_rejection_retry", wraps=original_validate) as validated:
+        context = task.admission.claim_next()
+    assert context and context.request_id == "missing-model-retry"
+    assert validated.call_count == 1
+    index = validated.call_args.kwargs["unfinished_by_conversation"]
+    assert ("text", "old") in next(iter(index.values()))
+    assert ("image", "queued-image") in next(iter(index.values()))
+
+    # The indexed path must retain the old full-scan rejection: an unrelated
+    # unfinished image in the exact physical conversation still blocks C.
+    with task.admission.store.transaction() as db:
+        successor = task.admission.store.read_receipt(db, "text", "owner", "missing-model-retry")
+        image = task.admission.store.read_receipt(db, "image", "owner", "queued-image")
+        other = {**image, "id": "other-pending-image", "_sequence": image["_sequence"] + 10}
+        task.admission.store.write_receipt(db, "image", "owner", "other-pending-image", other)
+        receipts = list(task.admission.store.receipts(db))
+        indexed = task.admission._missing_node_unfinished_by_conversation(receipts)
+        assert not TextTaskService._missing_node_model_rejection_retry(
+            task.admission.store, db, "owner", successor, 1000, unfinished_by_conversation=indexed)
+        # The send-edge fallback remains the full current read and must agree.
+        assert not TextTaskService._missing_node_model_rejection_retry(
+            task.admission.store, db, "owner", successor, 1000)
 
 
 def test_missing_node_retry_revalidates_root_before_send_and_same_id_is_idempotent(task):

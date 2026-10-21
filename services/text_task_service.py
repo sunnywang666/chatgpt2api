@@ -2166,8 +2166,14 @@ class TextTaskService:
         return len(children) == 1 and children[0][0] == parent_id
 
     @classmethod
-    def _queued_image_for_missing_node_retry(cls, store, db, owner, original, successor, now):
-        """Return the one unchanged queued image explicitly bound to C, if safe."""
+    def _queued_image_for_missing_node_retry(
+            cls, store, db, owner, original, successor, now, *, unfinished_by_conversation=None):
+        """Return the one unchanged queued image explicitly bound to C, if safe.
+
+        Queue projections may supply their existing transaction snapshot as an
+        index.  The send edge deliberately omits it and reads current receipts
+        again before an external write.
+        """
         image_id = successor.get(cls.MISSING_NODE_RETRY_FIELD)
         if not isinstance(image_id, str) or not image_id or len(image_id) > 200:
             return None
@@ -2212,19 +2218,29 @@ class TextTaskService:
                 or image.get("request_hash") != _request_hash(image["mode"], payload)
                 or any(payload.get(key) != image.get(key) for key in exact[1:])):
             return None
-        from services.pool_admission import unfinished
-        for kind, other_owner, other_id, other in store.receipts(db):
-            if (other_owner != owner
-                    or (kind == "text" and other_id in {original.get("request_id"), successor.get("request_id")})
-                    or (kind == "image" and other_id == image_id)):
-                continue
-            same_conversation = all(other.get(key) == original.get(key) for key in exact[1:])
-            if same_conversation and unfinished(kind, other):
+        excluded = {
+            ("text", original.get("request_id")),
+            ("text", successor.get("request_id")),
+            ("image", image_id),
+        }
+        conversation = (owner, *(original[key] for key in exact[1:]))
+        if unfinished_by_conversation is not None:
+            if any(candidate not in excluded
+                   for candidate in unfinished_by_conversation.get(conversation, ())):
                 return None
+        else:
+            from services.pool_admission import unfinished
+            for kind, other_owner, other_id, other in store.receipts(db):
+                if (other_owner != owner
+                        or (kind, other_id) in excluded):
+                    continue
+                same_conversation = all(other.get(key) == original.get(key) for key in exact[1:])
+                if same_conversation and unfinished(kind, other):
+                    return None
         return image
 
     @classmethod
-    def _missing_node_model_rejection_retry(cls, store, db, owner, receipt, now):
+    def _missing_node_model_rejection_retry(cls, store, db, owner, receipt, now, *, unfinished_by_conversation=None):
         """Validate C as the sole queued retry of typed rejected P after missing R."""
         parent_id = receipt.get("_supersedes_request_id")
         request_id = receipt.get("request_id")
@@ -2249,7 +2265,9 @@ class TextTaskService:
             return False
         original_id = parent.get("_supersedes_request_id")
         original = store.read_receipt(db, "text", owner, original_id) if isinstance(original_id, str) else None
-        if not original or cls._queued_image_for_missing_node_retry(store, db, owner, original, receipt, now) is None:
+        if not original or cls._queued_image_for_missing_node_retry(
+                store, db, owner, original, receipt, now,
+                unfinished_by_conversation=unfinished_by_conversation) is None:
             return False
         row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
         expected = cls._rejected_successor_body(

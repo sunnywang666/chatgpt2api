@@ -103,14 +103,17 @@ class TaskStore:
         self._schema_lock = threading.Lock()
         self._ready = False
 
-    def _connect(self):
+    def _connect(self, *, busy_timeout_secs=30.0):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Create with private permissions, including before SQLite first opens it.
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         os.fchmod(fd, 0o600)
         os.close(fd)
-        db = sqlite3.connect(self.path, timeout=30)
-        db.execute("PRAGMA busy_timeout=30000")
+        if (not isinstance(busy_timeout_secs, (int, float)) or isinstance(busy_timeout_secs, bool)
+                or busy_timeout_secs <= 0):
+            raise ValueError("busy timeout must be a positive number")
+        db = sqlite3.connect(self.path, timeout=float(busy_timeout_secs))
+        db.execute(f"PRAGMA busy_timeout={max(1, int(float(busy_timeout_secs) * 1000))}")
         return db
 
     def initialize(self):
@@ -129,9 +132,9 @@ class TaskStore:
             self._ready = True
 
     @contextmanager
-    def connect(self):
+    def connect(self, *, busy_timeout_secs=30.0):
         self.initialize()
-        db = self._connect()
+        db = self._connect(busy_timeout_secs=busy_timeout_secs)
         try:
             with db:
                 yield db
@@ -139,8 +142,8 @@ class TaskStore:
             db.close()
 
     @contextmanager
-    def transaction(self):
-        with self.connect() as db:
+    def transaction(self, *, busy_timeout_secs=30.0):
+        with self.connect(busy_timeout_secs=busy_timeout_secs) as db:
             db.execute("BEGIN IMMEDIATE")
             yield db
 
