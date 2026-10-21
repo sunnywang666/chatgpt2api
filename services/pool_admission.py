@@ -35,6 +35,8 @@ def reset_unsent_image_attempt(kind, receipt):
 _COMBINED_COPY_SOURCE = "internal:listing"
 _COMBINED_COPY_MODEL = "gpt-5-6-thinking"
 _COMBINED_COPY_EFFORT = "high"
+_FIRSTSEND_TRIAL_MODEL = "gpt-5-6-instant"
+_FIRSTSEND_TRIAL_EFFORT = "none"
 _COMBINED_COPY_SENT_STAGES = frozenset({
     "send_guard_passed", "send_call_started", "response_headers_received",
     "first_output", "artifact_saved", "task_finished",
@@ -111,7 +113,15 @@ def _legacy_combined_copy_scope(context, receipt, body):
     """The one original request family eligible for retained-copy handling."""
     return bool(
         context.kind == "text"
-        and receipt.get("_source") == _COMBINED_COPY_SOURCE
+        and _legacy_combined_copy_receipt_family(receipt)
+        and _recognizes_legacy_combined_copy(body)
+    )
+
+
+def _legacy_combined_copy_receipt_family(receipt):
+    """Receipt-only subset safe for pre-input claim fencing."""
+    return bool(
+        receipt.get("_source") == _COMBINED_COPY_SOURCE
         and receipt.get("_route", "chat") == "chat"
         and receipt.get("_operation", "text") == "text"
         and not receipt.get("_forward_protocol")
@@ -124,7 +134,6 @@ def _legacy_combined_copy_scope(context, receipt, body):
         and not receipt.get("_codex_rejected_retry_of")
         and not receipt.get("_derived_input")
         and receipt.get("model") == _COMBINED_COPY_MODEL
-        and _recognizes_legacy_combined_copy(body)
     )
 
 
@@ -157,6 +166,65 @@ def _queued_combined_copy_candidate(context, receipt, body):
         and isinstance(timeline, list)
         and not _combined_copy_send_evidence(receipt)
     )
+
+
+def firstsend_model_trial_scope(context, receipt, body):
+    """The one product original family eligible for an in-memory model trial.
+
+    This is deliberately narrower than compaction: it is an exact normal
+    product Chat original, still before every durable send boundary.  The
+    frozen input, receipt model and request identity remain authoritative.
+    """
+    return bool(
+        _legacy_combined_copy_scope(context, receipt, body)
+        and isinstance(body.get("product_work"), dict)
+        and bool(body["product_work"].get("product_ref"))
+        and bool(body["product_work"].get("step_ref"))
+        and body.get("model") == _COMBINED_COPY_MODEL
+        and body.get("thinking_effort") == _COMBINED_COPY_EFFORT
+    )
+
+
+def _firstsend_model_trial_marker(context, receipt, body, settings, now):
+    marker = receipt.get("_temporary_firstsend_model_trial")
+    trial = settings.get("temporary_firstsend_model_trial")
+    if (not isinstance(marker, dict) or not isinstance(trial, dict)
+            or type(marker.get("expires_at")) is not int
+            or settings.get("revision", 0) != marker.get("revision")
+            or any(trial.get(key) != marker.get(key)
+                   for key in ("account_identity", "request_id", "expires_at"))
+            or receipt.get("provider_account_identity") != marker.get("account_identity")
+            or context.request_id != marker.get("request_id")
+            or now >= marker.get("expires_at", 0)
+            or not _queued_combined_copy_candidate(context, receipt, body)
+            or not firstsend_model_trial_scope(context, receipt, body)):
+        return None
+    return marker
+
+
+def _firstsend_model_execution_body(context, receipt, body, store, settings, clock, *, scope_body=None):
+    """Return an ephemeral instant/none body only for one armed original.
+
+    Nothing durable is rewritten here.  The marker is rechecked again at the
+    model-send edge, where a fresh bound-account catalog probe is required.
+    """
+    scope_body = body if scope_body is None else scope_body
+    marker = _firstsend_model_trial_marker(context, receipt, scope_body, settings, float(clock()))
+    if marker is None:
+        return body
+    with store.transaction() as db:
+        current = store.read_receipt(db, context.kind, context.owner, context.request_id)
+        if not current or current.get("_claim_id") != context.claim or current.get("status") != "running":
+            raise AdmissionLost("original task claim changed before first-send model selection")
+        if _firstsend_model_trial_marker(context, current, scope_body, settings, float(clock())) is None:
+            return body
+    context._firstsend_model_trial = {
+        "original_model": _COMBINED_COPY_MODEL,
+        "original_thinking_effort": _COMBINED_COPY_EFFORT,
+        "effective_model": _FIRSTSEND_TRIAL_MODEL,
+        "effective_thinking_effort": _FIRSTSEND_TRIAL_EFFORT,
+    }
+    return {**body, "model": _FIRSTSEND_TRIAL_MODEL, "thinking_effort": _FIRSTSEND_TRIAL_EFFORT}
 
 
 def _compact_queued_combined_copy(context, receipt, body, store, clock):
@@ -983,6 +1051,33 @@ class PoolAdmission:
             return {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
         from services.model_service import model_catalog_service
         return model_catalog_service.route_for_model(model)
+
+    def _fresh_bound_firstsend_model_capability(self, receipt, trial):
+        """Require a just-read directory row for this bound physical account.
+
+        The ordinary account refresh and model-directory transport remain in
+        use.  This does not persist a token, catalog payload or a new routing
+        state; it only proves the one effective model immediately before send.
+        """
+        binding_id = receipt.get("provider_binding_id")
+        identity = receipt.get("provider_account_identity")
+        if (not isinstance(binding_id, str) or not binding_id
+                or not isinstance(identity, str) or not identity
+                or trial.get("effective_model") != _FIRSTSEND_TRIAL_MODEL):
+            raise AdmissionLost("first-send model trial binding is invalid")
+        try:
+            access_token = self.accounts.get_bound_text_access_token(
+                binding_id, model="auto", for_message=True,
+                requested_account_identity=identity,
+            )
+            from services.model_service import model_catalog_service
+            observed = model_catalog_service.observe_bound_model_at_send(
+                access_token, identity, _FIRSTSEND_TRIAL_MODEL,
+            )
+        except Exception:
+            raise AdmissionLost("first-send model capability discovery unavailable before send") from None
+        if not observed:
+            raise AdmissionLost("first-send model is unavailable before send")
 
     @staticmethod
     def _model_account_matches(account, route) -> bool:
@@ -1955,6 +2050,19 @@ class PoolAdmission:
             if r.get("status") != "queued" or not r.get("_input_ref"):
                 return None
             if ref.kind == "text":
+                # A stale queue status never reopens a model POST after its
+                # durable send fence. Preserve the original as UNKNOWN for
+                # result recovery; an armed first-send control cannot make it
+                # an effective-model retry.
+                if (_legacy_combined_copy_receipt_family(r)
+                        and (r.get("_submission_started") is True
+                        or r.get("_last_sent_sequence") is not None)):
+                    r.update(status="unknown", upstream_outcome="unknown",
+                             error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                             _claim_id=None, _claim_until=None,
+                             _executing=False, _turn_reserved=False)
+                    self.store.write_receipt(db, ref.kind, ref.owner, ref.request_id, r)
+                    return None
                 from services.text_task_service import TextTaskService
                 missing_attempt = TextTaskService._missing_successor_attempt(r)
                 if ("_missing_successor_resume" in r and missing_attempt is None) or (
@@ -1981,10 +2089,21 @@ class PoolAdmission:
             if snapshot.scoped_extra_turn and ref == snapshot.scoped_extra_turn[0]:
                 trial_marker = {**settings["temporary_chat_second_slot"],
                                 "revision": settings.get("revision", 0)}
+            firstsend_trial_marker = None
+            firstsend_trial = settings.get("temporary_firstsend_model_trial")
+            if (ref.kind == "text" and isinstance(firstsend_trial, dict)
+                    and type(firstsend_trial.get("expires_at")) is int and now < firstsend_trial["expires_at"]
+                    and firstsend_trial.get("request_id") == ref.request_id
+                    and firstsend_trial.get("account_identity") == pick.account
+                    and r.get("provider_account_identity") in (None, "", pick.account)
+                    and r.get("_submission_started") in (None, False)
+                    and not _combined_copy_send_evidence(r)):
+                firstsend_trial_marker = {**firstsend_trial, "revision": settings.get("revision", 0)}
             r.update(status="running", _claim_id=claim, _claim_until=now + self.CLAIM_SECONDS,
                      _turn_reserved=True, _submission_started=False, _executing=True,
                      _account_resource=account_clock_key(rows[pick.account]),
                      _temporary_chat_second_slot=trial_marker,
+                     _temporary_firstsend_model_trial=firstsend_trial_marker,
                      _execution_timeline=timeline[-32:],
                      provider_binding_id=binding, provider_account_identity=pick.account)
             if r.get("_route") == "codex" and self.codex is not None and r.get("_forward_protocol") == "codex":
@@ -2141,11 +2260,22 @@ class PoolAdmission:
         with self.store.transaction() as db:
             workflow_scheduling.expire_unsent(self.store, db, list(self.store.receipts(
                 db, statuses=("queued", "not_started", "running"))), float(self.clock()))
+        firstsend_trial = getattr(context, "_firstsend_model_trial", None)
+        execution_model = observed.get("model", "")
+        if firstsend_trial is not None:
+            if (not isinstance(firstsend_trial, dict)
+                    or firstsend_trial.get("original_model") != _COMBINED_COPY_MODEL
+                    or firstsend_trial.get("original_thinking_effort") != _COMBINED_COPY_EFFORT
+                    or firstsend_trial.get("effective_model") != _FIRSTSEND_TRIAL_MODEL
+                    or firstsend_trial.get("effective_thinking_effort") != _FIRSTSEND_TRIAL_EFFORT):
+                raise AdmissionLost("first-send model trial is invalid")
+            self._fresh_bound_firstsend_model_capability(observed, firstsend_trial)
+            execution_model = _FIRSTSEND_TRIAL_MODEL
         selected_route = None
         if (observed.get("_requested_account_identity") and context.kind == "text"
                 and observed.get("_operation", "text") != "image" and observed.get("_route", "chat") == "chat"):
             try:
-                selected_route = self._types(observed.get("model", ""))
+                selected_route = self._types(execution_model)
             except Exception:
                 raise AdmissionLost("selected Chat model discovery unavailable before send") from None
         with self._settings_guard(), self.store.transaction() as db, self._account_guard():
@@ -2179,6 +2309,22 @@ class PoolAdmission:
                         or context.request_id != marker.get("request_id")
                         or now >= marker.get("expires_at", 0)):
                     raise AdmissionLost("temporary second Chat turn was stopped or expired before send")
+            firstsend_marker = r.get("_temporary_firstsend_model_trial")
+            if firstsend_trial is not None:
+                settings = self._settings()
+                trial = settings.get("temporary_firstsend_model_trial")
+                if (not isinstance(firstsend_marker, dict) or not isinstance(trial, dict)
+                        or type(firstsend_marker.get("expires_at")) is not int
+                        or settings.get("revision", 0) != firstsend_marker.get("revision")
+                        or any(trial.get(key) != firstsend_marker.get(key)
+                               for key in ("account_identity", "request_id", "expires_at"))
+                        or r.get("provider_account_identity") != firstsend_marker.get("account_identity")
+                        or context.request_id != firstsend_marker.get("request_id")
+                        or now >= firstsend_marker.get("expires_at", 0)
+                        or r.get("model") != _COMBINED_COPY_MODEL
+                        or r.get("_submission_started") is not False
+                        or _combined_copy_send_evidence(r)):
+                    raise AdmissionLost("temporary first-send model trial was stopped or expired before send")
             if context.kind == "image" and r.get("_image_thread"):
                 # Only these exact same-owner originals participate in the
                 # predecessor check. Keep full source bytes for its fingerprint,
@@ -2309,7 +2455,7 @@ class PoolAdmission:
                         raise AdmissionLost("original image capacity decreased before send")
                     send_observation = {"image_capacity_at_send": capacity,
                                         "image_occupied_at_send_including_current": occupied}
-                if any(isinstance(limit, dict) and limit.get("feature_name") == r.get("model") and limit.get("remaining") == 0
+                if any(isinstance(limit, dict) and limit.get("feature_name") == execution_model and limit.get("remaining") == 0
                        for limit in selected.get("limits_progress") or []):
                     raise AdmissionLost("original model quota is unavailable before send")
             if (context.kind == "text" and r.get("_operation", "text") != "image"
@@ -2374,6 +2520,24 @@ class PoolAdmission:
                 # describes this attempt once its durable send boundary opens.
                 r["upstream_outcome"] = "unknown"
             timeline = list(r.get("_execution_timeline") or [])
+            if firstsend_trial is not None:
+                # Timeline is bounded. Preserve the exact send-edge decision on
+                # the existing per-request marker as well, so later result
+                # reads never infer an effective model from an active control.
+                r["_temporary_firstsend_model_trial"] = {
+                    **firstsend_marker,
+                    "original_model": _COMBINED_COPY_MODEL,
+                    "original_thinking_effort": _COMBINED_COPY_EFFORT,
+                    "effective_model": _FIRSTSEND_TRIAL_MODEL,
+                    "effective_thinking_effort": _FIRSTSEND_TRIAL_EFFORT,
+                    "sent_sequence": sequence,
+                    "sent_at": now,
+                }
+                timeline.append({"stage": "first_send_model_trial_selected", "at": now,
+                                 "original_model": _COMBINED_COPY_MODEL,
+                                 "original_thinking_effort": _COMBINED_COPY_EFFORT,
+                                 "effective_model": _FIRSTSEND_TRIAL_MODEL,
+                                 "effective_thinking_effort": _FIRSTSEND_TRIAL_EFFORT})
             timeline.append({"stage": "send_guard_passed", "at": now, **send_observation})
             r.update(_submission_started=True, _last_sent_sequence=sequence, _turn_reserved=True,
                      _claim_until=now + self.CLAIM_SECONDS, _execution_timeline=timeline[-32:])
@@ -2437,6 +2601,7 @@ class PoolAdmission:
                                            _turn_reserved=True, _claim_until=0)
                             self.store.write_receipt(db, context.kind, context.owner, context.request_id, current)
                     return
+                frozen_body = body
                 try:
                     body = _compact_queued_combined_copy(context, r, body, self.store, self.clock)
                 except Exception as exc:
@@ -2456,6 +2621,15 @@ class PoolAdmission:
                             record_unsent_failure(context, current, float(self.clock()), type(exc).__name__)
                             self.store.write_receipt(db, context.kind, context.owner, context.request_id, current)
                     return
+                # A single, explicitly armed original may select the proven
+                # instant execution model.  This happens only after the
+                # immutable frozen-input/hash check and remains an in-memory
+                # body copy; before_send revalidates the marker and probes the
+                # same bound account immediately before the model POST.
+                body = _firstsend_model_execution_body(
+                    context, r, body, self.store, self._settings(), self.clock,
+                    scope_body=frozen_body,
+                )
             missing_node_retry_parent = None
             if context.kind == "image":
                 # Resolve C's output parent for the in-memory A4 execution

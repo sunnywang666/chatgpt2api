@@ -458,6 +458,57 @@ class ModelCatalogService:
                 return
             self._refresh(accounts, signature)
 
+    def observe_bound_model_at_send(self, access_token: str, account_identity: str, model: str) -> bool:
+        """Refresh one bound account's directory at a guarded model-send edge.
+
+        This reuses the normal catalog transport, but avoids treating an old
+        pool-wide cache as proof that the exact physical account can execute a
+        one-shot first-send trial.  The successful full directory also updates
+        the existing route cache so the subsequent bound-token call checks the
+        same evidence rather than a stale peer observation.
+        """
+        identity = str(account_identity or "").strip()
+        requested = str(model or "").strip()
+        accounts = self._active_accounts()
+        account = accounts.get(identity)
+        if (not identity or not requested or account is None or account[0] != access_token
+                or account[2] != "active"):
+            return False
+        try:
+            models, read_at, observed_at = self._fetch_models(access_token)
+        except Exception:
+            return False
+        now = self._clock()
+        if read_at + self._cache_ttl_seconds <= now or requested not in models:
+            return False
+        # Recheck the physical binding after the read; a refresh/login change
+        # must never lend its capability evidence to the former account.
+        current = self._active_accounts()
+        if current.get(identity) != account:
+            return False
+        account_type = account[1]
+        observation = {
+            "models": models,
+            "account_type": account_type,
+            "state": "unknown",
+            "reason": self._observation_reason("observed"),
+            "observation_state": "observed",
+            "observed_at": observed_at,
+            "last_attempt_at": observed_at,
+            "refresh_after": read_at + self._cache_ttl_seconds,
+            "credential_fingerprint": account[3],
+            "observed_account_state": "active",
+            "last_seen_account_state": "active",
+        }
+        with self._lock:
+            self._model_observations = {**self._model_observations, identity: observation}
+            self._models_by_account = {**self._models_by_account, identity: models}
+            self._account_types = {**self._account_types, identity: account_type}
+            self._account_signature = self._signature(current)
+            expires = read_at + self._cache_ttl_seconds
+            self._expires_at = expires if self._expires_at <= now else min(self._expires_at, expires)
+        return True
+
     def list_models(self) -> dict[str, Any]:
         self._ensure_catalog()
         with self._lock:

@@ -214,6 +214,17 @@ class PoolResourceTests(unittest.TestCase):
         self.assertNotIn("temporary_chat_second_slot", ConfigStore(self.path).resource_settings())
         self.assertEqual(self.config.update_resource_settings(2, 4, 4, 2)["chat_account_concurrency"], 2)
 
+    def test_one_exact_firstsend_model_trial_persists_and_can_be_revoked(self):
+        trial = {"account_identity": "account_fixture", "request_id": "original-request", "expires_at": 1100}
+        result = self.config.update_temporary_firstsend_model_trial(0, trial)
+        self.assertEqual(result["revision"], 1)
+        self.assertEqual(ConfigStore(self.path).resource_settings()["temporary_firstsend_model_trial"], trial)
+        # Existing capacity settings remain untouched by the model-trial arm.
+        self.assertEqual(result["chat_account_concurrency"], 1)
+        stopped = self.config.update_temporary_firstsend_model_trial(1, None)
+        self.assertEqual(stopped["revision"], 2)
+        self.assertNotIn("temporary_firstsend_model_trial", stopped)
+
     def test_codex_unobserved_capacity_is_unknown_not_zero(self):
         record = account(source_type="codex")
         record["codex_observation"] = observation(state="unknown")

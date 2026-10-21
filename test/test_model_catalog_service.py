@@ -239,6 +239,20 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(self.calls.count("pro"), 1)
         self.assertEqual(self.calls.count(""), 1)
 
+    def test_exact_bound_send_observation_refreshes_only_that_route(self) -> None:
+        self.catalog.list_models()
+        identity = self.accounts._stable_account_identity(
+            next(account for account in self.accounts.list_accounts() if account.get("access_token") == "plus"))
+        self.outcomes["plus"] = model_list("gpt-5-6-instant")
+
+        self.assertTrue(self.catalog.observe_bound_model_at_send("plus", identity, "gpt-5-6-instant"))
+
+        route = self.catalog.route_for_model("gpt-5-6-instant")
+        self.assertEqual(route.account_types, frozenset({"Plus"}))
+        self.assertEqual(route.account_identities, frozenset({identity}))
+        self.assertEqual(self.calls.count("plus"), 2)
+        self.assertEqual(self.calls.count("pro"), 1)
+
     def test_cold_discovery_starts_pool_accounts_in_parallel_with_a_bounded_worker_count(self) -> None:
         started = Event()
         release = Event()

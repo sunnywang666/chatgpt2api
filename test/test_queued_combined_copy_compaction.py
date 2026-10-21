@@ -11,7 +11,7 @@ from services.account_service import AccountService
 from services.category_directory_derivation import compact_json
 from services.combined_copy_derivation import LEGACY_BOUNDARY, LEGACY_SUFFIX, MODEL, EFFORT
 from services.pool_admission import PoolAdmission
-from services.request_context import current_request
+from services.request_context import AdmissionLost, current_request
 from services.storage.json_storage import JSONStorageBackend
 from services.task_store import TaskStore
 from services.text_task_service import TextTaskService
@@ -296,6 +296,181 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
         self.assertEqual(self.sent[0]["messages"], body["messages"])
         self.assertFalse(any(item.get("stage") == "retained_input_compacted"
                              for item in self.receipt()["_execution_timeline"]))
+
+    def test_exact_unsent_product_original_uses_in_memory_instant_trial_after_fresh_capability_check(self):
+        body = queued_copy_body()
+        body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}
+        self.submit(body)
+        before = self.store.load_input(self.receipt()["_input_ref"])
+        self.admission.settings = lambda: {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {
+                "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1100,
+            },
+        }
+
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability") as fresh:
+            self.admission.execute(self.claim())
+
+        fresh.assert_called_once()
+        self.assertEqual(self.sent[0]["model"], "gpt-5-6-instant")
+        self.assertEqual(self.sent[0]["thinking_effort"], "none")
+        after = self.receipt()
+        self.assertEqual(after["model"], MODEL)
+        self.assertEqual(self.store.load_input(after["_input_ref"]), before)
+        self.assertEqual(after["_temporary_firstsend_model_trial"], {
+            "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1100,
+            "revision": 7, "original_model": MODEL, "original_thinking_effort": EFFORT,
+            "effective_model": "gpt-5-6-instant", "effective_thinking_effort": "none",
+            "sent_sequence": 0, "sent_at": 1000.0,
+        })
+        audit = [entry for entry in after["_execution_timeline"]
+                 if entry.get("stage") == "first_send_model_trial_selected"]
+        self.assertEqual(audit, [{"stage": "first_send_model_trial_selected", "at": 1000.0,
+                                  "original_model": MODEL, "original_thinking_effort": EFFORT,
+                                  "effective_model": "gpt-5-6-instant", "effective_thinking_effort": "none"}])
+
+    def test_missing_fresh_candidate_capability_requeues_without_changing_original(self):
+        body = queued_copy_body()
+        body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}
+        self.submit(body)
+        before = self.store.load_input(self.receipt()["_input_ref"])
+        self.admission.settings = lambda: {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {
+                "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1100,
+            },
+        }
+
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability",
+                          side_effect=AdmissionLost("first-send model is unavailable before send")):
+            self.admission.execute(self.claim())
+
+        after = self.receipt()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(after["status"], "queued")
+        self.assertEqual(after["model"], MODEL)
+        self.assertEqual(self.store.load_input(after["_input_ref"]), before)
+        self.assertFalse(any(entry.get("stage") == "first_send_model_trial_selected"
+                             for entry in after["_execution_timeline"]))
+
+    def test_revoked_or_expired_trial_leaves_the_unsent_original_on_its_normal_model_path(self):
+        body = queued_copy_body()
+        body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}
+        self.submit(body)
+        active = {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {
+                "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1100,
+            },
+        }
+        self.admission.settings = lambda: active
+        context = self.claim()
+        # The control is cleared after claim but before execution.  No model
+        # substitution survives its exact-ID/revision check.
+        self.admission.settings = lambda: {"revision": 8, "image_account_concurrency": 4,
+                                           "codex_max_concurrency": 4}
+        self.admission.execute(context)
+
+        self.assertEqual(self.sent[0]["model"], MODEL)
+        self.assertEqual(self.sent[0]["thinking_effort"], EFFORT)
+        self.assertFalse(any(entry.get("stage") == "first_send_model_trial_selected"
+                             for entry in self.receipt()["_execution_timeline"]))
+
+    def test_trial_revocation_after_capability_read_requeues_without_a_post(self):
+        body = queued_copy_body()
+        body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}
+        self.submit(body)
+        active = {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {
+                "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1100,
+            },
+        }
+        self.admission.settings = lambda: active
+        context = self.claim()
+
+        def revoke_after_read(*_):
+            active.clear()
+            active.update({"revision": 8, "image_account_concurrency": 4,
+                           "codex_max_concurrency": 4})
+
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability",
+                          side_effect=revoke_after_read):
+            self.admission.execute(context)
+
+        after = self.receipt()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(after["status"], "queued")
+        self.assertFalse(after["_submission_started"])
+        self.assertFalse(any(item.get("stage") == "first_send_model_trial_selected"
+                             for item in after["_execution_timeline"]))
+
+    def test_durable_trial_audit_survives_timeline_truncation(self):
+        body = queued_copy_body()
+        body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}
+        self.submit(body)
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "text", "admin", "queued-copy")
+            receipt["_execution_timeline"] = [{"stage": "prior", "at": float(i)} for i in range(32)]
+            self.store.write_receipt(db, "text", "admin", "queued-copy", receipt)
+        self.admission.settings = lambda: {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {
+                "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1100,
+            },
+        }
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability"):
+            self.admission.execute(self.claim())
+        with self.store.transaction() as db:
+            after = self.store.read_receipt(db, "text", "admin", "queued-copy")
+            after["_execution_timeline"] = [{"stage": "later", "at": float(i)} for i in range(40)][-32:]
+            self.store.write_receipt(db, "text", "admin", "queued-copy", after)
+        after = self.receipt()
+        self.assertNotIn("first_send_model_trial_selected", [item.get("stage") for item in after["_execution_timeline"]])
+        self.assertEqual(after["_temporary_firstsend_model_trial"]["effective_model"], "gpt-5-6-instant")
+        self.assertEqual(after["_temporary_firstsend_model_trial"]["sent_sequence"], 0)
+
+    def test_trial_configuration_cannot_claim_sent_unknown_or_succeeded_original(self):
+        for status, outcome in (("queued", "unknown"), ("running", "unknown"), ("unknown", "unknown"), ("succeeded", "completed")):
+            with self.subTest(status=status):
+                body = queued_copy_body()
+                body["client_request_id"] = "queued-copy-" + status
+                body["product_work"] = {"product_ref": "product-837", "step_ref": status}
+                self.submit(body)
+                with self.store.transaction() as db:
+                    receipt = self.store.read_receipt(db, "text", "admin", body["client_request_id"])
+                    receipt.update(status=status, upstream_outcome=outcome, _submission_started=True,
+                                   _last_sent_sequence=0, _executing=False, _claim_id=None, _claim_until=0)
+                    self.store.write_receipt(db, "text", "admin", body["client_request_id"], receipt)
+                self.admission.settings = lambda: {
+                    "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+                    "temporary_firstsend_model_trial": {
+                        "account_identity": "account-0", "request_id": body["client_request_id"], "expires_at": 1100,
+                    },
+                }
+                self.assertIsNone(self.admission.claim_next())
+                after = self.receipt(body["client_request_id"])
+                if status == "queued":
+                    self.assertEqual(after["status"], "unknown")
+                    self.assertEqual(after["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+                self.assertNotIn("effective_model", after.get("_temporary_firstsend_model_trial") or {})
+        self.assertEqual(self.sent, [])
+
+    def test_nonlegacy_queued_text_send_fence_keeps_existing_claim_behavior(self):
+        body = {"client_request_id": "nonlegacy-sent", "client_conversation_id": "other",
+                "model": "fixture-text", "messages": [{"role": "user", "content": "original"}]}
+        self.text.submit("admin", body, source="ordinary")
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "text", "admin", "nonlegacy-sent")
+            receipt.update(status="queued", _submission_started=True, _last_sent_sequence=0,
+                           upstream_outcome="unknown", _executing=False, _claim_id=None, _claim_until=0)
+            self.store.write_receipt(db, "text", "admin", "nonlegacy-sent", receipt)
+        context = self.admission.claim_next()
+        self.assertIsNotNone(context)
+        self.assertEqual(context.request_id, "nonlegacy-sent")
+        self.assertEqual(self.receipt("nonlegacy-sent")["status"], "running")
+        self.assertEqual(self.sent, [])
 
 
 if __name__ == "__main__":

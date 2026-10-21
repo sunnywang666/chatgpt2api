@@ -80,6 +80,7 @@ DEFAULT_PROXY_RUNTIME = {
 }
 
 _KEEP_CHAT_TRIAL = object()
+_KEEP_FIRSTSEND_MODEL_TRIAL = object()
 
 # A private config migration bit distinguishes formerly invalid stored M<5
 # from an administrator explicitly selecting the newly supported range.
@@ -121,6 +122,18 @@ def _read_inflight_value(raw: object) -> int:
 
 
 def _valid_temporary_chat_second_slot(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"account_identity", "request_id", "expires_at"}:
+        return False
+    for key in ("account_identity", "request_id"):
+        item = value[key]
+        if (not isinstance(item, str) or not item or len(item) > 300
+                or any(ord(char) < 32 for char in item)):
+            return False
+    return type(value["expires_at"]) is int and value["expires_at"] > 0
+
+
+def _valid_temporary_firstsend_model_trial(value: object) -> bool:
+    """Accept one exact original first-send trial, never a model selector."""
     if not isinstance(value, dict) or set(value) != {"account_identity", "request_id", "expires_at"}:
         return False
     for key in ("account_identity", "request_id"):
@@ -535,17 +548,20 @@ class ConfigStore:
         if not values:
             return {}
         allowed = {"revision", "image_account_concurrency", "codex_max_concurrency",
-                   "chat_account_concurrency", "temporary_chat_second_slot"}
+                   "chat_account_concurrency", "temporary_chat_second_slot",
+                   "temporary_firstsend_model_trial"}
         if (len(values) != 1 or not set(values[0]).issubset(allowed)
                 or not {"revision", "image_account_concurrency", "codex_max_concurrency"}.issubset(values[0])
                 or any(type(value) is not int for key, value in values[0].items()
-                       if key != "temporary_chat_second_slot")
+                       if key not in {"temporary_chat_second_slot", "temporary_firstsend_model_trial"})
                 or values[0]["revision"] < 1 or not 1 <= values[0]["image_account_concurrency"] <= 16
                 or not 1 <= values[0]["codex_max_concurrency"] <= 32
                 or ("chat_account_concurrency" in values[0]
                     and not 1 <= values[0]["chat_account_concurrency"] <= 16)
                 or ("temporary_chat_second_slot" in values[0]
-                    and not _valid_temporary_chat_second_slot(values[0]["temporary_chat_second_slot"]))):
+                    and not _valid_temporary_chat_second_slot(values[0]["temporary_chat_second_slot"]))
+                or ("temporary_firstsend_model_trial" in values[0]
+                    and not _valid_temporary_firstsend_model_trial(values[0]["temporary_firstsend_model_trial"]))):
             raise RuntimeError("resource settings are invalid")
         return values[0]
 
@@ -568,6 +584,8 @@ class ConfigStore:
                     "chat_account_concurrency": chat_limit}
             if "temporary_chat_second_slot" in snapshot:
                 result["temporary_chat_second_slot"] = dict(snapshot["temporary_chat_second_slot"])
+            if "temporary_firstsend_model_trial" in snapshot:
+                result["temporary_firstsend_model_trial"] = dict(snapshot["temporary_firstsend_model_trial"])
             return result
 
     @contextmanager
@@ -583,7 +601,8 @@ class ConfigStore:
 
     def update_resource_settings(self, expected_revision: int, image_account_concurrency: int,
                                  codex_max_concurrency: int, chat_account_concurrency: int | None = None,
-                                 *, trial_update: object = _KEEP_CHAT_TRIAL) -> dict:
+                                 *, trial_update: object = _KEEP_CHAT_TRIAL,
+                                 firstsend_trial_update: object = _KEEP_FIRSTSEND_MODEL_TRIAL) -> dict:
         from services.storage.json_storage import JSONStorageBackend
         from services.storage.base import AccountCommitUncertain
         if (type(image_account_concurrency) is not int or not 1 <= image_account_concurrency <= 16
@@ -591,7 +610,9 @@ class ConfigStore:
                 or (chat_account_concurrency is not None
                     and (type(chat_account_concurrency) is not int or not 1 <= chat_account_concurrency <= 16))
                 or (trial_update is not _KEEP_CHAT_TRIAL and trial_update is not None
-                    and not _valid_temporary_chat_second_slot(trial_update))):
+                    and not _valid_temporary_chat_second_slot(trial_update))
+                or (firstsend_trial_update is not _KEEP_FIRSTSEND_MODEL_TRIAL and firstsend_trial_update is not None
+                    and not _valid_temporary_firstsend_model_trial(firstsend_trial_update))):
             raise ValueError("resource_settings_invalid")
         self._resource_path.parent.mkdir(parents=True, exist_ok=True)
         with self._update_lock, self._resource_path.with_suffix(".lock").open("a+b") as lock:
@@ -603,6 +624,8 @@ class ConfigStore:
                 chat_limit = current["chat_account_concurrency"] if chat_account_concurrency is None else chat_account_concurrency
                 trial = (current.get("temporary_chat_second_slot")
                          if trial_update is _KEEP_CHAT_TRIAL else trial_update)
+                firstsend_trial = (current.get("temporary_firstsend_model_trial")
+                                   if firstsend_trial_update is _KEEP_FIRSTSEND_MODEL_TRIAL else firstsend_trial_update)
                 if trial is not None and chat_limit != 1:
                     raise ValueError("temporary_chat_second_slot_requires_global_one")
                 result = {"revision": expected_revision + 1,
@@ -611,6 +634,8 @@ class ConfigStore:
                           "chat_account_concurrency": chat_limit}
                 if trial is not None:
                     result["temporary_chat_second_slot"] = dict(trial)
+                if firstsend_trial is not None:
+                    result["temporary_firstsend_model_trial"] = dict(firstsend_trial)
                 if (len(result) == len(current)
                         and all(result[key] == current[key] for key in result if key != "revision")):
                     return current
@@ -633,6 +658,14 @@ class ConfigStore:
             expected_revision, current["image_account_concurrency"],
             current["codex_max_concurrency"], current["chat_account_concurrency"],
             trial_update=trial,
+        )
+
+    def update_temporary_firstsend_model_trial(self, expected_revision: int, trial: dict | None) -> dict:
+        current = self.resource_settings()
+        return self.update_resource_settings(
+            expected_revision, current["image_account_concurrency"],
+            current["codex_max_concurrency"], current["chat_account_concurrency"],
+            firstsend_trial_update=trial,
         )
 
     @property
