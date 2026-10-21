@@ -195,7 +195,7 @@ def test_window_rollover_retains_failed_candidates_and_matches(clock):
     assert backend.calls[-1][0] == 'later'
     assert row[SCAN]['failed_reads']['bad']['attempts'] == 1
     assert len(row[SCAN]['matches']) == 1
-    assert backend.pages == [0, 0, 20, 20, 40, 40, 60, 60, 80, 80, 100]
+    assert backend.pages == [0, 0, 20, 0, 20, 40, 20, 40, 60, 40, 60, 80, 60, 80, 100, 80]
 
 
 def test_all_failed_windows_stay_bounded_and_never_report_no_match(clock):
