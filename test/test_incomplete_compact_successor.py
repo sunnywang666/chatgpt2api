@@ -210,8 +210,14 @@ def test_incomplete_mode_is_closed_idempotent_and_never_resume_unsent(incomplete
 @pytest.mark.parametrize("change", [
     {"recovery_reason": "REQUEST_RESULT_NOT_FOUND"},
     {"_result_no_progress_reads": 2},
-    {"_claim_id": "expired", "_claim_until": 1.0},
+    {"_claim_id": "live", "_claim_until": 1001.0},
+    {"_claim_id": "nonfinite", "_claim_until": float("inf")},
+    {"_claim_id": "unpaired", "_claim_until": None},
+    {"_claim_id": None, "_claim_until": 999.0},
+    {"_claim_id": "expired", "_claim_until": 999.0, "_executing": True},
+    {"_claim_id": "expired", "_claim_until": 999.0, "_turn_reserved": True},
     {"recovery_claim_id": "reader", "recovery_lease_until": 1001.0},
+    {"_recovery_claim_id": "internal", "_recovery_claim_until": 999.0},
     {"_missing_successor_resume": {}},
     {"status": "succeeded", "content": "late answer"},
 ])
@@ -221,6 +227,16 @@ def test_only_qualified_incomplete_original_can_register(incomplete, change):
     with pytest.raises(ConversationBindingError):
         h.service.submit("owner", h.envelope)
     assert row(h.service, "successor") is None
+
+
+def test_expired_paired_sender_claim_can_continue_without_mutating_original(incomplete):
+    h = incomplete
+    update(h.service, _claim_id="historical-sender", _claim_until=999.0)
+    before = row(h.service)
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(before, h.clock.now)
+    accepted = h.service.submit("owner", h.envelope)
+    assert accepted["status"] == "queued" and accepted["continue_after_incomplete"] is True
+    assert row(h.service) == before
 
 
 def test_incomplete_source_accepts_explicit_nonterminal_false(incomplete):

@@ -3133,8 +3133,12 @@ class TextTaskService:
                 or any(previous.get(key) for key in ("_completion", "_completion_of",
                                                      "_recovery_paused", "_recovery_suppressed"))):
             return False
+        # The capacity predicate has already proved a historical sender claim
+        # is paired, finite, and expired.  Preserve that audit record instead
+        # of clearing it; recovery and internal claims remain active-work
+        # evidence and are never a continuation permission.
         return not any(previous.get(key) is not None for key in (
-            "_claim_id", "_claim_until", "recovery_claim_id", "recovery_claimed_at",
+            "recovery_claim_id", "recovery_claimed_at",
             "recovery_lease_until", "_recovery_claim_id", "_recovery_claim_until",
         ))
 
