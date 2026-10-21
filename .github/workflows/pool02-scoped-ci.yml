@@ -3,10 +3,8 @@ name: Provider POOL-02 isolated review
 on:
   push:
     branches:
-      - codex/provider-pool02-ci-20261021
-  pull_request:
-    branches:
       - main
+      - codex/**
     paths:
       - .github/workflows/pool02-scoped-ci.yml
       - services/conversation_binding_service.py
@@ -15,10 +13,12 @@ on:
       - services/text_task_service.py
       - services/openai_backend_api.py
       - services/model_service.py
+      - services/workflow_scheduling.py
       - utils/helper.py
       - test/test_text_stream_diagnostics.py
       - test/test_text_stream_handoff.py
       - test/test_model_catalog_service.py
+      - test/test_workflow_scheduling.py
       - test/test_background_original_reads.py
       - test/test_pool_admission.py
       - test/test_rejected_chat_successor.py
@@ -32,11 +32,15 @@ permissions:
 
 jobs:
   scoped-chat-admission:
-    if: ${{ github.repository == 'sunnywang666/chatgpt2api' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    runs-on: ubuntu-latest
+    # Only pushes created in this repository reach the persistent company runner.
+    # Review external contributions first, then bring approved code into a trusted
+    # main or codex/** branch with write access; fork PRs never execute here.
+    # GitHub contributor approval and runner-group policy remain independent controls.
+    if: ${{ github.repository == 'sunnywang666/chatgpt2api' }}
+    runs-on: ${{ fromJSON('["self-hosted","Linux","X64","hugsweet-linux-ci"]') }}
     timeout-minutes: 20
     env:
-      SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '57f9a40efe85ecacd3b031d7661a07e6d97f2418' }}
+      SOURCE_SHA: ${{ github.sha }}
       CHATGPT2API_AUTH_KEY: isolated-pool02-fixture
       PROVIDER_DATA_DIR: /tmp/provider-pool02-fixture
       TIKTOKEN_CACHE_DIR: /tmp/provider-pool02-tokenizer
@@ -73,6 +77,7 @@ jobs:
             test/test_text_stream_diagnostics.py \
             test/test_text_stream_handoff.py \
             test/test_model_catalog_service.py \
+            test/test_workflow_scheduling.py \
             test/test_image_task_service.py \
             test/test_reliable_pool_routes.py \
             test/test_non_text_recovery.py \
