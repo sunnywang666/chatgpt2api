@@ -47,7 +47,7 @@ if "/actions/runs/42/jobs" in url:
     if state["scenario"] == "partial-jobs":
         value["total_count"] = 2
 elif "/actions/runs/42" in url:
-    value = {"event": os.environ["FAKE_EVENT"], "head_sha": os.environ["WORKFLOW_SHA"],
+    value = {"event": os.environ["FAKE_EVENT"], "display_title": os.environ["FAKE_REST_DISPLAY_TITLE"], "head_sha": os.environ["WORKFLOW_SHA"],
       "run_attempt": 2 if state["phase"] == "attempt-changed" else 1,
       "status": "in_progress", "conclusion": None}
     if state["phase"] in {"cancelled", "race"}:
@@ -70,7 +70,7 @@ print(json.dumps(value))
 '''
 
 
-def run_observer(scenario: str, workflow_name: str, title: str, event: str = "push"):
+def run_observer(scenario: str, workflow_name: str, title: str, event: str = "push", rest_title: str | None = None):
     with TemporaryDirectory() as directory:
         root = Path(directory)
         fake_curl = root / "curl"
@@ -91,6 +91,7 @@ def run_observer(scenario: str, workflow_name: str, title: str, event: str = "pu
             "WORKFLOW_SHA": WORKFLOW_SHA,
             "SOURCE_BRANCH": "main",
             "DISPLAY_TITLE": title,
+            "FAKE_REST_DISPLAY_TITLE": rest_title or title,
             "FAKE_EVENT": event,
             "RUNNER_TEMP": str(root),
             "CURL_BIN": str(fake_curl),
@@ -136,6 +137,23 @@ def test_publisher_uses_run_name_source_ref_not_workflow_sha():
     dispatch = [call for call in calls if call["url"].endswith("/dispatches")][0]
     payload = json.loads(dispatch["payload"])
     assert payload == {"ref": "main", "inputs": {"source_ref": SOURCE_SHA, "github_hosted": True}}
+
+
+def test_publisher_uses_fresh_rest_title_when_requested_event_is_stale():
+    result, calls = run_observer(
+        "queued",
+        "Publish Docker Image",
+        "Publish Docker Image",
+        event="workflow_dispatch",
+        rest_title=f"Publish Docker Image {SOURCE_SHA} company",
+    )
+
+    assert result.returncode == 0, result.stderr
+    dispatch = [call for call in calls if call["url"].endswith("/dispatches")][0]
+    assert json.loads(dispatch["payload"]) == {
+        "ref": "main",
+        "inputs": {"source_ref": SOURCE_SHA, "github_hosted": True},
+    }
 
 
 def test_start_during_workflow_blob_reads_does_not_cancel():
