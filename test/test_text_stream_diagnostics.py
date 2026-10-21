@@ -150,7 +150,9 @@ def test_sse_terminal_observations_preserve_unknown_and_never_store_nodes_or_con
                "status": "finished_successfully", "end_turn": True, "channel": "final",
                "metadata": {"parent_id": request_node},
                "content": {"parts": ["PRIVATE_TEXT https://private.test/?token=PRIVATE_TOKEN"]}}
-    events = [{"v": {"message": message}}, {"message": message},
+    events = [{"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE_RESUME_TOKEN"},
+              {"type": "server_ste_metadata", "metadata": {"PRIVATE": "PRIVATE_METADATA"}},
+              {"v": {"message": message}}, {"message": message},
               {"message": {**message, "parent_id": "PRIVATE_DIFFERENT_PARENT"}},
               {"message": {**message, "id": ""}},
               {"message": {**message, "end_turn": "true"}},
@@ -180,9 +182,28 @@ def test_sse_terminal_observations_preserve_unknown_and_never_store_nodes_or_con
     assert evidence["sse_terminal_final_channel_events"] == 4
     assert evidence["sse_terminal_parent_events"] == 4
     assert evidence["sse_terminal_direct_parent_match_events"] == 2
+    assert evidence["resume_token_seen"] is True
+    assert evidence["resume_token_kind"] == "topic"
+    assert evidence["server_ste_metadata_seen"] is True
+    assert evidence["sse_event_type_counts"] == {"resume_conversation_token": 1, "server_ste_metadata": 1}
     assert row["status"] != "succeeded"
     assert sum(e["stage"] == "send_guard_passed" for e in row["_execution_timeline"]) == 1
     assert "PRIVATE" not in json.dumps(evidence)
+
+
+def test_sse_resume_metadata_redacts_unknown_kind_and_token():
+    from utils.helper import iter_sse_payloads
+    observation = {}
+    response = Response([
+        b'data: {"type":"resume_conversation_token","kind":"PRIVATE_KIND","token":"PRIVATE_TOKEN"}',
+        b'data: [DONE]',
+    ])
+    list(iter_sse_payloads(response, observation=observation))
+    assert observation["resume_token_seen"] is True
+    assert observation["resume_token_kind"] == "other"
+    assert observation["server_ste_metadata_seen"] is False
+    assert observation["sse_event_type_counts"] == {"resume_conversation_token": 1, "server_ste_metadata": 0}
+    assert "PRIVATE" not in json.dumps(observation)
 
 
 def test_sse_done_or_patch_alone_is_not_a_terminal_message_snapshot():
