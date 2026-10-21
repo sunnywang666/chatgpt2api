@@ -330,6 +330,49 @@ def _sse_error_category(event: dict) -> str:
     return "unknown"
 
 
+_SAFE_SSE_EVENT_TYPES = ("resume_conversation_token", "server_ste_metadata", "stream_handoff")
+_SAFE_RESUME_TOKEN_KINDS = frozenset({"topic"})
+_SAFE_STREAM_HANDOFF_OPTION_TYPES = ("resume_sse_endpoint", "subscribe_ws_topic")
+
+
+def _observe_sse_event_metadata(event: dict, observation: dict) -> None:
+    """Keep only fixed, content-free markers needed to diagnose stream closure."""
+    event_type = event.get("type")
+    if not isinstance(event_type, str) or event_type not in _SAFE_SSE_EVENT_TYPES:
+        return
+    counts = observation.setdefault("sse_event_type_counts", {
+        name: 0 for name in _SAFE_SSE_EVENT_TYPES
+    })
+    counts[event_type] = min(counts.get(event_type, 0) + 1, 2147483647)
+    if event_type == "server_ste_metadata":
+        observation["server_ste_metadata_seen"] = True
+        return
+    if event_type == "stream_handoff":
+        observation["stream_handoff_seen"] = True
+        option_counts = observation.setdefault("stream_handoff_option_counts", {
+            name: 0 for name in _SAFE_STREAM_HANDOFF_OPTION_TYPES
+        })
+        options = event.get("options")
+        if isinstance(options, list):
+            for option in options:
+                option_type = option.get("type") if isinstance(option, dict) else None
+                if option_type not in _SAFE_STREAM_HANDOFF_OPTION_TYPES:
+                    continue
+                option_counts[option_type] = min(option_counts.get(option_type, 0) + 1, 2147483647)
+                observation[f"{option_type}_seen"] = True
+        return
+
+    observation["resume_token_seen"] = True
+    raw_kind = event.get("kind")
+    kind = str(raw_kind).strip().lower() if isinstance(raw_kind, str) else ""
+    safe_kind = kind if kind in _SAFE_RESUME_TOKEN_KINDS else ("other" if kind else "unknown")
+    previous = observation.get("resume_token_kind")
+    if previous is None:
+        observation["resume_token_kind"] = safe_kind
+    elif previous != safe_kind:
+        observation["resume_token_kind"] = "multiple"
+
+
 def _observe_sse_message(event: dict, observation: dict, request_message_id: str) -> None:
     """Count complete message snapshots, never infer completion from patches.
 
@@ -386,6 +429,15 @@ def iter_sse_payloads(response: requests.Response, *, observation: dict | None =
                     "sse_terminal_final_channel_events", "sse_terminal_parent_events",
                     "sse_terminal_direct_parent_match_events"):
             observation.setdefault(key, 0)
+        observation.setdefault("resume_token_seen", False)
+        observation.setdefault("server_ste_metadata_seen", False)
+        observation.setdefault("stream_handoff_seen", False)
+        for option_type in _SAFE_STREAM_HANDOFF_OPTION_TYPES:
+            observation.setdefault(f"{option_type}_seen", False)
+        observation.setdefault("sse_event_type_counts", {name: 0 for name in _SAFE_SSE_EVENT_TYPES})
+        observation.setdefault("stream_handoff_option_counts", {
+            name: 0 for name in _SAFE_STREAM_HANDOFF_OPTION_TYPES
+        })
     error_event = False
     for raw_line in response.iter_lines():
         if not raw_line:
@@ -414,6 +466,7 @@ def iter_sse_payloads(response: requests.Response, *, observation: dict | None =
                             observe_error({"message": payload}, named=True)
                     else:
                         if isinstance(event, dict):
+                            _observe_sse_event_metadata(event, observation)
                             _observe_sse_message(event, observation, request_message_id)
                         if isinstance(event, dict) and (error_event or event.get("type") in ("error", "response.failed") or event.get("error")):
                             observe_error(event, named=error_event)

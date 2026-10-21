@@ -150,7 +150,14 @@ def test_sse_terminal_observations_preserve_unknown_and_never_store_nodes_or_con
                "status": "finished_successfully", "end_turn": True, "channel": "final",
                "metadata": {"parent_id": request_node},
                "content": {"parts": ["PRIVATE_TEXT https://private.test/?token=PRIVATE_TOKEN"]}}
-    events = [{"v": {"message": message}}, {"message": message},
+    events = [{"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE_RESUME_TOKEN"},
+              {"type": "stream_handoff", "options": [
+                  {"type": "resume_sse_endpoint", "url": "https://PRIVATE_ENDPOINT", "topic_id": "PRIVATE_TOPIC"},
+                  {"type": "subscribe_ws_topic", "topic_id": "PRIVATE_TOPIC"},
+                  {"type": "PRIVATE_UNKNOWN_OPTION", "url": "https://PRIVATE_ENDPOINT"},
+              ]},
+              {"type": "server_ste_metadata", "metadata": {"PRIVATE": "PRIVATE_METADATA"}},
+              {"v": {"message": message}}, {"message": message},
               {"message": {**message, "parent_id": "PRIVATE_DIFFERENT_PARENT"}},
               {"message": {**message, "id": ""}},
               {"message": {**message, "end_turn": "true"}},
@@ -180,9 +187,41 @@ def test_sse_terminal_observations_preserve_unknown_and_never_store_nodes_or_con
     assert evidence["sse_terminal_final_channel_events"] == 4
     assert evidence["sse_terminal_parent_events"] == 4
     assert evidence["sse_terminal_direct_parent_match_events"] == 2
+    assert evidence["resume_token_seen"] is True
+    assert evidence["resume_token_kind"] == "topic"
+    assert evidence["server_ste_metadata_seen"] is True
+    assert evidence["stream_handoff_seen"] is True
+    assert evidence["resume_sse_endpoint_seen"] is True
+    assert evidence["subscribe_ws_topic_seen"] is True
+    assert evidence["sse_event_type_counts"] == {
+        "resume_conversation_token": 1, "server_ste_metadata": 1, "stream_handoff": 1,
+    }
+    assert evidence["stream_handoff_option_counts"] == {
+        "resume_sse_endpoint": 1, "subscribe_ws_topic": 1,
+    }
     assert row["status"] != "succeeded"
     assert sum(e["stage"] == "send_guard_passed" for e in row["_execution_timeline"]) == 1
-    assert "PRIVATE" not in json.dumps(evidence)
+    serialized = json.dumps(evidence)
+    assert "PRIVATE" not in serialized
+    assert "url" not in serialized and "topic_id" not in serialized
+
+
+def test_sse_resume_metadata_redacts_unknown_kind_and_token():
+    from utils.helper import iter_sse_payloads
+    observation = {}
+    response = Response([
+        b'data: {"type":"resume_conversation_token","kind":"PRIVATE_KIND","token":"PRIVATE_TOKEN"}',
+        b'data: [DONE]',
+    ])
+    list(iter_sse_payloads(response, observation=observation))
+    assert observation["resume_token_seen"] is True
+    assert observation["resume_token_kind"] == "other"
+    assert observation["server_ste_metadata_seen"] is False
+    assert observation["stream_handoff_seen"] is False
+    assert observation["sse_event_type_counts"] == {
+        "resume_conversation_token": 1, "server_ste_metadata": 0, "stream_handoff": 0,
+    }
+    assert "PRIVATE" not in json.dumps(observation)
 
 
 def test_sse_done_or_patch_alone_is_not_a_terminal_message_snapshot():
