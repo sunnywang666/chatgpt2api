@@ -2168,6 +2168,11 @@ class ConversationBindingService:
             backend = OpenAIBackendAPI(access_token=access_token)
             backend.retain_bound_conversation = True
             backend.text_request_message_id = str(body.get("_request_message_id") or "")
+            # WS continuation is a text-only result-consumption feature.  The
+            # same retained binding flag is also used by image paths.
+            backend.text_stream_handoff_enabled = (
+                body.get("_route", "chat") == "chat" and body.get("_operation", "text") == "text"
+            )
             if body.get("_public_session_ref") or body.get("_supersedes_request_message_id"):
                 backend.text_cursor_callback = on_cursor
             missing_no_final_context = None

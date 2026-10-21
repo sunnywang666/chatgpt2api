@@ -12,7 +12,7 @@ import uuid
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
@@ -27,7 +27,7 @@ from services.account_request_pacing import AccountRequestDeadlineExceeded, pace
 from services.config import config
 from services.request_context import observing_archive_step
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import UpstreamHTTPError, ensure_ok, is_supported_image_model, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -92,6 +92,13 @@ CODEX_RESPONSES_MODEL = "gpt-5.5"
 SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
 TEXT_STREAM_HARD_CAP_SECS = 300.0
+STREAM_HANDOFF_WS_MAX_SECS = 60.0
+STREAM_HANDOFF_WS_MAX_FRAMES = 128
+STREAM_HANDOFF_WS_MAX_BYTES = 1_048_576
+_STREAM_HANDOFF_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,160}\Z")
+_STREAM_HANDOFF_TOPIC_PREFIX = "conversation-turn-"
+_STREAM_HANDOFF_WS_PATH = "/backend-api/celsius/ws/user"
+_STREAM_HANDOFF_WS_HOST = "ws.chatgpt.com"
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
@@ -103,6 +110,188 @@ EDITABLE_FILE_CLIENT_VERSION = "prod-bede35f9dcd856d080e012478f0c1031faa2588e"
 EDITABLE_FILE_CLIENT_BUILD_NUMBER = "6631702"
 EDITABLE_FILE_PSD_OUTPUT_DIR = "data/files/psd"
 EDITABLE_FILE_PPT_OUTPUT_DIR = "data/files/ppt"
+
+
+@dataclass
+class _StreamHandoff:
+    """Ephemeral, same-stack evidence for one result-only WS continuation.
+
+    Nothing here is placed in a receipt, timeline, exception, or log. A
+    handoff is deliberately conservative: the SSE must independently identify
+    the same conversation and turn as the advertised subscription topic.
+    """
+    expected_conversation_id: str = ""
+    original_message_id: str = ""
+    resume_conversation_id: str = ""
+    handoff_conversation_id: str = ""
+    turn_exchange_id: str = ""
+    topic_id: str = ""
+    handoff_count: int = 0
+    handoff_source: str = ""
+    resume_token_kind: str = ""
+    terminal_seen: bool = False
+    ws_terminal_seen: bool = False
+    ws_conversation_locked: bool = False
+    invalid: bool = False
+    _parents: dict[str, str] = field(default_factory=dict)
+
+    @staticmethod
+    def _clean_id(value: object) -> str:
+        value = value.strip() if isinstance(value, str) else ""
+        return value if _STREAM_HANDOFF_ID_RE.fullmatch(value) else ""
+
+    @staticmethod
+    def _message(event: dict[str, Any]) -> dict[str, Any]:
+        value = event.get("v")
+        frame = value if isinstance(value, dict) and isinstance(value.get("message"), dict) else event
+        message = frame.get("message")
+        return message if isinstance(message, dict) else {}
+
+    @classmethod
+    def _event_conversation_id(cls, event: dict[str, Any]) -> str:
+        value = event.get("v")
+        return cls._clean_id(event.get("conversation_id") or (
+            value.get("conversation_id") if isinstance(value, dict) else ""))
+
+    @staticmethod
+    def _assistant_terminal(message: dict[str, Any]) -> bool:
+        return (message.get("status") == "finished_successfully"
+                and message.get("end_turn") is True
+                and isinstance(message.get("author"), dict)
+                and message["author"].get("role") == "assistant")
+
+    def _set_handoff(self, source: str, conversation_id: str, turn_exchange_id: str) -> None:
+        if self.handoff_source or source not in {"stream_handoff", "server_ste_metadata"}:
+            self.invalid = True
+            return
+        if (not conversation_id or not turn_exchange_id
+                or (self.expected_conversation_id and self.expected_conversation_id != conversation_id)
+                or (self.resume_conversation_id and self.resume_conversation_id != conversation_id)):
+            self.invalid = True
+            return
+        self.handoff_source = source
+        self.handoff_conversation_id = conversation_id
+        self.turn_exchange_id = turn_exchange_id
+        self.topic_id = _STREAM_HANDOFF_TOPIC_PREFIX + turn_exchange_id
+
+    def _on_original_branch(self, message: dict[str, Any]) -> bool:
+        """Require streamed terminal evidence to reach this request's user node."""
+        original = self._clean_id(self.original_message_id)
+        message_id = self._clean_id(message.get("id"))
+        parent = self._clean_id(message.get("parent"))
+        if message_id and parent:
+            self._parents[message_id] = parent
+        if not original or not message_id:
+            return False
+        current = message_id
+        # Stored event frames may include thought/tool descendants.  Bound the
+        # walk so malformed parent graphs cannot turn this into unbounded work.
+        for _ in range(128):
+            if current == original:
+                return True
+            current = self._parents.get(current, "")
+            if not current:
+                return False
+        return False
+
+    def accepts_ws_payload(self, payload: str) -> bool:
+        """Admit only the handoff conversation's frames after its first ID."""
+        if self.invalid:
+            return False
+        if payload == "[DONE]":
+            return self.ws_conversation_locked and self.ws_terminal_seen
+        try:
+            event = json.loads(payload)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(event, dict):
+            return False
+        value = event.get("v")
+        conversation_id = self._clean_id(
+            event.get("conversation_id") or (value.get("conversation_id") if isinstance(value, dict) else "")
+        )
+        if not conversation_id:
+            # Incremental patches may omit the ID only after a matching frame
+            # has locked this ephemeral stream to the advertised handoff.
+            if not self.ws_conversation_locked:
+                return False
+        elif conversation_id != self.handoff_conversation_id:
+            self.invalid = True
+            return False
+        else:
+            self.ws_conversation_locked = True
+        message = self._message(event)
+        on_original_branch = self._on_original_branch(message)
+        if self._assistant_terminal(message):
+            if not on_original_branch:
+                return False
+            self.terminal_seen = True
+            self.ws_terminal_seen = True
+        return True
+
+    def observe(self, payload: str) -> None:
+        if payload == "[DONE]":
+            return
+        try:
+            event = json.loads(payload)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(event, dict):
+            return
+        message = self._message(event)
+        if self._assistant_terminal(message) and self._on_original_branch(message):
+            # A final can sit below a thinking/tool chain, but an unrelated
+            # historical branch may not suppress this turn's handoff.
+            self.terminal_seen = True
+        event_type = event.get("type")
+        if event_type == "resume_conversation_token":
+            conversation_id = self._event_conversation_id(event)
+            kind = event.get("kind")
+            if (kind != "topic" or not conversation_id
+                    or (self.resume_conversation_id and self.resume_conversation_id != conversation_id)):
+                self.invalid = True
+            else:
+                self.resume_conversation_id = conversation_id
+                self.resume_token_kind = kind
+            return
+        if event_type == "server_ste_metadata":
+            self.handoff_count += 1
+            metadata = event.get("metadata")
+            top_turn = self._clean_id(event.get("turn_exchange_id"))
+            nested_turn = self._clean_id(metadata.get("turn_exchange_id")) if isinstance(metadata, dict) else ""
+            if (self.handoff_count != 1 or not self.resume_conversation_id
+                    or not isinstance(metadata, dict)
+                    or (top_turn and nested_turn and top_turn != nested_turn)):
+                self.invalid = True
+                return
+            conversation_id = self._event_conversation_id(event) or self.resume_conversation_id
+            self._set_handoff("server_ste_metadata", conversation_id, top_turn or nested_turn)
+            return
+        if event_type != "stream_handoff":
+            return
+        self.handoff_count += 1
+        conversation_id = self._clean_id(event.get("conversation_id"))
+        turn_exchange_id = self._clean_id(event.get("turn_exchange_id"))
+        options = event.get("options")
+        subscribe_options = [option for option in options if isinstance(option, dict)
+                             and option.get("type") == "subscribe_ws_topic"] if isinstance(options, list) else []
+        topics = [self._clean_id(option.get("topic_id")) for option in subscribe_options]
+        topics = [topic for topic in topics if topic]
+        if (self.handoff_count != 1 or not conversation_id or not turn_exchange_id
+                or len(subscribe_options) != 1 or len(topics) != 1
+                or topics[0] != _STREAM_HANDOFF_TOPIC_PREFIX + turn_exchange_id):
+            self.invalid = True
+            return
+        self._set_handoff("stream_handoff", conversation_id, turn_exchange_id)
+
+    @property
+    def eligible(self) -> bool:
+        return (not self.invalid and not self.terminal_seen and self.handoff_count == 1
+                and bool(self.topic_id) and bool(self.handoff_conversation_id)
+                and self.resume_token_kind == "topic"
+                and self.resume_conversation_id == self.handoff_conversation_id)
+
+
 EDITABLE_FILE_PPT_PROMPT = """我需要你根据用户的需求，来制作一个可以编辑的PPT，你可以使用Agent来做，你不要再继续询问用户问题，内容风格、版式、配色、内容结构和页面信息你可以自行补充并直接执行。整体的流程如下：
 1. 用生图的方式，帮我生成一个精美的产品介绍ppt，5-6个页面
 2. 帮我把以上涉及到的所有图像和形状素材拆分成单独png，每个素材单独一张图片，不要有遗漏，让我可以直接在ppt里拼接素材还原，不要文字
@@ -3146,9 +3335,14 @@ class OpenAIBackendAPI:
             **({"_account_request_preflight": pre_send_check} if pre_send_check is not None else {}),
         )
         ensure_ok(response, path)
+        handoff = _StreamHandoff(
+            expected_conversation_id=conversation_id,
+            original_message_id=str(getattr(self, "text_request_message_id", "") or ""),
+        )
         try:
+            initial_done = False
             remaining_stream_budget = max(0.001, request_deadline - time.monotonic())
-            yield from self._iter_sse_payloads_capped(
+            for payload in self._iter_sse_payloads_capped(
                 response,
                 remaining_stream_budget,
                 timeout_error_type=StreamHardTimeoutError,
@@ -3157,9 +3351,209 @@ class OpenAIBackendAPI:
                 ),
                 observe_text=True,
                 request_message_id=str(getattr(self, "text_request_message_id", "") or ""),
-            )
+            ):
+                handoff.observe(payload)
+                if payload == "[DONE]":
+                    # A protocol consumer stops at DONE. Defer this one until
+                    # the same-turn WS handoff has either supplied its own
+                    # terminal marker or declined safely.
+                    initial_done = True
+                    continue
+                yield payload
+            # ConversationBindingService sets this while holding its existing
+            # binding/account lock. Generic unbound streams retain SSE-only
+            # behavior rather than opening a second transport.
+            # ``retain_bound_conversation`` also protects bound image work.
+            # Only ConversationBindingService's retained text path opts into
+            # result-only WS continuation; text prompts may still contain
+            # reference images, so do not infer this from ``images``.
+            if (handoff.eligible and getattr(self, "retain_bound_conversation", False)
+                    and getattr(self, "text_stream_handoff_enabled", False)
+                    and not is_supported_image_model(model)):
+                handoff_done = yield from self._consume_stream_handoff(handoff, request_deadline)
+                if initial_done and handoff_done:
+                    return
+            if initial_done:
+                yield "[DONE]"
         finally:
             response.close()
+
+    @staticmethod
+    def _handoff_websocket_url(value: object) -> str:
+        """Accept only the fixed, authenticated ChatGPT WS origin.
+
+        The upstream SSE endpoint is deliberately never dereferenced: this
+        avoids converting an event body into a generic outbound URL fetch.
+        """
+        value = value.strip() if isinstance(value, str) else ""
+        if not value or len(value) > 4096:
+            return ""
+        try:
+            parsed = urlparse(value)
+            port = parsed.port or 443
+        except ValueError:
+            return ""
+        if (parsed.scheme != "wss" or parsed.hostname != _STREAM_HANDOFF_WS_HOST
+                or port != 443 or parsed.username or parsed.password or parsed.fragment
+                or not parsed.path.startswith("/")):
+            return ""
+        return value
+
+    @staticmethod
+    def _handoff_ws_text(ws: Any) -> str:
+        receive = getattr(ws, "recv_str", None)
+        value = receive() if callable(receive) else ws.recv()
+        if isinstance(value, tuple):
+            value = value[0]
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="strict")
+        return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _handoff_ws_send(ws: Any, payload: str) -> None:
+        send = getattr(ws, "send_str", None)
+        if callable(send):
+            send(payload)
+        else:
+            ws.send(payload)
+
+    def _handoff_ws_options(self, deadline: float) -> dict[str, Any] | None:
+        """Explicitly preserve the HTTP session's auth and transport profile.
+
+        curl_cffi 0.15 only carries cookies into ``Session.ws_connect``.  The
+        bound account's Authorization/client headers, proxy, TLS verification,
+        and impersonation must therefore be passed again for this one WS hop.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        session = self.session
+        options: dict[str, Any] = {
+            "headers": self._headers(_STREAM_HANDOFF_WS_PATH, {"Origin": self.base_url}),
+            "timeout": remaining,
+            "allow_redirects": False,
+        }
+        for name in ("verify", "impersonate", "ja3", "akamai", "extra_fp", "default_headers",
+                     "http_version", "interface", "cert", "proxy_auth"):
+            value = getattr(session, name, None)
+            if value is not None:
+                options[name] = value
+        proxies = getattr(session, "proxies", None)
+        if proxies:
+            options["proxies"] = proxies
+        cookies = getattr(session, "cookies", None)
+        if cookies is not None:
+            options["cookies"] = cookies
+        return options
+
+    @staticmethod
+    def _handoff_encoded_payloads(frame: object, topic_id: str) -> Iterator[str]:
+        """Yield only exact-topic encoded SSE data from a WS message frame."""
+        frames = frame if isinstance(frame, list) else [frame]
+        for item in frames:
+            if not isinstance(item, dict):
+                continue
+            candidates: list[object] = []
+            if item.get("type") == "reply":
+                reply = item.get("reply")
+                if isinstance(reply, dict) and reply.get("topic_id") == topic_id:
+                    catchups = reply.get("catchups")
+                    candidates = catchups if isinstance(catchups, list) else []
+            elif item.get("type") == "message" and item.get("topic_id") == topic_id:
+                candidates = [item]
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                outer = candidate.get("payload")
+                inner = outer.get("payload") if isinstance(outer, dict) else None
+                encoded = inner.get("encoded_item") if isinstance(inner, dict) else None
+                if not isinstance(encoded, str) or len(encoded) > STREAM_HANDOFF_WS_MAX_BYTES:
+                    continue
+                for line in encoded.splitlines():
+                    line = line.rstrip("\r")
+                    if line.startswith("data:"):
+                        payload = line[5:].strip()
+                        if payload:
+                            yield payload
+
+    def _consume_stream_handoff(self, handoff: _StreamHandoff, request_deadline: float) -> Iterator[str]:
+        """Consume one bounded, result-only WS handoff without a new model send.
+
+        Failures intentionally produce no synthetic completion. The caller's
+        existing exact original-branch GET remains the sole success authority.
+        """
+        ws = watchdog = None
+        handoff_deadline = min(request_deadline, time.monotonic() + STREAM_HANDOFF_WS_MAX_SECS)
+        try:
+            remaining = handoff_deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            response = self.session.get(
+                self.base_url + _STREAM_HANDOFF_WS_PATH,
+                headers=self._headers(_STREAM_HANDOFF_WS_PATH, {"Accept": "application/json"}),
+                timeout=remaining,
+                _account_request_deadline_monotonic=handoff_deadline,
+            )
+            try:
+                ensure_ok(response, _STREAM_HANDOFF_WS_PATH)
+                body = response.json()
+            finally:
+                response.close()
+            ws_url = self._handoff_websocket_url(body.get("websocket_url") if isinstance(body, dict) else "")
+            if not ws_url:
+                return False
+            options = self._handoff_ws_options(handoff_deadline)
+            if options is None:
+                return False
+            ws = self.session.ws_connect(ws_url, **options)
+            # curl_cffi 0.15's synchronous recv_str() has no timeout
+            # parameter. Its thread-safe terminate() wakes a blocked receive,
+            # so one timer enforces the shared, non-retrying handoff budget.
+            remaining = handoff_deadline - time.monotonic()
+            terminate = getattr(ws, "terminate", None)
+            if remaining <= 0 or not callable(terminate):
+                return False
+            watchdog = threading.Timer(remaining, terminate)
+            watchdog.daemon = True
+            watchdog.start()
+            self._handoff_ws_send(ws, json.dumps([{
+                "id": 1,
+                "command": {"type": "subscribe", "topic_id": handoff.topic_id, "offset": "0"},
+            }], separators=(",", ":")))
+            frames = total_bytes = 0
+            while frames < STREAM_HANDOFF_WS_MAX_FRAMES and total_bytes < STREAM_HANDOFF_WS_MAX_BYTES:
+                raw = self._handoff_ws_text(ws)
+                if not raw:
+                    return False
+                frames += 1
+                total_bytes += len(raw.encode("utf-8"))
+                if total_bytes > STREAM_HANDOFF_WS_MAX_BYTES:
+                    return False
+                try:
+                    frame = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                for payload in self._handoff_encoded_payloads(frame, handoff.topic_id):
+                    if not handoff.accepts_ws_payload(payload):
+                        if handoff.invalid or payload == "[DONE]":
+                            return False
+                        continue
+                    yield payload
+                    if payload == "[DONE]":
+                        return True
+        except Exception:
+            # Never persist or log an endpoint, topic, token, or raw WS error.
+            # A failed continuation is still an original-request UNKNOWN until
+            # the caller's exact branch read proves otherwise.
+            return False
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
