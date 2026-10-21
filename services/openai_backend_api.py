@@ -5,6 +5,7 @@ import mimetypes
 import os
 import random
 import re
+import select
 import threading
 import time
 import uuid
@@ -19,7 +20,7 @@ from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import unquote, urlparse
 
-from curl_cffi import requests
+from curl_cffi import CurlECode, CurlError, CurlInfo, CurlWsFlag, requests
 from PIL import Image
 
 from services.account_service import account_service
@@ -3461,7 +3462,58 @@ class OpenAIBackendAPI:
         return value
 
     @staticmethod
-    def _handoff_ws_text(ws: Any) -> str:
+    def _handoff_ws_text(ws: Any, deadline: float, max_bytes: int) -> str:
+        """Read one complete WS TEXT frame without exceeding the shared deadline.
+
+        curl-cffi's synchronous ``recv_str`` retries EAGAIN internally.  Its
+        retry loop has no caller deadline, so a silent socket can outlive the
+        original-result budget even after a cross-thread terminate attempt.
+        Consume fragments here when that native interface is available; the
+        fallback keeps compatibility with lightweight test doubles.
+        """
+        receive_fragment = getattr(ws, "recv_fragment", None)
+        curl = getattr(ws, "curl", None)
+        if callable(receive_fragment) and curl is not None:
+            fragments = bytearray()
+            # Retain the TEXT type across continuation chunks, including
+            # adapters that mark only the first chunk as TEXT, until libcurl
+            # indicates the final fragment has arrived.
+            collecting_text: bool | None = None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AccountRequestDeadlineExceeded("stream handoff deadline exceeded")
+                try:
+                    chunk, frame = receive_fragment()
+                except CurlError as exc:
+                    if exc.code != CurlECode.AGAIN:
+                        raise
+                    socket_fd = curl.getinfo(CurlInfo.ACTIVESOCKET)
+                    if not isinstance(socket_fd, int) or socket_fd < 0:
+                        raise RuntimeError("stream handoff socket unavailable") from exc
+                    select.select([socket_fd], [], [], min(0.5, remaining))
+                    continue
+                flags = frame.flags
+                if flags & CurlWsFlag.CLOSE:
+                    return ""
+                if flags & CurlWsFlag.PING:
+                    continue
+                if collecting_text is None:
+                    if flags & CurlWsFlag.TEXT:
+                        collecting_text = True
+                    elif flags & (CurlWsFlag.BINARY | CurlWsFlag.CONT):
+                        collecting_text = False
+                    else:
+                        continue
+                if collecting_text:
+                    fragments.extend(chunk)
+                    if len(fragments) > max_bytes:
+                        raise AccountRequestDeadlineExceeded("stream handoff frame exceeds bound")
+                if frame.bytesleft or flags & CurlWsFlag.CONT:
+                    continue
+                if collecting_text:
+                    return bytes(fragments).decode("utf-8", errors="strict")
+                collecting_text = None
         receive = getattr(ws, "recv_str", None)
         value = receive() if callable(receive) else ws.recv()
         if isinstance(value, tuple):
@@ -3561,6 +3613,7 @@ class OpenAIBackendAPI:
         """
         ws = watchdog = None
         frames = total_bytes = 0
+        force_terminate = False
         handoff_deadline = min(request_deadline, time.monotonic() + STREAM_HANDOFF_WS_MAX_SECS)
         try:
             remaining = handoff_deadline - time.monotonic()
@@ -3590,9 +3643,9 @@ class OpenAIBackendAPI:
                 return False
             ws = self.session.ws_connect(ws_url, **options)
             self._record_stream_handoff_stage("ws_connected")
-            # curl_cffi 0.15's synchronous recv_str() has no timeout
-            # parameter. Its thread-safe terminate() wakes a blocked receive,
-            # so one timer enforces the shared, non-retrying handoff budget.
+            # The fragment reader checks this same deadline between native
+            # readiness waits; retain the timer for lightweight/legacy socket
+            # adapters whose blocking receive cannot expose fragments.
             remaining = handoff_deadline - time.monotonic()
             terminate = getattr(ws, "terminate", None)
             if remaining <= 0 or not callable(terminate):
@@ -3601,13 +3654,24 @@ class OpenAIBackendAPI:
             watchdog = threading.Timer(remaining, terminate)
             watchdog.daemon = True
             watchdog.start()
-            self._handoff_ws_send(ws, json.dumps([{
-                "id": 1,
-                "command": {"type": "subscribe", "topic_id": handoff.topic_id, "offset": "0"},
-            }], separators=(",", ":")))
+            # ``celsius/ws/user`` requires the same connection preface as the
+            # browser-compatible recovery client.  A bare turn subscription
+            # can leave the socket open without making the topic available.
+            # Keep this one bounded, result-only command: it neither opens a
+            # global feed nor changes the original request's account or turn.
+            self._handoff_ws_send(ws, json.dumps([
+                {"id": 1, "command": {
+                    "type": "connect",
+                    "presence": {"type": "presence", "state": "foreground"},
+                }},
+                {"id": 2, "command": {
+                    "type": "subscribe", "topic_id": handoff.topic_id, "offset": "0",
+                }},
+            ], separators=(",", ":")))
             self._record_stream_handoff_stage("ws_subscribed")
             while frames < STREAM_HANDOFF_WS_MAX_FRAMES and total_bytes < STREAM_HANDOFF_WS_MAX_BYTES:
-                raw = self._handoff_ws_text(ws)
+                raw = self._handoff_ws_text(
+                    ws, handoff_deadline, STREAM_HANDOFF_WS_MAX_BYTES - total_bytes)
                 if not raw:
                     self._record_stream_handoff_stage("ws_transport_error", frames=frames,
                                                       total_bytes=total_bytes)
@@ -3633,15 +3697,20 @@ class OpenAIBackendAPI:
                                                               total_bytes=total_bytes)
                             return False
                         continue
-                    yield payload
                     if payload == "[DONE]":
+                        # The protocol adapter stops at DONE and closes this
+                        # generator.  Persist terminal evidence before that
+                        # yield can inject GeneratorExit into this frame.
                         self._record_stream_handoff_stage("ws_terminal", frames=frames,
                                                           total_bytes=total_bytes, terminal_seen=True)
+                        yield payload
                         return True
+                    yield payload
             self._record_stream_handoff_stage("ws_budget_exhausted", frames=frames,
                                               total_bytes=total_bytes)
             return False
         except AccountRequestDeadlineExceeded:
+            force_terminate = True
             self._record_stream_handoff_stage("ws_budget_exhausted", frames=frames,
                                               total_bytes=total_bytes)
             return False
@@ -3656,10 +3725,18 @@ class OpenAIBackendAPI:
             if watchdog is not None:
                 watchdog.cancel()
             if ws is not None:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
+                if force_terminate:
+                    terminate = getattr(ws, "terminate", None)
+                    if callable(terminate):
+                        try:
+                            terminate()
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
