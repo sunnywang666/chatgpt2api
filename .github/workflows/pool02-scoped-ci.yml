@@ -21,6 +21,7 @@ on:
       - test/test_workflow_scheduling.py
       - test/test_background_original_reads.py
       - test/test_pool_admission.py
+      - test/test_image_metadata_refresh_liveness.py
       - test/test_rejected_chat_successor.py
       - test/test_missing_node_chain_lifecycle.py
       - test/test_queued_combined_copy_compaction.py
@@ -65,6 +66,7 @@ jobs:
           .venv/bin/python -m compileall -q api services utils test
           .venv/bin/python -m pytest -q \
             test/test_pool_admission.py \
+            test/test_image_metadata_refresh_liveness.py \
             test/test_rejected_chat_successor.py \
             test/test_missing_node_chain_lifecycle.py \
             test/test_queued_combined_copy_compaction.py \

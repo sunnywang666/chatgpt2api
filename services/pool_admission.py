@@ -808,6 +808,8 @@ class PoolAdmission:
         self._next_codex_probe = 0.0
         self._next_image_probe = 0.0
         self._image_probe_index = 0
+        self._image_refresh_lock = threading.Lock()
+        self._image_refresh_thread = None
         self._codex_probe_index = 0
 
     def register(self, kind, handler):
@@ -831,6 +833,7 @@ class PoolAdmission:
         while not self._stop.is_set():
             self._event.clear()
             try:
+                self._start_image_capability_refresh()
                 while not self._stop.is_set():
                     claim = self.claim_next()
                     if claim is None:
@@ -1897,9 +1900,45 @@ class PoolAdmission:
             if work.get("state", "active") == "active" and parent.get("state", "active") in {"queued", "active"}:
                 yield item
 
+    def _start_image_capability_refresh(self):
+        # Credential recovery and metadata clocks can wait before HTTP timeouts
+        # apply. Keep them off the admission/recovery dispatcher, with one live
+        # sweep per admission instance even when a previous read is stuck.
+        # Do not time out and replace the worker: Python cannot cancel that I/O.
+        with self._image_refresh_lock:
+            if (self._stop.is_set() or float(self.clock()) < self._next_image_probe
+                    or not callable(getattr(self.accounts, "refresh_image_capability", None))
+                    or (self._image_refresh_thread is not None and self._image_refresh_thread.is_alive())):
+                return
+            # Do not initialize a store or launch idle workers just to discover
+            # an empty queue. The normal claim path owns store initialization.
+            if not self.store.path.is_file():
+                return
+            with self.store.connect() as db:
+                waiting = any((kind == "image" or r.get("_operation") == "image")
+                              and r.get("status") == "queued" and not r.get("_submission_started")
+                              for kind, _, _, r in self._metadata_receipts(db, ("queued",)))
+            if not waiting or self._stop.is_set():
+                return
+
+            def run():
+                try:
+                    refreshed = self._refresh_waiting_image_capabilities()
+                except Exception:
+                    from utils.log import logger
+                    logger.warning({"event": "image_capability_refresh_unavailable", "layer": "provider"})
+                else:
+                    # An empty queue must not wake itself into a busy loop.
+                    if refreshed and not self._stop.is_set():
+                        self.wake()
+
+            self._image_refresh_thread = threading.Thread(
+                target=run, name="image-capability-refresh", daemon=True)
+            self._image_refresh_thread.start()
+
     def _refresh_waiting_image_capabilities(self):
         refresh = getattr(self.accounts, "refresh_image_capability", None)
-        if not callable(refresh) or float(self.clock()) < self._next_image_probe:
+        if self._stop.is_set() or not callable(refresh) or float(self.clock()) < self._next_image_probe:
             return
         with self.store.connect() as db:
             waiting = [r for kind, _, _, r in self._metadata_receipts(db, ("queued",))
@@ -1915,6 +1954,8 @@ class PoolAdmission:
         probes = 0
         start = self._image_probe_index % max(1, len(rows))
         for offset in range(len(rows)):
+            if self._stop.is_set():
+                break  # Let an already-started read finish, but start no next probe.
             account = rows[(start + offset) % len(rows)]
             if account.get("managed_disabled") or account.get("status") == "禁用":
                 continue
@@ -1937,6 +1978,7 @@ class PoolAdmission:
             self._image_probe_index = (start + offset + 1) % max(1, len(rows))
             if probes >= 3:
                 break
+        return probes > 0
 
     def _queued_codex_probe_accounts(self, rows, queued):
         """Return exact native-original accounts that may need observation.
@@ -2018,7 +2060,6 @@ class PoolAdmission:
         return targeted + [account for account in rows if account not in targeted]
 
     def claim_next(self):
-        self._refresh_waiting_image_capabilities()
         # Catalog lookup may perform a metadata read; never do that under the
         # database/account transaction or occupy an execution worker waiting.
         # UNKNOWN originals only need result recovery, never a new allocation.
