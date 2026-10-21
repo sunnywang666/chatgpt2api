@@ -56,6 +56,9 @@ _SAFE_STREAM_HANDOFF_STAGES = frozenset({
 })
 
 
+_EXPIRED_UNSENT_BEFORE_SEND = object()
+
+
 def _safe_stream_handoff_event_metadata(extra):
     """Persist only fixed continuation progress, never endpoint or payload data."""
     stage = extra.get("handoff_stage")
@@ -404,6 +407,24 @@ def _waiting_resource_family(resource):
     # suffix.  An unknown prefix is deliberately not exposed as a new channel.
     family = resource.split(":", 1)[0]
     return family if family in _WAITING_RESOURCE_FAMILIES else "other"
+
+
+def _same_waiting_projection(previous, proposed):
+    """Ignore only the per-snapshot diagnostic stamps when no blocker changed."""
+    if not isinstance(previous, dict) or not isinstance(proposed, dict):
+        return previous == proposed
+
+    def stable(value):
+        result = dict(value)
+        diagnostics = result.get("admission_diagnostics")
+        if isinstance(diagnostics, dict):
+            result["admission_diagnostics"] = {
+                key: item for key, item in diagnostics.items()
+                if key not in {"observed_at", "snapshot_revision"}
+            }
+        return result
+
+    return stable(previous) == stable(proposed)
 
 
 def waiting_admission_diagnostics(observed_at, snapshot_revision, offer_diagnostics):
@@ -1368,6 +1389,7 @@ class PoolAdmission:
             if kind == "image":
                 image_receipts.setdefault(owner, {})[request_id] = r
         ordered_receipts = [row for row in receipts if (row[1], row[2]) not in released_order_heads]
+        active_work_counts = workflow_scheduling.active_work_counts(ordered_receipts)
         for kind, owner, request_id, r in receipts:
             status = r.get("status")
             pending = unfinished(kind, r)
@@ -1439,7 +1461,7 @@ class PoolAdmission:
                 thread_resources.append(Resource(dependency, int(enabled), 0, now))
                 thread_needs += (Need(dependency),)
             scheduling_resources, scheduling_needs, scheduling_ready = workflow_scheduling.constraints(
-                r, works, workflow_clocks, ordered_receipts, now)
+                r, works, workflow_clocks, ordered_receipts, now, active_by_work=active_work_counts)
             thread_resources.extend(scheduling_resources)
             product_needs = ()
             product_fair_group = None
@@ -2093,12 +2115,14 @@ class PoolAdmission:
             snapshot = self._snapshot(self._rows(), receipts, settings, types, now,
                                       self.store.runtime(db, "fairness", {}), workflow_state, product_state, db=db)
             selection = choose_next(snapshot, now)
+            waiting_active_work_counts = workflow_scheduling.active_work_counts(receipts)
             for deferred in selection.deferred:
                 r = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id)
                 dependency_reason = r.get("_image_thread_waiting_reason") or r.get("_public_previous_waiting_reason")
                 reasons = [dependency_reason] if dependency_reason else list(deferred.reasons)
                 works, clocks = workflow_state
-                reasons = workflow_scheduling.waiting_reasons(r, works, clocks, receipts, now, reasons)
+                reasons = workflow_scheduling.waiting_reasons(
+                    r, works, clocks, receipts, now, reasons, active_by_work=waiting_active_work_counts)
                 if r.get("_completion_of"):
                     original = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, r["_completion_of"]) or {}
                     original_work = works.get(original.get("_work_key")) or {}
@@ -2117,19 +2141,21 @@ class PoolAdmission:
                         elif reason == "image_capability_observed":
                             reason = "model_not_supported"
                         reasons.append("image_" + reason)
-                r["waiting"] = {"reasons": reasons, "next_check_at": deferred.next_at}
+                waiting = {"reasons": reasons, "next_check_at": deferred.next_at}
                 diagnostics = waiting_admission_diagnostics(snapshot.observed_at, snapshot.revision,
                                                             deferred.offer_diagnostics)
                 if diagnostics is not None:
-                    r["waiting"]["admission_diagnostics"] = diagnostics
+                    waiting["admission_diagnostics"] = diagnostics
                 previous_id = (r.get("_image_thread") or {}).get("previous_task_id")
                 if previous_id and r.get("_image_thread_waiting_reason"):
                     # Same-owner original receipt is the recovery entry. This is
                     # diagnostic only: never replace or resend its failed turn.
-                    r["waiting"].update(previous_task_id=previous_id, action="read_original_predecessor")
+                    waiting.update(previous_task_id=previous_id, action="read_original_predecessor")
                 if r.get("_public_previous_waiting"):
-                    r["waiting"].update(previous_request_id=r["_previous_request_id"], action="read_original_predecessor")
-                self.store.write_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id, r)
+                    waiting.update(previous_request_id=r["_previous_request_id"], action="read_original_predecessor")
+                if not _same_waiting_projection(r.get("waiting"), waiting):
+                    r["waiting"] = waiting
+                    self.store.write_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id, r)
             if selection.dispatch is None:
                 return None
             pick = selection.dispatch
@@ -2312,7 +2338,10 @@ class PoolAdmission:
     def before_send(self, context):
         while True:
             try:
-                return self._before_send_guard(context)
+                guarded = self._before_send_guard(context)
+                if guarded is _EXPIRED_UNSENT_BEFORE_SEND:
+                    raise AdmissionLost("WAIT_DEADLINE_EXCEEDED")
+                return guarded
             except AdmissionLost as exc:
                 # A different account in this workflow may have sent after a
                 # partial n-image request waited, but before its final guard.
@@ -2369,9 +2398,6 @@ class PoolAdmission:
         # selected row under the send guard. Discovery failure must fail closed.
         with self.store.connect() as db:
             observed = self.store.read_receipt(db, context.kind, context.owner, context.request_id) or {}
-        with self.store.transaction() as db:
-            workflow_scheduling.expire_unsent(self.store, db, list(self.store.receipts(
-                db, statuses=("queued", "not_started", "running"))), float(self.clock()))
         firstsend_trial = getattr(context, "_firstsend_model_trial", None)
         execution_model = observed.get("model", "")
         selected_route = None
@@ -2400,6 +2426,13 @@ class PoolAdmission:
         with self._settings_guard(), self.store.transaction() as db, self._account_guard():
             now = float(self.clock())
             r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
+            # Preserve the former whole-queue expiry ordering for this exact
+            # receipt, even if its local claim was concurrently replaced.
+            if r is not None and workflow_scheduling.expire_unsent_receipt(
+                    self.store, db, context.kind, context.owner, context.request_id, r, now):
+                # Return through the transaction context so this terminal,
+                # known-unsent state commits before the outer fencing path.
+                return _EXPIRED_UNSENT_BEFORE_SEND
             if (r is None or r.get("_claim_id") != context.claim or r.get("status") != "running"
                     or float(r.get("_claim_until") or 0) <= now):
                 raise AdmissionLost("original task claim expired")

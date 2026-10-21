@@ -203,11 +203,15 @@ def test_paused_work_cannot_be_bypassed_by_new_model_submission(runtime):
         submit(rt,'next',session='same',scheduling=options)
 
 
-def test_wait_deadline_after_claim_is_not_sent_and_releases_provisional_slot(runtime):
+def test_wait_deadline_after_claim_is_not_sent_and_releases_provisional_slot(runtime, monkeypatch):
     rt=runtime;submit(rt,'first',scheduling={'workflow_id':'w','workflow_concurrency':1,'wait_deadline':at(1010)})
     ctx=rt.admission.claim_next();assert ctx
     assert row(rt,'first')['upstream_unfinished']
     rt.admission.clock=lambda:1011
+    # This exact claim must close itself without a second full queued-receipt
+    # sweep in the send-critical SQLite writer transaction.
+    monkeypatch.setattr('services.workflow_scheduling.expire_unsent',
+                        lambda *args: (_ for _ in ()).throw(AssertionError('global expiry sweep')))
     with pytest.raises(AdmissionLost):ctx.before_send()
     saved=row(rt,'first')
     assert saved['status']=='error' and saved['error_code']=='WAIT_DEADLINE_EXCEEDED'

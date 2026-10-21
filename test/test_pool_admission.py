@@ -1455,6 +1455,19 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn("fixture-token", serialized)
         self.assertNotIn("private original input", serialized)
 
+    def test_unchanged_deferred_waiting_diagnostics_do_not_rewrite_receipts(self):
+        self.accounts.update_account("fixture-token-0", {"managed_disabled": True}, quiet=True)
+        self.submit("blocked-diagnostic")
+        self.assertIsNone(self.admission.claim_next())
+        initial = self.read("text", "happy", "blocked-diagnostic")["waiting"]
+        self.assertIn("admission_diagnostics", initial)
+        # Snapshot UUID/time are diagnostic stamps only. An unchanged blocked
+        # queue must not serialize its receipt again on every admission tick.
+        with patch.object(self.store, "write_receipt", wraps=self.store.write_receipt) as writes:
+            self.assertIsNone(self.admission.claim_next())
+        writes.assert_not_called()
+        self.assertEqual(self.read("text", "happy", "blocked-diagnostic")["waiting"], initial)
+
     def test_waiting_diagnostic_unknown_resource_family_is_redacted(self):
         from services.admission_planner import OfferDiagnostic, ResourceBlock
         from services.pool_admission import waiting_admission_diagnostics
