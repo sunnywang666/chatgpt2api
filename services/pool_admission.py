@@ -230,8 +230,8 @@ def _firstsend_model_trial_marker(context, receipt, body, settings, now):
 def _firstsend_model_execution_body(context, receipt, body, store, settings, clock, *, scope_body=None):
     """Return an ephemeral instant/none body only for one armed original.
 
-    Nothing durable is rewritten here.  The marker is rechecked again at the
-    model-send edge, where a fresh bound-account catalog probe is required.
+    Nothing durable is rewritten here.  The marker is rechecked at the
+    model-send edge after its fresh bound-account catalog proof is prepared.
     """
     scope_body = body if scope_body is None else scope_body
     marker = _firstsend_model_trial_marker(context, receipt, scope_body, settings, float(clock()))
@@ -1103,6 +1103,44 @@ class PoolAdmission:
             raise AdmissionLost("first-send model capability discovery unavailable before send") from None
         if not observed:
             raise AdmissionLost("first-send model is unavailable before send")
+
+    def _prepare_firstsend_model_capability(self, context):
+        """Fetch the trial directory before the account send clock is held.
+
+        The resulting proof stays only on this execution context.  The final
+        send guard validates its cache freshness, physical binding and current
+        control revision; it never performs a catalog network request.
+        """
+        trial = getattr(context, "_firstsend_model_trial", None)
+        if trial is None:
+            return
+        if (not isinstance(trial, dict)
+                or trial.get("original_model") != _COMBINED_COPY_MODEL
+                or trial.get("original_thinking_effort") != _COMBINED_COPY_EFFORT
+                or trial.get("effective_model") != _FIRSTSEND_TRIAL_MODEL
+                or trial.get("effective_thinking_effort") != _FIRSTSEND_TRIAL_EFFORT):
+            raise AdmissionLost("first-send model trial is invalid")
+        with self.store.connect() as db:
+            receipt = self.store.read_receipt(db, context.kind, context.owner, context.request_id) or {}
+        if (context.kind != "text" or receipt.get("_claim_id") != context.claim
+                or receipt.get("status") != "running" or receipt.get("_submission_started") is not False
+                or float(receipt.get("_claim_until") or 0) <= float(self.clock())):
+            raise AdmissionLost("original task changed before first-send model discovery")
+        self._fresh_bound_firstsend_model_capability(receipt, trial)
+        from services.model_service import model_catalog_service
+        route = model_catalog_service.prepared_bound_model_route_at_send(
+            receipt.get("provider_account_identity"), _FIRSTSEND_TRIAL_MODEL)
+        if route is None:
+            raise AdmissionLost("first-send model capability discovery unavailable before send")
+        with self.store.connect() as db:
+            current = self.store.read_receipt(db, context.kind, context.owner, context.request_id) or {}
+        if (current.get("_claim_id") != context.claim or current.get("status") != "running"
+                or current.get("_submission_started") is not False
+                or current.get("provider_binding_id") != receipt.get("provider_binding_id")
+                or current.get("provider_account_identity") != receipt.get("provider_account_identity")
+                or float(current.get("_claim_until") or 0) <= float(self.clock())):
+            raise AdmissionLost("original task changed during first-send model discovery")
+        context._prepared_firstsend_model_route = route
 
     @staticmethod
     def _model_account_matches(account, route) -> bool:
@@ -2289,6 +2327,7 @@ class PoolAdmission:
                 db, statuses=("queued", "not_started", "running"))), float(self.clock()))
         firstsend_trial = getattr(context, "_firstsend_model_trial", None)
         execution_model = observed.get("model", "")
+        selected_route = None
         if firstsend_trial is not None:
             if (not isinstance(firstsend_trial, dict)
                     or firstsend_trial.get("original_model") != _COMBINED_COPY_MODEL
@@ -2296,15 +2335,21 @@ class PoolAdmission:
                     or firstsend_trial.get("effective_model") != _FIRSTSEND_TRIAL_MODEL
                     or firstsend_trial.get("effective_thinking_effort") != _FIRSTSEND_TRIAL_EFFORT):
                 raise AdmissionLost("first-send model trial is invalid")
-            self._fresh_bound_firstsend_model_capability(observed, firstsend_trial)
+            prepared = getattr(context, "_prepared_firstsend_model_route", None)
+            from services.model_service import model_catalog_service
+            current_route = model_catalog_service.prepared_bound_model_route_at_send(
+                observed.get("provider_account_identity"), _FIRSTSEND_TRIAL_MODEL)
+            if prepared is None or current_route is None or prepared != current_route:
+                raise AdmissionLost("first-send model capability discovery unavailable before send")
+            selected_route = current_route
             execution_model = _FIRSTSEND_TRIAL_MODEL
-        selected_route = None
         if (observed.get("_requested_account_identity") and context.kind == "text"
                 and observed.get("_operation", "text") != "image" and observed.get("_route", "chat") == "chat"):
-            try:
-                selected_route = self._types(execution_model)
-            except Exception:
-                raise AdmissionLost("selected Chat model discovery unavailable before send") from None
+            if selected_route is None:
+                try:
+                    selected_route = self._types(execution_model)
+                except Exception:
+                    raise AdmissionLost("selected Chat model discovery unavailable before send") from None
         with self._settings_guard(), self.store.transaction() as db, self._account_guard():
             now = float(self.clock())
             r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
@@ -2652,12 +2697,17 @@ class PoolAdmission:
                 # A single, explicitly armed original may select the proven
                 # instant execution model.  This happens only after the
                 # immutable frozen-input/hash check and remains an in-memory
-                # body copy; before_send revalidates the marker and probes the
-                # same bound account immediately before the model POST.
+                # body copy; before_send revalidates the marker and prepared
+                # exact-account proof immediately before the model POST.
                 body = _firstsend_model_execution_body(
                     context, r, body, self.store, self._settings(), self.clock,
                     scope_body=frozen_body,
                 )
+                # The exact bound catalog read must complete before the
+                # handler acquires its per-account HTTP send clock.  The
+                # final guard consumes only the prepared in-memory route and
+                # rejects it if that proof, binding or control has changed.
+                self._prepare_firstsend_model_capability(context)
             missing_node_retry_parent = None
             if context.kind == "image":
                 # Resolve C's output parent for the in-memory A4 execution

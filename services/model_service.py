@@ -508,6 +508,37 @@ class ModelCatalogService:
             self._expires_at = expires if self._expires_at <= now else min(self._expires_at, expires)
         return True
 
+    def prepared_bound_model_route_at_send(self, account_identity: str, model: str) -> ModelRoute | None:
+        """Return only still-fresh, exact-account send evidence without I/O.
+
+        A first-send trial prepares its bound directory before the account HTTP
+        clock is acquired.  Its final guard must not call ``route_for_model``:
+        that method can refresh the catalog and recursively acquire the same
+        clock.  This checks the prepared observation against the current
+        account state and credential fingerprint, but never refreshes it.
+        """
+        identity = str(account_identity or "").strip()
+        requested = str(model or "").strip()
+        account = self._active_accounts().get(identity)
+        if not identity or not requested or account is None or account[2] != "active":
+            return None
+        now = self._clock()
+        with self._lock:
+            observation = self._model_observations.get(identity)
+            models = observation.get("models") if isinstance(observation, dict) else None
+            refresh_after = observation.get("refresh_after") if isinstance(observation, dict) else None
+            if (not isinstance(models, dict) or requested not in models
+                    or observation.get("observation_state") != "observed"
+                    or observation.get("observed_account_state") != "active"
+                    or observation.get("account_type") != account[1]
+                    or observation.get("credential_fingerprint") != account[3]
+                    or not isinstance(refresh_after, (int, float))
+                    or isinstance(refresh_after, bool) or not math.isfinite(refresh_after)
+                    or refresh_after <= now):
+                return None
+        return ModelRoute(account_types=frozenset({account[1]}),
+                          account_identities=frozenset({identity}))
+
     def list_models(self) -> dict[str, Any]:
         self._ensure_catalog()
         with self._lock:

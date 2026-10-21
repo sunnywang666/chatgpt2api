@@ -247,11 +247,32 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         self.assertTrue(self.catalog.observe_bound_model_at_send("plus", identity, "gpt-5-6-instant"))
 
+        prepared = self.catalog.prepared_bound_model_route_at_send(identity, "gpt-5-6-instant")
+        self.assertIsNotNone(prepared)
+        self.assertEqual(prepared.account_types, frozenset({"Plus"}))
+        self.assertEqual(prepared.account_identities, frozenset({identity}))
+
         route = self.catalog.route_for_model("gpt-5-6-instant")
         self.assertEqual(route.account_types, frozenset({"Plus"}))
         self.assertEqual(route.account_identities, frozenset({identity}))
         self.assertEqual(self.calls.count("plus"), 2)
         self.assertEqual(self.calls.count("pro"), 1)
+
+    def test_prepared_bound_send_route_expires_or_rejects_changed_credential_without_io(self) -> None:
+        identity = self.accounts._stable_account_identity(
+            next(account for account in self.accounts.list_accounts() if account.get("access_token") == "plus"))
+        self.outcomes["plus"] = model_list("gpt-5-6-instant")
+        self.assertTrue(self.catalog.observe_bound_model_at_send("plus", identity, "gpt-5-6-instant"))
+        calls = list(self.calls)
+
+        self.now += 301
+        self.assertIsNone(self.catalog.prepared_bound_model_route_at_send(identity, "gpt-5-6-instant"))
+        self.assertEqual(self.calls, calls, "final send-cache validation must not start catalog I/O")
+
+        self.now -= 301
+        self.accounts.update_account("plus", {"managed_disabled": True})
+        self.assertIsNone(self.catalog.prepared_bound_model_route_at_send(identity, "gpt-5-6-instant"))
+        self.assertEqual(self.calls, calls)
 
     def test_bound_send_observation_does_not_validate_a_changed_peer_cache(self) -> None:
         self.catalog.list_models()
