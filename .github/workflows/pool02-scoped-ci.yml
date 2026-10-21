@@ -13,10 +13,12 @@ on:
       - services/text_task_service.py
       - services/openai_backend_api.py
       - services/model_service.py
+      - services/workflow_scheduling.py
       - utils/helper.py
       - test/test_text_stream_diagnostics.py
       - test/test_text_stream_handoff.py
       - test/test_model_catalog_service.py
+      - test/test_workflow_scheduling.py
       - test/test_background_original_reads.py
       - test/test_pool_admission.py
       - test/test_rejected_chat_successor.py
@@ -75,6 +77,7 @@ jobs:
             test/test_text_stream_diagnostics.py \
             test/test_text_stream_handoff.py \
             test/test_model_catalog_service.py \
+            test/test_workflow_scheduling.py \
             test/test_image_task_service.py \
             test/test_reliable_pool_routes.py \
             test/test_non_text_recovery.py \
