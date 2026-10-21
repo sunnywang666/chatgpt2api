@@ -285,3 +285,69 @@ def test_lease_thread_start_failure_finishes_claim_without_upstream_read(recover
     assert current["recovery_next_at"] > r.clock()
     r.text.recovery_reader.assert_not_called()
     failed_thread.join.assert_not_called()
+
+
+def test_capacity_contributing_originals_precede_history_without_losing_account_fairness(recovery):
+    r = recovery
+    # These are still due to read but already have the bounded local-wait
+    # marker, so they are historical UNKNOWNs rather than account-slot
+    # contributors.  Insert them first to reproduce the old starvation order.
+    for index in range(4):
+        request_id = f"history-{index}"
+        r.original(request_id, 0, request_id)
+        r.text._update("owner", request_id, status="failed", error_code="RESULT_UNRECOVERABLE",
+                       upstream_outcome="unknown", _execution_wait_ended_at=r.clock())
+    for index in range(4):
+        r.original(f"contributor-{index}", 1, f"contributor-{index}")
+
+    started = {f"contributor-{index}": threading.Event() for index in range(4)}
+    calls = []
+
+    def read(owner, request_id):
+        calls.append(request_id)
+        if request_id in started:
+            started[request_id].set()
+        r.release.wait(3)
+
+    r.admission.recoveries["text"] = read
+    r.admission.recover_one(background=True)
+
+    assert all(event.wait(1) for event in started.values())
+    assert set(calls) == set(started)
+
+
+def test_transferred_empty_roots_do_not_precede_later_capacity_contributor(recovery):
+    r = recovery
+    # The exact same-session retry proof moves each root's local turn to its
+    # queued child.  The roots remain UNKNOWN and due, but cannot consume the
+    # first four original-read permits ahead of a real capacity contributor.
+    for index in range(4):
+        root_id = f"transferred-root-{index}"
+        child_id = f"transferred-child-{index}"
+        root = r.original(root_id, 0, f"transferred-conversation-{index}")
+        r.original(child_id, 0, f"transferred-conversation-{index}")
+        r.text._update("owner", root_id,
+                       _retry_cursor={"conversation_id": root["conversation_id"],
+                                      "request_message_id": root["request_message_id"],
+                                      "retry_parent_message_id": f"retry-parent-{index}",
+                                      "observed_at": r.clock()},
+                       _completion={"replacement_id": child_id})
+        r.text._update("owner", child_id, status="queued", _same_session_retry_of=root_id,
+                       _completion_of=root_id, _submission_parent_message_id=f"retry-parent-{index}",
+                       client_conversation_id=root["client_conversation_id"],
+                       provider_account_identity=root["provider_account_identity"],
+                       provider_binding_id=root["provider_binding_id"],
+                       conversation_id=root["conversation_id"])
+    r.original("actual-contributor", 0, "actual-contributor")
+    scheduled = []
+
+    def dispatch(kind, owner, request_id, function, receipt):
+        scheduled.append(request_id)
+        return True
+
+    r.admission.recoveries["text"] = lambda *_: None
+    with patch.object(r.admission, "_dispatch_original_read", side_effect=dispatch):
+        r.admission.recover_one(background=True)
+
+    assert scheduled[0] == "actual-contributor"
+    assert set(scheduled[1:]) <= {f"transferred-root-{index}" for index in range(4)}
