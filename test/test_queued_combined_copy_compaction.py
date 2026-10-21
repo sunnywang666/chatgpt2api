@@ -330,6 +330,57 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
                                   "original_model": MODEL, "original_thinking_effort": EFFORT,
                                   "effective_model": "gpt-5-6-instant", "effective_thinking_effort": "none"}])
 
+    def test_exact_batch_trial_selects_each_target_without_a_per_account_limit(self):
+        bodies = []
+        for request_id in ("batch-a", "batch-b", "ordinary-c"):
+            body = queued_copy_body(request_id)
+            body["client_conversation_id"] = "conversation-" + request_id
+            body["product_work"] = {"product_ref": "product-" + request_id, "step_ref": "copy"}
+            bodies.append(self.submit(body))
+        self.admission.settings = lambda: {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {"targets": [
+                {"account_identity": "account-0", "request_id": "batch-a"},
+                {"account_identity": "account-0", "request_id": "batch-b"},
+            ], "expires_at": 1100},
+        }
+
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability") as fresh:
+            self.admission.execute(self.claim())
+            self.admission.execute(self.claim())
+            self.admission.execute(self.claim())
+
+        self.assertEqual(fresh.call_count, 2)
+        self.assertEqual([(body["client_request_id"], body["model"], body["thinking_effort"]) for body in self.sent], [
+            ("batch-a", "gpt-5-6-instant", "none"),
+            ("batch-b", "gpt-5-6-instant", "none"),
+            ("ordinary-c", MODEL, EFFORT),
+        ])
+        for request_id, body in zip(("batch-a", "batch-b"), bodies[:2]):
+            after = self.receipt(request_id)
+            self.assertEqual(after["model"], MODEL)
+            self.assertEqual(self.store.load_input(after["_input_ref"]), body)
+            self.assertEqual(after["_temporary_firstsend_model_trial"]["request_id"], request_id)
+        self.assertNotIn("effective_model", self.receipt("ordinary-c").get("_temporary_firstsend_model_trial") or {})
+
+    def test_expired_batch_trial_leaves_an_unsent_original_on_its_normal_model_path(self):
+        body = queued_copy_body()
+        body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}
+        self.submit(body)
+        self.admission.settings = lambda: {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {"targets": [
+                {"account_identity": "account-0", "request_id": "queued-copy"},
+            ], "expires_at": 1000},
+        }
+
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability") as fresh:
+            self.admission.execute(self.claim())
+
+        fresh.assert_not_called()
+        self.assertEqual(self.sent[0]["model"], MODEL)
+        self.assertNotIn("effective_model", self.receipt().get("_temporary_firstsend_model_trial") or {})
+
     def test_missing_fresh_candidate_capability_requeues_without_changing_original(self):
         body = queued_copy_body()
         body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}

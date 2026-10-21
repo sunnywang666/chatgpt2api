@@ -60,13 +60,14 @@ class TemporaryChatSecondSlot(BaseModel):
 
 
 class TemporaryFirstSendModelTrial(BaseModel):
-    """Arm one exact unsent product Chat original for the fixed safe trial."""
+    """Arm exact unsent product Chat originals for the fixed safe trial."""
     model_config = ConfigDict(extra="forbid", strict=True)
     expected_revision: int = Field(ge=0)
     action: Literal["start", "stop"]
     account_ref: str | None = Field(default=None, pattern=r"^car_[A-Za-z0-9_-]{43}$")
     request_id: str | None = Field(default=None, min_length=1, max_length=300)
-    ttl_seconds: int | None = Field(default=None, ge=1, le=600)
+    request_ids: list[str] | None = Field(default=None, min_length=1, max_length=1000)
+    ttl_seconds: int | None = Field(default=None, ge=1, le=3600)
 
 
 class CodexAuthorization(BaseModel):
@@ -253,11 +254,61 @@ def create_router() -> APIRouter:
         owner_scope(authorization, x_workbench_account_owner)
         from services.config import config
         if body.action == "stop":
-            if any(value is not None for value in (body.account_ref, body.request_id, body.ttl_seconds)):
+            if any(value is not None for value in (body.account_ref, body.request_id, body.request_ids, body.ttl_seconds)):
                 raise HTTPException(400, detail={"error": "stop must not name a request"})
             return await account_operation(config.update_temporary_firstsend_model_trial, body.expected_revision, None)
+        batch_ids = body.request_ids
+        if batch_ids is not None:
+            if body.account_ref is not None or body.request_id is not None:
+                raise HTTPException(400, detail={"error": "batch start accepts request_ids only"})
+            if body.ttl_seconds is None:
+                raise HTTPException(400, detail={"error": "exact original request IDs and TTL are required"})
+            if (len(set(batch_ids)) != len(batch_ids) or any(not request_id or len(request_id) > 300
+                    or any(ord(char) < 32 for char in request_id) for request_id in batch_ids)):
+                raise HTTPException(400, detail={"error": "batch request IDs must be unique exact IDs"})
+            all_accounts = await run_in_threadpool(account_service.list_accounts)
+            accounts_by_identity = {}
+            for account in all_accounts:
+                identity = account.get("provider_account_identity") if isinstance(account, dict) else None
+                if identity:
+                    accounts_by_identity.setdefault(identity, []).append(account)
+            from services.image_task_service import image_task_service
+            from services.pool_admission import (_combined_copy_send_evidence,
+                                                 firstsend_model_trial_scope)
+            from types import SimpleNamespace
+            admission = image_task_service.admission
+            requested = set(batch_ids)
+            targets = []
+            with admission.store.connect() as db:
+                candidates = {}
+                for kind, owner, request_id, receipt in admission.store.receipts(db):
+                    if kind == "text" and request_id in requested:
+                        candidates.setdefault(request_id, []).append((owner, receipt))
+                for request_id in sorted(requested):
+                    rows = candidates.get(request_id, [])
+                    if len(rows) != 1:
+                        raise HTTPException(409, detail={"error": "every batch item must be one durable queued product Chat original"})
+                    _owner, receipt = rows[0]
+                    identity = receipt.get("provider_account_identity")
+                    accounts = accounts_by_identity.get(identity, [])
+                    if (len(accounts) != 1 or accounts[0].get("managed_disabled")
+                            or accounts[0].get("status") in {"禁用", "异常", "限流"}):
+                        raise HTTPException(409, detail={"error": "every batch item must retain one available bound account"})
+                    try:
+                        frozen = admission.store.load_input(receipt.get("_input_ref"))
+                    except (OSError, TypeError, ValueError):
+                        raise HTTPException(409, detail={"error": "original frozen input is unavailable"}) from None
+                    if (receipt.get("status") != "queued" or receipt.get("_submission_started") is not False
+                            or _combined_copy_send_evidence(receipt)
+                            or not firstsend_model_trial_scope(SimpleNamespace(kind="text"), receipt, frozen)):
+                        raise HTTPException(409, detail={"error": "every batch item must be one eligible unsent product Chat original"})
+                    targets.append({"account_identity": identity, "request_id": request_id})
+            trial = {"targets": targets, "expires_at": int(time.time()) + body.ttl_seconds}
+            return await account_operation(config.update_temporary_firstsend_model_trial, body.expected_revision, trial)
         if not body.account_ref or not body.request_id or body.ttl_seconds is None:
             raise HTTPException(400, detail={"error": "exact account, original request and TTL are required"})
+        if body.ttl_seconds > 600:
+            raise HTTPException(400, detail={"error": "one original trial TTL must not exceed 600 seconds"})
         all_accounts = await run_in_threadpool(account_service.list_accounts)
         accounts = [row for row in all_accounts if account_service.pool_account_ref(row) == body.account_ref]
         if len(accounts) != 1 or not accounts[0].get("provider_account_identity"):
