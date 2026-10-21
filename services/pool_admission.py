@@ -185,13 +185,38 @@ def firstsend_model_trial_scope(context, receipt, body):
     )
 
 
+def _firstsend_model_trial_target(trial, request_id):
+    """Return this request's exact configured account binding, if any.
+
+    Keep the original one-item control shape readable while allowing one
+    bounded batch control to carry independently receipt-derived bindings.
+    """
+    if not isinstance(trial, dict):
+        return None
+    if set(trial) == {"account_identity", "request_id", "expires_at"}:
+        target = {"account_identity": trial.get("account_identity"), "request_id": trial.get("request_id"),
+                  "expires_at": trial.get("expires_at")}
+        return target if target["request_id"] == request_id else None
+    targets = trial.get("targets")
+    if set(trial) != {"targets", "expires_at"} or not isinstance(targets, list):
+        return None
+    matches = [target for target in targets if isinstance(target, dict) and target.get("request_id") == request_id]
+    if len(matches) != 1:
+        return None
+    target = matches[0]
+    if set(target) != {"account_identity", "request_id"}:
+        return None
+    return {**target, "expires_at": trial.get("expires_at")}
+
+
 def _firstsend_model_trial_marker(context, receipt, body, settings, now):
     marker = receipt.get("_temporary_firstsend_model_trial")
     trial = settings.get("temporary_firstsend_model_trial")
+    target = _firstsend_model_trial_target(trial, context.request_id)
     if (not isinstance(marker, dict) or not isinstance(trial, dict)
             or type(marker.get("expires_at")) is not int
             or settings.get("revision", 0) != marker.get("revision")
-            or any(trial.get(key) != marker.get(key)
+            or not isinstance(target, dict) or any(target.get(key) != marker.get(key)
                    for key in ("account_identity", "request_id", "expires_at"))
             or receipt.get("provider_account_identity") != marker.get("account_identity")
             or context.request_id != marker.get("request_id")
@@ -2091,14 +2116,16 @@ class PoolAdmission:
                                 "revision": settings.get("revision", 0)}
             firstsend_trial_marker = None
             firstsend_trial = settings.get("temporary_firstsend_model_trial")
+            firstsend_target = _firstsend_model_trial_target(firstsend_trial, ref.request_id)
             if (ref.kind == "text" and isinstance(firstsend_trial, dict)
                     and type(firstsend_trial.get("expires_at")) is int and now < firstsend_trial["expires_at"]
-                    and firstsend_trial.get("request_id") == ref.request_id
-                    and firstsend_trial.get("account_identity") == pick.account
+                    and isinstance(firstsend_target, dict)
+                    and firstsend_target.get("account_identity") == pick.account
                     and r.get("provider_account_identity") in (None, "", pick.account)
                     and r.get("_submission_started") in (None, False)
                     and not _combined_copy_send_evidence(r)):
-                firstsend_trial_marker = {**firstsend_trial, "revision": settings.get("revision", 0)}
+                firstsend_trial_marker = {**firstsend_target, "expires_at": firstsend_trial["expires_at"],
+                                          "revision": settings.get("revision", 0)}
             r.update(status="running", _claim_id=claim, _claim_until=now + self.CLAIM_SECONDS,
                      _turn_reserved=True, _submission_started=False, _executing=True,
                      _account_resource=account_clock_key(rows[pick.account]),
@@ -2313,10 +2340,11 @@ class PoolAdmission:
             if firstsend_trial is not None:
                 settings = self._settings()
                 trial = settings.get("temporary_firstsend_model_trial")
+                target = _firstsend_model_trial_target(trial, context.request_id)
                 if (not isinstance(firstsend_marker, dict) or not isinstance(trial, dict)
                         or type(firstsend_marker.get("expires_at")) is not int
                         or settings.get("revision", 0) != firstsend_marker.get("revision")
-                        or any(trial.get(key) != firstsend_marker.get(key)
+                        or not isinstance(target, dict) or any(target.get(key) != firstsend_marker.get(key)
                                for key in ("account_identity", "request_id", "expires_at"))
                         or r.get("provider_account_identity") != firstsend_marker.get("account_identity")
                         or context.request_id != firstsend_marker.get("request_id")

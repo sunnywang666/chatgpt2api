@@ -225,6 +225,20 @@ class PoolResourceTests(unittest.TestCase):
         self.assertEqual(stopped["revision"], 2)
         self.assertNotIn("temporary_firstsend_model_trial", stopped)
 
+    def test_bounded_firstsend_model_trial_targets_are_exact_and_unique(self):
+        trial = {"targets": [
+            {"account_identity": "account_fixture", "request_id": "original-request-a"},
+            {"account_identity": "account_fixture", "request_id": "original-request-b"},
+        ], "expires_at": 4600}
+        result = self.config.update_temporary_firstsend_model_trial(0, trial)
+        self.assertEqual(result["temporary_firstsend_model_trial"], trial)
+        duplicate = {"targets": [
+            {"account_identity": "account_fixture", "request_id": "original-request-a"},
+            {"account_identity": "other", "request_id": "original-request-a"},
+        ], "expires_at": 4600}
+        with self.assertRaisesRegex(ValueError, "resource_settings_invalid"):
+            self.config.update_temporary_firstsend_model_trial(1, duplicate)
+
     def test_codex_unobserved_capacity_is_unknown_not_zero(self):
         record = account(source_type="codex")
         record["codex_observation"] = observation(state="unknown")

@@ -99,6 +99,7 @@ def test_internal_admin_arms_only_one_eligible_unsent_product_model_trial(tmp_pa
         route = "/api/workbench/ai/pool/first-send-model-trial"
         body = {"expected_revision": 0, "action": "start", "account_ref": account_ref,
                 "request_id": "chosen-model", "ttl_seconds": 120}
+        assert client.post(route, headers=headers, json={**body, "ttl_seconds": 601}).status_code == 400
         response = client.post(route, headers=headers, json=body)
         assert response.status_code == 200, response.text
         assert response.json()["temporary_firstsend_model_trial"] == {
@@ -107,3 +108,46 @@ def test_internal_admin_arms_only_one_eligible_unsent_product_model_trial(tmp_pa
         stopped = client.post(route, headers=headers, json={"expected_revision": 1, "action": "stop"})
         assert stopped.status_code == 200, stopped.text
         assert "temporary_firstsend_model_trial" not in stopped.json()
+
+
+def test_internal_admin_arms_an_exact_firstsend_model_trial_batch_atomically(tmp_path: Path):
+    row = {"access_token": "fixture-token", "account_id": "upstream-account",
+           "provider_account_identity": "account_fixture", "type": "Plus",
+           "source_type": "web", "status": "正常", "quota": 100,
+           "conversation_binding_ids": ["binding-fixture"]}
+    (tmp_path / "accounts.json").write_text(json.dumps([row]))
+    (tmp_path / "config.json").write_text(json.dumps({"auth-key": "fixture-admin-secret"}))
+    accounts, store, admission = build(tmp_path, Clock())
+    text = TextTaskService(store.path, admission=admission, clock=Clock())
+    for request_id in ("batch-a", "batch-b"):
+        body = queued_copy_body(request_id)
+        body.update(product_work={"product_ref": "product-" + request_id, "step_ref": "copy"},
+                    provider_account_identity="account_fixture", provider_binding_id="binding-fixture")
+        text.submit("wb", body, source="internal:listing")
+    text.submit("wb", queued_copy_body("not-product"), source="internal:listing")
+    config = ConfigStore(tmp_path / "config.json")
+    auth = AuthService(JSONStorageBackend(tmp_path / "auth_keys.json"))
+    _, admin = auth.create_key(role="admin", name="admin")
+    from services.image_task_service import image_task_service
+    with (patch("api.support.auth_service", auth),
+          patch("api.owned_accounts.account_service", accounts),
+          patch("services.config.config", config),
+          patch.object(image_task_service, "admission", admission),
+          patch("api.owned_accounts.time.time", return_value=1000)):
+        app = FastAPI(); install_exception_handlers(app); app.include_router(owned_accounts.create_router())
+        client = TestClient(app)
+        headers = {"X-Workbench-Account-Owner": "workbench:org:boss", "Authorization": "Bearer " + admin}
+        route = "/api/workbench/ai/pool/first-send-model-trial"
+        rejected = client.post(route, headers=headers, json={"expected_revision": 0, "action": "start",
+                                                               "request_ids": ["batch-a", "not-product"], "ttl_seconds": 3600})
+        assert rejected.status_code == 409
+        assert config.resource_settings()["revision"] == 0
+        response = client.post(route, headers=headers, json={"expected_revision": 0, "action": "start",
+                                                               "request_ids": ["batch-b", "batch-a"], "ttl_seconds": 3600})
+        assert response.status_code == 200, response.text
+        assert response.json()["temporary_firstsend_model_trial"] == {
+            "targets": [
+                {"account_identity": "account_fixture", "request_id": "batch-a"},
+                {"account_identity": "account_fixture", "request_id": "batch-b"},
+            ], "expires_at": 4600,
+        }

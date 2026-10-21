@@ -132,16 +132,31 @@ def _valid_temporary_chat_second_slot(value: object) -> bool:
     return type(value["expires_at"]) is int and value["expires_at"] > 0
 
 
-def _valid_temporary_firstsend_model_trial(value: object) -> bool:
-    """Accept one exact original first-send trial, never a model selector."""
-    if not isinstance(value, dict) or set(value) != {"account_identity", "request_id", "expires_at"}:
+def _valid_temporary_firstsend_model_trial_target(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"account_identity", "request_id"}:
         return False
     for key in ("account_identity", "request_id"):
         item = value[key]
         if (not isinstance(item, str) or not item or len(item) > 300
                 or any(ord(char) < 32 for char in item)):
             return False
-    return type(value["expires_at"]) is int and value["expires_at"] > 0
+    return True
+
+
+def _valid_temporary_firstsend_model_trial(value: object) -> bool:
+    """Accept one legacy original or a bounded exact batch, never a model selector."""
+    if not isinstance(value, dict) or type(value.get("expires_at")) is not int or value["expires_at"] <= 0:
+        return False
+    if set(value) == {"account_identity", "request_id", "expires_at"}:
+        return _valid_temporary_firstsend_model_trial_target({
+            "account_identity": value["account_identity"], "request_id": value["request_id"],
+        })
+    if set(value) != {"targets", "expires_at"} or not isinstance(value["targets"], list):
+        return False
+    targets = value["targets"]
+    return (1 <= len(targets) <= 1000
+            and all(_valid_temporary_firstsend_model_trial_target(target) for target in targets)
+            and len({target["request_id"] for target in targets}) == len(targets))
 
 DEFAULT_THIRD_PARTY_APPS = {
     "infinite_canvas": {
