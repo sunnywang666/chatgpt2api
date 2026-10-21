@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   scoped-chat-admission:
-    if: ${{ github.repository == 'sunnywang666/chatgpt2api' && github.event.repository.private }}
+    if: ${{ github.repository == 'sunnywang666/chatgpt2api' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
