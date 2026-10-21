@@ -663,6 +663,47 @@ def test_stalled_read_claim_cannot_predate_last_observation(tmp_path):
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
 
 
+def test_stalled_expired_original_read_lease_keeps_only_capacity_released(tmp_path):
+    service, admission, backend, original = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+    now = admission.clock.now
+    patch(service, recovery_claim_id="expired-original-read", recovery_claimed_at=now - 20,
+          recovery_lease_until=now - 1, recovery_phase="read_text_request")
+
+    row = saved(service)
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(row, now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert row["status"] == "unknown"
+    assert row["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN"
+    for key in ("request_id", "request_message_id", "conversation_id", "provider_account_identity"):
+        assert row[key] == original[0][key]
+    assert backend.mock_calls == []
+
+
+@pytest.mark.parametrize("changes", [
+    {"recovery_phase": "other"},
+    {"_missing_successor_resume": {"state": "submitted"}},
+    {"recovery_claimed_at": 9999999999},
+])
+def test_stalled_expired_recovery_lease_keeps_original_read_guards(tmp_path, changes):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+    now = admission.clock.now
+    patch(service, **{
+        "recovery_claim_id": "expired-original-read",
+        "recovery_claimed_at": now - 20,
+        "recovery_lease_until": now - 1,
+        "recovery_phase": "read_text_request",
+        **changes,
+    })
+
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved(service), now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    assert backend.mock_calls == []
+
+
 @pytest.mark.parametrize("conflict", [None, "completed", "rejected", "not_submitted", "", False])
 def test_stalled_legacy_compatibility_does_not_override_explicit_outcomes(tmp_path, conflict):
     service, admission, backend, _ = migration(tmp_path)

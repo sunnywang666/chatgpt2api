@@ -1013,8 +1013,10 @@ class TextTaskService:
         last_update_time = value.get("last_update_time")
         next_index = value.get("next_index")
         matches = value.get("matches")
+        anchor = value.get("page_anchor")
+        restarting = value.get("restart_from_head", False)
         if (
-            set(value) - {"failed_reads"} != {
+            set(value) - {"failed_reads", "page_anchor", "restart_from_head"} != {
                 "identity", "conversation_ids", "next_offset", "coverage_complete",
                 "time_order_valid", "last_update_time", "next_index", "matches",
             }
@@ -1031,7 +1033,8 @@ class TextTaskService:
             or any(not isinstance(item, str) or not item or len(item) > 200 for item in conversation_ids)
             or len(set(conversation_ids)) != len(conversation_ids)
             or not isinstance(next_offset, int) or isinstance(next_offset, bool)
-            or next_offset < len(conversation_ids)
+            or next_offset < 0
+            or (not restarting and next_offset < len(conversation_ids))
             or not isinstance(coverage_complete, bool)
             or not isinstance(time_order_valid, bool)
             or (last_update_time is not None and (
@@ -1044,6 +1047,20 @@ class TextTaskService:
             or not isinstance(next_index, int) or isinstance(next_index, bool)
             or next_index < 0 or next_index > len(conversation_ids)
             or not isinstance(matches, list) or len(matches) > 2
+            or not isinstance(restarting, bool)
+        ):
+            return None
+        if anchor is not None and (
+            not isinstance(anchor, dict)
+            or set(anchor) != {"offset", "ids"}
+            or not isinstance(anchor.get("offset"), int)
+            or isinstance(anchor.get("offset"), bool)
+            or anchor["offset"] < 0
+            or not isinstance(anchor.get("ids"), list)
+            or not anchor["ids"]
+            or len(anchor["ids"]) > 20
+            or any(not isinstance(item, str) or not item or len(item) > 200 for item in anchor["ids"])
+            or anchor["offset"] + len(anchor["ids"]) != next_offset
         ):
             return None
         failures = safe_scan_failures(value.get("failed_reads", {}), conversation_ids[next_index:])
@@ -1067,6 +1084,9 @@ class TextTaskService:
             "last_update_time": last_update_time,
             "next_index": next_index,
             "matches": [dict(match) for match in matches],
+            **({"page_anchor": {"offset": anchor["offset"], "ids": list(anchor["ids"])}
+                } if anchor is not None else {}),
+            **({"restart_from_head": True} if restarting else {}),
             **({"failed_reads": failures} if failures else {}),
         }
 
@@ -1155,16 +1175,18 @@ class TextTaskService:
         recovery_at = receipt.get("recovery_claimed_at")
         recovery_until = receipt.get("recovery_lease_until")
         if any(value is not None for value in (recovery_id, recovery_at, recovery_until)):
-            # Only the current read of this already-qualified original is
-            # exempt. A successor read, partial claim, or expired lease cannot
-            # establish that the ongoing work is this read-only operation.
+            # Only an exact original-result reader can leave its lease on a
+            # qualified original.  An expired reader has ceased consuming a
+            # local worker slot; retaining its durable fields must not make
+            # that already-observed original occupy capacity again.
             if (type(recovery_id) is not str or not recovery_id.strip()
                     or recovery_id != recovery_id.strip() or len(recovery_id) > 300
                     or receipt.get("recovery_phase") != "read_text_request"
                     or "_missing_successor_resume" in receipt
                     or type(recovery_at) not in (int, float) or not math.isfinite(recovery_at)
                     or type(recovery_until) not in (int, float) or not math.isfinite(recovery_until)
-                    or not (last_checked <= recovery_at <= now < recovery_until)):
+                    or recovery_at > recovery_until
+                    or (recovery_until > now and not (last_checked <= recovery_at <= now))):
                 return False
         # A later snapshot clock cannot rehabilitate an early/stale marker:
         # the marker itself must have been recorded after the existing window.

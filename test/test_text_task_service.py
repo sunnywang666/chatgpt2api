@@ -1813,7 +1813,9 @@ class TextTaskTests(unittest.TestCase):
                 recovery_clock.advance(TextTaskService.RECOVERY_BASE_BACKOFF_SECONDS + 1)
                 result = restarted.recover("owner", "attempt-1", True)
 
-        self.assertEqual(backend.list_calls, 2)
+        # The second persisted page is checked both before and after its next
+        # offset is followed; the remaining recovery windows only finish it.
+        self.assertEqual(backend.list_calls, 4)
         self.assertEqual(
             [conversation_id for conversation_id, _timeout in backend.detail_calls],
             [f"conversation-{index}" for index in range(40)],

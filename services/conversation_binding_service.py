@@ -624,7 +624,7 @@ def _text_failure_category(exc: Exception) -> str:
 # Only typed, bounded evidence is persisted. Exception text, response bodies,
 # URLs, tokens and conversation titles must never enter a recovery diagnostic.
 _READ_PHASES = frozenset({
-    "conversation_list", "conversation_detail", "matched_conversation",
+    "conversation_list", "conversation_anchor", "conversation_detail", "matched_conversation",
     "read_image_request", "resolve_image_download", "download_image", "save_image_result",
 })
 _READ_CATEGORIES = frozenset({"http", "timeout", "transport", "parse", "other"})
@@ -866,7 +866,73 @@ class ConversationBindingService:
                 "matches": [],
             }
 
+        # The upstream endpoint only exposes mutable offset pagination: it has
+        # neither a snapshot token nor a cursor. Before following a persisted
+        # offset in a later recovery window, prove that the preceding page is
+        # still identical. A changed head, deletion, or reordering otherwise
+        # makes ``offset`` skip an unknown part of the original range.
+        pending = scan["conversation_ids"][scan["next_index"]:]
+        failed_reads = scan.get("failed_reads", {})
+        pending_has_readable_entry = any(
+            conversation_id not in failed_reads
+            or time.time() >= failed_reads[conversation_id]["next_at"]
+            for conversation_id in pending
+        )
+        if scan["next_offset"] and not scan.get("restart_from_head", False) and scan.get("page_anchor") is None:
+            # A legacy completed scan without the preceding-page proof cannot
+            # establish that its mutable offset covered the original range.
+            scan["next_offset"] = 0
+            scan["coverage_complete"] = False
+            scan["time_order_valid"] = False
+            scan["last_update_time"] = None
+            scan["restart_from_head"] = True
+            raise cls._scan_incomplete(scan)
+        if (
+            not scan["coverage_complete"]
+            and scan["next_offset"]
+            and not pending_has_readable_entry
+            and not scan.get("restart_from_head", False)
+        ):
+            anchor = scan.get("page_anchor")
+            try:
+                anchored_recent = backend._list_recent_conversations(
+                    limit=cls.RECOVERY_RECENT_CONVERSATION_LIMIT,
+                    offset=anchor["offset"],
+                    timeout_secs=min(cls.RECOVERY_LIST_TIMEOUT_SECONDS, remaining_timeout()),
+                    strict_schema=True,
+                )
+            except Exception as exc:
+                raise cls._scan_read_failed(scan, exc, phase="conversation_anchor") from exc
+            anchored_ids = [
+                str(item.get("id") or item.get("conversation_id") or "").strip()
+                for item in anchored_recent
+            ]
+            if anchored_ids != anchor["ids"]:
+                scan["next_offset"] = 0
+                scan["coverage_complete"] = False
+                scan["time_order_valid"] = False
+                scan["last_update_time"] = None
+                scan.pop("page_anchor", None)
+                scan["restart_from_head"] = True
+                raise cls._scan_incomplete(scan)
+
         while not scan["coverage_complete"]:
+            # Finish a persisted page before requesting a later offset.  The
+            # upstream recent-conversations list is live, so prefetching a
+            # large range while the current page still has readable entries
+            # makes an offset scan vulnerable to head drift across recovery
+            # windows.  Deferred failed entries remain an exception: keep
+            # advancing past a page whose remaining candidates are all in
+            # their recorded cooldown, so one transient detail failure cannot
+            # starve the rest of the bounded range.
+            pending = scan["conversation_ids"][scan["next_index"]:]
+            failed_reads = scan.get("failed_reads", {})
+            if pending and any(
+                conversation_id not in failed_reads
+                or time.time() >= failed_reads[conversation_id]["next_at"]
+                for conversation_id in pending
+            ):
+                break
             # Bound each persisted candidate window, then inspect it before
             # continuing from the accumulated upstream offset in another
             # recovery round. This keeps the receipt small without turning the
@@ -881,6 +947,8 @@ class ConversationBindingService:
             list_timeout = remaining_timeout()
             if list_timeout < cls.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS:
                 raise cls._scan_incomplete(scan)
+            page_offset = scan["next_offset"]
+            prior_anchor = scan.get("page_anchor")
             try:
                 recent = backend._list_recent_conversations(
                     limit=cls.RECOVERY_RECENT_CONVERSATION_LIMIT,
@@ -893,6 +961,32 @@ class ConversationBindingService:
                 )
             except Exception as exc:
                 raise cls._scan_read_failed(scan, exc, phase="conversation_list") from exc
+            # The validation above and this next page are separate upstream
+            # GETs. A deletion, insertion, or reorder between them changes
+            # the offset's meaning, so discard this uninspected page and
+            # restart instead of advancing past an unknown interval.
+            if prior_anchor is not None:
+                try:
+                    anchored_recent = backend._list_recent_conversations(
+                        limit=cls.RECOVERY_RECENT_CONVERSATION_LIMIT,
+                        offset=prior_anchor["offset"],
+                        timeout_secs=min(cls.RECOVERY_LIST_TIMEOUT_SECONDS, remaining_timeout()),
+                        strict_schema=True,
+                    )
+                except Exception as exc:
+                    raise cls._scan_read_failed(scan, exc, phase="conversation_anchor") from exc
+                anchored_ids = [
+                    str(item.get("id") or item.get("conversation_id") or "").strip()
+                    for item in anchored_recent
+                ]
+                if anchored_ids != prior_anchor["ids"]:
+                    scan["next_offset"] = 0
+                    scan["coverage_complete"] = False
+                    scan["time_order_valid"] = False
+                    scan["last_update_time"] = None
+                    scan.pop("page_anchor", None)
+                    scan["restart_from_head"] = True
+                    raise cls._scan_incomplete(scan)
             raw_page_ids = [
                 str(item.get("id") or item.get("conversation_id") or "").strip()
                 for item in recent
@@ -922,6 +1016,11 @@ class ConversationBindingService:
 
             scan["conversation_ids"].extend(page_ids)
             scan["next_offset"] += len(raw_page_ids)
+            if raw_page_ids:
+                scan["page_anchor"] = {"offset": page_offset, "ids": raw_page_ids}
+            else:
+                scan.pop("page_anchor", None)
+            scan.pop("restart_from_head", None)
             dispatch_at = cls._receipt_dispatch_time(receipt)
             covered_by_time = (
                 scan["time_order_valid"]
@@ -1161,8 +1260,10 @@ class ConversationBindingService:
         last_update_time = value.get("last_update_time")
         next_index = value.get("next_index")
         matches = value.get("matches")
+        anchor = value.get("page_anchor")
+        restarting = value.get("restart_from_head", False)
         if (
-            set(value) - {"failed_reads"} != {
+            set(value) - {"failed_reads", "page_anchor", "restart_from_head"} != {
                 "identity", "conversation_ids", "next_offset", "coverage_complete",
                 "time_order_valid", "last_update_time", "next_index", "matches",
             }
@@ -1171,7 +1272,8 @@ class ConversationBindingService:
             or any(not isinstance(item, str) or not item or len(item) > 200 for item in conversation_ids)
             or len(set(conversation_ids)) != len(conversation_ids)
             or not isinstance(next_offset, int) or isinstance(next_offset, bool)
-            or next_offset < len(conversation_ids)
+            or next_offset < 0
+            or (not restarting and next_offset < len(conversation_ids))
             or not isinstance(coverage_complete, bool)
             or not isinstance(time_order_valid, bool)
             or (last_update_time is not None and (
@@ -1184,6 +1286,20 @@ class ConversationBindingService:
             or not isinstance(next_index, int) or isinstance(next_index, bool)
             or next_index < 0 or next_index > len(conversation_ids)
             or not isinstance(matches, list) or len(matches) > 2
+            or not isinstance(restarting, bool)
+        ):
+            return None
+        if anchor is not None and (
+            not isinstance(anchor, dict)
+            or set(anchor) != {"offset", "ids"}
+            or not isinstance(anchor.get("offset"), int)
+            or isinstance(anchor.get("offset"), bool)
+            or anchor["offset"] < 0
+            or not isinstance(anchor.get("ids"), list)
+            or not anchor["ids"]
+            or len(anchor["ids"]) > cls.RECOVERY_RECENT_CONVERSATION_LIMIT
+            or any(not isinstance(item, str) or not item or len(item) > 200 for item in anchor["ids"])
+            or anchor["offset"] + len(anchor["ids"]) != next_offset
         ):
             return None
         failures = safe_scan_failures(value.get("failed_reads", {}), conversation_ids[next_index:])
@@ -1215,6 +1331,9 @@ class ConversationBindingService:
             "last_update_time": last_update_time,
             "next_index": next_index,
             "matches": safe_matches,
+            **({"page_anchor": {"offset": anchor["offset"], "ids": list(anchor["ids"])}
+                } if anchor is not None else {}),
+            **({"restart_from_head": True} if restarting else {}),
             **({"failed_reads": failures} if failures else {}),
         }
 

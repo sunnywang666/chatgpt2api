@@ -186,6 +186,8 @@ def test_window_rollover_retains_failed_candidates_and_matches(clock):
     rows += [('later', document('later', True))]
     backend = Backend(rows)
     scan_error(backend, row)
+    for _ in range(4):
+        scan_error(backend, row)
     assert row[SCAN]['next_offset'] == 100
     assert row[SCAN]['conversation_ids'] == ['bad']
     assert row[SCAN]['next_index'] == 0
@@ -193,18 +195,176 @@ def test_window_rollover_retains_failed_candidates_and_matches(clock):
     assert backend.calls[-1][0] == 'later'
     assert row[SCAN]['failed_reads']['bad']['attempts'] == 1
     assert len(row[SCAN]['matches']) == 1
-    assert backend.pages == [0, 20, 40, 60, 80, 100]
+    assert backend.pages == [0, 0, 20, 0, 20, 40, 20, 40, 60, 40, 60, 80, 60, 80, 100, 80]
 
 
 def test_all_failed_windows_stay_bounded_and_never_report_no_match(clock):
     row = receipt()
     backend = Backend([(f'bad-{i}', http_error(404)) for i in range(121)])
-    scan_error(backend, row)
-    scan_error(backend, row)
+    for _ in range(5):
+        scan_error(backend, row)
     assert len(row[SCAN]['conversation_ids']) == 100
     assert len(row[SCAN]['failed_reads']) == 100
     assert row[SCAN]['coverage_complete'] is False
     assert len(backend.calls) == 100
+
+
+@pytest.mark.parametrize('change', ['insert', 'delete', 'reorder'])
+def test_resumed_offset_scan_requires_the_previous_page_anchor(clock, change):
+    row = receipt()
+    original = [(f'conversation-{index}', document(f'conversation-{index}'))
+                for index in range(20)]
+    backend = Backend(original)
+    scan_error(backend, row)
+    assert row[SCAN]['next_offset'] == 20
+    assert row[SCAN]['page_anchor']['offset'] == 0
+
+    if change == 'insert':
+        backend.rows = dict([('new-head', document('new-head')), *original])
+    elif change == 'delete':
+        backend.rows = dict(original[1:])
+    else:
+        backend.rows = dict([original[1], original[0], *original[2:]])
+
+    reads_before = len(backend.calls)
+    error = scan_error(backend, row)
+    assert error.recovery_reason == TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value
+    assert error.recovery_scan['next_offset'] == 0
+    assert error.recovery_scan['restart_from_head'] is True
+    assert 'page_anchor' not in error.recovery_scan
+    assert error.recovery_scan['coverage_complete'] is False
+    assert len(backend.calls) == reads_before
+    assert backend.pages == [0, 0]
+
+
+def test_anchor_rate_limit_then_head_drift_keeps_the_original_scan_unknown(clock):
+    row = receipt()
+    original = [(f'conversation-{index}', document(f'conversation-{index}'))
+                for index in range(20)]
+    backend = Backend(original)
+    scan_error(backend, row)
+    list_recent = backend._list_recent_conversations
+    backend._list_recent_conversations = mock.Mock(side_effect=http_error(429, 120))
+
+    rate_limited = scan_error(backend, row)
+    assert TextTaskService._recovery_failure(rate_limited) == ('RECOVERY_RATE_LIMITED', 120)
+    assert rate_limited.recovery_read_error['phase'] == 'conversation_anchor'
+    assert row[SCAN]['next_offset'] == 20
+    assert row[SCAN]['page_anchor']['offset'] == 0
+
+    backend._list_recent_conversations = list_recent
+    backend.rows = dict([('new-head', document('new-head')), *original])
+    reads_before = len(backend.calls)
+    drift = scan_error(backend, row)
+    assert drift.recovery_reason == TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value
+    assert drift.recovery_scan['next_offset'] == 0
+    assert drift.recovery_scan['restart_from_head'] is True
+    assert drift.recovery_scan['coverage_complete'] is False
+    assert len(backend.calls) == reads_before
+    assert backend.pages == [0, 0]
+
+
+def test_legacy_offset_progress_without_an_anchor_restarts_before_short_page(clock):
+    row = receipt()
+    backend = Backend([(f'conversation-{index}', document(f'conversation-{index}'))
+                       for index in range(20)])
+    scan_error(backend, row)
+    row[SCAN].pop('page_anchor')
+    pages_before = list(backend.pages)
+
+    error = scan_error(backend, row)
+    assert error.recovery_reason == TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value
+    assert error.recovery_scan['next_offset'] == 0
+    assert error.recovery_scan['restart_from_head'] is True
+    assert error.recovery_scan['coverage_complete'] is False
+    assert backend.pages == pages_before
+
+
+def test_legacy_completed_offset_progress_without_an_anchor_restarts(clock):
+    row = receipt()
+    backend = Backend([(f'conversation-{index}', document(f'conversation-{index}'))
+                       for index in range(20)])
+    scan_error(backend, row)
+    row[SCAN].update(coverage_complete=True, conversation_ids=[], next_index=0)
+    row[SCAN].pop('page_anchor')
+    pages_before = list(backend.pages)
+
+    error = scan_error(backend, row)
+    assert error.recovery_reason == TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value
+    assert error.recovery_scan['next_offset'] == 0
+    assert error.recovery_scan['coverage_complete'] is False
+    assert error.recovery_scan['restart_from_head'] is True
+    assert backend.pages == pages_before
+
+
+@pytest.mark.parametrize('change', ['insert', 'delete', 'reorder'])
+def test_next_page_rechecks_anchor_after_in_window_head_drift(clock, change):
+    row = receipt()
+    original = [(f'conversation-{index}', document(f'conversation-{index}'))
+                for index in range(41)]
+    backend = Backend(original)
+    scan_error(backend, row)
+    original_list = backend._list_recent_conversations
+    drifted = False
+
+    def list_with_drift(*, offset, **kwargs):
+        nonlocal drifted
+        result = original_list(offset=offset, **kwargs)
+        if offset == 20 and not drifted:
+            if change == 'insert':
+                backend.rows = dict([('new-head', document('new-head')), *original])
+            elif change == 'delete':
+                backend.rows = dict(original[1:])
+            else:
+                backend.rows = dict([original[1], original[0], *original[2:]])
+            drifted = True
+        return result
+
+    backend._list_recent_conversations = list_with_drift
+    reads_before = len(backend.calls)
+    error = scan_error(backend, row)
+    assert error.recovery_reason == TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value
+    assert error.recovery_scan['next_offset'] == 0
+    assert error.recovery_scan['coverage_complete'] is False
+    assert error.recovery_scan['restart_from_head'] is True
+    assert 'page_anchor' not in error.recovery_scan
+    assert len(backend.calls) == reads_before
+    assert backend.pages[-3:] == [0, 20, 0]
+
+
+def test_next_page_anchor_rate_limit_after_head_drift_stays_unknown(clock):
+    row = receipt()
+    original = [(f'conversation-{index}', document(f'conversation-{index}'))
+                for index in range(41)]
+    backend = Backend(original)
+    scan_error(backend, row)
+    original_list = backend._list_recent_conversations
+    drifted = False
+
+    def list_with_drift_then_rate_limit(*, offset, **kwargs):
+        nonlocal drifted
+        if drifted and offset == 0:
+            raise http_error(429, 120)
+        result = original_list(offset=offset, **kwargs)
+        if offset == 20:
+            backend.rows = dict(original[1:])
+            drifted = True
+        return result
+
+    backend._list_recent_conversations = list_with_drift_then_rate_limit
+    limited = scan_error(backend, row)
+    assert TextTaskService._recovery_failure(limited) == ('RECOVERY_RATE_LIMITED', 120)
+    assert limited.recovery_read_error['phase'] == 'conversation_anchor'
+    assert row[SCAN]['next_offset'] == 20
+    assert row[SCAN]['page_anchor']['offset'] == 0
+    assert row[SCAN]['coverage_complete'] is False
+
+    backend._list_recent_conversations = original_list
+    drift = scan_error(backend, row)
+    assert drift.recovery_reason == TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value
+    assert drift.recovery_scan['next_offset'] == 0
+    assert drift.recovery_scan['restart_from_head'] is True
+    assert drift.recovery_scan['coverage_complete'] is False
 
 
 def test_deferred_retry_honors_longer_retry_after(clock):
