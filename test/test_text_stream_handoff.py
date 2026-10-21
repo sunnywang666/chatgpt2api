@@ -1,9 +1,15 @@
 """A stream handoff may only consume the exact original turn once."""
 import json
+import time
 from types import SimpleNamespace
 
+import pytest
+from curl_cffi import CurlECode, CurlError, CurlWsFlag
+from services.account_request_pacing import AccountRequestDeadlineExceeded
+from services import openai_backend_api as backend_module
 from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, _StreamHandoff
 from services.pool_admission import _safe_stream_handoff_event_metadata
+from services.protocol.conversation import conversation_events
 from services.request_context import current_request
 
 
@@ -38,6 +44,7 @@ class WebSocket:
         self.frames = iter(frames)
         self.sent = []
         self.closed = False
+        self.terminated = False
 
     def send_str(self, value):
         self.sent.append(value)
@@ -49,7 +56,27 @@ class WebSocket:
         self.closed = True
 
     def terminate(self):
+        self.terminated = True
         self.closed = True
+
+
+class FragmentWebSocket(WebSocket):
+    """A curl-cffi-like socket that exposes individually flagged fragments."""
+    def __init__(self, frames):
+        super().__init__(frames)
+        self.curl = SimpleNamespace(getinfo=lambda _info: 9)
+
+    def recv_fragment(self):
+        item = next(self.frames)
+        if isinstance(item, Exception):
+            raise item
+        if isinstance(item, tuple):
+            return item
+        return item.encode(), SimpleNamespace(flags=CurlWsFlag.TEXT, bytesleft=0)
+
+
+def _fragment(chunk, flags, *, bytesleft=0):
+    return chunk, SimpleNamespace(flags=flags, bytesleft=bytesleft)
 
 
 class Session:
@@ -61,6 +88,7 @@ class Session:
         self.get_calls = []
         self.ws_calls = []
         self.ws = None
+        self.ws_type = WebSocket
         self.verify = True
         self.impersonate = "chrome110"
         self.proxies = {"all": "socks5h://bound-proxy.example:1080"}
@@ -76,7 +104,7 @@ class Session:
 
     def ws_connect(self, url, **kwargs):
         self.ws_calls.append((url, kwargs))
-        self.ws = WebSocket(self.frames)
+        self.ws = self.ws_type(self.frames)
         return self.ws
 
 
@@ -242,10 +270,14 @@ def test_handoff_subscribes_once_and_closes_without_a_second_conversation_post()
     assert len(backend.session.post_calls) == 1
     assert len(backend.session.get_calls) == 1
     assert len(backend.session.ws_calls) == 1
-    assert json.loads(backend.session.ws.sent[0]) == [{
-        "id": 1,
-        "command": {"type": "subscribe", "topic_id": "conversation-turn-turn-1", "offset": "0"},
-    }]
+    assert json.loads(backend.session.ws.sent[0]) == [
+        {"id": 1, "command": {
+            "type": "connect", "presence": {"type": "presence", "state": "foreground"},
+        }},
+        {"id": 2, "command": {
+            "type": "subscribe", "topic_id": "conversation-turn-turn-1", "offset": "0",
+        }},
+    ]
     assert backend.session.ws_calls[0][1]["allow_redirects"] is False
     assert backend.session.ws_calls[0][1]["headers"]["Authorization"] == "Bearer bound"
     assert backend.session.ws_calls[0][1]["verify"] is True
@@ -253,6 +285,92 @@ def test_handoff_subscribes_once_and_closes_without_a_second_conversation_post()
     assert backend.session.ws_calls[0][1]["proxies"] == {"all": "socks5h://bound-proxy.example:1080"}
     assert backend.session.ws_calls[0][1]["cookies"] == {"session": "bound"}
     assert backend.session.ws.closed is True
+
+
+def test_protocol_consumer_closure_preserves_terminal_stage_before_closing_handoff():
+    """The DONE adapter closes upstream, but must not erase terminal evidence."""
+    backend = _backend(_initial_events(), frames=[_ws_frame()])
+    context = StageContext()
+    token = current_request.set(context)
+    try:
+        events = list(conversation_events(backend, prompt="fixture"))
+    finally:
+        current_request.reset(token)
+
+    assert events[-1]["type"] == "conversation.done"
+    stages = [data["handoff_stage"] for stage, data in context.stages if stage == "stream_handoff"]
+    assert stages == [
+        "candidate_bound", "ws_endpoint_get_entered", "ws_endpoint_get_completed",
+        "ws_connected", "ws_subscribed", "ws_terminal",
+    ]
+    assert len(backend.session.post_calls) == len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+    assert backend.session.ws.closed is True
+
+
+def test_handoff_consumes_curl_fragments_with_the_shared_deadline():
+    backend = _backend(_initial_events(), frames=[_ws_frame()])
+    backend.session.ws_type = FragmentWebSocket
+
+    assert list(backend.stream_conversation(prompt="fixture"))[-1] == "[DONE]"
+    assert len(backend.session.post_calls) == len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+    assert backend.session.ws.closed is True
+
+
+def test_handoff_fragment_receive_respects_the_existing_shared_deadline():
+    with pytest.raises(AccountRequestDeadlineExceeded):
+        OpenAIBackendAPI._handoff_ws_text(
+            FragmentWebSocket([_ws_frame()]), time.monotonic() - 0.01, 1024)
+
+
+def test_handoff_fragment_receive_collects_text_continuations_and_ignores_ping():
+    ws = FragmentWebSocket([
+        _fragment(b'{"reply":', CurlWsFlag.TEXT | CurlWsFlag.CONT, bytesleft=12),
+        _fragment(b"", CurlWsFlag.PING, bytesleft=0),
+        _fragment(b'"ok"', CurlWsFlag.CONT, bytesleft=2),
+        _fragment(b"}", 0, bytesleft=0),
+    ])
+
+    assert OpenAIBackendAPI._handoff_ws_text(ws, time.monotonic() + 1, 1024) == '{"reply":"ok"}'
+
+
+def test_handoff_fragment_close_has_no_terminal_payload():
+    ws = FragmentWebSocket([_fragment(b"", CurlWsFlag.CLOSE, bytesleft=0)])
+
+    assert OpenAIBackendAPI._handoff_ws_text(ws, time.monotonic() + 1, 1024) == ""
+
+
+def test_handoff_fragment_again_waits_only_until_shared_deadline(monkeypatch):
+    ws = FragmentWebSocket([CurlError("again", CurlECode.AGAIN)])
+    ticks = iter((10.0, 11.0))
+    waits = []
+    monkeypatch.setattr(backend_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(backend_module.select, "select",
+                        lambda _r, _w, _x, timeout: waits.append(timeout) or ([], [], []))
+
+    with pytest.raises(AccountRequestDeadlineExceeded):
+        OpenAIBackendAPI._handoff_ws_text(ws, 11.0, 1024)
+
+    assert waits == [0.5]
+
+
+def test_handoff_fragment_rejects_oversized_text_before_decode():
+    ws = FragmentWebSocket([_fragment(b"too-large", CurlWsFlag.TEXT, bytesleft=0)])
+
+    with pytest.raises(AccountRequestDeadlineExceeded):
+        OpenAIBackendAPI._handoff_ws_text(ws, time.monotonic() + 1, 3)
+
+
+def test_handoff_budget_terminates_the_socket_without_a_graceful_close(monkeypatch):
+    backend = _backend(_initial_events(), frames=[_ws_frame()])
+
+    def deadline(*_args, **_kwargs):
+        raise AccountRequestDeadlineExceeded("fixture deadline")
+
+    monkeypatch.setattr(OpenAIBackendAPI, "_handoff_ws_text", staticmethod(deadline))
+    handoff = SimpleNamespace(topic_id="conversation-turn-turn-1")
+
+    assert list(backend._consume_stream_handoff(handoff, time.monotonic() + 5)) == []
+    assert backend.session.ws.terminated is True
 
 
 def test_unbound_stream_does_not_open_a_handoff_transport():
@@ -406,7 +524,7 @@ def test_server_ste_metadata_turn_opens_one_bound_ws_handoff():
     assert len(backend.session.post_calls) == 1
     assert len(backend.session.get_calls) == 1
     assert len(backend.session.ws_calls) == 1
-    assert json.loads(backend.session.ws.sent[0])[0]["command"]["topic_id"] == "conversation-turn-turn-1"
+    assert json.loads(backend.session.ws.sent[0])[1]["command"]["topic_id"] == "conversation-turn-turn-1"
     assert backend.session.ws.closed is True
 
 
