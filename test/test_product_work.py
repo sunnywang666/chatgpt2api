@@ -1,5 +1,7 @@
 import copy
 import json
+import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -544,3 +546,90 @@ def test_cursorless_rejected_chat_unknown_codex_child_does_not_release_product(r
         service.close(IDENTITY, "P")
     assert service.get(IDENTITY, "P")["state"] == "active"
     assert calls == []
+
+
+def test_get_keeps_one_query_only_snapshot_without_blocking_wal_writer(runtime, monkeypatch):
+    """A product projection reads one point in time without claiming the writer lock."""
+    service, _, store, _, _, _, add = runtime
+    original = add("original", conversation="shared")
+
+    # TaskStore itself does not choose WAL. Configure this isolated real SQLite
+    # fixture explicitly so this test proves the configured WAL concurrency
+    # behavior without claiming it for every deployment.
+    with sqlite3.connect(store.path) as configured:
+        assert configured.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+
+    entered, release = threading.Event(), threading.Event()
+    result, failure, observed = {}, [], {}
+    projection = service._projection
+
+    def paused_projection(db, parent):
+        observed["query_only"] = db.execute("PRAGMA query_only").fetchone()[0]
+        observed["in_transaction"] = db.in_transaction
+        entered.set()  # _load has already established the read snapshot.
+        assert release.wait(3)
+        return projection(db, parent)
+
+    monkeypatch.setattr(service, "_projection", paused_projection)
+
+    def read_projection():
+        try:
+            result["value"] = service.get(IDENTITY, "P")
+        except BaseException as exc:  # Preserve the thread exception for the assertion below.
+            failure.append(exc)
+
+    reader = threading.Thread(target=read_projection)
+    reader.start()
+    assert entered.wait(2)
+    try:
+        # Same physical conversation but a foreign product binding would be a
+        # normal PRODUCT_WORK_CONVERSATION_CONFLICT on a later read. It must not
+        # appear midway through this projection's deferred snapshot.
+        foreign = copy.deepcopy(original)
+        foreign.update(request_id="foreign", _product_work_key="product_work:foreign",
+                       _product_work={"product_ref": "Q", "step_ref": "foreign"})
+        with store.transaction(busy_timeout_secs=0.5) as db:
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)",
+                       ("owner", "foreign", "foreign-hash", json.dumps(foreign)))
+    finally:
+        release.set()
+        reader.join(timeout=3)
+
+    assert not reader.is_alive() and not failure
+    assert observed == {"query_only": 1, "in_transaction": True}
+    assert "PRODUCT_WORK_CONVERSATION_CONFLICT" not in result["value"]["blocked_reasons"]
+    assert "PRODUCT_WORK_CONVERSATION_CONFLICT" in service.get(IDENTITY, "P")["blocked_reasons"]
+
+
+def test_get_in_delete_mode_reads_while_an_existing_writer_is_reserved(runtime, monkeypatch):
+    service, _, store, _, _, _, add = runtime
+    add("original")
+    with store.connect() as db:
+        assert db.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+    connect = store._connect
+    monkeypatch.setattr(store, "_connect", lambda **kwargs: connect(busy_timeout_secs=0.2))
+    with store.transaction() as writer:
+        store.set_runtime(writer, "uncommitted:writer", {"pending": True})
+        # A read can see the last committed snapshot while another connection
+        # owns RESERVED. BEGIN IMMEDIATE would instead contend with that writer.
+        assert service.get(IDENTITY, "P")["state"] == "active"
+    # DELETE-mode readers can still delay a writer's COMMIT. No test here claims
+    # that a long projection permits concurrent commit outside WAL mode.
+
+
+def test_get_read_snapshot_releases_transaction_when_projection_raises(runtime, monkeypatch):
+    service, _, store, _, _, _, add = runtime
+    add("original")
+
+    def fail_projection(db, parent):
+        assert db.execute("PRAGMA query_only").fetchone()[0] == 1
+        assert db.in_transaction
+        raise RuntimeError("projection failed")
+
+    monkeypatch.setattr(service, "_projection", fail_projection)
+    with pytest.raises(RuntimeError, match="projection failed"):
+        service.get(IDENTITY, "P")
+
+    # A new real writer proves the failed read released its deferred transaction.
+    with store.transaction(busy_timeout_secs=0.2) as db:
+        store.set_runtime(db, "product_work:test_after_failed_read", {"released": True})

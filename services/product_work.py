@@ -1029,8 +1029,20 @@ class ProductWorkService:
                 "blocked_reasons": sorted(set(reasons))}
 
     def get(self, identity, product_ref):
-        with self.store.transaction() as db:
-            return self._projection(db, self._load(db, identity, product_ref))
+        # A product projection spans parent, member and conflict receipts.  Hold
+        # one deferred snapshot for those reads, but never acquire the store's
+        # writer transaction merely to render it.  `query_only` applies only to
+        # this short-lived connection; schema initialization happens before it.
+        with self.store.connect() as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN DEFERRED")
+            try:
+                return self._projection(db, self._load(db, identity, product_ref))
+            finally:
+                # End an explicit read transaction before connection teardown on
+                # both the normal and exceptional paths.
+                if db.in_transaction:
+                    db.rollback()
 
     def cancel_step(self, identity, product_ref, request_id, expected_version):
         if type(expected_version) is not int or expected_version < 1:
