@@ -504,7 +504,6 @@ class ModelCatalogService:
             self._model_observations = {**self._model_observations, identity: observation}
             self._models_by_account = {**self._models_by_account, identity: models}
             self._account_types = {**self._account_types, identity: account_type}
-            self._account_signature = self._signature(current)
             expires = read_at + self._cache_ttl_seconds
             self._expires_at = expires if self._expires_at <= now else min(self._expires_at, expires)
         return True
