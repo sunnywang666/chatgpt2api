@@ -747,6 +747,10 @@ class ConversationBindingService:
     RECOVERY_SCAN_TIMEOUT_SECONDS = 20.0
     RECOVERY_LIST_TIMEOUT_SECONDS = 10.0
     RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS = 5.0
+    # A known original conversation is one read, but its account FIFO wait is
+    # still part of recovery.  Bound it so a pre-send pacing wait cannot keep
+    # renewing the durable recovery lease forever.
+    RECOVERY_EXACT_READ_TIMEOUT_SECONDS = 60.0
     RECOVERY_DISPATCH_CLOCK_SKEW_SECONDS = 30.0
     RECOVERY_COVERAGE_VERSION = 1
 
@@ -776,6 +780,11 @@ class ConversationBindingService:
 
     def read_text_request(self, receipt: dict[str, Any]) -> dict[str, Any]:
         """Recover only the answer descending from this request's own user turn."""
+        # Start one finite deadline for the whole exact-conversation recovery.
+        # It covers account pacing before GET as well as the socket read; a
+        # timeout therefore returns through TextTaskService recovery cleanup
+        # instead of extending the durable lease without an HTTP attempt.
+        deadline = time.monotonic() + self.RECOVERY_EXACT_READ_TIMEOUT_SECONDS
         binding = receipt["provider_binding_id"]
         if account_service.get_bound_account_identity(binding) != receipt["provider_account_identity"]:
             raise ConversationBindingError(
@@ -817,7 +826,12 @@ class ConversationBindingService:
                         raise
                     return {**recovered, RECOVERY_CONVERSATION_SCAN_FIELD: {}}
                 try:
-                    return self._read_text_request_result(backend, receipt)
+                    return self._read_text_request_result(
+                        backend, receipt,
+                        deadline_monotonic=deadline,
+                        connect_timeout_secs=10.0,
+                        minimum_budget_secs=10.0,
+                    )
                 except UpstreamHTTPError as exc:
                     if exc.status_code != 404:
                         raise
@@ -1521,6 +1535,9 @@ class ConversationBindingService:
         receipt: dict[str, Any],
         *,
         document: dict[str, Any] | None = None,
+        deadline_monotonic: float | None = None,
+        connect_timeout_secs: float | None = None,
+        minimum_budget_secs: float | None = None,
     ) -> dict[str, Any]:
         """Read the exact request branch without requiring it to be current.
 
@@ -1532,7 +1549,15 @@ class ConversationBindingService:
         """
         conversation_id = str(receipt.get("conversation_id") or "").strip()
         request_message_id = str(receipt.get("request_message_id") or "").strip()
-        document = document if document is not None else backend._get_conversation(conversation_id)
+        if document is None:
+            options = {}
+            if deadline_monotonic is not None:
+                options["deadline_monotonic"] = deadline_monotonic
+            if connect_timeout_secs is not None:
+                options["connect_timeout_secs"] = connect_timeout_secs
+            if minimum_budget_secs is not None:
+                options["minimum_budget_secs"] = minimum_budget_secs
+            document = backend._get_conversation(conversation_id, **options)
         returned_conversation_id = str(document.get("conversation_id") or conversation_id).strip()
         if returned_conversation_id != conversation_id:
             raise ConversationBindingError(

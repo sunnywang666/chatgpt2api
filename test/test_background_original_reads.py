@@ -192,6 +192,77 @@ def test_async_images_keep_one_dispatch_per_scan_and_do_not_block_text(recovery,
     assert len(image_calls) == 1
 
 
+def test_fifo_deadline_before_get_releases_all_reader_permits_and_other_account_can_continue(recovery):
+    from services.account_request_pacing import AccountRequestClock, AccountRequestDeadlineExceeded
+    import time
+
+    r = recovery
+    # A durable exact-result reader must not renew its lease forever merely
+    # because a prior same-account ordinary reader owns the FIFO head. Run the
+    # real clock path four times: if any local permit leaked, a different
+    # account's recovery could not enter the shared reader pool.
+    clock = AccountRequestClock("shared-account")
+    clock.ordinary_read_queue = [{"owner": "earlier", "until": time.monotonic() + 900}]
+    clock.ordinary_read_wait_until = clock.ordinary_read_queue[0]["until"]
+    sent = []
+
+    def no_send_reader(_receipt):
+        with pytest.raises(AccountRequestDeadlineExceeded):
+            clock.request(
+                lambda method, url, **kwargs: sent.append((method, url, kwargs)),
+                "GET", "https://chatgpt.com/backend-api/conversation/original",
+                timeout=60,
+                _account_request_deadline_monotonic=time.monotonic() + .01,
+                _account_request_connect_timeout_secs=10,
+                _account_request_minimum_budget_secs=10,
+            )
+        raise AccountRequestDeadlineExceeded("deadline elapsed before original result GET")
+
+    r.text.recovery_reader = no_send_reader
+    r.admission.recoveries["text"] = lambda owner, request_id: r.text.read(owner, request_id)
+    for index in range(4):
+        request_id = f"fifo-{index}"
+        receipt = r.original(request_id, 0, request_id)
+        original_identity = {key: receipt.get(key) for key in (
+            "request_id", "request_hash", "_input_ref", "provider_binding_id",
+            "provider_account_identity", "client_conversation_id", "conversation_id",
+            "request_message_id",
+        )}
+        finished = threading.Event()
+
+        def recover(owner, rid, finished=finished):
+            try:
+                return r.text.read(owner, rid)
+            finally:
+                finished.set()
+
+        assert r.admission._dispatch_original_read("text", "owner", request_id, recover, receipt)
+        assert finished.wait(1)
+        with r.store.connect() as db:
+            current = r.store.read_receipt(db, "text", "owner", request_id)
+        assert current["status"] == "unknown"
+        assert current.get("recovery_claim_id") is None
+        assert current["recovery_next_at"] > r.clock()
+        # No transport began: preserve the durable request/binding and do not
+        # treat this pacing timeout as a qualified original-result read.
+        assert {key: current.get(key) for key in original_identity} == original_identity
+        assert current.get("_result_last_checked_at") is None
+        assert current.get("recovery_no_result_reads", 0) == 0
+        assert current.get("_execution_wait_ended_at") is None
+
+    assert sent == []
+    assert [item["owner"] for item in clock.ordinary_read_queue] == ["earlier"]
+    assert not r.admission._original_reads
+
+    other = r.original("other-account", 1, "other-account")
+    progressed = threading.Event()
+    assert r.admission._dispatch_original_read(
+        "text", "owner", "other-account",
+        lambda *_args: progressed.set(), other,
+    )
+    assert progressed.wait(1)
+
+
 def test_worker_bound_and_start_failure_release_permit(recovery):
     r = recovery
     callbacks = []
