@@ -1,5 +1,7 @@
 name: Provider POOL-02 isolated review
 
+run-name: Provider POOL-02 ${{ inputs.source_sha || github.sha }}${{ inputs.github_hosted && ' auto-hosted' || ' company' }}
+
 on:
   push:
     branches:
@@ -7,6 +9,9 @@ on:
       - codex/**
     paths:
       - .github/workflows/pool02-scoped-ci.yml
+      - .github/workflows/company-queue-fallback.yml
+      - .github/workflows/docker-publish.yml
+      - tools/ci/provider-company-queue-fallback.sh
       - services/conversation_binding_service.py
       - services/pool_admission.py
       - services/product_work.py
@@ -29,6 +34,19 @@ on:
       - test/test_queued_combined_copy_compaction.py
       - test/test_conversation_continuation.py
       - test/test_recovery_scan_progress.py
+      - test/test_ci_fallback_workflow.py
+      - test/test_ci_fallback_observer.py
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact trusted push commit to test
+        required: true
+        type: string
+      github_hosted:
+        description: Run this exact source on GitHub-hosted capacity after the company queue fallback
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -39,11 +57,11 @@ jobs:
     # Review external contributions first, then bring approved code into a trusted
     # main or codex/** branch with write access; fork PRs never execute here.
     # GitHub contributor approval and runner-group policy remain independent controls.
-    if: ${{ github.repository == 'sunnywang666/chatgpt2api' }}
-    runs-on: ${{ fromJSON('["self-hosted","Linux","X64","hugsweet-linux-ci"]') }}
+    if: ${{ github.repository == 'sunnywang666/chatgpt2api' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/codex/')))) }}
+    runs-on: ${{ inputs.github_hosted == true && 'ubuntu-latest' || fromJSON('["self-hosted","Linux","X64","hugsweet-linux-ci"]') }}
     timeout-minutes: 20
     env:
-      SOURCE_SHA: ${{ github.sha }}
+      SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
       CHATGPT2API_AUTH_KEY: isolated-pool02-fixture
       PROVIDER_DATA_DIR: /tmp/provider-pool02-fixture
       TIKTOKEN_CACHE_DIR: /tmp/provider-pool02-tokenizer
@@ -53,7 +71,16 @@ jobs:
           ref: ${{ env.SOURCE_SHA }}
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            test "$DISPATCH_SHA" = "$SOURCE_SHA"
+          fi
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -89,4 +116,6 @@ jobs:
             test/test_image_thread_continuity.py \
             test/test_incomplete_compact_successor.py \
             test/test_conversation_continuation.py \
-            test/test_recovery_scan_progress.py
+            test/test_recovery_scan_progress.py \
+            test/test_ci_fallback_workflow.py \
+            test/test_ci_fallback_observer.py

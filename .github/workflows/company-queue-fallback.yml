@@ -1,0 +1,40 @@
+name: Provider company queue fallback
+
+on:
+  workflow_run:
+    workflows:
+      - Provider POOL-02 isolated review
+      - Publish Docker Image
+    types:
+      - requested
+
+# The observer never runs Provider code.  It can only inspect, cancel, and
+# explicitly re-dispatch an untouched company-queued run.
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  fallback:
+    if: ${{ github.repository == 'sunnywang666/chatgpt2api' && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') && github.event.workflow_run.head_repository.full_name == github.repository && !contains(github.event.workflow_run.display_title, ' auto-hosted') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Observe only an untouched company queue
+        id: route
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          DISPLAY_TITLE: ${{ github.event.workflow_run.display_title }}
+        run: |
+          bash tools/ci/provider-company-queue-fallback.sh
