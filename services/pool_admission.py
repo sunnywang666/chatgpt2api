@@ -12,6 +12,7 @@ from contextlib import nullcontext
 import hashlib
 import json
 import math
+import sqlite3
 import threading
 import time
 import uuid
@@ -748,6 +749,10 @@ class ExecutionContext:
 
 class PoolAdmission:
     CLAIM_SECONDS = 30.0
+    # Heartbeat writes must never consume the store's normal 30-second writer
+    # wait: a queued admission transaction would then outlive this claim.
+    CLAIM_HEARTBEAT_WRITER_TIMEOUT_SECS = 0.25
+    CLAIM_HEARTBEAT_RETRY_SECS = 0.25
     # Existing text executor's retained-input protection; waiting inputs live
     # on disk. This is an execution memory ceiling, not an account/user budget.
     MAX_ACTIVE_INPUT_BYTES = 256 * 1024 * 1024
@@ -1032,13 +1037,7 @@ class PoolAdmission:
 
     def run_recovery(self, context, function, args):
         done = threading.Event()
-        def heartbeat():
-            while not done.wait(self.CLAIM_SECONDS / 3):
-                try:
-                    self.update_claim(context, _claim_until=float(self.clock()) + self.CLAIM_SECONDS)
-                except Exception:
-                    return
-        threading.Thread(target=heartbeat, name="original-read-heartbeat", daemon=True).start()
+        self._start_claim_heartbeat(context, done, name="original-read-heartbeat")
         try:
             with executing(context):
                 function(*args)
@@ -1222,6 +1221,20 @@ class PoolAdmission:
                 transferred.add(key)
         return released, transferred
 
+    @staticmethod
+    def _missing_node_unfinished_by_conversation(receipts):
+        """Index unfinished receipts by the exact C/A4 conversation boundary."""
+        fields = ("provider_binding_id", "provider_account_identity",
+                  "client_conversation_id", "conversation_id")
+        indexed = {}
+        for kind, owner, request_id, receipt in receipts:
+            if not unfinished(kind, receipt):
+                continue
+            values = tuple(receipt.get(field) for field in fields)
+            if all(isinstance(value, str) and value for value in values):
+                indexed.setdefault((owner, *values), set()).add((kind, request_id))
+        return indexed
+
     def _snapshot(self, rows, receipts, settings, types, now, cursor, workflow_state=None, product_state=None, *, db=None):
         from services.text_task_service import TextTaskService
         works, workflow_clocks = workflow_state or ({}, {})
@@ -1237,6 +1250,20 @@ class PoolAdmission:
         # head forever. This is a planner-only projection, never a status edit.
         text_receipts = {(owner, request_id): r for kind, owner, request_id, r in receipts
                          if kind == "text"}
+        # The missing-node C proof needs to reject any unfinished receipt in
+        # its exact physical conversation.  `receipts` is already the current
+        # transaction snapshot; index it once instead of re-decoding the full
+        # database for every C while the admission writer is held.
+        missing_node_unfinished = self._missing_node_unfinished_by_conversation(receipts)
+        missing_node_retry_valid = {}
+
+        def valid_missing_node_retry(owner, request_id, receipt):
+            key = (owner, request_id)
+            if key not in missing_node_retry_valid:
+                missing_node_retry_valid[key] = TextTaskService._missing_node_model_rejection_retry(
+                    self.store, db, owner, receipt, now,
+                    unfinished_by_conversation=missing_node_unfinished)
+            return missing_node_retry_valid[key]
         released_order_heads, transferred_empty_turns = self._empty_turn_transfers(receipts)
         successors = {}
         for (owner, request_id), r in text_receipts.items():
@@ -1279,8 +1306,7 @@ class PoolAdmission:
                              or unknown_text_result(retries[0][1]))
                         and (TextTaskService._no_final_model_rejection_retry(
                                 self.store, db, key[0], retries[0][1], now)
-                             or TextTaskService._missing_node_model_rejection_retry(
-                                self.store, db, key[0], retries[0][1], now)
+                             or valid_missing_node_retry(key[0], retries[0][0], retries[0][1])
                              or TextTaskService._missing_node_model_rejection_retry_consumed(
                                 self.store, db, key[0], retries[0][1]))
                         and TextTaskService._supersede_order_link(successor, retries[0][1])
@@ -1304,8 +1330,7 @@ class PoolAdmission:
                 image_id = receipt.get(TextTaskService.MISSING_NODE_RETRY_FIELD)
                 live_link = (receipt.get("status") in {"queued", "running", "unknown"}
                              and isinstance(image_id, str) and image_id
-                             and TextTaskService._missing_node_model_rejection_retry(
-                                 self.store, db, owner, receipt, now))
+                             and valid_missing_node_retry(owner, request_id, receipt))
                 # Once C has positively succeeded, late observations on R/P
                 # must not revive their UNKNOWN queue barrier.  This is the
                 # durable four-receipt proof, deliberately separate from live
@@ -2209,6 +2234,28 @@ class PoolAdmission:
             self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
         self.wake()
 
+    def renew_claim(self, context, *, busy_timeout_secs=None):
+        """Extend one live claim from the instant its SQLite writer is held."""
+        timeout = (self.CLAIM_HEARTBEAT_WRITER_TIMEOUT_SECS
+                   if busy_timeout_secs is None else busy_timeout_secs)
+        with self.store.transaction(busy_timeout_secs=timeout) as db:
+            r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
+            if r is None or r.get("_claim_id") != context.claim:
+                raise AdmissionLost("original task claim changed")
+            # `BEGIN IMMEDIATE` may have waited behind a broad admission pass.
+            # Do not persist a deadline computed before that wait.
+            r["_claim_until"] = float(self.clock()) + self.CLAIM_SECONDS
+            self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
+        self.wake()
+
+    @staticmethod
+    def _sqlite_lock_contention(exc):
+        """Only retry a SQLite BUSY/LOCKED error; schema/I/O faults must surface."""
+        if not isinstance(exc, sqlite3.OperationalError):
+            return False
+        code = getattr(exc, "sqlite_errorcode", None)
+        return (type(code) is int and (code & 0xff) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+
     def image_capability_refresh(self, context):
         """Return one exact-account metadata read, never while send locks are held."""
         refresh = getattr(self.accounts, "refresh_image_capability", None)
@@ -2616,26 +2663,40 @@ class PoolAdmission:
                      _claim_until=now + self.CLAIM_SECONDS, _execution_timeline=timeline[-32:])
             self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
 
+    def _start_claim_heartbeat(self, context, done, *, name):
+        """Renew a fenced claim without letting a busy writer consume its lease."""
+        def heartbeat():
+            interval = self.CLAIM_SECONDS / 3
+            retry_delay = min(self.CLAIM_HEARTBEAT_RETRY_SECS, interval)
+            while not done.wait(interval):
+                while not done.is_set():
+                    try:
+                        self.renew_claim(context)
+                        break
+                    except Exception as exc:
+                        # No exception message, input, credential or raw identity.
+                        # A short SQLite writer collision is not a lost claim:
+                        # retry only the exact BUSY/LOCKED codes. Other storage
+                        # failures remain visible and cannot be spun forever.
+                        logger.warning({"event": "pool_execution_stage", "stage": "claim_heartbeat_failed",
+                                        "at": float(self.clock()),
+                                        "request_ref": hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24],
+                                        "error_type": ("AdmissionLost" if isinstance(exc, AdmissionLost)
+                                                       else type(exc).__name__ if type(exc).__name__ in
+                                                       {"OperationalError", "DatabaseError", "TimeoutError", "OSError"}
+                                                       else "ClaimRefreshError")})
+                        if self._sqlite_lock_contention(exc):
+                            if done.wait(retry_delay):
+                                return
+                            continue
+                        return
+        heart = threading.Thread(target=heartbeat, name=name, daemon=True)
+        heart.start()
+        return heart
+
     def execute(self, context):
         done = threading.Event()
-        def heartbeat():
-            while not done.wait(self.CLAIM_SECONDS / 3):
-                try:
-                    self.update_claim(context, _claim_until=float(self.clock()) + self.CLAIM_SECONDS)
-                except Exception as exc:
-                    # No exception message, input, credential or raw identity.
-                    # Failure to renew is otherwise lost before the send guard
-                    # rejects and safely requeues this original request.
-                    logger.warning({"event": "pool_execution_stage", "stage": "claim_heartbeat_failed",
-                                    "at": float(self.clock()),
-                                    "request_ref": hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24],
-                                    "error_type": ("AdmissionLost" if isinstance(exc, AdmissionLost)
-                                                   else type(exc).__name__ if type(exc).__name__ in
-                                                   {"OperationalError", "DatabaseError", "TimeoutError", "OSError"}
-                                                   else "ClaimRefreshError")})
-                    return
-        heart = threading.Thread(target=heartbeat, name="original-task-heartbeat", daemon=True)
-        heart.start()
+        self._start_claim_heartbeat(context, done, name="original-task-heartbeat")
         try:
             with self.store.connect() as db:
                 r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)

@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from datetime import datetime, timezone
@@ -1710,8 +1711,209 @@ class AdmissionTests(unittest.TestCase):
                 self.assertNotIn("fixture-token", "\n".join(captured.output))
                 self.assertNotIn("private image input", "\n".join(captured.output))
 
-    def test_guard_reason_and_heartbeat_diagnostics_do_not_log_exception_text(self):
+    def test_claim_renewal_uses_writer_acquisition_time_after_sqlite_contention(self):
+        self.submit("heartbeat-contention")
+        context = self.admission.claim_next()
+        with self.store.connect() as db:
+            before = self.store.read_receipt(db, "text", "happy", "heartbeat-contention")
+        original = {key: before.get(key) for key in (
+            "request_hash", "_input_ref", "provider_binding_id", "provider_account_identity",
+            "client_conversation_id", "request_message_id",
+        )}
+        holder = self.store._connect()
+        holder.execute("BEGIN IMMEDIATE")
+        started, finished, errors = threading.Event(), threading.Event(), []
+
+        def renew():
+            started.set()
+            try:
+                self.admission.renew_claim(context)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=renew)
+        worker.start()
+        try:
+            self.assertTrue(started.wait(1))
+            time.sleep(.05)
+            self.assertFalse(finished.is_set(), "renewal must wait for the real SQLite writer")
+            self.clock.now += self.admission.CLAIM_SECONDS + 1
+            holder.commit()
+        finally:
+            if holder.in_transaction:
+                holder.rollback()
+            holder.close()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        with self.store.connect() as db:
+            renewed = self.store.read_receipt(db, "text", "happy", "heartbeat-contention")
+        self.assertEqual(renewed["_claim_id"], context.claim)
+        self.assertEqual(renewed["_claim_until"], self.clock() + self.admission.CLAIM_SECONDS)
+        self.assertEqual({key: renewed.get(key) for key in original}, original)
+        # The strict send guard sees the fresh writer-time lease. No handler or
+        # upstream POST runs as part of a heartbeat renewal.
+        context.before_send()
+        self.assertEqual(self.calls, [])
+        with self.store.connect() as db:
+            guarded = self.store.read_receipt(db, "text", "happy", "heartbeat-contention")
+        self.assertTrue(guarded["_submission_started"])
+        self.assertEqual({key: guarded.get(key) for key in original}, original)
+
+    def test_busy_heartbeat_retries_real_sqlite_timeout_and_allows_exactly_one_send(self):
+        self.submit("heartbeat-busy")
+        context = self.admission.claim_next()
+        holders = []
+        busy_seen, renewed = threading.Event(), threading.Event()
+        renew = self.admission.renew_claim
+
+        def observed_renew(ctx):
+            result = renew(ctx)
+            renewed.set()
+            return result
+
+        def runner(body, on_cursor):
+            # The normal handler has reached its external-call boundary. Hold
+            # the writer only now, so this is the real heartbeat contention,
+            # rather than blocking initial handler bookkeeping.
+            holder = self.store._connect()
+            holders.append(holder)
+            holder.execute("BEGIN IMMEDIATE")
+            try:
+                self.assertTrue(busy_seen.wait(2), "real SQLite writer timeout was not observed")
+                holder.commit()
+                self.assertTrue(renewed.wait(2), "heartbeat must retry after the short writer timeout")
+            finally:
+                if holder.in_transaction:
+                    holder.rollback()
+                holder.close()
+            current_request.get().before_send()
+            self.calls.append(("happy", "heartbeat-busy", body))
+            return {"content": "done"}
+
+        def capture(entry):
+            if entry.get("stage") == "claim_heartbeat_failed":
+                busy_seen.set()
+
+        self.text.runner = runner
+        with patch.object(self.admission, "CLAIM_SECONDS", .06), \
+                patch.object(self.admission, "CLAIM_HEARTBEAT_WRITER_TIMEOUT_SECS", .01), \
+                patch.object(self.admission, "CLAIM_HEARTBEAT_RETRY_SECS", .01), \
+                patch.object(self.admission, "renew_claim", side_effect=observed_renew), \
+                patch("services.pool_admission.logger.warning", side_effect=capture):
+            self.admission.execute(context)
+        self.assertTrue(busy_seen.is_set())
+        self.assertTrue(renewed.is_set())
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.read("text", "happy", "heartbeat-busy")["status"], "succeeded")
+
+    def test_recovery_heartbeat_retries_after_real_sqlite_timeout_without_sending(self):
+        self.image("recovery-heartbeat")
+        context = self.admission.claim_next()
+        holders = []
+        busy_seen, renewed = threading.Event(), threading.Event()
+        renew = self.admission.renew_claim
+
+        def observed_renew(ctx):
+            result = renew(ctx)
+            renewed.set()
+            return result
+
+        def recover():
+            holder = self.store._connect()
+            holders.append(holder)
+            holder.execute("BEGIN IMMEDIATE")
+            try:
+                self.assertTrue(busy_seen.wait(2), "recovery heartbeat did not hit the held writer")
+                holder.commit()
+                self.assertTrue(renewed.wait(2), "recovery heartbeat did not retry")
+            finally:
+                if holder.in_transaction:
+                    holder.rollback()
+                holder.close()
+
+        def capture(entry):
+            if entry.get("stage") == "claim_heartbeat_failed":
+                busy_seen.set()
+
+        with patch.object(self.admission, "CLAIM_SECONDS", .06), \
+                patch.object(self.admission, "CLAIM_HEARTBEAT_WRITER_TIMEOUT_SECS", .01), \
+                patch.object(self.admission, "CLAIM_HEARTBEAT_RETRY_SECS", .01), \
+                patch.object(self.admission, "renew_claim", side_effect=observed_renew), \
+                patch("services.pool_admission.logger.warning", side_effect=capture):
+            self.admission.run_recovery(context, recover, ())
+        current = self.read("image", "happy", "recovery-heartbeat")
+        self.assertTrue(busy_seen.is_set())
+        self.assertTrue(renewed.is_set())
+        self.assertFalse(current["_executing"])
+        self.assertEqual(self.calls, [])
+
+    def test_recovery_replaced_claim_is_fenced_without_sending(self):
+        self.image("recovery-fenced")
+        context = self.admission.claim_next()
+        with self.store.transaction() as db:
+            current = self.store.read_receipt(db, "image", "happy", "recovery-fenced")
+            original = {key: current.get(key) for key in ("request_hash", "_input_ref", "provider_binding_id")}
+            current["_claim_id"] = "other-recovery"
+            self.store.write_receipt(db, "image", "happy", "recovery-fenced", current)
+
+        def would_send():
+            context.before_send()
+            self.calls.append(("happy", "recovery-fenced"))
+
+        with self.assertRaises(AdmissionLost):
+            self.admission.run_recovery(context, would_send, ())
+        current = self.read("image", "happy", "recovery-fenced")
+        self.assertEqual(current["_claim_id"], "other-recovery")
+        self.assertFalse(current["_submission_started"])
+        self.assertEqual({key: current.get(key) for key in original}, original)
+        self.assertEqual(self.calls, [])
+
+    def test_renew_claim_fences_replaced_claim_without_sending(self):
+        self.submit("heartbeat-fenced")
+        context = self.admission.claim_next()
+        with self.store.transaction() as db:
+            current = self.store.read_receipt(db, "text", "happy", "heartbeat-fenced")
+            original = {key: current.get(key) for key in ("request_hash", "_input_ref", "provider_binding_id")}
+            current["_claim_id"] = "other-executor"
+            self.store.write_receipt(db, "text", "happy", "heartbeat-fenced", current)
+        with self.assertRaises(AdmissionLost):
+            self.admission.renew_claim(context)
+        with self.assertRaises(AdmissionLost):
+            context.before_send()
+        with self.store.connect() as db:
+            current = self.store.read_receipt(db, "text", "happy", "heartbeat-fenced")
+        self.assertEqual(current["_claim_id"], "other-executor")
+        self.assertFalse(current["_submission_started"])
+        self.assertEqual({key: current.get(key) for key in original}, original)
+        self.assertEqual(self.calls, [])
+
+    def test_expired_claim_without_heartbeat_is_reclaimed_without_replaying_input(self):
+        self.submit("heartbeat-dead")
+        old = self.admission.claim_next()
+        with self.store.connect() as db:
+            before = self.store.read_receipt(db, "text", "happy", "heartbeat-dead")
+        original = {key: before.get(key) for key in ("request_hash", "_input_ref", "provider_binding_id")}
+        self.clock.now += self.admission.CLAIM_SECONDS + 1
+        renewed = self.admission.claim_next()
+        self.assertIsNotNone(renewed)
+        self.assertEqual(renewed.request_id, old.request_id)
+        self.assertNotEqual(renewed.claim, old.claim)
+        with self.assertRaises(AdmissionLost):
+            old.before_send()
+        with self.store.connect() as db:
+            current = self.store.read_receipt(db, "text", "happy", "heartbeat-dead")
+        self.assertEqual(current["_claim_id"], renewed.claim)
+        self.assertFalse(current["_submission_started"])
+        self.assertEqual({key: current.get(key) for key in original}, original)
+        self.assertEqual(self.calls, [])
+
+    def test_guard_reason_and_non_transient_heartbeat_diagnostics_do_not_log_exception_text(self):
         from services.pool_admission import record_unsent_failure
+        import sqlite3
+
         self.image("heartbeat")
         context = self.admission.claim_next()
         with patch("services.pool_admission.logger.warning") as logged:
@@ -1719,13 +1921,12 @@ class AdmissionTests(unittest.TestCase):
             record_unsent_failure(context, receipt, self.clock(), "AdmissionLost", reason="private credential")
             self.assertNotIn("private credential", str(logged.call_args_list))
             self.assertNotIn("reason", receipt["_execution_timeline"][0])
-        import sqlite3
-        update = self.admission.update_claim
+        error = sqlite3.OperationalError("private credential and database path")
+        error.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
         failed = threading.Event()
-        def fail_renewal(ctx, **changes):
-            if set(changes) == {"_claim_until"}:
-                raise sqlite3.OperationalError("private credential and database path")
-            return update(ctx, **changes)
+        def reject_renewal(ctx):
+            failed.set()
+            raise error
         def capture(entry):
             if entry.get("stage") == "claim_heartbeat_failed":
                 failed.set()
@@ -1733,10 +1934,10 @@ class AdmissionTests(unittest.TestCase):
             self.assertTrue(failed.wait(2), "heartbeat failure was not observed")
             ctx.before_send()
             ctx.record_stage("send_call_started")
-            update(ctx, status="success", upstream_unfinished=False)
+            self.admission.update_claim(ctx, status="success", upstream_unfinished=False)
         self.admission.register("image", succeed)
         with patch.object(self.admission, "CLAIM_SECONDS", .03), \
-                patch.object(self.admission, "update_claim", side_effect=fail_renewal), \
+                patch.object(self.admission, "renew_claim", side_effect=reject_renewal), \
                 patch("services.pool_admission.logger.warning", side_effect=capture) as logged:
             self.admission.execute(context)
         entries = [call.args[0] for call in logged.call_args_list
