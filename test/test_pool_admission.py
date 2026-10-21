@@ -1279,6 +1279,93 @@ class AdmissionTests(unittest.TestCase):
         _, _, restarted = build(self.root, self.clock)
         self.assertEqual(restarted.claim_next().owner, "person-b")
 
+    def test_product_image_lane_rotates_after_text_without_changing_text_order(self):
+        """A ready main image gets the next released bound turn, not a new priority."""
+        source = "internal:listing"
+        for request_id in ("older-copy", "later-copy"):
+            self.submit(request_id, source=source, product_work={
+                "product_ref": request_id, "step_ref": "copy",
+            })
+        self.images.submit_generation(
+            {"id": "happy", "role": "admin", "external_image_client": True,
+             "_trusted_source": source},
+            client_task_id="main-image", prompt="private image input", model="gpt-image-2", size=None,
+            product_work={"product_ref": "main-image", "step_ref": "image"},
+        )
+
+        first = self.admission.claim_next()
+        self.assertEqual((first.kind, first.request_id), ("text", "older-copy"))
+        # Simulate the completed original turning over its account slot.  The
+        # successful claim already persisted the existing fairness cursor.
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "text", "happy", "older-copy")
+            receipt.update(status="succeeded", upstream_outcome="completed", _attempt_finished_at=self.clock.now,
+                           _executing=False, _turn_reserved=False, _claim_id=None, _claim_until=None)
+            self.store.write_receipt(db, "text", "happy", "older-copy", receipt)
+
+        second = self.admission.claim_next()
+        self.assertEqual((second.kind, second.request_id), ("image", "main-image"))
+
+    def test_non_product_requests_keep_their_existing_sequence_lane(self):
+        source = "internal:listing"
+        self.submit("older-copy", source=source)
+        self.submit("later-copy", source=source)
+        self.images.submit_generation(
+            {"id": "happy", "role": "user", "external_image_client": True,
+             "_trusted_source": source},
+            client_task_id="later-image", prompt="private image input", model="gpt-image-2", size=None,
+        )
+        first = self.admission.claim_next()
+        self.assertEqual((first.kind, first.request_id), ("text", "older-copy"))
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "text", "happy", "older-copy")
+            receipt.update(status="succeeded", upstream_outcome="completed", _attempt_finished_at=self.clock.now,
+                           _executing=False, _turn_reserved=False, _claim_id=None, _claim_until=None)
+            self.store.write_receipt(db, "text", "happy", "older-copy", receipt)
+        second = self.admission.claim_next()
+        self.assertEqual((second.kind, second.request_id), ("text", "later-copy"))
+
+    def test_product_image_lane_keeps_conversation_and_capacity_guards(self):
+        source = "internal:listing"
+        self.submit("same-conversation-copy", source=source, product_work={
+            "product_ref": "copy-product", "step_ref": "copy",
+        })
+        self.images.submit_generation(
+            {"id": "happy", "role": "admin", "external_image_client": True,
+             "_trusted_source": source},
+            client_task_id="same-conversation-image", prompt="private image input", model="gpt-image-2", size=None,
+            product_work={"product_ref": "image-product", "step_ref": "image"},
+        )
+        with self.store.transaction() as db:
+            image = self.store.read_receipt(db, "image", "happy", "same-conversation-image")
+            image["client_conversation_id"] = "session-same-conversation-copy"
+            self.store.write_receipt(db, "image", "happy", "same-conversation-image", image)
+
+        first = self.admission.claim_next()
+        self.assertEqual((first.kind, first.request_id), ("text", "same-conversation-copy"))
+        self.assertIsNone(self.admission.claim_next())
+        image = self.read("image", "happy", "same-conversation-image")
+        self.assertEqual(image["waiting"]["reasons"], ["earlier_group_request_unfinished"])
+
+        # A distinct product image still needs both the account Chat turn and
+        # image-generation resource; a lane does not bypass either limit.
+        with self.store.transaction() as db:
+            copy = self.store.read_receipt(db, "text", "happy", "same-conversation-copy")
+            copy.update(status="succeeded", upstream_outcome="completed", _attempt_finished_at=self.clock.now,
+                        _executing=False, _turn_reserved=False, _claim_id=None, _claim_until=None)
+            self.store.write_receipt(db, "text", "happy", "same-conversation-copy", copy)
+        self.submit("occupied-turn", owner="other", source="internal:other")
+        with self.store.transaction() as db:
+            holder = self.store.read_receipt(db, "text", "other", "occupied-turn")
+            holder.update(status="running", upstream_outcome="unknown", _submission_started=True,
+                          _executing=True, _turn_reserved=True, _claim_id="fixture-claim",
+                          _claim_until=self.clock.now + 60, provider_binding_id="binding-0",
+                          provider_account_identity="account-0", conversation_id="occupied-conversation")
+            self.store.write_receipt(db, "text", "other", "occupied-turn", holder)
+        self.assertIsNone(self.admission.claim_next())
+        image = self.read("image", "happy", "same-conversation-image")
+        self.assertEqual(image["waiting"]["reasons"], ["resource_full"])
+
     def test_image_wire_request_does_not_consume_text_worker_budget(self):
         self.admission.text_workers = 1
         self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 4, "codex_max_concurrency": 4}

@@ -1251,6 +1251,18 @@ class PoolAdmission:
             # cannot execute without a durable input reference.
             scheduling = r.get("_scheduling") or {}
             workflow_id = scheduling.get("workflow_id")
+            fair_group = (product_fair_group if product_fair_group is not None
+                          else workflow_id if isinstance(workflow_id, str) and workflow_id else None)
+            # Product text and images draw from the same bound Chat turn, but
+            # an image additionally needs its image-generation slot.  Keep the
+            # existing durable sequence and conversation order checks, while
+            # letting the already-persisted fairness cursor rotate a ready
+            # product image after a product-text claim instead of allowing a
+            # continuous older text backlog to consume every released turn.
+            # This applies only to the trusted product lanes; ordinary and
+            # workflow-only traffic retains its established fair group.
+            if product_fair_group is not None and (kind == "image" or r.get("_operation") == "image"):
+                fair_group = product_fair_group + ":image"
             requests.append(WaitingRequest(
                 RequestRef(owner, kind, request_id), r.get("_source") or "key:" + owner,
                 continuation_sequences.get((owner, request_id), int(r.get("_sequence") or 0)),
@@ -1264,8 +1276,7 @@ class PoolAdmission:
                 # `source` is the trusted, stable caller.  The planner scopes
                 # this workflow ID to that source, so workflows cannot gain a
                 # second top-level caller turn by using multiple key owners.
-                fair_group=(product_fair_group if product_fair_group is not None
-                            else workflow_id if isinstance(workflow_id, str) and workflow_id else None),
+                fair_group=fair_group,
                 ready_at=max(float(r.get("_ready_at") or 0), scheduling_ready),
                 needs=thread_needs + physical_needs + product_needs + tuple(scheduling_needs) + (Need("execution_input_bytes", max(1, int(r.get("_input_bytes") or 1))),)
                       + ((Need("chat_executor"),) if kind == "text" and route == "chat" and r.get("_operation") != "image" else ())
