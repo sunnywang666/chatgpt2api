@@ -416,10 +416,31 @@ class ModelCatalogService:
             for identity, (_token, account_type, state, _fingerprint) in accounts.items()
             if state == "active" and identity in models_by_account
         }
-        self._catalog_unknown = bool(
-            any(account_type in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
+        paid_account_types = {"Plus", "Pro", "ProLite", "Team", "Enterprise"}
+        incomplete_active_catalog = bool(
+            any(account_type in paid_account_types
                 and state in {"active", "limited"} and identity not in models_by_account
                 for identity, (_token, account_type, state, _fingerprint) in accounts.items())
+        )
+        managed_disabled_paid = {
+            self._accounts._stable_account_identity(account)
+            for account in self._accounts.list_accounts()
+            if isinstance(account, dict) and account.get("managed_disabled")
+            and self._accounts._normalize_account_type(account.get("type")) in paid_account_types
+        }
+        paid_accounts = {
+            identity for identity, (_token, account_type, _state, _fingerprint) in accounts.items()
+            if account_type in paid_account_types
+        }
+        all_paid_accounts_managed_disabled = bool(paid_accounts) and paid_accounts <= managed_disabled_paid
+        no_executable_paid_model = not any(
+            identity in models_by_account for identity in paid_accounts
+        )
+        # A deliberately disabled complete paid pool has no executable model
+        # evidence.  It must remain a partial catalog so consumers retry it,
+        # rather than treating the empty directory as proof a model is unknown.
+        self._catalog_unknown = incomplete_active_catalog or (
+            all_paid_accounts_managed_disabled and no_executable_paid_model
         )
         next_refreshes = [self._anonymous_next_refresh(now)]
         next_refreshes.extend(
