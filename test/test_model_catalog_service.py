@@ -135,6 +135,40 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(shared_route.account_types, frozenset({"free", "Plus"}))
         self.assertTrue(shared_route.allow_anonymous)
 
+    def test_all_managed_disabled_paid_accounts_without_observation_are_partial(self) -> None:
+        for token in ("plus", "pro", "team-disabled"):
+            self.accounts.update_account(token, {"managed_disabled": True})
+        self.outcomes[""] = model_list()
+
+        result = self.catalog.list_models()
+
+        self.assertEqual([item["id"] for item in result["data"]], ["free-only", "shared"])
+        self.assertEqual(result.get("model_catalog"), {"state": "partial"})
+        self.assertCountEqual(self.calls, ["", "free-bad", "free-good"])
+        self.assertEqual(self.catalog.route_for_model("gpt-5-6-thinking").account_types, frozenset())
+
+    def test_active_paid_model_cache_becomes_partial_when_every_paid_account_is_managed_disabled(self) -> None:
+        self.catalog.list_models()
+        for token in ("plus", "pro", "team-disabled"):
+            self.accounts.update_account(token, {"managed_disabled": True})
+
+        result = self.catalog.list_models()
+
+        self.assertEqual(result.get("model_catalog"), {"state": "partial"})
+        self.assertTrue({"plus-only", "pro-only"} <= {item["id"] for item in result["data"]})
+        self.assertEqual(self.catalog.route_for_model("plus-only").account_types, frozenset())
+        self.assertEqual(self.catalog.route_for_model("pro-only").account_types, frozenset())
+
+    def test_observed_complete_catalog_keeps_a_missing_model_definitively_unsupported(self) -> None:
+        self.outcomes = {token: model_list() for token in self.outcomes}
+
+        result = self.catalog.list_models()
+
+        self.assertEqual(result["data"], [])
+        self.assertNotIn("model_catalog", result)
+        self.assertFalse(self.catalog.catalog_is_unknown())
+        self.assertEqual(self.catalog.route_for_model("gpt-5-6-thinking").account_types, frozenset())
+
     def test_bound_text_catalog_read_does_not_lock_out_other_requests_or_health(self) -> None:
         self.outcomes["plus"] = model_list("gpt-5-6")
         with self.accounts._lock:
