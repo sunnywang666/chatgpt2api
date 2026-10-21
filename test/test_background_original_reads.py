@@ -73,6 +73,55 @@ def test_slow_original_does_not_block_other_account_or_independent_conversation(
     assert len(r.queue.calls) == 4  # No generation executed or resubmitted.
 
 
+def test_due_history_on_one_account_cannot_take_all_original_read_slots(recovery):
+    r = recovery
+    # The persisted retry clock is intentionally identical.  SQLite insertion
+    # order makes account-0's history appear first, which previously consumed
+    # every one of the four local original-read slots before account-1's due
+    # original was considered.
+    for index in range(4):
+        r.original(f"account-0-history-{index}", 0, f"history-{index}")
+    r.original("account-1-due", 1, "due")
+    started = {"account-1-due": threading.Event()}
+    calls = []
+
+    def read(owner, request_id):
+        calls.append(request_id)
+        if request_id == "account-1-due":
+            started[request_id].set()
+        r.release.wait(3)
+
+    r.admission.recoveries["text"] = read
+    r.admission.recover_one(background=True)
+
+    assert started["account-1-due"].wait(1)
+    assert len(calls) == 4
+    assert sum(request_id.startswith("account-0-history-") for request_id in calls) == 3
+
+
+def test_live_recovery_leases_do_not_take_a_background_dispatch_turn(recovery):
+    r = recovery
+    for index in range(4):
+        request_id = f"leased-history-{index}"
+        r.original(request_id, 0, f"leased-{index}", recovery_claim_id=f"lease-{index}",
+                   recovery_claimed_at=r.clock(), recovery_lease_until=r.clock() + 60)
+    r.original("other-account-due", 1, "other-due")
+    started = threading.Event()
+    calls = []
+
+    def read(owner, request_id):
+        calls.append(request_id)
+        if request_id == "other-account-due":
+            started.set()
+        r.release.wait(3)
+
+    r.admission.recoveries["text"] = read
+    r.admission.recover_one(background=True)
+
+    assert started.wait(1)
+    assert calls == ["other-account-due"]
+
+
 def test_cooldown_disabled_and_paused_originals_do_not_take_workers(recovery):
     r = recovery
     r.original("cooldown")
