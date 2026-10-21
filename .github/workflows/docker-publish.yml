@@ -1,5 +1,7 @@
 name: Publish Docker Image
 
+run-name: Publish Docker Image ${{ inputs.source_ref || github.sha }}${{ inputs.github_hosted && ' auto-hosted' || ' company' }}
+
 on:
   push:
     tags:

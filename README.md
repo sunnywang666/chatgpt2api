@@ -96,6 +96,10 @@ docker-compose up -d
 
 ```
 
+### 内部 CI 队列回退
+
+受信任分支的 POOL-02 CI 和 Docker 发布默认使用公司 runner。一个独立的 GitHub-hosted observer 只会在原 run 已排队 90 秒、所有 job 都未领取且确认取消后，重放同一受控 source SHA 到 GitHub-hosted runner。已开始、已结束、来源分支已前移、workflow 定义不一致或取消状态不确定时不会回退。observer 不 checkout 或执行候选 Provider 源码；它只读取默认分支中的受控 helper，且不读取或保存额外凭据。为保留 tag push 的版本、latest 与多架构发布语义，tag 发布不自动回退；只有既有 `workflow_dispatch` publisher 合同可自动重放。达到 GitHub Actions 预算上限时 observer 可能无法启动，但不会阻断默认公司 runner 路径。
+
 ### 存储后端配置
 
 支持通过环境变量 `STORAGE_BACKEND` 切换存储方式：
