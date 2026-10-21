@@ -26,7 +26,7 @@ def compact_json(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
-def derive_retained_input(original, request_id, previous_id, parameters, *, no_final=False):
+def derive_retained_input(original, request_id, previous_id, parameters, *, no_final=False, incomplete=False):
     """Only closed transforms exist; their original-result proofs differ."""
     from services.required_attributes_derivation import KIND as ATTRIBUTES_KIND, derive_required_attributes_input
     from services.combined_copy_derivation import KIND as COMBINED_KIND, derive_combined_copy_input
@@ -34,6 +34,11 @@ def derive_retained_input(original, request_id, previous_id, parameters, *, no_f
         return derive_required_attributes_input(original, request_id, previous_id, parameters)
     if parameters == {"kind": COMBINED_KIND} and no_final is True:
         return derive_combined_copy_input(original, request_id, previous_id, parameters)
+    if parameters == {"kind": COMBINED_KIND} and incomplete is True and no_final is False:
+        body, audit = derive_combined_copy_input(original, request_id, previous_id, parameters)
+        body.pop("continue_after_no_final", None)
+        body["continue_after_incomplete"] = True
+        return body, audit
     if parameters == {"kind": KIND} and no_final is False:
         return derive_category_parent_input(original, request_id, previous_id, parameters)
     reject("CHAT_DERIVED_INPUT_INVALID")
