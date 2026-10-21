@@ -20,6 +20,7 @@ on:
       - test/test_model_catalog_service.py
       - test/test_background_original_reads.py
       - test/test_pool_admission.py
+      - test/test_queued_combined_copy_compaction.py
       - test/test_conversation_continuation.py
       - test/test_recovery_scan_progress.py
 
@@ -57,6 +58,7 @@ jobs:
           .venv/bin/python -m compileall -q api services utils test
           .venv/bin/python -m pytest -q \
             test/test_pool_admission.py \
+            test/test_queued_combined_copy_compaction.py \
             test/test_background_original_reads.py \
             test/test_pool_resources.py \
             test/test_scoped_chat_slot_api.py \

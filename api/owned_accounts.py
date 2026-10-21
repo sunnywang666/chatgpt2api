@@ -59,6 +59,16 @@ class TemporaryChatSecondSlot(BaseModel):
     ttl_seconds: int | None = Field(default=None, ge=1, le=600)
 
 
+class TemporaryFirstSendModelTrial(BaseModel):
+    """Arm one exact unsent product Chat original for the fixed safe trial."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_revision: int = Field(ge=0)
+    action: Literal["start", "stop"]
+    account_ref: str | None = Field(default=None, pattern=r"^car_[A-Za-z0-9_-]{43}$")
+    request_id: str | None = Field(default=None, min_length=1, max_length=300)
+    ttl_seconds: int | None = Field(default=None, ge=1, le=600)
+
+
 class CodexAuthorization(BaseModel):
     model_config = ConfigDict(extra="forbid")
     access_token: SecretStr = Field(min_length=1, max_length=20_000)
@@ -234,6 +244,52 @@ def create_router() -> APIRouter:
                  "request_id": body.request_id,
                  "expires_at": int(time.time()) + body.ttl_seconds}
         return await account_operation(config.update_temporary_chat_second_slot, body.expected_revision, trial)
+
+    @router.post("/pool/first-send-model-trial")
+    async def temporary_firstsend_model_trial(body: TemporaryFirstSendModelTrial,
+                                              authorization: str | None = Header(default=None),
+                                              x_workbench_account_owner: str | None = Header(default=None)):
+        """Arm one verified original; the effective model is fixed in admission."""
+        owner_scope(authorization, x_workbench_account_owner)
+        from services.config import config
+        if body.action == "stop":
+            if any(value is not None for value in (body.account_ref, body.request_id, body.ttl_seconds)):
+                raise HTTPException(400, detail={"error": "stop must not name a request"})
+            return await account_operation(config.update_temporary_firstsend_model_trial, body.expected_revision, None)
+        if not body.account_ref or not body.request_id or body.ttl_seconds is None:
+            raise HTTPException(400, detail={"error": "exact account, original request and TTL are required"})
+        all_accounts = await run_in_threadpool(account_service.list_accounts)
+        accounts = [row for row in all_accounts if account_service.pool_account_ref(row) == body.account_ref]
+        if len(accounts) != 1 or not accounts[0].get("provider_account_identity"):
+            raise HTTPException(409, detail={"error": "target account identity is not exact"})
+        account = accounts[0]
+        identity = account["provider_account_identity"]
+        if (sum(row.get("provider_account_identity") == identity for row in all_accounts) != 1
+                or account.get("managed_disabled") or account.get("status") in {"禁用", "异常", "限流"}):
+            raise HTTPException(409, detail={"error": "target account is unavailable"})
+        from services.image_task_service import image_task_service
+        from services.pool_admission import (_combined_copy_send_evidence,
+                                             firstsend_model_trial_scope)
+        from types import SimpleNamespace
+        admission = image_task_service.admission
+        with admission.store.connect() as db:
+            candidates = [(owner, receipt) for kind, owner, request_id, receipt in admission.store.receipts(db)
+                          if kind == "text" and request_id == body.request_id]
+            if len(candidates) != 1:
+                raise HTTPException(409, detail={"error": "one durable queued product Chat original is required"})
+            owner, receipt = candidates[0]
+            try:
+                frozen = admission.store.load_input(receipt.get("_input_ref"))
+            except (OSError, TypeError, ValueError):
+                raise HTTPException(409, detail={"error": "original frozen input is unavailable"}) from None
+        if (receipt.get("status") != "queued" or receipt.get("provider_account_identity") != identity
+                or receipt.get("_submission_started") is not False
+                or _combined_copy_send_evidence(receipt)
+                or not firstsend_model_trial_scope(SimpleNamespace(kind="text"), receipt, frozen)):
+            raise HTTPException(409, detail={"error": "one eligible unsent product Chat original is required"})
+        trial = {"account_identity": identity, "request_id": body.request_id,
+                 "expires_at": int(time.time()) + body.ttl_seconds}
+        return await account_operation(config.update_temporary_firstsend_model_trial, body.expected_revision, trial)
 
     @router.post("/accounts")
     async def import_account(body: ImportAccount, authorization: str | None = Header(default=None), x_workbench_account_owner: str | None = Header(default=None)):

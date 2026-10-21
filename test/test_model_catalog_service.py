@@ -239,6 +239,41 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(self.calls.count("pro"), 1)
         self.assertEqual(self.calls.count(""), 1)
 
+    def test_exact_bound_send_observation_refreshes_only_that_route(self) -> None:
+        self.catalog.list_models()
+        identity = self.accounts._stable_account_identity(
+            next(account for account in self.accounts.list_accounts() if account.get("access_token") == "plus"))
+        self.outcomes["plus"] = model_list("gpt-5-6-instant")
+
+        self.assertTrue(self.catalog.observe_bound_model_at_send("plus", identity, "gpt-5-6-instant"))
+
+        route = self.catalog.route_for_model("gpt-5-6-instant")
+        self.assertEqual(route.account_types, frozenset({"Plus"}))
+        self.assertEqual(route.account_identities, frozenset({identity}))
+        self.assertEqual(self.calls.count("plus"), 2)
+        self.assertEqual(self.calls.count("pro"), 1)
+
+    def test_bound_send_observation_does_not_validate_a_changed_peer_cache(self) -> None:
+        self.catalog.list_models()
+        identity = self.accounts._stable_account_identity(
+            next(account for account in self.accounts.list_accounts() if account.get("access_token") == "plus"))
+        original_fetch = self.catalog._fetch_models
+
+        def observe_plus_then_disable_pro(access_token: str = ""):
+            result = original_fetch(access_token)
+            if access_token == "plus":
+                self.accounts.update_account("pro", {"managed_disabled": True})
+            return result
+
+        self.catalog._fetch_models = observe_plus_then_disable_pro
+        self.outcomes["plus"] = model_list("gpt-5-6-instant")
+
+        self.assertTrue(self.catalog.observe_bound_model_at_send("plus", identity, "gpt-5-6-instant"))
+
+        route = self.catalog.route_for_model("pro-only")
+        self.assertEqual(route.account_types, frozenset())
+        self.assertEqual(route.account_identities, frozenset())
+
     def test_cold_discovery_starts_pool_accounts_in_parallel_with_a_bounded_worker_count(self) -> None:
         started = Event()
         release = Event()
