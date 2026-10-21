@@ -32,6 +32,128 @@ def reset_unsent_image_attempt(kind, receipt):
                        active_attempt_deadline_at=None, started_ts=None)
 
 
+_COMBINED_COPY_SOURCE = "internal:listing"
+_COMBINED_COPY_MODEL = "gpt-5-6-thinking"
+_COMBINED_COPY_EFFORT = "high"
+_COMBINED_COPY_SENT_STAGES = frozenset({
+    "send_guard_passed", "send_call_started", "response_headers_received",
+    "first_output", "artifact_saved", "task_finished",
+})
+_COMBINED_COPY_RESULT_FIELDS = frozenset({
+    "content", "result", "data", "result_file_ids", "result_sediment_ids",
+})
+
+
+def _recognizes_legacy_combined_copy(body):
+    """Use the derivation module's exact legacy recognizer.
+
+    This is a non-throwing, non-transforming scope check.  The strict helper
+    remains inside the controlled pre-send path below.
+    """
+    from services.combined_copy_derivation import is_legacy_combined_copy_input
+    return is_legacy_combined_copy_input(body)
+
+
+def _legacy_combined_copy_scope(context, receipt, body):
+    """The one original request family eligible for retained-copy handling."""
+    return bool(
+        context.kind == "text"
+        and receipt.get("_source") == _COMBINED_COPY_SOURCE
+        and receipt.get("_route", "chat") == "chat"
+        and receipt.get("_operation", "text") == "text"
+        and not receipt.get("_forward_protocol")
+        and not receipt.get("_forward")
+        and not receipt.get("_supersedes_request_id")
+        and not receipt.get("_previous_request_id")
+        and not receipt.get("_completion_of")
+        and not receipt.get("_codex_fallback_of")
+        and not receipt.get("_codex_continue_of")
+        and not receipt.get("_codex_rejected_retry_of")
+        and not receipt.get("_derived_input")
+        and receipt.get("model") == _COMBINED_COPY_MODEL
+        and _recognizes_legacy_combined_copy(body)
+    )
+
+
+def _combined_copy_send_evidence(receipt):
+    """Whether this original has already crossed, or may have crossed, send."""
+    timeline = receipt.get("_execution_timeline")
+    return bool(
+        receipt.get("_submission_started") is True
+        or receipt.get("_last_sent_sequence") is not None
+        or receipt.get("send_count", 0) not in (None, 0)
+        or receipt.get("upstream_outcome") in {"unknown", "completed", "rejected"}
+        or any(bool(receipt.get(field)) for field in _COMBINED_COPY_RESULT_FIELDS)
+        or isinstance(timeline, list) and any(
+            isinstance(item, dict) and item.get("stage") in _COMBINED_COPY_SENT_STAGES
+            for item in timeline
+        )
+    )
+
+
+def _queued_combined_copy_candidate(context, receipt, body):
+    """Whether one retained input may use the closed in-memory compactor."""
+    timeline = receipt.get("_execution_timeline")
+    return bool(
+        _legacy_combined_copy_scope(context, receipt, body)
+        and receipt.get("status") == "running"
+        and receipt.get("_claim_id") == context.claim
+        and receipt.get("_executing") is True
+        and receipt.get("_submission_started") is False
+        and receipt.get("upstream_outcome") in (None, "not_sent")
+        and isinstance(timeline, list)
+        and not _combined_copy_send_evidence(receipt)
+    )
+
+
+def _compact_queued_combined_copy(context, receipt, body, store, clock):
+    """Build one non-durable compact execution body for a proved-unsent input.
+
+    The caller already verified the stored input hash.  Reloading the receipt
+    under its existing transaction keeps a lost claim, cancellation, or a late
+    send/result marker from being transformed after that verification.
+    """
+    if not _queued_combined_copy_candidate(context, receipt, body):
+        return body
+    from services.combined_copy_derivation import compact_retained_messages
+    from services.conversation_binding_service import ConversationBindingError
+
+    # The successor helper's 64 KiB bound is deliberately tighter than the
+    # ordinary retained-input contract.  An original which it cannot compact
+    # still has a valid first-send path and must retain that path unchanged.
+    try:
+        messages, audit = compact_retained_messages(body)
+    except ConversationBindingError as exc:
+        if getattr(exc, "code", None) == "CHAT_DERIVED_INPUT_TOO_LARGE":
+            return body
+        raise
+    try:
+        original_bytes = len(json.dumps({"messages": body["messages"]}, ensure_ascii=False,
+                                        separators=(",", ":")).encode("utf-8"))
+        compact_bytes = len(json.dumps({"messages": messages}, ensure_ascii=False,
+                                       separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError, UnicodeError):
+        return body
+    # The execution-only variant exists solely to relieve the retained input
+    # size.  Do not replace a valid original with an equal or larger body.
+    if compact_bytes >= original_bytes:
+        return body
+    with store.transaction() as db:
+        current = store.read_receipt(db, context.kind, context.owner, context.request_id)
+        if not current or current.get("_claim_id") != context.claim or current.get("status") != "running":
+            raise AdmissionLost("original task claim changed before retained-input compaction")
+        if not _queued_combined_copy_candidate(context, current, body):
+            return body
+        timeline = list(current.get("_execution_timeline") or [])
+        timeline.append({"stage": "retained_input_compacted", "at": float(clock()),
+                         "kind": audit["kind"], "preparation_count": audit["preparation_count"],
+                         "evidence_set_count": audit["evidence_set_count"],
+                         "image_count": audit["image_count"]})
+        current["_execution_timeline"] = timeline[-32:]
+        store.write_receipt(db, context.kind, context.owner, context.request_id, current)
+    return {**body, "messages": messages}
+
+
 def _missing_node_retry_image_parent(store, db, owner, image_id, now):
     """Return C's only safe terminal parent for its linked A4, if any.
 
@@ -2099,6 +2221,43 @@ class PoolAdmission:
                 self.update_claim(context, status="failed" if context.kind == "text" else "error",
                                   error_code="TASK_INPUT_UNAVAILABLE", _turn_reserved=False, upstream_unfinished=False)
                 return
+            if context.kind == "text":
+                # Keep the retained original and its request hash intact.  The
+                # closed compactor returns an execution-only copy, after the
+                # immutable-input check and before the existing send guard.
+                if _legacy_combined_copy_scope(context, r, body) and _combined_copy_send_evidence(r):
+                    # A historically inconsistent queued receipt must not send
+                    # again merely because its old submission flag was lost.
+                    # The exact original remains recoverable as UNKNOWN.
+                    with self.store.transaction() as db:
+                        current = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
+                        if (current and current.get("_claim_id") == context.claim and current.get("status") == "running"
+                                and _legacy_combined_copy_scope(context, current, body)
+                                and _combined_copy_send_evidence(current)):
+                            current.update(status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                                           upstream_outcome="unknown", _submission_started=True,
+                                           _turn_reserved=True, _claim_until=0)
+                            self.store.write_receipt(db, context.kind, context.owner, context.request_id, current)
+                    return
+                try:
+                    body = _compact_queued_combined_copy(context, r, body, self.store, self.clock)
+                except Exception as exc:
+                    from services.conversation_binding_service import ConversationBindingError
+                    if not isinstance(exc, ConversationBindingError):
+                        raise
+                    # A recognised legacy shape that cannot be proven safe is
+                    # a deterministic pre-send failure.  Do not requeue it
+                    # into an endless claim/compaction loop, and never turn a
+                    # lost-claim or storage failure into a terminal result.
+                    with self.store.transaction() as db:
+                        current = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
+                        if current and current.get("_claim_id") == context.claim and current.get("status") == "running":
+                            current.update(status="failed", error_code=getattr(exc, "code", None) or "CHAT_DERIVED_INPUT_INVALID",
+                                           upstream_outcome="not_sent", upstream_unfinished=False,
+                                           _turn_reserved=False, _claim_until=0)
+                            record_unsent_failure(context, current, float(self.clock()), type(exc).__name__)
+                            self.store.write_receipt(db, context.kind, context.owner, context.request_id, current)
+                    return
             missing_node_retry_parent = None
             if context.kind == "image":
                 # Resolve C's output parent for the in-memory A4 execution

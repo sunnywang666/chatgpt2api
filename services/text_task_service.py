@@ -229,7 +229,7 @@ class TextTaskService:
         "_codex_fallback_of", "_codex_continue_of", "_codex_rejected_retry_of",
         "_codex_origin_request_id", "_codex_response_id", "_previous_response_id",
         "_missing_successor_resume", "continue_before_queued_image_id",
-        "_derived_input", "_supersedes_no_final",
+        "_derived_input", "_supersedes_no_final", "_supersedes_incomplete",
     )
     _VALID_CONVERSATION_REASONS = frozenset({
         TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value,
@@ -492,6 +492,8 @@ class TextTaskService:
             result["supersedes_request_id"] = receipt["_supersedes_request_id"]
         if receipt.get("_supersedes_no_final"):
             result["continue_after_no_final"] = True
+        if receipt.get("_supersedes_incomplete"):
+            result["continue_after_incomplete"] = True
         if receipt.get("_derived_input"):
             result["derived_input"] = receipt["_derived_input"]
         missing_attempt = TextTaskService._missing_successor_attempt(receipt)
@@ -2551,6 +2553,8 @@ class TextTaskService:
         if "supersedes_request_id" not in body:
             if "continue_after_no_final" in body:
                 raise ConversationBindingError("no-final continuation requires an original request", code="CHAT_SUPERSEDE_INVALID")
+            if "continue_after_incomplete" in body:
+                raise ConversationBindingError("incomplete continuation requires an original request", code="CHAT_SUPERSEDE_INVALID")
             if "derived_input" in body:
                 raise ConversationBindingError("derived input requires original request", code="CHAT_DERIVED_INPUT_INVALID")
             return body
@@ -2628,10 +2632,14 @@ class TextTaskService:
                 return expected
             derived = "derived_input" in body
             no_final = "continue_after_no_final" in body
-            attributes_upgrade = body.get("derived_input") == {"kind": "attributes_required_only_v4"}
-            if (set(body) != self.SUPERSEDE_FIELDS | ({"derived_input"} if derived else set()) | ({"continue_after_no_final"} if no_final else set()) or not owner
-                    or no_final and (body["continue_after_no_final"] is not True or derived and not attributes_upgrade)
-                    or attributes_upgrade and not no_final
+            incomplete = "continue_after_incomplete" in body
+            no_final_derived = body.get("derived_input") in ({"kind": "attributes_required_only_v4"}, {"kind": "combined_copy_compact_v1"})
+            incomplete_derived = body.get("derived_input") == {"kind": "combined_copy_compact_v1"}
+            if (set(body) != self.SUPERSEDE_FIELDS | ({"derived_input"} if derived else set()) | ({"continue_after_no_final"} if no_final else set()) | ({"continue_after_incomplete"} if incomplete else set()) or not owner
+                    or no_final and (body["continue_after_no_final"] is not True or derived and not no_final_derived)
+                    or incomplete and (body["continue_after_incomplete"] is not True or not incomplete_derived)
+                    or no_final and incomplete
+                    or no_final_derived and not (no_final or incomplete)
                     or any(not isinstance(body.get(k), str) or not body[k].strip() or body[k] != body[k].strip() for k in self.SUPERSEDE_FIELDS)
                     or len(request_id) > 200 or len(body["supersedes_request_id"]) > 200
                     or request_id == body["supersedes_request_id"]):
@@ -2654,15 +2662,19 @@ class TextTaskService:
             expected = {**retained, "client_request_id": request_id, "supersedes_request_id": body["supersedes_request_id"]}
             if no_final and not existing:
                 expected["continue_after_no_final"] = True
+            if incomplete and not existing:
+                expected["continue_after_incomplete"] = True
             if derived and not existing:
                 from services.category_directory_derivation import derive_retained_input
                 expected, _ = derive_retained_input(retained, request_id, body["supersedes_request_id"], body["derived_input"],
-                                                    no_final=no_final)
+                                                    no_final=no_final, incomplete=incomplete)
             if existing and retained.get("supersedes_request_id") != body["supersedes_request_id"]:
                 reject()
             if existing and ("derived_input" in retained) != derived:
                 reject()
             if existing and ("continue_after_no_final" in retained) != no_final:
+                reject()
+            if existing and ("continue_after_incomplete" in retained) != incomplete:
                 reject()
             if any(expected.get(k) != v for k, v in body.items()):
                 reject()
@@ -2734,6 +2746,7 @@ class TextTaskService:
                                   previous, allow_no_final_successor=True))
         audit = successor.get("_derived_input") or {}
         attributes_upgrade = isinstance(audit, dict) and audit.get("kind") == "attributes_required_only_v4"
+        compact_upgrade = isinstance(audit, dict) and audit.get("kind") == "combined_copy_compact_v1"
         model_upgrade = bool(attributes_upgrade
             and successor.get("_supersedes_no_final") is True
             and previous and previous.get("model") == audit.get("original_model") == "gpt-5-6-instant"
@@ -2747,7 +2760,9 @@ class TextTaskService:
             and successor.get("_route", "chat") == previous.get("_route", "chat") == "chat"
             and successor.get("_operation", "text") == previous.get("_operation", "text") == "text"
             and not successor.get("_forward_protocol") and not previous.get("_forward_protocol")
-            and (model_upgrade if attributes_upgrade else successor.get("model") == previous.get("model")))
+            and (model_upgrade if attributes_upgrade else successor.get("model") == previous.get("model"))
+            and (not compact_upgrade or successor.get("_supersedes_no_final") is True
+                 or successor.get("_supersedes_incomplete") is True))
         if not shared:
             return False
         if rejected_model:
@@ -2793,6 +2808,8 @@ class TextTaskService:
             and TextTaskService._native_no_final_successor_source(
                 store, db, owner, previous, now, successor_id=successor.get("request_id"),
                 successor_sequence=successor.get("_sequence")))
+        incomplete_retry = (successor.get("_supersedes_incomplete") is True
+                            and TextTaskService._incomplete_compact_successor_source(previous, now))
         rejected_model = direct_rejected_model or model_rejection_retry or missing_node_model_retry
         if (not rejected_model and (not isinstance(previous.get("request_message_id"), str)
                                     or not previous["request_message_id"])
@@ -2812,7 +2829,7 @@ class TextTaskService:
                 reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
         if previous.get("_executing") or previous.get("_turn_reserved"):
             reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
-        if (not rejected_model and not native_no_final_retry and (previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
+        if (not rejected_model and not native_no_final_retry and not incomplete_retry and (previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
                 or previous.get("upstream_outcome") != "unknown"
                 or (not TextTaskService._no_final_successor_source(previous, now)
                     if successor.get("_supersedes_no_final") else previous.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND")
@@ -2820,7 +2837,8 @@ class TextTaskService:
                 or type(previous.get("_execution_wait_ended_at")) not in (int, float)
                 or not math.isfinite(previous["_execution_wait_ended_at"]))):
             reject("CHAT_SUPERSEDE_INVALID")
-        if ((rejected_model or successor.get("_supersedes_no_final") is True)
+        if ((rejected_model or successor.get("_supersedes_no_final") is True
+             or successor.get("_supersedes_incomplete") is True)
                 and account_service.bound_text_recovery_auth_unavailable(
                     previous.get("provider_binding_id", ""))):
             # This is a local, read-only account-state check.  A stopped
@@ -2846,9 +2864,16 @@ class TextTaskService:
         elif TextTaskService._RECONCILED_QUEUED_SUCCESSOR in successor:
             reject("CHAT_SUPERSEDE_INVALID")
         if successor.get("_derived_input"):
-            attributes_upgrade = successor["_derived_input"].get("kind") == "attributes_required_only_v4"
-            if attributes_upgrade:
-                if successor.get("_supersedes_no_final") is not True or not TextTaskService._no_final_successor_source(previous, now):
+            kind = successor["_derived_input"].get("kind")
+            no_final_derived = kind in {"attributes_required_only_v4", "combined_copy_compact_v1"}
+            incomplete_derived = kind == "combined_copy_compact_v1" and successor.get("_supersedes_incomplete") is True
+            if no_final_derived or incomplete_derived:
+                if (successor.get("_supersedes_no_final") is True
+                        and TextTaskService._no_final_successor_source(previous, now)):
+                    pass
+                elif incomplete_derived and TextTaskService._incomplete_compact_successor_source(previous, now):
+                    pass
+                else:
                     reject("CHAT_DERIVED_INPUT_INVALID")
             elif (previous.get("original_http_status") != 413
                     or previous.get("original_failure_phase") != "stream_open"
@@ -2859,7 +2884,8 @@ class TextTaskService:
             from services.category_directory_derivation import derive_retained_input
             derived_body, audit = derive_retained_input(original_body, successor["request_id"], previous_id,
                                                        {"kind": successor["_derived_input"].get("kind")},
-                                                       no_final=successor.get("_supersedes_no_final") is True)
+                                                       no_final=successor.get("_supersedes_no_final") is True,
+                                                       incomplete=successor.get("_supersedes_incomplete") is True)
             if successor["_derived_input"] != {**audit, "original_input_hash": row[0]}:
                 reject("CHAT_DERIVED_INPUT_INVALID")
             saved = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, successor["request_id"])).fetchone()
@@ -3080,6 +3106,42 @@ class TextTaskService:
             and not any(previous.get(k) for k in ("_work_key", "_completion", "_completion_of",
                 "_recovery_paused", "_recovery_suppressed")))
 
+    @classmethod
+    def _incomplete_compact_successor_source(cls, previous, now):
+        """Strict explicit-risk eligibility; it never represents an upstream terminal state.
+
+        The unchanged observation opens one compact child only.  The binding
+        runner still reads the original branch before and at the send edge.
+        """
+        if not cls._qualified_stalled_incomplete_capacity_boundary(previous, now):
+            return False
+        if (previous.get("status") != "unknown"
+                or previous.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
+                or previous.get("upstream_outcome") != "unknown"
+                or previous.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
+                or previous.get("_submission_started") is not True
+                or previous.get("_upstream_terminal") not in (None, False)
+                or previous.get("_supersedes_request_id")
+                or previous.get("_derived_input")
+                or "_missing_successor_resume" in previous
+                or previous.get("_public_session_ref") or previous.get("_public_route")
+                or previous.get("_forward") or previous.get("_forward_protocol")
+                or previous.get("_executing") is not False
+                or previous.get("_turn_reserved") is not False
+                or any(key in previous for key in ("content", "result", "data"))
+                or previous.get("result_file_ids") or previous.get("result_sediment_ids")
+                or any(previous.get(key) for key in ("_completion", "_completion_of",
+                                                     "_recovery_paused", "_recovery_suppressed"))):
+            return False
+        # The capacity predicate has already proved a historical sender claim
+        # is paired, finite, and expired.  Preserve that audit record instead
+        # of clearing it; recovery and internal claims remain active-work
+        # evidence and are never a continuation permission.
+        return not any(previous.get(key) is not None for key in (
+            "recovery_claim_id", "recovery_claimed_at",
+            "recovery_lease_until", "_recovery_claim_id", "_recovery_claim_until",
+        ))
+
     def _prepare_supersede(self, db, owner, body, receipt):
         if "supersedes_request_id" not in body:
             return
@@ -3144,7 +3206,8 @@ class TextTaskService:
             try:
                 retained = self.store.load_input(original["_input_ref"])
                 expected, audit = derive_retained_input(retained, body["client_request_id"], previous_id, body["derived_input"],
-                                                       no_final=body.get("continue_after_no_final") is True)
+                                                       no_final=body.get("continue_after_no_final") is True,
+                                                       incomplete=body.get("continue_after_incomplete") is True)
             except (OSError, ValueError, TypeError, KeyError):
                 reject("CHAT_DERIVED_INPUT_INVALID")
             if self._submission_identity(owner, expected) != self._submission_identity(owner, body):
@@ -3152,7 +3215,7 @@ class TextTaskService:
             receipt["_derived_input"] = {**audit, "original_input_hash": row[0]}
         else:
             comparison = {k: v for k, v in body.items()
-                          if k not in {"supersedes_request_id", "continue_after_no_final"}}
+                          if k not in {"supersedes_request_id", "continue_after_no_final", "continue_after_incomplete"}}
             comparison["client_request_id"] = previous_id
             if self._submission_identity(owner, comparison) != (previous_id, row[0]):
                 reject("CHAT_SUPERSEDE_INVALID")
@@ -3169,6 +3232,8 @@ class TextTaskService:
                            _submission_parent_message_id=body.get("parent_message_id"))
         if body.get("continue_after_no_final") is True:
             receipt["_supersedes_no_final"] = True
+        if body.get("continue_after_incomplete") is True:
+            receipt["_supersedes_incomplete"] = True
         # This placeholder is used only for validation, never saved or exposed.
         candidate = {**receipt, "_input_ref": True}
         self._validate_supersede(self.store, db, owner, candidate, self._now())
@@ -3723,7 +3788,7 @@ class TextTaskService:
         if (set(envelope) == self.SUPERSEDE_FIELDS | {"derived_input", "continue_after_no_final"}
                 and envelope.get("client_request_id") == request_id
                 and envelope.get("continue_after_no_final") is True
-                and envelope.get("derived_input") == {"kind": "attributes_required_only_v4"}):
+                and envelope.get("derived_input") in ({"kind": "attributes_required_only_v4"}, {"kind": "combined_copy_compact_v1"})):
             # A rejected initial submit has no durable row and cannot have sent:
             # submission always commits its row before admission is awakened.
             # Reuse that transaction, immutable derivation and fresh send guard.
@@ -4130,7 +4195,8 @@ class TextTaskService:
                                                       missing_attempt["request_message_id"], cursor)
                 cursor = {k: v for k, v in cursor.items()
                           if k not in {"request_parent_message_id", "_submission_parent_message_id"}}
-            if (receipt.get("_supersedes_no_final") or preserve_submission_parent) and not missing_attempt:
+            if (receipt.get("_supersedes_no_final") or receipt.get("_supersedes_incomplete")
+                    or preserve_submission_parent) and not missing_attempt:
                 # The immutable predecessor link keeps its submitted root;
                 # request_parent_message_id records the actual fresh tool tail.
                 cursor = {k: v for k, v in cursor.items() if k != "_submission_parent_message_id"}
@@ -4237,6 +4303,8 @@ class TextTaskService:
                                 _missing_successor_expected_tail=expected_tail)
                 if receipt.get("_supersedes_no_final") and not missing_attempt:
                     body["_supersedes_no_final_original"] = previous
+                if receipt.get("_supersedes_incomplete") and not missing_attempt:
+                    body["_supersedes_incomplete_original"] = previous
             if receipt.get("_terminal_empty_correction_of"):
                 with self._db() as db:
                     previous = self.store.read_receipt(db, "text", owner, receipt["_terminal_empty_correction_of"])

@@ -1678,6 +1678,52 @@ class ConversationBindingService:
             reject("CHAT_SUPERSEDE_CURSOR_CHANGED")
 
     @staticmethod
+    def _incomplete_compact_successor_tail(backend, document, original):
+        """Read one still-incomplete original branch without treating it as no-final.
+
+        The saved observation is only an explicit-risk admission proof.  Both
+        the initial read and the pre-send read must reproduce it exactly, so a
+        late answer, any measured progress, a branch change, or a different
+        physical conversation tail prevents a second model POST.
+        """
+        from services.text_task_service import TextTaskService
+
+        def reject(code="CHAT_SUPERSEDE_CURSOR_CHANGED"):
+            raise ConversationBindingError("incomplete original branch changed", code=code)
+
+        saved = TextTaskService._safe_result_observation(
+            (original or {}).get(RESULT_OBSERVATION_FIELD), original or {})
+        if saved is None:
+            reject("CHAT_SUPERSEDE_INVALID")
+        try:
+            fresh = ConversationBindingService._read_text_request_result(backend, original, document=document)
+        except ConversationBindingError as exc:
+            if exc.code == "CONVERSATION_BINDING_UNAVAILABLE":
+                reject("CHAT_SUPERSEDE_READ_UNAVAILABLE")
+            reject()
+        if fresh.get("status") == "succeeded":
+            reject("CHAT_SUPERSEDE_ORIGINAL_FOUND")
+        observation = TextTaskService._safe_result_observation(fresh.get(RESULT_OBSERVATION_FIELD), original)
+        if (fresh.get("status") != "running"
+                or fresh.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
+                or observation is None or observation != saved
+                or not isinstance(document, dict) or document.get("is_archived") is not False
+                or document.get("conversation_id") != original.get("conversation_id")):
+            reject()
+        mapping, head = document.get("mapping"), document.get("current_node")
+        if not isinstance(mapping, dict) or not isinstance(head, str) or not observation["nodes"]:
+            reject()
+        tail = observation["nodes"][-1]
+        node = mapping.get(head)
+        message = node.get("message") if isinstance(node, dict) else None
+        if (head != tail["id"] or tail["status"] not in _ACTIVE_TEXT_RESULT_STATUSES
+                or tail["end_turn"] is not False or not isinstance(message, dict)
+                or message.get("id") != head or node.get("children")
+                or any(isinstance(item, dict) and item.get("parent") == head for item in mapping.values())):
+            reject()
+        return {"head": head, "observation": observation}
+
+    @staticmethod
     def _check_missing_node_model_retry(document, conversation_id, parent_message_id,
                                         root_user, rejected_user, retry_user):
         """Fence C beside an absent R -> P chain without treating R as no-final.
@@ -2008,6 +2054,7 @@ class ConversationBindingService:
             missing_no_final_context = None
             native_no_final_prefix_context = None
             missing_node_context = None
+            incomplete_context = None
             if body.get("_supersedes_request_message_id"):
                 def check_original(send):
                     nonlocal missing_node_context
@@ -2056,6 +2103,14 @@ class ConversationBindingService:
                                 "original no-final cursor changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED",
                                 no_final_guard={"phase": NoFinalGuardPhase.CONTEXT_CHANGED.value,
                                                 "reason": NoFinalGuardReason.CURRENT_NODE.value},
+                            )
+                    elif body.get("_supersedes_incomplete_original"):
+                        fresh_context = self._incomplete_compact_successor_tail(
+                            backend, fresh, body["_supersedes_incomplete_original"],
+                        )
+                        if fresh_context != incomplete_context:
+                            raise ConversationBindingError(
+                                "incomplete original branch changed", code="CHAT_SUPERSEDE_CURSOR_CHANGED",
                             )
                     else:
                         self._check_superseded_original(fresh, conversation_id, parent_message_id,
@@ -2173,6 +2228,13 @@ class ConversationBindingService:
                         elif body.get("_supersedes_no_final_original"):
                             no_final_context = self._no_final_successor_tail(document, body["_supersedes_no_final_original"])
                             parent_message_id = no_final_context[0]
+                            if on_cursor:
+                                on_cursor({"request_parent_message_id": parent_message_id})
+                        elif body.get("_supersedes_incomplete_original"):
+                            incomplete_context = self._incomplete_compact_successor_tail(
+                                backend, document, body["_supersedes_incomplete_original"],
+                            )
+                            parent_message_id = incomplete_context["head"]
                             if on_cursor:
                                 on_cursor({"request_parent_message_id": parent_message_id})
                         else:

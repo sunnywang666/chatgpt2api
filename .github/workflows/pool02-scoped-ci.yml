@@ -1,0 +1,51 @@
+name: Provider POOL-02 isolated review
+
+on:
+  push:
+    branches:
+      - codex/provider-pool02-ci-20261021
+
+permissions:
+  contents: read
+
+jobs:
+  scoped-chat-admission:
+    if: ${{ github.repository == 'sunnywang666/chatgpt2api' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SOURCE_SHA: 57f9a40efe85ecacd3b031d7661a07e6d97f2418
+      CHATGPT2API_AUTH_KEY: isolated-pool02-fixture
+      PROVIDER_DATA_DIR: /tmp/provider-pool02-fixture
+      TIKTOKEN_CACHE_DIR: /tmp/provider-pool02-tokenizer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify exact reviewed source
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install locked dependencies and pytest
+        run: |
+          python -m pip install --disable-pip-version-check uv pytest==9.1.1
+          uv sync --frozen
+          uv pip install --python .venv/bin/python --index-url https://pypi.org/simple pytest==9.1.1
+          mkdir -p "$PROVIDER_DATA_DIR" "$TIKTOKEN_CACHE_DIR"
+      - name: Test account admission, recovery, and PR156 continuation
+        run: |
+          .venv/bin/python -m compileall -q api services utils test
+          .venv/bin/python -m pytest -q \
+            test/test_pool_admission.py \
+            test/test_pool_resources.py \
+            test/test_scoped_chat_slot_api.py \
+            test/test_editable_pool_admission.py \
+            test/test_pool_admission_identity.py \
+            test/test_text_task_service.py \
+            test/test_image_task_service.py \
+            test/test_reliable_pool_routes.py \
+            test/test_non_text_recovery.py \
+            test/test_image_thread_continuity.py \
+            test/test_incomplete_compact_successor.py
