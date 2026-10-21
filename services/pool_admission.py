@@ -42,14 +42,16 @@ _COMBINED_COPY_SENT_STAGES = frozenset({
 _COMBINED_COPY_RESULT_FIELDS = frozenset({
     "content", "result", "data", "result_file_ids", "result_sediment_ids",
 })
-_SAFE_SSE_EVENT_TYPES = ("resume_conversation_token", "server_ste_metadata")
+_SAFE_SSE_EVENT_TYPES = ("resume_conversation_token", "server_ste_metadata", "stream_handoff")
 _SAFE_RESUME_TOKEN_KINDS = frozenset({"topic", "other", "unknown", "multiple"})
+_SAFE_STREAM_HANDOFF_OPTION_TYPES = ("resume_sse_endpoint", "subscribe_ws_topic")
 
 
 def _safe_stream_finished_event_metadata(extra):
     """Persist only fixed SSE diagnostics, never an event body or token."""
     fields = {}
-    for key in ("resume_token_seen", "server_ste_metadata_seen"):
+    for key in ("resume_token_seen", "server_ste_metadata_seen", "stream_handoff_seen",
+                "resume_sse_endpoint_seen", "subscribe_ws_topic_seen"):
         if type(extra.get(key)) is bool:
             fields[key] = extra[key]
     kind = extra.get("resume_token_kind")
@@ -63,6 +65,14 @@ def _safe_stream_finished_event_metadata(extra):
         }
         if safe_counts:
             fields["sse_event_type_counts"] = safe_counts
+    handoff_counts = extra.get("stream_handoff_option_counts")
+    if isinstance(handoff_counts, dict):
+        safe_handoff_counts = {
+            name: count for name in _SAFE_STREAM_HANDOFF_OPTION_TYPES
+            if type(count := handoff_counts.get(name)) is int and 0 <= count <= 2147483647
+        }
+        if safe_handoff_counts:
+            fields["stream_handoff_option_counts"] = safe_handoff_counts
     return fields
 
 
