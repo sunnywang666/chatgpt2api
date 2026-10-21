@@ -2005,15 +2005,20 @@ class TextResultRecoveryTests(unittest.TestCase):
             "mapping": {},
         }
 
-        with self.assertRaises(ConversationBindingError) as first:
-            ConversationBindingService._locate_text_request_conversation(backend, receipt)
-        self.assertEqual(
-            first.exception.recovery_reason,
-            TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value,
-        )
-        self.assertEqual(first.exception.recovery_scan["next_offset"], 100)
-        self.assertEqual(first.exception.recovery_scan["conversation_ids"], [])
-        receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = first.exception.recovery_scan
+        # Missing timestamps cannot establish a time cut-off.  Persist and
+        # finish one page at a time, so each subsequent recovery advances the
+        # original account range rather than prefetching a moving recent-list
+        # head or restarting at offset zero.
+        for offset in range(0, 120, 20):
+            with self.assertRaises(ConversationBindingError) as incomplete:
+                ConversationBindingService._locate_text_request_conversation(backend, receipt)
+            self.assertEqual(
+                incomplete.exception.recovery_reason,
+                TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value,
+            )
+            self.assertEqual(incomplete.exception.recovery_scan["next_offset"], offset + 20)
+            self.assertEqual(incomplete.exception.recovery_scan["conversation_ids"], [])
+            receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = incomplete.exception.recovery_scan
 
         with self.assertRaises(ConversationBindingError) as complete:
             ConversationBindingService._locate_text_request_conversation(backend, receipt)

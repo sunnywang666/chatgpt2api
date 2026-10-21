@@ -867,6 +867,22 @@ class ConversationBindingService:
             }
 
         while not scan["coverage_complete"]:
+            # Finish a persisted page before requesting a later offset.  The
+            # upstream recent-conversations list is live, so prefetching a
+            # large range while the current page still has readable entries
+            # makes an offset scan vulnerable to head drift across recovery
+            # windows.  Deferred failed entries remain an exception: keep
+            # advancing past a page whose remaining candidates are all in
+            # their recorded cooldown, so one transient detail failure cannot
+            # starve the rest of the bounded range.
+            pending = scan["conversation_ids"][scan["next_index"]:]
+            failed_reads = scan.get("failed_reads", {})
+            if pending and any(
+                conversation_id not in failed_reads
+                or time.time() >= failed_reads[conversation_id]["next_at"]
+                for conversation_id in pending
+            ):
+                break
             # Bound each persisted candidate window, then inspect it before
             # continuing from the accumulated upstream offset in another
             # recovery round. This keeps the receipt small without turning the
