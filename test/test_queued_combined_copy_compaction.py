@@ -4,12 +4,17 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import PropertyMock, patch
 
 from services.account_service import AccountService
 from services.category_directory_derivation import compact_json
 from services.combined_copy_derivation import LEGACY_BOUNDARY, LEGACY_SUFFIX, MODEL, EFFORT
+from services.account_request_pacing import AccountRequestClock
+from services.config import config
+from services.model_service import ModelCatalogService, ModelRoute
 from services.pool_admission import PoolAdmission
 from services.request_context import AdmissionLost, current_request
 from services.storage.json_storage import JSONStorageBackend
@@ -116,6 +121,10 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
         context = self.admission.claim_next()
         self.assertIsNotNone(context)
         return context
+
+    @staticmethod
+    def trial_route():
+        return ModelRoute(account_types=frozenset({"Plus"}), account_identities=frozenset({"account-0"}))
 
     def test_first_send_uses_compact_copy_without_rewriting_original_or_repeating_after_restart(self):
         body = self.submit()
@@ -309,7 +318,9 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
             },
         }
 
-        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability") as fresh:
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability") as fresh, \
+             patch("services.model_service.model_catalog_service.prepared_bound_model_route_at_send",
+                   return_value=self.trial_route()):
             self.admission.execute(self.claim())
 
         fresh.assert_called_once()
@@ -345,7 +356,9 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
             ], "expires_at": 1100},
         }
 
-        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability") as fresh:
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability") as fresh, \
+             patch("services.model_service.model_catalog_service.prepared_bound_model_route_at_send",
+                   return_value=self.trial_route()):
             self.admission.execute(self.claim())
             self.admission.execute(self.claim())
             self.admission.execute(self.claim())
@@ -447,7 +460,9 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
                            "codex_max_concurrency": 4})
 
         with patch.object(self.admission, "_fresh_bound_firstsend_model_capability",
-                          side_effect=revoke_after_read):
+                          side_effect=revoke_after_read), \
+             patch("services.model_service.model_catalog_service.prepared_bound_model_route_at_send",
+                   return_value=self.trial_route()):
             self.admission.execute(context)
 
         after = self.receipt()
@@ -456,6 +471,155 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
         self.assertFalse(after["_submission_started"])
         self.assertFalse(any(item.get("stage") == "first_send_model_trial_selected"
                              for item in after["_execution_timeline"]))
+
+    def test_trial_catalog_prepare_can_use_the_same_http_clock_before_the_post(self):
+        """The catalog GET must run before, never inside, the POST clock lock."""
+        body = queued_copy_body()
+        body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}
+        self.submit(body)
+        self.admission.settings = lambda: {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {
+                "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1100,
+            },
+        }
+        pace = AccountRequestClock("account-0", self.root / "trial-clock.json")
+        calls = []
+
+        def send(method, _url, **_kwargs):
+            calls.append(method)
+            return SimpleNamespace(status_code=200, headers={}, close=lambda: None)
+
+        class PacingCatalogBackend:
+            def __init__(self, *, access_token=""):
+                self.access_token = access_token
+
+            def list_models(self):
+                # A regression that calls the real catalog path from
+                # ``before_send`` holds this same clock and cannot reach POST.
+                pace.request(send, "GET", "https://fixture/backend-api/models",
+                             _account_request_deadline_monotonic=time.monotonic() + .2)
+                return {"object": "list", "data": [{"id": "gpt-5-6-instant"}]}
+
+            def close(self):
+                pass
+
+        catalog = ModelCatalogService(
+            self.accounts, backend_factory=PacingCatalogBackend,
+            cache_ttl_seconds=300,
+        )
+
+        def runner(body, on_cursor):
+            pace.request(send, "POST", "https://fixture/backend-api/conversation", json=body,
+                         _account_request_deadline_monotonic=time.monotonic() + 1)
+            # The pacing response is deliberately minimal.  TextTaskService
+            # still needs its normal terminal runner mapping after the POST.
+            return {"content": "fixture answer", "parent_message_id": "answer"}
+
+        self.text.runner = runner
+        with patch.object(type(config), "account_request_interval_secs", new_callable=PropertyMock, return_value=0), \
+             patch.object(type(config), "account_message_interval_secs", new_callable=PropertyMock, return_value=0), \
+             patch.object(self.accounts, "refresh_access_token", side_effect=lambda token, **_kwargs: token), \
+             patch("services.model_service.model_catalog_service", catalog):
+            self.admission.execute(self.claim())
+
+        self.assertEqual(calls, ["GET", "POST"])
+        self.assertTrue(self.receipt()["_submission_started"])
+
+    def test_trial_with_expired_prepared_catalog_proof_requeues_without_a_post(self):
+        body = queued_copy_body()
+        body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}
+        self.submit(body)
+        self.admission.settings = lambda: {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {
+                "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1100,
+            },
+        }
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability"), \
+             patch("services.model_service.model_catalog_service.prepared_bound_model_route_at_send",
+                   side_effect=[self.trial_route(), None]):
+            self.admission.execute(self.claim())
+
+        after = self.receipt()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(after["status"], "queued")
+        self.assertFalse(after["_submission_started"])
+
+    def test_trial_control_expiring_after_catalog_prepare_requeues_without_a_post(self):
+        """A clock wait may outlive an armed control, so final guard rechecks it."""
+        body = queued_copy_body()
+        body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}
+        self.submit(body)
+        self.admission.settings = lambda: {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {
+                "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1010,
+            },
+        }
+
+        def expire_after_prepare(*_):
+            self.clock.now = 1010
+
+        context = self.claim()
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability",
+                          side_effect=expire_after_prepare), \
+             patch("services.model_service.model_catalog_service.prepared_bound_model_route_at_send",
+                   return_value=self.trial_route()):
+            self.admission.execute(context)
+
+        self.assertIsNotNone(context._prepared_firstsend_model_route)
+        after = self.receipt()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(after["status"], "queued")
+        self.assertFalse(after["_submission_started"])
+
+    def test_trial_credential_rotation_after_catalog_prepare_requeues_without_a_post(self):
+        """A new bound credential invalidates the prepared exact-account proof."""
+        body = queued_copy_body()
+        body["product_work"] = {"product_ref": "product-837", "step_ref": "copy"}
+        self.submit(body)
+        self.admission.settings = lambda: {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {
+                "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1100,
+            },
+        }
+
+        class CatalogBackend:
+            def __init__(self, *, access_token=""):
+                self.access_token = access_token
+
+            def list_models(self):
+                return {"object": "list", "data": [{"id": "gpt-5-6-instant"}]}
+
+            def close(self):
+                pass
+
+        catalog = ModelCatalogService(self.accounts, backend_factory=CatalogBackend,
+                                      cache_ttl_seconds=300, clock=lambda: self.clock.now)
+        prepared = catalog.prepared_bound_model_route_at_send
+        calls = 0
+
+        def rotate_after_prepare(identity, model):
+            nonlocal calls
+            calls += 1
+            route = prepared(identity, model)
+            if calls == 1:
+                self.accounts._apply_refreshed_tokens(
+                    "fixture-token", {"access_token": "rotated-fixture-token"}, "test_rotation")
+            return route
+
+        with patch.object(self.accounts, "refresh_access_token", side_effect=lambda token, **_kwargs: token), \
+             patch("services.model_service.model_catalog_service", catalog), \
+             patch.object(catalog, "prepared_bound_model_route_at_send", side_effect=rotate_after_prepare):
+            self.admission.execute(self.claim())
+
+        after = self.receipt()
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(after["status"], "queued")
+        self.assertFalse(after["_submission_started"])
 
     def test_durable_trial_audit_survives_timeline_truncation(self):
         body = queued_copy_body()
@@ -471,7 +635,9 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
                 "account_identity": "account-0", "request_id": "queued-copy", "expires_at": 1100,
             },
         }
-        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability"):
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability"), \
+             patch("services.model_service.model_catalog_service.prepared_bound_model_route_at_send",
+                   return_value=self.trial_route()):
             self.admission.execute(self.claim())
         with self.store.transaction() as db:
             after = self.store.read_receipt(db, "text", "admin", "queued-copy")
