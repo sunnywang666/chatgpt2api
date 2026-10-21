@@ -124,11 +124,11 @@ class ConversationBindingTextRequest(BaseModel):
     def original_or_successor(self):
         no_final = "continue_after_no_final" in self.model_fields_set
         queued_image = "continue_before_queued_image_id" in self.model_fields_set
-        attributes_upgrade = self.derived_input == {"kind": "attributes_required_only_v4"}
-        if attributes_upgrade and not no_final:
-            raise ValueError("attributes upgrade requires explicit no-final continuation")
+        no_final_derivation = self.derived_input in ({"kind": "attributes_required_only_v4"}, {"kind": "combined_copy_compact_v1"})
+        if no_final_derivation and not no_final:
+            raise ValueError("derived upgrade requires explicit no-final continuation")
         if no_final and (self.continue_after_no_final is not True or not self.supersedes_request_id
-                         or self.derived_input is not None and not attributes_upgrade):
+                         or self.derived_input is not None and not no_final_derivation):
             raise ValueError("no-final continuation requires an explicit original-request successor")
         if queued_image and (not self.continue_before_queued_image_id or not self.supersedes_request_id
                              or no_final or self.derived_input is not None):
@@ -643,7 +643,7 @@ def create_router() -> APIRouter:
         try:
             owner = str(identity.get("id") or "anonymous")
             payload = body.model_dump(mode="python", exclude_unset=True)
-            if payload.get("derived_input") == {"kind": "attributes_required_only_v4"}:
+            if payload.get("derived_input") in ({"kind": "attributes_required_only_v4"}, {"kind": "combined_copy_compact_v1"}):
                 if payload.get("client_request_id") != request_id or text_task_service.admission is None:
                     raise ConversationBindingError("original successor envelope required", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
                 existing = await run_in_threadpool(text_task_service.validate_submission, owner, payload)

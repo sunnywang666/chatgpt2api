@@ -2628,10 +2628,10 @@ class TextTaskService:
                 return expected
             derived = "derived_input" in body
             no_final = "continue_after_no_final" in body
-            attributes_upgrade = body.get("derived_input") == {"kind": "attributes_required_only_v4"}
+            no_final_derived = body.get("derived_input") in ({"kind": "attributes_required_only_v4"}, {"kind": "combined_copy_compact_v1"})
             if (set(body) != self.SUPERSEDE_FIELDS | ({"derived_input"} if derived else set()) | ({"continue_after_no_final"} if no_final else set()) or not owner
-                    or no_final and (body["continue_after_no_final"] is not True or derived and not attributes_upgrade)
-                    or attributes_upgrade and not no_final
+                    or no_final and (body["continue_after_no_final"] is not True or derived and not no_final_derived)
+                    or no_final_derived and not no_final
                     or any(not isinstance(body.get(k), str) or not body[k].strip() or body[k] != body[k].strip() for k in self.SUPERSEDE_FIELDS)
                     or len(request_id) > 200 or len(body["supersedes_request_id"]) > 200
                     or request_id == body["supersedes_request_id"]):
@@ -2734,6 +2734,7 @@ class TextTaskService:
                                   previous, allow_no_final_successor=True))
         audit = successor.get("_derived_input") or {}
         attributes_upgrade = isinstance(audit, dict) and audit.get("kind") == "attributes_required_only_v4"
+        compact_upgrade = isinstance(audit, dict) and audit.get("kind") == "combined_copy_compact_v1"
         model_upgrade = bool(attributes_upgrade
             and successor.get("_supersedes_no_final") is True
             and previous and previous.get("model") == audit.get("original_model") == "gpt-5-6-instant"
@@ -2747,7 +2748,8 @@ class TextTaskService:
             and successor.get("_route", "chat") == previous.get("_route", "chat") == "chat"
             and successor.get("_operation", "text") == previous.get("_operation", "text") == "text"
             and not successor.get("_forward_protocol") and not previous.get("_forward_protocol")
-            and (model_upgrade if attributes_upgrade else successor.get("model") == previous.get("model")))
+            and (model_upgrade if attributes_upgrade else successor.get("model") == previous.get("model"))
+            and (not compact_upgrade or successor.get("_supersedes_no_final") is True))
         if not shared:
             return False
         if rejected_model:
@@ -2846,8 +2848,8 @@ class TextTaskService:
         elif TextTaskService._RECONCILED_QUEUED_SUCCESSOR in successor:
             reject("CHAT_SUPERSEDE_INVALID")
         if successor.get("_derived_input"):
-            attributes_upgrade = successor["_derived_input"].get("kind") == "attributes_required_only_v4"
-            if attributes_upgrade:
+            no_final_derived = successor["_derived_input"].get("kind") in {"attributes_required_only_v4", "combined_copy_compact_v1"}
+            if no_final_derived:
                 if successor.get("_supersedes_no_final") is not True or not TextTaskService._no_final_successor_source(previous, now):
                     reject("CHAT_DERIVED_INPUT_INVALID")
             elif (previous.get("original_http_status") != 413
@@ -3723,7 +3725,7 @@ class TextTaskService:
         if (set(envelope) == self.SUPERSEDE_FIELDS | {"derived_input", "continue_after_no_final"}
                 and envelope.get("client_request_id") == request_id
                 and envelope.get("continue_after_no_final") is True
-                and envelope.get("derived_input") == {"kind": "attributes_required_only_v4"}):
+                and envelope.get("derived_input") in ({"kind": "attributes_required_only_v4"}, {"kind": "combined_copy_compact_v1"})):
             # A rejected initial submit has no durable row and cannot have sent:
             # submission always commits its row before admission is awakened.
             # Reuse that transaction, immutable derivation and fresh send guard.
