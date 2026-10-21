@@ -71,7 +71,19 @@ def state_snapshot(store, db):
     return works, clocks
 
 
-def constraints(receipt, works, clocks, receipts, now):
+def active_work_counts(receipts):
+    """Count unfinished work members once for one immutable scheduler snapshot."""
+    counts = {}
+    for _, _, _, receipt in receipts:
+        work_key = receipt.get('_work_key')
+        if (work_key and not receipt.get('_attempt_finished_at') and (
+                receipt.get('status') == 'running' or receipt.get('upstream_unfinished') is True
+                or receipt.get('upstream_outcome') == 'unknown' or receipt.get('status') == 'unknown')):
+            counts[work_key] = counts.get(work_key, 0) + 1
+    return counts
+
+
+def constraints(receipt, works, clocks, receipts, now, *, active_by_work=None):
     """Return additional resources/needs and caller earliest-send timestamp."""
     scheduling = receipt.get('_scheduling') or {}
     work = works.get(receipt.get('_work_key'))
@@ -83,9 +95,10 @@ def constraints(receipt, works, clocks, receipts, now):
         return resources, needs, ready
     work_id = work['key']
     enabled = work.get('state', 'active') == 'active'
-    active = sum(1 for _, _, _, r in receipts if r.get('_work_key') == work_id and not r.get('_attempt_finished_at') and (
-        r.get('status') == 'running' or r.get('upstream_unfinished') is True or r.get('upstream_outcome') == 'unknown'
-        or r.get('status') == 'unknown'))
+    active = (active_by_work.get(work_id, 0) if active_by_work is not None else sum(
+        1 for _, _, _, r in receipts if r.get('_work_key') == work_id and not r.get('_attempt_finished_at') and (
+            r.get('status') == 'running' or r.get('upstream_unfinished') is True
+            or r.get('upstream_outcome') == 'unknown' or r.get('status') == 'unknown')))
     turn = 'work_turn:' + work_id.removeprefix('work:')
     resources.append(Resource(turn, int(enabled), active, now))
     needs.append(Need(turn))
@@ -103,19 +116,29 @@ def constraints(receipt, works, clocks, receipts, now):
     return resources, needs, ready
 
 
+def expire_unsent_receipt(store, db, kind, owner, request_id, receipt, now):
+    """Close one known-unsent receipt whose durable wait deadline has elapsed.
+
+    Callers that already hold an exact claimed receipt use this instead of
+    decoding every queued receipt in the send-critical transaction.
+    """
+    deadline = (receipt.get('_scheduling') or {}).get('wait_deadline')
+    if (not deadline or now < timestamp(deadline) or receipt.get('_submission_started')
+            or receipt.get('status') not in {'queued', 'not_started', 'running'}
+            or receipt.get('upstream_outcome') == 'unknown'):
+        return False
+    receipt.update(status='error' if kind == 'image' else 'failed', error_code='WAIT_DEADLINE_EXCEEDED',
+                   upstream_outcome='not_sent', upstream_unfinished=False, _turn_reserved=False, _executing=False,
+                   _claim_id=None, _claim_until=0, finished_at=now,
+                   waiting={'reasons': ['wait_deadline_exceeded'], 'next_check_at': None})
+    store.write_receipt(db, kind, owner, request_id, receipt)
+    release_provisional_slot(store, db, receipt)
+    return True
+
+
 def expire_unsent(store, db, receipts, now):
     for kind, owner, request_id, receipt in receipts:
-        deadline = (receipt.get('_scheduling') or {}).get('wait_deadline')
-        if (not deadline or now < timestamp(deadline) or receipt.get('_submission_started')
-                or receipt.get('status') not in {'queued', 'not_started', 'running'}
-                or receipt.get('upstream_outcome') == 'unknown'):
-            continue
-        receipt.update(status='error' if kind == 'image' else 'failed', error_code='WAIT_DEADLINE_EXCEEDED',
-                       upstream_outcome='not_sent', upstream_unfinished=False, _turn_reserved=False, _executing=False,
-                       _claim_id=None, _claim_until=0, finished_at=now,
-                       waiting={'reasons': ['wait_deadline_exceeded'], 'next_check_at': None})
-        store.write_receipt(db, kind, owner, request_id, receipt)
-        release_provisional_slot(store, db, receipt)
+        expire_unsent_receipt(store, db, kind, owner, request_id, receipt, now)
 
 
 def release_provisional_slot(store, db, receipt):
@@ -154,8 +177,8 @@ def before_send(store, db, receipt, now):
         store.set_runtime(db, key, now)
 
 
-def waiting_reasons(receipt, works, clocks, receipts, now, reasons):
-    resources, _, ready = constraints(receipt, works, clocks, receipts, now)
+def waiting_reasons(receipt, works, clocks, receipts, now, reasons, *, active_by_work=None):
+    resources, _, ready = constraints(receipt, works, clocks, receipts, now, active_by_work=active_by_work)
     result = list(reasons)
     scheduling = receipt.get('_scheduling') or {}
     if scheduling.get('not_before') and timestamp(scheduling['not_before']) > now:

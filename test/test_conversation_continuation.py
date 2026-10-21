@@ -1785,6 +1785,9 @@ class TextResultRecoveryTests(unittest.TestCase):
             offset=0,
             timeout_secs=10.0,
             strict_schema=True,
+            deadline_monotonic=mock.ANY,
+            connect_timeout_secs=10.0,
+            minimum_budget_secs=ConversationBindingService.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS,
         )
         self.assertEqual(backend._get_conversation.call_count, 3)
         for call in backend._get_conversation.call_args_list:
@@ -1936,8 +1939,99 @@ class TextResultRecoveryTests(unittest.TestCase):
             offset=0,
             timeout_secs=10.0,
             strict_schema=True,
+            deadline_monotonic=mock.ANY,
+            connect_timeout_secs=10.0,
+            minimum_budget_secs=ConversationBindingService.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS,
         )
         backend._get_conversation.assert_not_called()
+
+    def test_missing_conversation_scan_forwards_one_deadline_to_list_anchor_and_detail(self):
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        identity = ConversationBindingService._recovery_scan_identity(receipt)
+        observed = []
+
+        class Backend:
+            def _list_recent_conversations(self, *, offset, **kwargs):
+                observed.append(("list", offset, kwargs))
+                return ([{"id": f"anchor-{index}"} for index in range(20)]
+                        if offset == 0 else [])
+
+            def _get_conversation(self, conversation_id, **kwargs):
+                observed.append(("detail", conversation_id, kwargs))
+                return {"conversation_id": conversation_id, "mapping": {}}
+
+        backend = Backend()
+        # An anchored persisted offset exercises both anchor re-reads and the
+        # next mutable page under a caller-supplied scan deadline.
+        receipt[RECOVERY_CONVERSATION_SCAN_FIELD] = {
+            "identity": identity, "conversation_ids": [], "next_offset": 20,
+            "coverage_complete": False, "time_order_valid": False,
+            "last_update_time": None, "next_index": 0, "matches": [],
+            "page_anchor": {"offset": 0, "ids": [f"anchor-{index}" for index in range(20)]},
+        }
+        with mock.patch("services.conversation_binding_service.time.monotonic", return_value=100.0):
+            with self.assertRaises(ConversationBindingError):
+                ConversationBindingService._locate_text_request_conversation(
+                    backend, receipt, deadline_monotonic=115.0,
+                )
+        self.assertEqual([item[:2] for item in observed], [("list", 0), ("list", 20), ("list", 0)])
+        for _, _, kwargs in observed:
+            self.assertEqual(kwargs["deadline_monotonic"], 115.0)
+            self.assertEqual(kwargs["connect_timeout_secs"], 10.0)
+            self.assertEqual(kwargs["minimum_budget_secs"], 5.0)
+
+        # A new bounded scan reaches a candidate detail under that same
+        # deadline; preserving the persisted identity does not widen it.
+        receipt.pop(RECOVERY_CONVERSATION_SCAN_FIELD)
+        observed.clear()
+        with mock.patch("services.conversation_binding_service.time.monotonic", return_value=100.0):
+            with self.assertRaises(ConversationBindingError) as incomplete:
+                ConversationBindingService._locate_text_request_conversation(
+                    backend, receipt, deadline_monotonic=115.0,
+                )
+        self.assertEqual(incomplete.exception.recovery_scan["identity"], identity)
+        self.assertEqual(observed[0][:2], ("list", 0))
+        self.assertEqual([item[1] for item in observed[1:]], [f"anchor-{index}" for index in range(20)])
+        self.assertTrue(all(item[0] == "detail" for item in observed[1:]))
+        for _, _, kwargs in observed:
+            self.assertEqual(kwargs["deadline_monotonic"], 115.0)
+
+    def test_missing_conversation_scan_lock_wait_expires_without_a_transport_attempt(self):
+        from services.account_request_pacing import AccountRequestClock
+        from services.openai_backend_api import OpenAIBackendAPI
+
+        receipt = self.request_receipt()
+        receipt.pop("conversation_id")
+        receipt.pop("parent_message_id")
+        with tempfile.TemporaryDirectory() as directory:
+            clock = AccountRequestClock("scan-fixture", Path(directory) / "clock.json")
+            raw = mock.Mock(side_effect=AssertionError("deadline-bound scan must not reach transport"))
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.base_url = "https://chatgpt.com"
+            backend._headers = lambda _path, headers: headers
+            backend.session = SimpleNamespace(
+                get=lambda url, **kwargs: clock.request(raw, "GET", url, **kwargs),
+            )
+            self.assertTrue(clock.lock.acquire())
+            try:
+                # Keep this isolated contention test short while exercising the
+                # real minimum-budget and account-lock path.
+                with mock.patch.object(ConversationBindingService, "RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS", 0.01):
+                    with self.assertRaises(ConversationBindingError) as failed:
+                        ConversationBindingService._locate_text_request_conversation(
+                            backend, receipt, deadline_monotonic=time.monotonic() + 0.02,
+                        )
+            finally:
+                clock.lock.release()
+            raw.assert_not_called()
+            self.assertEqual(failed.exception.code, "RECOVERY_READ_FAILED")
+            self.assertEqual(
+                failed.exception.recovery_scan["identity"],
+                ConversationBindingService._recovery_scan_identity(receipt),
+            )
+            self.assertFalse(clock.lock.locked())
 
     def test_missing_conversation_scan_accepts_real_iso_update_time_and_stops_at_dispatch(self):
         receipt = self.request_receipt(
@@ -1967,6 +2061,9 @@ class TextResultRecoveryTests(unittest.TestCase):
         )
         backend._list_recent_conversations.assert_called_once_with(
             limit=20, offset=0, timeout_secs=10.0, strict_schema=True,
+            deadline_monotonic=mock.ANY,
+            connect_timeout_secs=10.0,
+            minimum_budget_secs=ConversationBindingService.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS,
         )
         self.assertEqual(backend._get_conversation.call_count, 20)
         self.assertEqual(

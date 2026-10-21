@@ -815,7 +815,7 @@ class ConversationBindingService:
             try:
                 if not str(receipt.get("conversation_id") or "").strip():
                     located_receipt, located_document = self._locate_text_request_conversation(
-                        backend, receipt,
+                        backend, receipt, deadline_monotonic=deadline,
                     )
                     try:
                         recovered = self._read_text_request_result(
@@ -849,6 +849,7 @@ class ConversationBindingService:
         cls,
         backend: OpenAIBackendAPI,
         receipt: dict[str, Any],
+        *, deadline_monotonic: float | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Find one exact request user node within a bounded recent-account scan."""
         request_message_id = str(receipt.get("request_message_id") or "").strip()
@@ -857,7 +858,11 @@ class ConversationBindingService:
                 "original request message identity is required",
                 code="CONVERSATION_BINDING_CONTRACT_INVALID",
             )
-        deadline = time.monotonic() + cls.RECOVERY_SCAN_TIMEOUT_SECONDS
+        started = time.monotonic()
+        deadline = started + cls.RECOVERY_SCAN_TIMEOUT_SECONDS
+        if (isinstance(deadline_monotonic, (int, float)) and not isinstance(deadline_monotonic, bool)
+                and math.isfinite(deadline_monotonic)):
+            deadline = min(deadline, float(deadline_monotonic))
         scan_identity = cls._recovery_scan_identity(receipt)
         scan: dict[str, Any] | None = None
 
@@ -914,6 +919,9 @@ class ConversationBindingService:
                     offset=anchor["offset"],
                     timeout_secs=min(cls.RECOVERY_LIST_TIMEOUT_SECONDS, remaining_timeout()),
                     strict_schema=True,
+                    deadline_monotonic=deadline,
+                    connect_timeout_secs=10.0,
+                    minimum_budget_secs=cls.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS,
                 )
             except Exception as exc:
                 raise cls._scan_read_failed(scan, exc, phase="conversation_anchor") from exc
@@ -972,6 +980,9 @@ class ConversationBindingService:
                         list_timeout,
                     ),
                     strict_schema=True,
+                    deadline_monotonic=deadline,
+                    connect_timeout_secs=10.0,
+                    minimum_budget_secs=cls.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS,
                 )
             except Exception as exc:
                 raise cls._scan_read_failed(scan, exc, phase="conversation_list") from exc
@@ -986,6 +997,9 @@ class ConversationBindingService:
                         offset=prior_anchor["offset"],
                         timeout_secs=min(cls.RECOVERY_LIST_TIMEOUT_SECONDS, remaining_timeout()),
                         strict_schema=True,
+                        deadline_monotonic=deadline,
+                        connect_timeout_secs=10.0,
+                        minimum_budget_secs=cls.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS,
                     )
                 except Exception as exc:
                     raise cls._scan_read_failed(scan, exc, phase="conversation_anchor") from exc
@@ -1070,7 +1084,11 @@ class ConversationBindingService:
                 raise cls._scan_incomplete(scan)
             visited_this_round.add(conversation_id)
             try:
-                document = backend._get_conversation(conversation_id, timeout_secs=detail_timeout)
+                document = backend._get_conversation(
+                    conversation_id, timeout_secs=detail_timeout,
+                    deadline_monotonic=deadline, connect_timeout_secs=10.0,
+                    minimum_budget_secs=cls.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS,
+                )
                 if not isinstance(document, dict):
                     raise ConversationBindingError("conversation document is invalid",
                                                    code="CONVERSATION_BINDING_CONTRACT_INVALID")
@@ -1153,6 +1171,8 @@ class ConversationBindingService:
             document = backend._get_conversation(
                 conversation_id,
                 timeout_secs=remaining_timeout(),
+                deadline_monotonic=deadline, connect_timeout_secs=10.0,
+                minimum_budget_secs=cls.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS,
             )
         except UpstreamHTTPError as exc:
             if exc.status_code == 404:

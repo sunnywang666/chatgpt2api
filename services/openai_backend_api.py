@@ -1645,6 +1645,8 @@ class OpenAIBackendAPI:
         offset: int = 0,
         timeout_secs: float = 10.0,
         strict_schema: bool = False,
+        *, deadline_monotonic: float | None = None, connect_timeout_secs: float | None = 10.0,
+        minimum_budget_secs: float | None = None,
     ) -> list[Dict[str, Any]]:
         """列出最近的对话列表，按更新时间倒序。
 
@@ -1652,11 +1654,21 @@ class OpenAIBackendAPI:
         查找最近创建的对话来恢复 conversation_id。
         """
         path = f"/backend-api/conversations?offset={offset}&limit={limit}&order=updated&conversation_filter=all"
+        options = self._image_request_options(timeout_secs)
+        if deadline_monotonic is not None:
+            existing = options.get("_account_request_deadline_monotonic")
+            options["_account_request_deadline_monotonic"] = (
+                min(existing, deadline_monotonic) if existing is not None else deadline_monotonic
+            )
+        if connect_timeout_secs is not None:
+            options["_account_request_connect_timeout_secs"] = connect_timeout_secs
+        if minimum_budget_secs is not None:
+            options["_account_request_minimum_budget_secs"] = minimum_budget_secs
         try:
             response = self.session.get(
                 self.base_url + path,
                 headers=self._headers(path, {"Accept": "application/json"}),
-                timeout=timeout_secs,
+                **options,
             )
             ensure_ok(response, path)
             data = response.json()
