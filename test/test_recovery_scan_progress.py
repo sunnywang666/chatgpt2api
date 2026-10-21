@@ -247,7 +247,7 @@ def test_anchor_rate_limit_then_head_drift_keeps_the_original_scan_unknown(clock
     backend._list_recent_conversations = mock.Mock(side_effect=http_error(429, 120))
 
     rate_limited = scan_error(backend, row)
-    assert rate_limited.code == 'RECOVERY_RATE_LIMITED'
+    assert TextTaskService._recovery_failure(rate_limited) == ('RECOVERY_RATE_LIMITED', 120)
     assert rate_limited.recovery_read_error['phase'] == 'conversation_anchor'
     assert row[SCAN]['next_offset'] == 20
     assert row[SCAN]['page_anchor']['offset'] == 0

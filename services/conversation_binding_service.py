@@ -871,9 +871,17 @@ class ConversationBindingService:
         # offset in a later recovery window, prove that the preceding page is
         # still identical. A changed head, deletion, or reordering otherwise
         # makes ``offset`` skip an unknown part of the original range.
+        pending = scan["conversation_ids"][scan["next_index"]:]
+        failed_reads = scan.get("failed_reads", {})
+        pending_has_readable_entry = any(
+            conversation_id not in failed_reads
+            or time.time() >= failed_reads[conversation_id]["next_at"]
+            for conversation_id in pending
+        )
         if (
             not scan["coverage_complete"]
             and scan["next_offset"]
+            and not pending_has_readable_entry
             and not scan.get("restart_from_head", False)
         ):
             anchor = scan.get("page_anchor")
