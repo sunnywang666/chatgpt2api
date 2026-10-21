@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${GH_TOKEN:?} ${REPOSITORY:?} ${RUN_ID:?} ${SOURCE_ATTEMPT:?} ${WORKFLOW_NAME:?} ${WORKFLOW_SHA:?} ${SOURCE_BRANCH:?} ${DISPLAY_TITLE:?}"
+: "${GH_TOKEN:?} ${REPOSITORY:?} ${RUN_ID:?} ${SOURCE_ATTEMPT:?} ${WORKFLOW_NAME:?} ${WORKFLOW_SHA:?} ${SOURCE_BRANCH:?}"
 CURL_BIN="${CURL_BIN:-curl}"
 OBSERVE_MAX_SECONDS="${OBSERVE_MAX_SECONDS:-90}"
 OBSERVE_INTERVAL_SECONDS="${OBSERVE_INTERVAL_SECONDS:-5}"
@@ -89,7 +89,10 @@ case "$WORKFLOW_NAME" in
     # Tag-push releases retain version/latest and multi-architecture semantics;
     # only the existing workflow_dispatch contract can be replayed safely.
     jq -e '.event == "workflow_dispatch"' "$RUN_JSON" >/dev/null || exit 0
-    [[ "$DISPLAY_TITLE" =~ ^Publish\ Docker\ Image\ ([a-f0-9]{40})\ company$ ]] || exit 0
+    # workflow_run.requested can still expose the workflow's default display
+    # name. The fresh run endpoint is the only title used for dispatch inputs.
+    REST_DISPLAY_TITLE="$(jq -r '.display_title // empty' "$RUN_JSON")"
+    [[ "$REST_DISPLAY_TITLE" =~ ^Publish\ Docker\ Image\ ([a-f0-9]{40})\ company$ ]] || exit 0
     SOURCE_SHA="${BASH_REMATCH[1]}"
     workflow_file='docker-publish.yml'
     dispatch_ref='main'

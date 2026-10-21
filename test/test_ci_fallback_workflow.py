@@ -39,6 +39,8 @@ def test_queue_observer_can_only_replay_untouched_runs():
     assert "Company job started during cancellation; refusing hosted fallback." in helper
     assert "source_blob" in helper and "dispatch_blob" in helper
     assert 'Publish\\ Docker\\ Image\\ ([a-f0-9]{40})\\ company' in helper
+    assert "REST_DISPLAY_TITLE" in helper
+    assert '"$DISPLAY_TITLE"' not in helper
     assert "Tag-push releases retain version/latest and multi-architecture semantics" in helper
     assert "jq -e '.event == \"workflow_dispatch\"'" in helper
     assert "inputs: $inputs" in helper
