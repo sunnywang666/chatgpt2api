@@ -1754,7 +1754,7 @@ class TextTaskTests(unittest.TestCase):
                     for index in range(20)
                 ]
 
-            def _get_conversation(self, conversation_id, *, timeout_secs):
+            def _get_conversation(self, conversation_id, *, timeout_secs, **_kwargs):
                 self.detail_calls.append((conversation_id, timeout_secs))
                 ScanClock.advance(9.5)
                 return {"conversation_id": conversation_id, "mapping": {}}

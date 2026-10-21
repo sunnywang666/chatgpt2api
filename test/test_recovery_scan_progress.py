@@ -63,7 +63,7 @@ class Backend:
     def _list_recent_conversations(self, *, limit, offset, **_):
         self.pages.append(offset)
         return [{'id': k} for k in list(self.rows)[offset:offset+limit]]
-    def _get_conversation(self, cid, *, timeout_secs):
+    def _get_conversation(self, cid, *, timeout_secs, **_kwargs):
         self.calls.append((cid, timeout_secs))
         value = self.rows[cid]
         if callable(value):
