@@ -32,8 +32,10 @@ permissions:
 
 jobs:
   scoped-chat-admission:
-    if: ${{ github.repository == 'sunnywang666/chatgpt2api' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    runs-on: ubuntu-latest
+    # Private, same-repository code only: an unavailable company runner queues;
+    # it must not silently fall back to GitHub-hosted capacity.
+    if: ${{ github.repository == 'sunnywang666/chatgpt2api' && github.event.repository.private == true && (github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.private == true)) }}
+    runs-on: ${{ fromJSON('["self-hosted","Linux","X64","hugsweet-linux-ci"]') }}
     timeout-minutes: 20
     env:
       SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '57f9a40efe85ecacd3b031d7661a07e6d97f2418' }}
