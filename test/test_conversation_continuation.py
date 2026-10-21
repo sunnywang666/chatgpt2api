@@ -2029,7 +2029,7 @@ class TextResultRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(
             [call.kwargs["offset"] for call in backend._list_recent_conversations.call_args_list],
-            [0, 20, 40, 60, 80, 100, 120],
+            [0, 0, 20, 20, 40, 40, 60, 60, 80, 80, 100, 100, 120],
         )
         self.assertEqual(backend._get_conversation.call_count, 120)
 
