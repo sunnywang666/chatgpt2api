@@ -749,7 +749,21 @@ class PoolAdmission:
             else:
                 completion.process_one()
         with self.store.connect() as db:
-            rows = list(self.store.receipts(db, statuses=("unknown", "failed", "error")))
+            # Recovery needs all text lineage to recognize a transferred empty
+            # root, but must keep the existing status prefilter for potentially
+            # large, completed image payloads.
+            text_receipts = [("text", owner, request_id, json.loads(raw))
+                             for owner, request_id, raw in db.execute(
+                                 "SELECT owner,id,receipt FROM requests")]
+            image_receipts = [("image", receipt["owner_id"], receipt["id"], receipt)
+                              for _, raw in db.execute(
+                                  "SELECT task_key,receipt FROM image_requests WHERE "
+                                  "json_extract(receipt,'$.status') IN (?,?,?)",
+                                  ("unknown", "failed", "error"))
+                              for receipt in (json.loads(raw),)]
+        receipts = text_receipts + image_receipts
+        rows = [row for row in receipts if row[3].get("status") in {"unknown", "failed", "error"}]
+        _, transferred_empty_turns = self._empty_turn_transfers(receipts)
         # Use the existing persisted retry timestamps. A short-backoff legacy
         # scan must not monopolize recovery ahead of other overdue originals.
         # Missing/zero retry times are immediately due. Image created_at is a
@@ -775,32 +789,69 @@ class PoolAdmission:
             # checks below.  A volatile cursor shares the next first chance
             # across recover_one passes without introducing durable scheduler
             # state or changing a receipt.
-            by_account = {}
-            for row in rows:
+            def recovery_priority(row):
+                # Match the capacity projection: an unresolved, not-yet-ended
+                # text turn still occupies a real account slot until one of the
+                # existing bounded-release proofs says otherwise.  Give its
+                # original-result read a first chance; historical UNKNOWN rows
+                # remain eligible in the later tier and are never discarded.
                 kind, owner, request_id, receipt = row
-                account = (receipt.get("provider_account_identity")
-                           or receipt.get("provider_binding_id")
-                           or f"{kind}:{owner}:{request_id}")
-                by_account.setdefault(account, []).append(row)
-            accounts = list(by_account)
-            if accounts:
+                if kind != "text" or not unresolved_result(kind, receipt):
+                    return 1
+                from services.text_task_service import TextTaskService
+                status = receipt.get("status")
+                active = status == "running" or not receipt.get("_attempt_finished_at")
+                wait_ended = (receipt.get("_route", "chat") == "chat"
+                              and receipt.get("_operation", "text") == "text"
+                              and not receipt.get("_forward_protocol")
+                              and status == "failed"
+                              and receipt.get("error_code") == "RESULT_UNRECOVERABLE"
+                              and receipt.get("upstream_outcome") == "unknown"
+                              and type(receipt.get("_execution_wait_ended_at")) in (int, float)
+                              and math.isfinite(receipt["_execution_wait_ended_at"]))
+                released = (receipt.get("_turn_reserved") is False
+                            and TextTaskService._verified_retryable_empty(receipt))
+                stalled = TextTaskService._qualified_stalled_incomplete_capacity_boundary(receipt, now)
+                return 0 if (active and (owner, request_id) not in transferred_empty_turns
+                             and not original_turn_ended(kind, receipt)
+                             and not wait_ended and not released and not stalled) else 1
+
+            priorities = {id(row): recovery_priority(row) for row in rows}
+            ordered_rows = []
+            # Do not let a large old UNKNOWN cohort cross a capacity-contributing
+            # original merely because account rotation interleaves both sets.
+            # Within either tier the established account cursor and per-account
+            # persisted due order remain authoritative.
+            for priority in (0, 1):
+                by_account = {}
+                for row in rows:
+                    if priorities[id(row)] != priority:
+                        continue
+                    kind, owner, request_id, receipt = row
+                    account = (receipt.get("provider_account_identity")
+                               or receipt.get("provider_binding_id")
+                               or f"{kind}:{owner}:{request_id}")
+                    by_account.setdefault(account, []).append(row)
+                accounts = list(by_account)
+                if not accounts:
+                    continue
                 if self._recovery_account_cursor in accounts:
                     start = (accounts.index(self._recovery_account_cursor) + 1) % len(accounts)
                 else:
                     start = 0
                 ordered_accounts = accounts[start:] + accounts[:start]
-                rows = []
                 depth = 0
                 while True:
                     added = False
                     for account in ordered_accounts:
                         candidates = by_account[account]
                         if depth < len(candidates):
-                            rows.append(candidates[depth])
+                            ordered_rows.append(candidates[depth])
                             added = True
                     if not added:
                         break
                     depth += 1
+            rows = ordered_rows
         for kind, owner, request_id, r in rows:
             saved_image = kind == "image" and bool(r.get("result_file_ids") or r.get("result_sediment_ids") or pending_image_result_ids(r))
             if recovery_suppressed(r) or r.get("_recovery_paused") is True or r.get("_attempt_finished_at") and not saved_image:
@@ -905,6 +956,58 @@ class PoolAdmission:
         read = getattr(self.accounts, "admission_accounts", None)
         return read() if read else self.accounts.list_accounts()
 
+    @staticmethod
+    def _empty_turn_transfers(receipts):
+        """Return proven empty roots whose local turn moved to one child."""
+        from services.generation_completion import same_session_retry
+        from services.text_task_service import TextTaskService
+        text_receipts = {(owner, request_id): receipt for kind, owner, request_id, receipt in receipts
+                         if kind == "text"}
+        released, transferred = set(), set()
+        all_receipts = {(kind, owner, request_id): receipt
+                        for kind, owner, request_id, receipt in receipts}
+        for kind, owner, request_id, receipt in receipts:
+            original_id = receipt.get("_same_session_retry_of")
+            original = all_receipts.get((kind, owner, original_id))
+            if original and same_session_retry(original, receipt):
+                released.add((owner, original_id))
+                transferred.add((owner, original_id))
+        corrections = {}
+        for kind, owner, request_id, receipt in receipts:
+            previous_id = receipt.get("_terminal_empty_correction_of")
+            if kind == "text" and isinstance(previous_id, str) and previous_id:
+                corrections.setdefault((owner, previous_id), []).append((request_id, receipt))
+        for key, candidates in corrections.items():
+            if len(candidates) != 1:
+                continue
+            previous = text_receipts.get(key)
+            evidence = TextTaskService._verified_retryable_empty(previous or {})
+            request_id, correction = candidates[0]
+            correction_parent = (correction.get("_submission_parent_message_id")
+                                 if correction.get("status") == "succeeded"
+                                 else correction.get("parent_message_id"))
+            if (not evidence or not previous or request_id == key[1]
+                    or correction.get("status") not in {"queued", "running", "unknown", "succeeded"}
+                    or not correction.get("_input_ref")
+                    or correction.get("route") != "chat"
+                    or correction.get("_route", "chat") != "chat"
+                    or correction.get("_previous_request_id") != key[1]
+                    or correction.get("_public_session_ref") != previous.get("_public_session_ref")
+                    or correction.get("client_conversation_id") != previous.get("client_conversation_id")
+                    or correction.get("model") != previous.get("model")
+                    or correction_parent != evidence["retry_parent_message_id"]
+                    or correction.get("request_message_id") == previous.get("request_message_id")
+                    or type(correction.get("_sequence")) is not int
+                    or type(previous.get("_sequence")) is not int
+                    or correction["_sequence"] <= previous["_sequence"]
+                    or any(correction.get(field) != previous.get(field) for field in (
+                        "provider_binding_id", "provider_account_identity", "conversation_id"))):
+                continue
+            released.add(key)
+            if previous.get("_empty_reply_evidence") and correction.get("_completion_of") == key[1]:
+                transferred.add(key)
+        return released, transferred
+
     def _snapshot(self, rows, receipts, settings, types, now, cursor, workflow_state=None, product_state=None, *, db=None):
         from services.text_task_service import TextTaskService
         works, workflow_clocks = workflow_state or ({}, {})
@@ -920,59 +1023,22 @@ class PoolAdmission:
         # head forever. This is a planner-only projection, never a status edit.
         text_receipts = {(owner, request_id): r for kind, owner, request_id, r in receipts
                          if kind == "text"}
-        corrections = {}
-        for kind, owner, request_id, r in receipts:
-            previous_id = r.get("_terminal_empty_correction_of")
-            if kind == "text" and isinstance(previous_id, str) and previous_id:
-                corrections.setdefault((owner, previous_id), []).append((request_id, r))
-        released_order_heads = set()
-        transferred_empty_turns = set()
-        from services.generation_completion import same_session_retry
-        all_receipts = {(kind, owner, rid): r for kind, owner, rid, r in receipts}
-        for kind, owner, rid, r in receipts:
-            original_id = r.get("_same_session_retry_of")
-            original = all_receipts.get((kind, owner, original_id))
-            if original and same_session_retry(original, r):
-                released_order_heads.add((owner, original_id))
-                transferred_empty_turns.add((owner, original_id))
-        if corrections:
-            from services.text_task_service import TextTaskService
-            for key, candidates in corrections.items():
-                if len(candidates) != 1:
-                    continue
-                previous = text_receipts.get(key)
-                evidence = TextTaskService._verified_retryable_empty(previous or {})
-                request_id, correction = candidates[0]
-                # Success advances the live cursor to the correction's result.
-                # Its persisted submission root still proves which empty turn
-                # it continued; do not put that original UNKNOWN back at head.
-                correction_parent = (correction.get("_submission_parent_message_id")
-                                     if correction.get("status") == "succeeded"
-                                     else correction.get("parent_message_id"))
-                if (not evidence or not previous or request_id == key[1]
-                        or correction.get("status") not in {"queued", "running", "unknown", "succeeded"}
-                        or not correction.get("_input_ref")
-                        or correction.get("route") != "chat"
-                        or correction.get("_route", "chat") != "chat"
-                        or correction.get("_previous_request_id") != key[1]
-                        or correction.get("_public_session_ref") != previous.get("_public_session_ref")
-                        or correction.get("client_conversation_id") != previous.get("client_conversation_id")
-                        or correction.get("model") != previous.get("model")
-                        or correction_parent != evidence["retry_parent_message_id"]
-                        or correction.get("request_message_id") == previous.get("request_message_id")
-                        or type(correction.get("_sequence")) is not int
-                        or type(previous.get("_sequence")) is not int
-                        or correction["_sequence"] <= previous["_sequence"]
-                        or any(correction.get(field) != previous.get(field) for field in (
-                            "provider_binding_id", "provider_account_identity", "conversation_id"))):
-                    continue
-                released_order_heads.add(key)
-                if previous.get("_empty_reply_evidence") and correction.get("_completion_of") == key[1]:
-                    transferred_empty_turns.add(key)
+        released_order_heads, transferred_empty_turns = self._empty_turn_transfers(receipts)
         successors = {}
         for (owner, request_id), r in text_receipts.items():
             if r.get("_supersedes_request_id"):
                 successors.setdefault((owner, r["_supersedes_request_id"]), []).append((request_id, r))
+        # Only an exact incomplete compact continuation inherits its original
+        # acceptance position for planner ordering.  This is a projection: the
+        # successor retains its own durable sequence and identity.  A model
+        # rejection/no-final branch, a fallback, duplicate child, or malformed
+        # chain never gets an older queue position.
+        continuation_sequences = {}
+        children_by_parent = {}
+        for (owner, request_id), receipt in text_receipts.items():
+            parent_id = receipt.get("_supersedes_request_id") or receipt.get("_codex_fallback_of")
+            if isinstance(parent_id, str) and parent_id:
+                children_by_parent.setdefault((owner, parent_id), []).append((request_id, receipt))
         if successors:
             from services.text_task_service import TextTaskService
             for key, candidates in successors.items():
@@ -1007,6 +1073,16 @@ class PoolAdmission:
                     )
                 if advances and TextTaskService._supersede_order_link(previous, successor):
                     released_order_heads.add(key)
+                    # Preserve the original business request's place only for
+                    # the one qualified incomplete compact child.  The source
+                    # predicate is the same one rechecked at the send edge;
+                    # the unique-child guard also rejects fallback/model
+                    # rejection forks before they can move ahead of peers.
+                    if (successor.get("_supersedes_incomplete") is True
+                            and len(children_by_parent.get(key, ())) == 1
+                            and TextTaskService._incomplete_compact_successor_source(previous, now)
+                            and type(previous.get("_sequence")) is int):
+                        continuation_sequences[(key[0], request_id)] = previous["_sequence"]
         missing_node_image_links = {}
         if db is not None:
             from services.text_task_service import TextTaskService
@@ -1177,7 +1253,8 @@ class PoolAdmission:
             workflow_id = scheduling.get("workflow_id")
             requests.append(WaitingRequest(
                 RequestRef(owner, kind, request_id), r.get("_source") or "key:" + owner,
-                int(r.get("_sequence") or 0), route, str(r.get("model") or "auto"),
+                continuation_sequences.get((owner, request_id), int(r.get("_sequence") or 0)),
+                route, str(r.get("model") or "auto"),
                 "image" if kind == "image" else r.get("_operation", "text"),
                 bool(r.get("_input_ref")), state=state,
                 bound_account=str(r.get("_requested_account_identity") or r.get("provider_account_identity") or "") or None,

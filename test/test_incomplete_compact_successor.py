@@ -244,3 +244,27 @@ def test_incomplete_source_accepts_explicit_nonterminal_false(incomplete):
     update(h.service, _upstream_terminal=False)
     accepted = h.service.submit("owner", h.envelope)
     assert accepted["status"] == "queued" and accepted["continue_after_incomplete"] is True
+
+
+def test_qualified_incomplete_successor_keeps_original_planner_position(incomplete):
+    h = incomplete
+    # The unrelated work is accepted after the original but before its compact
+    # child.  The child keeps its own stored sequence, while the planner must
+    # project the proved original position for this one continuation.
+    h.service.submit("owner", {
+        "client_request_id": "peer", "client_conversation_id": "peer-session",
+        "model": MODEL, "thinking_effort": EFFORT,
+        "messages": [{"role": "user", "content": "independent durable input"}],
+    }, source="internal:content")
+    accepted = h.service.submit("owner", h.envelope, source="internal:content")
+    saved = row(h.service, "successor")
+    peer_saved = row(h.service, "peer")
+    assert saved["_sequence"] > peer_saved["_sequence"] > h.old["_sequence"]
+    assert accepted["status"] == "queued"
+
+    context = h.admission.claim_next()
+
+    assert context is not None and context.request_id == "successor"
+    # Projection cannot rewrite the receipt's accepted ordering or lineage.
+    assert row(h.service, "successor")["_sequence"] == saved["_sequence"]
+    assert row(h.service, "successor")["_supersedes_request_id"] == "old"
