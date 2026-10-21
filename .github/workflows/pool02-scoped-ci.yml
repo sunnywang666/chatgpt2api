@@ -32,9 +32,9 @@ permissions:
 
 jobs:
   scoped-chat-admission:
-    # Private, same-repository code only: an unavailable company runner queues;
-    # it must not silently fall back to GitHub-hosted capacity.
-    if: ${{ github.repository == 'sunnywang666/chatgpt2api' && github.event.repository.private == true && (github.event_name == 'push' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.repo.private == true)) }}
+    # Same-repository events only: fork PR code never reaches this persistent runner.
+    # GitHub's external-contributor approval and runner-group policy remain the access boundary.
+    if: ${{ github.repository == 'sunnywang666/chatgpt2api' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON('["self-hosted","Linux","X64","hugsweet-linux-ci"]') }}
     timeout-minutes: 20
     env:
