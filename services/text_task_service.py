@@ -1175,16 +1175,18 @@ class TextTaskService:
         recovery_at = receipt.get("recovery_claimed_at")
         recovery_until = receipt.get("recovery_lease_until")
         if any(value is not None for value in (recovery_id, recovery_at, recovery_until)):
-            # Only the current read of this already-qualified original is
-            # exempt. A successor read, partial claim, or expired lease cannot
-            # establish that the ongoing work is this read-only operation.
+            # Only an exact original-result reader can leave its lease on a
+            # qualified original.  An expired reader has ceased consuming a
+            # local worker slot; retaining its durable fields must not make
+            # that already-observed original occupy capacity again.
             if (type(recovery_id) is not str or not recovery_id.strip()
                     or recovery_id != recovery_id.strip() or len(recovery_id) > 300
                     or receipt.get("recovery_phase") != "read_text_request"
                     or "_missing_successor_resume" in receipt
                     or type(recovery_at) not in (int, float) or not math.isfinite(recovery_at)
                     or type(recovery_until) not in (int, float) or not math.isfinite(recovery_until)
-                    or not (last_checked <= recovery_at <= now < recovery_until)):
+                    or recovery_at > recovery_until
+                    or (recovery_until > now and not (last_checked <= recovery_at <= now))):
                 return False
         # A later snapshot clock cannot rehabilitate an early/stale marker:
         # the marker itself must have been recorded after the existing window.
