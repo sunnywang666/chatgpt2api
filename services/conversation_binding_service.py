@@ -878,6 +878,15 @@ class ConversationBindingService:
             or time.time() >= failed_reads[conversation_id]["next_at"]
             for conversation_id in pending
         )
+        if scan["next_offset"] and not scan.get("restart_from_head", False) and scan.get("page_anchor") is None:
+            # A legacy completed scan without the preceding-page proof cannot
+            # establish that its mutable offset covered the original range.
+            scan["next_offset"] = 0
+            scan["coverage_complete"] = False
+            scan["time_order_valid"] = False
+            scan["last_update_time"] = None
+            scan["restart_from_head"] = True
+            raise cls._scan_incomplete(scan)
         if (
             not scan["coverage_complete"]
             and scan["next_offset"]
@@ -885,12 +894,6 @@ class ConversationBindingService:
             and not scan.get("restart_from_head", False)
         ):
             anchor = scan.get("page_anchor")
-            if anchor is None:
-                scan["next_offset"] = 0
-                scan["time_order_valid"] = False
-                scan["last_update_time"] = None
-                scan["restart_from_head"] = True
-                raise cls._scan_incomplete(scan)
             try:
                 anchored_recent = backend._list_recent_conversations(
                     limit=cls.RECOVERY_RECENT_CONVERSATION_LIMIT,
@@ -945,6 +948,7 @@ class ConversationBindingService:
             if list_timeout < cls.RECOVERY_DETAIL_MIN_TIMEOUT_SECONDS:
                 raise cls._scan_incomplete(scan)
             page_offset = scan["next_offset"]
+            prior_anchor = scan.get("page_anchor")
             try:
                 recent = backend._list_recent_conversations(
                     limit=cls.RECOVERY_RECENT_CONVERSATION_LIMIT,
@@ -957,6 +961,32 @@ class ConversationBindingService:
                 )
             except Exception as exc:
                 raise cls._scan_read_failed(scan, exc, phase="conversation_list") from exc
+            # The validation above and this next page are separate upstream
+            # GETs. A deletion, insertion, or reorder between them changes
+            # the offset's meaning, so discard this uninspected page and
+            # restart instead of advancing past an unknown interval.
+            if prior_anchor is not None:
+                try:
+                    anchored_recent = backend._list_recent_conversations(
+                        limit=cls.RECOVERY_RECENT_CONVERSATION_LIMIT,
+                        offset=prior_anchor["offset"],
+                        timeout_secs=min(cls.RECOVERY_LIST_TIMEOUT_SECONDS, remaining_timeout()),
+                        strict_schema=True,
+                    )
+                except Exception as exc:
+                    raise cls._scan_read_failed(scan, exc, phase="conversation_anchor") from exc
+                anchored_ids = [
+                    str(item.get("id") or item.get("conversation_id") or "").strip()
+                    for item in anchored_recent
+                ]
+                if anchored_ids != prior_anchor["ids"]:
+                    scan["next_offset"] = 0
+                    scan["coverage_complete"] = False
+                    scan["time_order_valid"] = False
+                    scan["last_update_time"] = None
+                    scan.pop("page_anchor", None)
+                    scan["restart_from_head"] = True
+                    raise cls._scan_incomplete(scan)
             raw_page_ids = [
                 str(item.get("id") or item.get("conversation_id") or "").strip()
                 for item in recent
