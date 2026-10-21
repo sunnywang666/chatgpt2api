@@ -621,6 +621,12 @@ class PoolAdmission:
         self._original_read_slots = threading.BoundedSemaphore(4)
         self._original_read_lock = threading.Lock()
         self._original_reads = set()
+        # The reader slots are shared across accounts.  Remember the last
+        # account selected so a large, overdue historical backlog on one
+        # account cannot keep every other due original behind its first rows.
+        # This is only an in-process scheduling cursor; receipt retry clocks
+        # remain the durable recovery ordering.
+        self._recovery_account_cursor = None
         self._event = threading.Event()
         self._stop = threading.Event()
         self._thread = None
@@ -750,6 +756,51 @@ class PoolAdmission:
         # formatted string, so it must not enter this numeric retry ordering.
         rows.sort(key=lambda row: float(row[3].get("recovery_next_at" if row[0] == "text" else "next_poll_at")
                                         or 0))
+        if background:
+            # The receipt-owning reader renews this durable lease while its
+            # exact original GET is in flight.  Do not spend a dispatcher turn
+            # on the same request merely to have TextTaskService reject the
+            # duplicate after it starts.
+            rows = [row for row in rows if not (
+                row[0] == "text"
+                and type(row[3].get("recovery_lease_until")) in (int, float)
+                and math.isfinite(row[3]["recovery_lease_until"])
+                and row[3]["recovery_lease_until"] > now
+            )]
+            # `_original_read_slots` is process-wide, while the first four
+            # rows above may all belong to a single account.  Interleave one
+            # due candidate per account before considering each account's
+            # second candidate.  We still retain each account's persisted
+            # retry order and all dispatch-time pacing, conversation and lease
+            # checks below.  A volatile cursor shares the next first chance
+            # across recover_one passes without introducing durable scheduler
+            # state or changing a receipt.
+            by_account = {}
+            for row in rows:
+                kind, owner, request_id, receipt = row
+                account = (receipt.get("provider_account_identity")
+                           or receipt.get("provider_binding_id")
+                           or f"{kind}:{owner}:{request_id}")
+                by_account.setdefault(account, []).append(row)
+            accounts = list(by_account)
+            if accounts:
+                if self._recovery_account_cursor in accounts:
+                    start = (accounts.index(self._recovery_account_cursor) + 1) % len(accounts)
+                else:
+                    start = 0
+                ordered_accounts = accounts[start:] + accounts[:start]
+                rows = []
+                depth = 0
+                while True:
+                    added = False
+                    for account in ordered_accounts:
+                        candidates = by_account[account]
+                        if depth < len(candidates):
+                            rows.append(candidates[depth])
+                            added = True
+                    if not added:
+                        break
+                    depth += 1
         for kind, owner, request_id, r in rows:
             saved_image = kind == "image" and bool(r.get("result_file_ids") or r.get("result_sediment_ids") or pending_image_result_ids(r))
             if recovery_suppressed(r) or r.get("_recovery_paused") is True or r.get("_attempt_finished_at") and not saved_image:
@@ -766,7 +817,10 @@ class PoolAdmission:
                 due = image_original_recovery_pending(r) and float(r.get("next_poll_at") or 0) <= now
             if due:
                 if background:
-                    dispatch(kind, owner, request_id, self.recoveries[kind], r)
+                    if dispatch(kind, owner, request_id, self.recoveries[kind], r):
+                        self._recovery_account_cursor = (r.get("provider_account_identity")
+                                                         or r.get("provider_binding_id")
+                                                         or f"{kind}:{owner}:{request_id}")
                     continue
                 try:
                     self.recoveries[kind](owner, request_id)
