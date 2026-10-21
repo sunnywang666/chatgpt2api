@@ -2,7 +2,9 @@
 import json
 from types import SimpleNamespace
 
-from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI
+from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, _StreamHandoff
+from services.pool_admission import _safe_stream_handoff_event_metadata
+from services.request_context import current_request
 
 
 class Response:
@@ -22,6 +24,14 @@ class Response:
 
     def close(self):
         self.closed = True
+
+class StageContext:
+    def __init__(self):
+        self.stages = []
+
+    def record_stage(self, stage, **fields):
+        self.stages.append((stage, fields))
+
 
 class WebSocket:
     def __init__(self, frames):
@@ -68,6 +78,12 @@ class Session:
         self.ws_calls.append((url, kwargs))
         self.ws = WebSocket(self.frames)
         return self.ws
+
+
+class FailingHandoffSession(Session):
+    def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        raise RuntimeError("PRIVATE_WS_TRANSPORT_DETAIL")
 
 
 def _line(event):
@@ -142,6 +158,75 @@ def _ws_frame(topic="conversation-turn-turn-1"):
     return json.dumps({"type": "reply", "reply": {"topic_id": topic, "catchups": [
         {"payload": {"payload": {"encoded_item": encoded}}},
     ]}})
+
+
+def test_handoff_records_only_fixed_safe_progress_and_one_transport_each():
+    backend = _backend(_initial_events(), frames=[_ws_frame()])
+    context = StageContext()
+    token = current_request.set(context)
+    try:
+        assert list(backend.stream_conversation(prompt="fixture"))[-1] == "[DONE]"
+    finally:
+        current_request.reset(token)
+
+    fields = [data for stage, data in context.stages if stage == "stream_handoff"]
+    assert [data["handoff_stage"] for data in fields] == [
+        "candidate_bound", "ws_endpoint_get_entered", "ws_endpoint_get_completed",
+        "ws_connected", "ws_subscribed", "ws_terminal",
+    ]
+    assert fields[-1]["handoff_terminal_seen"] is True
+    assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+    serialized = json.dumps(fields)
+    assert "PRIVATE" not in serialized and "topic" not in serialized and "url" not in serialized
+
+
+def test_handoff_transport_error_stays_unknown_and_records_no_exception_text():
+    backend = _backend(_initial_events(), frames=[_ws_frame()])
+    backend.session = FailingHandoffSession(backend.session.initial, backend.session.ws_url)
+    context = StageContext()
+    token = current_request.set(context)
+    try:
+        assert list(backend.stream_conversation(prompt="fixture"))[-1] == "[DONE]"
+    finally:
+        current_request.reset(token)
+
+    fields = [data for stage, data in context.stages if stage == "stream_handoff"]
+    assert [data["handoff_stage"] for data in fields] == ["candidate_bound", "ws_endpoint_get_entered", "ws_transport_error"]
+    assert len(backend.session.get_calls) == 1 and backend.session.ws_calls == []
+    assert "PRIVATE" not in json.dumps(fields)
+
+
+def test_handoff_timeline_whitelist_drops_arbitrary_fields_and_values():
+    fields = _safe_stream_handoff_event_metadata({
+        "handoff_stage": "ws_terminal", "handoff_frame_count": 2,
+        "handoff_byte_count": 17, "handoff_terminal_seen": True,
+        "topic_id": "PRIVATE_TOPIC", "exception": "PRIVATE_EXCEPTION",
+    })
+    assert fields == {"handoff_stage": "ws_terminal", "handoff_frame_count": 2,
+                      "handoff_byte_count": 17, "handoff_terminal_seen": True}
+    assert _safe_stream_handoff_event_metadata({"handoff_stage": "PRIVATE"}) == {}
+
+
+def test_handoff_parent_edges_are_bounded_and_conflicts_cannot_prove_original_branch():
+    bounded = _StreamHandoff(original_message_id="original-user")
+    for index in range(256):
+        bounded.observe(json.dumps({"v": {"message": {
+            "id": f"thought-{index}", "author": {"role": "assistant"}, "parent": "original-user",
+        }}}))
+    assert len(bounded._parents) == 128
+
+    handoff = _StreamHandoff(original_message_id="original-user")
+    handoff.observe(json.dumps({"v": {"message": {
+        "id": "conflicted", "author": {"role": "assistant"}, "parent": "original-user",
+    }}}))
+    handoff.observe(json.dumps({"v": {"message": {
+        "id": "conflicted", "author": {"role": "assistant"}, "parent": "old-user",
+    }}}))
+    final = {"id": "final", "author": {"role": "assistant"}, "status": "finished_successfully",
+             "end_turn": True, "parent": "conflicted"}
+    handoff.observe(json.dumps({"v": {"message": final}}))
+    assert handoff._conflicted_parent_ids == {"conflicted"}
+    assert handoff.terminal_seen is False
 
 
 def test_handoff_subscribes_once_and_closes_without_a_second_conversation_post():
@@ -226,6 +311,20 @@ def test_initial_terminal_skips_handoff_even_when_its_parent_is_a_thought_node()
     assert backend.session.get_calls == [] and backend.session.ws_calls == []
 
 
+def test_later_user_branch_never_turns_a_nonterminal_sse_parent_chain_into_original_final():
+    backend = _backend(Response([
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE", "conversation_id": "conversation-1"}),
+        _line(_handoff()),
+        _line({"v": {"message": {"id": "later-user", "author": {"role": "user"}, "parent": "original-user"}}}),
+        _line({"v": {"message": {"id": "old-thought", "author": {"role": "assistant"}, "parent": "later-user"}}}),
+        _line({"v": {"message": {"id": "old-final", "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True, "parent": "old-thought"}}}),
+        b"data: [DONE]",
+    ]), frames=[_ws_frame()])
+
+    assert list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))[-1] == "[DONE]"
+    assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+
+
 def test_terminal_from_an_old_branch_does_not_suppress_this_turns_handoff():
     backend = _backend(_initial_events(terminal=True, terminal_parent="old-user"), frames=[_ws_frame()])
 
@@ -259,6 +358,43 @@ def test_same_conversation_old_branch_final_is_not_yielded_or_settled():
 
     assert all("old-final" not in payload for payload in payloads)
     assert payloads[-1] == "[DONE]"
+
+
+def test_server_ste_metadata_before_resume_binds_once_after_same_conversation_arrives():
+    backend = _backend(Response([
+        _line(_ste(conversation="conversation-1")),
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE", "conversation_id": "conversation-1"}),
+        b"data: [DONE]",
+    ]), frames=[_ws_frame()])
+
+    payloads = list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))
+
+    assert payloads[-1] == "[DONE]"
+    assert len(backend.session.post_calls) == 1
+    assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+
+
+def test_server_ste_before_resume_with_a_different_conversation_stays_unknown():
+    backend = _backend(Response([
+        _line(_ste(conversation="conversation-1")),
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE", "conversation_id": "conversation-other"}),
+        b"data: [DONE]",
+    ]), frames=[_ws_frame()])
+
+    assert list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))[-1] == "[DONE]"
+    assert backend.session.get_calls == backend.session.ws_calls == []
+
+
+def test_duplicate_ste_candidates_stay_unknown_before_any_ws_endpoint_read():
+    backend = _backend(Response([
+        _line(_ste(conversation="conversation-1")),
+        _line(_ste(conversation="conversation-1")),
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE", "conversation_id": "conversation-1"}),
+        b"data: [DONE]",
+    ]), frames=[_ws_frame()])
+
+    assert list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))[-1] == "[DONE]"
+    assert backend.session.get_calls == backend.session.ws_calls == []
 
 
 def test_server_ste_metadata_turn_opens_one_bound_ws_handoff():

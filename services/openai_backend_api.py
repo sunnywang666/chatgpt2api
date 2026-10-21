@@ -96,6 +96,7 @@ STREAM_HANDOFF_WS_MAX_SECS = 60.0
 STREAM_HANDOFF_WS_MAX_FRAMES = 128
 STREAM_HANDOFF_WS_MAX_BYTES = 1_048_576
 _STREAM_HANDOFF_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,160}\Z")
+_STREAM_HANDOFF_MAX_PARENT_EDGES = 128
 _STREAM_HANDOFF_TOPIC_PREFIX = "conversation-turn-"
 _STREAM_HANDOFF_WS_PATH = "/backend-api/celsius/ws/user"
 _STREAM_HANDOFF_WS_HOST = "ws.chatgpt.com"
@@ -128,12 +129,16 @@ class _StreamHandoff:
     topic_id: str = ""
     handoff_count: int = 0
     handoff_source: str = ""
+    candidate_conversation_id: str = ""
+    candidate_turn_exchange_id: str = ""
+    candidate_source: str = ""
     resume_token_kind: str = ""
     terminal_seen: bool = False
     ws_terminal_seen: bool = False
     ws_conversation_locked: bool = False
     invalid: bool = False
     _parents: dict[str, str] = field(default_factory=dict)
+    _conflicted_parent_ids: set[str] = field(default_factory=set)
 
     @staticmethod
     def _clean_id(value: object) -> str:
@@ -166,7 +171,7 @@ class _StreamHandoff:
             return
         if (not conversation_id or not turn_exchange_id
                 or (self.expected_conversation_id and self.expected_conversation_id != conversation_id)
-                or (self.resume_conversation_id and self.resume_conversation_id != conversation_id)):
+                or self.resume_conversation_id != conversation_id):
             self.invalid = True
             return
         self.handoff_source = source
@@ -174,19 +179,63 @@ class _StreamHandoff:
         self.turn_exchange_id = turn_exchange_id
         self.topic_id = _STREAM_HANDOFF_TOPIC_PREFIX + turn_exchange_id
 
+    def _record_handoff_candidate(self, source: str, conversation_id: str, turn_exchange_id: str) -> None:
+        """Keep exactly one SSE candidate until its topic resume can bind it."""
+        if (self.handoff_count != 1 or self.candidate_source
+                or source not in {"stream_handoff", "server_ste_metadata"}
+                or not turn_exchange_id
+                or (conversation_id and self.expected_conversation_id
+                    and conversation_id != self.expected_conversation_id)):
+            self.invalid = True
+            return
+        self.candidate_source = source
+        self.candidate_conversation_id = conversation_id
+        self.candidate_turn_exchange_id = turn_exchange_id
+        self._finalize_handoff_candidate()
+
+    def _finalize_handoff_candidate(self) -> None:
+        """Bind a saved candidate only after the exact topic resume arrives."""
+        if self.invalid or self.handoff_source or not self.candidate_source:
+            return
+        if self.resume_token_kind != "topic" or not self.resume_conversation_id:
+            return
+        conversation_id = self.candidate_conversation_id or self.resume_conversation_id
+        if (conversation_id != self.resume_conversation_id
+                or (self.expected_conversation_id
+                    and conversation_id != self.expected_conversation_id)):
+            self.invalid = True
+            return
+        self._set_handoff(self.candidate_source, conversation_id,
+                          self.candidate_turn_exchange_id)
+
     def _on_original_branch(self, message: dict[str, Any]) -> bool:
         """Require streamed terminal evidence to reach this request's user node."""
         original = self._clean_id(self.original_message_id)
         message_id = self._clean_id(message.get("id"))
         parent = self._clean_id(message.get("parent"))
-        if message_id and parent:
-            self._parents[message_id] = parent
+        # A later user turn is a branch boundary.  Remember thought/tool edges
+        # from this SSE frame, but never connect a new user turn back to the
+        # original request merely because it shares the same conversation.
+        author = message.get("author") if isinstance(message.get("author"), dict) else {}
+        if (message_id and parent
+                and not (message_id != original and author.get("role") == "user")):
+            existing = self._parents.get(message_id)
+            if existing is None:
+                if len(self._parents) < _STREAM_HANDOFF_MAX_PARENT_EDGES:
+                    self._parents[message_id] = parent
+            elif existing != parent:
+                # A later patch may not rewrite a known node onto this request's
+                # branch.  Keep the original edge for bounded diagnostics, but
+                # treat either version as unusable terminal proof.
+                self._conflicted_parent_ids.add(message_id)
         if not original or not message_id:
             return False
         current = message_id
         # Stored event frames may include thought/tool descendants.  Bound the
         # walk so malformed parent graphs cannot turn this into unbounded work.
-        for _ in range(128):
+        for _ in range(_STREAM_HANDOFF_MAX_PARENT_EDGES):
+            if current in self._conflicted_parent_ids:
+                return False
             if current == original:
                 return True
             current = self._parents.get(current, "")
@@ -239,7 +288,8 @@ class _StreamHandoff:
         if not isinstance(event, dict):
             return
         message = self._message(event)
-        if self._assistant_terminal(message) and self._on_original_branch(message):
+        on_original_branch = self._on_original_branch(message)
+        if self._assistant_terminal(message) and on_original_branch:
             # A final can sit below a thinking/tool chain, but an unrelated
             # historical branch may not suppress this turn's handoff.
             self.terminal_seen = True
@@ -253,19 +303,19 @@ class _StreamHandoff:
             else:
                 self.resume_conversation_id = conversation_id
                 self.resume_token_kind = kind
+                self._finalize_handoff_candidate()
             return
         if event_type == "server_ste_metadata":
             self.handoff_count += 1
             metadata = event.get("metadata")
             top_turn = self._clean_id(event.get("turn_exchange_id"))
             nested_turn = self._clean_id(metadata.get("turn_exchange_id")) if isinstance(metadata, dict) else ""
-            if (self.handoff_count != 1 or not self.resume_conversation_id
-                    or not isinstance(metadata, dict)
+            if (self.handoff_count != 1 or not isinstance(metadata, dict)
                     or (top_turn and nested_turn and top_turn != nested_turn)):
                 self.invalid = True
                 return
-            conversation_id = self._event_conversation_id(event) or self.resume_conversation_id
-            self._set_handoff("server_ste_metadata", conversation_id, top_turn or nested_turn)
+            self._record_handoff_candidate(
+                "server_ste_metadata", self._event_conversation_id(event), top_turn or nested_turn)
             return
         if event_type != "stream_handoff":
             return
@@ -282,7 +332,15 @@ class _StreamHandoff:
                 or topics[0] != _STREAM_HANDOFF_TOPIC_PREFIX + turn_exchange_id):
             self.invalid = True
             return
-        self._set_handoff("stream_handoff", conversation_id, turn_exchange_id)
+        self._record_handoff_candidate("stream_handoff", conversation_id, turn_exchange_id)
+
+    @property
+    def diagnostic_stage(self) -> str:
+        if self.handoff_source:
+            return "candidate_bound"
+        if self.invalid or self.candidate_source:
+            return "candidate_invalid"
+        return "candidate_absent"
 
     @property
     def eligible(self) -> bool:
@@ -3367,9 +3425,12 @@ class OpenAIBackendAPI:
             # Only ConversationBindingService's retained text path opts into
             # result-only WS continuation; text prompts may still contain
             # reference images, so do not infer this from ``images``.
-            if (handoff.eligible and getattr(self, "retain_bound_conversation", False)
-                    and getattr(self, "text_stream_handoff_enabled", False)
-                    and not is_supported_image_model(model)):
+            handoff_enabled = (getattr(self, "retain_bound_conversation", False)
+                               and getattr(self, "text_stream_handoff_enabled", False)
+                               and not is_supported_image_model(model))
+            if handoff_enabled:
+                self._record_stream_handoff_stage(handoff.diagnostic_stage)
+            if handoff.eligible and handoff_enabled:
                 handoff_done = yield from self._consume_stream_handoff(handoff, request_deadline)
                 if initial_done and handoff_done:
                     return
@@ -3476,6 +3537,22 @@ class OpenAIBackendAPI:
                         if payload:
                             yield payload
 
+    @staticmethod
+    def _record_stream_handoff_stage(stage: str, *, frames: int = 0, total_bytes: int = 0,
+                                     terminal_seen: bool = False) -> None:
+        """Best-effort fixed diagnostics; they never alter stream authority."""
+        from services.request_context import current_request
+        context = current_request.get()
+        if context is None:
+            return
+        try:
+            context.record_stage("stream_handoff", handoff_stage=stage,
+                                 handoff_frame_count=frames,
+                                 handoff_byte_count=total_bytes,
+                                 handoff_terminal_seen=terminal_seen)
+        except Exception:
+            pass
+
     def _consume_stream_handoff(self, handoff: _StreamHandoff, request_deadline: float) -> Iterator[str]:
         """Consume one bounded, result-only WS handoff without a new model send.
 
@@ -3483,11 +3560,14 @@ class OpenAIBackendAPI:
         existing exact original-branch GET remains the sole success authority.
         """
         ws = watchdog = None
+        frames = total_bytes = 0
         handoff_deadline = min(request_deadline, time.monotonic() + STREAM_HANDOFF_WS_MAX_SECS)
         try:
             remaining = handoff_deadline - time.monotonic()
             if remaining <= 0:
+                self._record_stream_handoff_stage("ws_budget_exhausted")
                 return False
+            self._record_stream_handoff_stage("ws_endpoint_get_entered")
             response = self.session.get(
                 self.base_url + _STREAM_HANDOFF_WS_PATH,
                 headers=self._headers(_STREAM_HANDOFF_WS_PATH, {"Accept": "application/json"}),
@@ -3499,19 +3579,24 @@ class OpenAIBackendAPI:
                 body = response.json()
             finally:
                 response.close()
+            self._record_stream_handoff_stage("ws_endpoint_get_completed")
             ws_url = self._handoff_websocket_url(body.get("websocket_url") if isinstance(body, dict) else "")
             if not ws_url:
+                self._record_stream_handoff_stage("ws_endpoint_invalid")
                 return False
             options = self._handoff_ws_options(handoff_deadline)
             if options is None:
+                self._record_stream_handoff_stage("ws_budget_exhausted")
                 return False
             ws = self.session.ws_connect(ws_url, **options)
+            self._record_stream_handoff_stage("ws_connected")
             # curl_cffi 0.15's synchronous recv_str() has no timeout
             # parameter. Its thread-safe terminate() wakes a blocked receive,
             # so one timer enforces the shared, non-retrying handoff budget.
             remaining = handoff_deadline - time.monotonic()
             terminate = getattr(ws, "terminate", None)
             if remaining <= 0 or not callable(terminate):
+                self._record_stream_handoff_stage("ws_budget_exhausted")
                 return False
             watchdog = threading.Timer(remaining, terminate)
             watchdog.daemon = True
@@ -3520,14 +3605,18 @@ class OpenAIBackendAPI:
                 "id": 1,
                 "command": {"type": "subscribe", "topic_id": handoff.topic_id, "offset": "0"},
             }], separators=(",", ":")))
-            frames = total_bytes = 0
+            self._record_stream_handoff_stage("ws_subscribed")
             while frames < STREAM_HANDOFF_WS_MAX_FRAMES and total_bytes < STREAM_HANDOFF_WS_MAX_BYTES:
                 raw = self._handoff_ws_text(ws)
                 if not raw:
+                    self._record_stream_handoff_stage("ws_transport_error", frames=frames,
+                                                      total_bytes=total_bytes)
                     return False
                 frames += 1
                 total_bytes += len(raw.encode("utf-8"))
                 if total_bytes > STREAM_HANDOFF_WS_MAX_BYTES:
+                    self._record_stream_handoff_stage("ws_budget_exhausted", frames=frames,
+                                                      total_bytes=total_bytes)
                     return False
                 try:
                     frame = json.loads(raw)
@@ -3535,16 +3624,33 @@ class OpenAIBackendAPI:
                     continue
                 for payload in self._handoff_encoded_payloads(frame, handoff.topic_id):
                     if not handoff.accepts_ws_payload(payload):
-                        if handoff.invalid or payload == "[DONE]":
+                        if handoff.invalid:
+                            self._record_stream_handoff_stage("ws_payload_rejected", frames=frames,
+                                                              total_bytes=total_bytes)
+                            return False
+                        if payload == "[DONE]":
+                            self._record_stream_handoff_stage("ws_no_terminal", frames=frames,
+                                                              total_bytes=total_bytes)
                             return False
                         continue
                     yield payload
                     if payload == "[DONE]":
+                        self._record_stream_handoff_stage("ws_terminal", frames=frames,
+                                                          total_bytes=total_bytes, terminal_seen=True)
                         return True
+            self._record_stream_handoff_stage("ws_budget_exhausted", frames=frames,
+                                              total_bytes=total_bytes)
+            return False
+        except AccountRequestDeadlineExceeded:
+            self._record_stream_handoff_stage("ws_budget_exhausted", frames=frames,
+                                              total_bytes=total_bytes)
+            return False
         except Exception:
             # Never persist or log an endpoint, topic, token, or raw WS error.
             # A failed continuation is still an original-request UNKNOWN until
             # the caller's exact branch read proves otherwise.
+            self._record_stream_handoff_stage("ws_transport_error", frames=frames,
+                                              total_bytes=total_bytes)
             return False
         finally:
             if watchdog is not None:

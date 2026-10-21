@@ -45,6 +45,27 @@ _COMBINED_COPY_RESULT_FIELDS = frozenset({
 _SAFE_SSE_EVENT_TYPES = ("resume_conversation_token", "server_ste_metadata", "stream_handoff")
 _SAFE_RESUME_TOKEN_KINDS = frozenset({"topic", "other", "unknown", "multiple"})
 _SAFE_STREAM_HANDOFF_OPTION_TYPES = ("resume_sse_endpoint", "subscribe_ws_topic")
+_SAFE_STREAM_HANDOFF_STAGES = frozenset({
+    "candidate_absent", "candidate_invalid", "candidate_bound",
+    "ws_endpoint_get_entered", "ws_endpoint_get_completed", "ws_endpoint_invalid",
+    "ws_connected", "ws_subscribed", "ws_terminal", "ws_no_terminal",
+    "ws_budget_exhausted", "ws_transport_error", "ws_payload_rejected",
+})
+
+
+def _safe_stream_handoff_event_metadata(extra):
+    """Persist only fixed continuation progress, never endpoint or payload data."""
+    stage = extra.get("handoff_stage")
+    if stage not in _SAFE_STREAM_HANDOFF_STAGES:
+        return {}
+    fields = {"handoff_stage": stage}
+    for key in ("handoff_frame_count", "handoff_byte_count"):
+        value = extra.get(key)
+        if type(value) is int and 0 <= value <= 2_147_483_647:
+            fields[key] = value
+    if type(extra.get("handoff_terminal_seen")) is bool:
+        fields["handoff_terminal_seen"] = extra["handoff_terminal_seen"]
+    return fields
 
 
 def _safe_stream_finished_event_metadata(extra):
@@ -579,6 +600,8 @@ class ExecutionContext:
             detail = safe_upstream_error(extra.get("upstream_error"))
             if detail:
                 entry["upstream_error"] = detail
+        elif stage == "stream_handoff":
+            entry.update(_safe_stream_handoff_event_metadata(extra))
         timeline = list(receipt.get("_execution_timeline") or [])
         timeline.append(entry)
         try:
