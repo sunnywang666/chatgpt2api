@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from services.image_thread import bind_waiting_threads, predecessor_state
 
+from collections import deque
 from contextlib import nullcontext
 import hashlib
 import json
@@ -38,6 +39,7 @@ _COMBINED_COPY_MODEL = "gpt-5-6-thinking"
 _COMBINED_COPY_EFFORT = "high"
 _FIRSTSEND_TRIAL_MODEL = "gpt-5-6-instant"
 _FIRSTSEND_TRIAL_EFFORT = "none"
+_ORIGINAL_READ_CONTRIBUTOR_BURST = 3
 _COMBINED_COPY_SENT_STAGES = frozenset({
     "send_guard_passed", "send_call_started", "response_headers_received",
     "first_output", "artifact_saved", "task_finished",
@@ -806,6 +808,13 @@ class PoolAdmission:
         # This is only an in-process scheduling cursor; receipt retry clocks
         # remain the durable recovery ordering.
         self._recovery_account_cursor = None
+        # Prefer reads that can free capacity, but give released originals a
+        # turn after three successful admissions on their own account. Scans
+        # and failed reservations do not consume or reset this volatile budget.
+        self._recovery_contributor_streak = {}
+        # An initial capacity-recovery head start must not permanently exclude
+        # an account that has only released originals and cannot earn a streak.
+        self._recovery_contributor_warmup = 0
         self._event = threading.Event()
         self._stop = threading.Event()
         self._thread = None
@@ -936,18 +945,15 @@ class PoolAdmission:
 
     def recover_one(self, *, background=False):
         now = float(self.clock())
-        image_dispatched = False
-        def dispatch(kind, owner, request_id, function, receipt):
-            nonlocal image_dispatched
-            # Image recovery owns a separate asynchronous worker. Preserve its
-            # existing one-dispatch-per-scan cadence; the local read permit only
-            # bounds synchronous text I/O, not that image worker's lifetime.
-            if kind == "image" and image_dispatched:
-                return False
-            started = self._dispatch_original_read(kind, owner, request_id, function, receipt)
-            if started and kind == "image":
-                image_dispatched = True
-            return started
+        candidates = {}
+        def collect_completion(kind, owner, request_id, function, receipt):
+            # Completion retains its own eligibility and callback, including
+            # permitted rechecks of ended attempts. It must share scheduling
+            # with ordinary reads rather than always taking the next FIFO turn.
+            candidates[(kind, owner, request_id)] = (
+                kind, owner, request_id, function, receipt,
+                float(receipt.get("_completion", {}).get("next_at") or 0))
+            return False
         lifecycle = getattr(self, "work_lifecycle", None)
         if background and lifecycle is not None:
             # Its existing bounded, per-account workers must get a chance even
@@ -956,7 +962,7 @@ class PoolAdmission:
         completion = getattr(self, "generation_completion", None)
         if completion is not None:
             if background:
-                completion.process_one(dispatch=dispatch)
+                completion.process_one(dispatch=collect_completion)
             else:
                 completion.process_one()
         with self.store.connect() as db:
@@ -982,91 +988,6 @@ class PoolAdmission:
         from services.text_task_service import TextTaskService
         rows.sort(key=lambda row: float((TextTaskService._recovery_due_at(row[3])
                                         if row[0] == "text" else row[3].get("next_poll_at")) or 0))
-        if background:
-            # The receipt-owning reader renews this durable lease while its
-            # exact original GET is in flight.  Do not spend a dispatcher turn
-            # on the same request merely to have TextTaskService reject the
-            # duplicate after it starts.
-            rows = [row for row in rows if not (
-                row[0] == "text"
-                and type(row[3].get("recovery_lease_until")) in (int, float)
-                and math.isfinite(row[3]["recovery_lease_until"])
-                and row[3]["recovery_lease_until"] > now
-            )]
-            # `_original_read_slots` is process-wide, while the first four
-            # rows above may all belong to a single account.  Interleave one
-            # due candidate per account before considering each account's
-            # second candidate.  We still retain each account's persisted
-            # retry order and all dispatch-time pacing, conversation and lease
-            # checks below.  A volatile cursor shares the next first chance
-            # across recover_one passes without introducing durable scheduler
-            # state or changing a receipt.
-            def recovery_priority(row):
-                # Match the capacity projection: an unresolved, not-yet-ended
-                # text turn still occupies a real account slot until one of the
-                # existing bounded-release proofs says otherwise.  Give its
-                # original-result read a first chance; historical UNKNOWN rows
-                # remain eligible in the later tier and are never discarded.
-                kind, owner, request_id, receipt = row
-                if kind != "text" or not unresolved_result(kind, receipt):
-                    return 1
-                from services.text_task_service import TextTaskService
-                status = receipt.get("status")
-                active = status == "running" or not receipt.get("_attempt_finished_at")
-                wait_ended = (receipt.get("_route", "chat") == "chat"
-                              and receipt.get("_operation", "text") == "text"
-                              and not receipt.get("_forward_protocol")
-                              and status == "failed"
-                              and receipt.get("error_code") == "RESULT_UNRECOVERABLE"
-                              and receipt.get("upstream_outcome") == "unknown"
-                              and type(receipt.get("_execution_wait_ended_at")) in (int, float)
-                              and math.isfinite(receipt["_execution_wait_ended_at"]))
-                released = (receipt.get("_turn_reserved") is False
-                            and TextTaskService._verified_retryable_empty(receipt))
-                stalled = (
-                    TextTaskService._qualified_stalled_incomplete_capacity_boundary(receipt, now)
-                    or TextTaskService._bounded_unreadable_result_capacity_boundary(receipt, now)
-                )
-                return 0 if (active and (owner, request_id) not in transferred_empty_turns
-                             and not original_turn_ended(kind, receipt)
-                             and not wait_ended and not released and not stalled) else 1
-
-            priorities = {id(row): recovery_priority(row) for row in rows}
-            ordered_rows = []
-            # Do not let a large old UNKNOWN cohort cross a capacity-contributing
-            # original merely because account rotation interleaves both sets.
-            # Within either tier the established account cursor and per-account
-            # persisted due order remain authoritative.
-            for priority in (0, 1):
-                by_account = {}
-                for row in rows:
-                    if priorities[id(row)] != priority:
-                        continue
-                    kind, owner, request_id, receipt = row
-                    account = (receipt.get("provider_account_identity")
-                               or receipt.get("provider_binding_id")
-                               or f"{kind}:{owner}:{request_id}")
-                    by_account.setdefault(account, []).append(row)
-                accounts = list(by_account)
-                if not accounts:
-                    continue
-                if self._recovery_account_cursor in accounts:
-                    start = (accounts.index(self._recovery_account_cursor) + 1) % len(accounts)
-                else:
-                    start = 0
-                ordered_accounts = accounts[start:] + accounts[:start]
-                depth = 0
-                while True:
-                    added = False
-                    for account in ordered_accounts:
-                        candidates = by_account[account]
-                        if depth < len(candidates):
-                            ordered_rows.append(candidates[depth])
-                            added = True
-                    if not added:
-                        break
-                    depth += 1
-            rows = ordered_rows
         for kind, owner, request_id, r in rows:
             saved_image = kind == "image" and bool(r.get("result_file_ids") or r.get("result_sediment_ids") or pending_image_result_ids(r))
             if recovery_suppressed(r) or r.get("_recovery_paused") is True or r.get("_attempt_finished_at") and not saved_image:
@@ -1085,18 +1006,104 @@ class PoolAdmission:
                 due = image_original_recovery_pending(r) and float(r.get("next_poll_at") or 0) <= now
             if due:
                 if background:
-                    if dispatch(kind, owner, request_id, self.recoveries[kind], r):
-                        self._recovery_account_cursor = (r.get("provider_account_identity")
-                                                         or r.get("provider_binding_id")
-                                                         or f"{kind}:{owner}:{request_id}")
+                    # Keep completion's callback if both paths select this
+                    # exact request; one scan must not advance it twice.
+                    candidates.setdefault((kind, owner, request_id), (
+                        kind, owner, request_id, self.recoveries[kind], r,
+                        float((TextTaskService._recovery_due_at(r) if kind == "text"
+                               else r.get("next_poll_at")) or 0)))
                     continue
                 try:
                     self.recoveries[kind](owner, request_id)
                 except Exception:
                     pass  # Original read handlers retain bounded retry evidence.
                 return
+        if background:
+            self._dispatch_recovery_candidates(candidates.values(), transferred_empty_turns, now)
         if not background and lifecycle is not None:
             lifecycle.process_one(background=True)
+
+    def _dispatch_recovery_candidates(self, candidates, transferred_empty_turns, now):
+        from services.text_task_service import TextTaskService
+
+        def recovery_priority(candidate):
+            # Retain the existing capacity-release proofs. Priority never
+            # changes occupancy, original ownership, or recovery eligibility.
+            kind, owner, request_id, _, receipt, _ = candidate
+            if kind != "text" or not unresolved_result(kind, receipt):
+                return 1
+            status = receipt.get("status")
+            active = status == "running" or not receipt.get("_attempt_finished_at")
+            wait_ended = (receipt.get("_route", "chat") == "chat"
+                          and receipt.get("_operation", "text") == "text"
+                          and not receipt.get("_forward_protocol")
+                          and status == "failed"
+                          and receipt.get("error_code") == "RESULT_UNRECOVERABLE"
+                          and receipt.get("upstream_outcome") == "unknown"
+                          and type(receipt.get("_execution_wait_ended_at")) in (int, float)
+                          and math.isfinite(receipt["_execution_wait_ended_at"]))
+            released = (receipt.get("_turn_reserved") is False
+                        and TextTaskService._verified_retryable_empty(receipt))
+            stalled = (TextTaskService._qualified_stalled_incomplete_capacity_boundary(receipt, now)
+                       or TextTaskService._bounded_unreadable_result_capacity_boundary(receipt, now))
+            return 0 if (active and (owner, request_id) not in transferred_empty_turns
+                         and not original_turn_ended(kind, receipt)
+                         and not wait_ended and not released and not stalled) else 1
+
+        by_account = {}
+        for candidate in sorted(candidates, key=lambda candidate: candidate[-1]):
+            kind, owner, request_id, _, receipt, _ = candidate
+            # A receipt-owning reader already renews this durable lease while
+            # its GET is in flight. Completion shares the same exclusion.
+            lease = receipt.get("recovery_lease_until")
+            if kind == "text" and type(lease) in (int, float) and math.isfinite(lease) and lease > now:
+                continue
+            account = (receipt.get("provider_account_identity") or receipt.get("provider_binding_id")
+                       or f"{kind}:{owner}:{request_id}")
+            by_account.setdefault(account, (deque(), deque()))[recovery_priority(candidate)].append(candidate)
+        accounts = list(by_account)
+        if self._recovery_account_cursor in accounts:
+            start = (accounts.index(self._recovery_account_cursor) + 1) % len(accounts)
+            accounts = accounts[start:] + accounts[:start]
+
+        image_dispatched = False
+        # Snapshot the one-time head start at scan entry. Thereafter all due
+        # accounts share rotation; mixed accounts retain their own 3:1 bias.
+        include_released_accounts = self._recovery_contributor_warmup >= _ORIGINAL_READ_CONTRIBUTOR_BURST
+        while True:
+            preferred = []
+            for account in accounts:
+                contributing, released = by_account[account]
+                if released and self._recovery_contributor_streak.get(account, 0) >= _ORIGINAL_READ_CONTRIBUTOR_BURST:
+                    preferred.append((account, 1))
+                elif contributing:
+                    preferred.append((account, 0))
+                elif released and include_released_accounts:
+                    preferred.append((account, 1))
+            if not preferred:
+                preferred = [(account, 1) for account in accounts if by_account[account][1]]
+            if not preferred:
+                return
+            # One candidate per account per round preserves account rotation.
+            # Reevaluate after each round so even a single burst-capable scan
+            # cannot admit a fourth contributor ahead of its released original.
+            for account, priority in preferred:
+                kind, owner, request_id, function, receipt, _ = by_account[account][priority].popleft()
+                # Image recovery owns a separate async worker; retain its
+                # one-dispatch-per-scan cadence.
+                if kind == "image" and image_dispatched:
+                    continue
+                if self._dispatch_original_read(kind, owner, request_id, function, receipt):
+                    if kind == "image":
+                        image_dispatched = True
+                    self._recovery_account_cursor = account
+                    self._recovery_contributor_streak[account] = (
+                        min(_ORIGINAL_READ_CONTRIBUTOR_BURST,
+                            self._recovery_contributor_streak.get(account, 0) + 1)
+                        if priority == 0 else 0)
+                    if priority == 0:
+                        self._recovery_contributor_warmup = min(
+                            _ORIGINAL_READ_CONTRIBUTOR_BURST, self._recovery_contributor_warmup + 1)
 
     def run_recovery(self, context, function, args):
         done = threading.Event()
