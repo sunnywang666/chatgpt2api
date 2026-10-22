@@ -783,7 +783,17 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
             or original_body.get("derived_input") is not None):
         return None
     audit = receipt.get("_derived_input")
-    if audit is not None:
+    reconciled = receipt.get(TextTaskService._RECONCILED_QUEUED_SUCCESSOR) is True
+    if reconciled:
+        if incomplete or ancestors or audit is not None:
+            return None
+        try:
+            TextTaskService._validate_reconciled_queued_successor(
+                store, db, parent["owner"], receipt, original, original_row[0], original_body, now,
+            )
+        except ConversationBindingError:
+            return None
+    elif audit is not None:
         allowed = {"combined_copy_compact_v1"} if incomplete else {
             "attributes_required_only_v4", "combined_copy_compact_v1"}
         if ancestors or not isinstance(audit, dict) or audit.get("kind") not in allowed:

@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -9,8 +10,10 @@ from fastapi.testclient import TestClient
 
 import api.ai as api
 from services.conversation_binding_service import ConversationBindingError
+from services.product_work import ProductWorkService, ensure_product_work
 from services.request_context import current_request
 from services.text_task_service import TextTaskService
+from services.work_lifecycle import WorkLifecycleError, WorkLifecycleService
 from test.test_explicit_unknown_successor import row, update
 from test.test_pool_admission import Clock, build
 
@@ -59,10 +62,43 @@ def reconciled(tmp_path):
     return service, admission, root_body, child_body, sent, tmp_path
 
 
-def reconcile(service, body, *, dry_run=True):
+def reconcile(service, body, *, dry_run=True, continue_after_no_final=False):
     return service.reconcile_queued_successor(
         "owner", "queued", "root", cursor(body), source="internal:listing", dry_run=dry_run,
+        continue_after_no_final=continue_after_no_final,
     )
+
+
+def qualify_no_final(service):
+    """Turn the frozen root into the separately proved no-final outcome."""
+    update(service, "root", status="failed", error_code="RESULT_UNRECOVERABLE", upstream_outcome="unknown",
+           recovery_reason="REQUEST_RESULT_NOT_FOUND", recovery_no_result_reads=3,
+           _attempt_reason="ORIGINAL_RESULT_NO_FINAL", _attempt_finished_at=900,
+           _execution_wait_ended_at=900, _submission_started=True, _last_sent_sequence=0,
+           _executing=False, _turn_reserved=False, _claim_id=None, _claim_until=None,
+           recovery_claim_id=None, recovery_lease_until=None, _scheduling_owner="internal:listing")
+
+
+def attach_product_work_to_reconciled_pair(service):
+    """Seed the existing accepted pair's durable product association for close checks."""
+    metadata = {"product_ref": "queued-reconcile-product", "step_ref": "title"}
+    with service.store.transaction() as db:
+        root = service.store.read_receipt(db, "text", "owner", "root")
+        child = service.store.read_receipt(db, "text", "owner", "queued")
+        root_body = {**service.store.load_input(root["_input_ref"]), "product_work": metadata}
+        child_body = {**root_body, "client_request_id": "queued"}
+        root["_input_ref"] = service.store.save_input(root_body)
+        child["_input_ref"] = service.store.save_input(child_body)
+        root_hash = service._submission_identity("owner", root_body)[1]
+        child_hash = service._submission_identity("owner", child_body)[1]
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id=?", (root_hash, "owner", "root"))
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id=?", (child_hash, "owner", "queued"))
+        child["_supersedes_input_hash"] = root_hash
+        ensure_product_work(service.store, db, "text", "owner", "root", root, metadata, source="internal:listing")
+        ensure_product_work(service.store, db, "text", "owner", "queued", child, metadata, source="internal:listing")
+        service.store.write_receipt(db, "text", "owner", "root", root)
+        service.store.write_receipt(db, "text", "owner", "queued", child)
+    return metadata
 
 
 def test_dry_run_is_read_only_then_apply_claims_same_frozen_receipt(reconciled):
@@ -177,6 +213,146 @@ def test_reconcile_is_idempotent_across_concurrent_apply_and_restart(reconciled)
     assert len(sent) == 1 and row(service, "root")["status"] == "failed"
 
 
+def test_qualified_no_final_requires_explicit_mode_and_preserves_the_frozen_child(reconciled):
+    service, admission, root_body, _, sent, root = reconciled
+    qualify_no_final(service)
+    root_before, child_before = deepcopy(row(service, "root")), deepcopy(row(service, "queued"))
+    with pytest.raises(ConversationBindingError):
+        reconcile(service, root_body, dry_run=False)
+    assert row(service, "root") == root_before and row(service, "queued") == child_before
+
+    assert reconcile(service, root_body, continue_after_no_final=True) == {
+        "request_id": "queued", "original_request_id": "root", "type": "queued_successor_reconciliation",
+        "eligible": True, "reconciled": False, "dry_run": True,
+    }
+    assert row(service, "root") == root_before and row(service, "queued") == child_before
+    applied = reconcile(service, root_body, dry_run=False, continue_after_no_final=True)
+    assert applied["reconciled"] is True
+    child = row(service, "queued")
+    assert child["_supersedes_no_final"] is True
+    for key in ("request_id", "request_message_id", "_input_ref", "_sequence"):
+        assert child[key] == child_before[key]
+    with service.store.connect() as db:
+        assert service.store.load_input(child["_input_ref"]) == {**root_body, "client_request_id": "queued"}
+    assert row(service, "root") == root_before
+
+    claim = admission.claim_next()
+    assert claim and claim.request_id == "queued"
+    admission.execute(claim)
+    assert len(sent) == 1 and sent[0]["_supersedes_no_final_original"] == root_before
+    assert reconcile(service, root_body, dry_run=False, continue_after_no_final=True)["reconciled"] is True
+    with pytest.raises(ConversationBindingError):
+        reconcile(service, root_body, dry_run=False)
+    with pytest.raises(ConversationBindingError):
+        reconcile(service, {**root_body, "parent_message_id": "other"}, dry_run=False,
+                  continue_after_no_final=True)
+
+    _, _, restarted = build(root, service.clock)
+    restarted.register("text", lambda context, body: service._run(context.owner, context.request_id, body))
+    restarted_service = TextTaskService(service.store.path, runner=service.runner, clock=service.clock, admission=restarted)
+    assert reconcile(restarted_service, root_body, dry_run=False, continue_after_no_final=True)["reconciled"] is True
+
+
+@pytest.mark.parametrize("changes,expected_status", [
+    ({"status": "succeeded", "upstream_outcome": "completed", "content": "late"}, "failed"),
+    ({"recovery_no_result_reads": 2}, "failed"),
+    ({"_claim_id": "busy", "_claim_until": 2000}, "queued"),
+])
+def test_qualified_no_final_reconcile_rechecks_original_before_send(reconciled, changes, expected_status):
+    service, admission, root_body, _, sent, _ = reconciled
+    qualify_no_final(service)
+    reconcile(service, root_body, dry_run=False, continue_after_no_final=True)
+    update(service, "root", **changes)
+    claim = admission.claim_next()
+    assert claim and claim.request_id == "queued"
+    admission.execute(claim)
+    child = row(service, "queued")
+    assert child["status"] == expected_status and sent == []
+    if expected_status == "failed":
+        assert child["upstream_outcome"] == "not_sent"
+
+
+@pytest.mark.parametrize("value", [1, False, "true"])
+def test_qualified_no_final_reconcile_rejects_non_boolean_persisted_mode_before_send(reconciled, value):
+    service, admission, root_body, _, sent, _ = reconciled
+    qualify_no_final(service)
+    reconcile(service, root_body, dry_run=False, continue_after_no_final=True)
+    update(service, "queued", _supersedes_no_final=value)
+    claim = admission.claim_next()
+    assert claim and claim.request_id == "queued"
+    admission.execute(claim)
+    child = row(service, "queued")
+    assert child["status"] == "failed" and child["upstream_outcome"] == "not_sent" and sent == []
+
+
+@pytest.mark.parametrize("value", [1, False, "true"])
+def test_qualified_no_final_reconcile_acknowledgement_rejects_non_boolean_persisted_mode(reconciled, value):
+    service, admission, root_body, _, sent, _ = reconciled
+    qualify_no_final(service)
+    reconcile(service, root_body, dry_run=False, continue_after_no_final=True)
+    claim = admission.claim_next()
+    assert claim and claim.request_id == "queued"
+    admission.execute(claim)
+    assert len(sent) == 1
+    update(service, "queued", _supersedes_no_final=value)
+    with pytest.raises(ConversationBindingError):
+        reconcile(service, root_body, dry_run=False, continue_after_no_final=True)
+
+
+def test_qualified_no_final_reconciled_result_closes_and_archives_product_work(reconciled, monkeypatch):
+    service, admission, root_body, _, sent, root = reconciled
+    qualify_no_final(service)
+    reconcile(service, root_body, dry_run=False, continue_after_no_final=True)
+    metadata = attach_product_work_to_reconciled_pair(service)
+    claim = admission.claim_next()
+    assert claim and claim.request_id == "queued"
+    admission.execute(claim)
+    assert row(service, "queued")["status"] == "succeeded" and len(sent) == 1
+
+    archived = []
+    monkeypatch.setattr("services.text_task_service.conversation_binding_service.set_archived",
+                        lambda receipt, value: archived.append((receipt["request_id"], value)))
+    images = SimpleNamespace(archive_product_work=lambda *_args: None)
+    product = ProductWorkService(service, images, clock=service.clock)
+    lifecycle = WorkLifecycleService(service, images, clock=service.clock)
+    identity = {"id": "owner", "role": "admin", "_trusted_source": "internal:listing"}
+    assert product.close(identity, metadata["product_ref"], results_saved=True)["state"] == "closing"
+    assert lifecycle.process_one()
+    assert archived == [("queued", True)]
+    assert product.get(identity, metadata["product_ref"])["state"] == "completed"
+
+    _, store, restarted_admission = build(root, service.clock)
+    restarted = TextTaskService(store.path, runner=service.runner, clock=service.clock, admission=restarted_admission)
+    restarted_admission.register("text", lambda context, body: restarted._run(context.owner, context.request_id, body))
+    restarted_product = ProductWorkService(restarted, images, clock=service.clock)
+    assert restarted_product.get(identity, metadata["product_ref"])["state"] == "completed"
+
+
+@pytest.mark.parametrize("target,changes", [
+    ("queued", {"_reconciled_queued_successor": False}),
+    ("queued", {"_product_work": {"product_ref": "queued-reconcile-product", "step_ref": "other"}}),
+    ("hash", {}),
+])
+def test_qualified_no_final_reconciled_product_close_rejects_forged_contract(reconciled, target, changes):
+    service, admission, root_body, _, _, _ = reconciled
+    qualify_no_final(service)
+    reconcile(service, root_body, dry_run=False, continue_after_no_final=True)
+    metadata = attach_product_work_to_reconciled_pair(service)
+    claim = admission.claim_next()
+    assert claim and claim.request_id == "queued"
+    admission.execute(claim)
+    if target == "hash":
+        with service.store.connect() as db:
+            db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id=?", ("tampered", "owner", "queued"))
+    else:
+        update(service, target, **changes)
+    images = SimpleNamespace(archive_product_work=lambda *_args: None)
+    product = ProductWorkService(service, images, clock=service.clock)
+    identity = {"id": "owner", "role": "admin", "_trusted_source": "internal:listing"}
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_"):
+        product.close(identity, metadata["product_ref"], results_saved=True)
+
+
 def test_http_requires_admin_listing_source_and_has_strict_body(reconciled, monkeypatch):
     service, admission, root_body, _, sent, _ = reconciled
     monkeypatch.setattr(api, "text_task_service", service)
@@ -191,6 +367,8 @@ def test_http_requires_admin_listing_source_and_has_strict_body(reconciled, monk
         assert response.headers["cache-control"] == "private, no-store"
         assert client.post("/api/conversation-bindings/text-requests/queued/reconcile-queued-successor",
                            json={**body, "messages": []}).status_code == 422
+        assert client.post("/api/conversation-bindings/text-requests/queued/reconcile-queued-successor",
+                           json={**body, "continue_after_no_final": "true"}).status_code == 422
         assert client.post("/api/conversation-bindings/text-requests/wrong/reconcile-queued-successor", json=body).status_code == 409
         changed_cursor = {**body, "parent_message_id": "other"}
         assert client.post("/api/conversation-bindings/text-requests/queued/reconcile-queued-successor",
@@ -210,3 +388,25 @@ def test_http_requires_admin_listing_source_and_has_strict_body(reconciled, monk
     monkeypatch.setattr(api, "trusted_source", lambda _identity, _request: "internal:content")
     with TestClient(app) as client:
         assert client.post("/api/conversation-bindings/text-requests/queued/reconcile-queued-successor", json=body).status_code == 404
+
+
+def test_http_explicit_no_final_mode_reaches_reconcile_service(reconciled, monkeypatch):
+    service, admission, root_body, _, sent, _ = reconciled
+    qualify_no_final(service)
+    monkeypatch.setattr(api, "text_task_service", service)
+    app = FastAPI()
+    app.include_router(api.create_router())
+    monkeypatch.setattr(api, "require_identity", lambda _authorization, request=None: {"id": "owner", "role": "admin"})
+    monkeypatch.setattr(api, "trusted_source", lambda _identity, _request: "internal:listing")
+    body = {"client_request_id": "queued", "original_request_id": "root", **cursor(root_body),
+            "continue_after_no_final": True}
+    with TestClient(app) as client:
+        assert client.post("/api/conversation-bindings/text-requests/queued/reconcile-queued-successor", json=body).status_code == 200
+        applied = client.post("/api/conversation-bindings/text-requests/queued/reconcile-queued-successor",
+                              json={**body, "dry_run": False})
+        assert applied.status_code == 200 and applied.json()["reconciled"] is True
+    assert row(service, "queued")["_supersedes_no_final"] is True
+    claim = admission.claim_next()
+    assert claim and claim.request_id == "queued"
+    admission.execute(claim)
+    assert len(sent) == 1 and sent[0]["_supersedes_no_final_original"]["request_id"] == "root"
