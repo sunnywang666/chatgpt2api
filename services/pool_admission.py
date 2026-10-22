@@ -20,7 +20,7 @@ import uuid
 from services.admission_planner import (Need, Resource, Offer, OfferDiagnostic,
                                         RequestRef, WaitingRequest, Snapshot,
                                         choose_next, fairness_lane, fairness_subgroup_key)
-from services.request_context import AdmissionLost, executing, safe_account_ref
+from services.request_context import AdmissionLost, executing, safe_account_ref, reserving_original_read
 from services.task_store import TaskStore, pending_image_result_ids
 from services import workflow_scheduling, product_work
 from utils.log import logger
@@ -796,6 +796,10 @@ class PoolAdmission:
         self._original_read_slots = threading.BoundedSemaphore(4)
         self._original_read_lock = threading.Lock()
         self._original_reads = set()
+        # A durable FIFO ticket belongs to one dispatcher instance.  The
+        # original request identity remains part of its hash, while an expired
+        # worker/restart falls back to the queue's existing short expiry.
+        self._original_read_ticket_nonce = uuid.uuid4().hex
         # The reader slots are shared across accounts.  Remember the last
         # account selected so a large, overdue historical backlog on one
         # account cannot keep every other due original behind its first rows.
@@ -860,17 +864,16 @@ class PoolAdmission:
         with self._account_guard():
             account = next((a for a in self._rows()
                             if a.get("provider_account_identity") == receipt.get("provider_account_identity")), None)
-        if account is not None:
-            if account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
-                return False
-            now = float(self.clock())
-            if self.pacing:
-                pacing = self.pacing(account, now)
-            else:
-                from services.account_request_pacing import account_pacing_snapshot
-                pacing = account_pacing_snapshot(account, now, include_turn=False, include_conversation_read=True)
-            if pacing.get("next_at") is None or pacing["next_at"] > now:
-                return False
+        read_owner = "original-result:" + hashlib.sha256(
+            (self._original_read_ticket_nonce + "\0" + kind + "\0" + owner + "\0" + request_id).encode()
+        ).hexdigest()[:24]
+        reserve_text_read = kind == "text" and account is not None and self.pacing is None
+
+        def release_read_ticket():
+            if reserve_text_read:
+                from services.account_request_pacing import release_account_original_read
+                release_account_original_read(account, read_owner)
+
         key = physical_conversation_key(receipt)
         if key is None:
             account_key = receipt.get("provider_account_identity") or receipt.get("provider_binding_id")
@@ -878,16 +881,45 @@ class PoolAdmission:
             key = ((account_key, client_conversation) if account_key and client_conversation
                    else (kind, owner, request_id))
         with self._original_read_lock:
-            if key in self._original_reads or not self._original_read_slots.acquire(blocking=False):
+            # Check before booking: another receipt for this physical read
+            # must not leave an unused FIFO head after the active GET starts.
+            if key in self._original_reads:
+                return False
+            if account is not None:
+                if account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
+                    release_read_ticket()
+                    return False
+                if reserve_text_read:
+                    from services.account_request_pacing import reserve_account_original_read
+                    # Nonblocking account lock; no reader slot is held until
+                    # this original is at the FIFO head and its clock is due.
+                    if not reserve_account_original_read(account, read_owner):
+                        return False
+                else:
+                    now = float(self.clock())
+                    if self.pacing:
+                        pacing = self.pacing(account, now)
+                    else:
+                        # Image recovery owns a separate asynchronous worker;
+                        # retain its existing clock gate and owner lifetime.
+                        from services.account_request_pacing import account_pacing_snapshot
+                        pacing = account_pacing_snapshot(account, now, include_turn=False,
+                                                         include_conversation_read=True)
+                    if pacing.get("next_at") is None or pacing["next_at"] > now:
+                        return False
+            if not self._original_read_slots.acquire(blocking=False):
+                release_read_ticket()
                 return False
             self._original_reads.add(key)
 
         def run():
             try:
-                function(owner, request_id)
+                with reserving_original_read(read_owner if reserve_text_read else None):
+                    function(owner, request_id)
             except Exception:
                 pass  # The original handler persists the bounded failure.
             finally:
+                release_read_ticket()
                 with self._original_read_lock:
                     self._original_reads.discard(key)
                     self._original_read_slots.release()
@@ -898,6 +930,7 @@ class PoolAdmission:
             with self._original_read_lock:
                 self._original_reads.discard(key)
                 self._original_read_slots.release()
+            release_read_ticket()
             raise
         return True
 

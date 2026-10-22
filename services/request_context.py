@@ -13,6 +13,7 @@ current_archive_guard = ContextVar("provider_archive_guard", default=None)
 current_archive_read_owner = ContextVar("provider_archive_read_owner", default=None)
 current_archive_observation = ContextVar("provider_archive_observation", default=None)
 current_archive_step = ContextVar("provider_archive_step", default=None)
+current_original_read_owner = ContextVar("provider_original_read_owner", default=None)
 _FAIR_SOURCE = re.compile(r"^(?:user|company):[0-9a-f]{64}$")
 
 
@@ -111,6 +112,16 @@ def guarding_archive(check_and_renew, *, read_owner=None, request_key=None, work
         current_archive_observation.reset(observation_token)
         current_archive_read_owner.reset(read_token)
         current_archive_guard.reset(token)
+
+
+@contextmanager
+def reserving_original_read(owner):
+    """Carry a pre-booked ordinary-read FIFO owner to the exact result GET."""
+    token = current_original_read_owner.set(owner)
+    try:
+        yield
+    finally:
+        current_original_read_owner.reset(token)
 
 
 @contextmanager
