@@ -16,7 +16,7 @@ from services.conversation_binding_service import ConversationBindingService
 from services.image_task_service import ImageTaskService
 from services.openai_backend_api import OpenAIBackendAPI as RealBackend
 from services.text_task_service import TextTaskService
-from services.request_context import operation_deadline, bounded_lock, executing
+from services.request_context import current_operation_deadline, operation_deadline, bounded_lock, executing
 from test.test_work_lifecycle import runtime
 from test.test_background_original_reads import recovery
 
@@ -25,7 +25,7 @@ from test.test_background_original_reads import recovery
 def local_upstream(tmp_path, monkeypatch):
     import services.account_request_pacing as pacing
     from services.config import ConfigStore
-    state = SimpleNamespace(calls=[], backends=[], blocked=threading.Event(), release=threading.Event(),
+    state = SimpleNamespace(calls=[], transport_attempts=[], backends=[], blocked=threading.Event(), release=threading.Event(),
                             block=None, delays={}, archived=False, status=200, invalid_json=False,
                             disconnect=False)
     class Handler(BaseHTTPRequestHandler):
@@ -87,6 +87,14 @@ def local_upstream(tmp_path, monkeypatch):
         session = requests.Session(trust_env=False)
         raw_send = session.request
         def send(method, url, **kwargs):
+            parsed = urlsplit(url)
+            timeout = kwargs.get("timeout")
+            state.transport_attempts.append({
+                "method": method,
+                "path": parsed.path,
+                "timeout": timeout,
+                "deadline": current_operation_deadline.get(),
+            })
             if urlsplit(url).hostname == "chatgpt.com":
                 url = f"http://127.0.0.1:{server.server_port}" + urlsplit(url).path
             return raw_send(method, url, **kwargs)
@@ -265,6 +273,28 @@ def run_image(images, seconds):
                             "generate", "gpt-image-2", False, False)
 
 
+def assert_shared_remaining_transport_budget(state, blocked_path):
+    """The second actual transport send must inherit the first call's deadline."""
+    def total_timeout(value):
+        if isinstance(value, (int, float)):
+            return float(value)
+        if (isinstance(value, tuple) and len(value) == 2
+                and all(isinstance(part, (int, float)) for part in value)):
+            # Conversation reads split curl's total budget into connect and
+            # transfer portions only after pacing capped the shared deadline.
+            return float(value[0] + value[1])
+        raise AssertionError(f"unexpected transport timeout shape: {value!r}")
+
+    first = next(attempt for attempt in state.transport_attempts
+                 if attempt["path"] == "/backend-api/files/original-file/download")
+    second = next(attempt for attempt in state.transport_attempts if attempt["path"] == blocked_path)
+    first_timeout = total_timeout(first["timeout"])
+    second_timeout = total_timeout(second["timeout"])
+    assert isinstance(first["deadline"], (int, float))
+    assert second["deadline"] == first["deadline"]
+    assert second_timeout <= first_timeout - .08
+
+
 def test_image_real_lock_wait_obeys_whole_recovery_budget(tmp_path, local_upstream):
     images = seed_image(tmp_path)
     lock = local_upstream.accounts.conversation_binding_lock("binding", "blocked")
@@ -290,9 +320,15 @@ def test_image_http_download_and_confirmation_share_remaining_budget(tmp_path, l
     state.delays["/backend-api/files/original-file/download"] = .10
     state.block = ("GET", blocked_path)
     started = time.monotonic()
-    run_image(images, .25)
+    # The first HTTP response deliberately consumes 100 ms.  A 250 ms total
+    # budget leaves too little real scheduling margin on loaded CI for the
+    # second request to reach this local handler, which tests dispatcher load
+    # rather than shared-deadline behavior.  The recorded send options below
+    # directly prove that the second request receives only the remainder.
+    run_image(images, .50)
     elapsed = time.monotonic() - started
-    assert state.blocked.is_set() and .18 <= elapsed < .9
+    assert state.blocked.is_set() and .40 <= elapsed < .9
+    assert_shared_remaining_transport_budget(state, blocked_path)
     row = image_row(images)
     assert row["status"] == "error" and row["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN"
     assert row["result_file_ids"] == ["original-file"]
