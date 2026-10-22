@@ -15,6 +15,12 @@ on:
       - api/product_works.py
       - services/account_request_pacing.py
       - services/account_service.py
+      - services/oauth_login_service.py
+      - utils/sentinel.py
+      - test/test_auth_tls_verification.py
+      - Dockerfile
+      - pyproject.toml
+      - uv.lock
       - services/admission_planner.py
       - services/image_task_service.py
       - services/request_context.py
@@ -114,6 +120,7 @@ jobs:
           .venv/bin/python -m compileall -q api services utils test
           .venv/bin/python -m pytest -q \
             test/test_pool_admission.py \
+            test/test_auth_tls_verification.py \
             test/test_stalled_text_diagnostics.py \
             test/test_original_operation_budget.py \
             test/test_product_compact_successor.py \
