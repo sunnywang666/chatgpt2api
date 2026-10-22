@@ -128,8 +128,21 @@ def patch_bound_runner(monkeypatch, h, *, before_send_change=None):
     return calls
 
 
-def test_incomplete_compact_successor_uses_pool_and_two_fresh_original_reads(incomplete, monkeypatch):
+def set_original_outcome(h, outcome):
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        if outcome == "missing":
+            original.pop("upstream_outcome", None)
+        else:
+            original["upstream_outcome"] = outcome
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+    h.old = row(h.service)
+
+
+@pytest.mark.parametrize("outcome", ["unknown", "missing", "not_sent"])
+def test_incomplete_compact_successor_uses_pool_and_two_fresh_original_reads(incomplete, monkeypatch, outcome):
     h = incomplete
+    set_original_outcome(h, outcome)
     calls = patch_bound_runner(monkeypatch, h)
     accepted = h.service.submit("owner", h.envelope)
     assert accepted["status"] == "queued" and accepted["continue_after_incomplete"] is True
@@ -173,8 +186,10 @@ def test_incomplete_compact_successor_uses_pool_and_two_fresh_original_reads(inc
 
 
 @pytest.mark.parametrize("change", ["late_final", "progress", "branch"])
-def test_incomplete_send_edge_rejects_late_result_progress_or_branch(incomplete, monkeypatch, change):
+@pytest.mark.parametrize("outcome", ["unknown", "missing", "not_sent"])
+def test_incomplete_send_edge_rejects_late_result_progress_or_branch(incomplete, monkeypatch, change, outcome):
     h = incomplete
+    set_original_outcome(h, outcome)
     calls = patch_bound_runner(monkeypatch, h, before_send_change=change)
     h.service.submit("owner", h.envelope)
     h.admission.execute(h.admission.claim_next())
@@ -208,6 +223,12 @@ def test_incomplete_mode_is_closed_idempotent_and_never_resume_unsent(incomplete
 
 
 @pytest.mark.parametrize("change", [
+    {"upstream_outcome": None},
+    {"upstream_outcome": "not_submitted"},
+    {"upstream_outcome": "submitted"},
+    {"upstream_outcome": "completed"},
+    {"upstream_outcome": "rejected"},
+    {"upstream_outcome": "not_sent", "_submission_started": False},
     {"recovery_reason": "REQUEST_RESULT_NOT_FOUND"},
     {"_result_no_progress_reads": 2},
     {"_claim_id": "live", "_claim_until": 1001.0},

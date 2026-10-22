@@ -3429,9 +3429,12 @@ class TextTaskService:
         """
         if not cls._qualified_stalled_incomplete_capacity_boundary(previous, now):
             return False
+        # Legacy sent Chat receipts can omit the outcome or retain an earlier
+        # not_sent label. Reuse the original-result recovery proof for those
+        # exact shapes; do not rewrite the original or accept an explicit null.
         if (previous.get("status") != "unknown"
                 or previous.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
-                or previous.get("upstream_outcome") != "unknown"
+                or not cls._normal_sent_chat_result_recovery(previous)
                 or previous.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
                 or previous.get("_submission_started") is not True
                 or previous.get("_upstream_terminal") not in (None, False)

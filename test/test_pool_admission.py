@@ -196,6 +196,10 @@ class AdmissionTests(unittest.TestCase):
                 ordinary_waiting.set()
                 if not release_ordinary.wait(2):
                     raise TimeoutError("ordinary reader was not released")
+                # This is a scheduling handoff to let the due FIFO owner
+                # consume its already-due credit.  It is not an account-pacing
+                # wait, so it must not advance the shared virtual clock.
+                return
             now[0] += seconds
 
         with patch.object(pacing, "DATA_DIR", self.root), \
@@ -224,10 +228,13 @@ class AdmissionTests(unittest.TestCase):
                     self.assertTrue(self.admission._dispatch_original_read("text", "happy", "due", recover, receipt))
                     self.assertTrue(started.wait(2))
                     self.assertEqual(sent, [("due-conversation", 1090.0)])
+                    # ``started`` is set by recover() before the dispatcher's
+                    # finally block drops the FIFO ticket.  Wait for that
+                    # cleanup before letting the ordinary reader race again.
+                    self.assertTrue(finished.wait(2))
                 finally:
                     release_ordinary.set()
                     ordinary.join(3)
-                    self.assertTrue(finished.wait(2))
             self.assertFalse(ordinary.is_alive())
             self.assertEqual(ordinary_errors, [])
             self.assertEqual(sent, [("due-conversation", 1090.0), ("ordinary-reader", 1180.0)])
