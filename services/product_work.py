@@ -821,7 +821,17 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
         return None
     member_refs = {member["request_id"]: member for member, _ in members if member["kind"] == "text"}
     metadata = original_body.get("product_work")
-    if (not isinstance(metadata, dict) or metadata != _metadata(parent, metadata.get("step_ref"))
+    attempt_steps = reconciled and receipt.get(TextTaskService._RECONCILED_ATTEMPT_STEP) is True
+    if attempt_steps:
+        # The registered pair retains two attempt-addressed members. Each must
+        # still match its own frozen input and the same durable parent.
+        for item, body in ((original, original_body), (receipt, successor_body)):
+            item_metadata = body.get("product_work")
+            if (not isinstance(item_metadata, dict)
+                    or item_metadata != _metadata(parent, member_refs[item["request_id"]].get("step_ref"))
+                    or item.get("_product_work") != item_metadata):
+                return None
+    elif (not isinstance(metadata, dict) or metadata != _metadata(parent, metadata.get("step_ref"))
             or any(item.get("_product_work") != metadata
                    or member_refs[item["request_id"]].get("step_ref") != metadata.get("step_ref")
                    for item in chain_members)):

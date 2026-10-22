@@ -231,6 +231,7 @@ class TextTaskService:
         "RECOVERY_AUTH_REQUIRED", "RECOVERY_READ_FAILED",
     })
     _RECONCILED_QUEUED_SUCCESSOR = "_reconciled_queued_successor"
+    _RECONCILED_ATTEMPT_STEP = "_reconciled_attempt_step"
     _RECONCILE_LINK_FIELDS = (
         "_supersedes_request_id", "_previous_request_id", "_completion_of",
         "_same_session_retry_of", "_terminal_empty_correction_of",
@@ -2920,6 +2921,59 @@ class TextTaskService:
             return expected
 
     @classmethod
+    def _reconciled_queued_inputs_match(cls, store, db, owner, successor, previous, body, original_body):
+        """Keep attempt-addressed listing steps distinct without changing either input.
+
+        The trusted listing caller explicitly confirms the same logical write.
+        Node's accessory step address is writeName:writeAttemptId, and its
+        client_request_id is that same attempt UUID. No other step grammar is
+        accepted by this compatibility path.
+        """
+        mode = successor.get(cls._RECONCILED_ATTEMPT_STEP)
+        if mode is None:
+            return body == {**original_body, "client_request_id": successor.get("request_id")}
+        if mode is not True or successor.get("_supersedes_no_final") is not True:
+            return False
+        from services.product_work import _key, normalize_product_work
+        from services.work_lifecycle import WorkLifecycleError
+        try:
+            metadata = [normalize_product_work(value.get("product_work")) for value in (original_body, body)]
+            if not all(isinstance(value, dict) for value in metadata):
+                return False
+            for receipt, value in zip((previous, successor), metadata):
+                rid = receipt.get("request_id")
+                if (not isinstance(rid, str) or str(uuid.UUID(rid)) != rid
+                        or value["step_ref"] != "direct-listing.accessory.recognition:" + rid
+                        or receipt.get("_product_work") != value
+                        or receipt.get("_source") != "internal:listing"
+                        or receipt.get("_scheduling_owner") != "internal:listing"):
+                    return False
+            original_meta, child_meta = metadata
+            if (original_meta["step_ref"] == child_meta["step_ref"]
+                    or child_meta != {**original_meta, "step_ref": child_meta["step_ref"]}
+                    or body != {**original_body, "client_request_id": successor["request_id"],
+                                "product_work": child_meta}):
+                return False
+            key = _key("internal:listing", owner, original_meta["product_ref"])
+            parent = store.runtime(db, key)
+            if (not isinstance(parent, dict) or parent.get("key") != key or parent.get("owner") != owner
+                    or parent.get("source") != "internal:listing"
+                    or parent.get("product_ref") != original_meta["product_ref"]
+                    or parent.get("fairness") != original_meta.get("fairness")
+                    or not isinstance(parent.get("members"), list)):
+                return False
+            for receipt, value in zip((previous, successor), metadata):
+                member = {"kind": "text", "owner": owner, "request_id": receipt["request_id"],
+                          "step_ref": value["step_ref"]}
+                matches = [m for m in parent["members"] if isinstance(m, dict)
+                           and m.get("request_id") == receipt["request_id"]]
+                if receipt.get("_product_work_key") != key or matches != [member]:
+                    return False
+            return True
+        except (ValueError, TypeError, KeyError, AttributeError, WorkLifecycleError):
+            return False
+
+    @classmethod
     def _validate_reconciled_queued_successor(cls, store, db, owner, successor, previous, previous_hash, original_body, now):
         """Revalidate the frozen, pre-accepted queued child at both send guards."""
         def reject():
@@ -2941,7 +2995,7 @@ class TextTaskService:
                 or stored.get("request_id") != request_id
                 or cls._submission_identity(owner, body) != (request_id, row[0])
                 or cls._submission_identity(owner, original_body) != (previous.get("request_id"), previous_hash)
-                or body != {**original_body, "client_request_id": request_id}
+                or not cls._reconciled_queued_inputs_match(store, db, owner, successor, previous, body, original_body)
                 or "supersedes_request_id" in body):
             reject()
         required = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
@@ -3171,7 +3225,7 @@ class TextTaskService:
         return previous
 
     def reconcile_queued_successor(self, owner, request_id, original_request_id, cursor, *, source, dry_run=True,
-                                   continue_after_no_final=False):
+                                   continue_after_no_final=False, reconcile_attempt_step=False):
         """Attach one proven, accepted-but-unsent listing receipt to its original.
 
         The retained child input is never rebuilt.  This narrow repair exists for
@@ -3181,7 +3235,8 @@ class TextTaskService:
         def reject(code="CHAT_QUEUED_SUCCESSOR_NOT_RECONCILABLE"):
             raise ConversationBindingError("queued successor cannot be reconciled", code=code)
         if (source != "internal:listing" or type(dry_run) is not bool
-                or type(continue_after_no_final) is not bool):
+                or type(continue_after_no_final) is not bool or type(reconcile_attempt_step) is not bool
+                or reconcile_attempt_step and not continue_after_no_final):
             reject()
         fields = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
                   "conversation_id", "parent_message_id")
@@ -3220,7 +3275,8 @@ class TextTaskService:
                             or child.get("request_id") != request_id or parent.get("request_id") != original_request_id
                             or self._submission_identity(owner, parent_body) != (original_request_id, parent_row[0])
                             or self._submission_identity(owner, child_body) != (request_id, child_row[0])
-                            or child_body != {**parent_body, "client_request_id": request_id}
+                            or not self._reconciled_queued_inputs_match(
+                                self.store, db, owner, child, parent, child_body, parent_body)
                             or "supersedes_request_id" in child_body
                             or any(parent_body.get(key) != cursor[key] or child_body.get(key) != cursor[key]
                                    for key in fields)
@@ -3228,14 +3284,16 @@ class TextTaskService:
                             or child.get("_supersedes_input_hash") != parent_row[0]
                             or child.get("_supersedes_request_message_id") != parent.get("request_message_id")
                             or child.get("_submission_parent_message_id") != parent_body.get("parent_message_id")
-                            or (child.get("_supersedes_no_final") is True) != continue_after_no_final):
+                            or (child.get("_supersedes_no_final") is True) != continue_after_no_final
+                            or (child.get(self._RECONCILED_ATTEMPT_STEP) is True) != reconcile_attempt_step):
                         reject("CHAT_QUEUED_SUCCESSOR_CONFLICT")
                     result = {"request_id": request_id, "original_request_id": original_request_id,
                               "type": "queued_successor_reconciliation", "eligible": True,
                               "reconciled": True, "dry_run": dry_run}
                     db.execute("ROLLBACK")
                     return result
-                if existing is not None or any(child.get(key) for key in self._RECONCILE_LINK_FIELDS):
+                if (existing is not None or self._RECONCILED_ATTEMPT_STEP in child
+                        or any(child.get(key) for key in self._RECONCILE_LINK_FIELDS)):
                     reject("CHAT_QUEUED_SUCCESSOR_CONFLICT")
                 if any(child.get(key) != cursor[key] or parent.get(key) != cursor[key] for key in fields):
                     reject()
@@ -3306,6 +3364,8 @@ class TextTaskService:
                 }
                 if continue_after_no_final:
                     candidate["_supersedes_no_final"] = True
+                if reconcile_attempt_step:
+                    candidate[self._RECONCILED_ATTEMPT_STEP] = True
                 self._validate_supersede(self.store, db, owner, candidate, self._now())
                 result = {"request_id": request_id, "original_request_id": original_request_id,
                           "type": "queued_successor_reconciliation", "eligible": True,
