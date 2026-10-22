@@ -1907,8 +1907,11 @@ def test_native_get_connect_cap_preserves_total_deadline(tmp_path, monkeypatch):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     session = requests.Session(trust_env=False)
     raw_send = session.request
-    session.request = lambda method, url, **kw: raw_send(
-        method, f"https://127.0.0.1:{server.server_address[1]}"+urlsplit(url).path, **kw)
+    transport_timeouts = []
+    def redirected_send(method, url, **kw):
+        transport_timeouts.append(kw.get("timeout"))
+        return raw_send(method, f"https://127.0.0.1:{server.server_address[1]}"+urlsplit(url).path, **kw)
+    session.request = redirected_send
     (tmp_path / "config.json").write_text(json.dumps({"auth-key":"test-only"}))
     settings = ConfigStore(tmp_path / "config.json")
     settings.update({"account_request_interval_secs":0, "account_conversation_read_interval_secs":0})
@@ -1926,7 +1929,17 @@ def test_native_get_connect_cap_preserves_total_deadline(tmp_path, monkeypatch):
         assert .1 <= time.monotonic()-started < .6
         assert ConversationBindingService._retryable_direct_read_connection(caught.value)
         attempt = next(c.args[0] for c in log.call_args_list if c.args[0].get("event")=="account_http_attempt")
-        assert .6 < attempt["request_timeout_secs"] <= .7
+        # The deadline is capped again in the worker immediately before it
+        # enters transport, so scheduler delay may legitimately leave less
+        # than the caller's initial .7 seconds.  It must still be a positive
+        # remainder of that deadline, then be split into the requested
+        # connect cap plus the rest of the same total budget.
+        assert 0 < attempt["request_timeout_secs"] <= .7
+        assert len(transport_timeouts) == 1
+        connect_timeout, remaining_timeout = transport_timeouts[0]
+        assert connect_timeout == min(.15, attempt["request_timeout_secs"])
+        assert remaining_timeout >= 0
+        assert connect_timeout + remaining_timeout == attempt["request_timeout_secs"]
         assert attempt["transport_details"]["appconnect_secs"] == 0
         assert attempt["transport_details"]["downloaded_bytes"] == 0
         assert attempt.get("transport_response_status") is None

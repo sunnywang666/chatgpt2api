@@ -1490,7 +1490,11 @@ class PoolAdmission:
             if resource and image_generation_active(kind, r, active):
                 key = "image:" + resource
                 occupied[key] = occupied.get(key, 0) + 1
-            state = "unknown" if unknown else "queued" if status in {"queued", "not_started"} else "active" if active else "succeeded"
+            # A durable not_started original has no proof that its first send
+            # may be resumed. Keep it as a non-terminal conversation barrier,
+            # but do not place it in the planner's claimable queued set.
+            state = ("unknown" if unknown else "queued" if status == "queued"
+                     else "active" if status == "not_started" or active else "succeeded")
             thread_needs = ()
             if kind == "image" and r.get("_image_thread"):
                 _, blocked = predecessor_state(r, image_receipts.get(owner, {}))
