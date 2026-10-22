@@ -525,6 +525,88 @@ def test_same_scan_rechecks_priority_and_serves_released_originals_in_due_order(
                         "contributor-3", "contributor-4", "contributor-5", "newer-released"]
 
 
+def test_bounded_get_timeout_stays_a_contributor_before_released_history(recovery):
+    """A failed exact GET frees capacity without proving its original stopped."""
+    r = recovery
+    r.original("timeout-original", _submission_started=True, _turn_reserved=False,
+               _executing=False, upstream_outcome="unknown")
+
+    def unavailable(_receipt):
+        error = TimeoutError("fixture exact original GET timed out")
+        error._original_result_get_attempted = True
+        raise error
+
+    r.text.recovery_reader = unavailable
+    assert r.text.read("owner", "timeout-original")["status"] == "unknown"
+    with r.store.connect() as db:
+        timed_out = r.store.read_receipt(db, "text", "owner", "timeout-original")
+    assert timed_out["recovery_error_code"] == "RECOVERY_READ_FAILED"
+    assert TextTaskService._bounded_unreadable_result_capacity_boundary(timed_out, r.clock())
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(timed_out, r.clock())
+
+    # Make the proven live original and three ordinary contributors due in
+    # order.  The old rows model the 178 released originals ahead of the
+    # incident child in the production snapshot without retaining their IDs.
+    r.text._update("owner", "timeout-original", recovery_next_at=0)
+    for index in range(3):
+        request_id = f"contributor-{index}"
+        r.original(request_id)
+        r.text._update("owner", request_id, recovery_next_at=index + 1)
+    for index in range(178):
+        released_original(r, f"released-history-{index}", next_at=10 + index)
+
+    submitted = len(r.queue.calls)
+    admitted = []
+    r.admission.recoveries["text"] = lambda *_: None
+    with patch.object(r.admission, "_dispatch_original_read",
+                      side_effect=lambda kind, owner, request_id, function, receipt:
+                      admitted.append(request_id) or True):
+        r.admission.recover_one(background=True)
+
+    # The timeout child must not wait behind released history.  Once three
+    # P0 originals have been served, the existing 3:1 fairness edge gives the
+    # earliest P1 row a turn before another P0 contributor.
+    assert admitted[:4] == ["timeout-original", "contributor-0", "contributor-1",
+                            "released-history-0"]
+    assert len(r.queue.calls) == submitted  # Recovery scheduled reads only; no new POST.
+
+
+def test_qualified_stalled_original_remains_released_history(recovery):
+    r = recovery
+    r.original("qualified-stalled", _submission_started=True, _turn_reserved=False,
+               _executing=False, request_message_id="message-qualified-stalled",
+               upstream_outcome="unknown")
+    r.text._update("owner", "qualified-stalled",
+                   recovery_reason="REQUEST_RESULT_INCOMPLETE",
+                   _result_observation_started_at=1.0,
+                   _result_last_checked_at=r.clock(), _result_wait_ended_at=r.clock(),
+                   _result_last_progress_at=None, _result_no_progress_reads=3,
+                   _original_result_observation={
+                       "conversation_id": "qualified-stalled",
+                       "request_message_id": "message-qualified-stalled",
+                       "upstream_updated_at": 100.0,
+                       "nodes": [{"id": "unfinished-node", "role": "assistant",
+                                  "status": "in_progress", "end_turn": False,
+                                  "text_chars": 0}],
+                   })
+    with r.store.connect() as db:
+        stalled = r.store.read_receipt(db, "text", "owner", "qualified-stalled")
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(stalled, r.clock())
+
+    for index in range(4):
+        request_id = f"contributor-{index}"
+        r.original(request_id)
+        r.text._update("owner", request_id, recovery_next_at=index + 1)
+    admitted = []
+    r.admission.recoveries["text"] = lambda *_: None
+    with patch.object(r.admission, "_dispatch_original_read",
+                      side_effect=lambda kind, owner, request_id, function, receipt:
+                      admitted.append(request_id) or True):
+        r.admission.recover_one(background=True)
+    assert admitted[:5] == ["contributor-0", "contributor-1", "contributor-2",
+                            "qualified-stalled", "contributor-3"]
+
+
 def test_each_account_keeps_its_turn_budget_across_pacing_failures_and_empty_scans(recovery):
     r = recovery
     for account in range(2):

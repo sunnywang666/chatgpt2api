@@ -1044,8 +1044,12 @@ class PoolAdmission:
                           and math.isfinite(receipt["_execution_wait_ended_at"]))
             released = (receipt.get("_turn_reserved") is False
                         and TextTaskService._verified_retryable_empty(receipt))
-            stalled = (TextTaskService._qualified_stalled_incomplete_capacity_boundary(receipt, now)
-                       or TextTaskService._bounded_unreadable_result_capacity_boundary(receipt, now))
+            # A bounded exact-result GET failure releases local Chat capacity,
+            # but establishes nothing about whether the upstream turn remains
+            # active.  Keep that original in the contributor lane; only a
+            # qualified stalled observation proves it belongs with released
+            # history for scheduling.
+            stalled = TextTaskService._qualified_stalled_incomplete_capacity_boundary(receipt, now)
             return 0 if (active and (owner, request_id) not in transferred_empty_turns
                          and not original_turn_ended(kind, receipt)
                          and not wait_ended and not released and not stalled) else 1
