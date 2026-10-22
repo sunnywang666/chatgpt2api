@@ -1,5 +1,7 @@
 """Ordinary background recovery with isolated storage and controlled I/O."""
 import json
+import hashlib
+import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -422,3 +424,208 @@ def test_transferred_empty_roots_do_not_precede_later_capacity_contributor(recov
 
     assert scheduled[0] == "actual-contributor"
     assert set(scheduled[1:]) <= {f"transferred-root-{index}" for index in range(4)}
+
+
+@pytest.mark.parametrize("completion_first", [False, True])
+def test_released_original_gets_a_read_turn_during_continuous_contributor_recovery(recovery, completion_first):
+    """A released UNKNOWN still needs its original result under steady load."""
+    from services import account_request_pacing as pacing
+    from services.account_request_pacing import AccountRequestClock
+    from services.config import config
+
+    r = recovery
+    root = r.store.path.parent
+    for rid in ("contributor-a", "contributor-b", "released-original"):
+        r.original(rid, 0, rid, _submission_started=True, _executing=False,
+                   request_message_id=f"message-{rid}", upstream_outcome="unknown")
+    released = r.text._update("owner", "released-original", _turn_reserved=False,
+        recovery_reason="REQUEST_RESULT_INCOMPLETE", _result_observation_started_at=1.0,
+        _result_last_checked_at=r.clock(), _result_wait_ended_at=r.clock(),
+        _result_last_progress_at=None, _result_no_progress_reads=3,
+        _original_result_observation={"conversation_id": "released-original",
+            "request_message_id": "message-released-original", "upstream_updated_at": 100.0,
+            "nodes": [{"id": "unfinished-node", "role": "assistant", "status": "in_progress",
+                       "end_turn": False, "text_chars": 0}]})
+    with r.store.connect() as db:
+        released = r.store.read_receipt(db, "text", "owner", "released-original")
+    assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(released, r.clock())
+
+    key = hashlib.sha256(b"upstream-0").hexdigest()
+    path = root / "account_request_clocks" / f"{key}.json"
+    pending, sent, finished = queue.Queue(), [], threading.Event()
+    def read(owner, request_id):
+        allow = threading.Event()
+        pending.put((request_id, allow))
+        assert allow.wait(2)
+        def send(method, *_args, **_kwargs):
+            assert method == "GET"
+            sent.append(request_id)
+            return SimpleNamespace(status_code=200, headers={})
+        AccountRequestClock(key[:12], path).request(send, "GET", f"https://provider/conversation/{request_id}")
+        # A normal local outcome can be due again by the following account
+        # read edge; the other contributor keeps a continuous backlog.
+        r.text._update(owner, request_id, recovery_next_at=r.clock() + 30, updated_at=r.clock(),
+                       _completion={"next_at": r.clock() + 30})
+
+    if completion_first:
+        def offer_completion(*, dispatch):
+            with r.store.connect() as db:
+                receipts = [r.store.read_receipt(db, "text", "owner", rid)
+                            for rid in ("contributor-a", "contributor-b")]
+            for receipt in receipts:
+                if receipt.get("_completion", {}).get("next_at", 0) <= r.clock():
+                    dispatch("text", "owner", receipt["request_id"], read, receipt)
+        r.admission.generation_completion = SimpleNamespace(process_one=offer_completion)
+
+    r.admission.pacing = None
+    r.admission.recoveries["text"] = read
+    with patch.object(pacing, "DATA_DIR", root), patch.object(pacing, "_clocks", {}), \
+         patch("services.account_request_pacing.time.monotonic", side_effect=r.clock), \
+         patch("services.account_request_pacing.time.time", side_effect=r.clock), \
+         patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+         patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 45)), \
+         patch.object(type(config), "account_conversation_read_burst", property(lambda _: 1)), \
+         patch.object(r.admission, "wake", side_effect=finished.set):
+        for _ in range(8):
+            finished.clear()
+            r.admission.recover_one(background=True)
+            request_id, allow = pending.get(timeout=1)
+            allow.set()
+            assert finished.wait(2)
+            # The scanner also runs before the next read edge.  Its first
+            # eligible candidate books the only dormant original FIFO ticket.
+            r.clock.now += 1
+            r.admission.recover_one(background=True)
+            r.clock.now += 44
+        assert sent[0].startswith("contributor-")
+        assert "released-original" in sent[:4]
+        assert any(rid.startswith("contributor-") for rid in sent[4:])
+    assert len(r.queue.calls) == 3  # Only the three fixture submissions; no replacement or resend.
+
+
+def released_original(recovery, request_id, account=0, next_at=0, conversation=None, **changes):
+    recovery.original(request_id, account, conversation)
+    recovery.text._update("owner", request_id, status="failed", error_code="RESULT_UNRECOVERABLE",
+                          upstream_outcome="unknown", _execution_wait_ended_at=recovery.clock(),
+                          recovery_next_at=next_at, **changes)
+
+
+def test_same_scan_rechecks_priority_and_serves_released_originals_in_due_order(recovery):
+    r = recovery
+    released_original(r, "newer-released", next_at=900)
+    released_original(r, "older-released", next_at=800)
+    for i in range(6):
+        r.original(f"contributor-{i}")
+    admitted = []
+    r.admission.recoveries["text"] = lambda *_: None
+    with patch.object(r.admission, "_dispatch_original_read",
+                      side_effect=lambda k, o, rid, f, receipt: admitted.append(rid) or True):
+        r.admission.recover_one(background=True)
+    assert admitted == ["contributor-0", "contributor-1", "contributor-2", "older-released",
+                        "contributor-3", "contributor-4", "contributor-5", "newer-released"]
+
+
+def test_each_account_keeps_its_turn_budget_across_pacing_failures_and_empty_scans(recovery):
+    r = recovery
+    for account in range(2):
+        for i in range(2):
+            r.original(f"account-{account}-contributor-{i}", account)
+        released_original(r, f"account-{account}-released", account)
+    available = {}
+    admitted = {f"account-{i}": [] for i in range(2)}
+    def dispatch(kind, owner, request_id, function, receipt):
+        account = receipt["provider_account_identity"]
+        if not available.get(account):
+            return False
+        available[account] = False
+        admitted[account].append(request_id)
+        r.text._update(owner, request_id, recovery_next_at=r.clock() + 1)
+        return True
+    r.admission.recoveries["text"] = lambda *_: None
+    with patch.object(r.admission, "_dispatch_original_read", side_effect=dispatch):
+        for tick in range(12):
+            available.update({"account-0": True, "account-1": tick % 3 == 0})
+            r.admission.recover_one(background=True)
+            for _ in range(2):
+                r.admission.recover_one(background=True)  # No pacing opportunity.
+            r.clock.now += 1
+    for account, calls in admitted.items():
+        assert all("contributor" in rid for rid in calls[:3])
+        assert calls[3] == f"{account}-released"
+
+
+@pytest.mark.parametrize("blocker", ["absent", "paused", "future", "leased", "physical_duplicate"])
+def test_unavailable_released_original_does_not_stop_contributor_fallback(recovery, blocker):
+    r = recovery
+    for i in range(4):
+        r.original(f"contributor-{i}")
+    changes = {"paused": {"_recovery_paused": True},
+               "future": {"next_at": r.clock() + 60},
+               "leased": {"recovery_lease_until": r.clock() + 60},
+               "physical_duplicate": {"conversation": "contributor-0"}}
+    if blocker != "absent":
+        released_original(r, "unavailable-released", **changes[blocker])
+    started = {f"contributor-{i}": threading.Event() for i in range(4)}
+    calls = []
+    def read(owner, request_id):
+        calls.append(request_id)
+        if request_id in started:
+            started[request_id].set()
+        r.release.wait(3)
+    r.admission.recoveries["text"] = read
+    r.admission.recover_one(background=True)
+    assert all(event.wait(1) for event in started.values())
+    assert set(calls) == set(started)
+
+
+def test_completion_only_ended_recheck_survives_and_duplicate_uses_completion_callback_once(recovery):
+    r = recovery
+    r.original("completion-only", _attempt_finished_at=r.clock())
+    r.original("duplicate")
+    r.original("ordinary")
+    completion_calls, ordinary_calls = [], []
+    def offer_completion(*, dispatch):
+        with r.store.connect() as db:
+            receipts = [r.store.read_receipt(db, "text", "owner", rid)
+                        for rid in ("completion-only", "duplicate")]
+        for receipt in receipts:
+            dispatch("text", "owner", receipt["request_id"], lambda o, rid: completion_calls.append(rid), receipt)
+    def dispatch(kind, owner, request_id, function, receipt):
+        function(owner, request_id)
+        return True
+    r.admission.generation_completion = SimpleNamespace(process_one=offer_completion)
+    r.admission.recoveries["text"] = lambda o, rid: ordinary_calls.append(rid)
+    with patch.object(r.admission, "_dispatch_original_read", side_effect=dispatch):
+        r.admission.recover_one(background=True)
+    assert sorted(completion_calls) == ["completion-only", "duplicate"]
+    assert ordinary_calls == ["ordinary"]
+
+
+@pytest.mark.parametrize("mixed_busy_account", [False, True])
+def test_released_only_account_progresses_after_initial_contributor_head_start(recovery, mixed_busy_account):
+    r = recovery
+    # One variant keeps four accounts continuously busy. The other spends
+    # every scan on three contributors plus one released read on a mixed
+    # account, which must not reset another account's chance to zero forever.
+    for i in range(4):
+        r.original(f"busy-{i}", 0 if mixed_busy_account else i)
+    if mixed_busy_account:
+        released_original(r, "mixed-account-released", 0)
+    released_original(r, "released-only-account", 9)
+    scans, available = [], [0]
+    def dispatch(kind, owner, request_id, function, receipt):
+        if available[0] == 0:
+            return False
+        available[0] -= 1
+        scans[-1].append(request_id)
+        return True
+    r.admission.recoveries["text"] = lambda *_: None
+    with patch.object(r.admission, "_dispatch_original_read", side_effect=dispatch):
+        for _ in range(4):
+            scans.append([])
+            available[0] = 4
+            r.admission.recover_one(background=True)
+    if not mixed_busy_account:
+        assert all(rid.startswith("busy-") for rid in scans[0])
+    assert "released-only-account" in scans[1]
+    assert any(rid.startswith("busy-") for rid in scans[-1])
