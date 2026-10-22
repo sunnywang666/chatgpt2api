@@ -27,6 +27,7 @@ on:
       - services/work_lifecycle.py
       - test/test_original_operation_budget.py
       - test/test_product_compact_successor.py
+      - test/test_incomplete_compact_successor.py
       - test/test_product_fairness.py
       - test/test_product_work_api.py
       - test/test_product_work_admission.py
