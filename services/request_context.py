@@ -1,9 +1,13 @@
 """The current original receipt at the upstream send boundary."""
 from contextvars import ContextVar
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from functools import wraps
+import math
+import time
 import hashlib
 import re
 
+current_operation_deadline = ContextVar("provider_operation_deadline", default=None)
 current_request = ContextVar("provider_original_request", default=None)
 current_archive_guard = ContextVar("provider_archive_guard", default=None)
 current_archive_read_owner = ContextVar("provider_archive_read_owner", default=None)
@@ -14,6 +18,70 @@ _FAIR_SOURCE = re.compile(r"^(?:user|company):[0-9a-f]{64}$")
 
 class AdmissionLost(RuntimeError):
     """The original claim is no longer allowed to send."""
+
+
+@contextmanager
+def operation_deadline(deadline):
+    """One transient monotonic budget; nested stages may only shorten it."""
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise ValueError("finite operation deadline required")
+    inherited = current_operation_deadline.get()
+    token = current_operation_deadline.set(min(deadline, inherited) if inherited is not None else deadline)
+    try:
+        yield
+    finally:
+        current_operation_deadline.reset(token)
+
+
+def operation_budget(seconds):
+    """Bound a synchronous operation without abandoning a background writer."""
+    def decorate(function):
+        @wraps(function)
+        def run(*args, **kwargs):
+            budget = seconds(args[0]) if callable(seconds) else seconds
+            with operation_deadline(time.monotonic() + budget):
+                return function(*args, **kwargs)
+        return run
+    return decorate
+
+
+def operation_remaining(maximum):
+    deadline = current_operation_deadline.get()
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        raise AccountRequestDeadlineExceeded("original operation deadline exhausted")
+    return min(maximum, remaining)
+
+
+def operation_request_options(maximum):
+    options = {"timeout": operation_remaining(maximum)}
+    deadline = current_operation_deadline.get()
+    if deadline is not None:
+        options["_account_request_deadline_monotonic"] = deadline
+    return options
+
+
+@contextmanager
+def bounded_lock(lock, deadline_monotonic=None):
+    """Wait only within the caller's budget; never release another owner's lock."""
+    inherited = current_operation_deadline.get()
+    deadline = (inherited if deadline_monotonic is None else deadline_monotonic
+                if inherited is None else min(inherited, deadline_monotonic))
+    if deadline is None or isinstance(lock, nullcontext):
+        with lock:
+            yield
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not lock.acquire(timeout=remaining):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        raise AccountRequestDeadlineExceeded("original session lock deadline exhausted")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def safe_account_ref(identity):

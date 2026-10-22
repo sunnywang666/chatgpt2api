@@ -39,7 +39,9 @@ def bound_chat(monkeypatch):
                 raise state.read_error
             return deepcopy(state.document)
 
-        def patch(self, url, *, headers, json, timeout):
+        def patch(self, url, *, headers, json, timeout, _account_request_deadline_monotonic):
+            assert 0 < timeout <= 60
+            assert _account_request_deadline_monotonic > 0
             assert url.endswith("/conversation/original-chat") and json == {"is_archived": False}
             state.calls.append("restore")
             if state.patch_error:

@@ -16,6 +16,7 @@ from services.account_service import account_service
 from services.account_request_pacing import AccountReadRetryBudgetInsufficient
 from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
 from services.protocol.conversation import conversation_events
+from services.request_context import bounded_lock, operation_budget, current_operation_deadline
 from utils.helper import UpstreamHTTPError
 from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
 
@@ -754,12 +755,13 @@ class ConversationBindingService:
     RECOVERY_DISPATCH_CLOCK_SKEW_SECONDS = 30.0
     RECOVERY_COVERAGE_VERSION = 1
 
+    @operation_budget(60.0)
     def set_archived(self, body: dict[str, Any], archived: bool) -> dict[str, Any]:
         binding = body["provider_binding_id"]
         if account_service.get_bound_account_identity(binding) != body["provider_account_identity"]:
             raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
         token = account_service.get_bound_text_access_token(binding, model="auto")
-        with account_service.conversation_binding_lock(binding, body["client_conversation_id"]):
+        with bounded_lock(account_service.conversation_binding_lock(binding, body["client_conversation_id"])):
             backend = OpenAIBackendAPI(access_token=token)
             try:
                 # The backend checks the original turn and current cursor before
@@ -778,13 +780,14 @@ class ConversationBindingService:
     def archive(self, body: dict[str, Any]) -> dict[str, Any]:
         return self.set_archived(body, True)
 
+    @operation_budget(lambda self: self.RECOVERY_EXACT_READ_TIMEOUT_SECONDS)
     def read_text_request(self, receipt: dict[str, Any]) -> dict[str, Any]:
         """Recover only the answer descending from this request's own user turn."""
         # Start one finite deadline for the whole exact-conversation recovery.
         # It covers account pacing before GET as well as the socket read; a
         # timeout therefore returns through TextTaskService recovery cleanup
         # instead of extending the durable lease without an HTTP attempt.
-        deadline = time.monotonic() + self.RECOVERY_EXACT_READ_TIMEOUT_SECONDS
+        deadline = current_operation_deadline.get()
         binding = receipt["provider_binding_id"]
         if account_service.get_bound_account_identity(binding) != receipt["provider_account_identity"]:
             raise ConversationBindingError(
@@ -810,7 +813,7 @@ class ConversationBindingService:
                     },
                 ) from exc
             raise
-        with account_service.conversation_binding_lock(binding, receipt["client_conversation_id"]):
+        with bounded_lock(account_service.conversation_binding_lock(binding, receipt["client_conversation_id"])):
             backend = OpenAIBackendAPI(access_token=token)
             try:
                 if not str(receipt.get("conversation_id") or "").strip():
@@ -1441,12 +1444,13 @@ class ConversationBindingService:
             )
         return str(request_node.get("parent") or "").strip()
 
+    @operation_budget(60.0)
     def read_text(self, body: dict[str, Any]) -> dict[str, Any]:
         """Read an already-issued cursor on its bound account; never send a message."""
         # This direct, non-durable GET has the same 60-second budget for
         # queueing and HTTP. Do not leave a read queued after its caller gives
         # up; durable request recovery uses its own persisted scheduling.
-        deadline = time.monotonic() + 60.0
+        deadline = current_operation_deadline.get()
         keys = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
                 "conversation_id", "parent_message_id")
         if any(not isinstance(body.get(key), str) or not body[key].strip() for key in keys):
@@ -1455,7 +1459,7 @@ class ConversationBindingService:
         if account_service.get_bound_account_identity(binding_id) != body["provider_account_identity"]:
             raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
         token = account_service.get_bound_text_access_token(binding_id, model="auto")
-        with account_service.conversation_binding_lock(binding_id, body["client_conversation_id"]):
+        with bounded_lock(account_service.conversation_binding_lock(binding_id, body["client_conversation_id"])):
             backend = OpenAIBackendAPI(access_token=token)
             try:
                 first_error = None

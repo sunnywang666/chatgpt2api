@@ -27,9 +27,37 @@ def _ref(value):
 def normalize_product_work(value):
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {"product_ref", "step_ref"}:
+    if (not isinstance(value, dict) or not {"product_ref", "step_ref"} <= set(value)
+            or set(value) - {"product_ref", "step_ref", "fairness"}):
         raise WorkLifecycleError("PRODUCT_WORK_INVALID", 400)
-    return {k: _ref(value[k]) for k in ("product_ref", "step_ref")}
+    result = {k: _ref(value[k]) for k in ("product_ref", "step_ref")}
+    if "fairness" in value:
+        fair = value["fairness"]
+        keys = {"organization_id", "subject_id", "root_workflow_id"}
+        if (not isinstance(fair, dict) or set(fair) != keys
+                or any(not isinstance(v, str) or not v or len(v) > 200
+                       or any(ord(c) < 33 or ord(c) == 127 for c in v) for v in fair.values())):
+            raise WorkLifecycleError("PRODUCT_WORK_FAIRNESS_INVALID", 400)
+        result["fairness"] = dict(fair)
+    return result
+
+
+def _metadata(parent, step_ref):
+    metadata = {"product_ref": parent["product_ref"], "step_ref": step_ref}
+    if parent.get("fairness") is not None:
+        metadata["fairness"] = parent["fairness"]
+    return metadata
+
+
+def fair_subject(parent):
+    """Use the same org/person lane as company requests, never the service key."""
+    fair = parent.get("fairness")
+    if fair is None:
+        return None
+    normalize_product_work(_metadata(parent, "fairness-validation"))
+    identity = json.dumps([fair["organization_id"], fair["subject_id"]],
+                          separators=(",", ":"), ensure_ascii=True)
+    return "company:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
 def require_product_source(identity):
@@ -54,14 +82,15 @@ def locking_product_conversations(receipts):
     mutex map, with a separate namespace from generation's client cursor locks.
     """
     from services.account_service import account_service
+    from services.request_context import bounded_lock, operation_deadline
     keys = _physical_lock_keys(list(receipts))
-    locks = [account_service.conversation_binding_lock("product-archive:" + account, conversation)
-             for account, conversation in keys]
-    with ExitStack() as stack:
+    with operation_deadline(time.monotonic() + 60.0), ExitStack() as stack:
+        locks = [account_service.conversation_binding_lock("product-archive:" + account, conversation)
+                 for account, conversation in keys]
         seen = set()
         for lock in locks:
             if id(lock) not in seen:
-                stack.enter_context(lock)
+                stack.enter_context(bounded_lock(lock))
                 seen.add(id(lock))
         yield
 
@@ -178,7 +207,7 @@ def _cancelled_unsent_step(store, db, parent, member, receipt, *, allow_historic
             or member.get("request_id") != receipt.get("request_id")
             or receipt.get("_product_work_key") != parent.get("key")
             or _source(receipt) != parent.get("source")
-            or receipt.get("_product_work") != {"product_ref": parent.get("product_ref"), "step_ref": member.get("step_ref")}
+            or receipt.get("_product_work") != _metadata(parent, member.get("step_ref"))
             or receipt.get("status") != "cancelled"
             or receipt.get("error_code") != "PRODUCT_WORK_STEP_CANCELLED"
             or receipt.get("upstream_outcome") != "not_sent"
@@ -398,6 +427,9 @@ def ensure_product_work(store, db, kind, owner, request_id, receipt, product_wor
     source = source or _source(receipt)
     if not source or source != _source(receipt) or kind not in {"text", "image"}:
         raise WorkLifecycleError("PRODUCT_WORK_SOURCE_CONFLICT")
+    if metadata.get("fairness") is not None and source not in {
+            "internal:listing", "internal:content", "internal:wb-to-ozon", "internal:ozon-to-wb"}:
+        raise WorkLifecycleError("PRODUCT_WORK_SOURCE_REQUIRED", 403)
     key = _key(source, owner, metadata["product_ref"])
     if receipt.get("_product_work_key") not in {None, key}:
         raise WorkLifecycleError("PRODUCT_WORK_BINDING_CONFLICT")
@@ -407,6 +439,8 @@ def ensure_product_work(store, db, kind, owner, request_id, receipt, product_wor
     if parent:
         if parent["owner"] != owner or parent["source"] != source:
             raise WorkLifecycleError("PRODUCT_WORK_OWNER_CONFLICT")
+        if parent.get("fairness") != metadata.get("fairness"):
+            raise WorkLifecycleError("PRODUCT_WORK_FAIRNESS_CONFLICT")
         existing = [m for m in parent["members"] if (m["kind"], m["owner"], m["request_id"]) == (kind, owner, request_id)]
         if existing:
             if existing != [member]:
@@ -436,6 +470,8 @@ def ensure_product_work(store, db, kind, owner, request_id, receipt, product_wor
                   "state": "queued", "slot_held": False, "members": [], "archive_keys": [],
                   "results_saved": False, "outcome": None, "cleanup_pending": False,
                   "created_at": time.time()}
+        if metadata.get("fairness") is not None:
+            parent["fairness"] = metadata["fairness"]
     parent["members"].append(member)
     receipt.update(_product_work_key=key, _product_work=metadata)
     _save(store, db, parent)
@@ -634,7 +670,7 @@ def _missing_node_chain(store, db, parent, receipt, members, now):
 
 
 def _no_final_successor_chain(store, db, parent, receipt, members, now):
-    """Return the one terminal successor which resolves a proved no-final chain.
+    """Resolve one saved successor using the exact original recovery proof.
 
     This is deliberately a lifecycle proof, not a call to the send-time
     supersede validator.  Close and archive must re-read the frozen inputs,
@@ -646,9 +682,10 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
 
     successor_id = receipt.get("request_id")
     original_id = receipt.get("_supersedes_request_id")
+    incomplete = receipt.get("_supersedes_incomplete") is True
     if (not isinstance(successor_id, str) or not successor_id
             or not isinstance(original_id, str) or not original_id or successor_id == original_id
-            or receipt.get("_supersedes_no_final") is not True
+            or (receipt.get("_supersedes_no_final") is True) == incomplete
             or receipt.get("status") != "succeeded"
             or receipt.get("upstream_outcome") != "completed"
             or not isinstance(receipt.get("content"), str) or not receipt["content"].strip()
@@ -670,6 +707,8 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
         return None
     ancestors = []
     if original.get("_supersedes_request_id"):
+        if incomplete:
+            return None
         try:
             native_chain = TextTaskService._native_no_final_successor_source(
                 store, db, parent["owner"], original, now,
@@ -679,23 +718,52 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
         if not native_chain:
             return None
         ancestors = [native_chain["original"], native_chain["parent"]]
+    if incomplete:
+        # Child success never terminates the original. Only the original
+        # reader's exact persisted terminal-empty proof can waive UNKNOWN;
+        # a nonempty original success needs no waiver in the first place.
+        ended = original.get("_turn_end_evidence")
+        original_ended = bool(
+            original.get("status") in {"unknown", "failed"}
+            and original.get("error_code") in {"CONVERSATION_OUTCOME_UNKNOWN", "RESULT_UNRECOVERABLE"}
+            and original.get("recovery_reason") == "REQUEST_RESULT_TERMINAL_EMPTY"
+            and original.get("_upstream_terminal") is True
+            and isinstance(ended, dict)
+            and set(ended) == {"conversation_id", "request_message_id", "final_message_id", "observed_at"}
+            and all(isinstance(ended.get(key), str) and ended[key].strip() for key in (
+                "conversation_id", "request_message_id", "final_message_id"))
+            and ended["conversation_id"] == original.get("conversation_id")
+            and ended["request_message_id"] == original.get("request_message_id")
+            and ended["final_message_id"] != ended["request_message_id"]
+            and type(ended.get("observed_at")) in {int, float}
+            and math.isfinite(ended["observed_at"]) and 0 < ended["observed_at"] <= now)
+    else:
+        original_ended = (original.get("status") == "failed"
+                          and original.get("error_code") == "RESULT_UNRECOVERABLE"
+                          and not original.get("_upstream_terminal")
+                          and TextTaskService._no_final_successor_source(original, now))
     if (original.get("request_id") != original_id
-            or original.get("status") != "failed"
-            or original.get("error_code") != "RESULT_UNRECOVERABLE"
+            or not original_ended
             or original.get("upstream_outcome") != "unknown"
             or original.get("_supersedes_no_final") is True
-            or original.get("_upstream_terminal")
             or original.get("upstream_unfinished")
             or any(key in original for key in ("content", "result", "data"))
             or original.get("result_file_ids") or original.get("result_sediment_ids")
-            or not TextTaskService._no_final_successor_source(original, now)
             or original_identity != (original_id, original_row[0])
             or successor_identity != (successor_id, successor_row[0])):
         return None
     controls = ("_executing", "_turn_reserved", "recovery_claim_id", "_recovery_claim_id",
                 "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of")
     chain_members = [*ancestors, original, receipt]
-    if (any(_claims(item) or any(item.get(key) for key in controls) for item in chain_members)
+    def has_claim(item):
+        if incomplete and item is original and item.get("_claim_id"):
+            until = item.get("_claim_until")
+            if (isinstance(item["_claim_id"], str) and type(until) in {int, float}
+                    and math.isfinite(until) and until <= now
+                    and item.get("_executing") is False and item.get("_turn_reserved") is False):
+                return _claims({**item, "_claim_id": None})
+        return _claims(item)
+    if (any(has_claim(item) or any(item.get(key) for key in controls) for item in chain_members)
             or _unresolved(receipt, [row for _, row in members])):
         return None
     keys = ("_product_work_key", "provider_binding_id", "provider_account_identity",
@@ -711,20 +779,24 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
         return None
     if ((original_body.get("supersedes_request_id") and not ancestors)
             or original_body.get("continue_after_no_final") is not None
+            or original_body.get("continue_after_incomplete") is not None
             or original_body.get("derived_input") is not None):
         return None
     audit = receipt.get("_derived_input")
     if audit is not None:
-        if ancestors or not isinstance(audit, dict) or audit.get("kind") != "attributes_required_only_v4":
+        allowed = {"combined_copy_compact_v1"} if incomplete else {
+            "attributes_required_only_v4", "combined_copy_compact_v1"}
+        if ancestors or not isinstance(audit, dict) or audit.get("kind") not in allowed:
             return None
         try:
             expected_body, expected_audit = derive_retained_input(
-                original_body, successor_id, original_id, {"kind": audit["kind"]}, no_final=True)
+                original_body, successor_id, original_id, {"kind": audit["kind"]},
+                no_final=not incomplete, incomplete=incomplete)
         except (ConversationBindingError, ValueError, TypeError, KeyError):
             return None
         if audit != {**expected_audit, "original_input_hash": original_row[0]} or successor_body != expected_body:
             return None
-    elif successor_body != {**original_body, "client_request_id": successor_id,
+    elif incomplete or successor_body != {**original_body, "client_request_id": successor_id,
                             "supersedes_request_id": original_id, "continue_after_no_final": True}:
         return None
     children = db.execute(
@@ -737,6 +809,13 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
     member_ids = {(member["kind"], row.get("request_id") or row.get("id")) for member, row in members}
     if not {("text", item["request_id"]) for item in chain_members} <= member_ids:
         return None
+    member_refs = {member["request_id"]: member for member, _ in members if member["kind"] == "text"}
+    metadata = original_body.get("product_work")
+    if (not isinstance(metadata, dict) or metadata != _metadata(parent, metadata.get("step_ref"))
+            or any(item.get("_product_work") != metadata
+                   or member_refs[item["request_id"]].get("step_ref") != metadata.get("step_ref")
+                   for item in chain_members)):
+        return None
     if ancestors:
         if any(not TextTaskService._supersede_order_link(previous, successor)
                for previous, successor in zip(chain_members, chain_members[1:])):
@@ -746,8 +825,7 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
             member = member_refs.get(item["request_id"])
             if not member:
                 return None
-            metadata = {"product_ref": parent["product_ref"],
-                        "step_ref": member["step_ref"]}
+            metadata = _metadata(parent, member["step_ref"])
             if item.get("_product_work") != metadata or original_body.get("product_work") != metadata:
                 return None
     return {"original": original, "successor": receipt, "resolved": [*ancestors, original]}
@@ -789,9 +867,9 @@ def _codex_rejected_retry_chain(store, db, parent, receipt, members):
             or any(item.get("_product_work_key") != parent["key"] or _source(item) != parent["source"] for item in chain)
             or any(_claims(item) or any(item.get(key) for key in controls)
                    or any(item.get(key) is not None for key in leases) for item in chain)
-            or any(item.get("_product_work") != {"product_ref": parent["product_ref"], "step_ref":
-                                                   next((member["step_ref"] for member, row in members
-                                                         if row.get("request_id") == item.get("request_id")), None)}
+            or any(item.get("_product_work") != _metadata(parent,
+                        next((member["step_ref"] for member, row in members
+                              if row.get("request_id") == item.get("request_id")), None))
                    for item in chain)):
         return None
     try:
@@ -1074,7 +1152,7 @@ class ProductWorkService:
             if not _cancel_unsent_eligible(receipt):
                 raise WorkLifecycleError("PRODUCT_WORK_CANCEL_STEP_NOT_UNSENT")
             if (receipt.get("request_id") != member["request_id"]
-                    or receipt.get("_product_work") != {"product_ref": parent["product_ref"], "step_ref": member["step_ref"]}):
+                    or receipt.get("_product_work") != _metadata(parent, member["step_ref"])):
                 raise WorkLifecycleError("PRODUCT_WORK_CANCEL_STEP_INPUT_INVALID")
             row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
                              (member["owner"], member["request_id"])).fetchone()

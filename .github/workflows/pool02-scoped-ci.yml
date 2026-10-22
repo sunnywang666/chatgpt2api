@@ -12,6 +12,24 @@ on:
       - .github/workflows/company-queue-fallback.yml
       - .github/workflows/docker-publish.yml
       - tools/ci/provider-company-queue-fallback.sh
+      - api/product_works.py
+      - services/account_request_pacing.py
+      - services/account_service.py
+      - services/admission_planner.py
+      - services/image_task_service.py
+      - services/request_context.py
+      - services/work_lifecycle.py
+      - test/test_original_operation_budget.py
+      - test/test_product_compact_successor.py
+      - test/test_product_fairness.py
+      - test/test_product_work_api.py
+      - test/test_product_work_admission.py
+      - test/test_admission_planner.py
+      - test/test_bound_text_archive.py
+      - test/test_work_lifecycle.py
+      - test/test_no_final_successor.py
+      - test/test_combined_copy_derivation.py
+      - test/test_account_request_pacing.py
       - services/conversation_binding_service.py
       - services/pool_admission.py
       - services/product_work.py
@@ -27,6 +45,7 @@ on:
       - test/test_workflow_scheduling.py
       - test/test_background_original_reads.py
       - test/test_pool_admission.py
+      - test/test_stalled_text_diagnostics.py
       - test/test_image_metadata_refresh_liveness.py
       - test/test_product_work.py
       - test/test_rejected_chat_successor.py
@@ -95,6 +114,18 @@ jobs:
           .venv/bin/python -m compileall -q api services utils test
           .venv/bin/python -m pytest -q \
             test/test_pool_admission.py \
+            test/test_stalled_text_diagnostics.py \
+            test/test_original_operation_budget.py \
+            test/test_product_compact_successor.py \
+            test/test_product_fairness.py \
+            test/test_product_work_api.py \
+            test/test_product_work_admission.py \
+            test/test_admission_planner.py \
+            test/test_bound_text_archive.py \
+            test/test_work_lifecycle.py \
+            test/test_no_final_successor.py \
+            test/test_combined_copy_derivation.py \
+            test/test_account_request_pacing.py \
             test/test_image_metadata_refresh_liveness.py \
             test/test_product_work.py \
             test/test_rejected_chat_successor.py \

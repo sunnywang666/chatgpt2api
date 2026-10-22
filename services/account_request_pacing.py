@@ -595,6 +595,16 @@ class AccountRequestClock:
                 response = send(send_method, send_url, **send_kwargs)
                 return response
             except Exception as exc:
+                # This bit is intentionally transient: a direct original-result
+                # reader may release only after this actual conversation GET
+                # entered transport. Pacer/credential/deadline errors happen
+                # before observed_send and therefore never receive it. Candidate
+                # scans are still rejected later by their candidate evidence.
+                if is_conversation_read:
+                    try:
+                        exc._original_result_get_attempted = True
+                    except Exception:
+                        pass
                 # Exception messages/URLs may contain credentials. Retain only
                 # known class names and a numeric transport code for diagnosis.
                 names = {"TimeoutError", "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",

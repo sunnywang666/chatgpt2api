@@ -19,7 +19,7 @@ import uuid
 
 from services.admission_planner import (Need, Resource, Offer, OfferDiagnostic,
                                         RequestRef, WaitingRequest, Snapshot,
-                                        choose_next, fairness_lane)
+                                        choose_next, fairness_lane, fairness_subgroup_key)
 from services.request_context import AdmissionLost, executing, safe_account_ref
 from services.task_store import TaskStore, pending_image_result_ids
 from services import workflow_scheduling, product_work
@@ -946,8 +946,9 @@ class PoolAdmission:
         # scan must not monopolize recovery ahead of other overdue originals.
         # Missing/zero retry times are immediately due. Image created_at is a
         # formatted string, so it must not enter this numeric retry ordering.
-        rows.sort(key=lambda row: float(row[3].get("recovery_next_at" if row[0] == "text" else "next_poll_at")
-                                        or 0))
+        from services.text_task_service import TextTaskService
+        rows.sort(key=lambda row: float((TextTaskService._recovery_due_at(row[3])
+                                        if row[0] == "text" else row[3].get("next_poll_at")) or 0))
         if background:
             # The receipt-owning reader renews this durable lease while its
             # exact original GET is in flight.  Do not spend a dispatcher turn
@@ -989,7 +990,10 @@ class PoolAdmission:
                               and math.isfinite(receipt["_execution_wait_ended_at"]))
                 released = (receipt.get("_turn_reserved") is False
                             and TextTaskService._verified_retryable_empty(receipt))
-                stalled = TextTaskService._qualified_stalled_incomplete_capacity_boundary(receipt, now)
+                stalled = (
+                    TextTaskService._qualified_stalled_incomplete_capacity_boundary(receipt, now)
+                    or TextTaskService._bounded_unreadable_result_capacity_boundary(receipt, now)
+                )
                 return 0 if (active and (owner, request_id) not in transferred_empty_turns
                              and not original_turn_ended(kind, receipt)
                              and not wait_ended and not released and not stalled) else 1
@@ -1041,7 +1045,9 @@ class PoolAdmission:
                 if not chat_recovery_supported(r):
                     continue
             if kind == "text":
-                due = unknown_text_result(r) and r.get("provider_binding_id") and float(r.get("recovery_next_at") or 0) <= now
+                from services.text_task_service import TextTaskService
+                due = (unknown_text_result(r) and r.get("provider_binding_id")
+                       and TextTaskService._recovery_due(r, now))
             else:
                 due = image_original_recovery_pending(r) and float(r.get("next_poll_at") or 0) <= now
             if due:
@@ -1417,7 +1423,10 @@ class PoolAdmission:
             # consuming this account's local execution slot while no worker or
             # recovery lease is active.
             stalled_local_capacity_released = (kind == "text"
-                                               and TextTaskService._qualified_stalled_incomplete_capacity_boundary(r, now))
+                                               and (
+                                                   TextTaskService._qualified_stalled_incomplete_capacity_boundary(r, now)
+                                                   or TextTaskService._bounded_unreadable_result_capacity_boundary(r, now)
+                                               ))
             turn_active = (active and not original_turn_ended(kind, r) and not wait_ended and not empty_local_released
                            and not stalled_local_capacity_released
                            and (owner, request_id) not in transferred_empty_turns)
@@ -1468,6 +1477,8 @@ class PoolAdmission:
             thread_resources.extend(scheduling_resources)
             product_needs = ()
             product_fair_group = None
+            product_fair_source = None
+            product_fair_root = None
             product_key = r.get("_product_work_key")
             if "_product_work_key" in r:
                 parent = product_works.get(product_key)
@@ -1475,7 +1486,14 @@ class PoolAdmission:
                 valid_parent = (isinstance(product_key, str) and isinstance(parent, dict)
                                 and parent.get("key") == product_key
                                 and parent.get("owner") == owner
-                                and parent.get("source") == source)
+                                and parent.get("source") == source
+                                and (r.get("_product_work") or {}).get("fairness") == parent.get("fairness"))
+                if valid_parent and parent.get("fairness") is not None:
+                    try:
+                        product_fair_source = product_work.fair_subject(parent)
+                        product_fair_root = parent["fairness"]["root_workflow_id"]
+                    except (product_work.WorkLifecycleError, KeyError, TypeError):
+                        valid_parent = False
                 if valid_parent and parent.get("state") == "active" and parent.get("slot_held") is True:
                     product_fair_group = "product-continuation"
                 elif valid_parent and parent.get("state") == "queued" and parent.get("slot_held") is False:
@@ -1527,8 +1545,11 @@ class PoolAdmission:
             # workflow-only traffic retains its established fair group.
             if product_fair_group is not None and (kind == "image" or r.get("_operation") == "image"):
                 fair_group = product_fair_group + ":image"
+            fair_subgroup = fair_group if product_fair_source is not None else None
+            if product_fair_source is not None:
+                fair_group = product_fair_root
             requests.append(WaitingRequest(
-                RequestRef(owner, kind, request_id), r.get("_source") or "key:" + owner,
+                RequestRef(owner, kind, request_id), product_fair_source or r.get("_source") or "key:" + owner,
                 continuation_sequences.get((owner, request_id), int(r.get("_sequence") or 0)),
                 route, str(r.get("model") or "auto"),
                 "image" if kind == "image" else r.get("_operation", "text"),
@@ -1541,6 +1562,7 @@ class PoolAdmission:
                 # this workflow ID to that source, so workflows cannot gain a
                 # second top-level caller turn by using multiple key owners.
                 fair_group=fair_group,
+                fair_subgroup=fair_subgroup,
                 ready_at=max(float(r.get("_ready_at") or 0), scheduling_ready),
                 needs=thread_needs + physical_needs + product_needs + tuple(scheduling_needs) + (Need("execution_input_bytes", max(1, int(r.get("_input_bytes") or 1))),)
                       + ((Need("chat_executor"),) if kind == "text" and route == "chat" and r.get("_operation") != "image" else ())
@@ -1694,12 +1716,17 @@ class PoolAdmission:
         groups = cursor.get("groups") or {}
         if not isinstance(groups, dict):
             groups = {}
+        subgroups = cursor.get("subgroups") or {}
+        if not isinstance(subgroups, dict):
+            subgroups = {}
         return Snapshot(uuid.uuid4().hex, now, now + 1, tuple(resources.values()), tuple(unique.values()), tuple(requests),
                         last_source=cursor.get("source"), last_account=cursor.get("account"),
                         last_owner_by_source=tuple((cursor.get("owners") or {}).items()),
                         last_group_by_source=tuple((source, group) for source, group in groups.items()
                                                    if isinstance(source, str) and isinstance(group, str)),
-                        scoped_extra_turn=scoped_extra_turn)
+                        scoped_extra_turn=scoped_extra_turn,
+                        last_subgroup_by_group=tuple((key, value) for key, value in subgroups.items()
+                                                    if isinstance(key, str) and isinstance(value, str)))
 
     def _recover_claims(self, db, receipts, now):
         from services.text_task_service import TextTaskService
@@ -2288,8 +2315,15 @@ class PoolAdmission:
                       if any(request.source == source and request.state == "queued" for request in snapshot.requests)}
             selected_group = next((request.fair_group for request in snapshot.requests if request.ref == ref), None)
             groups[pick.source] = fairness_lane(selected_group)
+            active_subgroups = {fairness_subgroup_key(request.source, request.fair_group)
+                                for request in snapshot.requests if request.state == "queued"
+                                and request.fair_subgroup is not None}
+            subgroups = {key: value for key, value in snapshot.last_subgroup_by_group if key in active_subgroups}
+            selected = next(request for request in snapshot.requests if request.ref == ref)
+            if selected.fair_subgroup is not None:
+                subgroups[fairness_subgroup_key(pick.source, selected_group)] = fairness_lane(selected.fair_subgroup)
             self.store.set_runtime(db, "fairness", {"source": pick.source, "account": pick.account,
-                                                      "owners": owners, "groups": groups})
+                                                      "owners": owners, "groups": groups, "subgroups": subgroups})
             return ExecutionContext(self, ref.kind, ref.owner, ref.request_id, claim)
 
     def update_claim(self, context, **changes):
@@ -2410,12 +2444,14 @@ class PoolAdmission:
                             and r.get("status") == "running"):
                         now = float(self.clock())
                         reasons = {"SCHEDULING_NOT_BEFORE": "not_before", "SCHEDULING_SEND_INTERVAL": "send_interval",
-                                   "WORK_NOT_ACTIVE": "work_not_active"}
+                                   "WORK_NOT_ACTIVE": "work_not_active",
+                                   "original Chat account capacity changed before send": "chat_capacity_changed"}
                         reason = reasons.get(str(exc), "send_constraints_changed")
                         from services.generation_completion import replacement_send_allowed
                         cancelled = not replacement_send_allowed(self.store, db, context.kind, context.owner, context.request_id, r)
                         diagnostic = {"original task claim expired": "claim_expired",
                                       "original image capacity decreased before send": "image_capacity_changed",
+                                      "original Chat account capacity changed before send": "chat_capacity_changed",
                                       "original account is unavailable before send": "account_unavailable",
                                       "original image capability is unavailable before send": "image_capability_unavailable",
                                       "original image binding changed before send": "image_binding_changed",
@@ -2652,12 +2688,14 @@ class PoolAdmission:
                 if any(isinstance(limit, dict) and limit.get("feature_name") == execution_model and limit.get("remaining") == 0
                        for limit in selected.get("limits_progress") or []):
                     raise AdmissionLost("original model quota is unavailable before send")
-            if (context.kind == "text" and r.get("_operation", "text") != "image"
-                    and r.get("_route", "chat") == "chat"):
+            if r.get("_route", "chat") == "chat":
                 # A claimed independent request can wait while a stalled
                 # original's next exact-ID read makes verified progress. Reuse
                 # the normal snapshot inside this send transaction so that
-                # progress re-holds its account slot before this request posts.
+                # progress re-holds its account slot before either a Chat text
+                # or Chat image request posts. Image-specific capacity remains
+                # checked independently above; this is the shared account-turn
+                # fence only.
                 # Do not decode completed image payloads merely to recheck a
                 # Chat turn. The status/unfinished filter is the scheduler's
                 # existing active-occupancy set; completed text continuations

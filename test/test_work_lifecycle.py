@@ -115,7 +115,8 @@ def test_background_archive_does_not_occupy_original_result_recovery(runtime):
         calls.append(rid)
         return {"request_id": rid, "archived": desired, "conversation": {"client_conversation_id": "A"}}
     service.text.set_public_session_archived = archive
-    admission = SimpleNamespace(store=store, clock=lambda: now[0], recoveries={}, work_lifecycle=service)
+    admission = SimpleNamespace(store=store, clock=lambda: now[0], recoveries={}, work_lifecycle=service,
+                                _empty_turn_transfers=PoolAdmission._empty_turn_transfers)
     try:
         PoolAdmission.recover_one(admission)
         assert entered.wait(1) and not finished.is_set()

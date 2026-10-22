@@ -17,6 +17,7 @@ from services.public_chat_service import project_public_chat_receipt
 from services.request_context import AdmissionLost
 from services.text_task_service import TextTaskService
 from test.test_expired_execution_wait import saved, patch, waiter
+from test.test_pool_admission import build
 from test.test_unknown_turn_recovery import document, migration
 
 
@@ -31,8 +32,8 @@ def test_explicit_recovery_reports_real_sqlite_writer_contention_without_claim(t
     service.recovery_reader = reader
     connect = service.store._connect
 
-    def short_busy_timeout():
-        db = connect()
+    def short_busy_timeout(**kwargs):
+        db = connect(**kwargs)
         db.execute("PRAGMA busy_timeout=10")
         return db
 
@@ -884,6 +885,8 @@ def test_unqualified_reads_cannot_count_or_finish_stagnant_wait(tmp_path, failur
     service.recovery_reader = read
     service.read("owner", "old-0")
     row = saved(service)
+    # An unverified status/branch shape is not original progress. It must not
+    # clear or restart the established observation baseline.
     for key in ("_result_last_checked_at", "_result_last_progress_at", "_result_no_progress_reads"):
         assert row[key] == original[key]
     assert "_result_wait_ended_at" not in row
@@ -1132,3 +1135,206 @@ def test_read_failure_does_not_restore_missing_stalled_reason_or_release_capacit
     assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(after, admission.clock.now)
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
     assert backend.mock_calls == []
+
+
+def test_completed_exact_read_failure_releases_only_local_capacity_and_preserves_recovery(tmp_path):
+    service, admission, backend, legacy = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+
+    # Establish a real original observation first. Its age is reused below;
+    # the later GET failure does not restart this clock.
+    service.recovery_reader = incomplete_reader(backend)
+    assert service.read("owner", "old-0")["status"] == "unknown"
+    observed = saved(service)
+    first_observation_at = observed["_result_observation_started_at"]
+    admission.clock.now += TextTaskService.RECOVERY_LEASE_SECONDS + 1
+    patch(service, recovery_attempt=9)
+
+    def unavailable(row):
+        assert row["recovery_claim_id"]
+        error = ConnectionError("synthetic original GET unavailable")
+        error._original_result_get_attempted = True
+        raise error
+
+    service.recovery_reader = unavailable
+    assert service.read("owner", "old-0")["status"] == "unknown"
+    row = saved(service)
+    # A high attempt no longer stretches normal sent-Chat original-result
+    # recovery past five minutes. The completed exact GET error also releases
+    # only local capacity immediately.
+    assert row["recovery_attempt"] == 10
+    assert row["recovery_next_at"] == admission.clock.now + 300
+    # A persisted pre-fix +900 schedule for this same original GET becomes
+    # due at five minutes from its completed read; explicit Retry-After and
+    # unsent work keep their existing schedules.
+    legacy_due = {**row, "recovery_next_at": admission.clock.now + 900,
+                  "updated_at": admission.clock.now,
+                  "recovery_retry_after_seconds": None}
+    assert not TextTaskService._recovery_due(legacy_due, admission.clock.now + 299)
+    assert TextTaskService._recovery_due(legacy_due, admission.clock.now + 300)
+    from services.public_chat_service import project_public_chat_receipt
+    public = service._public(legacy_due)
+    assert public["recovery_next_at"] == admission.clock.now + 300
+    assert project_public_chat_receipt(public)["recovery"]["next_at"] == admission.clock.now + 300
+    assert legacy_due["recovery_next_at"] == admission.clock.now + 900
+    legacy_no_outcome = dict(legacy_due)
+    legacy_no_outcome.pop("upstream_outcome", None)
+    assert TextTaskService._recovery_due(legacy_no_outcome, admission.clock.now + 300)
+    retry_after_due = {**legacy_due, "recovery_retry_after_seconds": 900}
+    assert not TextTaskService._recovery_due(retry_after_due, admission.clock.now + 300)
+    assert service._public(retry_after_due)["recovery_next_at"] == admission.clock.now + 900
+    unsent_due = {**legacy_due, "_submission_started": False}
+    assert not TextTaskService._recovery_due(unsent_due, admission.clock.now + 300)
+    assert service._public(unsent_due)["recovery_next_at"] == admission.clock.now + 900
+    assert row["_result_read_capacity_released_at"] == admission.clock.now
+    assert row["_result_observation_started_at"] == first_observation_at
+    assert TextTaskService._bounded_unreadable_result_capacity_boundary(row, admission.clock.now)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert not TextTaskService._no_final_successor_source(row, admission.clock.now)
+    assert not TextTaskService._incomplete_compact_successor_source(row, admission.clock.now)
+
+    # The marker survives a SQLite restart, does not end the original turn,
+    # and only frees a different physical chat/account for normal claiming.
+    _, _, restarted_admission = build(tmp_path, admission.clock)
+    restarted = TextTaskService(service.path, admission=restarted_admission, clock=admission.clock)
+    assert restarted_admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    waiter(restarted, "same-conversation-next", "client-0")
+    waiter(restarted, "independent-next", "independent")
+    restarted.submit("owner", {
+        "client_request_id": "other-account-next", "client_conversation_id": "other-account-session",
+        "provider_binding_id": "binding-1", "provider_account_identity": "account-1",
+        "model": "fixture-text", "messages": [{"role": "user", "content": "other account work"}],
+    })
+    context = restarted_admission.claim_next()
+    assert context and context.request_id == "independent-next"
+    other_context = restarted_admission.claim_next()
+    assert other_context and other_context.request_id == "other-account-next"
+    # The claim assertions above exercise unrelated scheduling. Retire those
+    # synthetic holders before checking the original marker by itself.
+    with restarted.store.transaction() as db:
+        for request_id in ("independent-next", "other-account-next"):
+            holder = restarted.store.read_receipt(db, "text", "owner", request_id)
+            holder.update(status="succeeded", upstream_outcome="completed",
+                          _attempt_finished_at=admission.clock.now, _executing=False,
+                          _turn_reserved=False, _claim_id=None, _claim_until=None)
+            restarted.store.write_receipt(db, "text", "owner", request_id, holder)
+    for key in ("request_id", "request_message_id", "provider_binding_id",
+                "provider_account_identity", "client_conversation_id", "conversation_id"):
+        assert row[key] == legacy[0][key]
+    assert row["_turn_reserved"] is False
+    assert row.get("_attempt_finished_at") is None
+
+    # A status-only running result is not verifiable branch progress. It keeps
+    # the old observation and local release marker; it never restarts the
+    # five-minute result-read cadence or the existing progress clock.
+    def active_without_observation(original):
+        doc = document(original)
+        del doc["mapping"][original["request_message_id"]]
+        active = doc["mapping"][doc["current_node"]]["message"]
+        active.update(status="in_progress", end_turn=None)
+        return ConversationBindingService._read_text_request_result(backend, original, document=doc)
+
+    restarted.recovery_reader = active_without_observation
+    admission.clock.now = row["recovery_next_at"] + 1
+    assert restarted.read("owner", "old-0")["status"] == "unknown"
+    after_running = saved(restarted)
+    assert after_running["_result_read_capacity_released_at"] == row["_result_read_capacity_released_at"]
+    assert after_running["_result_observation_started_at"] == first_observation_at
+    assert TextTaskService._bounded_unreadable_result_capacity_boundary(after_running, admission.clock.now)
+    assert restarted_admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+
+    # A later typed GET failure also preserves the original marker and
+    # progress clock. It cannot manufacture a new 60-second hold or push the
+    # normal result-read cadence back to the old 900-second cap.
+    restarted.recovery_reader = unavailable
+    admission.clock.now = after_running["recovery_next_at"] + 1
+    assert restarted.read("owner", "old-0")["status"] == "unknown"
+    after_repeat_failure = saved(restarted)
+    assert after_repeat_failure["_result_read_capacity_released_at"] == row["_result_read_capacity_released_at"]
+    assert after_repeat_failure["_result_observation_started_at"] == first_observation_at
+    assert after_repeat_failure["recovery_next_at"] == admission.clock.now + 300
+    assert TextTaskService._bounded_unreadable_result_capacity_boundary(after_repeat_failure, admission.clock.now)
+    assert restarted_admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+
+    # A changed, identity-safe original observation is real progress. It takes
+    # the account slot back and clears only this local marker.
+    restarted.recovery_reader = incomplete_reader(
+        backend, lambda _doc, message: message["content"].update(parts=["new verified text"]),
+    )
+    admission.clock.now = after_repeat_failure["recovery_next_at"] + 1
+    assert restarted.read("owner", "old-0")["status"] == "unknown"
+    progressed = saved(restarted)
+    assert "_result_read_capacity_released_at" not in progressed
+    assert progressed["_result_last_progress_at"] == admission.clock.now
+    assert not TextTaskService._bounded_unreadable_result_capacity_boundary(progressed, admission.clock.now)
+    assert restarted_admission.resource_snapshot()["chat_turn"]["inflight"] >= 1
+
+    # An exact late success remains admissible under the original identity and
+    # never schedules a new POST.
+    def complete(original):
+        doc = document(original)
+        doc["mapping"]["final-user-0"]["message"]["content"]["parts"] = ["late original result"]
+        return ConversationBindingService._read_text_request_result(backend, original, document=doc)
+
+    restarted.recovery_reader = complete
+    admission.clock.now = progressed["recovery_next_at"] + 1
+    result = restarted.read("owner", "old-0")
+    assert result["status"] == "succeeded"
+    assert result["content"] == "late original result"
+    after = saved(restarted)
+    before_stale_failure = copy.deepcopy(after)
+    restarted._finish_recovery(
+        "owner", "old-0", "obsolete-reader", error_code="RECOVERY_TRANSPORT_FAILED",
+        read_error={"phase": "conversation_detail", "category": "transport",
+                    "http_status": None, "retry_after_seconds": None, "candidate_ref": None},
+    )
+    assert saved(restarted) == before_stale_failure
+    assert backend.mock_calls == []
+
+
+def test_capacity_marker_rejects_preflight_and_unknown_leases(tmp_path):
+    service, admission, _backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    before = saved(service)
+    # A credential/local preparation failure has no proved GET and must not
+    # create the release marker, even though it is a typed auth recovery error.
+    claim = "current-reader"
+    patch(service, recovery_claim_id=claim, recovery_claimed_at=admission.clock.now,
+          recovery_lease_until=admission.clock.now + 60)
+    service._finish_recovery(
+        "owner", "old-0", claim, error_code="RECOVERY_AUTH_REQUIRED",
+        recovery_reason=None,
+        read_error={"phase": "conversation_detail", "category": "other",
+                    "http_status": None, "retry_after_seconds": None, "candidate_ref": None},
+    )
+    assert "_result_read_capacity_released_at" not in saved(service)
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+
+    # Begin from a genuine completed exact GET failure, then prove that sender
+    # claims and unknown/non-reader recovery leases cannot borrow its release.
+    patch(service, recovery_claim_id="exact", recovery_claimed_at=admission.clock.now,
+          recovery_lease_until=admission.clock.now + 60)
+    service._finish_recovery(
+        "owner", "old-0", "exact", error_code="RECOVERY_TRANSPORT_FAILED",
+        recovery_reason=None,
+        original_result_get_attempted=True,
+        read_error={"phase": "conversation_detail", "category": "transport",
+                    "http_status": None, "retry_after_seconds": None, "candidate_ref": None},
+    )
+    released = saved(service)
+    assert TextTaskService._bounded_unreadable_result_capacity_boundary(released, admission.clock.now)
+    unsafe = (
+        {"_executing": True},
+        {"_claim_id": "live-sender", "_claim_until": admission.clock.now + 1},
+        {"_claim_id": "malformed-sender", "_claim_until": None},
+        {"recovery_claim_id": "foreign", "recovery_claimed_at": admission.clock.now,
+         "recovery_lease_until": admission.clock.now + 1, "recovery_phase": "send_text"},
+        {"_missing_successor_resume": {"state": "recovered"}},
+    )
+    for changes in unsafe:
+        assert not TextTaskService._bounded_unreadable_result_capacity_boundary(
+            {**released, **changes}, admission.clock.now)
+    exact_lease = {**released, "recovery_claim_id": "reader", "recovery_claimed_at": admission.clock.now,
+                   "recovery_lease_until": admission.clock.now + 60, "recovery_phase": "read_text_request"}
+    assert TextTaskService._bounded_unreadable_result_capacity_boundary(exact_lease, admission.clock.now)
+    assert before["request_message_id"] == released["request_message_id"]

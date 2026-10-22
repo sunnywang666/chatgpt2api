@@ -428,11 +428,15 @@ def test_adoption_waits_for_archive_binding_lock_then_fresh_reads(runtime, monke
     lock = account_service.conversation_binding_lock("product-archive:account", "legacy")
     acquiring = threading.Event()
     class ObservedLock:
-        def __enter__(self):
+        def acquire(self, *args, **kwargs):
             acquiring.set()
-            lock.acquire()
-        def __exit__(self, *exc):
+            return lock.acquire(*args, **kwargs)
+        def release(self):
             lock.release()
+        def __enter__(self):
+            self.acquire()
+        def __exit__(self, *exc):
+            self.release()
     monkeypatch.setattr(account_service, "conversation_binding_lock", lambda binding, client: ObservedLock())
     lock.acquire()  # An existing raw archive owns this across PATCH and readback.
     with ThreadPoolExecutor(max_workers=1) as workers:

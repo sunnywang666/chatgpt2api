@@ -27,7 +27,7 @@ def no_final(h):
 
 
 @pytest.fixture
-def product_no_final(tmp_path):
+def product_no_final(tmp_path, request):
     (tmp_path / "accounts.json").write_text(json.dumps([{"access_token": "fixture",
         "account_id": "physical", "provider_account_identity": "original-account",
         "conversation_binding_ids": ["original-binding"], "type": "Plus", "status": "正常",
@@ -42,6 +42,8 @@ def product_no_final(tmp_path):
     service = TextTaskService(store.path, runner=runner, clock=clock, admission=admission)
     admission.register("text", lambda ctx, body: service._run(ctx.owner, ctx.request_id, body))
     metadata = {"product_ref": "fixture-product", "step_ref": "title"}
+    if getattr(request, "param", None) is not None:
+        metadata["fairness"] = deepcopy(request.param)
     body = {"client_request_id": "old", "client_conversation_id": "product-session",
         "provider_binding_id": "original-binding", "provider_account_identity": "original-account",
         "conversation_id": "original-chat", "parent_message_id": "previous-answer", "model": "fixture-text",

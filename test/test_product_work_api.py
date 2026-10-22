@@ -18,6 +18,8 @@ from services.work_lifecycle import WorkLifecycleError
 
 IDENTITY = {"id": "owner", "role": "admin", "_trusted_source": "internal:wb-to-ozon"}
 META = {"product_ref": "org/batch/product/rev1", "step_ref": "title"}
+FAIR_META = {**META, "fairness": {"organization_id": "company", "subject_id": "alice",
+                              "root_workflow_id": "root-a"}}
 
 
 @pytest.fixture
@@ -187,10 +189,11 @@ def test_cancel_step_route_rejects_unauthorized_or_expanded_scope_without_mutati
     text.runner.assert_not_called(); images.generation_handler.assert_not_called()
 
 
-def test_cancel_step_route_returns_same_verified_proof_as_original_read(services, monkeypatch):
+@pytest.mark.parametrize("metadata", [META, FAIR_META])
+def test_cancel_step_route_returns_same_verified_proof_as_original_read(services, monkeypatch, metadata):
     text, images, service = services
-    text.submit("owner", text_body(), source=IDENTITY["_trusted_source"])
-    text.submit("owner", text_body("text-2", {**META, "step_ref": "another-step"}),
+    text.submit("owner", text_body(metadata=metadata), source=IDENTITY["_trusted_source"])
+    text.submit("owner", text_body("text-2", {**metadata, "step_ref": "another-step"}),
                 source=IDENTITY["_trusted_source"])
     monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
     monkeypatch.setattr(product_works, "get_product_work_service", lambda: service)
@@ -215,9 +218,10 @@ def test_cancel_step_route_returns_same_verified_proof_as_original_read(services
     text.runner.assert_not_called(); images.generation_handler.assert_not_called()
 
 
-def test_resume_route_requires_source_and_version_and_fences_close(services, monkeypatch):
+@pytest.mark.parametrize("metadata", [META, FAIR_META])
+def test_resume_route_requires_source_and_version_and_fences_close(services, monkeypatch, metadata):
     text, images, service = services
-    text.submit("owner", text_body(), source=IDENTITY["_trusted_source"])
+    text.submit("owner", text_body(metadata=metadata), source=IDENTITY["_trusted_source"])
     # API transport checks use a completed no-conversation parent; actual
     # archive proof/cursors and concurrency are exercised by service tests.
     monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
@@ -276,7 +280,8 @@ def test_adoption_keeps_successful_original_hash_input_and_generation_count(serv
     text.runner.assert_not_called()
 
 
-def test_actual_submission_routes_share_parent_and_project_metadata(services, monkeypatch):
+@pytest.mark.parametrize("metadata", [META, FAIR_META])
+def test_actual_submission_routes_share_parent_and_project_metadata(services, monkeypatch, metadata):
     text, images, product = services
     monkeypatch.setattr(ai, "require_identity", lambda *a, **k: IDENTITY)
     monkeypatch.setattr(image_tasks, "require_identity", lambda *a, **k: IDENTITY)
@@ -289,15 +294,27 @@ def test_actual_submission_routes_share_parent_and_project_metadata(services, mo
     app = FastAPI(); app.include_router(ai.create_router()); app.include_router(image_tasks.create_router())
     client = TestClient(app)
     headers = {"x-workbench-consumer": "wb-to-ozon"}
-    response = client.post("/api/conversation-bindings/text", headers=headers, json=text_body())
+    response = client.post("/api/conversation-bindings/text", headers=headers, json=text_body(metadata=metadata))
     assert response.status_code == 200, response.text
     image = client.post("/api/image-tasks/generations", headers=headers,
-        json={"client_task_id": "image-route", "prompt": "main image", "product_work": {**META, "step_ref": "image"}})
+        json={"client_task_id": "image-route", "prompt": "main image", "product_work": {**metadata, "step_ref": "image"}})
     assert image.status_code == 200, image.text
     assert image.json()["product_work"]["product_ref"] == META["product_ref"]
     assert len(product.get(IDENTITY, META["product_ref"])["members"]) == 2
-    wrong_source = client.post("/api/conversation-bindings/text", headers={"x-workbench-consumer": "content"}, json=text_body())
+    wrong_source = client.post("/api/conversation-bindings/text", headers={"x-workbench-consumer": "content"}, json=text_body(metadata=metadata))
     assert wrong_source.status_code == 403, wrong_source.text
+    monkeypatch.setattr(ai, "require_identity", lambda *a, **k: {**IDENTITY, "role": "user"})
+    monkeypatch.setattr(image_tasks, "require_identity", lambda *a, **k: {**IDENTITY, "role": "user"})
+    rejected = client.post("/api/conversation-bindings/text", headers=headers,
+                           json=text_body("forged", metadata))
+    assert rejected.status_code == 501
+    assert rejected.json()["detail"]["code"] == "SERVICE_OPERATION_UNAVAILABLE"
+    assert client.post("/api/image-tasks/generations", headers=headers, json={
+        "client_task_id": "forged-image", "prompt": "p", "product_work": metadata}).status_code == 403
+    with text.store.connect() as db:
+        rows = list(text.store.receipts(db))
+    assert len(rows) == 2
+    assert all(row[3]["_product_work"].get("fairness") == metadata.get("fairness") for row in rows)
     text.runner.assert_not_called(); images.generation_handler.assert_not_called()
 
 
@@ -392,14 +409,20 @@ def test_first_bound_product_waits_for_raw_archive_even_with_another_client_alia
     attempts = []
 
     class ObservedLock:
-        def __enter__(self):
+        def acquire(self, *args, **kwargs):
             attempts.append(1)
             if len(attempts) > 1:
                 attachment_waiting.set()
-            physical_lock.acquire()
+            return physical_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            physical_lock.release()
+
+        def __enter__(self):
+            self.acquire()
 
         def __exit__(self, *args):
-            physical_lock.release()
+            self.release()
 
     def canonical_lock(binding, conversation):
         assert (binding, conversation) == ("product-archive:account", "original-chat")

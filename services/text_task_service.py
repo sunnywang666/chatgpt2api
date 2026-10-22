@@ -222,6 +222,14 @@ class TextTaskService:
         TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
         TextRecoveryReason.REQUEST_CONVERSATION_UNATTRIBUTABLE.value,
     })
+    # These are completed, redacted original-result reads which could not
+    # inspect the original at all. They are deliberately separate from a
+    # qualified no-result observation: an unavailable GET never proves that
+    # the upstream turn stopped or that a successor may be sent.
+    _BOUNDED_RESULT_READ_FAILURE_CODES = frozenset({
+        "RECOVERY_TRANSPORT_FAILED", "RECOVERY_RATE_LIMITED",
+        "RECOVERY_AUTH_REQUIRED", "RECOVERY_READ_FAILED",
+    })
     _RECONCILED_QUEUED_SUCCESSOR = "_reconciled_queued_successor"
     _RECONCILE_LINK_FIELDS = (
         "_supersedes_request_id", "_previous_request_id", "_completion_of",
@@ -392,6 +400,10 @@ class TextTaskService:
         from services.public_chat_service import project_text_execution
         from utils.upstream_error import safe_upstream_error
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
+        if "recovery_next_at" in result:
+            # The caller must see the same effective cadence as the dispatcher,
+            # including legacy schedules. Preserve the original durable row.
+            result["recovery_next_at"] = TextTaskService._recovery_due_at(receipt)
         # A cancellation proof is always recomputed from the request hash and
         # durable ProductWork parent below. Never echo a persisted projection.
         result.pop("cancelled_unsent", None)
@@ -641,12 +653,49 @@ class TextTaskService:
         )
 
     @classmethod
+    def _normal_sent_chat_result_recovery(cls, receipt):
+        """Whether this is the original sent Chat-result read cadence."""
+        return bool(
+            receipt.get("_route", "chat") == "chat"
+            and receipt.get("_operation", "text") == "text"
+            and receipt.get("_submission_started") is True
+            and receipt.get("_attempt_finished_at") is None
+            and not receipt.get("_forward_protocol")
+            and "_missing_successor_resume" not in receipt
+            and receipt.get("status") == "unknown"
+            and (receipt.get("upstream_outcome") == "unknown"
+                 or (receipt.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+                     and ("upstream_outcome" not in receipt
+                          or receipt.get("upstream_outcome") == "not_sent")))
+        )
+
+    @classmethod
+    def _recovery_due_at(cls, receipt):
+        next_at = receipt.get("recovery_next_at")
+        if next_at is None:
+            return None
+        if type(next_at) not in (int, float) or not math.isfinite(next_at):
+            return next_at
+        # Old high-attempt receipts may already hold a +900 second schedule.
+        # Their saved update time is the completed read outcome; reuse it to
+        # cap only the same sent-Chat original-result cadence at five minutes.
+        # Explicit upstream Retry-After and all non-normal recovery modes keep
+        # their existing durable schedule.
+        if (cls._normal_sent_chat_result_recovery(receipt)
+                and receipt.get("recovery_retry_after_seconds") is None):
+            updated = receipt.get("updated_at")
+            if (type(updated) in (int, float) and math.isfinite(updated)
+                    and 0 < updated <= next_at):
+                return min(next_at, updated + 300.0)
+        return next_at
+
+    @classmethod
     def _recovery_due(cls, receipt, now):
         if receipt.get("_forward_protocol"):
             from services.durable_forward import chat_recovery_supported
             if not chat_recovery_supported(receipt):
                 return False
-        next_at = receipt.get("recovery_next_at")
+        next_at = cls._recovery_due_at(receipt)
         lease_until = receipt.get("recovery_lease_until")
         if lease_until is not None and now < float(lease_until):
             return False
@@ -656,6 +705,11 @@ class TextTaskService:
     def _recovery_backoff(cls, attempt):
         exponent = max(0, min(int(attempt) - 1, 5))
         return min(cls.RECOVERY_MAX_BACKOFF_SECONDS, cls.RECOVERY_BASE_BACKOFF_SECONDS * (2 ** exponent))
+
+    @classmethod
+    def _result_recovery_backoff(cls, receipt, attempt):
+        delay = cls._recovery_backoff(attempt)
+        return min(delay, 300.0) if cls._normal_sent_chat_result_recovery(receipt) else delay
 
     @staticmethod
     def _provably_expired_execution_claim(receipt, now):
@@ -1196,6 +1250,87 @@ class TextTaskService:
         return True
 
     @classmethod
+    def _bounded_unreadable_result_capacity_boundary(cls, receipt, now):
+        """Whether a completed exact-result read frees only local Chat capacity.
+
+        The durable marker records one current recovery claim whose bound
+        original-result GET actually failed. It is neither an upstream terminal
+        state nor a continuation/successor proof. Subsequent exact-read leases
+        consume only the recovery reader resource; they do not reclaim the
+        generation slot that the completed failed read already released.
+        """
+        if type(now) not in (int, float) or not math.isfinite(now) or now <= 0:
+            return False
+        unresolved_outcome = (receipt.get("upstream_outcome") == "unknown"
+                              or receipt.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+                              and ("upstream_outcome" not in receipt
+                                   or receipt.get("upstream_outcome") == "not_sent"
+                                   and receipt.get("_submission_started") is True))
+        if (not cls._bounded_chat_wait(receipt)
+                or receipt.get("status") != "unknown"
+                or not unresolved_outcome
+                or receipt.get("_attempt_finished_at") is not None
+                or receipt.get("_submission_started") is not True
+                or receipt.get("_turn_reserved") is not False
+                or receipt.get("_executing") is not False
+                or "_missing_successor_resume" in receipt):
+            return False
+        if (receipt.get("_recovery_claim_id") is not None
+                or receipt.get("_recovery_claim_until") is not None):
+            return False
+        if (receipt.get("_upstream_terminal") is not None and receipt.get("_upstream_terminal") is not False
+                or any(receipt.get(field) is not None and receipt.get(field) is not False
+                       for field in ("_recovery_suppressed", "_recovery_paused", "_forward_protocol"))):
+            return False
+        if receipt.get("_route", "chat") != "chat" or receipt.get("_operation", "text") != "text":
+            return False
+        if any(type(receipt.get(field)) is not str
+               or not 1 <= len(receipt[field]) <= 300
+               or receipt[field] != receipt[field].strip()
+               for field in ("request_id", "request_message_id", "provider_binding_id",
+                             "provider_account_identity", "client_conversation_id",
+                             "conversation_id", "model")):
+            return False
+        marker = receipt.get("_result_read_capacity_released_at")
+        if type(marker) not in (int, float) or not math.isfinite(marker) or not 0 < marker <= now:
+            return False
+        claim_id, claim_until = receipt.get("_claim_id"), receipt.get("_claim_until")
+        if claim_id is None:
+            if claim_until is not None:
+                return False
+        elif (not isinstance(claim_id, str) or not claim_id
+              or type(claim_until) not in (int, float) or not math.isfinite(claim_until)
+              or claim_until > now):
+            return False
+        # A verified progress clock is evidence from the original branch. Its
+        # existing 60-second recovery lease is the only freshness grace: old
+        # observations count as old, and a later read error never restarts it.
+        progress = receipt.get("_result_last_progress_at")
+        if progress is None:
+            progress = receipt.get("_result_observation_started_at")
+        if progress is not None:
+            if (type(progress) not in (int, float) or not math.isfinite(progress)
+                    or not 0 < progress <= now):
+                return False
+            if now - progress < cls.RECOVERY_LEASE_SECONDS:
+                return False
+        recovery_id = receipt.get("recovery_claim_id")
+        recovery_at = receipt.get("recovery_claimed_at")
+        recovery_until = receipt.get("recovery_lease_until")
+        if any(value is not None for value in (recovery_id, recovery_at, recovery_until)):
+            # Only a later exact original-result reader may coexist with the
+            # marker. A sender/foreign lease remains live-work evidence.
+            if (type(recovery_id) is not str or not recovery_id.strip()
+                    or recovery_id != recovery_id.strip() or len(recovery_id) > 300
+                    or receipt.get("recovery_phase") != "read_text_request"
+                    or type(recovery_at) not in (int, float) or not math.isfinite(recovery_at)
+                    or type(recovery_until) not in (int, float) or not math.isfinite(recovery_until)
+                    or not (marker <= recovery_at <= recovery_until)
+                    or recovery_until > now and recovery_at > now):
+                return False
+        return True
+
+    @classmethod
     def _end_execution_wait(cls, receipt, now, *, observed=False):
         """End local waiting, not the upstream turn or its original-ID recovery.
 
@@ -1298,7 +1433,7 @@ class TextTaskService:
     def _finish_recovery(
         self, owner, request_id, claim_id, recovered=None, error_code=None,
         phase=None, recovery_reason=None, retry_after_seconds=None, *, count_unrecoverable=False,
-        read_error=None,
+        read_error=None, original_result_get_attempted=False,
     ):
         now = self._now()
         with self._db() as db:
@@ -1328,6 +1463,24 @@ class TextTaskService:
                 return self._public(current)
             if current.get("recovery_claim_id") != claim_id:
                 return self._public(current)
+            # Keep the exact outcome of this completed read separate from the
+            # durable recovery reason below. A prior verified incomplete
+            # observation is intentionally retained through later transport
+            # failures, but it must not disguise whether this read itself was
+            # an unavailable original-result GET.
+            completed_read_reason = recovery_reason
+            read_failure = safe_recovery_read_error(read_error)
+            bounded_read_failure = bool(
+                error_code in self._BOUNDED_RESULT_READ_FAILURE_CODES
+                and completed_read_reason is None
+                and original_result_get_attempted is True
+                and read_failure is not None
+                and read_failure["phase"] == "conversation_detail"
+                and read_failure["candidate_ref"] is None
+                and read_failure["category"] in {"http", "timeout", "transport", "parse"}
+                and all(isinstance(current.get(field), str) and current[field].strip()
+                        for field in ("conversation_id", "request_message_id"))
+            )
             if error_code:
                 # A transient recovery failure does not disprove a persisted,
                 # validated incomplete original observation. Keep only that
@@ -1384,8 +1537,8 @@ class TextTaskService:
                     "recovery_next_at": now + (
                         retry_after_seconds
                         if retry_after_seconds is not None
-                        else self._recovery_backoff(
-                            qualified_reads if qualified_read_recorded else (1 if scan_incomplete else attempt)
+                        else self._result_recovery_backoff(
+                            current, qualified_reads if qualified_read_recorded else (1 if scan_incomplete else attempt)
                         )
                     ),
                     "recovery_error_code": error_code,
@@ -1454,6 +1607,7 @@ class TextTaskService:
             observed = bool(error_code == "UPSTREAM_OUTCOME_UNKNOWN"
                             and recovery_reason == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
                             and observation is not None)
+            meaningful_observation = False
             if observed:
                 previous = self._safe_result_observation(
                     current.get("_original_result_observation"), recovery_view,
@@ -1463,6 +1617,7 @@ class TextTaskService:
                 initial = previous is None or type(started) not in (int, float) or not math.isfinite(started)
                 changed = previous is not None and previous["nodes"] != observation["nodes"]
                 count = current.get("_result_no_progress_reads")
+                meaningful_observation = initial or changed
                 changes.update(_original_result_observation=observation, _result_last_checked_at=now,
                                _result_observation_started_at=now if initial else started,
                                _result_last_progress_at=now if changed else None if initial else progress,
@@ -1482,6 +1637,20 @@ class TextTaskService:
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}
+            if bounded_read_failure:
+                # This claim completed an exact original-result GET and could
+                # not read it. Preserve the first marker across later errors
+                # and status-only running replies; neither is verified branch
+                # progress and neither gets to restart a long wait.
+                updated.setdefault("_result_read_capacity_released_at", now)
+            elif (meaningful_observation
+                  or updated.get("status") == "succeeded"
+                  or updated.get("_upstream_terminal") is True
+                  or (updated.get("status") == "failed"
+                      and updated.get("error_code") == "CHAT_RESPONSE_NOT_TEXT")):
+                # Only identity-safe original progress/first observation or an
+                # authoritative terminal result takes the local slot back.
+                updated.pop("_result_read_capacity_released_at", None)
             if observed and changed:
                 # A verified original-branch change puts the local account
                 # boundary back on hold. It does not alter UNKNOWN, the
@@ -1812,6 +1981,9 @@ class TextTaskService:
                     recovery_reason=self._safe_recovery_reason(getattr(exc, "recovery_reason", "")),
                     retry_after_seconds=retry_after_seconds,
                     count_unrecoverable=allow_unrecoverable_retry,
+                    original_result_get_attempted=(
+                        getattr(exc, "_original_result_get_attempted", False) is True
+                    ),
                 )
             except Exception as exc:
                 # Never persist exception text: it may contain a token, prompt,
@@ -1825,6 +1997,9 @@ class TextTaskService:
                     phase=recovery_error["phase"], read_error=recovery_error,
                     retry_after_seconds=retry_after_seconds,
                     recovery_reason=None, count_unrecoverable=allow_unrecoverable_retry,
+                    original_result_get_attempted=(
+                        getattr(exc, "_original_result_get_attempted", False) is True
+                    ),
                 )
             finally:
                 recovery_done.set()
