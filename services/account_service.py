@@ -1180,7 +1180,7 @@ class AccountService:
         user_agent = self._OAUTH_USER_AGENT
         
         # 创建 session
-        session_kwargs = {"impersonate": "chrome110", "verify": False}
+        session_kwargs = {"impersonate": "chrome110", "verify": True}
         proxy = config.get_proxy_settings()
         if proxy:
             session_kwargs["proxy"] = proxy
@@ -1359,7 +1359,7 @@ class AccountService:
                     "code": auth_code,
                     "redirect_uri": platform_oauth_redirect_uri,
                 },
-                verify=False,
+                verify=True,
                 timeout=60,
             )
             
