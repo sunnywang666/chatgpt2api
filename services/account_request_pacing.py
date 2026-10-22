@@ -23,7 +23,8 @@ from curl_cffi import CurlInfo
 from services.config import DATA_DIR, config
 from utils.log import logger
 from services.request_context import (current_request, current_archive_guard, current_archive_read_owner,
-                                      current_archive_observation, current_archive_step)
+                                      current_archive_observation, current_archive_step,
+                                      current_original_read_owner)
 
 
 # libcurl times are cumulative from request start, not individual phase durations.
@@ -540,7 +541,8 @@ class AccountRequestClock:
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
-        ordinary_owner = uuid.uuid4().hex if is_conversation_read and not read_owner else None
+        original_read_owner = current_original_read_owner.get() if is_conversation_read else None
+        ordinary_owner = (original_read_owner or uuid.uuid4().hex) if is_conversation_read and not read_owner else None
         read_slot = None
         read_slot_transferred = False
         read_slot_release_lock = threading.Lock()
@@ -1133,19 +1135,85 @@ def account_pacing_snapshot(account, now=None, *, include_turn=True, include_con
 _clocks: dict[str, AccountRequestClock] = {}
 _clocks_lock = threading.Lock()
 
+_ORIGINAL_READ_OWNER_PREFIX = "original-result:"
+
+
+def _clock_for_account(identity):
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    with _clocks_lock:
+        clock = _clocks.get(key)
+        if clock is None:
+            clock = AccountRequestClock(key[:12], DATA_DIR / "account_request_clocks" / f"{key}.json")
+            _clocks[key] = clock
+    return key, clock
+
+
+def reserve_account_original_read(account, owner):
+    """Book one due original read in the existing ordinary-read FIFO.
+
+    The caller does not receive a worker slot until this ticket is first and
+    the persisted account clock is due.  Only one such dormant ticket per
+    account is allowed, so a recovery backlog cannot fill the ordinary queue.
+    """
+    identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
+    if not identity or not isinstance(owner, str) or not owner.startswith(_ORIGINAL_READ_OWNER_PREFIX):
+        return False
+    try:
+        # Retain the dispatcher's strict, read-only validation.  A future clock
+        # can reserve a FIFO position, but an unreadable clock cannot book one.
+        if account_pacing_snapshot(account, include_turn=False,
+                                   include_conversation_read=True)["next_at"] is None:
+            return False
+        _, clock = _clock_for_account(identity)
+        if not clock.lock.acquire(blocking=False):
+            return False
+        try:
+            now = time.monotonic()
+            queue = [entry for entry in clock.ordinary_read_queue if entry["until"] > now]
+            if len(queue) != len(clock.ordinary_read_queue):
+                clock.ordinary_read_queue = queue
+                clock.ordinary_read_wait_until = max((entry["until"] for entry in queue), default=0.0)
+                clock._save()
+            other = next((entry for entry in queue
+                          if entry["owner"].startswith(_ORIGINAL_READ_OWNER_PREFIX)
+                          and entry["owner"] != owner), None)
+            if other is not None:
+                return False
+            ready = max(clock.next_request, clock.cooldown_until, clock._read_ready(now))
+            first = clock._ordinary_read_turn(owner, now, max(0.0, ready - now))
+            return first and ready <= now
+        finally:
+            clock.lock.release()
+    except (OSError, ValueError, TypeError, KeyError, OverflowError, AttributeError):
+        return False
+
+
+def release_account_original_read(account, owner):
+    """Drop an unconsumed original-read FIFO ticket; expiry remains the restart fallback."""
+    identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
+    if not identity or not isinstance(owner, str) or not owner.startswith(_ORIGINAL_READ_OWNER_PREFIX):
+        return False
+    try:
+        _, clock = _clock_for_account(identity)
+        if not clock.lock.acquire(blocking=False):
+            return False
+        try:
+            before = len(clock.ordinary_read_queue)
+            clock._release_ordinary_read(owner)
+            return len(clock.ordinary_read_queue) != before
+        finally:
+            clock.lock.release()
+    except (OSError, ValueError, TypeError, KeyError, OverflowError, AttributeError):
+        return False
+
 
 def reserve_account_archive_read(account, owner):
     """Best-effort booking outside SQLite transactions; never wait on HTTP."""
     identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
     if not identity or not getattr(config, "account_conversation_read_interval_secs", 0.0):
         return False
-    key = hashlib.sha256(identity.encode()).hexdigest()
     try:
-        with _clocks_lock:
-            clock = _clocks.get(key)
-            if clock is None:
-                clock = AccountRequestClock(key[:12], DATA_DIR / "account_request_clocks" / f"{key}.json")
-                _clocks[key] = clock
+        _, clock = _clock_for_account(identity)
         if not clock.lock.acquire(blocking=False):
             return False
         try:

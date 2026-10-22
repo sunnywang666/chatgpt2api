@@ -154,6 +154,226 @@ class AdmissionTests(unittest.TestCase):
                 self.assertEqual(all_rows[rid], {"id": rid, "owner_id": "happy", **row})
                 self.assertEqual(self.store.read_receipt(db, "image", "happy", rid), all_rows[rid])
 
+    def test_due_original_read_reserves_the_account_read_fifo_before_dispatch(self):
+        """A due recovery must not repeatedly lose a one-credit read edge."""
+        from services import account_request_pacing as pacing
+        from services.account_request_pacing import AccountRequestClock
+        from services.config import config
+
+        now, sent, started = [1000.0], [], threading.Event()
+        finished = threading.Event()
+        ordinary_waiting, release_ordinary = threading.Event(), threading.Event()
+        ordinary_errors = []
+        account = self.rows[0]
+        identity = account["account_id"]
+        key = hashlib.sha256(identity.encode()).hexdigest()
+        path = self.root / "account_request_clocks" / f"{key}.json"
+        receipt = {
+            "provider_account_identity": account["provider_account_identity"],
+            "provider_binding_id": "binding-0",
+            "client_conversation_id": "due-conversation",
+            "conversation_id": "due-conversation",
+        }
+
+        def send(method, url, **kwargs):
+            sent.append((url.rsplit("/", 1)[-1], now[0]))
+            return type("Response", (), {"status_code": 200, "headers": {}})()
+
+        def recover(owner, request_id):
+            AccountRequestClock(key[:12], path).request(
+                send, "GET", "https://provider/conversation/due-conversation")
+            started.set()
+
+        def ordinary_read():
+            try:
+                AccountRequestClock(key[:12], path).request(
+                    send, "GET", "https://provider/conversation/ordinary-reader")
+            except BaseException as exc:
+                ordinary_errors.append(exc)
+
+        def wait(seconds):
+            if threading.current_thread().name == "ordinary-reader" and not ordinary_waiting.is_set():
+                ordinary_waiting.set()
+                if not release_ordinary.wait(2):
+                    raise TimeoutError("ordinary reader was not released")
+            now[0] += seconds
+
+        with patch.object(pacing, "DATA_DIR", self.root), \
+             patch.object(pacing, "_clocks", {}), \
+             patch.object(self.admission, "wake", side_effect=finished.set), \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 90)):
+            clock = AccountRequestClock(key[:12], path)
+            clock.next_conversation_read = now[0] + 90
+            clock._save()
+            self.admission.pacing = None
+
+            # Before the edge, recovery has no worker slot but must take a FIFO
+            # position.  This assertion is the pre-fix red edge: old dispatch
+            # returned here without a ticket at all.
+            self.assertFalse(self.admission._dispatch_original_read("text", "happy", "due", recover, receipt))
+            self.assertEqual(len(AccountRequestClock(key[:12], path).ordinary_read_queue), 1)
+            now[0] += 90
+            with patch("services.account_request_pacing.time.sleep", side_effect=wait):
+                ordinary = threading.Thread(target=ordinary_read, name="ordinary-reader")
+                ordinary.start()
+                try:
+                    self.assertTrue(ordinary_waiting.wait(2))
+                    self.assertTrue(self.admission._dispatch_original_read("text", "happy", "due", recover, receipt))
+                    self.assertTrue(started.wait(2))
+                    self.assertEqual(sent, [("due-conversation", 1090.0)])
+                finally:
+                    release_ordinary.set()
+                    ordinary.join(3)
+                    self.assertTrue(finished.wait(2))
+            self.assertFalse(ordinary.is_alive())
+            self.assertEqual(ordinary_errors, [])
+            self.assertEqual(sent, [("due-conversation", 1090.0), ("ordinary-reader", 1180.0)])
+
+    def test_second_admission_does_not_release_another_dispatchers_original_ticket(self):
+        from services import account_request_pacing as pacing
+        from services.account_request_pacing import AccountRequestClock
+        from services.config import config
+
+        now, entered, allow_return, released = [1000.0], threading.Event(), threading.Event(), threading.Event()
+        account = self.rows[0]
+        key = hashlib.sha256(account["account_id"].encode()).hexdigest()
+        path = self.root / "account_request_clocks" / f"{key}.json"
+        receipt = {"provider_account_identity": account["provider_account_identity"],
+                   "provider_binding_id": "binding-0", "client_conversation_id": "same-original",
+                   "conversation_id": "same-original"}
+        peer = PoolAdmission(self.store, self.accounts, clock=self.clock,
+                             settings=self.admission.settings, model_types=self.admission.model_types)
+
+        def recover(owner, request_id):
+            entered.set()
+            self.assertTrue(allow_return.wait(2))
+
+        with patch.object(pacing, "DATA_DIR", self.root), \
+             patch.object(pacing, "_clocks", {}), \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 90)):
+            clock = AccountRequestClock(key[:12], path)
+            clock.next_conversation_read = now[0] + 90
+            clock._save()
+            self.admission.pacing = None
+            self.assertFalse(self.admission._dispatch_original_read("text", "happy", "same", recover, receipt))
+            now[0] += 90
+            from services.account_request_pacing import release_account_original_read as real_release
+            def release(account_row, owner):
+                result = real_release(account_row, owner)
+                released.set()
+                return result
+            with patch("services.account_request_pacing.release_account_original_read", side_effect=release):
+                self.assertTrue(self.admission._dispatch_original_read("text", "happy", "same", recover, receipt))
+                self.assertTrue(entered.wait(2))
+                before = list(AccountRequestClock(key[:12], path).ordinary_read_queue)
+                self.assertFalse(peer._dispatch_original_read("text", "happy", "same", recover, receipt))
+                self.assertEqual(AccountRequestClock(key[:12], path).ordinary_read_queue, before)
+                allow_return.set()
+                self.assertTrue(released.wait(2))
+            self.assertEqual(AccountRequestClock(key[:12], path).ordinary_read_queue, [])
+
+    def test_active_physical_read_does_not_leave_another_receipts_ticket(self):
+        from services import account_request_pacing as pacing
+        from services.account_request_pacing import AccountRequestClock
+
+        entered, allow_return, finished = threading.Event(), threading.Event(), threading.Event()
+        account = self.rows[0]
+        key = hashlib.sha256(account["account_id"].encode()).hexdigest()
+        path = self.root / "account_request_clocks" / f"{key}.json"
+        receipt = {"provider_account_identity": "account-0", "conversation_id": "same-conversation"}
+        def recover(owner, request_id):
+            AccountRequestClock(key[:12], path).request(
+                lambda *_args, **_kwargs: type("Response", (), {"status_code": 200, "headers": {}})(),
+                "GET", "https://provider/conversation/same-conversation")
+            entered.set()
+            allow_return.wait(2)
+        with patch.object(pacing, "DATA_DIR", self.root), \
+             patch.object(pacing, "_clocks", {}), \
+             patch.object(self.admission, "wake", side_effect=finished.set):
+            self.admission.pacing = None
+            self.assertTrue(self.admission._dispatch_original_read("text", "happy", "first", recover, receipt))
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(AccountRequestClock(key[:12], path).ordinary_read_queue, [])
+                self.assertFalse(self.admission._dispatch_original_read("text", "happy", "second", recover, receipt))
+                self.assertEqual(AccountRequestClock(key[:12], path).ordinary_read_queue, [])
+            finally:
+                allow_return.set()
+                self.assertTrue(finished.wait(2))
+
+    def test_async_image_recovery_keeps_existing_pacing_without_text_ticket(self):
+        from services import account_request_pacing as pacing
+        from services.account_request_pacing import AccountRequestClock
+        from services.request_context import current_original_read_owner
+        from services.config import config
+
+        now, owners, finished = [1000.0], [], threading.Event()
+        key = hashlib.sha256(self.rows[0]["account_id"].encode()).hexdigest()
+        path = self.root / "account_request_clocks" / f"{key}.json"
+        receipt = {"provider_account_identity": "account-0", "conversation_id": "image"}
+        with patch.object(pacing, "DATA_DIR", self.root), \
+             patch.object(pacing, "_clocks", {}), \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: now[0]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 90)), \
+             patch.object(self.admission, "wake", side_effect=finished.set):
+            clock = AccountRequestClock(key[:12], path)
+            clock.next_conversation_read = now[0] + 90
+            clock._save()
+            self.admission.pacing = None
+            recover = lambda *_args: owners.append(current_original_read_owner.get())
+            self.assertFalse(self.admission._dispatch_original_read("image", "happy", "image", recover, receipt))
+            self.assertEqual(AccountRequestClock(key[:12], path).ordinary_read_queue, [])
+            now[0] += 90
+            self.clock.now = now[0]
+            self.assertTrue(self.admission._dispatch_original_read("image", "happy", "image", recover, receipt))
+            self.assertTrue(finished.wait(2))
+            self.assertEqual(owners, [None])
+            self.assertEqual(AccountRequestClock(key[:12], path).ordinary_read_queue, [])
+
+    def test_original_read_invalid_clock_does_not_block_other_accounts(self):
+        from services import account_request_pacing as pacing
+        from services.account_request_pacing import AccountRequestClock
+
+        self.write_accounts(2)
+        self.admission.pacing = None
+        key = hashlib.sha256(self.rows[0]["account_id"].encode()).hexdigest()
+        path = self.root / "account_request_clocks" / f"{key}.json"
+        AccountRequestClock(key[:12], path)._save()
+        saved = json.loads(path.read_text())
+        invalid_clocks = [
+            {key: value for key, value in saved.items() if key != "next_request"},
+            {**saved, "next_request": True},
+            {key: value for key, value in saved.items() if key != "rate_failures"},
+            {**saved, "rate_failures": float("inf")},
+        ]
+        calls, finished = [], threading.Event()
+        def recover(owner, request_id):
+            calls.append(request_id)
+        with patch.object(pacing, "DATA_DIR", self.root), \
+             patch.object(pacing, "_clocks", {}), \
+             patch.object(self.admission, "wake", side_effect=finished.set):
+            for invalid in invalid_clocks:
+                with self.subTest(invalid=invalid):
+                    before = json.dumps(invalid)
+                    path.write_text(before)
+                    self.assertFalse(self.admission._dispatch_original_read(
+                        "text", "happy", "invalid", recover,
+                        {"provider_account_identity": "account-0", "conversation_id": "invalid"}))
+                    self.assertEqual(path.read_text(), before)
+            self.assertTrue(self.admission._dispatch_original_read(
+                "text", "happy", "healthy", recover,
+                {"provider_account_identity": "account-1", "conversation_id": "healthy"}))
+            self.assertTrue(finished.wait(2))
+            self.assertEqual(calls, ["healthy"])
+
     def test_send_guard_does_not_decode_unrelated_saved_images(self):
         self.image("new-independent")
         context = self.admission.claim_next()
