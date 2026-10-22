@@ -59,6 +59,7 @@ on:
       - test/test_queued_combined_copy_compaction.py
       - test/test_conversation_continuation.py
       - test/test_recovery_scan_progress.py
+      - test/test_reconcile_queued_successor.py
       - test/test_ci_fallback_workflow.py
       - test/test_ci_fallback_observer.py
   workflow_dispatch:
@@ -155,5 +156,6 @@ jobs:
             test/test_incomplete_compact_successor.py \
             test/test_conversation_continuation.py \
             test/test_recovery_scan_progress.py \
+            test/test_reconcile_queued_successor.py \
             test/test_ci_fallback_workflow.py \
             test/test_ci_fallback_observer.py

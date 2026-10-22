@@ -2935,7 +2935,10 @@ class TextTaskService:
             body = store.load_input(successor.get("_input_ref"))
         except (OSError, ValueError, TypeError, KeyError):
             reject()
-        if (stored.get("request_id") != request_id
+        no_final = successor.get("_supersedes_no_final") is True
+        if ((successor.get("_supersedes_no_final") is not None
+             and successor.get("_supersedes_no_final") is not True)
+                or stored.get("request_id") != request_id
                 or cls._submission_identity(owner, body) != (request_id, row[0])
                 or cls._submission_identity(owner, original_body) != (previous.get("request_id"), previous_hash)
                 or body != {**original_body, "client_request_id": request_id}
@@ -2951,13 +2954,11 @@ class TextTaskService:
         if (any(type(value) is not int or value <= 0 for value in sequence)
                 or not sequence[0] < sequence[1]):
             reject()
-        if (previous.get("_route", "chat") != "chat" or previous.get("_operation", "text") != "text"
+        common_invalid = (previous.get("_route", "chat") != "chat" or previous.get("_operation", "text") != "text"
                 or previous.get("_forward_protocol") or previous.get("_public_session_ref")
                 or previous.get("_expected_sends") != 1
                 or previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
                 or previous.get("upstream_outcome") != "unknown"
-                or previous.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND"
-                or previous.get("_attempt_reason") != "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"
                 or previous.get("_submission_started") is not True
                 or type(previous.get("_attempt_finished_at")) not in (int, float)
                 or not math.isfinite(previous["_attempt_finished_at"])
@@ -2968,7 +2969,14 @@ class TextTaskService:
                 or previous.get("_recovery_suppressed") or previous.get("_work_key")
                 or previous.get("_completion") or previous.get("_completion_of")
                 or previous.get("_supersedes_request_id")
-                or any(previous.get(key) is not None for key in ("content", "result", "data"))):
+                or any(previous.get(key) is not None for key in ("content", "result", "data")))
+        if common_invalid:
+            reject()
+        if no_final:
+            if not cls._no_final_successor_source(previous, now):
+                reject()
+        elif (previous.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND"
+              or previous.get("_attempt_reason") != "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND"):
             reject()
         for claim, until in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until"),
                              ("_recovery_claim_id", "_recovery_claim_until")):
@@ -3162,7 +3170,8 @@ class TextTaskService:
             reject("CHAT_SUPERSEDE_CONFLICT")
         return previous
 
-    def reconcile_queued_successor(self, owner, request_id, original_request_id, cursor, *, source, dry_run=True):
+    def reconcile_queued_successor(self, owner, request_id, original_request_id, cursor, *, source, dry_run=True,
+                                   continue_after_no_final=False):
         """Attach one proven, accepted-but-unsent listing receipt to its original.
 
         The retained child input is never rebuilt.  This narrow repair exists for
@@ -3171,7 +3180,8 @@ class TextTaskService:
         """
         def reject(code="CHAT_QUEUED_SUCCESSOR_NOT_RECONCILABLE"):
             raise ConversationBindingError("queued successor cannot be reconciled", code=code)
-        if source != "internal:listing" or type(dry_run) is not bool:
+        if (source != "internal:listing" or type(dry_run) is not bool
+                or type(continue_after_no_final) is not bool):
             reject()
         fields = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
                   "conversation_id", "parent_message_id")
@@ -3205,7 +3215,9 @@ class TextTaskService:
                         child_body = self.store.load_input(child.get("_input_ref"))
                     except (OSError, ValueError, TypeError, KeyError):
                         reject("CHAT_QUEUED_SUCCESSOR_CONFLICT")
-                    if (child.get("request_id") != request_id or parent.get("request_id") != original_request_id
+                    mode = child.get("_supersedes_no_final")
+                    if ((mode is not None and mode is not True)
+                            or child.get("request_id") != request_id or parent.get("request_id") != original_request_id
                             or self._submission_identity(owner, parent_body) != (original_request_id, parent_row[0])
                             or self._submission_identity(owner, child_body) != (request_id, child_row[0])
                             or child_body != {**parent_body, "client_request_id": request_id}
@@ -3215,7 +3227,8 @@ class TextTaskService:
                             or child.get("_supersedes_request_id") != original_request_id
                             or child.get("_supersedes_input_hash") != parent_row[0]
                             or child.get("_supersedes_request_message_id") != parent.get("request_message_id")
-                            or child.get("_submission_parent_message_id") != parent_body.get("parent_message_id")):
+                            or child.get("_submission_parent_message_id") != parent_body.get("parent_message_id")
+                            or (child.get("_supersedes_no_final") is True) != continue_after_no_final):
                         reject("CHAT_QUEUED_SUCCESSOR_CONFLICT")
                     result = {"request_id": request_id, "original_request_id": original_request_id,
                               "type": "queued_successor_reconciliation", "eligible": True,
@@ -3291,6 +3304,8 @@ class TextTaskService:
                     "_submission_parent_message_id": parent.get("_submission_parent_message_id") or parent.get("parent_message_id"),
                     self._RECONCILED_QUEUED_SUCCESSOR: True,
                 }
+                if continue_after_no_final:
+                    candidate["_supersedes_no_final"] = True
                 self._validate_supersede(self.store, db, owner, candidate, self._now())
                 result = {"request_id": request_id, "original_request_id": original_request_id,
                           "type": "queued_successor_reconciliation", "eligible": True,
