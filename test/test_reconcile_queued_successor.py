@@ -410,3 +410,190 @@ def test_http_explicit_no_final_mode_reaches_reconcile_service(reconciled, monke
     assert claim and claim.request_id == "queued"
     admission.execute(claim)
     assert len(sent) == 1 and sent[0]["_supersedes_no_final_original"]["request_id"] == "root"
+
+
+@pytest.fixture
+def attempt_steps(tmp_path):
+    """Actual Node contract: the business step address contains its write UUID."""
+    (tmp_path / "accounts.json").write_text(json.dumps([{
+        "access_token": "fixture", "account_id": "physical", "provider_account_identity": "account",
+        "conversation_binding_ids": ["binding"], "type": "Plus", "status": "正常", "quota": 99,
+        "source_type": "web",
+    }]))
+    clock = Clock()
+    _, store, admission = build(tmp_path, clock)
+    sent, before_send = [], []
+    def runner(body, on_cursor):
+        for action in before_send:
+            action()
+        current_request.get().before_send()
+        sent.append(deepcopy(body))
+        return {"content": "answer", "parent_message_id": "answer"}
+    service = TextTaskService(store.path, runner=runner, clock=clock, admission=admission)
+    admission.register("text", lambda ctx, body: service._run(ctx.owner, ctx.request_id, body))
+    original_id = "00000000-0000-4000-8000-000000000001"
+    queued_id = "00000000-0000-4000-8000-000000000002"
+    base = {"client_conversation_id": "session", "provider_binding_id": "binding",
+            "provider_account_identity": "account", "conversation_id": "conversation",
+            "parent_message_id": "parent", "model": "fixture-text", "image_model": "gpt-image-2",
+            "thinking_effort": "standard", "messages": [{"role": "user", "content": "frozen recognition"}]}
+    bodies = []
+    for rid in (original_id, queued_id):
+        body = {**base, "client_request_id": rid, "product_work": {
+            "product_ref": "same-product", "step_ref": "direct-listing.accessory.recognition:" + rid}}
+        service.submit("owner", body, source="internal:listing")
+        update(service, rid, _scheduling_owner="internal:listing")
+        bodies.append(body)
+    update(service, original_id, status="failed", error_code="RESULT_UNRECOVERABLE", upstream_outcome="unknown",
+           recovery_reason="REQUEST_RESULT_NOT_FOUND", recovery_no_result_reads=3,
+           _attempt_reason="ORIGINAL_RESULT_NO_FINAL", _attempt_finished_at=900,
+           _execution_wait_ended_at=900, _submission_started=True, _last_sent_sequence=0,
+           _executing=False, _turn_reserved=False, _claim_id=None, _claim_until=None,
+           recovery_claim_id=None, recovery_lease_until=None)
+    return SimpleNamespace(service=service, admission=admission, sent=sent, before_send=before_send,
+                           original=original_id, queued=queued_id, bodies=bodies, root=tmp_path)
+
+
+def reconcile_attempt(h, **overrides):
+    options = {"source": "internal:listing", "dry_run": False, "continue_after_no_final": True,
+               "reconcile_attempt_step": True, **overrides}
+    return h.service.reconcile_queued_successor("owner", h.queued, h.original, cursor(h.bodies[0]), **options)
+
+
+def rewrite_attempt_input(h, transform):
+    """Model a different accepted input, retaining its independently valid hash."""
+    with h.service.store.transaction() as db:
+        child = h.service.store.read_receipt(db, "text", "owner", h.queued)
+        body = transform(deepcopy(h.service.store.load_input(child["_input_ref"])))
+        child["_input_ref"] = h.service.store.save_input(body)
+        child["_product_work"] = body.get("product_work")
+        h.service.store.write_receipt(db, "text", "owner", h.queued, child)
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id=?",
+                   (h.service._submission_identity("owner", body)[1], "owner", h.queued))
+
+
+def test_attempt_addressed_reconcile_preserves_inputs_and_completes_archive_after_restart(attempt_steps, monkeypatch):
+    h = attempt_steps
+    before = [deepcopy(row(h.service, rid)) for rid in (h.original, h.queued)]
+    with h.service.store.connect() as db:
+        hashes = list(db.execute("SELECT id,request_hash FROM requests ORDER BY id"))
+    with pytest.raises(ConversationBindingError):
+        reconcile_attempt(h, reconcile_attempt_step=False)
+    assert reconcile_attempt(h, dry_run=True)["reconciled"] is False
+    assert [row(h.service, rid) for rid in (h.original, h.queued)] == before
+    assert reconcile_attempt(h)["reconciled"] is True
+    assert row(h.service, h.original) == before[0]
+    for field in ("request_id", "request_message_id", "_input_ref", "_sequence", "_product_work", "_product_work_key"):
+        assert row(h.service, h.queued)[field] == before[1][field]
+    with h.service.store.connect() as db:
+        assert list(db.execute("SELECT id,request_hash FROM requests ORDER BY id")) == hashes
+        assert [h.service.store.load_input(row(h.service, rid)["_input_ref"]) for rid in (h.original, h.queued)] == h.bodies
+    claim = h.admission.claim_next()
+    assert claim and claim.request_id == h.queued
+    h.admission.execute(claim)
+    assert len(h.sent) == 1 and row(h.service, h.queued)["status"] == "succeeded"
+    assert reconcile_attempt(h)["reconciled"] is True
+    with pytest.raises(ConversationBindingError):
+        reconcile_attempt(h, reconcile_attempt_step=False)
+
+    archived = []
+    monkeypatch.setattr("services.text_task_service.conversation_binding_service.set_archived",
+                        lambda receipt, value: archived.append((receipt["request_id"], value)))
+    images = SimpleNamespace(archive_product_work=lambda *_args: None)
+    product = ProductWorkService(h.service, images, clock=h.service.clock)
+    identity = {"id": "owner", "role": "admin", "_trusted_source": "internal:listing"}
+    assert product.close(identity, "same-product", results_saved=True)["state"] == "closing"
+    assert WorkLifecycleService(h.service, images, clock=h.service.clock).process_one()
+    assert archived == [(h.queued, True)]
+    assert product.get(identity, "same-product")["state"] == "completed"
+    _, store, admission = build(h.root, h.service.clock)
+    restarted = TextTaskService(store.path, runner=h.service.runner, clock=h.service.clock, admission=admission)
+    assert ProductWorkService(restarted, images, clock=h.service.clock).get(identity, "same-product")["state"] == "completed"
+    assert restarted.reconcile_queued_successor("owner", h.queued, h.original, cursor(h.bodies[0]),
+        source="internal:listing", dry_run=False, continue_after_no_final=True, reconcile_attempt_step=True)["reconciled"]
+    assert row(h.service, h.original)["upstream_outcome"] == "unknown"
+    assert len(h.sent) == 1
+
+
+@pytest.mark.parametrize("mutation", ["prompt", "model", "product", "fairness", "operation", "wrong_attempt", "member", "hash", "third_child"])
+def test_attempt_reconcile_rejects_different_input_or_unproved_members(attempt_steps, mutation):
+    h = attempt_steps
+    if mutation in {"prompt", "model", "product", "fairness", "operation", "wrong_attempt"}:
+        def change(body):
+            if mutation == "prompt": body["messages"] = [{"role": "user", "content": "different"}]
+            if mutation == "model": body["model"] = "different"
+            if mutation == "product": body["product_work"]["product_ref"] = "other-product"
+            if mutation == "fairness": body["product_work"]["fairness"] = {"organization_id": "org", "subject_id": "subject", "root_workflow_id": "root"}
+            if mutation == "operation": body["product_work"]["step_ref"] = "direct-listing.gallery.review:" + h.queued
+            if mutation == "wrong_attempt": body["product_work"]["step_ref"] = "direct-listing.accessory.recognition:" + h.original
+            return body
+        rewrite_attempt_input(h, change)
+    elif mutation == "member":
+        with h.service.store.transaction() as db:
+            key = row(h.service, h.queued)["_product_work_key"]
+            parent = h.service.store.runtime(db, key)
+            parent["members"] = [m for m in parent["members"] if m["request_id"] != h.queued]
+            h.service.store.set_runtime(db, key, parent)
+    elif mutation == "hash":
+        with h.service.store.transaction() as db:
+            db.execute("UPDATE requests SET request_hash='bad' WHERE owner='owner' AND id=?", (h.queued,))
+    else:
+        h.service.submit("owner", {**h.bodies[0], "client_request_id": "other-child", "product_work": {
+            "product_ref": "same-product", "step_ref": "other-step"}}, source="internal:listing")
+        update(h.service, "other-child", _supersedes_request_id=h.original)
+    with pytest.raises(ConversationBindingError):
+        reconcile_attempt(h)
+    assert h.sent == [] and not row(h.service, h.queued).get("_reconciled_attempt_step")
+
+
+@pytest.mark.parametrize("mutation", ["late_success", "mode_int", "member", "metadata"])
+def test_attempt_reconcile_rechecks_at_actual_send_edge(attempt_steps, mutation):
+    h = attempt_steps
+    reconcile_attempt(h)
+    def drift():
+        if mutation == "late_success": update(h.service, h.original, status="succeeded", content="late", upstream_outcome="completed")
+        elif mutation == "mode_int": update(h.service, h.queued, _reconciled_attempt_step=1)
+        elif mutation == "metadata": update(h.service, h.queued, _product_work={"product_ref": "same-product", "step_ref": "changed"})
+        else:
+            with h.service.store.transaction() as db:
+                key = row(h.service, h.queued)["_product_work_key"]
+                parent = h.service.store.runtime(db, key)
+                parent["members"][1]["step_ref"] = "changed"
+                h.service.store.set_runtime(db, key, parent)
+    h.before_send.append(drift)
+    claim = h.admission.claim_next()
+    assert claim and claim.request_id == h.queued
+    h.admission.execute(claim)
+    assert h.sent == [] and row(h.service, h.queued)["upstream_outcome"] == "not_sent"
+
+
+@pytest.mark.parametrize("mode", [False, 1, "true"])
+def test_attempt_reconcile_close_and_ack_reject_persisted_mode_drift(attempt_steps, mode):
+    h = attempt_steps
+    reconcile_attempt(h)
+    claim = h.admission.claim_next()
+    h.admission.execute(claim)
+    assert len(h.sent) == 1
+    update(h.service, h.queued, _reconciled_attempt_step=mode)
+    with pytest.raises(ConversationBindingError): reconcile_attempt(h)
+    product = ProductWorkService(h.service, SimpleNamespace(archive_product_work=lambda *_: None), clock=h.service.clock)
+    with pytest.raises(WorkLifecycleError):
+        product.close({"id": "owner", "role": "admin", "_trusted_source": "internal:listing"}, "same-product", results_saved=True)
+
+
+def test_http_attempt_step_requires_explicit_strict_no_final_mode(attempt_steps, monkeypatch):
+    h = attempt_steps
+    monkeypatch.setattr(api, "text_task_service", h.service)
+    monkeypatch.setattr(api, "require_identity", lambda _authorization, request=None: {"id": "owner", "role": "admin"})
+    monkeypatch.setattr(api, "trusted_source", lambda _identity, _request: "internal:listing")
+    app = FastAPI(); app.include_router(api.create_router())
+    body = {"client_request_id": h.queued, "original_request_id": h.original, **cursor(h.bodies[0]),
+            "reconcile_attempt_step": True}
+    url = f"/api/conversation-bindings/text-requests/{h.queued}/reconcile-queued-successor"
+    with TestClient(app) as client:
+        assert client.post(url, json=body).status_code == 409
+        assert client.post(url, json={**body, "continue_after_no_final": True, "reconcile_attempt_step": 1}).status_code == 422
+        assert client.post(url, json={**body, "continue_after_no_final": True}).status_code == 200
+        assert not row(h.service, h.queued).get("_reconciled_attempt_step")
+        assert client.post(url, json={**body, "continue_after_no_final": True, "dry_run": False}).status_code == 200
+        assert row(h.service, h.queued)["_reconciled_attempt_step"] is True

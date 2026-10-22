@@ -223,6 +223,7 @@ class ReconcileQueuedSuccessorRequest(ConversationArchiveRequest):
     original_request_id: str = Field(strict=True, min_length=1, max_length=200)
     dry_run: bool = Field(default=True, strict=True)
     continue_after_no_final: bool = Field(default=False, strict=True)
+    reconcile_attempt_step: bool = Field(default=False, strict=True)
 
     @field_validator("client_request_id", "original_request_id")
     @classmethod
@@ -707,6 +708,7 @@ def create_router() -> APIRouter:
                 text_task_service.reconcile_queued_successor,
                 str(identity.get("id") or "anonymous"), request_id, body.original_request_id, cursor,
                 source=source, dry_run=body.dry_run, continue_after_no_final=body.continue_after_no_final,
+                reconcile_attempt_step=body.reconcile_attempt_step,
             )
         except ConversationBindingError as exc:
             raise HTTPException(409, detail={"code": exc.code}) from None
