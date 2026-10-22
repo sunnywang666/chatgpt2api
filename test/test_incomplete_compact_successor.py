@@ -38,6 +38,8 @@ def incomplete_document(original, *, change=None):
     elif change == "progress":
         document["mapping"]["active"]["message"]["content"]["thoughts"][0]["content"] = "new measured progress"
         document["mapping"]["active"]["message"]["update_time"] = 11
+    elif change == "heartbeat":
+        document["mapping"]["active"]["message"]["update_time"] = 11
     elif change == "branch":
         document["mapping"]["active"]["children"] = ["later"]
         document["mapping"]["later"] = {"parent": "active", "children": [], "message": {
@@ -197,6 +199,31 @@ def test_incomplete_send_edge_rejects_late_result_progress_or_branch(incomplete,
     assert successor["status"] == "failed" and successor["upstream_outcome"] == "not_sent"
     assert not successor["_submission_started"] and "send" not in calls
     assert row(h.service) == h.old
+
+
+def test_incomplete_compact_successor_accepts_heartbeat_only_at_initial_read(incomplete, monkeypatch):
+    h = incomplete
+    h.document = incomplete_document(h.old, change="heartbeat")
+    calls = patch_bound_runner(monkeypatch, h)
+
+    h.service.submit("owner", h.envelope)
+    h.admission.execute(h.admission.claim_next())
+
+    successor = row(h.service, "successor")
+    assert successor["status"] == "succeeded"
+    assert calls == ["read", "read", "send", "read"]
+
+
+def test_incomplete_compact_successor_accepts_heartbeat_only_before_send(incomplete, monkeypatch):
+    h = incomplete
+    calls = patch_bound_runner(monkeypatch, h, before_send_change="heartbeat")
+
+    h.service.submit("owner", h.envelope)
+    h.admission.execute(h.admission.claim_next())
+
+    successor = row(h.service, "successor")
+    assert successor["status"] == "succeeded"
+    assert calls == ["read", "read", "send", "read"]
 
 
 def test_incomplete_mode_is_closed_idempotent_and_never_resume_unsent(incomplete):

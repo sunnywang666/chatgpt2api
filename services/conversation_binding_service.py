@@ -1850,8 +1850,9 @@ class ConversationBindingService:
         """Read one still-incomplete original branch without treating it as no-final.
 
         The saved observation is only an explicit-risk admission proof.  Both
-        the initial read and the pre-send read must reproduce it exactly, so a
-        late answer, any measured progress, a branch change, or a different
+        the initial read and the pre-send read must reproduce its identity and
+        node observations exactly. A timestamp-only heartbeat is not progress;
+        a late answer, measured progress, a branch change, or a different
         physical conversation tail prevents a second model POST.
         """
         from services.text_task_service import TextTaskService
@@ -1872,9 +1873,23 @@ class ConversationBindingService:
         if fresh.get("status") == "succeeded":
             reject("CHAT_SUPERSEDE_ORIGINAL_FOUND")
         observation = TextTaskService._safe_result_observation(fresh.get(RESULT_OBSERVATION_FIELD), original)
+        # ``upstream_updated_at`` is an upstream heartbeat, not evidence that
+        # this branch made generation progress.  Keep the conversation and
+        # request anchors plus the bounded node observation exact across both
+        # guards, while allowing a timestamp-only refresh between them.
+        observation_signature = ({
+            "conversation_id": observation["conversation_id"],
+            "request_message_id": observation["request_message_id"],
+            "nodes": observation["nodes"],
+        } if observation is not None else None)
+        saved_signature = ({
+            "conversation_id": saved["conversation_id"],
+            "request_message_id": saved["request_message_id"],
+            "nodes": saved["nodes"],
+        })
         if (fresh.get("status") != "running"
                 or fresh.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
-                or observation is None or observation != saved
+                or observation_signature is None or observation_signature != saved_signature
                 or not isinstance(document, dict) or document.get("is_archived") is not False
                 or document.get("conversation_id") != original.get("conversation_id")):
             reject()
@@ -1889,7 +1904,7 @@ class ConversationBindingService:
                 or message.get("id") != head or node.get("children")
                 or any(isinstance(item, dict) and item.get("parent") == head for item in mapping.values())):
             reject()
-        return {"head": head, "observation": observation}
+        return {"head": head, "observation": observation_signature}
 
     @staticmethod
     def _check_missing_node_model_retry(document, conversation_id, parent_message_id,
