@@ -3717,7 +3717,14 @@ class OpenAIBackendAPI:
                         if payload == "[DONE]":
                             self._record_stream_handoff_stage("ws_no_terminal", frames=frames,
                                                               total_bytes=total_bytes)
-                            return False
+                            # A WS SSE delimiter does not prove this exact
+                            # turn is complete.  Keep the already-bound
+                            # subscription open for the remainder of its
+                            # existing deadline: a following frame may carry
+                            # the validated original-branch terminal.
+                            # It is never forwarded to the protocol adapter,
+                            # which would otherwise close the generator.
+                            continue
                         continue
                     if payload == "[DONE]":
                         # The protocol adapter stops at DONE and closes this
