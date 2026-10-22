@@ -162,6 +162,88 @@ def test_received_original_get_error_marks_actual_attempt(local_upstream, respon
     assert state.backends[-1]._closed
 
 
+@pytest.mark.parametrize("wait_at", ["session_lock", "account_pacing"])
+def test_unsent_original_get_timeout_keeps_short_retry_without_releasing_capacity(
+        tmp_path, local_upstream, wait_at):
+    import services.account_request_pacing as pacing
+    from test.test_unknown_turn_recovery import migration
+    from test.test_expired_execution_wait import saved, patch
+
+    service, admission, _, _ = migration(tmp_path)
+    state = local_upstream
+    state.accounts.get_bound_account_identity = lambda _binding: "account-0"
+    service.recovery_reader = ConversationBindingService().read_text_request
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False,
+          recovery_attempt=9, recovery_next_at=0, conversation_id="original",
+          request_message_id="user", request_parent_message_id="root")
+    before = saved(service)
+    lock = None
+    if wait_at == "session_lock":
+        lock = state.accounts.conversation_binding_lock("binding-0", "client-0")
+        lock.acquire()
+    else:
+        state.backend("fixture-token")  # Create the real original account clock.
+        clock = next(iter(pacing._clocks.values()))
+        with clock.lock:
+            clock.cooldown_until = time.monotonic() + 60
+            clock._save()
+    try:
+        with operation_deadline(time.monotonic() + .1):
+            result = service.read("owner", "old-0")
+    finally:
+        if lock is not None:
+            lock.release()
+    after = saved(service)
+    assert state.calls == []
+    assert result["status"] == "unknown"
+    assert after["recovery_attempt"] == 10
+    assert after["recovery_last_read_error"]["category"] == "timeout"
+    assert after["recovery_next_at"] == admission.clock.now + service._recovery_backoff(1)
+    assert after.get("recovery_claim_id") is None
+    assert after.get("_result_last_checked_at") is None
+    assert after.get("_result_read_capacity_released_at") is None
+    assert after.get("_attempt_finished_at") is None
+    assert after.get("_upstream_terminal") is not True
+    assert after["request_message_id"] == before["request_message_id"]
+    assert after["conversation_id"] == before["conversation_id"]
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+
+    if wait_at == "account_pacing":
+        # Ending the local read did not erase the actual account cooldown.
+        with clock.lock:
+            assert clock.cooldown_until > time.monotonic()
+            assert clock.ordinary_read_queue == []
+            clock.cooldown_until = 0  # The fixture's cooldown expires.
+            clock._save()
+    # After the existing first retry interval, the same persisted original can
+    # receive its real answer. No generation callback or POST is involved.
+    admission.clock.now = after["recovery_next_at"]
+    assert service.read("owner", "old-0")["content"] == "original answer"
+    assert state.calls == [("GET", "/backend-api/conversation/original")]
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+
+
+@pytest.mark.parametrize("actual_get", [False, True])
+def test_generic_timeout_without_local_wait_proof_keeps_original_backoff(tmp_path, actual_get):
+    from test.test_unknown_turn_recovery import migration
+    from test.test_expired_execution_wait import saved, patch
+
+    service, admission, _, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False,
+          recovery_attempt=9, recovery_next_at=0)
+    def timeout(_receipt):
+        error = TimeoutError("test original timeout")
+        if actual_get:
+            error._original_result_get_attempted = True
+        raise error
+    service.recovery_reader = timeout
+    service.read("owner", "old-0")
+    after = saved(service)
+    assert after["recovery_next_at"] == admission.clock.now + 300
+    assert (after.get("_result_read_capacity_released_at") is not None) is actual_get
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == (0 if actual_get else 1)
+
+
 def seed_image(tmp_path, *, claim="original-claim"):
     images = ImageTaskService(tmp_path / "images.json", generation_handler=lambda *_: pytest.fail("no generation"))
     row = {"id": "original-image", "owner_id": "owner", "status": "error", "mode": "generate",
