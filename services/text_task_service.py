@@ -1433,7 +1433,7 @@ class TextTaskService:
     def _finish_recovery(
         self, owner, request_id, claim_id, recovered=None, error_code=None,
         phase=None, recovery_reason=None, retry_after_seconds=None, *, count_unrecoverable=False,
-        read_error=None, original_result_get_attempted=False,
+        read_error=None, original_result_get_attempted=False, original_result_get_waited=False,
     ):
         now = self._now()
         with self._db() as db:
@@ -1532,13 +1532,35 @@ class TextTaskService:
                     recovery_reason
                     == TextRecoveryReason.REQUEST_CONVERSATION_SCAN_INCOMPLETE.value
                 )
+                waited_before_get = bool(
+                    error_code == "RECOVERY_READ_FAILED"
+                    and completed_read_reason is None
+                    and original_result_get_waited is True
+                    and original_result_get_attempted is False
+                    and read_failure is not None
+                    and read_failure["phase"] == "conversation_detail"
+                    and read_failure["candidate_ref"] is None
+                    and read_failure["category"] == "timeout"
+                    and self._normal_sent_chat_result_recovery(current)
+                    and all(isinstance(current.get(field), str) and current[field].strip()
+                            for field in ("conversation_id", "request_message_id"))
+                )
+                # A local lock/FIFO deadline did not inspect the original.
+                # Retry on the existing first interval instead of penalizing
+                # contention with a high-attempt five-minute read backoff.
+                # Account pacing and explicit Retry-After remain authoritative;
+                # this neither counts an observation nor releases capacity.
+                backoff_attempt = (qualified_reads if qualified_read_recorded
+                                   else 1 if scan_incomplete else attempt)
+                if waited_before_get:
+                    backoff_attempt = 1
                 changes = {
                     **recovered_anchor,
                     "recovery_next_at": now + (
                         retry_after_seconds
                         if retry_after_seconds is not None
                         else self._result_recovery_backoff(
-                            current, qualified_reads if qualified_read_recorded else (1 if scan_incomplete else attempt)
+                            current, backoff_attempt
                         )
                     ),
                     "recovery_error_code": error_code,
@@ -1989,6 +2011,7 @@ class TextTaskService:
                 # Never persist exception text: it may contain a token, prompt,
                 # or provider response. The next bounded recovery window is
                 # enough to make the request retryable without hammering GET.
+                from services.account_request_pacing import AccountRequestDeadlineExceeded
                 recovery_error_code, retry_after_seconds = self._recovery_failure(exc)
                 recovery_error = self._generic_recovery_read_error(exc)
                 result = self._finish_recovery(
@@ -2000,6 +2023,7 @@ class TextTaskService:
                     original_result_get_attempted=(
                         getattr(exc, "_original_result_get_attempted", False) is True
                     ),
+                    original_result_get_waited=isinstance(exc, AccountRequestDeadlineExceeded),
                 )
             finally:
                 recovery_done.set()
