@@ -26,7 +26,8 @@ from PIL import Image
 from services.account_service import account_service
 from services.account_request_pacing import AccountRequestDeadlineExceeded, pace_account_session, retry_after_seconds
 from services.config import config
-from services.request_context import observing_archive_step
+from services.request_context import (observing_archive_step, operation_budget, operation_remaining,
+                                      operation_request_options, current_operation_deadline)
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, is_supported_image_model, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -518,6 +519,7 @@ class OpenAIBackendAPI:
 
     def _image_active_timeout(self, maximum_secs: float) -> float:
         """Cap image preparation/generation work by the persisted deadline."""
+        maximum_secs = operation_remaining(maximum_secs)
         deadline = getattr(getattr(self, "progress_callback", None), "active_deadline_at", None)
         if not isinstance(deadline, (int, float)) or isinstance(deadline, bool) or deadline <= 0:
             return float(maximum_secs)
@@ -529,14 +531,16 @@ class OpenAIBackendAPI:
     def _image_request_options(self, maximum_secs: float) -> dict[str, Any]:
         """Bound waits by the active attempt, then cap the network operation."""
         timeout = self._image_active_timeout(maximum_secs)
-        options = {"timeout": timeout}
+        options = operation_request_options(timeout)
         deadline = getattr(getattr(self, "progress_callback", None), "active_deadline_at", None)
         if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and deadline > 0:
             # A slow account pace must not consume the entire per-HTTP timeout
             # before transport starts. The account clock caps that timeout
             # again at the send edge using the remaining active-attempt budget.
-            options["_account_request_deadline_monotonic"] = time.monotonic() + max(0.0, deadline - time.time())
-            if callable(getattr(self.progress_callback, "record_local_pacing_wait", None)):
+            active_deadline = time.monotonic() + max(0.0, deadline - time.time())
+            options["_account_request_deadline_monotonic"] = min(
+                active_deadline, options.get("_account_request_deadline_monotonic", active_deadline))
+            if current_operation_deadline.get() is None and callable(getattr(self.progress_callback, "record_local_pacing_wait", None)):
                 options["_account_request_local_wait"] = self.progress_callback.record_local_pacing_wait
         return options
 
@@ -1577,6 +1581,11 @@ class OpenAIBackendAPI:
         try:
             ensure_ok(response, path)
             return response.json()
+        except Exception as exc:
+            # Only a received exact-conversation response proves this GET ran.
+            # Pre-send pacing/credential failures must retain their own evidence.
+            exc._original_result_get_attempted = True
+            raise
         finally:
             if _send is not None:
                 response.close()
@@ -1588,6 +1597,7 @@ class OpenAIBackendAPI:
             raise RuntimeError("upstream conversation has no authoritative current_node")
         return parent_message_id
 
+    @operation_budget(60.0)
     def set_conversation_archived(self, conversation_id: str, parent_message_id: str, archived: bool,
                                   *, validate_document=None) -> Dict[str, Any]:
         """Change visibility only after checking the original conversation and cursor."""
@@ -1607,7 +1617,7 @@ class OpenAIBackendAPI:
         with observing_archive_step("patch"):
             response = self.session.patch(self.base_url + path,
                 headers=self._headers(path, {"Accept": "application/json", "Content-Type": "application/json"}),
-                json={"is_archived": archived}, timeout=60)
+                json={"is_archived": archived}, **operation_request_options(60))
         ensure_ok(response, path)
         # A timeout on PATCH is safe to recover by reading this exact chat first.
         with observing_archive_step("readback"):
@@ -2859,7 +2869,7 @@ class OpenAIBackendAPI:
 
         def _remaining() -> float:
             pacing_wait = float(getattr(getattr(self, "progress_callback", None), "local_pacing_wait_secs", 0)) - initial_pacing_wait
-            return timeout_secs - (time.time() - start - pacing_wait)
+            return operation_remaining(timeout_secs - (time.time() - start - pacing_wait))
 
         # Recovery has already read this exact conversation under the account
         # clock. Consume that fresh observation once; a second immediate GET

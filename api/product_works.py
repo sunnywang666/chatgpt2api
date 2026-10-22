@@ -10,10 +10,32 @@ from services.request_context import trusted_source
 from services.work_lifecycle import WorkLifecycleError
 
 
+class ProductFairnessInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    organization_id: str = Field(strict=True, min_length=1, max_length=200)
+    subject_id: str = Field(strict=True, min_length=1, max_length=200)
+    root_workflow_id: str = Field(strict=True, min_length=1, max_length=200)
+
+    @field_validator("organization_id", "subject_id", "root_workflow_id")
+    @classmethod
+    def stable_identity(cls, value):
+        if any(ord(c) < 33 or ord(c) == 127 for c in value):
+            raise ValueError("invalid fairness identity")
+        return value
+
+
 class ProductWorkInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     product_ref: str = Field(strict=True, min_length=1, max_length=200)
     step_ref: str = Field(strict=True, min_length=1, max_length=200)
+    fairness: ProductFairnessInput | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @field_validator("fairness", mode="before")
+    @classmethod
+    def supplied_fairness(cls, value):
+        if value is None:
+            raise ValueError("omit fairness when unavailable")
+        return value
 
     @field_validator("product_ref", "step_ref")
     @classmethod

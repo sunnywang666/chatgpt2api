@@ -18,7 +18,8 @@ from services.config import DATA_DIR, config
 from services.task_store import TaskStore, recovery_control, pending_image_result_ids
 from services.pool_admission import image_result_stage
 from contextlib import contextmanager
-from services.request_context import current_request, AdmissionLost
+from services.request_context import (current_request, AdmissionLost, bounded_lock, operation_budget,
+                                      operation_deadline, operation_remaining)
 from utils.log import logger
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
@@ -1106,7 +1107,7 @@ class ImageTaskService:
             if account_service.get_bound_account_identity(binding) != account:
                 raise ImageThreadError("IMAGE_CONTINUATION_IDENTITY_MISMATCH")
             token = account_service.get_bound_text_access_token(binding, model="auto")
-            with account_service.conversation_binding_lock(binding, client):
+            with bounded_lock(account_service.conversation_binding_lock(binding, client)):
                 if (account_service.get_bound_account_identity(binding) != account
                         or snapshot() != before):
                     raise ImageThreadError("IMAGE_CONTINUATION_IDENTITY_MISMATCH")
@@ -1273,6 +1274,7 @@ class ImageTaskService:
             if backend is not None:
                 backend.close()
 
+    @operation_budget(60.0)
     def set_thread_archived(self, identity: dict[str, object], task_id: str, archived: bool) -> dict[str, Any]:
         """Change only the owner's latest, fully recovered image conversation."""
         from services.account_service import account_service
@@ -1333,6 +1335,7 @@ class ImageTaskService:
     def archive_thread(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
         return self.set_thread_archived(identity, task_id, True)
 
+    @operation_budget(60.0)
     def archive_product_work(self, owner, request_id, archived):
         """Use the original image binding; never synthesize a public image thread."""
         from services.account_service import account_service
@@ -1353,7 +1356,7 @@ class ImageTaskService:
         if account_service.get_bound_account_identity(binding) != task["provider_account_identity"]:
             raise WorkLifecycleError("PRODUCT_WORK_BINDING_CONFLICT")
         token = account_service.get_bound_text_access_token(binding, model="auto")
-        with account_service.conversation_binding_lock(binding, task["client_conversation_id"]):
+        with bounded_lock(account_service.conversation_binding_lock(binding, task["client_conversation_id"])):
             guard()
             backend = OpenAIBackendAPI(access_token=token)
             try:
@@ -2267,6 +2270,10 @@ class ImageTaskService:
         completion_recheck: bool = False,
     ) -> dict[str, Any]:
         """恢复对已超时任务的轮询，额外等待 extra_timeout_secs 秒。"""
+        recovery_budget = float(extra_timeout_secs)
+        if not math.isfinite(recovery_budget):
+            raise ValueError("finite recovery timeout required")
+        recovery_deadline = time.monotonic() + max(0.0, recovery_budget)
         owner = _owner_id(identity)
         key = _task_key(owner, _clean(task_id))
         with self._transaction():
@@ -2349,7 +2356,7 @@ class ImageTaskService:
 
         # 启动新线程继续轮询
         arguments = (key, conversation_id, extra_timeout_secs, base_url, dict(identity), mode, model,
-                     bool(allow_unrecoverable_retry), bool(deadline_expired))
+                     bool(allow_unrecoverable_retry), bool(deadline_expired), recovery_deadline)
         thread = threading.Thread(
             target=self.admission.run_recovery if recovery_context is not None else self._run_resume_poll,
             args=(recovery_context, self._run_resume_poll, arguments) if recovery_context is not None else arguments,
@@ -2686,7 +2693,17 @@ class ImageTaskService:
                 raise AdmissionLost("original image output coverage changed")
             self._update_task(key, _pending_image_output={"output_ref": ref, "coverage": coverage})
 
-    def _run_resume_poll(
+    def _run_resume_poll(self, key, conversation_id, extra_timeout_secs, base_url, identity,
+                         mode, model, allow_unrecoverable_retry, deadline_expired,
+                         recovery_deadline=None):
+        deadline = (time.monotonic() + max(0.0, float(extra_timeout_secs))
+                    if recovery_deadline is None else recovery_deadline)
+        with operation_deadline(deadline):
+            return self._run_resume_poll_bounded(
+                key, conversation_id, extra_timeout_secs, base_url, identity, mode, model,
+                allow_unrecoverable_retry, deadline_expired)
+
+    def _run_resume_poll_bounded(
         self,
         key: str,
         conversation_id: str,
@@ -2791,7 +2808,7 @@ class ImageTaskService:
                 raise error
             # Reading the original task consumes no new generation admission.
             access_token = account_service.get_bound_text_access_token(binding_id, model="auto")
-            with account_service.conversation_binding_lock(binding_id, client_conversation_id):
+            with bounded_lock(account_service.conversation_binding_lock(binding_id, client_conversation_id)):
                 backend = OpenAIBackendAPI(access_token=access_token)
                 def record_pending_ids(files, sediments):
                     pending_ids.update(file_ids=files, sediment_ids=sediments)
@@ -2967,8 +2984,9 @@ class ImageTaskService:
                         # Query before sleeping so a strictly finished original
                         # can proceed immediately. A fallback settle still needs
                         # a NEW observation after the wait, never the pre-wait doc.
+                        extra_timeout_secs = operation_remaining(float(extra_timeout_secs))
                         settle_wait = min(max(0.0, float(config.image_settle_secs)),
-                                          max(0.0, float(extra_timeout_secs)))
+                                          max(0.0, extra_timeout_secs))
                         if settle_wait:
                             time.sleep(settle_wait)
                         extra_timeout_secs = max(0.0, float(extra_timeout_secs) - settle_wait)
@@ -2990,7 +3008,7 @@ class ImageTaskService:
                     )
                     file_ids, sediment_ids = strict_ids if strict_ids is not None else backend._poll_image_results(
                         conversation_id,
-                        extra_timeout_secs,
+                        operation_remaining(extra_timeout_secs),
                         request_message_id=request_message_id,
                         initial_document=document,
                         **pending_options,

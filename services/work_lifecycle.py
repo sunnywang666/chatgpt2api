@@ -5,6 +5,8 @@ It never generates, owns credentials, or replaces an original receipt.
 """
 from __future__ import annotations
 
+from services.request_context import operation_budget
+
 import hashlib
 import json
 import re
@@ -439,6 +441,7 @@ class WorkLifecycleService:
         if admission is not None:
             admission.wake()
 
+    @operation_budget(60.0)
     def _run_claim(self, work, claim, account_key, reservations):
         archive = work["archive"]
         request_id = archive["request_id"]

@@ -339,8 +339,11 @@ curl "$SERVER_ROOT/api/chat-requests/$ORIGINAL_REQUEST_ID/snapshot" \
 `bound_successor_resume_retryable:true`；这只是可执行资格，查询本身不会恢复发送，
 显式恢复入口仍会再次验证原输入与身份。
 
-自动原结果读取仍由 Provider 启动后的 `PoolAdmission` 后台承担：按原 `recovery_next_at`
+自动原结果读取仍由 Provider 启动后的 `PoolAdmission` 后台承担：按有效的 `recovery_next_at`
 和账号读取节奏执行，最多 4 个后台原读，并沿原账号、请求、会话和父消息位置恢复。
+普通已提交 Chat 文字请求的常规退避最长为 300 秒；历史更长间隔按最近更新时间加 300 秒核对，
+公共 `recovery.next_at` 与绑定回执 `recovery_next_at` 返回同一有效时间，不改写原持久记录。
+上游明确的 Retry-After 仍优先保留，暂停、特殊后继和其它受保护路径不被提前读取。
 会话级在途去重与持久恢复租约共同防止重复原读；客户端断开快照查询不会取消该恢复。
 暂停、suppression、已结束的自动恢复预算仍生效；没有后台 worker 的单独服务实例不会因为
 读取快照而自行启动恢复。状态为 `active` 也不表示当前一定有原读在途，应同时看 `in_flight`

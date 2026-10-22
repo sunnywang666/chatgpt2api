@@ -19,6 +19,7 @@ from services.task_store import TaskStore
 from services.pool_admission import PoolAdmission
 from services.request_context import current_request, AdmissionLost
 from services.text_task_service import TextTaskService
+from services.conversation_binding_service import ConversationBindingService
 from services.image_task_service import ImageTaskService
 
 
@@ -1366,6 +1367,113 @@ class AdmissionTests(unittest.TestCase):
         self.assertIsNone(self.admission.claim_next())
         image = self.read("image", "happy", "same-conversation-image")
         self.assertEqual(image["waiting"]["reasons"], ["resource_full"])
+
+    def test_chat_text_and_image_send_edges_follow_completed_read_capacity_marker(self):
+        self.admission.settings = lambda: {
+            "chat_account_concurrency": 1, "image_account_concurrency": 1, "codex_max_concurrency": 4,
+        }
+        self.submit("unreadable-original")
+        original_context = self.admission.claim_next()
+        self.assertEqual(original_context.request_id, "unreadable-original")
+        with self.store.transaction() as db:
+            original = self.store.read_receipt(db, "text", "happy", "unreadable-original")
+            original.update(
+                status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_outcome="unknown",
+                _submission_started=True, _turn_reserved=False, _executing=False,
+                _claim_id=None, _claim_until=None, conversation_id="original-conversation",
+                recovery_attempt=9,
+            )
+            self.store.write_receipt(db, "text", "happy", "unreadable-original", original)
+
+        def unavailable(_receipt):
+            error = ConnectionError("fixture original GET unavailable")
+            error._original_result_get_attempted = True
+            raise error
+
+        self.text.recovery_reader = unavailable
+        self.assertEqual(self.text.read("happy", "unreadable-original")["status"], "unknown")
+        original = self.read("text", "happy", "unreadable-original")
+        self.assertEqual(original["recovery_attempt"], 10)
+        self.assertEqual(original["recovery_next_at"], self.clock.now + 300)
+        self.assertEqual(original["_result_read_capacity_released_at"], self.clock.now)
+        self.assertEqual(self.admission.resource_snapshot()["chat_turn"]["inflight"], 0)
+
+        # The first failed exact GET makes unrelated work sendable immediately;
+        # it does not wait for the next original result read.
+        self.submit("text-pass")
+        text_pass = self.admission.claim_next()
+        self.assertEqual(text_pass.request_id, "text-pass")
+        text_pass.before_send()
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "text", "happy", "text-pass")
+            receipt.update(status="succeeded", upstream_outcome="completed", _attempt_finished_at=self.clock.now,
+                           _executing=False, _turn_reserved=False, _claim_id=None, _claim_until=None)
+            self.store.write_receipt(db, "text", "happy", "text-pass", receipt)
+
+        self.image("image-pass")
+        image_pass = self.admission.claim_next()
+        self.assertEqual((image_pass.kind, image_pass.request_id), ("image", "image-pass"))
+        image_pass.before_send()
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "image", "happy", "image-pass")
+            receipt.update(status="success", upstream_unfinished=False, _executing=False,
+                           _claim_id=None, _claim_until=None)
+            self.store.write_receipt(db, "image", "happy", "image-pass", receipt)
+
+        def progress_reader(content):
+            def read(receipt):
+                request = receipt["request_message_id"]
+                final = "progress-" + content
+                doc = {"conversation_id": receipt["conversation_id"], "current_node": final, "mapping": {
+                    request: {"parent": "parent", "message": {"id": request, "author": {"role": "user"}}},
+                    final: {"parent": request, "message": {"id": final, "author": {"role": "assistant"},
+                        "status": "in_progress", "end_turn": None, "channel": "final",
+                        "content": {"content_type": "text", "parts": [content]}}},
+                }}
+                return ConversationBindingService._read_text_request_result(None, receipt, document=doc)
+            return read
+
+        # Claim an image while the original marker releases its account. A real
+        # identity-safe original node update before POST must fence the image.
+        self.clock.now = original["recovery_next_at"] + 1
+        self.image("image-race")
+        image_race = self.admission.claim_next()
+        self.assertEqual((image_race.kind, image_race.request_id), ("image", "image-race"))
+        self.text.recovery_reader = progress_reader("verified-one")
+        self.assertEqual(self.text.read("happy", "unreadable-original")["status"], "unknown")
+        original = self.read("text", "happy", "unreadable-original")
+        self.assertNotIn("_result_read_capacity_released_at", original)
+        with self.assertRaisesRegex(AdmissionLost, "Chat account capacity changed"):
+            image_race.before_send()
+        image = self.read("image", "happy", "image-race")
+        self.assertFalse(image["_submission_started"])
+        self.assertEqual(image["waiting"]["reasons"], ["chat_capacity_changed"])
+        # Retire this deliberately fenced image before exercising the text edge.
+        with self.store.transaction() as db:
+            image = self.store.read_receipt(db, "image", "happy", "image-race")
+            image.update(status="error", upstream_unfinished=False, _attempt_finished_at=self.clock.now,
+                         _executing=False, _claim_id=None, _claim_until=None)
+            self.store.write_receipt(db, "image", "happy", "image-race", image)
+
+        # The next scheduled read is still bounded to five minutes. Its completed
+        # exact GET failure releases local capacity again; a later
+        # verified node update fences a claimed text request at the same edge.
+        self.clock.now = original["recovery_next_at"] + 1
+        self.text.recovery_reader = unavailable
+        self.assertEqual(self.text.read("happy", "unreadable-original")["status"], "unknown")
+        original = self.read("text", "happy", "unreadable-original")
+        self.assertIn("_result_read_capacity_released_at", original)
+        self.clock.now = original["recovery_next_at"] + 1
+        self.submit("text-race")
+        text_race = self.admission.claim_next()
+        self.assertEqual(text_race.request_id, "text-race")
+        self.text.recovery_reader = progress_reader("verified-two")
+        self.assertEqual(self.text.read("happy", "unreadable-original")["status"], "unknown")
+        with self.assertRaisesRegex(AdmissionLost, "Chat account capacity changed"):
+            text_race.before_send()
+        text = self.read("text", "happy", "text-race")
+        self.assertFalse(text["_submission_started"])
+        self.assertEqual(text["waiting"]["reasons"], ["chat_capacity_changed"])
 
     def test_image_wire_request_does_not_consume_text_worker_budget(self):
         self.admission.text_workers = 1

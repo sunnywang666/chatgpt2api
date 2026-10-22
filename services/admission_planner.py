@@ -137,6 +137,7 @@ class WaitingRequest:
     # receipts leave this unset and retain the owner/sequence ordering below.
     fair_group: str | None = None
     needs: tuple[Need, ...] = () # global worker/memory demands, distinct from Offer
+    fair_subgroup: str | None = None  # existing text/image lanes within a trusted root
 
     def __post_init__(self) -> None:
         for value in (self.source, self.route, self.model, self.operation):
@@ -145,7 +146,7 @@ class WaitingRequest:
         _number(self.ready_at)
         if type(self.payload_saved) is not bool or self.state not in _STATES:
             raise InvalidSnapshot('invalid request state')
-        for value in (self.bound_account, self.order_group, self.fair_group):
+        for value in (self.bound_account, self.order_group, self.fair_group, self.fair_subgroup):
             if value is not None:
                 _name(value)
         _unique_needs(self.needs)
@@ -166,6 +167,7 @@ class Snapshot:
     # One already accepted request may use a temporary second Chat turn. The
     # extra place is never offered to another request or another account.
     scoped_extra_turn: tuple[RequestRef, str] | None = None
+    last_subgroup_by_group: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         _name(self.revision)
@@ -179,7 +181,7 @@ class Snapshot:
         for source, owner in self.last_owner_by_source:
             _name(source)
             _name(owner)
-        for source, group in self.last_group_by_source:
+        for source, group in (*self.last_group_by_source, *self.last_subgroup_by_group):
             _name(source)
             _name(group)
         if self.scoped_extra_turn is not None:
@@ -290,6 +292,11 @@ def _rotate(values: list[str], after: str | None) -> list[str]:
 def fairness_lane(fair_group: str | None) -> str:
     """Return the persisted subgroup cursor without colliding with legacy."""
     return 'legacy' if fair_group is None else 'workflow:' + fair_group
+
+
+def fairness_subgroup_key(source: str, group: str | None) -> str:
+    # Length-prefix the authenticated source; caller root IDs cannot collide.
+    return str(len(source)) + ':' + source + ':' + fairness_lane(group)
 
 
 def choose_next(snapshot: Snapshot, now: float) -> Selection:
@@ -434,10 +441,15 @@ def choose_next(snapshot: Snapshot, now: float) -> Selection:
         for request in source_pending:
             grouped.setdefault(fairness_lane(request.fair_group), []).append(request)
         for lane in _rotate(list(grouped), dict(snapshot.last_group_by_source).get(source)):
-            requests_in_group = sorted(grouped[lane],
-                                       key=lambda r: (owner_position[r.ref.owner], r.sequence, r.ref))
-            for request in requests_in_group:
-                dispatch = select_request(request)
-                if dispatch is not None:
-                    return Selection(dispatch, tuple(deferred), None)
+            subgroups: dict[str, list[WaitingRequest]] = {}
+            for request in grouped[lane]:
+                subgroups.setdefault(fairness_lane(request.fair_subgroup), []).append(request)
+            cursor = fairness_subgroup_key(source, grouped[lane][0].fair_group)
+            for subgroup in _rotate(list(subgroups), dict(snapshot.last_subgroup_by_group).get(cursor)):
+                requests_in_group = sorted(subgroups[subgroup],
+                                           key=lambda r: (owner_position[r.ref.owner], r.sequence, r.ref))
+                for request in requests_in_group:
+                    dispatch = select_request(request)
+                    if dispatch is not None:
+                        return Selection(dispatch, tuple(deferred), None)
     return Selection(None, tuple(deferred), min(wakeups) if wakeups else None)

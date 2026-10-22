@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from services.config import config
+from services.request_context import bounded_lock, operation_remaining
 from services.account_state_lock import AccountStateLock
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
@@ -161,7 +162,7 @@ class AccountService:
             raise RuntimeError("conversation binding unavailable: binding id is required")
         conversation_key = str(client_conversation_id or "").strip()
         lock_key = f"{expected}:{conversation_key}" if conversation_key else expected
-        with self._lock:
+        with bounded_lock(self._lock):
             return self._conversation_binding_locks.setdefault(lock_key, Lock())
 
     def _get_cumulative_file(self) -> Path:
@@ -683,14 +684,14 @@ class AccountService:
             return self._resolve_access_token_locked(access_token)
 
     def _get_account_for_token(self, access_token: str) -> tuple[str, dict | None]:
-        with self._lock:
+        with bounded_lock(self._lock):
             resolved = self._resolve_access_token_locked(access_token)
             account = self._accounts.get(resolved)
             return resolved, self._copy_account(account) if account else None
 
     def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        with self._lock:
+        with bounded_lock(self._lock):
             resolved = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(resolved)
             if current is None:
@@ -766,7 +767,7 @@ class AccountService:
                     "refresh_token": refresh_token,
                     "client_id": (self._CODEX_OAUTH_CLIENT_ID if (account or {}).get("source_type") == "codex" else self._OAUTH_CLIENT_ID),
                 },
-                timeout=timeout,
+                timeout=operation_remaining(timeout),
                 allow_redirects=False,
             )
             data = response.json() if response.text else {}
@@ -793,6 +794,8 @@ class AccountService:
         capacity_observed_at: str | None = None,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
+        # OAuth may already have rotated the refresh token. Finish installing
+        # that successful response even if the original-read budget has expired.
         with self._image_slot_condition:
             old_token = self._resolve_access_token_locked(old_access_token)
             current = self._accounts.get(old_token)
@@ -881,7 +884,7 @@ class AccountService:
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
         if not access_token:
             return ""
-        with self._token_refresh_lock:
+        with bounded_lock(self._token_refresh_lock):
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
                 return access_token
@@ -896,6 +899,8 @@ class AccountService:
             try:
                 token_data = self._request_access_token_refresh(refresh_token, account)
             except Exception as exc:
+                # A caller budget expiry is not a new credential failure.
+                operation_remaining(float("inf"))
                 error_str = str(exc or "")
                 self._record_token_refresh_error(active_token, event, error_str)
                 # 如果是 app_session_terminated 错误，尝试密码重新登录
@@ -1774,7 +1779,7 @@ class AccountService:
         return binding_id, account_identity
 
     def get_bound_account_identity(self, binding_id: str) -> str:
-        with self._lock:
+        with bounded_lock(self._lock):
             access_token = self._bound_token_locked(binding_id)
             return self._provider_account_identity_for_token_locked(access_token)
 
@@ -1825,7 +1830,7 @@ class AccountService:
             from services.model_service import model_catalog_service
 
             route = model_catalog_service.route_for_model(model)
-        with self._lock:
+        with bounded_lock(self._lock):
             access_token = self._bound_token_locked(binding_id)
             account = self._accounts.get(access_token) or {}
             if for_message and self._normalize_account_type(account.get("type")) not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}:
@@ -1851,7 +1856,7 @@ class AccountService:
         if not refreshed:
             raise RuntimeError("conversation binding unavailable: bound account token refresh failed")
         if requested_account_identity:
-            with self._lock:
+            with bounded_lock(self._lock):
                 selected = self._accounts.get(self._resolve_access_token_locked(refreshed)) or {}
                 if (self._stable_account_identity(selected) != requested_account_identity
                         or sum(self._stable_account_identity(a) == requested_account_identity for a in self._accounts.values()) != 1
@@ -1872,7 +1877,7 @@ class AccountService:
         nor changes account state.  It lets durable recovery distinguish a
         known disabled/invalidated bound account from an opaque reader error.
         """
-        with self._lock:
+        with bounded_lock(self._lock):
             try:
                 access_token = self._bound_token_locked(binding_id)
             except RuntimeError:

@@ -2527,6 +2527,7 @@ class TextResultRecoveryTests(unittest.TestCase):
                         get=lambda url, **kwargs: clock.request(raw, "GET", url, **kwargs), close=closed)
                     with (
                         mock.patch("services.conversation_binding_service.time", fake_time),
+                        mock.patch("services.request_context.time", fake_time),
                         mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
                         mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
                         mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
@@ -2605,6 +2606,7 @@ class TextResultRecoveryTests(unittest.TestCase):
                 backend._get_conversation.side_effect = fail
                 with (
                     mock.patch("services.conversation_binding_service.time", SimpleNamespace(monotonic=lambda:now[0])),
+                    mock.patch("services.request_context.time", SimpleNamespace(monotonic=lambda:now[0])),
                     mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-one"),
                     mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="synthetic-token"),
                     mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),

@@ -2054,7 +2054,9 @@ class ImageTaskServiceTests(unittest.TestCase):
                 ) as sleep:
                     service._run_resume_poll("owner-1:pending-task", "conversation-1", 5,
                                              "http://provider", OWNER, "generate", "gpt-image-2", False, False)
-                    sleep.assert_called_once_with(5)
+                    sleep.assert_called_once()
+                    self.assertGreater(sleep.call_args.args[0], 0)
+                    self.assertLessEqual(sleep.call_args.args[0], 5)
                     self.assertEqual(PendingBackend.reads, 1)
                     self.assertEqual(observations, ["read", "sleep"])
                     self.assertEqual(calls, [])
@@ -2717,7 +2719,9 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(task["image_session_id"], "conversation-1")
             self.assertEqual(task["image_session_parent_id"], "message-2")
             self.assertEqual(task["data"], [{"url": "http://content-provider/images/result.png"}])
-            self.assertEqual(FakeBackend.poll_calls, [("conversation-1", 30, "request-message-1")])
+            self.assertEqual([(cid, rid) for cid, _, rid in FakeBackend.poll_calls],
+                             [("conversation-1", "request-message-1")])
+            self.assertTrue(0 < FakeBackend.poll_calls[0][1] <= 30)
             recovered = service._tasks["owner-1:unknown-task"]
             self.assertGreater(recovered["_first_qualified_image_assets_observed_at"], 0)
             self.assertEqual(recovered["_first_qualified_image_asset_id_count"], 1)
@@ -2807,10 +2811,9 @@ class ImageTaskServiceTests(unittest.TestCase):
                     self.assertEqual(task["recovery_error_code"], "RECOVERY_READ_FAILED")
                     self.assertNotIn("status=404", task["error"])
                 else:
-                    self.assertEqual(
-                        FakeBackend.poll_calls,
-                        [("conversation-1", 30, "request-message-1")],
-                    )
+                    self.assertEqual([(cid, rid) for cid, _, rid in FakeBackend.poll_calls],
+                                     [("conversation-1", "request-message-1")])
+                    self.assertTrue(0 < FakeBackend.poll_calls[0][1] <= 30)
 
                 restarted = self.make_service(path)
                 persisted = restarted.list_tasks(OWNER, ["unknown-task"])["items"][0]
