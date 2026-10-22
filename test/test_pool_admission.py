@@ -1204,6 +1204,27 @@ class AdmissionTests(unittest.TestCase):
                 self.assertEqual(saved[key], value)
         self.assertEqual(catalog_calls, [])
 
+    def test_not_started_blocks_its_chain_without_consuming_an_independent_claim(self):
+        session = "not-started-chain"
+        self.submit("not-started", source="shared", client_conversation_id=session)
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "text", "happy", "not-started")
+            receipt["status"] = "not_started"
+            self.store.write_receipt(db, "text", "happy", "not-started", receipt)
+        self.submit("same-chain", source="shared", client_conversation_id=session)
+        self.submit("independent", owner="other", source="shared")
+
+        context = self.admission.claim_next()
+
+        self.assertIsNotNone(context)
+        self.assertEqual(context.request_id, "independent")
+        original = self.read("text", "happy", "not-started")
+        self.assertEqual(original["status"], "not_started")
+        self.assertFalse(original["_submission_started"])
+        self.assertEqual(self.calls, [])
+        self.assertIn("earlier_group_request_unfinished",
+                      self.read("text", "happy", "same-chain")["waiting"]["reasons"])
+
     def test_expired_unsent_worker_releases_execution_marker_for_work_pause(self):
         from services.work_lifecycle import WorkLifecycleService
         self.submit("stopped-unsent", _public_session_ref="session-stopped-unsent")
