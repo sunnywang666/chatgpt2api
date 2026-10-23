@@ -84,6 +84,55 @@
 实际成功结果仍须保存，归档仍使用真正执行过的原会话位置。其它排队、未知或证据变化的成员继续阻止关闭。
 上线须与调用方的原尝试退役逻辑配对，单独部署接口不代表业务已经解堵。
 
+### 显式撤回历史普通未发送文字请求
+
+没有 ProductWork 成员关系的历史普通绑定文字请求，使用
+`POST /api/conversation-bindings/text-requests/{request_id}/cancel-unsent`。
+不能伪造商品成员来调用 `cancel-step`。该入口仅供原 admin 可信内部来源使用，
+owner 与 source 从认证上下文取得；普通查询、CHECK 和排队通知不会触发撤回。
+
+```json
+{
+  "mode": "dry-run",
+  "expected_request_hash": "<Provider 原请求的 64 位小写 SHA256>",
+  "expected_binding": {
+    "provider_binding_id": "<原 binding>",
+    "provider_account_identity": "<原账号身份>",
+    "client_conversation_id": "<原调用方会话>",
+    "conversation_id": "<原物理会话>",
+    "parent_message_id": "<原父节点>"
+  },
+  "reason": "independent_stage_replacement"
+}
+```
+
+`mode` 必须明确为 `dry-run` 或 `apply`，没有默认执行模式。原请求 snapshot 仅在显式
+`?include_cancel_unsent_context=true` 且原可信来源匹配时，给符合条件的原请求提供
+`cancel_unsent_context:{request_hash,source,expected_binding,reason}`；普通 CHECK 不加该参数。
+调用方仍须与自己保存的原任务身份核对。Provider hash 与调用方对 operation/request
+封装计算的 hash 不是同一口径，不能混用。该只读上下文和 dry-run 都不是后续执行许可。
+
+dry-run 返回 `cancel_unsent.mode=dry-run`、`eligible=true` 和核对字段，不写取消证明。
+apply 在与领取共用的 TaskStore 事务内重新核验原 ID、来源、hash、冻结输入及全部绑定。
+任何领取历史（包括过期领取）、发送、UNKNOWN、结果、恢复或后继关系均拒绝。
+领取先完成则撤回失败；撤回先完成则该原请求不能再次领取或发送。
+
+成功及精确重试返回原 `cancelled_unsent` 证明：`request_id`、`source`、`request_hash`、
+`binding`（上述五字段）、`reason`、`cancelled_at`、`code=TEXT_REQUEST_CANCELLED_UNSENT`、
+`upstream_outcome=not_sent`。原请求保持可读，输入和身份不变。
+调用方必须先持久保存并读回该证明，不能只凭 `status=cancelled` 新建替代请求。
+重复同 ID 提交、重启或普通查询不能把它重新排队。此接口不创建替代请求、不修改旧
+UNKNOWN，也不解除旧会话的顺序或物理会话保护；真实替代发送另按原业务授权执行。
+
+错误以 `TEXT_REQUEST_CANCEL_` 为前缀：`INVALID`（400）、`SOURCE_CONFLICT`（403）、
+`NOT_FOUND`（404）、`IDENTITY_CONFLICT`、`NOT_UNSENT`、`PROOF_INVALID`（409）。
+入口不符合可信内部来源要求时沿用 `PRODUCT_WORK_SOURCE_REQUIRED`（403）。
+缺失字段、未知字段或不符合 JSON 模型的值由 FastAPI 返回 422；调用方须将任何非成功响应视为未取得撤回证明。
+
+文字 queued/running 的 `task-notification-v1` 可附加
+`waiting_reasons:["earlier_group_request_unfinished"]`，仅投影已保存且匹配的等待原因。
+不输出其他请求身份或任意错误原文；image、ready 及无匹配原因的通知保持原格式。
+
 ### 已完成商品沿原会话接续
 
 能力响应 `resume=true` 表示支持以下接续；沿用原可信 Workbench 来源和原 `product_ref`，

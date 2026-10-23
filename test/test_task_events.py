@@ -81,6 +81,17 @@ def test_running_to_committed_result_and_revocation(runtime, monkeypatch):
     assert 'event: access_lost' in result.text and 'event: result_ready' not in result.text
 
 
+def test_text_waiting_reason_projects_only_the_allowlisted_group_dependency(runtime):
+    _, put, identity, store = runtime
+    put(kind='text', status='queued', waiting={'reasons': ['private-detail', 'earlier_group_request_unfinished']})
+    state = events._snapshot('text', SimpleNamespace(store=store), identity, 'original')
+    assert state['waiting_reasons'] == ['earlier_group_request_unfinished']
+    put(kind='text', status='queued', waiting={'reasons': ['private-detail']})
+    assert 'waiting_reasons' not in events._snapshot('text', SimpleNamespace(store=store), identity, 'original')
+    put(kind='image', status='queued', waiting={'reasons': ['earlier_group_request_unfinished']})
+    assert 'waiting_reasons' not in events._snapshot('image', SimpleNamespace(store=store), identity, 'original')
+
+
 def test_image_stages_emit_state_changes_without_exposing_assets(runtime, monkeypatch):
     client, put, identity, _ = runtime
     put(status='running', upstream_outcome='unknown', conversation_id='original')

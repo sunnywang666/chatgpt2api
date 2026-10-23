@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -408,6 +409,7 @@ class TextTaskService:
         # A cancellation proof is always recomputed from the request hash and
         # durable ProductWork parent below. Never echo a persisted projection.
         result.pop("cancelled_unsent", None)
+        result.pop("cancel_unsent_context", None)
         # Revalidate owner-scoped HTTP diagnostics on every read.  Receipts can
         # outlive code versions and must never turn arbitrary stored content
         # into a public error message.
@@ -523,7 +525,7 @@ class TextTaskService:
                 "automatic_empty_retry") if key in completion}
         return result
 
-    def _public_with_product_cancellation(self, db, owner, request_hash, receipt):
+    def _public_with_product_cancellation(self, db, owner, request_hash, receipt, *, request_id=None):
         result = self._public(receipt)
         try:
             from services.product_work import cancelled_unsent_public
@@ -532,7 +534,182 @@ class TextTaskService:
             proof = None
         if proof:
             result["cancelled_unsent"] = proof
+        ordinary_proof = self._ordinary_cancel_unsent_public(
+            db, owner, request_hash, receipt, request_id=request_id,
+        )
+        if ordinary_proof:
+            result["cancelled_unsent"] = ordinary_proof
         return result
+
+    _ORDINARY_CANCEL_REASON = "independent_stage_replacement"
+    _ORDINARY_CANCELLED_FIELD = "_ordinary_unsent_cancelled"
+    _ORDINARY_CANCEL_BINDING = (
+        "provider_binding_id", "provider_account_identity", "client_conversation_id",
+        "conversation_id", "parent_message_id",
+    )
+
+    @classmethod
+    def _ordinary_cancel_binding(cls, value):
+        if not isinstance(value, dict) or set(value) != set(cls._ORDINARY_CANCEL_BINDING):
+            return None
+        binding = {field: value.get(field) for field in cls._ORDINARY_CANCEL_BINDING}
+        if any(not isinstance(item, str) or not item.strip() for item in binding.values()):
+            return None
+        return binding
+
+    @classmethod
+    def _ordinary_cancel_input_identity(cls, store, owner, request_hash, receipt, *, request_id=None):
+        binding = cls._ordinary_cancel_binding({field: receipt.get(field) for field in cls._ORDINARY_CANCEL_BINDING})
+        if (not binding or receipt.get("request_id") is None
+                or request_id is not None and receipt.get("request_id") != request_id):
+            return None
+        try:
+            body = store.load_input(receipt["_input_ref"])
+            if (cls._submission_identity(owner, body) != (receipt["request_id"], request_hash)
+                    or cls._ordinary_cancel_binding({field: body.get(field) for field in cls._ORDINARY_CANCEL_BINDING}) != binding
+                    or any(body.get(key) is not None for key in (
+                        "supersedes_request_id", "derived_input", "continue_after_no_final",
+                        "continue_before_queued_image_id",
+                    ))):
+                return None
+        except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
+            return None
+        return binding
+
+    @classmethod
+    def _ordinary_cancel_context(cls, store, db, owner, request_hash, receipt, *, request_id=None):
+        """Return the only narrow ordinary-Chat withdrawal context, if proved.
+
+        The caller pin is derived from the retained immutable input.  It is
+        intentionally stricter than generic unsent recovery: an execution
+        lease, expired claim residue, successor, result or recovery marker
+        means this original is no longer withdrawable.
+        """
+        from services.product_work import _cancel_unsent_eligible
+        binding = cls._ordinary_cancel_input_identity(store, owner, request_hash, receipt, request_id=request_id)
+        if (not binding
+                or receipt.get("_route", "chat") != "chat"
+                or receipt.get("_operation", "text") != "text"
+                or receipt.get("_product_work") or receipt.get("_product_work_key")
+                or receipt.get("_work_key") or receipt.get("_public_session_ref")
+                or receipt.get("_forward_protocol") or receipt.get("_forward")
+                or receipt.get("_source") is None
+                or not _cancel_unsent_eligible(receipt)):
+            return None
+        # Any trace is material, including a completed/expired local claim.
+        if any(key in receipt for key in (
+                "_claim_id", "_claim_until", "_executing", "_account_resource",
+                "_temporary_chat_second_slot", "recovery_claim_id", "recovery_claimed_at",
+                "recovery_lease_until", "_recovery_claim_id", "_recovery_claim_until",
+                "_execution_wait_ended_at", "_attempt_started_at", "_attempt_finished_at",
+        )) or any(key.startswith(("recovery_", "_recovery", "_supersedes", "_codex")) for key in receipt):
+            return None
+        children = db.execute(
+            "SELECT id FROM requests WHERE owner=? AND id<>? AND ("
+            "json_extract(receipt,'$._supersedes_request_id')=? OR "
+            "json_extract(receipt,'$._previous_request_id')=? OR "
+            "json_extract(receipt,'$._completion_of')=? OR "
+            "json_extract(receipt,'$._same_session_retry_of')=? OR "
+            "json_extract(receipt,'$._terminal_empty_correction_of')=? OR "
+            "json_extract(receipt,'$._codex_fallback_of')=? OR "
+            "json_extract(receipt,'$._codex_continue_of')=? OR "
+            "json_extract(receipt,'$._codex_rejected_retry_of')=?) LIMIT 1",
+            (owner, receipt["request_id"], receipt["request_id"], receipt["request_id"],
+             receipt["request_id"], receipt["request_id"], receipt["request_id"], receipt["request_id"],
+             receipt["request_id"], receipt["request_id"]),
+        ).fetchone()
+        if children:
+            return None
+        return {"request_hash": request_hash, "source": receipt["_source"],
+                "expected_binding": binding, "reason": cls._ORDINARY_CANCEL_REASON}
+
+    def _ordinary_cancel_unsent_public(self, db, owner, request_hash, receipt, *, request_id=None):
+        proof = receipt.get(self._ORDINARY_CANCELLED_FIELD)
+        if not isinstance(proof, dict):
+            return None
+        required = {"owner", "source", "request_id", "request_hash", "binding", "reason", "cancelled_at"}
+        if (set(proof) != required or proof.get("owner") != owner
+                or proof.get("request_id") != receipt.get("request_id")
+                or request_id is not None and proof.get("request_id") != request_id):
+            return None
+        binding = self._ordinary_cancel_binding(proof.get("binding"))
+        if (not binding or proof.get("request_hash") != request_hash
+                or proof.get("source") != receipt.get("_source")
+                or proof.get("reason") != self._ORDINARY_CANCEL_REASON
+                or type(proof.get("cancelled_at")) not in (int, float)
+                or not math.isfinite(proof["cancelled_at"])
+                or receipt.get("status") != "cancelled"
+                or receipt.get("error_code") != "TEXT_REQUEST_CANCELLED_UNSENT"
+                or receipt.get("upstream_outcome") != "not_sent"
+                or receipt.get("upstream_unfinished") is not False):
+            return None
+        # Reconstruct the only pre-cancellation state this proof can certify,
+        # then run the same immutable-input, receipt and child-lineage checks
+        # used before applying it. A stale proof can never hide later history.
+        original = dict(receipt)
+        original.pop(self._ORDINARY_CANCELLED_FIELD, None)
+        original.update(status="queued", upstream_outcome="not_sent", upstream_unfinished=False)
+        original.pop("error_code", None)
+        context = self._ordinary_cancel_context(self.store, db, owner, request_hash, original,
+                                                request_id=request_id or proof["request_id"])
+        if not context or context["source"] != proof["source"] or context["expected_binding"] != binding:
+            return None
+        public = {key: proof[key] for key in ("request_id", "source", "request_hash", "reason", "cancelled_at")}
+        public.update(binding=binding, code="TEXT_REQUEST_CANCELLED_UNSENT", upstream_outcome="not_sent")
+        return public
+
+    def cancel_unsent(self, identity, request_id, expected_request_hash, expected_binding, reason, mode):
+        """Withdraw one accepted ordinary Chat original before any claim/send."""
+        from services.product_work import require_product_source
+        from services.work_lifecycle import WorkLifecycleError
+        source = require_product_source(identity)
+        owner = str(identity.get("id") or "")
+        if (mode not in {"dry-run", "apply"} or reason != self._ORDINARY_CANCEL_REASON
+                or not isinstance(expected_request_hash, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected_request_hash)
+                or self._ordinary_cancel_binding(expected_binding) is None):
+            raise WorkLifecycleError("TEXT_REQUEST_CANCEL_INVALID", 400)
+        with self.store.transaction() as db:
+            row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
+            if not row:
+                raise WorkLifecycleError("TEXT_REQUEST_CANCEL_NOT_FOUND", 404)
+            request_hash, encoded = row
+            receipt = json.loads(encoded)
+            proof = self._ordinary_cancel_unsent_public(db, owner, request_hash, receipt, request_id=request_id)
+            if receipt.get(self._ORDINARY_CANCELLED_FIELD):
+                if (not proof or expected_request_hash != request_hash or expected_binding != proof["binding"]
+                        or reason != proof["reason"] or source != proof["source"]):
+                    raise WorkLifecycleError("TEXT_REQUEST_CANCEL_PROOF_INVALID")
+                return {"request_id": request_id, "status": "cancelled", "cancelled_unsent": proof}
+            if receipt.get("_source") != source:
+                raise WorkLifecycleError("TEXT_REQUEST_CANCEL_SOURCE_CONFLICT", 403)
+            if not self._ordinary_cancel_input_identity(self.store, owner, request_hash, receipt,
+                                                        request_id=request_id):
+                raise WorkLifecycleError("TEXT_REQUEST_CANCEL_IDENTITY_CONFLICT")
+            context = self._ordinary_cancel_context(self.store, db, owner, request_hash, receipt,
+                                                    request_id=request_id)
+            if not context:
+                raise WorkLifecycleError("TEXT_REQUEST_CANCEL_NOT_UNSENT")
+            if (expected_request_hash != request_hash or expected_binding != context["expected_binding"]
+                    or reason != context["reason"]):
+                raise WorkLifecycleError("TEXT_REQUEST_CANCEL_IDENTITY_CONFLICT")
+            if mode == "dry-run":
+                return {"request_id": request_id, "status": receipt["status"],
+                        "cancel_unsent": {"mode": "dry-run", "eligible": True,
+                                          "expected_request_hash": request_hash,
+                                          "expected_binding": context["expected_binding"], "reason": reason}}
+            receipt.update(status="cancelled", error_code="TEXT_REQUEST_CANCELLED_UNSENT",
+                           upstream_outcome="not_sent", upstream_unfinished=False,
+                           **{self._ORDINARY_CANCELLED_FIELD: {
+                               "owner": owner, "source": source, "request_id": request_id,
+                               "request_hash": request_hash, "binding": context["expected_binding"],
+                               "reason": reason, "cancelled_at": float(self._now()),
+                           }})
+            self.store.write_receipt(db, "text", owner, request_id, receipt)
+            proof = self._ordinary_cancel_unsent_public(db, owner, request_hash, receipt, request_id=request_id)
+            if not proof:
+                raise WorkLifecycleError("TEXT_REQUEST_CANCEL_PROOF_INVALID")
+            return {"request_id": request_id, "status": "cancelled", "cancelled_unsent": proof}
 
     @staticmethod
     def _cancelled_completion_child(receipt, original):
@@ -1795,7 +1972,8 @@ class TextTaskService:
     def restore_public_session(self, owner: str, request_id: str) -> dict[str, object]:
         return self.set_public_session_archived(owner, request_id, False)
 
-    def read_snapshot(self, owner: str, request_id: str):
+    def read_snapshot(self, owner: str, request_id: str, *, include_cancel_unsent_context: bool = False,
+                      cancel_unsent_source: str | None = None):
         """Return the persisted original without joining its recovery work.
 
         PoolAdmission owns automatic original-result recovery independently of
@@ -1816,10 +1994,22 @@ class TextTaskService:
             # wire file, but it never claims recovery or writes this receipt.
             now = self._now()
             self._correct_historical_codex_request_rejection(receipt, now)
-            return self._local_read_projection(db, owner, row[0], receipt, now)
+            return self._local_read_projection(
+                db, owner, row[0], receipt, now,
+                request_id=request_id,
+                include_cancel_unsent_context=include_cancel_unsent_context,
+                cancel_unsent_source=cancel_unsent_source,
+            )
 
-    def _local_read_projection(self, db, owner, request_hash, receipt, now):
-        result = self._public_with_product_cancellation(db, owner, request_hash, receipt)
+    def _local_read_projection(self, db, owner, request_hash, receipt, now, *, request_id=None,
+                               include_cancel_unsent_context=False,
+                               cancel_unsent_source=None):
+        result = self._public_with_product_cancellation(db, owner, request_hash, receipt, request_id=request_id)
+        if include_cancel_unsent_context:
+            context = self._ordinary_cancel_context(self.store, db, owner, request_hash, receipt,
+                                                    request_id=request_id)
+            if context and context["source"] == cancel_unsent_source:
+                result["cancel_unsent_context"] = context
         # Keep the existing known-unsent eligibility advertisement. Its local
         # input/predecessor proof is observational; the explicit resume endpoint
         # still revalidates it under a writer before admitting any work.
@@ -1856,7 +2046,7 @@ class TextTaskService:
                          # transactionally below, never only in the response.
                          and not self._retire_completed_recovery_claim(dict(receipt), now))
             if self._queued_read_snapshot(receipt) or completed:
-                if receipt.get("_product_unsent_cancelled"):
+                if receipt.get("_product_unsent_cancelled") or receipt.get(self._ORDINARY_CANCELLED_FIELD):
                     return self.read_snapshot(owner, request_id)
                 return self._public(receipt)
         with self._db() as db:
@@ -2055,7 +2245,7 @@ class TextTaskService:
             return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result
         observed = json.loads(row[0])
         result = self._public(observed)
-        if observed.get("_product_unsent_cancelled"):
+        if observed.get("_product_unsent_cancelled") or observed.get(self._ORDINARY_CANCELLED_FIELD):
             result = self.read_snapshot(owner, request_id)
         # This advertisement is a local proof only, never an implicit retry or
         # upstream read. The explicit endpoint revalidates it transactionally.
@@ -2064,7 +2254,8 @@ class TextTaskService:
                 with self._db() as db:
                     current = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
                     if current:
-                        result = self._local_read_projection(db, owner, current[0], json.loads(current[1]), self._now())
+                        result = self._local_read_projection(db, owner, current[0], json.loads(current[1]), self._now(),
+                                                             request_id=request_id)
             except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
                 pass
         return self._authorize_unrecoverable(owner, request_id, result) if allow_unrecoverable_retry else result

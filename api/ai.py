@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from api.product_works import ProductWorkInput, product_identity
 from services.work_lifecycle import WorkLifecycleError
 
@@ -158,6 +160,31 @@ class ConversationBindingTextRequest(BaseModel):
 class TextRequestRecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     allow_unrecoverable_retry: bool = False
+
+
+class CancelUnsentTextBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    provider_binding_id: str = Field(strict=True, min_length=1, max_length=200)
+    provider_account_identity: str = Field(strict=True, min_length=1, max_length=200)
+    client_conversation_id: str = Field(strict=True, min_length=1, max_length=200)
+    conversation_id: str = Field(strict=True, min_length=1, max_length=200)
+    parent_message_id: str = Field(strict=True, min_length=1, max_length=200)
+
+    @field_validator("provider_binding_id", "provider_account_identity", "client_conversation_id",
+                     "conversation_id", "parent_message_id")
+    @classmethod
+    def stable_binding(cls, value):
+        if value != value.strip() or any(ord(char) < 32 for char in value):
+            raise ValueError("invalid conversation binding")
+        return value
+
+
+class CancelUnsentTextRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["dry-run", "apply"]
+    expected_request_hash: str = Field(strict=True, pattern=r"^[0-9a-f]{64}$")
+    expected_binding: CancelUnsentTextBinding
+    reason: Literal["independent_stage_replacement"]
 
 
 class CodexTextFallbackRequest(BaseModel):
@@ -511,12 +538,35 @@ def create_router() -> APIRouter:
         return await run_in_threadpool(text_task_service.read, str(identity.get("id") or "anonymous"), request_id)
 
     @router.get("/api/conversation-bindings/text-requests/{request_id}/snapshot")
-    async def snapshot_bound_text_request(request_id: str, response: Response,
+    async def snapshot_bound_text_request(request_id: str, request: Request, response: Response,
+                                          include_cancel_unsent_context: bool = False,
                                           authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
+        if include_cancel_unsent_context:
+            try:
+                identity = product_identity(identity, request)
+            except WorkLifecycleError as exc:
+                raise HTTPException(status_code=exc.status, detail={"code": exc.code}) from None
         response.headers["Cache-Control"] = "private, no-store"
         return await run_in_threadpool(text_task_service.read_snapshot,
-                                       str(identity.get("id") or "anonymous"), request_id)
+                                       str(identity.get("id") or "anonymous"), request_id,
+                                       include_cancel_unsent_context=include_cancel_unsent_context,
+                                       cancel_unsent_source=identity.get("_trusted_source"))
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/cancel-unsent")
+    async def cancel_unsent_bound_text_request(
+            request_id: str, body: CancelUnsentTextRequest, request: Request,
+            response: Response, authorization: str | None = Header(default=None),
+    ):
+        response.headers["Cache-Control"] = "private, no-store"
+        try:
+            identity = product_identity(require_identity(authorization, request=request), request)
+            return await run_in_threadpool(
+                text_task_service.cancel_unsent, identity, request_id,
+                body.expected_request_hash, body.expected_binding.model_dump(), body.reason, body.mode,
+            )
+        except WorkLifecycleError as exc:
+            raise HTTPException(status_code=exc.status, detail={"code": exc.code}) from None
 
     @router.post("/api/conversation-bindings/text-requests/{request_id}/recovery-control")
     async def control_bound_text_recovery(request_id: str, body: RecoveryControlRequest, response: Response,

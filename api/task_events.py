@@ -87,9 +87,16 @@ def _snapshot(kind, service, identity, request_id):
         status = "unknown"
     retrying_unsent = (_retrying_unsent(receipt) or kind == "image" and _automatic_unsent_image_retry(
         service, receipt, not receipt.get("_work_key") or bool(work and work.get("state") == "active")))
+    waiting_reasons = []
+    if kind == "text" and status in {"queued", "running"}:
+        waiting = receipt.get("waiting")
+        reasons = waiting.get("reasons") if isinstance(waiting, dict) else None
+        if isinstance(reasons, list) and "earlier_group_request_unfinished" in reasons:
+            waiting_reasons.append("earlier_group_request_unfinished")
     return {"protocol": "task-notification-v1", "kind": kind, "request_id": request_id,
             "status": status, "result_ready": ready, "result_count": result_count,
             **({"result_stage": "preparing" if retrying_unsent else image_result_stage(receipt)} if kind == "image" else {}),
+            **({"waiting_reasons": waiting_reasons} if waiting_reasons else {}),
             "retrying_unsent": retrying_unsent,
             "recovering_original": kind == "image" and image_original_recovery_pending(receipt)}
 
