@@ -429,6 +429,54 @@ def test_initial_terminal_skips_handoff_even_when_its_parent_is_a_thought_node()
     assert backend.session.get_calls == [] and backend.session.ws_calls == []
 
 
+@pytest.mark.parametrize("channel,content_type", [
+    ("analysis", "text"), ("commentary", "text"), (None, "thoughts"),
+    (None, "reasoning_recap"), ("final", "thoughts"),
+])
+@pytest.mark.parametrize("phase", ["initial_sse", "ws_catchup"])
+@pytest.mark.parametrize("terminal_shape", ["full_message", "sparse_patch"])
+def test_finished_reasoning_phase_keeps_reading_until_same_turn_final(channel, content_type, phase, terminal_shape):
+    thought = {"v": {"conversation_id": "conversation-1", "message": {
+        "id": "phase-end", "parent": "original-user", "author": {"role": "assistant"},
+        "status": "finished_successfully", "end_turn": True, "channel": channel,
+        "content": {"content_type": content_type, "parts": ["intermediate phase"]},
+    }}}
+    final = {"v": {"conversation_id": "conversation-1", "message": {
+        "id": "actual-final", "parent": "phase-end", "author": {"role": "assistant"},
+        "status": "finished_successfully", "end_turn": True, "channel": "final",
+        "content": {"content_type": "text", "parts": ["complete answer"]},
+    }}}
+
+    def frame(event):
+        return json.dumps({"type": "message", "topic_id": "conversation-turn-turn-1",
+            "payload": {"payload": {"encoded_item": "data: " + json.dumps(event) + "\n" + "data: [DONE]"}}})
+
+    phase_events = [thought]
+    if terminal_shape == "sparse_patch":
+        thought["v"]["message"].update(status="in_progress", end_turn=False)
+        phase_events.append({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "phase-end", "author": {"role": "assistant"},
+            "status": "finished_successfully", "end_turn": True,
+        }}})
+    initial = _initial_events()
+    if phase == "initial_sse":
+        initial.lines[-1:-1] = list(map(_line, phase_events))
+        frames = [frame(final)]
+    else:
+        frames = [*map(frame, phase_events), frame(final)]
+    backend = _backend(initial, frames=frames)
+
+    payloads = list(backend.stream_conversation(prompt="fixture"))
+
+    final_index = next(index for index, payload in enumerate(payloads) if "actual-final" in payload)
+    assert "[DONE]" not in payloads[:final_index]
+    assert payloads.count("[DONE]") == 1
+    assert len(backend.session.post_calls) == 1
+    assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+    assert len(backend.session.ws.sent) == 1
+    assert backend.session.ws.closed is True
+
+
 def test_later_user_branch_never_turns_a_nonterminal_sse_parent_chain_into_original_final():
     backend = _backend(Response([
         _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE", "conversation_id": "conversation-1"}),
@@ -441,6 +489,20 @@ def test_later_user_branch_never_turns_a_nonterminal_sse_parent_chain_into_origi
 
     assert list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))[-1] == "[DONE]"
     assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+
+
+def test_explicit_final_text_update_replaces_same_message_reasoning_phase():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    message = {"id": "phase-node", "parent": "original-user", "author": {"role": "assistant"},
+        "status": "in_progress", "end_turn": False, "channel": "analysis",
+        "content": {"content_type": "thoughts"}}
+    handoff.observe(json.dumps({"message": message}))
+    assert handoff.terminal_seen is False
+    message.update(status="finished_successfully", end_turn=True, channel="final",
+        content={"content_type": "text", "parts": ["complete answer"]})
+    handoff.observe(json.dumps({"message": message}))
+    assert handoff.terminal_seen is True
+    assert len(handoff._message_phases) <= len(handoff._parents)
 
 
 def test_terminal_from_an_old_branch_does_not_suppress_this_turns_handoff():

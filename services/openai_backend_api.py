@@ -141,6 +141,7 @@ class _StreamHandoff:
     invalid: bool = False
     _parents: dict[str, str] = field(default_factory=dict)
     _conflicted_parent_ids: set[str] = field(default_factory=set)
+    _message_phases: dict[str, tuple[bool | None, bool | None]] = field(default_factory=dict)
 
     @staticmethod
     def _clean_id(value: object) -> str:
@@ -160,8 +161,23 @@ class _StreamHandoff:
         return cls._clean_id(event.get("conversation_id") or (
             value.get("conversation_id") if isinstance(value, dict) else ""))
 
-    @staticmethod
-    def _assistant_terminal(message: dict[str, Any]) -> bool:
+    def _assistant_terminal(self, message: dict[str, Any]) -> bool:
+        # A finished reasoning message is not the final answer. Some terminal
+        # patches omit channel/content: retain known phase evidence for the
+        # same bounded parent graph instead of forgetting it on such a patch.
+        message_id = self._clean_id(message.get("id"))
+        channel_final, content_text = self._message_phases.get(message_id, (None, None))
+        if message.get("channel") is not None:
+            channel_final = message["channel"] == "final"
+        content = message.get("content")
+        if isinstance(content, dict) and content.get("content_type") is not None:
+            content_text = content["content_type"] == "text"
+        if message_id in self._parents:
+            self._message_phases[message_id] = (channel_final, content_text)
+        # Unknown legacy fields remain compatible; explicit intermediate
+        # evidence must be replaced by an explicit final/text update.
+        if channel_final is False or content_text is False:
+            return False
         return (message.get("status") == "finished_successfully"
                 and message.get("end_turn") is True
                 and isinstance(message.get("author"), dict)

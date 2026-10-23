@@ -320,14 +320,15 @@ def test_image_http_download_and_confirmation_share_remaining_budget(tmp_path, l
     state.delays["/backend-api/files/original-file/download"] = .10
     state.block = ("GET", blocked_path)
     started = time.monotonic()
-    # The first HTTP response deliberately consumes 100 ms.  A 250 ms total
-    # budget leaves too little real scheduling margin on loaded CI for the
-    # second request to reach this local handler, which tests dispatcher load
-    # rather than shared-deadline behavior.  The recorded send options below
-    # directly prove that the second request receives only the remainder.
-    run_image(images, .50)
+    # The confirmation variant performs three real reads: resolve URL,
+    # download bytes, then (after the private output-file fsync) confirm the
+    # original cursor.  Keep enough elapsed budget for that last local handler
+    # on loaded CI.  The transport assertions below, rather than this margin,
+    # prove that each later send consumes the original operation's remainder.
+    recovery_budget = 1.50
+    run_image(images, recovery_budget)
     elapsed = time.monotonic() - started
-    assert state.blocked.is_set() and .40 <= elapsed < .9
+    assert state.blocked.is_set() and recovery_budget - .30 <= elapsed < recovery_budget + .60
     assert_shared_remaining_transport_budget(state, blocked_path)
     row = image_row(images)
     assert row["status"] == "error" and row["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN"
