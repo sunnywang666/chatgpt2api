@@ -401,6 +401,7 @@ class TextTaskService:
         from services.public_chat_service import project_text_execution
         from utils.upstream_error import safe_upstream_error
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
+        result.pop("recovery_deferred", None)  # This is only a current-call projection.
         if "recovery_next_at" in result:
             # The caller must see the same effective cadence as the dispatcher,
             # including legacy schedules. Preserve the original durable row.
@@ -1795,7 +1796,7 @@ class TextTaskService:
     def restore_public_session(self, owner: str, request_id: str) -> dict[str, object]:
         return self.set_public_session_archived(owner, request_id, False)
 
-    def read_snapshot(self, owner: str, request_id: str):
+    def read_snapshot(self, owner: str, request_id: str, *, _deferred_original_read=False):
         """Return the persisted original without joining its recovery work.
 
         PoolAdmission owns automatic original-result recovery independently of
@@ -1816,7 +1817,12 @@ class TextTaskService:
             # wire file, but it never claims recovery or writes this receipt.
             now = self._now()
             self._correct_historical_codex_request_rejection(receipt, now)
-            return self._local_read_projection(db, owner, row[0], receipt, now)
+            result = self._local_read_projection(db, owner, row[0], receipt, now)
+            if (_deferred_original_read and self._normal_sent_chat_result_recovery(receipt)
+                    and not receipt.get("_recovery_paused") and not receipt.get("_recovery_suppressed")
+                    and self._recovery_due(receipt, now)):
+                result["recovery_deferred"] = True
+            return result
 
     def _local_read_projection(self, db, owner, request_hash, receipt, now):
         result = self._public_with_product_cancellation(db, owner, request_hash, receipt)
@@ -2073,12 +2079,32 @@ class TextTaskService:
 
     def recover(self, owner: str, request_id: str, allow_unrecoverable_retry: bool = False,
                 *, explicit_ended_recheck: bool = False):
-        return self.read(
-            owner, request_id,
-            allow_unrecoverable_retry=bool(allow_unrecoverable_retry),
-            _explicit_ended_recheck=explicit_ended_recheck,
-            _explicit_recovery=True,
-        )
+        def read(original_owner, original_id):
+            # Admission is only a scheduling hint. The original transaction
+            # still rechecks status, pause, due time and recovery-claim owner.
+            return self.read(
+                original_owner, original_id,
+                allow_unrecoverable_retry=bool(allow_unrecoverable_retry),
+                _explicit_ended_recheck=explicit_ended_recheck,
+                _explicit_recovery=True,
+            )
+
+        admit = getattr(self.admission, "read_original_if_ready", None)
+        if callable(admit) and not allow_unrecoverable_retry:
+            with self._db() as db:
+                receipt = self.store.read_receipt(db, "text", owner, request_id)
+            if (receipt and self._normal_sent_chat_result_recovery(receipt)
+                    and not receipt.get("_recovery_paused") and not receipt.get("_recovery_suppressed")
+                    and self._recovery_due(receipt, self._now())
+                    and all(isinstance(receipt.get(field), str) and receipt[field].strip()
+                            for field in ("provider_binding_id", "provider_account_identity",
+                                          "client_conversation_id", "conversation_id", "request_message_id"))):
+                result = admit(owner, request_id, read, receipt)
+                if result is False:
+                    return self.read_snapshot(owner, request_id, _deferred_original_read=True)
+                if result is not NotImplemented:
+                    return result
+        return read(owner, request_id)
 
     def _authorize_unrecoverable(self, owner, request_id, observed):
         if observed.get("recovery_control", {}).get("state") in {"paused", "pausing"}:

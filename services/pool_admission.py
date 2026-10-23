@@ -865,7 +865,7 @@ class PoolAdmission:
             # client retry. Timed waits never occupy execution workers.
             self._event.wait(1.0)
 
-    def _dispatch_original_read(self, kind, owner, request_id, function, receipt):
+    def _acquire_original_read(self, kind, owner, request_id, receipt, *, require_text_reservation=False):
         if self._stop.is_set():
             return False
         # Do not fill the local workers with known pacing waits. The transport
@@ -873,6 +873,10 @@ class PoolAdmission:
         with self._account_guard():
             account = next((a for a in self._rows()
                             if a.get("provider_account_identity") == receipt.get("provider_account_identity")), None)
+        if require_text_reservation and (
+                self.pacing is not None or account is None or account.get("managed_disabled")
+                or account.get("status") in {"禁用", "异常"}):
+            return NotImplemented
         read_owner = "original-result:" + hashlib.sha256(
             (self._original_read_ticket_nonce + "\0" + kind + "\0" + owner + "\0" + request_id).encode()
         ).hexdigest()[:24]
@@ -921,25 +925,52 @@ class PoolAdmission:
                 return False
             self._original_reads.add(key)
 
-        def run():
-            try:
-                with reserving_original_read(read_owner if reserve_text_read else None):
-                    function(owner, request_id)
-            except Exception:
-                pass  # The original handler persists the bounded failure.
-            finally:
-                release_read_ticket()
-                with self._original_read_lock:
-                    self._original_reads.discard(key)
-                    self._original_read_slots.release()
-                self.wake()
-        try:
-            threading.Thread(target=run, name="original-result-io", daemon=True).start()
-        except Exception:
+        def release():
+            release_read_ticket()
             with self._original_read_lock:
                 self._original_reads.discard(key)
                 self._original_read_slots.release()
-            release_read_ticket()
+            self.wake()
+        return read_owner if reserve_text_read else None, release
+
+    @staticmethod
+    def _run_original_read(permit, function, owner, request_id):
+        read_owner, release = permit
+        try:
+            with reserving_original_read(read_owner):
+                return function(owner, request_id)
+        finally:
+            release()
+
+    def read_original_if_ready(self, owner, request_id, function, receipt):
+        """Explicit reads share background FIFO admission before claiming work.
+
+        False means deferred without touching the receipt. NotImplemented
+        retains the legacy recovery path for accounts/adapters this scheduler
+        cannot pre-admit. A dormant FIFO ticket belongs to the original, so a
+        deferred caller must leave it for the background dispatcher to adopt.
+        """
+        permit = self._acquire_original_read("text", owner, request_id, receipt, require_text_reservation=True)
+        if permit is NotImplemented:
+            return NotImplemented
+        if not permit:
+            return False
+        return self._run_original_read(permit, function, owner, request_id)
+
+    def _dispatch_original_read(self, kind, owner, request_id, function, receipt):
+        permit = self._acquire_original_read(kind, owner, request_id, receipt)
+        if not permit:
+            return False
+
+        def run():
+            try:
+                self._run_original_read(permit, function, owner, request_id)
+            except Exception:
+                pass  # The original handler persists the bounded failure.
+        try:
+            threading.Thread(target=run, name="original-result-io", daemon=True).start()
+        except Exception:
+            permit[1]()
             raise
         return True
 

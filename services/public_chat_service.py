@@ -394,6 +394,8 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
         for internal_name, public_name in recovery_mapping.items()
         if receipt.get(internal_name) is not None
     }
+    if receipt.get("recovery_deferred") is True:
+        recovery["deferred"] = True
     if recovery:
         result["recovery"] = recovery
     execution = safe_public_execution(receipt.get("execution"))
