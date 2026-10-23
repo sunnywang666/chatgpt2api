@@ -2,6 +2,7 @@
 import copy
 import json
 import sqlite3
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -403,3 +404,199 @@ def test_existing_saved_success_without_exact_final_proof_keeps_residual_turn(tm
     with service.store.connect() as db:
         saved = service.store.read_receipt(db, "text", "owner", original["request_id"])
     assert saved["_turn_reserved"] is True
+
+
+@pytest.mark.parametrize("entrypoint", ["ordinary", "explicit", "scanner", "scanner_background"])
+def test_expired_saved_success_reader_lease_is_fenced_by_all_recovery_entrypoints(tmp_path, entrypoint):
+    service, admission, backend, legacy = migration(tmp_path)
+    original = legacy[0]
+    now = service.clock.now
+    final = "final-" + original["request_message_id"]
+    service._update(
+        "owner", original["request_id"], status="succeeded", content="legacy saved content",
+        upstream_outcome="completed", error_code=None, finished_at=now - 100,
+        _submission_started=True, _turn_reserved=True, _executing=False,
+        parent_message_id=final,
+    )
+    class ReaderProcessDied(BaseException):
+        pass
+    service.recovery_reader = lambda _receipt: (_ for _ in ()).throw(ReaderProcessDied())
+    # This is an actual ordinary compatibility read: it durably claims the
+    # original, then its process dies before it can call _finish_recovery.
+    with pytest.raises(ReaderProcessDied):
+        service.read("owner", original["request_id"])
+    with service.store.connect() as db:
+        crashed = service.store.read_receipt(db, "text", "owner", original["request_id"])
+    assert crashed["recovery_claim_id"] and crashed["recovery_phase"] == "read_text_request"
+    crashed_claim = crashed["recovery_claim_id"]
+    service.clock.now = crashed["recovery_lease_until"] + 1
+    # Reopen the same SQLite file after the old reader has died. Its late
+    # completion cannot change the newer fenced claim created by this read.
+    reopened = TextTaskService(service.store.path, admission=admission, clock=service.clock)
+    reads = []
+    def reader(receipt):
+        reads.append(receipt["recovery_claim_id"])
+        late_doc = document(receipt)
+        late_doc["mapping"][final]["message"]["content"]["parts"] = ["old reader result"]
+        late = ConversationBindingService._read_text_request_result(backend, receipt, document=late_doc)
+        reopened._finish_recovery("owner", original["request_id"], crashed_claim, late)
+        with reopened.store.connect() as db:
+            assert reopened.store.read_receipt(db, "text", "owner", original["request_id"])["recovery_claim_id"] == reads[0]
+        fresh_doc = document(receipt)
+        fresh_doc["mapping"][final]["message"]["content"]["parts"] = ["legacy saved content"]
+        return ConversationBindingService._read_text_request_result(backend, receipt, document=fresh_doc)
+    reopened.recovery_reader = reader
+
+    if entrypoint == "ordinary":
+        result = reopened.read("owner", original["request_id"])
+    elif entrypoint == "explicit":
+        result = reopened.recover("owner", original["request_id"])
+    else:
+        admission.recoveries["text"] = reopened.read
+        admission.recover_one(background=entrypoint == "scanner_background")
+        if entrypoint == "scanner_background":
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                with reopened.store.connect() as db:
+                    current = reopened.store.read_receipt(db, "text", "owner", original["request_id"])
+                if current.get("status") == "succeeded" and current.get("_turn_reserved") is False:
+                    break
+                time.sleep(0.01)
+        result = reopened.read_snapshot("owner", original["request_id"])
+
+    assert result["status"] == "succeeded" and result["content"] == "legacy saved content"
+    assert len(reads) == 1 and reads[0] != crashed_claim
+    with reopened.store.connect() as db:
+        saved = reopened.store.read_receipt(db, "text", "owner", original["request_id"])
+    assert saved["_turn_reserved"] is False
+    assert saved.get("recovery_claim_id") is None
+    assert saved[TURN_END_EVIDENCE_FIELD]["final_message_id"] == final
+
+
+@pytest.mark.parametrize("field,value", [
+    ("_claim_id", "different-sender"), ("content", "late changed content"),
+    ("parent_message_id", "late-final"), ("provider_binding_id", "late-binding"),
+    ("provider_account_identity", "late-account"), ("client_conversation_id", "late-client"),
+])
+def test_sender_finally_marker_rejects_late_claim_content_cursor_or_identity_change(field, value):
+    receipt = {
+        "status": "succeeded", "content": "exact saved final", "upstream_outcome": "completed",
+        "error_code": None, "_route": "chat", "_operation": "text", "_submission_started": True,
+        "_turn_reserved": True, "_executing": False, "_claim_id": "sender-claim", "_claim_until": 2000,
+        "provider_binding_id": "binding", "provider_account_identity": "account", "client_conversation_id": "client",
+        "conversation_id": "conversation", "request_message_id": "request", "parent_message_id": "final",
+        TURN_END_EVIDENCE_FIELD: {
+            "conversation_id": "conversation", "request_message_id": "request",
+            "final_message_id": "final", "observed_at": 1000,
+        },
+    }
+    recovered = {
+        "provider_binding_id": "binding", "provider_account_identity": "account", "client_conversation_id": "client",
+        TURN_END_EVIDENCE_FIELD: dict(receipt[TURN_END_EVIDENCE_FIELD]),
+    }
+    receipt["_recovered_final_sender"] = TextTaskService._recovered_final_sender_marker(receipt, recovered)
+    receipt[field] = value
+    assert not TextTaskService.retire_recovered_final_after_sender_exit(receipt, "sender-claim")
+    assert receipt["_turn_reserved"] is True
+
+
+def test_marker_saved_before_sender_finally_requires_a_fresh_read_after_sender_crash(tmp_path):
+    service, _, backend, legacy = migration(tmp_path)
+    original = legacy[0]
+    final = "final-" + original["request_message_id"]
+    service._update(
+        "owner", original["request_id"], _submission_started=True, _turn_reserved=True,
+        _executing=True, _claim_id="crashed-sender", _claim_until=service.clock.now + 10,
+    )
+    reads = []
+    def reader(receipt):
+        reads.append(receipt["request_id"])
+        upstream = document(receipt)
+        upstream["mapping"][final]["message"]["content"]["parts"] = ["exact original final"]
+        return ConversationBindingService._read_text_request_result(backend, receipt, document=upstream)
+    service.recovery_reader = reader
+
+    assert service.read("owner", original["request_id"])["content"] == "exact original final"
+    with service.store.connect() as db:
+        saved = service.store.read_receipt(db, "text", "owner", original["request_id"])
+    assert saved["_turn_reserved"] is True and saved["_executing"] is True
+    assert saved["_recovered_final_sender"]["claim_id"] == "crashed-sender"
+
+    service.clock.now = saved["_claim_until"] + 1
+    reopened = TextTaskService(service.store.path, admission=service.admission, clock=service.clock,
+                               recovery_reader=reader)
+    assert reopened.read("owner", original["request_id"])["content"] == "exact original final"
+    with reopened.store.connect() as db:
+        recovered = reopened.store.read_receipt(db, "text", "owner", original["request_id"])
+    assert reads == [original["request_id"], original["request_id"]]
+    assert recovered["_turn_reserved"] is False and recovered["_executing"] is False
+    assert recovered["_claim_id"] is None and "_recovered_final_sender" not in recovered
+
+
+@pytest.mark.parametrize("block", ["missing_binding", "missing_account", "missing_client", "reader_lease", "paused", "suppressed"])
+def test_sender_finally_marker_keeps_reserved_for_missing_identity_or_protected_recovery(block):
+    receipt = {
+        "status": "succeeded", "content": "exact saved final", "upstream_outcome": "completed",
+        "error_code": None, "_route": "chat", "_operation": "text", "_submission_started": True,
+        "_turn_reserved": True, "_executing": False, "_claim_id": "sender-claim", "_claim_until": 2000,
+        "provider_binding_id": "binding", "provider_account_identity": "account", "client_conversation_id": "client",
+        "conversation_id": "conversation", "request_message_id": "request", "parent_message_id": "final",
+        TURN_END_EVIDENCE_FIELD: {
+            "conversation_id": "conversation", "request_message_id": "request",
+            "final_message_id": "final", "observed_at": 1000,
+        },
+    }
+    recovered = {
+        "provider_binding_id": "binding", "provider_account_identity": "account", "client_conversation_id": "client",
+        TURN_END_EVIDENCE_FIELD: dict(receipt[TURN_END_EVIDENCE_FIELD]),
+    }
+    receipt["_recovered_final_sender"] = TextTaskService._recovered_final_sender_marker(receipt, recovered)
+    if block == "missing_binding":
+        receipt.pop("provider_binding_id")
+    elif block == "missing_account":
+        receipt.pop("provider_account_identity")
+    elif block == "missing_client":
+        receipt.pop("client_conversation_id")
+    elif block == "reader_lease":
+        receipt.update(recovery_claim_id="live-reader", recovery_claimed_at=1000,
+                       recovery_lease_until=2000, recovery_phase="read_text_request")
+    elif block == "paused":
+        receipt["_recovery_paused"] = True
+    else:
+        receipt["_recovery_suppressed"] = True
+    assert not TextTaskService.retire_recovered_final_after_sender_exit(receipt, "sender-claim")
+    assert receipt["_turn_reserved"] is True
+
+
+@pytest.mark.parametrize("field", ["provider_binding_id", "provider_account_identity", "client_conversation_id"])
+@pytest.mark.parametrize("saved_success", [False, True])
+def test_original_read_cannot_restore_identity_changed_during_get(tmp_path, field, saved_success):
+    service, _, backend, legacy = migration(tmp_path)
+    original = legacy[0]
+    rid = original["request_id"]
+    final = "final-" + original["request_message_id"]
+    changes = dict(_submission_started=True, _turn_reserved=True, _executing=False)
+    if saved_success:
+        changes.update(status="succeeded", content="saved final", upstream_outcome="completed",
+                       error_code=None, parent_message_id=final)
+    service._update("owner", rid, **changes)
+
+    def reader(receipt):
+        upstream = document(receipt)
+        upstream["mapping"][final]["message"]["content"]["parts"] = ["saved final"]
+        result = ConversationBindingService._read_text_request_result(backend, receipt, document=upstream)
+        with service.store.transaction() as db:
+            current = service.store.read_receipt(db, "text", "owner", rid)
+            current[field] = "changed-during-get"
+            service.store.write_receipt(db, "text", "owner", rid, current)
+        return result
+
+    service.recovery_reader = reader
+    service.read("owner", rid)
+    with service.store.connect() as db:
+        current = service.store.read_receipt(db, "text", "owner", rid)
+    assert current[field] == "changed-during-get"
+    assert current["_turn_reserved"] is True
+    assert current.get("_recovered_final_sender") is None
+    assert current["status"] == ("succeeded" if saved_success else "unknown")
+    assert current.get("content") == ("saved final" if saved_success else None)
