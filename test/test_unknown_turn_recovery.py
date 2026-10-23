@@ -217,3 +217,189 @@ def test_terminal_evidence_must_match_the_original_request(tmp_path, field, valu
     service.recovery_reader = lambda row: recovered
     assert service.read("owner", "old-0")["recovery_error_code"] == "RECOVERY_INVALID_RESULT"
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+
+
+@pytest.mark.parametrize("expired_sender", [False, True])
+def test_exact_recovered_final_retires_original_turn_after_sender_exits_or_expires(tmp_path, expired_sender):
+    service, _, backend, legacy = migration(tmp_path)
+    original = legacy[0]
+    service._update(
+        "owner", original["request_id"], _submission_started=True, _turn_reserved=True,
+        _executing=expired_sender, _claim_id="old-sender", _claim_until=10 if expired_sender else 2000,
+    )
+    doc = document(original)
+    doc["mapping"]["final-" + original["request_message_id"]]["message"]["content"]["parts"] = ["saved original final"]
+    service.recovery_reader = lambda row: ConversationBindingService._read_text_request_result(
+        backend, row, document=doc,
+    )
+
+    result = service.read("owner", original["request_id"])
+    assert result["status"] == "succeeded" and result["content"] == "saved original final"
+    with service.store.connect() as db:
+        saved = service.store.read_receipt(db, "text", "owner", original["request_id"])
+    assert saved["_turn_reserved"] is False
+    assert saved[TURN_END_EVIDENCE_FIELD]["request_message_id"] == original["request_message_id"]
+    if expired_sender:
+        assert saved["_executing"] is False
+        assert saved["_claim_id"] is None and saved["_claim_until"] is None
+    else:
+        # A sender which already ran its finally block keeps only its normal
+        # attribution claim; it is no longer a turn owner.
+        assert saved["_executing"] is False and saved["_claim_id"] == "old-sender"
+    restarted = TextTaskService(service.store.path, admission=service.admission, clock=service.clock,
+                                recovery_reader=lambda _row: (_ for _ in ()).throw(AssertionError("no reread")))
+    assert restarted.read("owner", original["request_id"])["status"] == "succeeded"
+
+
+def test_paused_recovery_success_keeps_original_turn_reserved(tmp_path):
+    service, _, backend, legacy = migration(tmp_path)
+    original = legacy[0]
+    with service.store.transaction() as db:
+        saved = service.store.read_receipt(db, "text", "owner", original["request_id"])
+        saved.update(_submission_started=True, _turn_reserved=True, _executing=False,
+                     recovery_claim_id="current-reader", recovery_claimed_at=900,
+                     recovery_lease_until=1100, recovery_phase="read_text_request",
+                     _recovery_paused=True)
+        service.store.write_receipt(db, "text", "owner", original["request_id"], saved)
+    doc = document(original)
+    doc["mapping"]["final-" + original["request_message_id"]]["message"]["content"]["parts"] = ["saved final"]
+    recovered = ConversationBindingService._read_text_request_result(backend, original, document=doc)
+    safe, error, phase, reason = service._safe_recovery_result(recovered, original)
+    assert error is None
+    assert service._finish_recovery("owner", original["request_id"], "current-reader", safe, error, phase, reason)["status"] == "succeeded"
+    with service.store.connect() as db:
+        saved = service.store.read_receipt(db, "text", "owner", original["request_id"])
+    assert saved["_turn_reserved"] is True and saved["_recovery_paused"] is True
+
+
+def test_existing_saved_success_rechecks_exact_original_before_retiring_residual_turn(tmp_path):
+    service, _, backend, legacy = migration(tmp_path)
+    original = legacy[0]
+    service._update(
+        "owner", original["request_id"], status="succeeded", content="exact original final",
+        upstream_outcome="completed", error_code=None, finished_at=900,
+        _submission_started=True, _turn_reserved=True, _executing=False,
+        _claim_id="retained-attribution", _claim_until=2000,
+        _attempt_finished_at=850,
+        parent_message_id="final-" + original["request_message_id"],
+    )
+    doc = document(original)
+    doc["mapping"]["final-" + original["request_message_id"]]["message"]["content"]["parts"] = ["exact original final"]
+    service.recovery_reader = lambda row: ConversationBindingService._read_text_request_result(
+        backend, row, document=doc,
+    )
+
+    repaired = service.read("owner", original["request_id"])
+    assert repaired["status"] == "succeeded" and repaired["content"] == "exact original final"
+    with service.store.connect() as db:
+        saved = service.store.read_receipt(db, "text", "owner", original["request_id"])
+    assert saved["_turn_reserved"] is False
+    assert saved[TURN_END_EVIDENCE_FIELD]["request_message_id"] == original["request_message_id"]
+
+
+@pytest.mark.parametrize("initial_status", ["unknown", "succeeded"])
+def test_historical_terminal_proof_cannot_replace_this_read_proof(tmp_path, initial_status):
+    service, _, backend, legacy = migration(tmp_path)
+    original = legacy[0]
+    final = "final-" + original["request_message_id"]
+    historical = {
+        "conversation_id": original["conversation_id"],
+        "request_message_id": original["request_message_id"],
+        "final_message_id": final,
+        "observed_at": 800,
+    }
+    service._update(
+        "owner", original["request_id"], status=initial_status,
+        content="saved original final" if initial_status == "succeeded" else None,
+        upstream_outcome="completed" if initial_status == "succeeded" else "unknown",
+        error_code=None if initial_status == "succeeded" else "CONVERSATION_OUTCOME_UNKNOWN",
+        finished_at=900 if initial_status == "succeeded" else None,
+        _submission_started=True, _turn_reserved=True, _executing=False,
+        _attempt_finished_at=850 if initial_status == "succeeded" else None,
+        parent_message_id=final,
+        **{TURN_END_EVIDENCE_FIELD: historical},
+    )
+    # This is a nonempty recovered answer, but it deliberately lacks the
+    # current exact-branch proof.  A historical receipt proof cannot retire
+    # either the UNKNOWN or already-succeeded reservation.
+    service.recovery_reader = lambda row: {
+        "status": "succeeded", "binding_status": "bound",
+        "conversation_id": row["conversation_id"], "parent_message_id": final,
+        "content": "saved original final",
+    }
+
+    result = service.read("owner", original["request_id"])
+    assert result["status"] == "succeeded" and result["content"] == "saved original final"
+    with service.store.connect() as db:
+        saved = service.store.read_receipt(db, "text", "owner", original["request_id"])
+    assert saved["_turn_reserved"] is True
+    assert saved[TURN_END_EVIDENCE_FIELD] == historical
+
+
+@pytest.mark.parametrize("case", ["live_sender", "newer_recovery_claim", "wrong_identity", "content_mismatch", "parent_mismatch"])
+def test_nonempty_recovered_final_never_retires_protected_or_mismatched_turn(tmp_path, case):
+    service, _, backend, legacy = migration(tmp_path)
+    original = legacy[0]
+    final = "final-" + original["request_message_id"]
+    service._update(
+        "owner", original["request_id"], _submission_started=True, _turn_reserved=True,
+        _executing=case == "live_sender", _claim_id="live-sender" if case == "live_sender" else None,
+        _claim_until=2000 if case == "live_sender" else None,
+        status="succeeded" if case in {"content_mismatch", "parent_mismatch"} else "unknown",
+        content="saved content" if case == "content_mismatch" else "fresh recovered final" if case == "parent_mismatch" else None,
+        upstream_outcome="completed" if case in {"content_mismatch", "parent_mismatch"} else "unknown",
+        error_code=None if case in {"content_mismatch", "parent_mismatch"} else "CONVERSATION_OUTCOME_UNKNOWN",
+        finished_at=900 if case in {"content_mismatch", "parent_mismatch"} else None,
+        parent_message_id="older-final" if case == "parent_mismatch" else final if case == "content_mismatch" else None,
+    )
+    doc = document(original)
+    doc["mapping"][final]["message"]["content"]["parts"] = ["fresh recovered final"]
+    if case == "wrong_identity":
+        doc["mapping"][final]["message"]["id"] = "wrong-final"
+    if case == "newer_recovery_claim":
+        def reader(row):
+            with service.store.transaction() as db:
+                saved = service.store.read_receipt(db, "text", "owner", original["request_id"])
+                saved.update(recovery_claim_id="newer-reader", recovery_claimed_at=900,
+                             recovery_lease_until=1100)
+                service.store.write_receipt(db, "text", "owner", original["request_id"], saved)
+            return ConversationBindingService._read_text_request_result(backend, row, document=doc)
+        service.recovery_reader = reader
+    else:
+        service.recovery_reader = lambda row: ConversationBindingService._read_text_request_result(
+            backend, row, document=doc,
+        )
+
+    result = service.read("owner", original["request_id"])
+    with service.store.connect() as db:
+        saved = service.store.read_receipt(db, "text", "owner", original["request_id"])
+    assert saved["_turn_reserved"] is True
+    if case == "newer_recovery_claim":
+        assert result["status"] == "unknown" and saved["recovery_claim_id"] == "newer-reader"
+    elif case == "content_mismatch":
+        assert result["status"] == "succeeded" and result["content"] == "saved content"
+        assert saved["parent_message_id"] == final
+    elif case == "parent_mismatch":
+        assert result["status"] == "succeeded" and saved["parent_message_id"] == "older-final"
+    else:
+        assert result["status"] == ("succeeded" if case == "live_sender" else "unknown")
+
+
+def test_existing_saved_success_without_exact_final_proof_keeps_residual_turn(tmp_path):
+    service, _, backend, legacy = migration(tmp_path)
+    original = legacy[0]
+    service._update(
+        "owner", original["request_id"], status="succeeded", content="legacy saved content",
+        upstream_outcome="completed", error_code=None, finished_at=900,
+        _submission_started=True, _turn_reserved=True, _executing=False,
+    )
+    doc = document(original)
+    doc["mapping"]["final-" + original["request_message_id"]]["message"]["content"]["parts"] = []
+    service.recovery_reader = lambda row: ConversationBindingService._read_text_request_result(
+        backend, row, document=doc,
+    )
+
+    assert service.read("owner", original["request_id"])["status"] == "succeeded"
+    with service.store.connect() as db:
+        saved = service.store.read_receipt(db, "text", "owner", original["request_id"])
+    assert saved["_turn_reserved"] is True
