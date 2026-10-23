@@ -23,6 +23,112 @@ def raw(service, kind="text", owner="owner", rid="old-0"):
         return service.store.read_receipt(db, kind, owner, rid)
 
 
+def released_original(tmp_path, proof):
+    from test.test_stalled_text_diagnostics import incomplete_reader, stalled
+
+    service, admission, backend, _ = migration(tmp_path)
+    service._update("owner", "old-0", _submission_started=True,
+                    _turn_reserved=False, _executing=False)
+    if proof == "stalled":
+        stalled(service, admission, backend)
+    else:
+        service.recovery_reader = incomplete_reader(backend)
+        service.read("owner", "old-0")
+        admission.clock.now += TextTaskService.RECOVERY_LEASE_SECONDS + 1
+
+        def unavailable(_receipt):
+            error = ConnectionError("synthetic original GET unavailable")
+            error._original_result_get_attempted = True
+            raise error
+
+        service.recovery_reader = unavailable
+        service.read("owner", "old-0")
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    return service, admission, backend
+
+
+@pytest.mark.parametrize("proof", ["stalled", "unreadable"])
+def test_pause_keeps_proven_capacity_released_without_recovery_or_same_chat_send(tmp_path, monkeypatch, proof):
+    from services.public_chat_service import project_text_execution
+    from services.work_lifecycle import _blocked
+    from test.test_expired_execution_wait import waiter
+    from test.test_pool_admission import build
+
+    service, admission, _ = released_original(tmp_path, proof)
+    monkeypatch.setattr("services.public_chat_service.time.time", lambda: admission.clock.now)
+    original = raw(service)
+    control = service.store.set_recovery_paused("text", "owner", "old-0", True)
+    paused = raw(service)
+    assert {k: v for k, v in paused.items() if not k.startswith("_recovery_")} == original
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert project_text_execution(paused)["resources"]["account_turn"] == "released"
+    assert _blocked(paused)  # No permission to close/archive the unresolved work.
+    assert not service._incomplete_compact_successor_source(paused, admission.clock.now)
+    assert not service._no_final_successor_source(paused, admission.clock.now)
+
+    _, _, restarted_admission = build(tmp_path, admission.clock)
+    reader, runner = Mock(), Mock()
+    restarted = TextTaskService(service.path, admission=restarted_admission,
+                                clock=admission.clock, recovery_reader=reader, runner=runner)
+    restarted_admission.recoveries["text"] = restarted.read
+    admission.clock.now += 301
+    assert restarted.read("owner", "old-0")["status"] == "unknown"
+    assert restarted.recover("owner", "old-0", True)["status"] == "unknown"
+    restarted_admission.recover_one()
+    reader.assert_not_called()
+    runner.assert_not_called()
+    assert raw(restarted) == paused
+    assert restarted_admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    waiter(restarted, "same-chat", "client-0")
+    assert restarted_admission.claim_next() is None
+    waiter(restarted, "independent", "independent")
+    assert restarted_admission.claim_next().request_id == "independent"
+    assert restarted.store.set_recovery_paused("text", "owner", "old-0", False,
+                                               expected_version=control["version"])["state"] == "active"
+
+
+@pytest.mark.parametrize("progress", [False, True])
+def test_pause_during_stalled_read_keeps_only_unchanged_capacity_proof(tmp_path, progress):
+    from test.test_stalled_text_diagnostics import incomplete_reader
+
+    service, admission, backend = released_original(tmp_path, "stalled")
+
+    def read_and_pause(receipt):
+        service.store.set_recovery_paused("text", "owner", "old-0", True)
+        transform = (lambda _doc, message: message["content"].update(parts=["verified progress"])) if progress else None
+        return incomplete_reader(backend, transform)(receipt)
+
+    service.recovery_reader = read_and_pause
+    admission.clock.now += 301
+    assert service.read("owner", "old-0")["status"] == "unknown"
+    paused = raw(service)
+    assert paused["_recovery_paused"] is True
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == (1 if progress else 0)
+    assert ("_result_wait_ended_at" in paused) is not progress
+    service.recovery_reader = Mock()
+    admission.clock.now += 301
+    service.recover("owner", "old-0", True)
+    service.recovery_reader.assert_not_called()
+
+
+def test_paused_capacity_proof_keeps_progress_grace_and_rejects_invalid_controls(tmp_path):
+    service, admission, _ = released_original(tmp_path, "unreadable")
+    original = raw(service)
+    progress = original["_result_observation_started_at"]
+    marker = original["_result_read_capacity_released_at"]
+    paused = {**original, "_recovery_paused": True,
+              "_result_read_capacity_released_at": progress + 1}
+    # Pausing cannot shorten the original progress grace. Clock passage alone
+    # can mature the same proof, exactly as it would without a pause.
+    assert not service._bounded_unreadable_result_capacity_boundary(paused, progress + 59)
+    assert service._bounded_unreadable_result_capacity_boundary(paused, marker)
+    for changes in ({"_recovery_paused": 1}, {"_recovery_paused": "paused"},
+                    {"_recovery_suppressed": True}, {"_executing": True},
+                    {"_result_read_capacity_released_at": None}):
+        assert not service._bounded_unreadable_result_capacity_boundary(
+            {**paused, **changes}, admission.clock.now)
+
+
 def complete(receipt):
     doc = document(receipt)
     doc["mapping"]["final-" + receipt["request_message_id"]]["message"]["content"]["parts"] = ["saved original"]

@@ -1169,12 +1169,12 @@ class TextTaskService:
         }
 
     @staticmethod
-    def _bounded_chat_wait(receipt):
+    def _bounded_chat_wait(receipt, *, allow_paused=False):
         return (receipt.get("_route", "chat") == "chat"
                 and receipt.get("_operation", "text") == "text"
                 and not receipt.get("_forward_protocol")
                 and receipt.get("_recovery_suppressed") is not True
-                and receipt.get("_recovery_paused") is not True)
+                and (allow_paused or receipt.get("_recovery_paused") is not True))
 
     @classmethod
     def _qualified_stalled_incomplete_capacity_boundary(cls, receipt, now):
@@ -1184,6 +1184,8 @@ class TextTaskService:
         terminal result, alter the receipt, release its physical conversation,
         or change recovery cadence. A fresh original observation that progresses
         clears the persisted wait marker before this predicate is consulted.
+        Pausing further reads does not invalidate this independent capacity
+        proof; the default wait/continuation paths still reject paused work.
         """
         if type(now) not in (int, float) or not math.isfinite(now) or now <= 0:
             return False
@@ -1197,7 +1199,7 @@ class TextTaskService:
                               and ("upstream_outcome" not in receipt
                                    or receipt.get("upstream_outcome") == "not_sent"
                                    and receipt.get("_submission_started") is True))
-        if (not cls._bounded_chat_wait(receipt)
+        if (not cls._bounded_chat_wait(receipt, allow_paused=True)
                 or receipt.get("status") != "unknown"
                 or receipt.get("recovery_reason") != TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
                 or not unresolved_outcome
@@ -1211,7 +1213,9 @@ class TextTaskService:
             return False
         if (receipt.get("_upstream_terminal") is not None and receipt.get("_upstream_terminal") is not False
                 or any(receipt.get(field) is not None and receipt.get(field) is not False
-                       for field in ("_recovery_suppressed", "_recovery_paused", "_forward_protocol"))):
+                       for field in ("_recovery_suppressed", "_forward_protocol"))
+                or receipt.get("_recovery_paused") is not None
+                and type(receipt["_recovery_paused"]) is not bool):
             return False
         # Old durable Chat rows omitted route/operation; preserve that existing
         # Chat/text default while rejecting any explicit incompatible value.
@@ -1282,6 +1286,8 @@ class TextTaskService:
         state nor a continuation/successor proof. Subsequent exact-read leases
         consume only the recovery reader resource; they do not reclaim the
         generation slot that the completed failed read already released.
+        A read pause preserves this proof, including its progress grace, but
+        cannot substitute for a completed exact-result GET failure.
         """
         if type(now) not in (int, float) or not math.isfinite(now) or now <= 0:
             return False
@@ -1290,7 +1296,7 @@ class TextTaskService:
                               and ("upstream_outcome" not in receipt
                                    or receipt.get("upstream_outcome") == "not_sent"
                                    and receipt.get("_submission_started") is True))
-        if (not cls._bounded_chat_wait(receipt)
+        if (not cls._bounded_chat_wait(receipt, allow_paused=True)
                 or receipt.get("status") != "unknown"
                 or not unresolved_outcome
                 or receipt.get("_attempt_finished_at") is not None
@@ -1304,7 +1310,9 @@ class TextTaskService:
             return False
         if (receipt.get("_upstream_terminal") is not None and receipt.get("_upstream_terminal") is not False
                 or any(receipt.get(field) is not None and receipt.get(field) is not False
-                       for field in ("_recovery_suppressed", "_recovery_paused", "_forward_protocol"))):
+                       for field in ("_recovery_suppressed", "_forward_protocol"))
+                or receipt.get("_recovery_paused") is not None
+                and type(receipt["_recovery_paused"]) is not bool):
             return False
         if receipt.get("_route", "chat") != "chat" or receipt.get("_operation", "text") != "text":
             return False

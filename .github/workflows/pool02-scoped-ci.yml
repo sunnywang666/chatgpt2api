@@ -45,6 +45,7 @@ on:
       - services/product_work.py
       - services/task_store.py
       - services/text_task_service.py
+      - services/public_chat_service.py
       - services/openai_backend_api.py
       - services/model_service.py
       - services/workflow_scheduling.py
@@ -56,6 +57,7 @@ on:
       - test/test_background_original_reads.py
       - test/test_pool_admission.py
       - test/test_stalled_text_diagnostics.py
+      - test/test_recovery_control.py
       - test/test_image_metadata_refresh_liveness.py
       - test/test_product_work.py
       - test/test_rejected_chat_successor.py
@@ -127,6 +129,7 @@ jobs:
             test/test_pool_admission.py \
             test/test_auth_tls_verification.py \
             test/test_stalled_text_diagnostics.py \
+            test/test_recovery_control.py \
             test/test_original_operation_budget.py \
             test/test_product_compact_successor.py \
             test/test_product_fairness.py \
