@@ -510,6 +510,190 @@ def released_original(recovery, request_id, account=0, next_at=0, conversation=N
                           recovery_next_at=next_at, **changes)
 
 
+def explicit_original(recovery, request_id, account=0, **changes):
+    return recovery.original(request_id, account, _submission_started=True,
+                             _turn_reserved=False, _executing=False, upstream_outcome="unknown",
+                             request_message_id="message-" + request_id, **changes)
+
+
+def prepare_explicit_recovery(recovery, monkeypatch):
+    from services import account_request_pacing as pacing
+    from services.config import config
+    r = recovery
+    r.text.admission = r.admission
+    r.admission.pacing = None
+    monkeypatch.setattr(pacing, "DATA_DIR", r.store.path.parent)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    monkeypatch.setattr(pacing.time, "monotonic", r.clock)
+    monkeypatch.setattr(pacing.time, "time", r.clock)
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 45))
+    monkeypatch.setattr(type(config), "account_conversation_read_burst", property(lambda _: 1))
+    calls = []
+
+    def reader(receipt):
+        account = receipt["provider_account_identity"].replace("account-", "upstream-")
+        _, clock = pacing._clock_for_account(account)
+        def send(method, *_args, **_kwargs):
+            calls.append((method, receipt["request_id"]))
+            return SimpleNamespace(status_code=200, headers={})
+        clock.request(send, "GET", "https://provider/conversation/" + receipt["conversation_id"])
+        return {**receipt, "status": "succeeded", "binding_status": "bound",
+                "parent_message_id": "final-" + receipt["request_id"], "content": "original final"}
+    r.text.recovery_reader = reader
+    r.admission.recoveries["text"] = r.text.read
+    return pacing, calls
+
+
+def test_explicit_recover_defers_without_claim_and_background_adopts_same_fifo_ticket(recovery, monkeypatch):
+    from services.public_chat_service import project_public_chat_receipt
+    r = recovery
+    explicit_original(r, "waiting-original", recovery_attempt=8)
+    explicit_original(r, "same-account")
+    explicit_original(r, "other-account", 1)
+    pacing, calls = prepare_explicit_recovery(r, monkeypatch)
+    _, clock = pacing._clock_for_account("upstream-0")
+    clock.request(lambda *_a, **_k: SimpleNamespace(status_code=200, headers={}),
+                  "GET", "https://provider/conversation/previous")
+    with r.store.connect() as db:
+        before = db.execute("SELECT request_hash,receipt FROM requests WHERE id=?", ("waiting-original",)).fetchone()
+    for _ in range(3):
+        result = r.text.recover("owner", "waiting-original", explicit_ended_recheck=True)
+        assert result["recovery_deferred"] is True
+        assert project_public_chat_receipt(result)["recovery"]["deferred"] is True
+    ticket = list(clock.ordinary_read_queue)
+    assert len(ticket) == 1
+    assert r.text.recover("owner", "same-account")["recovery_deferred"] is True
+    assert clock.ordinary_read_queue == ticket  # No second dormant ticket or queue jump.
+    with r.store.connect() as db:
+        assert db.execute("SELECT request_hash,receipt FROM requests WHERE id=?", ("waiting-original",)).fetchone() == before
+    assert not calls and not r.admission._original_reads
+    assert r.text.recover("owner", "other-account")["content"] == "original final"
+    assert calls == [("GET", "other-account")]
+
+    finished = threading.Event()
+    monkeypatch.setattr(r.admission, "wake", finished.set)
+    r.clock.now += 45
+    r.admission.recover_one(background=True)
+    assert finished.wait(2)
+    result = r.text.read_snapshot("owner", "waiting-original")
+    assert result["status"] == "succeeded" and result["content"] == "original final"
+    assert "recovery_deferred" not in result
+    assert calls == [("GET", "other-account"), ("GET", "waiting-original")]
+    assert not r.admission._original_reads
+
+
+def test_explicit_and_background_recovery_share_physical_read_exclusion(recovery, monkeypatch):
+    r = recovery
+    receipt = explicit_original(r, "shared-original")
+    _, calls = prepare_explicit_recovery(r, monkeypatch)
+    acquired, finished = threading.Event(), threading.Event()
+    def background(owner, request_id):
+        acquired.set()
+        assert r.release.wait(2)
+        return r.text.read(owner, request_id)
+    monkeypatch.setattr(r.admission, "wake", finished.set)
+    assert r.admission._dispatch_original_read("text", "owner", "shared-original", background, receipt)
+    assert acquired.wait(1)
+    assert r.text.recover("owner", "shared-original")["recovery_deferred"] is True
+    assert calls == []
+    r.release.set()
+    assert finished.wait(2)
+    assert r.text.read_snapshot("owner", "shared-original")["status"] == "succeeded"
+    assert calls == [("GET", "shared-original")] and not r.admission._original_reads
+
+
+@pytest.mark.parametrize("change", [
+    {"status": "succeeded", "content": "already saved"},
+    {"_recovery_paused": True},
+    {"recovery_claim_id": "other-reader", "recovery_lease_until": 1100},
+])
+def test_explicit_read_revalidates_receipt_after_admission(recovery, monkeypatch, change):
+    r = recovery
+    explicit_original(r, "changed-original")
+    pacing, calls = prepare_explicit_recovery(r, monkeypatch)
+    original_read = r.text.read
+    def changed(owner, request_id, **kwargs):
+        r.text._update(owner, request_id, **change)
+        return original_read(owner, request_id, **kwargs)
+    monkeypatch.setattr(r.text, "read", changed)
+    result = r.text.recover("owner", "changed-original")
+    assert result["status"] == change.get("status", "unknown")
+    assert calls == [] and not r.admission._original_reads
+    assert not pacing._clock_for_account("upstream-0")[1].ordinary_read_queue
+
+
+@pytest.mark.parametrize("change", [
+    {"status": "succeeded", "content": "saved concurrently"},
+    {"_recovery_paused": True},
+    {"_recovery_suppressed": True},
+    {"recovery_claim_id": "other-reader", "recovery_lease_until": 1100},
+    {"_attempt_finished_at": 900},
+])
+def test_deferred_projection_rechecks_latest_state_without_writing(recovery, monkeypatch, change):
+    r = recovery
+    explicit_original(r, "deferred-race")
+    _, calls = prepare_explicit_recovery(r, monkeypatch)
+    changed = []
+    def defer(*_args):
+        r.text._update("owner", "deferred-race", **change)
+        with r.store.connect() as db:
+            changed.append(db.execute("SELECT receipt FROM requests WHERE id='deferred-race'").fetchone())
+        return False
+    monkeypatch.setattr(r.admission, "read_original_if_ready", defer)
+    result = r.text.recover("owner", "deferred-race")
+    assert "recovery_deferred" not in result
+    with r.store.connect() as db:
+        assert db.execute("SELECT receipt FROM requests WHERE id='deferred-race'").fetchone() == changed[0]
+    assert calls == []
+
+
+def test_explicit_claim_busy_releases_admitted_fifo_and_local_slot(recovery, monkeypatch):
+    import sqlite3
+    from services.text_task_service import TextRecoveryLeaseBusy
+    r = recovery
+    explicit_original(r, "busy-original")
+    pacing, calls = prepare_explicit_recovery(r, monkeypatch)
+    connect = r.text.store._connect
+    def bounded_connect(**kwargs):
+        db = connect(**kwargs)
+        db.execute("PRAGMA busy_timeout=10")
+        return db
+    monkeypatch.setattr(r.text.store, "_connect", bounded_connect)
+    with sqlite3.connect(r.store.path) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        with pytest.raises(TextRecoveryLeaseBusy):
+            r.text.recover("owner", "busy-original")
+    assert not calls and not r.admission._original_reads
+    assert not pacing._clock_for_account("upstream-0")[1].ordinary_read_queue
+    assert r.text.recover("owner", "busy-original")["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("legacy", ["ended", "allow_unrecoverable", "no_admission", "custom_pacing", "missing_account", "disabled"])
+def test_explicit_admission_preserves_legacy_recovery_modes(recovery, monkeypatch, legacy):
+    r = recovery
+    explicit_original(r, "legacy-original")
+    prepare_explicit_recovery(r, monkeypatch)
+    if legacy == "ended":
+        r.text._update("owner", "legacy-original", _attempt_finished_at=900,
+                       _attempt_reason="ORIGINAL_RESULT_NO_FINAL", recovery_reason="REQUEST_RESULT_NOT_FOUND")
+    elif legacy == "no_admission":
+        r.text.admission = None
+    elif legacy == "custom_pacing":
+        r.admission.pacing = lambda *_: {"next_at": 9999}
+    elif legacy == "missing_account":
+        monkeypatch.setattr(r.admission, "_rows", lambda: [])
+    elif legacy == "disabled":
+        monkeypatch.setattr(r.admission, "_rows", lambda: [{"provider_account_identity": "account-0", "managed_disabled": True}])
+    read = Mock(return_value={"status": "unknown", "legacy_path": True})
+    monkeypatch.setattr(r.text, "read", read)
+    assert r.text.recover("owner", "legacy-original", legacy == "allow_unrecoverable",
+                          explicit_ended_recheck=True)["legacy_path"] is True
+    assert read.call_count == 1
+    assert read.call_args.kwargs["_explicit_ended_recheck"] is True
+    assert read.call_args.kwargs["allow_unrecoverable_retry"] == (legacy == "allow_unrecoverable")
+
+
 def test_same_scan_rechecks_priority_and_serves_released_originals_in_due_order(recovery):
     r = recovery
     released_original(r, "newer-released", next_at=900)
