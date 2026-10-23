@@ -653,10 +653,11 @@ def create_router() -> APIRouter:
         try:
             owner = str(identity.get("id") or "anonymous")
             payload = body.model_dump(mode="python", exclude_unset=True)
-            if payload.get("continue_after_incomplete") is True:
-                raise ConversationBindingError("incomplete continuation is not a resume-unsent authorization",
-                                               code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
-            if payload.get("derived_input") in ({"kind": "attributes_required_only_v4"}, {"kind": "combined_copy_compact_v1"}):
+            # Incomplete children must already exist and pass the service's
+            # strict known-unsent proof. Only no-final families can admit an
+            # absent ID and therefore need a new-input review here.
+            if (payload.get("continue_after_incomplete") is not True
+                    and payload.get("derived_input") in ({"kind": "attributes_required_only_v4"}, {"kind": "combined_copy_compact_v1"})):
                 if payload.get("client_request_id") != request_id or text_task_service.admission is None:
                     raise ConversationBindingError("original successor envelope required", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
                 existing = await run_in_threadpool(text_task_service.validate_submission, owner, payload)

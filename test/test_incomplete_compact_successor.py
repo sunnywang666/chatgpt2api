@@ -4,7 +4,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from pydantic import ValidationError
@@ -84,9 +84,10 @@ def incomplete(task):
     return install_incomplete(task)
 
 
-def patch_bound_runner(monkeypatch, h, *, before_send_change=None):
+def patch_bound_runner(monkeypatch, h, *, before_send_change=None, before_send_document=None, before_send_once=False):
     import services.conversation_binding_service as binding
     calls = []
+    pending_change = [before_send_change]
     class Backend:
         def __init__(self, access_token):
             assert access_token == "fixture-token"
@@ -110,14 +111,22 @@ def patch_bound_runner(monkeypatch, h, *, before_send_change=None):
     monkeypatch.setattr(binding, "OpenAIBackendAPI", Backend)
     def events(backend, **kwargs):
         assert kwargs["conversation_id"] == h.body["conversation_id"]
-        assert kwargs["parent_message_id"] == "active"
-        if before_send_change:
-            h.document = incomplete_document(h.old, change=before_send_change)
+        parent_message_id = h.document["current_node"]
+        assert kwargs["parent_message_id"] == parent_message_id
+        if before_send_document is not None:
+            h.document = deepcopy(before_send_document)
+        elif pending_change[0]:
+            h.document = incomplete_document(h.old, change=pending_change[0])
+            if before_send_once:
+                pending_change[0] = None
         backend.text_pre_send_check(None)
+        # Match the real runner boundary: the durable admission context must
+        # still permit the POST after the second live original-result read.
+        current_request.get().before_send()
         calls.append("send")
         request_id = backend.text_request_message_id
-        h.document["mapping"]["active"]["children"] = [request_id]
-        h.document["mapping"][request_id] = {"parent": "active", "children": ["successor-answer"], "message": {
+        h.document["mapping"][parent_message_id]["children"] = [request_id]
+        h.document["mapping"][request_id] = {"parent": parent_message_id, "children": ["successor-answer"], "message": {
             "id": request_id, "author": {"role": "user"}, "status": "finished_successfully",
             "end_turn": True, "content": {"content_type": "text", "parts": ["compact request"]}}}
         h.document["mapping"]["successor-answer"] = {"parent": request_id, "children": [], "message": {
@@ -226,7 +235,7 @@ def test_incomplete_compact_successor_accepts_heartbeat_only_before_send(incompl
     assert calls == ["read", "read", "send", "read"]
 
 
-def test_incomplete_mode_is_closed_idempotent_and_never_resume_unsent(incomplete):
+def test_incomplete_mode_is_closed_idempotent_and_rejects_queued_resume(incomplete):
     h = incomplete
     first = h.service.submit("owner", h.envelope)
     assert h.service.submit("owner", h.envelope) == first
@@ -316,3 +325,330 @@ def test_qualified_incomplete_successor_keeps_original_planner_position(incomple
     # Projection cannot rewrite the receipt's accepted ordering or lineage.
     assert row(h.service, "successor")["_sequence"] == saved["_sequence"]
     assert row(h.service, "successor")["_supersedes_request_id"] == "old"
+
+
+
+def request_hash(service, request_id):
+    with service.store.connect() as db:
+        return db.execute(
+            "SELECT request_hash FROM requests WHERE owner=? AND id=?", ("owner", request_id)
+        ).fetchone()[0]
+
+
+def failed_unsent_incomplete_successor(h, monkeypatch):
+    """Reach the real second guard, fail before POST, then restore its live input."""
+    original_document = deepcopy(h.document)
+    calls = patch_bound_runner(monkeypatch, h, before_send_change="progress", before_send_once=True)
+    h.service.submit("owner", h.envelope)
+    context = h.admission.claim_next()
+    assert context and context.request_id == "successor"
+    h.admission.execute(context)
+    failed = row(h.service, "successor")
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "CHAT_SUPERSEDE_CURSOR_CHANGED"
+    assert failed["upstream_outcome"] == "not_sent"
+    assert failed["_submission_started"] is False
+    assert "send" not in calls
+    h.document = original_document
+    calls.clear()
+    return failed, calls
+
+
+def finished_thought_document(original, *, channel=None, recipient=None,
+                              metadata_channel=None, is_complete=None):
+    """A still-running original with a completed analysis segment at its leaf."""
+    document = incomplete_document(original)
+    active = document["mapping"]["active"]
+    active["children"] = ["finished"]
+    message = {
+        "id": "finished", "author": {"role": "assistant"},
+        "status": "finished_successfully", "end_turn": False,
+        "content": {"content_type": "thoughts", "thoughts": [{
+            "summary": "completed", "content": "completed thought", "finished": True, "chunks": [],
+        }]},
+        "update_time": 11,
+    }
+    if channel is not None:
+        message["channel"] = channel
+    if recipient is not None:
+        message["recipient"] = recipient
+    if metadata_channel is not None or is_complete is not None:
+        metadata = {}
+        if metadata_channel is not None:
+            metadata["channel"] = metadata_channel
+        if is_complete is not None:
+            metadata["is_complete"] = is_complete
+        message["metadata"] = metadata
+    document["mapping"]["finished"] = {"parent": "active", "children": [], "message": message}
+    document["current_node"] = "finished"
+    return document
+
+
+def save_incomplete_observation(h, document):
+    """Store the same redacted node metrics that the two live guards compare."""
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        observed = ConversationBindingService._read_text_request_result(None, original, document=document)
+        assert observed["status"] == "running"
+        assert observed["recovery_reason"] == "REQUEST_RESULT_INCOMPLETE"
+        original["_original_result_observation"] = observed["_original_result_observation"]
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+    h.old = row(h.service)
+    h.document = document
+
+
+def test_incomplete_known_unsent_snapshot_and_read_advertise_without_mutation(incomplete, monkeypatch):
+    h = incomplete
+    failed, calls = failed_unsent_incomplete_successor(h, monkeypatch)
+    before = deepcopy(failed)
+
+    snapshot = h.service.read_snapshot("owner", "successor")
+    ordinary = h.service.read("owner", "successor")
+
+    for result in (snapshot, ordinary):
+        assert result["status"] == "failed"
+        assert result["bound_successor_resume_retryable"] is True
+        assert result["upstream_outcome"] == "not_submitted"
+        assert result["upstream_submission_started"] is False
+        assert result["continue_after_incomplete"] is True
+    assert row(h.service, "successor") == before
+    assert h.admission.claim_next() is None
+    assert calls == []
+
+
+@pytest.mark.parametrize("changes", [
+    {"send_count": 1},
+    {"status": "unknown", "upstream_outcome": "unknown", "recovery_next_at": 1100.0},
+])
+def test_incomplete_resume_advertisement_hides_sent_or_unknown_receipt(incomplete, monkeypatch, changes):
+    h = incomplete
+    failed_unsent_incomplete_successor(h, monkeypatch)
+    update(h.service, "successor", **changes)
+    before = deepcopy(row(h.service, "successor"))
+
+    snapshot = h.service.read_snapshot("owner", "successor")
+    ordinary = h.service.read("owner", "successor")
+
+    assert "bound_successor_resume_retryable" not in snapshot
+    assert "bound_successor_resume_retryable" not in ordinary
+    assert row(h.service, "successor") == before
+
+
+@pytest.mark.parametrize("finished_tail", [False, True])
+def test_incomplete_known_unsent_resumes_once_after_restart_without_changing_identity(incomplete, monkeypatch, finished_tail):
+    h = incomplete
+    if finished_tail:
+        save_incomplete_observation(h, finished_thought_document(h.old))
+    failed, calls = failed_unsent_incomplete_successor(h, monkeypatch)
+    frozen_input = h.service.store.load_input(failed["_input_ref"])
+    frozen_hash = request_hash(h.service, "successor")
+    original_before = deepcopy(row(h.service, "old"))
+
+    resumed = h.service.resume_unsent_successor("owner", "successor", h.envelope)
+
+    assert resumed["status"] == "queued"
+    queued = row(h.service, "successor")
+    assert queued["_bound_successor_resume_count"] == 1
+    assert queued["_bound_successor_resume_failure"]["error_code"] == "CHAT_SUPERSEDE_CURSOR_CHANGED"
+    for key in ("request_id", "request_message_id", "_input_ref", "_supersedes_request_id",
+                "_supersedes_input_hash", "_sequence", "provider_binding_id",
+                "provider_account_identity", "conversation_id", "client_conversation_id"):
+        assert queued[key] == failed[key]
+    assert h.service.store.load_input(queued["_input_ref"]) == frozen_input
+    assert request_hash(h.service, "successor") == frozen_hash
+    assert row(h.service, "old") == original_before
+
+    _, store, restarted = build(h.root, h.clock)
+    service = TextTaskService(store.path, runner=h.service.runner, clock=h.clock, admission=restarted)
+    restarted.register("text", lambda ctx, body: service._run(ctx.owner, ctx.request_id, body))
+    assert service.resume_unsent_successor("owner", "successor", h.envelope)["status"] == "queued"
+    context = restarted.claim_next()
+    assert context and context.request_id == "successor"
+    restarted.execute(context)
+
+    succeeded = row(service, "successor")
+    assert succeeded["status"] == "succeeded"
+    assert succeeded["_submission_started"] is True and succeeded["_last_sent_sequence"] == 0
+    assert succeeded["request_message_id"] == failed["request_message_id"]
+    assert service.store.load_input(succeeded["_input_ref"]) == frozen_input
+    assert request_hash(service, "successor") == frozen_hash
+    assert calls == ["read", "read", "send", "read"]
+    assert service.resume_unsent_successor("owner", "successor", h.envelope)["status"] == "succeeded"
+    assert calls == ["read", "read", "send", "read"]
+    assert restarted.claim_next() is None
+    assert row(service, "old") == original_before
+
+
+@pytest.mark.parametrize("changes", [
+    {"_claim_id": "live", "_claim_until": 1001.0},
+    {"send_count": 1},
+    {"_last_sent_sequence": 0},
+    {"_sequence": 0},
+    {"_submission_started": True},
+    {"status": "running"},
+    {"status": "unknown"},
+])
+def test_incomplete_resume_rejects_claim_send_or_sequence_ambiguity(incomplete, monkeypatch, changes):
+    h = incomplete
+    failed_unsent_incomplete_successor(h, monkeypatch)
+    update(h.service, "successor", **changes)
+    before = deepcopy(row(h.service, "successor"))
+
+    with pytest.raises(ConversationBindingError) as error:
+        h.service.resume_unsent_successor("owner", "successor", h.envelope)
+
+    assert error.value.code == "CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE"
+    assert row(h.service, "successor") == before
+    assert h.admission.claim_next() is None
+
+
+@pytest.mark.parametrize("mutation", ["input_hash", "parent_late_result"])
+def test_incomplete_resume_rejects_changed_frozen_or_parent_proof(incomplete, monkeypatch, mutation):
+    h = incomplete
+    failed_unsent_incomplete_successor(h, monkeypatch)
+    if mutation == "input_hash":
+        with h.service.store.transaction() as db:
+            db.execute("UPDATE requests SET request_hash='changed' WHERE owner=? AND id=?", ("owner", "successor"))
+    else:
+        update(h.service, "old", status="succeeded", content="late answer", upstream_outcome="completed")
+    before = deepcopy(row(h.service, "successor"))
+
+    with pytest.raises(ConversationBindingError):
+        h.service.resume_unsent_successor("owner", "successor", h.envelope)
+
+    assert row(h.service, "successor") == before
+    assert h.admission.claim_next() is None
+
+
+@pytest.mark.parametrize("channel,recipient,metadata_channel,is_complete", [
+    (None, None, None, None),
+    ("analysis", "all", "analysis", None),
+    (None, None, None, True),
+])
+def test_completed_thought_tail_can_continue_when_the_whole_branch_is_still_incomplete(
+        incomplete, monkeypatch, channel, recipient, metadata_channel, is_complete):
+    h = incomplete
+    document = finished_thought_document(h.old, channel=channel, recipient=recipient,
+                                         metadata_channel=metadata_channel, is_complete=is_complete)
+    save_incomplete_observation(h, document)
+    calls = patch_bound_runner(monkeypatch, h)
+
+    h.service.submit("owner", h.envelope)
+    h.admission.execute(h.admission.claim_next())
+
+    assert row(h.service, "successor")["status"] == "succeeded"
+    assert calls == ["read", "read", "send", "read"]
+
+
+def invalid_finished_tail(original, kind):
+    document = finished_thought_document(original)
+    tail = document["current_node"]
+    message = document["mapping"][tail]["message"]
+    if kind == "final":
+        message.update(status="finished_successfully", end_turn=True,
+                       content={"content_type": "text", "parts": ["answer"]})
+    elif kind == "tool":
+        message["author"] = {"role": "tool"}
+    elif kind == "code":
+        message["content"] = {"content_type": "code", "text": "x"}
+    elif kind == "end_turn":
+        message["end_turn"] = True
+    elif kind == "channel":
+        message["channel"] = "final"
+    elif kind == "recipient":
+        message["recipient"] = "tool"
+    elif kind == "metadata_final":
+        message["metadata"] = {"channel": "final"}
+    elif kind == "children":
+        document["mapping"][tail]["children"] = ["later"]
+        document["mapping"]["later"] = {"parent": tail, "children": [], "message": {
+            "id": "later", "author": {"role": "user"}, "status": "finished_successfully",
+            "end_turn": True, "content": {"content_type": "text", "parts": ["later"]}}}
+    elif kind == "missing_finished":
+        message["content"]["thoughts"][0]["finished"] = False
+    elif kind == "no_active_ancestor":
+        document = incomplete_document(original)
+        message = document["mapping"]["active"]["message"]
+        message.update(status="finished_successfully", end_turn=False)
+        message["content"]["thoughts"][0].update(content="completed thought", finished=True)
+    else:
+        raise AssertionError(kind)
+    return document
+
+
+@pytest.mark.parametrize("stage", ["initial", "pre_send"])
+@pytest.mark.parametrize("kind", ["final", "tool", "code", "end_turn", "channel", "recipient",
+                                    "metadata_final", "children", "missing_finished", "no_active_ancestor"])
+def test_completed_thought_tail_rejects_final_or_branch_changes_at_both_live_guards(
+        incomplete, monkeypatch, stage, kind):
+    h = incomplete
+    good = finished_thought_document(h.old)
+    save_incomplete_observation(h, good)
+    bad = invalid_finished_tail(h.old, kind)
+    if stage == "initial":
+        h.document = bad
+        calls = patch_bound_runner(monkeypatch, h)
+    else:
+        calls = patch_bound_runner(monkeypatch, h, before_send_document=bad)
+
+    h.service.submit("owner", h.envelope)
+    h.admission.execute(h.admission.claim_next())
+
+    failed = row(h.service, "successor")
+    assert failed["status"] == "failed"
+    assert failed["error_code"] in {"CHAT_SUPERSEDE_CURSOR_CHANGED", "CHAT_SUPERSEDE_ORIGINAL_FOUND"}
+    assert failed["upstream_outcome"] == "not_sent"
+    assert "send" not in calls
+
+
+@pytest.mark.parametrize("stage", ["initial", "pre_send"])
+@pytest.mark.parametrize("change", ["progress", "branch"])
+def test_incomplete_resume_rechecks_late_progress_or_branch_at_both_live_guards(incomplete, monkeypatch, stage, change):
+    h = incomplete
+    failed_unsent_incomplete_successor(h, monkeypatch)
+    if stage == "initial":
+        h.document = incomplete_document(h.old, change=change)
+        calls = patch_bound_runner(monkeypatch, h)
+    else:
+        calls = patch_bound_runner(monkeypatch, h, before_send_change=change)
+    h.service.resume_unsent_successor("owner", "successor", h.envelope)
+    h.admission.execute(h.admission.claim_next())
+
+    failed = row(h.service, "successor")
+    assert failed["status"] == "failed"
+    assert failed["error_code"] == "CHAT_SUPERSEDE_CURSOR_CHANGED"
+    assert failed["upstream_outcome"] == "not_sent"
+    assert "send" not in calls
+
+
+def test_incomplete_resume_endpoint_is_admin_only_existing_only_and_has_no_review(incomplete, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    import api.ai as api
+
+    h = incomplete
+    failed_unsent_incomplete_successor(h, monkeypatch)
+    app = FastAPI()
+    app.include_router(api.create_router())
+    monkeypatch.setattr(api, "text_task_service", h.service)
+    monkeypatch.setattr(api, "require_identity", lambda token: {
+        "id": "owner", "role": "admin" if token == "internal" else "user",
+    })
+    monkeypatch.setattr(api, "require_chat_text_policy", lambda _: None)
+    review = AsyncMock()
+    monkeypatch.setattr(api, "filter_or_log", review)
+    submit = Mock(side_effect=AssertionError("incomplete resume must not create a new submit"))
+    monkeypatch.setattr(h.service, "submit", submit)
+    url = "/api/conversation-bindings/text-requests/successor/resume-unsent-successor"
+
+    with TestClient(app) as client:
+        assert client.post(url, json=h.envelope).status_code == 501
+        first = client.post(url, json=h.envelope, headers={"Authorization": "internal"})
+        assert first.status_code == 200 and first.json()["status"] == "queued", first.text
+        missing = client.post(url.replace("/successor/", "/absent/"),
+                              json={**h.envelope, "client_request_id": "absent"},
+                              headers={"Authorization": "internal"})
+        assert missing.status_code == 409
+        assert missing.json()["detail"]["code"] == "CHAT_REQUEST_NOT_FOUND"
+    assert submit.call_count == 0
+    assert review.await_count == 0

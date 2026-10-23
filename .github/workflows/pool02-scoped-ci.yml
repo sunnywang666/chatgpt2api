@@ -28,6 +28,8 @@ on:
       - test/test_original_operation_budget.py
       - test/test_product_compact_successor.py
       - test/test_incomplete_compact_successor.py
+      - test/test_plain_unsent_successor_resume.py
+      - test/test_unsent_category_successor.py
       - test/test_product_fairness.py
       - test/test_product_work_api.py
       - test/test_product_work_admission.py
@@ -157,6 +159,8 @@ jobs:
             test/test_non_text_recovery.py \
             test/test_image_thread_continuity.py \
             test/test_incomplete_compact_successor.py \
+            test/test_plain_unsent_successor_resume.py \
+            test/test_unsent_category_successor.py \
             test/test_conversation_continuation.py \
             test/test_recovery_scan_progress.py \
             test/test_reconcile_queued_successor.py \
