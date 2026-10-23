@@ -61,6 +61,63 @@ _SAFE_STREAM_HANDOFF_STAGES = frozenset({
 _EXPIRED_UNSENT_BEFORE_SEND = object()
 
 
+def _verified_current_incomplete_leaves(text_rows):
+    """Return sent compact-successor leaves safe to keep in the contributor lane.
+
+    This is intentionally a receipt-snapshot check, not the full supersede
+    validator.  Original-result reads must remain available after the child
+    has already been sent even when its parent is no longer eligible to send.
+    Missing immutable lineage evidence therefore fails closed to released
+    history priority without changing recovery eligibility or making a send.
+    """
+    from services.text_task_service import TextTaskService
+
+    receipts = {}
+    hashes = {}
+    descendants = {}
+    for owner, request_id, request_hash, receipt in text_rows:
+        key = (owner, request_id)
+        receipts[key] = receipt
+        hashes[key] = request_hash
+        for field in ("_supersedes_request_id", "_codex_fallback_of"):
+            parent_id = receipt.get(field)
+            if isinstance(parent_id, str) and parent_id:
+                descendants.setdefault((owner, parent_id), set()).add(request_id)
+
+    verified = set()
+    for (owner, request_id), successor in receipts.items():
+        parent_id = successor.get("_supersedes_request_id")
+        audit = successor.get("_derived_input")
+        if (not TextTaskService._normal_sent_chat_result_recovery(successor)
+                or successor.get("_supersedes_incomplete") is not True
+                or successor.get("_supersedes_no_final") is True
+                or not isinstance(parent_id, str) or not parent_id
+                or not isinstance(audit, dict)
+                or audit.get("kind") != "combined_copy_compact_v1"):
+            continue
+        parent_key = (owner, parent_id)
+        parent = receipts.get(parent_key)
+        parent_hash = hashes.get(parent_key)
+        successor_hash = successor.get("_supersedes_input_hash")
+        original_hash = audit.get("original_input_hash")
+        if (parent is None
+                or parent.get("request_id") != parent_id
+                or successor.get("request_id") != request_id
+                or not all(isinstance(value, str) and value
+                           for value in (parent_hash, successor_hash, original_hash))
+                or parent_hash != successor_hash
+                or successor_hash != original_hash
+                or not TextTaskService._supersede_order_link(parent, successor)
+                # Any owner-scoped competing child or descendant makes this
+                # no longer the current compact leaf.  Do not infer which one
+                # should receive an expedited original read.
+                or descendants.get(parent_key) != {request_id}
+                or descendants.get((owner, request_id))):
+            continue
+        verified.add((owner, request_id))
+    return frozenset(verified)
+
+
 def _safe_stream_handoff_event_metadata(extra):
     """Persist only fixed continuation progress, never endpoint or payload data."""
     stage = extra.get("handoff_stage")
@@ -1000,9 +1057,12 @@ class PoolAdmission:
             # Recovery needs all text lineage to recognize a transferred empty
             # root, but must keep the existing status prefilter for potentially
             # large, completed image payloads.
-            text_receipts = [("text", owner, request_id, json.loads(raw))
-                             for owner, request_id, raw in db.execute(
-                                 "SELECT owner,id,receipt FROM requests")]
+            text_rows = [(owner, request_id, request_hash, json.loads(raw))
+                         for owner, request_id, request_hash, raw in db.execute(
+                             "SELECT owner,id,request_hash,receipt FROM requests")]
+            verified_current_incomplete_leaves = _verified_current_incomplete_leaves(text_rows)
+            text_receipts = [("text", owner, request_id, receipt)
+                             for owner, request_id, _request_hash, receipt in text_rows]
             image_receipts = [("image", receipt["owner_id"], receipt["id"], receipt)
                               for _, raw in db.execute(
                                   "SELECT task_key,receipt FROM image_requests WHERE "
@@ -1056,11 +1116,14 @@ class PoolAdmission:
                     pass  # Original read handlers retain bounded retry evidence.
                 return
         if background:
-            self._dispatch_recovery_candidates(candidates.values(), transferred_empty_turns, now)
+            self._dispatch_recovery_candidates(
+                candidates.values(), transferred_empty_turns, now,
+                verified_current_incomplete_leaves=verified_current_incomplete_leaves)
         if not background and lifecycle is not None:
             lifecycle.process_one(background=True)
 
-    def _dispatch_recovery_candidates(self, candidates, transferred_empty_turns, now):
+    def _dispatch_recovery_candidates(self, candidates, transferred_empty_turns, now,
+                                      *, verified_current_incomplete_leaves=frozenset()):
         from services.text_task_service import TextTaskService
 
         def recovery_priority(candidate):
@@ -1089,7 +1152,8 @@ class PoolAdmission:
             stalled = TextTaskService._qualified_stalled_incomplete_capacity_boundary(receipt, now)
             return 0 if (active and (owner, request_id) not in transferred_empty_turns
                          and not original_turn_ended(kind, receipt)
-                         and not wait_ended and not released and not stalled) else 1
+                         and not wait_ended and not released
+                         and (not stalled or (owner, request_id) in verified_current_incomplete_leaves)) else 1
 
         by_account = {}
         for candidate in sorted(candidates, key=lambda candidate: candidate[-1]):
