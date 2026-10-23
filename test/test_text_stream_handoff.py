@@ -434,7 +434,8 @@ def test_initial_terminal_skips_handoff_even_when_its_parent_is_a_thought_node()
     (None, "reasoning_recap"), ("final", "thoughts"),
 ])
 @pytest.mark.parametrize("phase", ["initial_sse", "ws_catchup"])
-def test_finished_reasoning_phase_keeps_reading_until_same_turn_final(channel, content_type, phase):
+@pytest.mark.parametrize("terminal_shape", ["full_message", "sparse_patch"])
+def test_finished_reasoning_phase_keeps_reading_until_same_turn_final(channel, content_type, phase, terminal_shape):
     thought = {"v": {"conversation_id": "conversation-1", "message": {
         "id": "phase-end", "parent": "original-user", "author": {"role": "assistant"},
         "status": "finished_successfully", "end_turn": True, "channel": channel,
@@ -450,12 +451,19 @@ def test_finished_reasoning_phase_keeps_reading_until_same_turn_final(channel, c
         return json.dumps({"type": "message", "topic_id": "conversation-turn-turn-1",
             "payload": {"payload": {"encoded_item": "data: " + json.dumps(event) + "\n" + "data: [DONE]"}}})
 
+    phase_events = [thought]
+    if terminal_shape == "sparse_patch":
+        thought["v"]["message"].update(status="in_progress", end_turn=False)
+        phase_events.append({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "phase-end", "author": {"role": "assistant"},
+            "status": "finished_successfully", "end_turn": True,
+        }}})
     initial = _initial_events()
     if phase == "initial_sse":
-        initial.lines.insert(-1, _line(thought))
+        initial.lines[-1:-1] = list(map(_line, phase_events))
         frames = [frame(final)]
     else:
-        frames = [frame(thought), frame(final)]
+        frames = [*map(frame, phase_events), frame(final)]
     backend = _backend(initial, frames=frames)
 
     payloads = list(backend.stream_conversation(prompt="fixture"))
@@ -481,6 +489,20 @@ def test_later_user_branch_never_turns_a_nonterminal_sse_parent_chain_into_origi
 
     assert list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))[-1] == "[DONE]"
     assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+
+
+def test_explicit_final_text_update_replaces_same_message_reasoning_phase():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    message = {"id": "phase-node", "parent": "original-user", "author": {"role": "assistant"},
+        "status": "in_progress", "end_turn": False, "channel": "analysis",
+        "content": {"content_type": "thoughts"}}
+    handoff.observe(json.dumps({"message": message}))
+    assert handoff.terminal_seen is False
+    message.update(status="finished_successfully", end_turn=True, channel="final",
+        content={"content_type": "text", "parts": ["complete answer"]})
+    handoff.observe(json.dumps({"message": message}))
+    assert handoff.terminal_seen is True
+    assert len(handoff._message_phases) <= len(handoff._parents)
 
 
 def test_terminal_from_an_old_branch_does_not_suppress_this_turns_handoff():
