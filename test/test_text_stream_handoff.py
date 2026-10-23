@@ -429,6 +429,46 @@ def test_initial_terminal_skips_handoff_even_when_its_parent_is_a_thought_node()
     assert backend.session.get_calls == [] and backend.session.ws_calls == []
 
 
+@pytest.mark.parametrize("channel,content_type", [
+    ("analysis", "text"), ("commentary", "text"), (None, "thoughts"),
+    (None, "reasoning_recap"), ("final", "thoughts"),
+])
+@pytest.mark.parametrize("phase", ["initial_sse", "ws_catchup"])
+def test_finished_reasoning_phase_keeps_reading_until_same_turn_final(channel, content_type, phase):
+    thought = {"v": {"conversation_id": "conversation-1", "message": {
+        "id": "phase-end", "parent": "original-user", "author": {"role": "assistant"},
+        "status": "finished_successfully", "end_turn": True, "channel": channel,
+        "content": {"content_type": content_type, "parts": ["intermediate phase"]},
+    }}}
+    final = {"v": {"conversation_id": "conversation-1", "message": {
+        "id": "actual-final", "parent": "phase-end", "author": {"role": "assistant"},
+        "status": "finished_successfully", "end_turn": True, "channel": "final",
+        "content": {"content_type": "text", "parts": ["complete answer"]},
+    }}}
+
+    def frame(event):
+        return json.dumps({"type": "message", "topic_id": "conversation-turn-turn-1",
+            "payload": {"payload": {"encoded_item": "data: " + json.dumps(event) + "\n" + "data: [DONE]"}}})
+
+    initial = _initial_events()
+    if phase == "initial_sse":
+        initial.lines.insert(-1, _line(thought))
+        frames = [frame(final)]
+    else:
+        frames = [frame(thought), frame(final)]
+    backend = _backend(initial, frames=frames)
+
+    payloads = list(backend.stream_conversation(prompt="fixture"))
+
+    final_index = next(index for index, payload in enumerate(payloads) if "actual-final" in payload)
+    assert "[DONE]" not in payloads[:final_index]
+    assert payloads.count("[DONE]") == 1
+    assert len(backend.session.post_calls) == 1
+    assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+    assert len(backend.session.ws.sent) == 1
+    assert backend.session.ws.closed is True
+
+
 def test_later_user_branch_never_turns_a_nonterminal_sse_parent_chain_into_original_final():
     backend = _backend(Response([
         _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE", "conversation_id": "conversation-1"}),

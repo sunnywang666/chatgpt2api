@@ -162,6 +162,13 @@ class _StreamHandoff:
 
     @staticmethod
     def _assistant_terminal(message: dict[str, Any]) -> bool:
+        # A finished reasoning message is not the final answer. Some terminal
+        # patches omit channel/content, so preserve that legacy shape while
+        # refusing explicit evidence that this is an intermediate phase.
+        content = message.get("content")
+        if (message.get("channel") not in (None, "final")
+                or isinstance(content, dict) and content.get("content_type") not in (None, "text")):
+            return False
         return (message.get("status") == "finished_successfully"
                 and message.get("end_turn") is True
                 and isinstance(message.get("author"), dict)
