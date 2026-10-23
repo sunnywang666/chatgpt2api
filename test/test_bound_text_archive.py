@@ -83,7 +83,7 @@ def bound_chat(monkeypatch):
 def test_internal_archived_chat_is_verified_restored_then_sent(bound_chat):
     h = bound_chat
     result = h.service.complete_text(h.body)
-    assert h.calls == ["read", "read", "restore", "read", "send"]
+    assert h.calls == ["read", "restore", "read", "send"]
     assert result["content"] == "answer" and result["conversation_id"] == "original-chat"
     assert result["provider_account_identity"] == "original-account"
     h.accounts.create_conversation_binding.assert_not_called()
@@ -94,6 +94,76 @@ def test_unarchived_internal_chat_only_checks_cursor_then_sends(bound_chat):
     h.document["is_archived"] = False
     h.service.complete_text(h.body)
     assert h.calls == ["read", "send"]
+
+
+def test_request_cannot_supply_restore_precheck_document(bound_chat):
+    h = bound_chat
+    h.body["_restore_precheck_document"] = {
+        "conversation_id": "foreign-chat", "current_node": "foreign-parent", "is_archived": False,
+    }
+    h.service.complete_text(h.body)
+    assert h.calls == ["read", "restore", "read", "send"]
+
+
+@pytest.mark.parametrize("read_interval", [45, 90])
+def test_restore_progresses_with_exhausted_read_burst(bound_chat, tmp_path, monkeypatch, read_interval):
+    """Real pacing must not repeat the initial GET before applying restore."""
+    import time
+    from services.account_request_pacing import AccountRequestClock
+    from services.config import config
+
+    h = bound_chat
+    now = [10000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(time, "time", lambda: 1700000000 + now[0])
+    monkeypatch.setattr(time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: read_interval))
+    monkeypatch.setattr(type(config), "account_conversation_read_burst", property(lambda _: 1))
+    clock = AccountRequestClock("fixture", tmp_path / "clock.json")
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return deepcopy(h.document)
+
+        def close(self):
+            pass
+
+    def transport(method, url, **options):
+        assert url == "https://fixture.invalid/backend-api/conversation/original-chat"
+        assert method in {"GET", "PATCH"}
+        h.calls.append("read" if method == "GET" else "restore")
+        if method == "PATCH":
+            assert options["json"] == {"is_archived": False}
+            h.document["is_archived"] = False
+        return Response()
+
+    backend = object.__new__(OpenAIBackendAPI)
+    backend.base_url = "https://fixture.invalid"
+    backend._headers = lambda _path, headers: headers
+    backend.session = SimpleNamespace(
+        get=lambda url, **options: clock.request(transport, "GET", url, **options),
+        patch=lambda url, **options: clock.request(transport, "PATCH", url, **options),
+    )
+    backend.close = lambda: None
+    backend.get_conversation_parent_message_id = lambda _chat: "new-answer"
+    monkeypatch.setattr("services.conversation_binding_service.OpenAIBackendAPI", lambda **_: backend)
+
+    if read_interval == 90:
+        # The bounded readback can still run out of budget. Do not send until
+        # the next original-ID attempt independently confirms the applied PATCH.
+        with pytest.raises(ConversationBindingError) as failure:
+            h.service.complete_text(h.body)
+        assert failure.value.code == "CHAT_ARCHIVE_RESTORE_UNCONFIRMED"
+        assert h.calls == ["read", "restore"]
+        assert h.document["is_archived"] is False
+    result = h.service.complete_text(h.body)
+    assert result["content"] == "answer"
+    assert h.calls == ["read", "restore", "read", "send"]
+    assert now[0] == 10000 + read_interval
 
 
 @pytest.mark.parametrize("value", [None, "false", 0])
@@ -158,3 +228,59 @@ def test_old_failed_unknown_is_not_replayed_by_archive_fix(bound_chat, tmp_path)
     result = tasks.submit("owner", h.body, source="internal:listing")
     assert result["status"] == "failed" and result["upstream_outcome"] == "unknown"
     assert h.calls == [] and queue.calls == []
+
+
+def test_applied_restore_timeout_requeues_original_across_restart(bound_chat, tmp_path, monkeypatch):
+    import json
+    from services.request_context import current_request
+    from test.test_pool_admission import build
+
+    h = bound_chat
+    now = [1000.0]
+    (tmp_path / "accounts.json").write_text(json.dumps([{
+        "access_token": "fixture-token", "account_id": "fixture-upstream",
+        "provider_account_identity": "original-account", "type": "Plus", "status": "正常",
+        "quota": 999, "source_type": "web", "conversation_binding_ids": ["original-binding"],
+    }]))
+    _, store, admission = build(tmp_path, lambda: now[0])
+    tasks = TextTaskService(store.path, runner=h.service.complete_text, admission=admission, clock=lambda: now[0])
+    admission.register("text", lambda ctx, body: tasks._run(ctx.owner, ctx.request_id, body))
+    h.after_patch = lambda _doc: setattr(h, "read_error", TimeoutError("fixture readback timeout"))
+    tasks.submit("owner", h.body, source="internal:listing")
+    first = admission.claim_next()
+    admission.execute(first)
+    with store.connect() as db:
+        before = store.read_receipt(db, "text", "owner", "new-original")
+        request_hash = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", ("owner", "new-original")).fetchone()[0]
+    assert before["status"] == "queued" and before["upstream_outcome"] == "not_sent"
+    assert before["_submission_started"] is False
+    assert before.get("_last_sent_sequence") is None
+    assert before["_claim_id"] is None and before["_executing"] is False
+    assert h.document["is_archived"] is False
+    assert h.calls == ["read", "restore", "read"]
+
+    # New service/admission instances reuse the persisted receipt and input.
+    h.read_error = None
+    now[0] += 31
+    _, restarted_store, restarted = build(tmp_path, lambda: now[0])
+    resumed = TextTaskService(restarted_store.path, runner=h.service.complete_text,
+                             admission=restarted, clock=lambda: now[0])
+    restarted.register("text", lambda ctx, body: resumed._run(ctx.owner, ctx.request_id, body))
+    def events(_backend, **kwargs):
+        current_request.get().before_send()
+        h.calls.append("send")
+        yield {"type": "conversation.delta", "conversation_id": "original-chat", "delta": "answer"}
+    monkeypatch.setattr("services.conversation_binding_service.conversation_events", events)
+    second = restarted.claim_next()
+    assert second.request_id == first.request_id and second.claim != first.claim
+    restarted.execute(second)
+    with restarted_store.connect() as db:
+        after = restarted_store.read_receipt(db, "text", "owner", "new-original")
+        assert db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", ("owner", "new-original")).fetchone()[0] == request_hash
+    assert after["status"] == "succeeded" and after["_submission_started"] is True
+    assert after["_last_sent_sequence"] == (before.get("_send_sequence") or 0)
+    assert h.calls == ["read", "restore", "read", "read", "send"]
+    for key in ("request_id", "provider_binding_id", "provider_account_identity", "client_conversation_id", "request_message_id", "_sequence"):
+        assert after[key] == before[key]
+    assert resumed.submit("owner", h.body, source="internal:listing")["status"] == "succeeded"
+    assert restarted.claim_next() is None

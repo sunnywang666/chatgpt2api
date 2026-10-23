@@ -1615,10 +1615,21 @@ class OpenAIBackendAPI:
 
     @operation_budget(60.0)
     def set_conversation_archived(self, conversation_id: str, parent_message_id: str, archived: bool,
-                                  *, validate_document=None) -> Dict[str, Any]:
+                                  *, validate_document=None, _restore_precheck_document=None) -> Dict[str, Any]:
         """Change visibility only after checking the original conversation and cursor."""
-        with observing_archive_step("precheck"):
-            document = self._get_conversation(conversation_id)
+        if _restore_precheck_document is None:
+            with observing_archive_step("precheck"):
+                document = self._get_conversation(conversation_id)
+        else:
+            # Only bound text continuation supplies its just-read document,
+            # while still holding the same conversation lock. Repeating that
+            # GET can spend the entire restore budget in the account FIFO.
+            # This is not an input/API option or an archive-result cache.
+            document = _restore_precheck_document
+            if (archived is not False or not isinstance(document, dict)
+                    or document.get("is_archived") is not True
+                    or str(document.get("conversation_id") or conversation_id) != conversation_id):
+                raise ValueError("invalid bound conversation restore precheck")
         if str(document.get("current_node") or "").strip() != parent_message_id:
             raise ConversationArchiveCursorMismatch("original conversation cursor changed")
         if parent_message_id not in (document.get("mapping") or {}):

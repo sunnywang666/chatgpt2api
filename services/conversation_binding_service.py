@@ -2474,7 +2474,10 @@ class ConversationBindingService:
                         raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH")
                     if document.get("is_archived") is True:
                         try:
-                            backend.set_conversation_archived(conversation_id, parent_message_id, False)
+                            backend.set_conversation_archived(
+                                conversation_id, parent_message_id, False,
+                                _restore_precheck_document=document,
+                            )
                         except Exception as exc:
                             raise ConversationBindingError("original conversation restore is temporarily unavailable",
                                                            code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED") from exc
