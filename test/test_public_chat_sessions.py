@@ -92,7 +92,10 @@ def test_archived_sequential_text_chat_is_restored_before_continuation():
         accounts.get_bound_text_access_token.return_value='token'
         accounts.conversation_binding_lock.return_value=nullcontext()
         service.complete_text(body,on_cursor=Mock())
-    backend.set_conversation_archived.assert_called_once_with('chat','previous-answer',False)
+    backend.set_conversation_archived.assert_called_once_with(
+        'chat','previous-answer',False,
+        _restore_precheck_document=backend._get_conversation.return_value)
+    backend._get_conversation.assert_called_once_with('chat')
 
 
 def test_uncertain_archive_restore_never_sends_a_new_text_turn(public_chat):
@@ -704,7 +707,7 @@ def test_sequential_readback_errors_keep_original_unknown_until_get_recovers(tmp
     backend.get_conversation_parent_message_id = Mock()
     valid_readback = False
 
-    def document(_conversation_id):
+    def document(_conversation_id, **_options):
         user = backend.text_request_message_id
         answer = {'parent': user, 'message': {
             'id': 'original-final', 'author': {'role': 'assistant'},

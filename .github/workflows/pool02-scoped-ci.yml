@@ -33,6 +33,7 @@ on:
       - test/test_product_work_admission.py
       - test/test_admission_planner.py
       - test/test_bound_text_archive.py
+      - test/test_public_chat_sessions.py
       - test/test_work_lifecycle.py
       - test/test_no_final_successor.py
       - test/test_combined_copy_derivation.py
@@ -131,6 +132,7 @@ jobs:
             test/test_product_work_admission.py \
             test/test_admission_planner.py \
             test/test_bound_text_archive.py \
+            test/test_public_chat_sessions.py \
             test/test_work_lifecycle.py \
             test/test_no_final_successor.py \
             test/test_combined_copy_derivation.py \
