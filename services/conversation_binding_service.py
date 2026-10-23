@@ -85,7 +85,35 @@ def _content_observation(content):
     return {"content_type": kind, "text_chars": chars, "content_items": items, "finished_items": finished}
 
 
-def _result_observation(mapping, children, request_message_id, conversation_id):
+def _phase_label(value, known):
+    return None if value is None else value if isinstance(value, str) and value in known else "other"
+
+
+def _result_phase_observation(mapping, nodes, request_message_id, current_node):
+    """Retain only phase labels for the already validated original branch."""
+    relation = ("missing" if current_node is None else "request" if current_node == request_message_id
+                else "observed" if any(current_node == node["id"] for node in nodes) else "other")
+    phases = []
+    for node in nodes:
+        message = mapping[node["id"]]["message"]
+        metadata = message.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        finish = metadata.get("finish_details")
+        finish = finish if isinstance(finish, dict) else {}
+        phases.append({
+            "id": node["id"],
+            "channel": _phase_label(message.get("channel"), ("analysis", "final", "commentary")),
+            "metadata_channel": _phase_label(metadata.get("channel"), ("analysis", "final", "commentary")),
+            "recipient": _phase_label(message.get("recipient"), ("all",)),
+            "is_complete": metadata.get("is_complete") if type(metadata.get("is_complete")) is bool else None,
+            "finish_type": _phase_label(finish.get("type"), ("stop", "max_tokens", "length", "interrupted")),
+        })
+    return {"current_node_relation": relation,
+            "current_node_id": current_node if relation in {"request", "observed"} else None,
+            "nodes": phases}
+
+
+def _result_observation(mapping, children, request_message_id, conversation_id, current_node=None):
     """Observe only this request's unambiguous branch, never message contents.
 
     An upstream heartbeat timestamp alone is not generation progress. Keep a
@@ -122,7 +150,10 @@ def _result_observation(mapping, children, request_message_id, conversation_id):
     if not nodes:
         return None
     return {"conversation_id": conversation_id, "request_message_id": request_message_id,
-            "nodes": nodes, "upstream_updated_at": updated_at}
+            "nodes": nodes, "upstream_updated_at": updated_at,
+            # Keep diagnostics outside nodes: changes to these labels alone
+            # must not manufacture progress or restart the stalled-turn clock.
+            "phase": _result_phase_observation(mapping, nodes, request_message_id, current_node)}
 
 
 def _request_parent_matches_receipt(
@@ -1743,7 +1774,8 @@ class ConversationBindingService:
                 "recovery_reason": recovery_reason,
                 "_retry_cursor": continuation,
                 **({RESULT_OBSERVATION_FIELD: observation} if active_result_seen
-                   and (observation := _result_observation(mapping, children, request_message_id, conversation_id)) else {}),
+                   and (observation := _result_observation(mapping, children, request_message_id, conversation_id,
+                                                          document.get("current_node"))) else {}),
                 **({TURN_END_EVIDENCE_FIELD: ended} if not active_result_seen and terminal_empty_seen
                    and (ended := _completed_request_turn(mapping, children, request_message_id, conversation_id)) else {}),
                 **({"_empty_reply_evidence": empty} if (empty := _empty_reply_evidence(

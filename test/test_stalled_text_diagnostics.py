@@ -403,6 +403,94 @@ def incomplete_reader(backend, mutate=None):
     return read
 
 
+def test_original_phase_diagnostic_is_private_bounded_and_not_completion_proof(tmp_path):
+    service, _, backend, _ = migration(tmp_path)
+    def mutate(doc, message):
+        mixed_chain(doc)
+        message.update(channel="final", recipient="all", metadata={
+            "channel": "final", "is_complete": True,
+            "finish_details": {"type": "stop"}, "token": "PRIVATE_TOKEN"})
+        message["content"]["parts"] = ["PRIVATE_PARTIAL_ANSWER"]
+        thought = doc["mapping"][doc["current_node"] + "-thought"]["message"]
+        thought.update(channel="analysis", recipient="PRIVATE_TOOL_NAME", metadata={
+            "channel": "PRIVATE_CHANNEL", "is_complete": "PRIVATE_VALUE",
+            "finish_details": {"type": "PRIVATE_FINISH"}})
+    service.recovery_reader = incomplete_reader(backend, mutate)
+    result = service.read("owner", "old-0")
+    row = saved(service)
+    phase = row["_original_result_observation"]["phase"]
+    assert phase["current_node_relation"] == "observed"
+    assert phase["current_node_id"] == "final-user-0"
+    assert phase["nodes"][-1] == {
+        "id": "final-user-0", "channel": "final", "metadata_channel": "final",
+        "recipient": "all", "is_complete": True, "finish_type": "stop"}
+    assert phase["nodes"][-3] == {
+        "id": "final-user-0-thought", "channel": "analysis", "metadata_channel": "other",
+        "recipient": "other", "is_complete": None, "finish_type": "other"}
+    assert "PRIVATE_" not in json.dumps(row)
+    assert "_original_result_observation" not in result
+    assert result["status"] == "unknown" and "content" not in result
+    assert row.get("_upstream_terminal") is not True
+    assert backend.mock_calls == []
+
+
+@pytest.mark.parametrize("current,relation,retained", [
+    (None, "missing", None), ("user-0", "request", "user-0"),
+    ("PRIVATE_OTHER_NODE", "other", None), (["PRIVATE_INVALID_NODE"], "other", None),
+])
+def test_phase_current_node_retains_only_original_branch_ids(tmp_path, current, relation, retained):
+    service, _, backend, _ = migration(tmp_path)
+    result = incomplete_reader(backend, lambda doc, _message: doc.update(current_node=current))(saved(service))
+    observation = result["_original_result_observation"]
+    phase = observation["phase"]
+    assert phase["current_node_relation"] == relation and phase["current_node_id"] == retained
+    assert "PRIVATE_" not in json.dumps(observation)
+    assert TextTaskService._safe_result_observation(observation, saved(service)) == observation
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_phase_changes_and_reader_upgrade_do_not_reset_original_progress(tmp_path, legacy):
+    service, admission, backend, _ = migration(tmp_path)
+    service.recovery_reader = incomplete_reader(backend)
+    service.read("owner", "old-0")
+    before = saved(service)
+    if legacy:
+        observation = copy.deepcopy(before["_original_result_observation"])
+        observation.pop("phase")
+        patch(service, _original_result_observation=observation)
+    def mutate(doc, message):
+        message.update(channel="commentary", metadata={"is_complete": True, "channel": "final"})
+        doc["current_node"] = "PRIVATE_OTHER_NODE"
+    service.recovery_reader = incomplete_reader(backend, mutate)
+    admission.clock.now += 301
+    result = service.read("owner", "old-0")
+    after = saved(service)
+    assert result["status"] == "unknown"
+    assert after["_result_no_progress_reads"] == before["_result_no_progress_reads"] + 1
+    for key in ("_result_observation_started_at", "_result_last_progress_at", "request_message_id", "conversation_id"):
+        assert after.get(key) == before.get(key)
+    assert after["_original_result_observation"]["nodes"] == before["_original_result_observation"]["nodes"]
+    assert after["_original_result_observation"]["phase"] != before["_original_result_observation"]["phase"]
+    assert backend.mock_calls == []
+
+
+@pytest.mark.parametrize("case", ["extra", "node_id", "node_count", "channel", "recipient", "complete", "finish", "current"])
+def test_phase_validator_rejects_unscoped_or_unbounded_fields(tmp_path, case):
+    service, _, backend, _ = migration(tmp_path)
+    row = saved(service)
+    observation = incomplete_reader(backend)(row)["_original_result_observation"]
+    phase = observation["phase"]
+    if case == "extra": phase["body"] = "PRIVATE_BODY"
+    elif case == "node_id": phase["nodes"][0]["id"] = "OTHER_NODE"
+    elif case == "node_count": phase["nodes"] *= 2
+    elif case == "channel": phase["nodes"][0]["metadata_channel"] = {"token": "PRIVATE_TOKEN"}
+    elif case == "recipient": phase["nodes"][0]["recipient"] = "PRIVATE_RECIPIENT"
+    elif case == "complete": phase["nodes"][0]["is_complete"] = 1
+    elif case == "finish": phase["nodes"][0]["finish_type"] = "PRIVATE_FINISH"
+    else: phase["current_node_id"] = "OTHER_NODE"
+    assert TextTaskService._safe_result_observation(observation, row) is None
+
+
 def stalled(service, admission, backend):
     service.recovery_reader = incomplete_reader(backend)
     for index in range(4):

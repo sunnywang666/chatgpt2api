@@ -1018,7 +1018,7 @@ class TextTaskService:
     @staticmethod
     def _safe_result_observation(value, receipt):
         if (not isinstance(value, dict)
-                or set(value) != {"conversation_id", "request_message_id", "nodes", "upstream_updated_at"}
+                or set(value) - {"phase"} != {"conversation_id", "request_message_id", "nodes", "upstream_updated_at"}
                 or not value.get("conversation_id")
                 or value["conversation_id"] != receipt.get("conversation_id")
                 or not value.get("request_message_id")
@@ -1052,6 +1052,28 @@ class TextTaskService:
         updated = value["upstream_updated_at"]
         if updated is not None and (type(updated) not in (int, float) or not math.isfinite(updated) or updated <= 0):
             return None
+        if "phase" in value:
+            phase = value["phase"]
+            if (not isinstance(phase, dict)
+                    or set(phase) != {"current_node_relation", "current_node_id", "nodes"}
+                    or phase["current_node_relation"] not in ("missing", "request", "observed", "other")
+                    or not isinstance(phase["nodes"], list) or len(phase["nodes"]) != len(normalized)):
+                return None
+            relation, current = phase["current_node_relation"], phase["current_node_id"]
+            if (relation == "request" and current != value["request_message_id"]
+                    or relation == "observed" and (not isinstance(current, str) or current not in ids)
+                    or relation in ("missing", "other") and current is not None):
+                return None
+            for diagnostic, node in zip(phase["nodes"], normalized):
+                if (not isinstance(diagnostic, dict)
+                        or set(diagnostic) != {"id", "channel", "metadata_channel", "recipient", "is_complete", "finish_type"}
+                        or diagnostic["id"] != node["id"]
+                        or any(diagnostic[key] not in (None, "analysis", "final", "commentary", "other")
+                               for key in ("channel", "metadata_channel"))
+                        or diagnostic["recipient"] not in (None, "all", "other")
+                        or diagnostic["is_complete"] is not None and type(diagnostic["is_complete"]) is not bool
+                        or diagnostic["finish_type"] not in (None, "stop", "max_tokens", "length", "interrupted", "other")):
+                    return None
         return {**value, "nodes": normalized}
 
     @staticmethod
