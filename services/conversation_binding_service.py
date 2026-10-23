@@ -1931,7 +1931,23 @@ class ConversationBindingService:
         tail = observation["nodes"][-1]
         node = mapping.get(head)
         message = node.get("message") if isinstance(node, dict) else None
-        if (head != tail["id"] or tail["status"] not in _ACTIVE_TEXT_RESULT_STATUSES
+        # A completed thoughts segment is not a completed assistant turn.
+        # Accept only that narrow leaf shape while the exact whole branch
+        # above still proves REQUEST_RESULT_INCOMPLETE; final/code/tool tails
+        # and later user turns cannot use this compatibility path.
+        content = message.get("content") if isinstance(message, dict) else None
+        thoughts = content.get("thoughts") if isinstance(content, dict) else None
+        metadata = message.get("metadata") if isinstance(message, dict) else None
+        metadata = metadata if isinstance(metadata, dict) else {}
+        finished_thoughts = (isinstance(message, dict)
+            and isinstance(message.get("author"), dict) and message["author"].get("role") == "assistant"
+            and tail["status"] == "finished_successfully" and tail["end_turn"] is False
+            and message.get("channel") in (None, "analysis") and message.get("recipient") in (None, "all")
+            and metadata.get("channel") in (None, "analysis")
+            and isinstance(content, dict) and content.get("content_type") == "thoughts"
+            and isinstance(thoughts, list) and bool(thoughts)
+            and all(isinstance(item, dict) and item.get("finished") is True for item in thoughts))
+        if (head != tail["id"] or not (tail["status"] in _ACTIVE_TEXT_RESULT_STATUSES or finished_thoughts)
                 or tail["end_turn"] is not False or not isinstance(message, dict)
                 or message.get("id") != head or node.get("children")
                 or any(isinstance(item, dict) and item.get("parent") == head for item in mapping.values())):

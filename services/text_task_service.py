@@ -1825,7 +1825,8 @@ class TextTaskService:
         # still revalidates it under a writer before admitting any work.
         if self.admission is not None and (
                 self._known_unsent_category_successor(receipt, now)
-                or self._known_unsent_no_final_successor(receipt, now)):
+                or self._known_unsent_no_final_successor(receipt, now)
+                or self._known_unsent_incomplete_successor(receipt, now)):
             try:
                 self._validated_unsent_successor_input(db, owner, request_hash, receipt, now)
                 result.update(bound_successor_resume_retryable=True, upstream_outcome="not_submitted",
@@ -2059,7 +2060,8 @@ class TextTaskService:
             result = self.read_snapshot(owner, request_id)
         # This advertisement is a local proof only, never an implicit retry or
         # upstream read. The explicit endpoint revalidates it transactionally.
-        if self.admission is not None and self._known_unsent_category_successor(json.loads(row[0]), now):
+        if self.admission is not None and (self._known_unsent_category_successor(observed, now)
+                or self._known_unsent_incomplete_successor(observed, now)):
             try:
                 with self._db() as db:
                     current = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
@@ -4093,8 +4095,38 @@ class TextTaskService:
                 ("_input_ref", "_supersedes_request_id", "request_id", "request_message_id")))
 
     @staticmethod
+    def _known_unsent_incomplete_successor(receipt, now):
+        """Permit only a stopped, never-sent compact incomplete child, once."""
+        timeline = receipt.get("_execution_timeline")
+        if (not isinstance(timeline, list) or not timeline
+                or any(not isinstance(item, dict) or item.get("stage") not in {"accepted", "execution_claimed"} for item in timeline)
+                or receipt.get("_last_sent_sequence") is not None
+                or type(receipt.get("send_count", 0)) is not int or receipt.get("send_count", 0) != 0
+                or type(receipt.get("_bound_successor_resume_count", 0)) is not int
+                or receipt.get("_bound_successor_resume_count", 0) != 0):
+            return False
+        for claim, until in (("_claim_id", "_claim_until"), ("recovery_claim_id", "recovery_lease_until")):
+            expires = receipt.get(until)
+            if (expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires) or expires > now)
+                    or receipt.get(claim) and expires is None):
+                return False
+        return bool(receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
+            and not receipt.get("_public_session_ref") and not receipt.get("_forward_protocol")
+            and receipt.get("status") == "failed" and receipt.get("error_code") == "CHAT_SUPERSEDE_CURSOR_CHANGED"
+            and receipt.get("upstream_outcome") == "not_sent"
+            and all(receipt.get(key) is False for key in ("_submission_started", "_turn_reserved", "_executing"))
+            and not any(receipt.get(key) for key in ("_recovery_paused", "_recovery_suppressed", "_execution_wait_ended_at", "_attempt_finished_at"))
+            and receipt.get("_supersedes_incomplete") is True
+            and not receipt.get("_supersedes_no_final")
+            and not any(key in receipt for key in ("content", "result", "data", "_missing_successor_resume"))
+            and isinstance(receipt.get("_derived_input"), dict)
+            and receipt["_derived_input"].get("kind") == "combined_copy_compact_v1"
+            and all(isinstance(receipt.get(key), str) and receipt[key] for key in
+                ("_input_ref", "_supersedes_request_id", "request_id", "request_message_id")))
+
+    @staticmethod
     def _strict_successor_sequence(previous, successor):
-        """Keep a plain no-final resume on its original, ordered lineage."""
+        """Keep a resumed child on its original, ordered lineage."""
         parent_sequence = previous.get("_sequence")
         child_sequence = successor.get("_sequence")
         return (type(parent_sequence) is int and parent_sequence > 0
@@ -4103,7 +4135,8 @@ class TextTaskService:
 
     def _validated_unsent_successor_input(self, db, owner, request_hash, receipt, now):
         plain_no_final = self._known_unsent_no_final_successor(receipt, now)
-        if not plain_no_final and not self._known_unsent_category_successor(receipt, now):
+        incomplete = self._known_unsent_incomplete_successor(receipt, now)
+        if not (plain_no_final or incomplete or self._known_unsent_category_successor(receipt, now)):
             raise ConversationBindingError("successor is not known unsent", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
         body = self.store.load_input(receipt["_input_ref"])
         if self._submission_identity(owner, body) != (receipt["request_id"], request_hash):
@@ -4112,12 +4145,15 @@ class TextTaskService:
         if plain_no_final and (not self._strict_successor_sequence(previous, receipt)
                                or not self._no_final_successor_source(previous, now)):
             raise ConversationBindingError("original no-final proof is unavailable", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
+        if incomplete and (not self._strict_successor_sequence(previous, receipt)
+                           or not self._incomplete_compact_successor_source(previous, now)):
+            raise ConversationBindingError("original incomplete proof is unavailable", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
         if previous.get("_recovery_paused") or previous.get("_recovery_suppressed"):
             raise ConversationBindingError("original recovery is paused", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
         return body
 
     def resume_unsent_successor(self, owner, request_id, envelope):
-        """Resume a proved-unsent category or plain no-final row, or a still-absent v4 ID.
+        """Resume a proved-unsent supported child, or a still-absent no-final v4 ID.
 
         No original outcome or identity is rewritten. The normal runner repeats
         its original-node checks at both the read and final send boundaries.
@@ -4137,8 +4173,11 @@ class TextTaskService:
             and envelope.get("derived_input") == {"kind": "category_directory_parent_v1"})
         plain_no_final_envelope = (set(envelope) == self.SUPERSEDE_FIELDS | {"continue_after_no_final"}
             and envelope.get("continue_after_no_final") is True)
+        incomplete_envelope = (set(envelope) == self.SUPERSEDE_FIELDS | {"derived_input", "continue_after_incomplete"}
+            and envelope.get("derived_input") == {"kind": "combined_copy_compact_v1"}
+            and envelope.get("continue_after_incomplete") is True)
         if (envelope.get("client_request_id") != request_id
-                or not (category_envelope or plain_no_final_envelope)):
+                or not (category_envelope or plain_no_final_envelope or incomplete_envelope)):
             raise ConversationBindingError("original successor envelope required", code="CHAT_UNSENT_SUCCESSOR_NOT_RESUMABLE")
         expanded = self.submission_input(owner, envelope)
         identity = self._submission_identity(owner, expanded)
