@@ -104,6 +104,8 @@ class ConversationBindingTextRequest(BaseModel):
     client_conversation_id: str
     client_request_id: str | None = Field(default=None, min_length=1, max_length=200)
     supersedes_request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    retry_unsent_request_id: str | None = Field(default=None, min_length=1, max_length=200,
+                                                 exclude_if=lambda value: value is None)
     continue_before_queued_image_id: str | None = Field(default=None, min_length=1, max_length=200,
                                                         exclude_if=lambda value: value is None)
     derived_input: dict[str, object] | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -141,7 +143,13 @@ class ConversationBindingTextRequest(BaseModel):
         if queued_image and (not self.continue_before_queued_image_id or not self.supersedes_request_id
                              or no_final or incomplete or self.derived_input is not None):
             raise ValueError("queued-image continuation requires its own explicit rejected successor")
-        if self.supersedes_request_id is None:
+        retry_unsent = self.retry_unsent_request_id is not None
+        if retry_unsent and self.supersedes_request_id is not None:
+            raise ValueError("unsent retry and explicit successor are mutually exclusive")
+        if retry_unsent:
+            if self.model_fields_set != TextTaskService.RETRY_UNSENT_FIELDS:
+                raise ValueError("unsent retry requires only original binding and request identities")
+        elif self.supersedes_request_id is None:
             if self.derived_input is not None:
                 raise ValueError("derived input requires an original request")
             if self.messages is None:
@@ -726,10 +734,13 @@ def create_router() -> APIRouter:
                 "error": "ordinary-client bound conversation submission is not supported; use the supported Chat API"})
         require_chat_text_policy(identity)
         owner = str(identity.get("id") or "anonymous")
-        payload = body.model_dump(mode="python", exclude_unset=body.supersedes_request_id is not None)
+        reference_request = body.supersedes_request_id is not None or body.retry_unsent_request_id is not None
+        payload = body.model_dump(mode="python", exclude_unset=reference_request)
         # Preserve hashes of every pre-existing ordinary submission.
         if body.supersedes_request_id is None:
             payload.pop("supersedes_request_id", None)
+        if body.retry_unsent_request_id is None:
+            payload.pop("retry_unsent_request_id", None)
         try:
             if body.product_work is not None:
                 product_identity(identity, request)
@@ -738,6 +749,9 @@ def create_router() -> APIRouter:
             if body.supersedes_request_id is not None and not body.client_request_id:
                 raise ConversationBindingError("explicit successor request identity is required",
                                                code="CHAT_SUPERSEDE_INVALID")
+            if body.retry_unsent_request_id is not None and not body.client_request_id:
+                raise ConversationBindingError("unsent retry request identity is required",
+                                               code="CHAT_UNSENT_RETRY_INVALID")
             if body.client_request_id:
                 # Reject a durable id/body conflict before the optional AI
                 # review can make an external request. submit repeats the same
@@ -753,7 +767,7 @@ def create_router() -> APIRouter:
                         )
                     return existing
             review_payload = (await run_in_threadpool(text_task_service.submission_input, owner, payload)
-                              if body.supersedes_request_id is not None else payload)
+                              if reference_request else payload)
             request_preview = request_text(review_payload.get("messages"))
             await filter_or_log(
                 LoggedCall(
