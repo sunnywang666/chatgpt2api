@@ -27,14 +27,14 @@ def recovery(tmp_path):
     release = threading.Event()
     workers = []
 
-    def original(rid, account=0, conversation=None, **changes):
-        text.submit("owner", {"client_request_id": rid, "client_conversation_id": rid,
+    def original(rid, account=0, conversation=None, owner="owner", **changes):
+        text.submit(owner, {"client_request_id": rid, "client_conversation_id": rid,
                               "messages": [{"role": "user", "content": "original input"}]})
-        text._update("owner", rid, status="unknown", provider_account_identity=f"account-{account}",
+        text._update(owner, rid, status="unknown", provider_account_identity=f"account-{account}",
                      provider_binding_id=f"binding-{account}", conversation_id=conversation or rid,
                      recovery_next_at=0, **changes)
         with store.connect() as db:
-            return store.read_receipt(db, "text", "owner", rid)
+            return store.read_receipt(db, "text", owner, rid)
 
     # Capture only threads started by this dispatcher so cleanup never leaves
     # an I/O callback using the temporary store after the test ends.
@@ -516,6 +516,56 @@ def explicit_original(recovery, request_id, account=0, **changes):
                              request_message_id="message-" + request_id, **changes)
 
 
+def compact_incomplete_leaf(recovery, parent_id="compact-parent", child_id="compact-child",
+                            *, parent_owner="owner", child_owner="owner"):
+    """Persist a sent compact child and a stale exact-result observation."""
+    r = recovery
+    shared = "compact-conversation"
+    parent = r.original(parent_id, 0, shared, owner=parent_owner,
+                        client_conversation_id="compact-client",
+                        parent_message_id="compact-root",
+                        request_message_id="message-" + parent_id,
+                        _submission_started=True, _turn_reserved=False, _executing=False,
+                        upstream_outcome="unknown")
+    child = r.original(child_id, 0, shared, owner=child_owner,
+                       client_conversation_id="compact-client",
+                       parent_message_id="compact-root",
+                       request_message_id="message-" + child_id,
+                       _submission_started=True, _turn_reserved=False, _executing=False,
+                       upstream_outcome="unknown")
+    with r.store.connect() as db:
+        parent_hash = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                                 (parent_owner, parent_id)).fetchone()[0]
+    assert child.get("_input_ref")
+    stalled = {
+        "recovery_reason": "REQUEST_RESULT_INCOMPLETE",
+        "_result_observation_started_at": 1.0,
+        "_result_last_checked_at": r.clock(),
+        "_result_wait_ended_at": r.clock(),
+        "_result_last_progress_at": None,
+        "_result_no_progress_reads": 3,
+    }
+    for owner, request_id in ((parent_owner, parent_id), (child_owner, child_id)):
+        r.text._update(owner, request_id, **stalled,
+                       _original_result_observation={
+                           "conversation_id": shared,
+                           "request_message_id": "message-" + request_id,
+                           "upstream_updated_at": 100.0,
+                           "nodes": [{"id": "unfinished-" + request_id,
+                                      "role": "assistant", "status": "in_progress",
+                                      "end_turn": False, "text_chars": 0}],
+                       })
+    r.text._update(child_owner, child_id,
+                   _supersedes_request_id=parent_id,
+                   _supersedes_input_hash=parent_hash,
+                   _supersedes_request_message_id="message-" + parent_id,
+                   _submission_parent_message_id="compact-root",
+                   _supersedes_incomplete=True,
+                   _derived_input={"kind": "combined_copy_compact_v1",
+                                   "original_input_hash": parent_hash})
+    return parent_id, child_id
+
+
 def prepare_explicit_recovery(recovery, monkeypatch):
     from services import account_request_pacing as pacing
     from services.config import config
@@ -789,6 +839,105 @@ def test_qualified_stalled_original_remains_released_history(recovery):
         r.admission.recover_one(background=True)
     assert admitted[:5] == ["contributor-0", "contributor-1", "contributor-2",
                             "qualified-stalled", "contributor-3"]
+
+
+def test_sent_compact_leaf_keeps_current_read_priority_and_preserves_three_to_one(recovery):
+    r = recovery
+    parent_id, child_id = compact_incomplete_leaf(r)
+    for index in range(2):
+        r.original(f"contributor-{index}")
+        r.text._update("owner", f"contributor-{index}", recovery_next_at=index + 1)
+    released_original(r, "older-released", next_at=4)
+
+    admitted = []
+    r.admission.recoveries["text"] = lambda *_: None
+    with patch.object(r.admission, "_dispatch_original_read",
+                      side_effect=lambda kind, owner, request_id, function, receipt:
+                      admitted.append(request_id) or True):
+        r.admission.recover_one(background=True)
+
+    # The verified sent child is P0 despite its capacity-release observation.
+    # Three P0 reads (including that child) still give released history a turn.
+    assert admitted[:4] == [child_id, "contributor-0", "contributor-1", parent_id]
+
+
+@pytest.mark.parametrize("invalid", [
+    "fake-flags", "hash-drift", "audit-hash-drift", "other-owner", "newer-child",
+    "wrong-binding", "wrong-account", "wrong-conversation", "wrong-client", "sibling-fallback",
+])
+def test_unverified_compact_lineage_stays_released_history(recovery, invalid):
+    r = recovery
+    parent_owner, child_owner = ("owner", "other-owner") if invalid == "other-owner" else ("owner", "owner")
+    parent_id, child_id = compact_incomplete_leaf(
+        r, f"{invalid}-parent", f"{invalid}-child",
+        parent_owner=parent_owner, child_owner=child_owner)
+    if invalid == "fake-flags":
+        r.text._update(child_owner, child_id, _derived_input={"kind": "untrusted",
+                                                               "original_input_hash": "not-used"})
+    elif invalid == "hash-drift":
+        r.text._update(child_owner, child_id, _supersedes_input_hash="drifted-hash")
+    elif invalid == "audit-hash-drift":
+        r.text._update(child_owner, child_id, _derived_input={
+            "kind": "combined_copy_compact_v1", "original_input_hash": "drifted-hash"})
+    elif invalid.startswith("wrong-"):
+        field = {"wrong-binding": "provider_binding_id", "wrong-account": "provider_account_identity",
+                 "wrong-conversation": "conversation_id", "wrong-client": "client_conversation_id"}[invalid]
+        r.text._update(child_owner, child_id, **{field: "mismatched-identity"})
+        if invalid == "wrong-conversation":
+            # Keep the child's own stalled observation valid while breaking
+            # only its lineage relationship to the parent's conversation.
+            with r.store.connect() as db:
+                receipt = r.store.read_receipt(db, "text", child_owner, child_id)
+            r.text._update(child_owner, child_id, _original_result_observation={
+                **receipt["_original_result_observation"], "conversation_id": "mismatched-identity"})
+    elif invalid == "sibling-fallback":
+        r.original("competing-fallback", owner=child_owner, _attempt_finished_at=r.clock())
+        r.text._update(child_owner, "competing-fallback", _codex_fallback_of=parent_id)
+    elif invalid == "newer-child":
+        r.original(f"{invalid}-newer", 0, "compact-conversation", owner=child_owner,
+                   _attempt_finished_at=r.clock())
+        r.text._update(child_owner, f"{invalid}-newer",
+                       _supersedes_request_id=child_id)
+
+    from services.pool_admission import _verified_current_incomplete_leaves
+    with r.store.connect() as db:
+        rows = [(owner, rid, digest, json.loads(raw)) for owner, rid, digest, raw in
+                db.execute("SELECT owner,id,request_hash,receipt FROM requests")]
+    assert (child_owner, child_id) not in _verified_current_incomplete_leaves(rows)
+    r.original("ordinary-contributor")
+    r.text._update("owner", "ordinary-contributor", recovery_next_at=1)
+    admitted = []
+    r.admission.recoveries["text"] = lambda *_: None
+    with patch.object(r.admission, "_dispatch_original_read",
+                      side_effect=lambda kind, owner, request_id, function, receipt:
+                      admitted.append(request_id) or True):
+        r.admission.recover_one(background=True)
+
+    # The ordinary due original remains ahead: mutable/fake receipt flags,
+    # hash drift, owner mismatch, and a newer child fail closed to P1.
+    if invalid != "wrong-account":
+        assert admitted[0] == "ordinary-contributor"
+
+
+def test_compact_leaf_and_parent_keep_one_physical_original_read(recovery):
+    r = recovery
+    _parent_id, child_id = compact_incomplete_leaf(r)
+    child_started = threading.Event()
+    calls = []
+
+    def read(_owner, request_id):
+        calls.append(request_id)
+        if request_id == child_id:
+            child_started.set()
+            assert r.release.wait(3)
+
+    r.admission.recoveries["text"] = read
+    r.admission.recover_one(background=True)
+    assert child_started.wait(1)
+    # The parent is due too, but shares the exact physical conversation key
+    # and cannot start another original-result reader while the child is live.
+    r.admission.recover_one(background=True)
+    assert calls == [child_id]
 
 
 def test_each_account_keeps_its_turn_budget_across_pacing_failures_and_empty_scans(recovery):
