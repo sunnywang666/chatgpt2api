@@ -546,7 +546,7 @@ def test_server_ste_metadata_without_turn_or_with_conflicting_turn_stays_unknown
     assert conflict.session.get_calls == conflict.session.ws_calls == []
 
 
-def test_late_final_after_ws_done_is_not_yielded():
+def test_unconfirmed_ws_done_in_one_catchup_does_not_end_the_turn_before_late_final():
     late = json.dumps({"type": "reply", "reply": {"topic_id": "conversation-turn-turn-1", "catchups": [
         {"payload": {"payload": {"encoded_item": "\n".join((
             'data: {"v":{"conversation_id":"conversation-1","message":{"id":"thought-leaf","author":{"role":"assistant"},"parent":"original-user"}}}',
@@ -558,8 +558,35 @@ def test_late_final_after_ws_done_is_not_yielded():
 
     payloads = list(backend.stream_conversation(prompt="fixture"))
 
-    assert all("final-leaf" not in payload for payload in payloads)
+    final_index = next(index for index, payload in enumerate(payloads) if "final-leaf" in payload)
+    assert "[DONE]" not in payloads[:final_index]
     assert payloads[-1] == "[DONE]"
+
+
+def test_unconfirmed_catchup_done_keeps_same_subscription_for_later_live_terminal():
+    catchup = json.dumps({"type": "reply", "reply": {"topic_id": "conversation-turn-turn-1", "catchups": [
+        {"payload": {"payload": {"encoded_item": "\n".join((
+            'data: {"v":{"conversation_id":"conversation-1","message":{"id":"thought-leaf","author":{"role":"assistant"},"parent":"original-user"}}}',
+            "data: [DONE]",
+        ))}}},
+    ]}})
+    live = json.dumps({"type": "message", "topic_id": "conversation-turn-turn-1", "payload": {"payload": {
+        "encoded_item": "\n".join((
+            'data: {"v":{"conversation_id":"conversation-1","message":{"id":"final-leaf","author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"parent":"thought-leaf"}}}',
+            "data: [DONE]",
+        )),
+    }}})
+    backend = _backend(_initial_events(), frames=[catchup, live])
+
+    payloads = list(backend.stream_conversation(prompt="fixture"))
+
+    assert any("thought-leaf" in payload for payload in payloads)
+    final_index = next(index for index, payload in enumerate(payloads) if "final-leaf" in payload)
+    assert "[DONE]" not in payloads[:final_index]
+    assert payloads.count("[DONE]") == 1
+    assert len(backend.session.post_calls) == 1
+    assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+    assert backend.session.ws.closed is True
 
 
 def test_handoff_uses_one_monotonic_sixty_second_budget_for_get_connect_and_receive(monkeypatch):
