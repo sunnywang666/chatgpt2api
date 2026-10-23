@@ -374,14 +374,15 @@ class TextTaskService:
         return True
 
     @classmethod
-    def _completed_reserved_original_recheck(cls, receipt):
+    def _completed_reserved_original_recheck(cls, receipt, now=None):
         """Whether a legacy saved success needs one exact original GET.
 
         Earlier writers could durably save a recovered answer while retaining
         the original turn reservation but without retaining its terminal
         branch proof.  Content/status are not enough to repair that residue;
         an ordinary read may only reopen the existing original-result reader
-        when no sender is live and all original identity anchors remain.
+        when no sender is live, or when an expired sender is durably bound to
+        a saved exact final that still needs one fresh recheck.
         """
         finite = lambda value: type(value) in (int, float) and math.isfinite(value)
         claim_id, claim_until = receipt.get("_claim_id"), receipt.get("_claim_until")
@@ -394,19 +395,105 @@ class TextTaskService:
                 or receipt.get("error_code") is not None
                 or not isinstance(receipt.get("content"), str) or not receipt["content"].strip()
                 or receipt.get("_turn_reserved") is not True
-                or receipt.get("_executing") is not False
                 or receipt.get("_recovery_paused") is True or receipt.get("_recovery_suppressed") is True
                 or receipt.get("_completion") or receipt.get("_completion_of")
                 or receipt.get("_missing_successor_resume")
-                or receipt.get("recovery_claim_id") is not None
                 or receipt.get("_recovery_claim_id") is not None
                 or any(not isinstance(receipt.get(key), str) or not receipt[key].strip()
                        for key in ("request_message_id", "provider_binding_id", "provider_account_identity",
                                    "client_conversation_id", "conversation_id"))):
             return False
+        recovery_claim = receipt.get("recovery_claim_id")
+        recovery_claimed_at = receipt.get("recovery_claimed_at")
+        recovery_lease_until = receipt.get("recovery_lease_until")
+        if any(value is not None for value in (recovery_claim, recovery_claimed_at, recovery_lease_until)):
+            # A crashed result reader may be fenced only after its durable
+            # lease has expired. A current reader remains the sole owner.
+            if (not finite(now)
+                    or not isinstance(recovery_claim, str) or not recovery_claim
+                    or not finite(recovery_claimed_at) or not finite(recovery_lease_until)
+                    or recovery_claimed_at > recovery_lease_until
+                    or recovery_lease_until > now
+                    or receipt.get("recovery_phase") != "read_text_request"):
+                return False
+        executing = receipt.get("_executing")
+        if executing is True:
+            # A sender which died after the recovery reader saved its exact
+            # final never ran its finally block. Do not treat that saved proof
+            # as a terminal snapshot: make one new exact read take the next
+            # transition after fencing the expired sender.
+            marker = receipt.get("_recovered_final_sender")
+            evidence = receipt.get(TURN_END_EVIDENCE_FIELD)
+            if (not finite(now) or not isinstance(claim_id, str) or not claim_id
+                    or not finite(claim_until) or claim_until > now
+                    or not isinstance(marker, dict)
+                    or set(marker) != {"claim_id", "content_sha256", "provider_binding_id",
+                                       "provider_account_identity", "client_conversation_id", "conversation_id",
+                                       "request_message_id", "final_message_id"}
+                    or marker.get("claim_id") != claim_id
+                    or any(marker.get(key) != receipt.get(key) for key in (
+                        "provider_binding_id", "provider_account_identity", "client_conversation_id"))
+                    or marker.get("conversation_id") != receipt.get("conversation_id")
+                    or marker.get("request_message_id") != receipt.get("request_message_id")
+                    or marker.get("final_message_id") != receipt.get("parent_message_id")
+                    or marker.get("content_sha256") != hashlib.sha256(
+                        receipt["content"].encode("utf-8")).hexdigest()
+                    or not isinstance(evidence, dict)
+                    or evidence.get("conversation_id") != marker["conversation_id"]
+                    or evidence.get("request_message_id") != marker["request_message_id"]
+                    or evidence.get("final_message_id") != marker["final_message_id"]):
+                return False
+        elif executing is not False:
+            return False
         if claim_id is None:
             return claim_until is None
         return isinstance(claim_id, str) and bool(claim_id) and finite(claim_until)
+
+    @staticmethod
+    def _recovered_final_sender_marker(receipt, recovered, *, require_reader_identity=True):
+        """Bind a fresh exact final to the sender that was still executing."""
+        evidence = (recovered or {}).get(TURN_END_EVIDENCE_FIELD)
+        content = receipt.get("content")
+        claim = receipt.get("_claim_id")
+        if (not isinstance(claim, str) or not claim
+                or not isinstance(content, str) or not content.strip()
+                or any(not isinstance(receipt.get(key), str) or not receipt[key].strip()
+                       for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))
+                or not isinstance(evidence, dict)
+                or set(evidence) != {"conversation_id", "request_message_id", "final_message_id", "observed_at"}
+                or evidence.get("conversation_id") != receipt.get("conversation_id")
+                or evidence.get("request_message_id") != receipt.get("request_message_id")
+                or evidence.get("final_message_id") != receipt.get("parent_message_id")
+                or require_reader_identity and any(
+                    recovered.get(key) != receipt.get(key)
+                    for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))):
+            return None
+        return {
+            "claim_id": claim,
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "provider_binding_id": receipt["provider_binding_id"],
+            "provider_account_identity": receipt["provider_account_identity"],
+            "client_conversation_id": receipt["client_conversation_id"],
+            "conversation_id": evidence["conversation_id"],
+            "request_message_id": evidence["request_message_id"],
+            "final_message_id": evidence["final_message_id"],
+        }
+
+    @classmethod
+    def retire_recovered_final_after_sender_exit(cls, receipt, claim):
+        """Release a completed original only from that sender's real finally."""
+        if (receipt.get("_recovered_final_sender") is None
+                or receipt.get("_claim_id") != claim or receipt.get("_executing") is not False):
+            return False
+        marker = cls._recovered_final_sender_marker(receipt, {
+            TURN_END_EVIDENCE_FIELD: receipt.get(TURN_END_EVIDENCE_FIELD),
+        }, require_reader_identity=False)
+        if (marker is None or marker != receipt.get("_recovered_final_sender")
+                or not cls._completed_reserved_original_recheck(receipt)):
+            return False
+        receipt.update(_turn_reserved=False)
+        receipt.pop("_recovered_final_sender", None)
+        return True
 
     @staticmethod
     def _public_not_submitted(receipt):
@@ -1002,6 +1089,9 @@ class TextTaskService:
                         or any(not receipt.get(key) or recovered.get(key) != receipt[key]
                                for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))):
                     return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+                result.update({key: recovered[key] for key in (
+                    "provider_binding_id", "provider_account_identity", "client_conversation_id",
+                )})
                 result[TURN_END_EVIDENCE_FIELD] = dict(ended)
             if ((receipt or {}).get("_chat_recovery") or {}).get("kind") == "search":
                 search = recovered.get("_search_result")
@@ -1088,7 +1178,7 @@ class TextTaskService:
         ended = recovered.get(TURN_END_EVIDENCE_FIELD)
         compatibility_recheck = cls._completed_reserved_original_recheck(
             {**current, "recovery_claim_id": None, "recovery_claimed_at": None,
-             "recovery_lease_until": None},
+             "recovery_lease_until": None}, now=updated.get("updated_at"),
         )
         if (not (cls._normal_sent_chat_result_recovery(current) or compatibility_recheck)
                 or current.get("_turn_reserved") is not True
@@ -1573,6 +1663,14 @@ class TextTaskService:
                 return {"request_id": request_id, "status": "not_found"}
             current = json.loads(row[0])
             missing_attempt = self._missing_successor_attempt(current)
+            # Validation before the GET used the reader's snapshot. Recheck
+            # its retained identity under the write transaction so a late
+            # result cannot restore an account/binding changed in the meantime.
+            identity_fields = ("provider_binding_id", "provider_account_identity", "client_conversation_id")
+            if (isinstance(recovered, dict)
+                    and any(key in recovered for key in identity_fields)
+                    and any(recovered.get(key) != current.get(key) for key in identity_fields)):
+                recovered, error_code, phase = None, "RECOVERY_INVALID_RESULT", "read_text_result"
             if current.get("status") == "succeeded" or (
                 current.get("status") == "failed" and current.get("error_code") == "CHAT_RESPONSE_NOT_TEXT"
             ):
@@ -1606,6 +1704,15 @@ class TextTaskService:
                             _turn_reserved=False,
                             **{TURN_END_EVIDENCE_FIELD: dict(recovered[TURN_END_EVIDENCE_FIELD])},
                         )
+                        updated.pop("_recovered_final_sender", None)
+                    elif (not error_code and current.get("_executing") is True
+                          and not expired_execution):
+                        marker = self._recovered_final_sender_marker(
+                            {**updated, **(recovered or {})}, recovered)
+                        if marker is not None:
+                            updated["_recovered_final_sender"] = marker
+                    if expired_execution:
+                        updated.update(_claim_id=None, _claim_until=None, _executing=False)
                     current = updated
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
                                (json.dumps(current), owner, request_id, row[0]))
@@ -1855,6 +1962,12 @@ class TextTaskService:
                 # original turn; a live sender, pause, successor recovery, or
                 # non-final observation remains protected above.
                 updated["_turn_reserved"] = False
+                updated.pop("_recovered_final_sender", None)
+            elif (not error_code and current.get("_executing") is True
+                  and not expired_execution):
+                marker = self._recovered_final_sender_marker(updated, recovered)
+                if marker is not None:
+                    updated["_recovered_final_sender"] = marker
             self._end_execution_wait(updated, now, observed=observed)
             self._end_no_final_recovery(updated, now)
             if (error_code and updated.get("_attempt_reason") in self._BOUNDED_RECOVERY_STOPS.values()
@@ -1992,7 +2105,7 @@ class TextTaskService:
                 ).fetchone()
         if snapshot:
             receipt = json.loads(snapshot[1])
-            compatibility_recheck = self._completed_reserved_original_recheck(receipt)
+            compatibility_recheck = self._completed_reserved_original_recheck(receipt, now)
             completed = (receipt.get("status") == "succeeded"
                          and isinstance(receipt.get("content"), str) and bool(receipt["content"].strip())
                          # Probe a copy: an eligible cleanup must be persisted
@@ -2070,7 +2183,7 @@ class TextTaskService:
                     and not completion.get("replacement_id") and not completion.get("selected_id")
                     and not previous.get("_completion_of")
                 )
-                compatibility_final_recheck = self._completed_reserved_original_recheck(previous)
+                compatibility_final_recheck = self._completed_reserved_original_recheck(previous, now)
                 no_final_recheck = bool(
                     _explicit_ended_recheck and previous.get("_attempt_finished_at")
                     and previous.get("_attempt_reason") in self._BOUNDED_RECOVERY_STOPS.values()

@@ -406,6 +406,75 @@ def test_real_text_admission_retires_turn_and_allows_product_close(tmp_path):
     assert result["state"] == "closing" and result["slot_held"] and result["cleanup_pending"]
 
 
+def test_live_sender_exact_recovery_releases_only_from_same_finally_and_allows_close(tmp_path):
+    from datetime import datetime, timezone
+    from unittest.mock import Mock
+    from services.conversation_binding_service import ConversationBindingService
+    from services.request_context import current_request
+    from services.text_task_service import TextTaskService
+    from test.test_pool_admission import build, Clock
+    from test.test_unknown_turn_recovery import document
+
+    clock = Clock()
+    (tmp_path / "accounts.json").write_text(json.dumps([{
+        "access_token": "fixture-token", "account_id": "upstream", "provider_account_identity": "account",
+        "type": "Plus", "status": "正常", "quota": 99, "source_type": "web",
+        "conversation_binding_ids": ["binding"],
+        "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+    }]))
+    _, store, admission = build(tmp_path, clock)
+    backend, reads, sends = Mock(), [], []
+    text = TextTaskService(store.path, admission=admission, clock=clock)
+
+    def reader(receipt):
+        reads.append(receipt["request_id"])
+        upstream = document(receipt)
+        upstream["mapping"]["final-" + receipt["request_message_id"]]["message"]["content"]["parts"] = ["exact original final"]
+        return ConversationBindingService._read_text_request_result(backend, receipt, document=upstream)
+
+    def runner(_body, on_cursor):
+        sends.append("send")
+        current_request.get().before_send()
+        on_cursor({"provider_binding_id": "binding", "provider_account_identity": "account",
+                   "conversation_id": "conversation", "parent_message_id": "parent"})
+        # The sender remains inside execute(); recovery saves the exact final
+        # first, and this later callback must not replace that saved result.
+        text._update("owner", "live-recovered", status="unknown",
+                     error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_outcome="unknown")
+        assert text.read("owner", "live-recovered")["content"] == "exact original final"
+        live_product = ProductWorkService(text, SimpleNamespace(archive_product_work=lambda *args: None), clock=clock)
+        assert live_product.get(IDENTITY, "P")["state"] == "active"
+        with pytest.raises(WorkLifecycleError, match="TURN_UNFINISHED"):
+            live_product.close(IDENTITY, "P")
+        return {"content": "late different callback", "upstream_outcome": "completed",
+                "provider_binding_id": "binding", "provider_account_identity": "account",
+                "conversation_id": "conversation", "parent_message_id": "late-final"}
+
+    text.runner, text.recovery_reader = runner, reader
+    admission.register("text", lambda context, body: text._run(context.owner, context.request_id, body))
+    text.submit("owner", {
+        "client_request_id": "live-recovered", "client_conversation_id": "client", "model": "fixture-text",
+        "messages": [{"role": "user", "content": "fixture"}],
+        "product_work": {"product_ref": "P", "step_ref": "text"},
+    }, source="internal:listing")
+
+    context = admission.claim_next()
+    assert context and context.kind == "text"
+    admission.execute(context)
+    with store.connect() as db:
+        saved = store.read_receipt(db, "text", "owner", "live-recovered")
+    assert saved["status"] == "succeeded" and saved["content"] == "exact original final"
+    assert saved["parent_message_id"] != "late-final"
+    assert saved["_executing"] is False and saved["_turn_reserved"] is False
+    assert "_recovered_final_sender" not in saved and reads == ["live-recovered"] and sends == ["send"]
+
+    reopened = TextTaskService(store.path, admission=admission, clock=clock)
+    product = ProductWorkService(reopened, SimpleNamespace(archive_product_work=lambda *args: None), clock=clock)
+    assert product.get(IDENTITY, "P")["state"] == "active"
+    assert product.close(IDENTITY, "P")["state"] == "closing"
+    assert reads == ["live-recovered"] and sends == ["send"]
+
+
 def test_recovered_original_final_retires_turn_and_allows_same_product_close(tmp_path):
     from datetime import datetime, timezone
     from unittest.mock import Mock

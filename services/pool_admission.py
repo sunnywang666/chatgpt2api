@@ -1010,18 +1010,24 @@ class PoolAdmission:
                                   ("unknown", "failed", "error"))
                               for receipt in (json.loads(raw),)]
         receipts = text_receipts + image_receipts
-        rows = [row for row in receipts if row[3].get("status") in {"unknown", "failed", "error"}]
+        from services.text_task_service import TextTaskService
+        rows = [row for row in receipts if (
+            row[3].get("status") in {"unknown", "failed", "error"}
+            or row[0] == "text" and TextTaskService._completed_reserved_original_recheck(row[3], now)
+        )]
         _, transferred_empty_turns = self._empty_turn_transfers(receipts)
         # Use the existing persisted retry timestamps. A short-backoff legacy
         # scan must not monopolize recovery ahead of other overdue originals.
         # Missing/zero retry times are immediately due. Image created_at is a
         # formatted string, so it must not enter this numeric retry ordering.
-        from services.text_task_service import TextTaskService
         rows.sort(key=lambda row: float((TextTaskService._recovery_due_at(row[3])
                                         if row[0] == "text" else row[3].get("next_poll_at")) or 0))
         for kind, owner, request_id, r in rows:
             saved_image = kind == "image" and bool(r.get("result_file_ids") or r.get("result_sediment_ids") or pending_image_result_ids(r))
-            if recovery_suppressed(r) or r.get("_recovery_paused") is True or r.get("_attempt_finished_at") and not saved_image:
+            compatibility_recheck = (kind == "text"
+                                     and TextTaskService._completed_reserved_original_recheck(r, now))
+            if (recovery_suppressed(r) or r.get("_recovery_paused") is True
+                    or r.get("_attempt_finished_at") and not saved_image and not compatibility_recheck):
                 continue
             if kind not in self.recoveries:
                 continue
@@ -1031,7 +1037,7 @@ class PoolAdmission:
                     continue
             if kind == "text":
                 from services.text_task_service import TextTaskService
-                due = (unknown_text_result(r) and r.get("provider_binding_id")
+                due = ((unknown_text_result(r) or compatibility_recheck) and r.get("provider_binding_id")
                        and TextTaskService._recovery_due(r, now))
             else:
                 due = image_original_recovery_pending(r) and float(r.get("next_poll_at") or 0) <= now
@@ -3029,6 +3035,9 @@ class PoolAdmission:
                 r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
                 if r and r.get("_claim_id") == context.claim:
                     r["_executing"] = False
+                    if context.kind == "text":
+                        from services.text_task_service import TextTaskService
+                        TextTaskService.retire_recovered_final_after_sender_exit(r, context.claim)
                     if not r.get("_submission_started") and r.get("error_code") in {"CONVERSATION_OUTCOME_UNKNOWN", "CONVERSATION_BINDING_UNAVAILABLE", "IMAGE_RESOURCE_UNAVAILABLE"}:
                         record_unsent_failure(context, r, float(self.clock()))
                         r.update(status="queued", _claim_id=None, _claim_until=0, _executing=False,
