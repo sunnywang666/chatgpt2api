@@ -1842,7 +1842,8 @@ class TextTaskService:
         return result
 
     def read(self, owner: str, request_id: str, *, allow_unrecoverable_retry: bool = False,
-             _explicit_ended_recheck: bool = False, _explicit_recovery: bool = False):
+             _explicit_ended_recheck: bool = False, _explicit_recovery: bool = False,
+             _initial_snapshot=None):
         from services.pool_admission import unknown_text_result
         recovery_claim = None
         recovery_target = None
@@ -1851,10 +1852,12 @@ class TextTaskService:
         # projected without competing with admission for the SQLite writer
         # lock. Any recovery or completed-lease cleanup still rereads under
         # the existing write transaction before changing the receipt.
-        with self._db() as db:
-            snapshot = db.execute(
-                "SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id),
-            ).fetchone()
+        snapshot = _initial_snapshot
+        if snapshot is None:
+            with self._db() as db:
+                snapshot = db.execute(
+                    "SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id),
+                ).fetchone()
         if snapshot:
             receipt = json.loads(snapshot[1])
             completed = (receipt.get("status") == "succeeded"
@@ -2079,6 +2082,7 @@ class TextTaskService:
 
     def recover(self, owner: str, request_id: str, allow_unrecoverable_retry: bool = False,
                 *, explicit_ended_recheck: bool = False):
+        initial_snapshot = None
         def read(original_owner, original_id):
             # Admission is only a scheduling hint. The original transaction
             # still rechecks status, pause, due time and recovery-claim owner.
@@ -2087,12 +2091,16 @@ class TextTaskService:
                 allow_unrecoverable_retry=bool(allow_unrecoverable_retry),
                 _explicit_ended_recheck=explicit_ended_recheck,
                 _explicit_recovery=True,
+                _initial_snapshot=initial_snapshot,
             )
 
         admit = getattr(self.admission, "read_original_if_ready", None)
         if callable(admit) and not allow_unrecoverable_retry:
             with self._db() as db:
-                receipt = self.store.read_receipt(db, "text", owner, request_id)
+                initial_snapshot = db.execute(
+                    "SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", (owner, request_id),
+                ).fetchone()
+            receipt = json.loads(initial_snapshot[1]) if initial_snapshot else None
             if (receipt and self._normal_sent_chat_result_recovery(receipt)
                     and not receipt.get("_recovery_paused") and not receipt.get("_recovery_suppressed")
                     and self._recovery_due(receipt, self._now())
