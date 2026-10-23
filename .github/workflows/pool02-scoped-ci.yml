@@ -62,6 +62,7 @@ on:
       - test/test_image_metadata_refresh_liveness.py
       - test/test_product_work.py
       - test/test_rejected_chat_successor.py
+      - test/test_unsent_bound_retry.py
       - test/test_missing_node_chain_lifecycle.py
       - test/test_queued_combined_copy_compaction.py
       - test/test_conversation_continuation.py
@@ -146,6 +147,7 @@ jobs:
             test/test_image_metadata_refresh_liveness.py \
             test/test_product_work.py \
             test/test_rejected_chat_successor.py \
+            test/test_unsent_bound_retry.py \
             test/test_missing_node_chain_lifecycle.py \
             test/test_queued_combined_copy_compaction.py \
             test/test_background_original_reads.py \

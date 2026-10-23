@@ -626,6 +626,8 @@ class TextTaskService:
             result["correction_of_request_id"] = receipt["_terminal_empty_correction_of"]
         if receipt.get("_supersedes_request_id"):
             result["supersedes_request_id"] = receipt["_supersedes_request_id"]
+        if receipt.get("_retry_unsent_of"):
+            result["retry_unsent_request_id"] = receipt["_retry_unsent_of"]
         if receipt.get("_supersedes_no_final"):
             result["continue_after_no_final"] = True
         if receipt.get("_supersedes_incomplete"):
@@ -2490,6 +2492,8 @@ class TextTaskService:
 
     SUPERSEDE_FIELDS = frozenset({"supersedes_request_id", "client_request_id", "provider_binding_id",
         "provider_account_identity", "client_conversation_id", "conversation_id", "parent_message_id"})
+    RETRY_UNSENT_FIELDS = frozenset({"retry_unsent_request_id", "client_request_id", "provider_binding_id",
+        "provider_account_identity", "client_conversation_id", "conversation_id", "parent_message_id"})
     REJECTED_SUPERSEDE_FIELDS = frozenset({"supersedes_request_id", "client_request_id", "client_conversation_id"})
     MISSING_NODE_RETRY_FIELD = "continue_before_queued_image_id"
     MISSING_NODE_RETRY_FIELDS = REJECTED_SUPERSEDE_FIELDS | frozenset({MISSING_NODE_RETRY_FIELD})
@@ -3096,6 +3100,8 @@ class TextTaskService:
 
     def submission_input(self, owner, body):
         """Resolve an explicit internal reference; callers cannot replace original content."""
+        if "retry_unsent_request_id" in body:
+            return self._unsent_retry_input(owner, body)
         if "supersedes_request_id" not in body:
             if "continue_after_no_final" in body:
                 raise ConversationBindingError("no-final continuation requires an original request", code="CHAT_SUPERSEDE_INVALID")
@@ -3225,6 +3231,147 @@ class TextTaskService:
             if any(expected.get(k) != v for k, v in body.items()):
                 reject()
             return expected
+
+    @classmethod
+    def _known_unsent_binding_retry_source(cls, receipt, now):
+        """The only original which may donate retained input to a new retry ID.
+
+        This is deliberately a binding failure before the first send, not a
+        recovery path for a possibly sent or UNKNOWN request.  An expired
+        claim is historical evidence; a live/malformed claim remains a hard
+        stop.  Timeline stages are limited to local acceptance/claiming and
+        must contain no send edge.
+        """
+        timeline = receipt.get("_execution_timeline")
+        if (receipt.get("status") != "failed"
+                or receipt.get("error_code") != "CONVERSATION_BINDING_MISMATCH"
+                or receipt.get("upstream_outcome") != "not_sent"
+                or receipt.get("_route", "chat") != "chat"
+                or receipt.get("_operation", "text") != "text"
+                or receipt.get("_forward_protocol")
+                or receipt.get("_submission_started") is not False
+                or receipt.get("_executing") is not False
+                or receipt.get("_turn_reserved") is not False
+                or receipt.get("upstream_unfinished")
+                or receipt.get("_upstream_terminal")
+                or receipt.get("_supersedes_request_id")
+                or receipt.get("_retry_unsent_of")
+                or any(receipt.get(key) for key in (
+                    "_recovery_paused", "_recovery_suppressed", "_work_key",
+                    "_completion", "_completion_of", "_retry_cursor",
+                ))
+                or any(key in receipt for key in ("content", "result", "data"))
+                or receipt.get("result_file_ids") or receipt.get("result_sediment_ids")
+                or (receipt.get("send_count") is not None
+                    and (type(receipt.get("send_count")) is not int or receipt.get("send_count") != 0))
+                or receipt.get("_last_sent_sequence") is not None
+                or receipt.get("_send_sequence") is not None
+                or receipt.get("upstream_submission_started") not in (None, False)
+                or not isinstance(receipt.get("_input_ref"), str)
+                or not receipt["_input_ref"]
+                or not isinstance(timeline, list)
+                or any(not isinstance(item, dict) for item in timeline)
+                or not (
+                    [item.get("stage") for item in timeline]
+                    in (["accepted"], ["accepted", "execution_claimed"])
+                    or ([item.get("stage") for item in timeline]
+                        == ["accepted", "execution_claimed", "task_finished"]
+                        and timeline[-1].get("task_status") == "failed")
+                )):
+            return False
+        for claim_key, until_key in (("_claim_id", "_claim_until"),
+                                     ("recovery_claim_id", "recovery_lease_until"),
+                                     ("_recovery_claim_id", "_recovery_claim_until")):
+            claim, until = receipt.get(claim_key), receipt.get(until_key)
+            if claim is not None and (type(until) not in (int, float) or not math.isfinite(until) or until > now):
+                return False
+            if until is not None and (type(until) not in (int, float) or not math.isfinite(until)):
+                return False
+        return True
+
+    def _unsent_retry_body(self, owner, original_id, original_hash, original, retained, envelope, request_id):
+        """Derive the sole permitted child input without exposing P's messages."""
+        def invalid():
+            raise ConversationBindingError("unsent retry envelope is invalid", code="CHAT_UNSENT_RETRY_INVALID")
+        if (set(envelope) != self.RETRY_UNSENT_FIELDS or not owner
+                or any(not isinstance(envelope.get(key), str) or not envelope[key].strip()
+                      or envelope[key] != envelope[key].strip() for key in self.RETRY_UNSENT_FIELDS)
+                or request_id != envelope.get("client_request_id")
+                or original_id != envelope.get("retry_unsent_request_id")
+                or request_id == original_id
+                or self._submission_identity(owner, retained) != (original_id, original_hash)
+                or not self._known_unsent_binding_retry_source(original, self._now())):
+            invalid()
+        # Four durable binding identities cannot be rebound.  B is a fresh
+        # parent cursor and is validated by the normal binding runner outside
+        # this SQLite transaction before it reaches an upstream send.
+        for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"):
+            if original.get(key) != envelope[key] or retained.get(key) != envelope[key]:
+                invalid()
+        if (retained.get("client_request_id") != original_id
+                or retained.get("supersedes_request_id") is not None
+                or retained.get("retry_unsent_request_id") is not None
+                or retained.get("derived_input") is not None
+                or retained.get("continue_after_no_final") is not None
+                or retained.get("continue_after_incomplete") is not None):
+            invalid()
+        try:
+            from services.product_work import normalize_product_work
+            original_product = normalize_product_work(retained.get("product_work"))
+        except Exception:
+            invalid()
+        if original_product is None or original.get("_product_work") != original_product:
+            invalid()
+        old_step = original_product["step_ref"]
+        prefix = "direct-listing.content.copy:"
+        if not old_step.startswith(prefix) or old_step != prefix + original_id:
+            invalid()
+        new_product = {**original_product, "step_ref": prefix + request_id}
+        try:
+            from services.product_work import normalize_product_work
+            new_product = normalize_product_work(new_product)
+        except Exception:
+            invalid()
+        return {**retained,
+                "client_request_id": request_id,
+                "retry_unsent_request_id": original_id,
+                "provider_binding_id": envelope["provider_binding_id"],
+                "provider_account_identity": envelope["provider_account_identity"],
+                "client_conversation_id": envelope["client_conversation_id"],
+                "conversation_id": envelope["conversation_id"],
+                "parent_message_id": envelope["parent_message_id"],
+                "product_work": new_product}
+
+    def _unsent_retry_input(self, owner, envelope):
+        request_id = envelope.get("client_request_id")
+        original_id = envelope.get("retry_unsent_request_id")
+        with self._db() as db:
+            existing = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                  (owner, request_id)).fetchone()
+            if existing:
+                try:
+                    receipt = json.loads(existing[1])
+                    saved = self.store.load_input(receipt["_input_ref"])
+                    if (receipt.get("_retry_unsent_of") != original_id
+                            or self._submission_identity(owner, saved) != (request_id, existing[0])
+                            or any(saved.get(key) != value for key, value in envelope.items())):
+                        raise ValueError
+                    return saved
+                except (OSError, ValueError, TypeError, KeyError):
+                    raise ConversationBindingError("request identity already has different input",
+                                                   code="CONVERSATION_REQUEST_CONFLICT") from None
+            row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                             (owner, original_id)).fetchone()
+            if not row:
+                raise ConversationBindingError("unsent retry envelope is invalid", code="CHAT_UNSENT_RETRY_INVALID")
+            try:
+                original = json.loads(row[1])
+                retained = self.store.load_input(original["_input_ref"])
+                return self._unsent_retry_body(owner, original_id, row[0], original, retained, envelope, request_id)
+            except (OSError, ValueError, TypeError, KeyError, ConversationBindingError) as exc:
+                if isinstance(exc, ConversationBindingError):
+                    raise
+                raise ConversationBindingError("unsent retry envelope is invalid", code="CHAT_UNSENT_RETRY_INVALID") from None
 
     @classmethod
     def _reconciled_queued_inputs_match(cls, store, db, owner, successor, previous, body, original_body):
@@ -3889,6 +4036,38 @@ class TextTaskService:
                 reject("CHAT_SUPERSEDE_CONFLICT")
         return native_sequence if native_no_final_retry else None
 
+    def _prepare_unsent_retry(self, db, owner, body, receipt, *, source):
+        """Atomically reserve P's one fresh-ID retry without touching P itself."""
+        original_id = body.get("retry_unsent_request_id")
+        if original_id is None:
+            return
+        def reject(code="CHAT_UNSENT_RETRY_INVALID"):
+            raise ConversationBindingError("unsent retry cannot advance", code=code)
+        row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                         (owner, original_id)).fetchone()
+        if not row:
+            reject()
+        try:
+            original = json.loads(row[1])
+            retained = self.store.load_input(original["_input_ref"])
+            envelope = {key: body.get(key) for key in self.RETRY_UNSENT_FIELDS}
+            expected = self._unsent_retry_body(owner, original_id, row[0], original, retained,
+                                                envelope, body.get("client_request_id"))
+        except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
+            reject()
+        if body != expected:
+            reject()
+        if source != original.get("_source"):
+            from services.work_lifecycle import WorkLifecycleError
+            raise WorkLifecycleError("PRODUCT_WORK_SOURCE_CONFLICT", 403)
+        other = db.execute(
+            "SELECT id FROM requests WHERE owner=? AND json_extract(receipt,'$._retry_unsent_of')=? LIMIT 1",
+            (owner, original_id),
+        ).fetchone()
+        if other:
+            reject("CHAT_UNSENT_RETRY_CONFLICT")
+        receipt.update(_retry_unsent_of=original_id, _retry_unsent_input_hash=row[0])
+
     @classmethod
     def _completed_historical_successor(cls, db, owner, previous_id, previous, original, now):
         """A completed registered child already released this historical head.
@@ -3934,6 +4113,7 @@ class TextTaskService:
 
     def validate_submission(self, owner: str, body: dict, *, source=None):
         """Read-only conflict check before any optional external review call."""
+        from services.durable_forward import dispatch_model
         body = self.submission_input(owner, body)
         request_id, request_hash = self._submission_identity(owner, body)
         with self._db() as db:
@@ -3942,9 +4122,11 @@ class TextTaskService:
                 (owner, request_id),
             ).fetchone()
             if not previous and "supersedes_request_id" in body:
-                from services.durable_forward import dispatch_model
                 self._prepare_supersede(db, owner, body, {"request_id": request_id,
                     "client_conversation_id": body["client_conversation_id"], "model": dispatch_model(body)})
+            if not previous and "retry_unsent_request_id" in body:
+                self._prepare_unsent_retry(db, owner, body, {"request_id": request_id,
+                    "client_conversation_id": body["client_conversation_id"], "model": dispatch_model(body)}, source=source)
         if previous and previous[0] != request_hash:
             raise ConversationBindingError(
                 "request identity already has different input",
@@ -4246,6 +4428,7 @@ class TextTaskService:
                         raise ConversationBindingError("account selection conflicts with binding",
                                                        code="CHAT_ACCOUNT_SELECTION_CONFLICT")
                 expected_native_sequence = self._prepare_supersede(db, owner, body, receipt)
+                self._prepare_unsent_retry(db, owner, body, receipt, source=source)
                 self._continue_public_session(db, owner, body, receipt)
                 from services.generation_completion import attach_replacement
                 attach_replacement(self.store, db, "text", owner, request_id, body, receipt)
@@ -4270,15 +4453,22 @@ class TextTaskService:
                 prepare_receipt(receipt, body.get("_scheduling"), receipt["_source"])
                 from services.product_work import ensure_product_work
                 product = body.get("product_work")
-                previous_id = (receipt.get("_supersedes_request_id") or receipt.get("_previous_request_id")
+                previous_id = (receipt.get("_supersedes_request_id") or receipt.get("_retry_unsent_of")
+                               or receipt.get("_previous_request_id")
                                or receipt.get("_completion_of") or receipt.get("_codex_fallback_of")
                                or receipt.get("_codex_continue_of") or receipt.get("_codex_rejected_retry_of"))
                 original = self.store.read_receipt(db, "text", owner, previous_id) if previous_id else None
                 if original and original.get("_product_work"):
                     from services.work_lifecycle import WorkLifecycleError
                     if product is not None and product != original["_product_work"]:
-                        if (not codex_product_bridge
-                                or product.get("product_ref") != original["_product_work"].get("product_ref")):
+                        unsent_retry_product = bool(
+                            receipt.get("_retry_unsent_of")
+                            and product.get("product_ref") == original["_product_work"].get("product_ref")
+                            and product.get("step_ref")
+                            == "direct-listing.content.copy:" + request_id
+                        )
+                        if (not unsent_retry_product and (not codex_product_bridge
+                                or product.get("product_ref") != original["_product_work"].get("product_ref"))):
                             raise WorkLifecycleError("PRODUCT_WORK_BINDING_CONFLICT")
                     else:
                         product = original["_product_work"]
@@ -4893,6 +5083,31 @@ class TextTaskService:
                                  upstream_outcome="not_sent", _turn_reserved=False, finished_at=self._now())
                     return
                 body = {**body, "_failed_retry_original": original}
+            if receipt.get("_retry_unsent_of"):
+                # The original P remains immutable.  Re-read its receipt and
+                # retained input immediately before the normal binding runner
+                # can inspect B or reach an upstream send.
+                with self.store.transaction() as db:
+                    original_id = receipt["_retry_unsent_of"]
+                    row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                     (owner, original_id)).fetchone()
+                    try:
+                        if not row or receipt.get("_retry_unsent_input_hash") != row[0]:
+                            raise ValueError
+                        original = json.loads(row[1])
+                        retained = self.store.load_input(original["_input_ref"])
+                        envelope = {key: body.get(key) for key in self.RETRY_UNSENT_FIELDS}
+                        expected = self._unsent_retry_body(owner, original_id, row[0], original, retained,
+                                                            envelope, request_id)
+                        stored = self.store.load_input(receipt["_input_ref"])
+                        # Admission supplies execution-only fields (including
+                        # its claim) to the runner.  The durable input is the
+                        # authoritative frozen envelope to compare here.
+                        if stored != expected:
+                            raise ValueError
+                    except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
+                        raise ConversationBindingError("unsent retry original changed",
+                                                       code="CHAT_UNSENT_RETRY_ORIGINAL_CHANGED") from None
             if receipt.get("_supersedes_request_id"):
                 with self.store.transaction() as db:
                     previous = self._validate_supersede(self.store, db, owner, receipt, self._now())
@@ -5070,6 +5285,11 @@ class TextTaskService:
                 else:
                     changes.update(status="failed", finished_at=self._now())
                 self._update(owner, request_id, **changes)
+                return
+            if exc.code.startswith("CHAT_UNSENT_RETRY_"):
+                self._update(owner, request_id, error_code=exc.code, upstream_outcome="not_sent",
+                             status="failed", _turn_reserved=False, _executing=False,
+                             _claim_id=None, _claim_until=None, finished_at=self._now())
                 return
             if exc.code == "CHAT_ARCHIVE_RESTORE_UNCONFIRMED":
                 changes = {"error_code": exc.code, "upstream_outcome": "not_sent", "_turn_reserved": False,
