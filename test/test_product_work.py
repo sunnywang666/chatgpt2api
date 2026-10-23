@@ -406,6 +406,147 @@ def test_real_text_admission_retires_turn_and_allows_product_close(tmp_path):
     assert result["state"] == "closing" and result["slot_held"] and result["cleanup_pending"]
 
 
+def test_recovered_original_final_retires_turn_and_allows_same_product_close(tmp_path):
+    from datetime import datetime, timezone
+    from unittest.mock import Mock
+    from services.conversation_binding_service import ConversationBindingService
+    from services.request_context import current_request
+    from services.text_task_service import TextTaskService
+    from test.test_pool_admission import build, Clock
+    from test.test_unknown_turn_recovery import document
+
+    clock = Clock()
+    (tmp_path / "accounts.json").write_text(json.dumps([{
+        "access_token": "fixture-token", "account_id": "upstream", "provider_account_identity": "account",
+        "type": "Plus", "status": "正常", "quota": 99, "source_type": "web",
+        "conversation_binding_ids": ["binding"],
+        "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+    }]))
+    _, store, admission = build(tmp_path, clock)
+
+    runner_calls = []
+    def runner(_body, on_cursor):
+        runner_calls.append("send")
+        current_request.get().before_send()
+        on_cursor({"provider_binding_id": "binding", "provider_account_identity": "account",
+                   "conversation_id": "conversation", "parent_message_id": "parent"})
+        raise TimeoutError("synthetic sender timeout")
+
+    text = TextTaskService(store.path, runner=runner, admission=admission, clock=clock)
+    admission.register("text", lambda context, body: text._run(context.owner, context.request_id, body))
+    text.submit("owner", {
+        "client_request_id": "recovered-text", "client_conversation_id": "client", "model": "fixture-text",
+        "messages": [{"role": "user", "content": "fixture"}],
+        "product_work": {"product_ref": "P", "step_ref": "text"},
+    }, source="internal:listing")
+    context = admission.claim_next()
+    assert context and context.kind == "text"
+    admission.execute(context)
+    with store.connect() as db:
+        timed_out = store.read_receipt(db, "text", "owner", "recovered-text")
+    assert timed_out["status"] == "unknown" and timed_out["_turn_reserved"] is True
+
+    backend = Mock()
+    upstream = document(timed_out)
+    upstream["mapping"]["final-" + timed_out["request_message_id"]]["message"]["content"]["parts"] = ["recovered final"]
+    text.recovery_reader = lambda row: ConversationBindingService._read_text_request_result(
+        backend, row, document=upstream,
+    )
+    recovered = text.read("owner", "recovered-text")
+    assert recovered["status"] == "succeeded" and recovered["content"] == "recovered final"
+    with store.connect() as db:
+        saved = store.read_receipt(db, "text", "owner", "recovered-text")
+    assert saved["_turn_reserved"] is False and saved["_executing"] is False
+
+    images = SimpleNamespace(archive_product_work=lambda *args: None)
+    product = ProductWorkService(text, images, clock=clock)
+    closed = product.close(IDENTITY, "P")
+    assert closed["state"] == "closing" and closed["cleanup_pending"] is True
+    # A repeated close retains the one durable archive intent.  Simulate a
+    # remote archive that accepted its PATCH but lost the response: restart
+    # reconciliation observes that remote state read-only and never resends
+    # either the model turn or the archive PATCH before resume.
+    assert product.close(IDENTITY, "P")["state"] == "closing"
+    remote = {"archived": False}
+    archive_calls = []
+    def archive(_owner, _request_id, desired):
+        archive_calls.append("precheck")
+        if remote["archived"]:
+            return {"request_id": "recovered-text", "conversation_id": "conversation", "archived": desired}
+        archive_calls.append("patch")
+        remote["archived"] = True
+        raise TimeoutError("synthetic lost archive response")
+
+    text.archive_product_work = archive
+    from services.work_lifecycle import WorkLifecycleService
+    lifecycle = WorkLifecycleService(text, images, clock=clock)
+    assert lifecycle.process_one()
+    assert product.get(IDENTITY, "P")["archive"]["pending"] == 1
+    clock.now += 61
+    restarted_lifecycle = WorkLifecycleService(text, images, clock=clock)
+    assert restarted_lifecycle.process_one()
+    completed = product.get(IDENTITY, "P")
+    assert completed["state"] == "completed" and archive_calls.count("patch") == 1
+    assert product.resume(IDENTITY, "P", completed["version"])["state"] == "active"
+    assert runner_calls == ["send"]
+
+
+def test_expired_sender_claim_scanner_recovers_original_final_and_allows_product_close(tmp_path):
+    from datetime import datetime, timezone
+    from unittest.mock import Mock
+    from services.conversation_binding_service import ConversationBindingService
+    from services.request_context import executing
+    from services.text_task_service import TextTaskService
+    from test.test_pool_admission import build, Clock
+    from test.test_unknown_turn_recovery import document
+
+    clock = Clock()
+    (tmp_path / "accounts.json").write_text(json.dumps([{
+        "access_token": "fixture-token", "account_id": "upstream", "provider_account_identity": "account",
+        "type": "Plus", "status": "正常", "quota": 99, "source_type": "web",
+        "conversation_binding_ids": ["binding"],
+        "capacity_observed_at": datetime.now(timezone.utc).isoformat(),
+    }]))
+    _, store, admission = build(tmp_path, clock)
+    text = TextTaskService(store.path, admission=admission, clock=clock)
+    text.submit("owner", {
+        "client_request_id": "expired-text", "client_conversation_id": "client", "model": "fixture-text",
+        "messages": [{"role": "user", "content": "fixture"}],
+        "product_work": {"product_ref": "expired-product", "step_ref": "text"},
+    }, source="internal:listing")
+    sender = admission.claim_next()
+    assert sender and sender.kind == "text"
+    # This is the real claim/send edge.  No execute() finally runs afterwards,
+    # modelling a sender process that exits after durable cursor persistence.
+    with executing(sender):
+        sender.before_send()
+        text._update("owner", "expired-text", provider_binding_id="binding",
+                     provider_account_identity="account", conversation_id="conversation",
+                     parent_message_id="parent")
+    with store.connect() as db:
+        stranded = store.read_receipt(db, "text", "owner", "expired-text")
+    assert stranded["_executing"] is True and stranded["_turn_reserved"] is True
+    clock.now = stranded["_claim_until"] + 1
+    # The real claim scanner converts only this expired, sent claim to
+    # UNKNOWN; it does not clear the reserved original turn or resubmit it.
+    assert admission.claim_next() is None
+
+    backend = Mock()
+    upstream = document(stranded)
+    upstream["mapping"]["final-" + stranded["request_message_id"]]["message"]["content"]["parts"] = ["recovered expired final"]
+    text.recovery_reader = lambda row: ConversationBindingService._read_text_request_result(
+        backend, row, document=upstream,
+    )
+    admission.recoveries["text"] = text.read
+    admission.recover_one()
+    with store.connect() as db:
+        recovered = store.read_receipt(db, "text", "owner", "expired-text")
+    assert recovered["status"] == "succeeded" and recovered["_turn_reserved"] is False
+    assert recovered["_executing"] is False and recovered["_claim_id"] is None
+    product = ProductWorkService(text, SimpleNamespace(archive_product_work=lambda *args: None), clock=clock)
+    assert product.close(IDENTITY, "expired-product")["state"] == "closing"
+
+
 @pytest.mark.parametrize("extra", [{"_forward_protocol": "responses"}, {"_editable_task_id": "file"},
     {"_editable_kind": "spreadsheet"}, {"_editable": {"kind": "file"}}, {"_operation": "image"}])
 def test_adoption_rejects_nonpure_legacy_text(runtime, extra):

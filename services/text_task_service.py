@@ -373,6 +373,41 @@ class TextTaskService:
         )
         return True
 
+    @classmethod
+    def _completed_reserved_original_recheck(cls, receipt):
+        """Whether a legacy saved success needs one exact original GET.
+
+        Earlier writers could durably save a recovered answer while retaining
+        the original turn reservation but without retaining its terminal
+        branch proof.  Content/status are not enough to repair that residue;
+        an ordinary read may only reopen the existing original-result reader
+        when no sender is live and all original identity anchors remain.
+        """
+        finite = lambda value: type(value) in (int, float) and math.isfinite(value)
+        claim_id, claim_until = receipt.get("_claim_id"), receipt.get("_claim_until")
+        if (receipt.get("_route", "chat") != "chat" or receipt.get("_operation", "text") != "text"
+                or receipt.get("_submission_started") is not True
+                or receipt.get("_forward_protocol") or receipt.get("_forward")
+                or receipt.get("_supersedes_request_id") or receipt.get("_derived_input")
+                or receipt.get("status") != "succeeded"
+                or receipt.get("upstream_outcome") != "completed"
+                or receipt.get("error_code") is not None
+                or not isinstance(receipt.get("content"), str) or not receipt["content"].strip()
+                or receipt.get("_turn_reserved") is not True
+                or receipt.get("_executing") is not False
+                or receipt.get("_recovery_paused") is True or receipt.get("_recovery_suppressed") is True
+                or receipt.get("_completion") or receipt.get("_completion_of")
+                or receipt.get("_missing_successor_resume")
+                or receipt.get("recovery_claim_id") is not None
+                or receipt.get("_recovery_claim_id") is not None
+                or any(not isinstance(receipt.get(key), str) or not receipt[key].strip()
+                       for key in ("request_message_id", "provider_binding_id", "provider_account_identity",
+                                   "client_conversation_id", "conversation_id"))):
+            return False
+        if claim_id is None:
+            return claim_until is None
+        return isinstance(claim_id, str) and bool(claim_id) and finite(claim_until)
+
     @staticmethod
     def _public_not_submitted(receipt):
         """Whether this terminal receipt proves the upstream text turn was not sent.
@@ -950,6 +985,24 @@ class TextTaskService:
                     or not isinstance(parent_message_id, str) or not parent_message_id.strip()):
                 return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
             result = {key: recovered[key] for key in cls._SUCCESS_RECOVERY_FIELDS if key in recovered}
+            ended = recovered.get(TURN_END_EVIDENCE_FIELD)
+            if ended is not None:
+                receipt = receipt or {}
+                if (not isinstance(ended, dict)
+                        or set(ended) != {"conversation_id", "request_message_id", "final_message_id", "observed_at"}
+                        or any(not isinstance(ended.get(key), str) or not ended[key].strip()
+                               for key in ("conversation_id", "request_message_id", "final_message_id"))
+                        or ended["request_message_id"] != receipt.get("request_message_id")
+                        or ended["final_message_id"] != parent_message_id
+                        or ended["final_message_id"] == ended["request_message_id"]
+                        or ended["conversation_id"] != recovered.get("conversation_id")
+                        or receipt.get("conversation_id") and ended["conversation_id"] != receipt["conversation_id"]
+                        or type(ended["observed_at"]) not in {int, float}
+                        or not math.isfinite(ended["observed_at"]) or ended["observed_at"] <= 0
+                        or any(not receipt.get(key) or recovered.get(key) != receipt[key]
+                               for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))):
+                    return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+                result[TURN_END_EVIDENCE_FIELD] = dict(ended)
             if ((receipt or {}).get("_chat_recovery") or {}).get("kind") == "search":
                 search = recovered.get("_search_result")
                 if (not isinstance(search, dict)
@@ -1015,6 +1068,51 @@ class TextTaskService:
                 anchor.update({TURN_END_EVIDENCE_FIELD: dict(ended), "_upstream_terminal": True, "_turn_reserved": False})
             return anchor or None, "UPSTREAM_OUTCOME_UNKNOWN", "read_text_result", cls._safe_recovery_reason(recovered.get("recovery_reason"))
         return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+
+    @classmethod
+    def _recovered_original_final_retires_turn(
+        cls, current, updated, recovered, *, expired_execution,
+    ):
+        """Whether this current reader proved its original sent Chat turn ended.
+
+        A saved success by itself remains compatible with older recovery
+        readers, but it cannot retire the turn reservation.  That transition
+        needs the exact request-branch evidence produced by the bound reader,
+        and must not race a still-live sender or an operator pause.
+        """
+        # `updated` deliberately retains existing receipt fields.  The proof
+        # which releases the reservation must nonetheless come from *this*
+        # exact original-result GET: a historical proof cannot stand in for a
+        # reader which did not prove a terminal result this time.
+        recovered = recovered if isinstance(recovered, dict) else {}
+        ended = recovered.get(TURN_END_EVIDENCE_FIELD)
+        compatibility_recheck = cls._completed_reserved_original_recheck(
+            {**current, "recovery_claim_id": None, "recovery_claimed_at": None,
+             "recovery_lease_until": None},
+        )
+        if (not (cls._normal_sent_chat_result_recovery(current) or compatibility_recheck)
+                or current.get("_turn_reserved") is not True
+                or current.get("_recovery_paused") is True
+                or current.get("_recovery_suppressed") is True
+                or current.get("_completion") or current.get("_completion_of")
+                or current.get("_missing_successor_resume")
+                or current.get("_executing") is True and not expired_execution
+                or current.get("status") == "succeeded" and current.get("content") != updated.get("content")
+                or compatibility_recheck and current.get("parent_message_id") != recovered.get("parent_message_id")
+                or updated.get("status") != "succeeded"
+                or updated.get("upstream_outcome") != "completed"
+                or not isinstance(updated.get("content"), str) or not updated["content"].strip()
+                or not isinstance(ended, dict)
+                or updated.get(TURN_END_EVIDENCE_FIELD) != ended
+                or set(ended) != {"conversation_id", "request_message_id", "final_message_id", "observed_at"}
+                or ended.get("request_message_id") != current.get("request_message_id")
+                or ended.get("conversation_id") != current.get("conversation_id")
+                or ended.get("final_message_id") != updated.get("parent_message_id")
+                or ended.get("final_message_id") == ended.get("request_message_id")
+                or type(ended.get("observed_at")) not in {int, float}
+                or not math.isfinite(ended["observed_at"]) or ended["observed_at"] <= 0):
+            return False
+        return True
 
     @staticmethod
     def _safe_result_observation(value, receipt):
@@ -1483,13 +1581,32 @@ class TextTaskService:
                 # lease; a late reader must never clear a newer worker's.
                 current_claim = current.get("recovery_claim_id")
                 if current_claim and current_claim == claim_id:
-                    current = {
+                    updated = {
                         **current,
                         "recovery_claim_id": None,
                         "recovery_claimed_at": None,
                         "recovery_lease_until": None,
                         "updated_at": now,
                     }
+                    old_claim_until = current.get("_claim_until")
+                    expired_execution = (
+                        current.get("_submission_started") is True
+                        and current.get("_executing") is True
+                        and isinstance(current.get("_claim_id"), str)
+                        and bool(current["_claim_id"])
+                        and type(old_claim_until) in (int, float)
+                        and math.isfinite(old_claim_until)
+                        and old_claim_until <= now
+                    )
+                    if (not error_code
+                            and self._recovered_original_final_retires_turn(
+                                current, {**updated, **(recovered or {})}, recovered,
+                                expired_execution=expired_execution)):
+                        updated.update(
+                            _turn_reserved=False,
+                            **{TURN_END_EVIDENCE_FIELD: dict(recovered[TURN_END_EVIDENCE_FIELD])},
+                        )
+                    current = updated
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=? AND receipt=?",
                                (json.dumps(current), owner, request_id, row[0]))
                 return self._public(current)
@@ -1731,6 +1848,13 @@ class TextTaskService:
                 # Fence that stale local executor; retain UNKNOWN and every
                 # original identity/result-recovery anchor.
                 updated.update(_claim_id=None, _claim_until=None, _executing=False)
+            if self._recovered_original_final_retires_turn(
+                    current, updated, recovered, expired_execution=expired_execution):
+                # The bound reader proved the exact submitted user branch
+                # reached one terminal final.  Retire only this completed
+                # original turn; a live sender, pause, successor recovery, or
+                # non-final observation remains protected above.
+                updated["_turn_reserved"] = False
             self._end_execution_wait(updated, now, observed=observed)
             self._end_no_final_recovery(updated, now)
             if (error_code and updated.get("_attempt_reason") in self._BOUNDED_RECOVERY_STOPS.values()
@@ -1868,12 +1992,13 @@ class TextTaskService:
                 ).fetchone()
         if snapshot:
             receipt = json.loads(snapshot[1])
+            compatibility_recheck = self._completed_reserved_original_recheck(receipt)
             completed = (receipt.get("status") == "succeeded"
                          and isinstance(receipt.get("content"), str) and bool(receipt["content"].strip())
                          # Probe a copy: an eligible cleanup must be persisted
                          # transactionally below, never only in the response.
                          and not self._retire_completed_recovery_claim(dict(receipt), now))
-            if self._queued_read_snapshot(receipt) or completed:
+            if self._queued_read_snapshot(receipt) or completed and not compatibility_recheck:
                 if receipt.get("_product_unsent_cancelled"):
                     return self.read_snapshot(owner, request_id)
                 return self._public(receipt)
@@ -1945,6 +2070,7 @@ class TextTaskService:
                     and not completion.get("replacement_id") and not completion.get("selected_id")
                     and not previous.get("_completion_of")
                 )
+                compatibility_final_recheck = self._completed_reserved_original_recheck(previous)
                 no_final_recheck = bool(
                     _explicit_ended_recheck and previous.get("_attempt_finished_at")
                     and previous.get("_attempt_reason") in self._BOUNDED_RECOVERY_STOPS.values()
@@ -1953,8 +2079,9 @@ class TextTaskService:
                 ended_recheck = completion_recheck or no_final_recheck
                 if (previous.get("_recovery_suppressed") is not True
                         and previous.get("_recovery_paused") is not True
-                        and (not previous.get("_attempt_finished_at") or ended_recheck)
-                        and unknown_text_result(previous)
+                        and (not previous.get("_attempt_finished_at") or ended_recheck
+                             or compatibility_final_recheck)
+                        and (unknown_text_result(previous) or compatibility_final_recheck)
                         and previous.get("request_message_id")
                         and previous.get("provider_binding_id")
                         and previous.get("provider_account_identity")

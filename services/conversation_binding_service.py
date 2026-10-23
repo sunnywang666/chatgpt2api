@@ -1804,6 +1804,11 @@ class ConversationBindingService:
             "status": "succeeded",
             "parent_message_id": parent_message_id,
             "content": text,
+            # Preserve the exact-branch terminal proof for the durable
+            # recovery writer.  A completed answer alone is not enough to
+            # release the original turn: it must remain tied to this saved
+            # request user node and its sole terminal descendant.
+            TURN_END_EVIDENCE_FIELD: ended,
             **({"_search_result": search_result} if search_result is not None else {}),
         }
 

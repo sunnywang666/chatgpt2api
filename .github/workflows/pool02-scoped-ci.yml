@@ -58,6 +58,7 @@ on:
       - test/test_pool_admission.py
       - test/test_stalled_text_diagnostics.py
       - test/test_recovery_control.py
+      - test/test_unknown_turn_recovery.py
       - test/test_image_metadata_refresh_liveness.py
       - test/test_product_work.py
       - test/test_rejected_chat_successor.py
@@ -153,6 +154,7 @@ jobs:
             test/test_editable_pool_admission.py \
             test/test_pool_admission_identity.py \
             test/test_text_task_service.py \
+            test/test_unknown_turn_recovery.py \
             test/test_text_stream_diagnostics.py \
             test/test_text_stream_handoff.py \
             test/test_model_catalog_service.py \
