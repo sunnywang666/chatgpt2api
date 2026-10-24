@@ -18,7 +18,7 @@ IDENTITY = {"id": "owner", "role": "admin", "_trusted_source": "internal:content
 PRODUCT = {"product_ref": "fixture-product", "step_ref": "text"}
 
 
-def _chain(task):
+def _chain(task, before_continue=None):
     """Build R/P/C/A4 and execute C plus ordinary retained A4 locally."""
     with task.service.store.transaction() as db:
         root = task.service.store.read_receipt(db, "text", "owner", "old")
@@ -26,6 +26,8 @@ def _chain(task):
                             source="internal:content")
         task.service.store.write_receipt(db, "text", "owner", "old", root)
     envelope = missing_node_model_rejection_with_queued_image(task)
+    if before_continue:
+        before_continue()
     task.service.submit("owner", envelope, source="internal:content")
     context = task.admission.claim_next()
     assert context and context.request_id == "missing-model-retry"
@@ -172,6 +174,27 @@ def _new_v2_text(task, request_id="v2-text"):
     }, source="internal:content")
 
 
+def _completed_text_after(task, request_id, parent_message_id):
+    task.service.submit("owner", {
+        **task.body,
+        "client_request_id": request_id,
+        "parent_message_id": parent_message_id,
+        "product_work": {"product_ref": "fixture-product", "step_ref": request_id},
+    }, source="internal:content")
+    context = task.admission.claim_next()
+    assert context and context.request_id == request_id
+    task.admission.execute(context)
+    task.admission.update_claim(context, _claim_id=None, _claim_until=0, _turn_reserved=False)
+    with task.service.store.connect() as db:
+        color = task.service.store.read_receipt(db, "text", "owner", request_id)
+    assert color["status"] == "succeeded" and color["upstream_outcome"] == "completed"
+    return color
+
+
+def _completed_color_after_a4(task, request_id="color"):
+    return _completed_text_after(task, request_id, "a4-final")
+
+
 def _archive_any(task, calls):
     def archive(owner, request_id, archived):
         calls.append((owner, request_id, archived))
@@ -180,6 +203,111 @@ def _archive_any(task, calls):
                        or task.service.store.read_receipt(db, "image", owner, request_id))
         return {"request_id": request_id, "conversation_id": receipt["conversation_id"], "archived": archived}
     return archive
+
+
+def test_first_close_archives_completed_color_anchored_to_a4(task):
+    product, lifecycle, calls, _ = _chain(task)
+    # Pool admission retains terminal claim IDs for attribution.  They are not
+    # live work once both retirement flags are false.
+    with task.service.store.transaction() as db:
+        for kind, request_id in (("text", "missing-model-retry"), ("image", "queued-image")):
+            receipt = task.service.store.read_receipt(db, kind, "owner", request_id)
+            receipt.update(_claim_id="retired-attribution", _claim_until=900,
+                           _executing=False, _turn_reserved=False)
+            task.service.store.write_receipt(db, kind, "owner", request_id, receipt)
+    color = _completed_color_after_a4(task)
+    # Some legacy successful receipts did not persist the optional observed
+    # request parent.  The hash-checked frozen input remains authoritative.
+    with task.service.store.transaction() as db:
+        current = task.service.store.read_receipt(db, "text", "owner", color["request_id"])
+        current["request_parent_message_id"] = ""
+        task.service.store.write_receipt(db, "text", "owner", color["request_id"], current)
+    lifecycle.text.archive_product_work = _archive_any(task, calls)
+
+    closing = product.close(IDENTITY, "fixture-product", results_saved=True)
+    assert closing["state"] == "closing"
+    with task.service.store.connect() as db:
+        parent = product._load(db, IDENTITY, "fixture-product")
+        child = task.service.store.runtime(db, parent["archive_keys"][0])
+        target, _, _ = product.load_archive_target(db, child)
+    assert child["last_request_id"] == color["request_id"]
+    assert target["request_id"] == color["request_id"]
+    assert lifecycle.process_one()
+    assert calls == [("owner", color["request_id"], True)]
+    assert product.get(IDENTITY, "fixture-product")["state"] == "completed"
+
+
+def test_first_close_archives_last_of_two_linear_followups(task):
+    product, lifecycle, calls, _ = _chain(task)
+    color = _completed_color_after_a4(task)
+    detail = _completed_text_after(task, "detail", color["parent_message_id"])
+    lifecycle.text.archive_product_work = _archive_any(task, calls)
+
+    assert product.close(IDENTITY, "fixture-product", results_saved=True)["state"] == "closing"
+    with task.service.store.connect() as db:
+        parent = product._load(db, IDENTITY, "fixture-product")
+        child = task.service.store.runtime(db, parent["archive_keys"][0])
+    assert child["last_request_id"] == detail["request_id"]
+    assert lifecycle.process_one()
+    assert calls == [("owner", detail["request_id"], True)]
+
+
+def test_first_close_preserves_completed_members_before_missing_node_continue(task):
+    early_ids = ("gallery", "copy")
+
+    def add_earlier_members():
+        for request_id in early_ids:
+            _new_v2_text(task, request_id)
+        with task.service.store.transaction() as db:
+            for request_id in early_ids:
+                earlier = task.service.store.read_receipt(db, "text", "owner", request_id)
+                earlier.update(status="succeeded", upstream_outcome="completed", content=request_id + " saved",
+                               parent_message_id=request_id + "-final", _executing=False, _turn_reserved=False,
+                               _claim_id=None, _claim_until=None)
+                task.service.store.write_receipt(db, "text", "owner", request_id, earlier)
+
+    product, lifecycle, calls, _ = _chain(task, before_continue=add_earlier_members)
+    color = _completed_color_after_a4(task)
+    lifecycle.text.archive_product_work = _archive_any(task, calls)
+
+    assert product.close(IDENTITY, "fixture-product", results_saved=True)["state"] == "closing"
+    assert lifecycle.process_one()
+    assert calls == [("owner", color["request_id"], True)]
+
+
+@pytest.mark.parametrize("invalid", ["unknown", "wrong-anchor", "wrong-observed-parent"],
+                         ids=["unknown", "wrong-anchor", "wrong-observed-parent"])
+def test_first_close_keeps_missing_node_chain_blocked_for_invalid_later_color(task, invalid):
+    product, _, calls, _ = _chain(task)
+    _completed_color_after_a4(task)
+    with task.service.store.transaction() as db:
+        color = task.service.store.read_receipt(db, "text", "owner", "color")
+        if invalid == "unknown":
+            color.update(status="unknown", upstream_outcome="unknown", _attempt_finished_at=None)
+        elif invalid == "wrong-observed-parent":
+            color["request_parent_message_id"] = "conflicting-a4-cursor"
+        else:
+            body = task.service.store.load_input(color["_input_ref"])
+            body["parent_message_id"] = "wrong-a4-cursor"
+            color["_input_ref"] = task.service.store.save_input(body)
+        task.service.store.write_receipt(db, "text", "owner", "color", color)
+
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_TURN_UNFINISHED"):
+        product.close(IDENTITY, "fixture-product", results_saved=True)
+    assert calls == []
+
+
+def test_first_close_rejects_stale_a4_archive_target_after_color(task):
+    product, _, _, _ = _chain(task)
+    _completed_color_after_a4(task)
+    assert product.close(IDENTITY, "fixture-product", results_saved=True)["state"] == "closing"
+    with task.service.store.transaction() as db:
+        parent = product._load(db, IDENTITY, "fixture-product")
+        child = task.service.store.runtime(db, parent["archive_keys"][0])
+        child["kind"], child["last_request_id"] = "image", "queued-image"
+        task.service.store.set_runtime(db, child["key"], child)
+        with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_ARCHIVE_BINDING_CHANGED"):
+            product.load_archive_target(db, child)
 
 
 def test_resumed_missing_node_chain_archives_latest_normal_text_cursor(task):

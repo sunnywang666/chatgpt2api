@@ -645,9 +645,16 @@ def _missing_node_chain(store, db, parent, receipt, members, now):
         return None
     # Do not turn this narrow exception into a generic cleanup of paused,
     # claimed, completion-owned, or later-mutated historical work.
-    controls = ("_executing", "_turn_reserved", "_claim_id", "recovery_claim_id", "_recovery_claim_id",
-                "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of")
-    if any(any(item.get(key) for key in controls) for item in chain):
+    controls = ("_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of")
+    # R/P are only retired through the immutable successor proof.  Preserve
+    # their existing no-claim constraint; only successful result receipts may
+    # retain the normal attribution claim after execution has ended.
+    if original.get("_claim_id") or rejected.get("_claim_id"):
+        return None
+    # Terminal receipts deliberately retain their old admission claim for
+    # attribution.  `_claims` recognizes that retired claim while retaining
+    # the block for executing, reserved, or otherwise ambiguous turns.
+    if any(_claims(item) or any(item.get(key) for key in controls) for item in chain):
         return None
     sequence = [item.get("_sequence") for item in chain]
     if not all(type(value) is int and value > 0 for value in sequence) or not sequence[0] < sequence[1] < sequence[3] < sequence[2]:
@@ -657,16 +664,69 @@ def _missing_node_chain(store, db, parent, receipt, members, now):
                     ("text", receipt.get("request_id")), ("image", image_id)}
     if not expected_ids <= member_ids:
         return None
-    # C is intentionally newer than A4 because A4 was queued first.  A later
-    # member would make that historical ordering ambiguous, so keep close
-    # blocked rather than silently archiving an older cursor.
+    # C is intentionally newer than A4 because A4 was queued first.  Keep
+    # earlier members as historical work; then accept only a linear later text
+    # chain whose immutable inputs start at A4's resulting cursor.  This
+    # preserves the original R/P/C/A4 proof but archives the actual latest
+    # safe cursor.  A parallel, unproved, or non-text later member remains an
+    # ambiguity rather than a reason to retire an UNKNOWN root.
+    later = []
     for member, other in members:
         kind = member["kind"]
         other_id = other.get("request_id") or other.get("id")
         if (kind, other_id) not in expected_ids and _same_conversation(other, receipt):
-            if type(other.get("_sequence")) is not int or other["_sequence"] > receipt["_sequence"]:
+            if type(other.get("_sequence")) is not int:
                 return None
-    return {"original": original, "rejected": rejected, "continue": receipt, "image": image}
+            if other["_sequence"] <= receipt["_sequence"]:
+                continue
+            later.append((other["_sequence"], member, other))
+    later.sort(key=lambda item: item[0])
+    if any(left[0] == right[0] for left, right in zip(later, later[1:])):
+        return None
+    successors = []
+    cursor = image["parent_message_id"]
+    for _, member, other in later:
+        kind = member["kind"]
+        other_id = other.get("request_id") or other.get("id")
+        if not isinstance(other_id, str) or not other_id:
+            return None
+        if (kind != "text"
+                or other.get("status") != "succeeded"
+                or other.get("upstream_outcome") != "completed"
+                or not isinstance(other.get("content"), str) or not other["content"].strip()
+                or not isinstance(other.get("parent_message_id"), str) or not other["parent_message_id"]
+                or other.get("request_parent_message_id") not in (None, "", cursor)
+                or _claims(other) or any(other.get(key) for key in controls)
+                or _unresolved(other, [row for _, row in members])):
+            return None
+        if any(other.get(key) != original.get(key) or not other.get(key) for key in keys):
+            return None
+        try:
+            row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                             (parent["owner"], other_id)).fetchone()
+            body = store.load_input(other["_input_ref"])
+            if not row or TextTaskService._submission_identity(parent["owner"], body) != (other_id, row[0]):
+                return None
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            return None
+        if (other.get("_product_work") != _metadata(parent, member["step_ref"])
+                or body.get("product_work") != other.get("_product_work")
+                or body.get("parent_message_id") != cursor
+                or any(body.get(key) != image.get(key) for key in (
+                    "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"))):
+            return None
+        successors.append((member, other))
+        cursor = other["parent_message_id"]
+    if successors:
+        archive_member, archive = successors[-1]
+    else:
+        archive_member = next((member for member, row in members
+                               if member["kind"] == "image" and row.get("id") == image_id), None)
+        archive = image
+    if not isinstance(archive_member, dict):
+        return None
+    return {"original": original, "rejected": rejected, "continue": receipt, "image": image,
+            "archive": archive, "archive_member": archive_member}
 
 
 def _no_final_successor_chain(store, db, parent, receipt, members, now):
@@ -1000,10 +1060,11 @@ class ProductWorkService:
             if archives is None:
                 continue
             for request_id, chain in self._missing_node_chains(db, parent, previous).items():
-                image = chain["image"]
-                if any(row.get("kind") == "image" and row.get("last_request_id") == image["id"]
+                archive = chain["archive"]
+                if any(row.get("kind") == chain["archive_member"]["kind"]
+                       and row.get("last_request_id") == chain["archive_member"]["request_id"]
                        and row.get("owner") == parent["owner"]
-                       and all(row.get("target", {}).get(k) == image.get(k) for k in (
+                       and all(row.get("target", {}).get(k) == archive.get(k) for k in (
                            "provider_binding_id", "provider_account_identity", "conversation_id"))
                        for row in archives):
                     chains[request_id] = chain
@@ -1330,22 +1391,28 @@ class ProductWorkService:
             targets = {}
             chains = self._missing_node_chains(db, parent, members)
             chain_member_ids = set()
-            special_canonicals = set()
-            image_members = {(member["kind"], member["request_id"]): (member, receipt)
-                             for member, receipt in members}
+            special_targets = {}
+            members_by_identity = {(member["kind"], member["request_id"]): (member, receipt)
+                                   for member, receipt in members}
             for chain in chains.values():
                 chain_member_ids.update(("text", chain[name]["request_id"])
                                         for name in ("original", "rejected", "continue"))
                 chain_member_ids.add(("image", chain["image"]["id"]))
-                special_canonicals.add((chain["image"]["provider_account_identity"],
-                                        chain["image"]["conversation_id"]))
+                archive_member, archive = chain["archive_member"], chain["archive"]
+                chain_member_ids.add((archive_member["kind"], archive_member["request_id"]))
+                canonical = (archive["provider_account_identity"], archive["conversation_id"])
+                target = archive_member["kind"], archive_member["request_id"]
+                if canonical in special_targets and special_targets[canonical] != target:
+                    raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
+                special_targets[canonical] = target
             for member, receipt in members:
                 identity = member["kind"], member["request_id"]
                 if identity in chain_member_ids:
                     chain = chains.get(receipt.get("request_id"))
                     if not chain:
                         continue
-                    member, receipt = image_members[("image", chain["image"]["id"])]
+                    member, receipt = members_by_identity[(chain["archive_member"]["kind"],
+                                                           chain["archive_member"]["request_id"])]
                 if _cancelled_unsent_step(self.store, db, parent, member, receipt):
                     continue
                 if _unsent(receipt) and outcome == "cancelled":
@@ -1358,13 +1425,10 @@ class ProductWorkService:
                         raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_REQUIRED")
                     canonical = next((key for key, (_, other) in targets.items() if _same_conversation(receipt, other)),
                                      (account, conversation))
-                    if canonical in special_canonicals and receipt.get("id") != next(
-                            (chain["image"]["id"] for chain in chains.values()
-                             if (chain["image"]["provider_account_identity"], chain["image"]["conversation_id"]) == canonical),
-                            None):
+                    if canonical in special_targets and (member["kind"], member["request_id"]) != special_targets[canonical]:
                         continue
                     previous = targets.get(canonical)
-                    if (canonical in special_canonicals or previous is None
+                    if (canonical in special_targets or previous is None
                             or receipt.get("_sequence", 0) > previous[1].get("_sequence", 0)):
                         targets[canonical] = member, receipt
                 elif _codex_product_bridge(receipt):
@@ -1414,10 +1478,10 @@ class ProductWorkService:
         if not self.archive_turns_ready(db, child, [receipt for _, receipt in members]):
             raise WorkLifecycleError("WORK_TURN_UNFINISHED")
         for chain in self._missing_node_chains(db, parent, members).values():
-            image = chain["image"]
-            if (child["target"].get("provider_account_identity") == image["provider_account_identity"]
-                    and child["target"].get("conversation_id") == image["conversation_id"]
-                    and (child["kind"], child["last_request_id"]) != ("image", image["id"])):
+            archive_member, archive = chain["archive_member"], chain["archive"]
+            if (child["target"].get("provider_account_identity") == archive["provider_account_identity"]
+                    and child["target"].get("conversation_id") == archive["conversation_id"]
+                    and (child["kind"], child["last_request_id"]) != (archive_member["kind"], archive_member["request_id"])):
                 raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
         receipt = self.store.read_receipt(db, child["kind"], child["owner"], child["last_request_id"])
         if not receipt or any(receipt.get(k) != v for k, v in child["target"].items()):
