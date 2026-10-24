@@ -118,6 +118,60 @@ class AdmissionTests(unittest.TestCase):
             route.assert_called_once_with("fixture-text")
         self.assertEqual(self.calls, [])
 
+    def test_recovery_loop_rescans_due_original_while_claim_pass_blocks(self):
+        """A later due original is not held behind a synchronous claim pass."""
+        self.submit("later-original")
+        self.text._update(
+            "happy", "later-original", status="unknown",
+            provider_account_identity="account-0", provider_binding_id="binding-0",
+            conversation_id="later-original", request_message_id="message-later-original",
+            _submission_started=True, _turn_reserved=False, _executing=False,
+            upstream_outcome="unknown", recovery_next_at=self.clock() + 1,
+        )
+        claim_entered, release_claim, claim_finished = threading.Event(), threading.Event(), threading.Event()
+        first_scan, dispatched = threading.Event(), threading.Event()
+        scan_count = [0]
+        original_recover_one = self.admission.recover_one
+
+        def slow_claim():
+            claim_entered.set()
+            release_claim.wait(5)
+            claim_finished.set()
+            return None
+
+        def recover(*, background=False):
+            self.assertTrue(background)
+            scan_count[0] += 1
+            try:
+                return original_recover_one(background=background)
+            finally:
+                if scan_count[0] == 1:
+                    first_scan.set()
+
+        self.admission.claim_next = slow_claim
+        self.admission.recover_one = recover
+        self.admission.recoveries["text"] = lambda _owner, request_id: (
+            dispatched.set() if request_id == "later-original" else None)
+        worker = threading.Thread(target=self.admission._loop, name="fixture-admission-loop")
+        worker.start()
+        try:
+            self.assertTrue(claim_entered.wait(1))
+            self.assertTrue(first_scan.wait(1))
+            self.clock.now += 1
+            self.assertTrue(dispatched.wait(2))
+            self.assertFalse(claim_finished.is_set())
+        finally:
+            self.admission._stop.set()
+            release_claim.set()
+            self.admission.wake()
+            worker.join(2)
+        recovery = self.admission._recovery_thread
+        if recovery is not None:
+            recovery.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(recovery is not None and recovery.is_alive())
+        self.assertGreaterEqual(scan_count[0], 2)
+
     def test_recovery_candidate_reads_preserve_terminal_payloads_and_late_completion(self):
         large_saved = [{"b64_json": "completed-payload-must-not-be-decoded" * 10000}]
         rows = {

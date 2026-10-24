@@ -904,15 +904,20 @@ class PoolAdmission:
             self._event.clear()
             try:
                 self._start_image_capability_refresh()
+                # Model catalog discovery for queued first sends is bounded,
+                # but it can still take a synchronous wait in ``claim_next``.
+                # Unknown originals never need that discovery, so give their
+                # independent read dispatcher its turn before entering the
+                # allocation loop.
+                if self._recovery_thread is None or not self._recovery_thread.is_alive():
+                    self._recovery_thread = threading.Thread(target=self._recovery_loop,
+                                                             name="original-result-read", daemon=True)
+                    self._recovery_thread.start()
                 while not self._stop.is_set():
                     claim = self.claim_next()
                     if claim is None:
                         break
                     threading.Thread(target=self.execute, args=(claim,), name="original-task-execute", daemon=True).start()
-                if self._recovery_thread is None or not self._recovery_thread.is_alive():
-                    self._recovery_thread = threading.Thread(target=self.recover_one, kwargs={"background": True},
-                                                             name="original-result-read", daemon=True)
-                    self._recovery_thread.start()
             except Exception:
                 # Invalid snapshots/storage are not permission to bypass
                 # admission. The existing receipt remains queryable.
@@ -921,6 +926,22 @@ class PoolAdmission:
             # Account/config changes in another worker are seen without a
             # client retry. Timed waits never occupy execution workers.
             self._event.wait(1.0)
+
+    def _recovery_loop(self):
+        """Scan due original results independently of first-send admission."""
+        while not self._stop.is_set():
+            try:
+                self.recover_one(background=True)
+            except Exception:
+                # A malformed or transiently unreadable recovery candidate
+                # must not stop later due originals while claim admission is
+                # busy.  Preserve its receipt; the next bounded scan retries.
+                from utils.log import logger
+                logger.warning({"event": "task_admission_unavailable", "layer": "provider", "phase": "recovery"})
+            # Keep the existing one-second recovery cadence even when wakeups
+            # or a continuously productive claim loop are busy.
+            if self._stop.wait(1.0):
+                return
 
     def _acquire_original_read(self, kind, owner, request_id, receipt, *, require_text_reservation=False):
         if self._stop.is_set():

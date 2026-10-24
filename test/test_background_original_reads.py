@@ -633,6 +633,37 @@ def test_explicit_recover_defers_without_claim_and_background_adopts_same_fifo_t
     assert not r.admission._original_reads
 
 
+def test_background_registered_read_reserves_fifo_then_claims_at_the_read_edge(recovery, monkeypatch):
+    """A due background original retains its FIFO place without claiming early."""
+    r = recovery
+    r.original("paced-background")
+    pacing, calls = prepare_explicit_recovery(r, monkeypatch)
+    _, clock = pacing._clock_for_account("upstream-0")
+    # Consume the only read credit first.  The background dispatcher must
+    # reserve the due original, then invoke its registered ``text.read`` only
+    # when that durable read edge arrives.
+    clock.request(lambda *_args, **_kwargs: SimpleNamespace(status_code=200, headers={}),
+                  "GET", "https://provider/conversation/previous")
+    completed = threading.Event()
+    monkeypatch.setattr(r.admission, "wake", completed.set)
+
+    r.admission.recover_one(background=True)
+    with r.store.connect() as db:
+        waiting = r.store.read_receipt(db, "text", "owner", "paced-background")
+    assert waiting.get("recovery_attempt") is None
+    assert not calls
+    assert len(clock.ordinary_read_queue) == 1
+    assert clock.ordinary_read_queue[0]["owner"].startswith("original-result:")
+
+    r.clock.now += 45
+    r.admission.recover_one(background=True)
+    assert completed.wait(2)
+    result = r.text.read_snapshot("owner", "paced-background")
+    assert result["status"] == "succeeded" and result["content"] == "original final"
+    assert calls == [("GET", "paced-background")]
+    assert not clock.ordinary_read_queue and not r.admission._original_reads
+
+
 def test_explicit_and_background_recovery_share_physical_read_exclusion(recovery, monkeypatch):
     r = recovery
     receipt = explicit_original(r, "shared-original")
