@@ -3663,28 +3663,50 @@ class OpenAIBackendAPI:
             expected_conversation_id=conversation_id,
             original_message_id=str(getattr(self, "text_request_message_id", "") or ""),
         )
+        # This continuation is deliberately unavailable to generic streams.
+        # Keep the predicate outside the normal-completion path too: an SSE
+        # body can fail after it has supplied a bound resume candidate.
+        handoff_enabled = (getattr(self, "retain_bound_conversation", False)
+                           and getattr(self, "text_stream_handoff_enabled", False)
+                           and not is_supported_image_model(model))
         try:
             initial_done = False
             remaining_stream_budget = max(0.001, request_deadline - time.monotonic())
-            for payload in self._iter_sse_payloads_capped(
-                response,
-                remaining_stream_budget,
-                timeout_error_type=StreamHardTimeoutError,
-                timeout_message=(
-                    f"conversation stream exceeded hard limit of {int(TEXT_STREAM_HARD_CAP_SECS)} seconds"
-                ),
-                observe_text=True,
-                request_message_id=str(getattr(self, "text_request_message_id", "") or ""),
-            ):
-                handoff.observe(payload)
-                self.text_stream_terminal = handoff.terminal_cursor()
-                if payload == "[DONE]":
-                    # A protocol consumer stops at DONE. Defer this one until
-                    # the same-turn WS handoff has either supplied its own
-                    # terminal marker or declined safely.
-                    initial_done = True
-                    continue
-                yield payload
+            try:
+                for payload in self._iter_sse_payloads_capped(
+                    response,
+                    remaining_stream_budget,
+                    timeout_error_type=StreamHardTimeoutError,
+                    timeout_message=(
+                        f"conversation stream exceeded hard limit of {int(TEXT_STREAM_HARD_CAP_SECS)} seconds"
+                    ),
+                    observe_text=True,
+                    request_message_id=str(getattr(self, "text_request_message_id", "") or ""),
+                ):
+                    handoff.observe(payload)
+                    self.text_stream_terminal = handoff.terminal_cursor()
+                    if payload == "[DONE]":
+                        # A protocol consumer stops at DONE. Defer this one until
+                        # the same-turn WS handoff has either supplied its own
+                        # terminal marker or declined safely.
+                        initial_done = True
+                        continue
+                    yield payload
+            except (TimeoutError, OSError, CurlError, requests.exceptions.RequestException):
+                # A broken SSE body can arrive after it has identified one
+                # exact, same-turn continuation topic.  The old normal-exit
+                # handoff below was unreachable in that case, leaving an
+                # otherwise safe continuation unused.  Do not turn a failed
+                # or ineligible handoff into success: preserve the original
+                # stream exception unless the WS path itself supplies its
+                # validated terminal marker.
+                if not (handoff_enabled and handoff.eligible):
+                    raise
+                self._record_stream_handoff_stage(handoff.diagnostic_stage)
+                handoff_done = yield from self._consume_stream_handoff(handoff, request_deadline)
+                if handoff_done:
+                    return
+                raise
             # ConversationBindingService sets this while holding its existing
             # binding/account lock. Generic unbound streams retain SSE-only
             # behavior rather than opening a second transport.
@@ -3692,9 +3714,6 @@ class OpenAIBackendAPI:
             # Only ConversationBindingService's retained text path opts into
             # result-only WS continuation; text prompts may still contain
             # reference images, so do not infer this from ``images``.
-            handoff_enabled = (getattr(self, "retain_bound_conversation", False)
-                               and getattr(self, "text_stream_handoff_enabled", False)
-                               and not is_supported_image_model(model))
             if handoff_enabled:
                 self._record_stream_handoff_stage(handoff.diagnostic_stage)
             if handoff.eligible and handoff_enabled:
@@ -3880,9 +3899,13 @@ class OpenAIBackendAPI:
         ws = watchdog = None
         frames = total_bytes = 0
         force_terminate = False
-        handoff_deadline = min(request_deadline, time.monotonic() + STREAM_HANDOFF_WS_MAX_SECS)
+        # Endpoint discovery, connection and subscription are bounded setup.
+        # A successfully subscribed socket receives its own bounded window so
+        # a slow-but-in-budget TLS/WS setup cannot consume every receive tick.
+        # Both legs remain capped by the original conversation deadline.
+        setup_deadline = min(request_deadline, time.monotonic() + STREAM_HANDOFF_WS_MAX_SECS)
         try:
-            remaining = handoff_deadline - time.monotonic()
+            remaining = setup_deadline - time.monotonic()
             if remaining <= 0:
                 self._record_stream_handoff_stage("ws_budget_exhausted")
                 return False
@@ -3891,7 +3914,7 @@ class OpenAIBackendAPI:
                 self.base_url + _STREAM_HANDOFF_WS_PATH,
                 headers=self._headers(_STREAM_HANDOFF_WS_PATH, {"Accept": "application/json"}),
                 timeout=remaining,
-                _account_request_deadline_monotonic=handoff_deadline,
+                _account_request_deadline_monotonic=setup_deadline,
             )
             try:
                 ensure_ok(response, _STREAM_HANDOFF_WS_PATH)
@@ -3903,20 +3926,22 @@ class OpenAIBackendAPI:
             if not ws_url:
                 self._record_stream_handoff_stage("ws_endpoint_invalid")
                 return False
-            options = self._handoff_ws_options(handoff_deadline)
+            options = self._handoff_ws_options(setup_deadline)
             if options is None:
                 self._record_stream_handoff_stage("ws_budget_exhausted")
                 return False
             ws = self.session.ws_connect(ws_url, **options)
             self._record_stream_handoff_stage("ws_connected")
-            # The fragment reader checks this same deadline between native
-            # readiness waits; retain the timer for lightweight/legacy socket
-            # adapters whose blocking receive cannot expose fragments.
-            remaining = handoff_deadline - time.monotonic()
+            # A connect implementation may return after its requested timeout.
+            # Never let that late return reset setup or issue a subscription.
+            remaining = setup_deadline - time.monotonic()
             terminate = getattr(ws, "terminate", None)
             if remaining <= 0 or not callable(terminate):
+                force_terminate = True
                 self._record_stream_handoff_stage("ws_budget_exhausted")
                 return False
+            # Keep the existing bound on a blocking subscription send. A new
+            # receive window is available only if setup actually finishes on time.
             watchdog = threading.Timer(remaining, terminate)
             watchdog.daemon = True
             watchdog.start()
@@ -3934,10 +3959,32 @@ class OpenAIBackendAPI:
                     "type": "subscribe", "topic_id": handoff.topic_id, "offset": "0",
                 }},
             ], separators=(",", ":")))
+            subscribed_at = time.monotonic()
+            if subscribed_at >= setup_deadline:
+                force_terminate = True
+                self._record_stream_handoff_stage("ws_budget_exhausted")
+                return False
+            watchdog.cancel()
+            watchdog = None
+            # Start the receive timer only after the subscription has been
+            # accepted locally.  This is still bounded by request_deadline;
+            # it cannot turn one original stream into an unbounded listener.
+            receive_deadline = min(request_deadline, subscribed_at + STREAM_HANDOFF_WS_MAX_SECS)
+            remaining = receive_deadline - time.monotonic()
+            if remaining <= 0:
+                force_terminate = True
+                self._record_stream_handoff_stage("ws_budget_exhausted")
+                return False
+            # The fragment reader checks the receive deadline between native
+            # readiness waits; retain the timer for lightweight/legacy socket
+            # adapters whose blocking receive cannot expose fragments.
+            watchdog = threading.Timer(remaining, terminate)
+            watchdog.daemon = True
+            watchdog.start()
             self._record_stream_handoff_stage("ws_subscribed")
             while frames < STREAM_HANDOFF_WS_MAX_FRAMES and total_bytes < STREAM_HANDOFF_WS_MAX_BYTES:
                 raw = self._handoff_ws_text(
-                    ws, handoff_deadline, STREAM_HANDOFF_WS_MAX_BYTES - total_bytes)
+                    ws, receive_deadline, STREAM_HANDOFF_WS_MAX_BYTES - total_bytes)
                 if not raw:
                     self._record_stream_handoff_stage("ws_transport_error", frames=frames,
                                                       total_bytes=total_bytes)
