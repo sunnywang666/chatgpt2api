@@ -151,3 +151,36 @@ def test_compact_archive_rechecks_original_after_close(product_no_final, monkeyp
     assert calls == []
     assert product.get(identity, "fixture-product")["state"] == "closing"
     assert row(h.service)["_input_ref"] == original["_input_ref"]
+
+
+@pytest.mark.parametrize("legacy_outcome", ["missing", None])
+@pytest.mark.parametrize("original_ended", [False, True])
+def test_legacy_missing_outcome_needs_own_end_proof_before_compact_close(
+        product_no_final, monkeypatch, legacy_outcome, original_ended):
+    h = product_no_final
+    compact(h, True)
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        if legacy_outcome == "missing":
+            original.pop("upstream_outcome", None)
+        else:
+            original["upstream_outcome"] = None
+        original.update(_claim_id="historical-sender", _claim_until=h.clock()-1,
+                        _executing=False, _turn_reserved=False)
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    with pytest.raises(WorkLifecycleError, match="TURN_UNFINISHED"):
+        product.close(identity, "fixture-product", results_saved=True)
+    assert calls == []
+    if not original_ended:
+        assert row(h.service) == original
+        return
+    ended = ended_original(h, monkeypatch)
+    assert ended["status"] == "unknown" and "content" not in ended
+    assert ended["_claim_id"] == original["_claim_id"]
+    assert ended["_claim_until"] == original["_claim_until"]
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    assert lifecycle.process_one()
+    assert product.get(identity, "fixture-product")["state"] == "completed"
+    assert calls == [("owner", "successor", True)] and len(h.sent) == 1
+    assert row(h.service) == ended
