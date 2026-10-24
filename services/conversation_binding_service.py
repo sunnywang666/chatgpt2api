@@ -14,7 +14,7 @@ from curl_cffi.requests.exceptions import RequestException
 
 from services.account_service import account_service
 from services.account_request_pacing import AccountReadRetryBudgetInsufficient
-from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
+from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI, explicit_final_channel
 from services.protocol.conversation import conversation_events, sanitize_output_text
 from services.request_context import bounded_lock, operation_budget, current_operation_deadline
 from utils.helper import UpstreamHTTPError
@@ -253,7 +253,7 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
                 and isinstance(content, dict) and content.get("content_type") == "text"
                 and isinstance(content.get("parts"), list) and all(isinstance(p, str) for p in content["parts"])
                 and any(p.strip() for p in content["parts"]))
-            if message.get("channel") not in {None, "final"} and not completed_commentary:
+            if explicit_final_channel(message) is False and not completed_commentary:
                 return None
             for successor in children.get(node_id, []):
                 following = mapping.get(successor, {}).get("message")
@@ -323,7 +323,7 @@ def _empty_reply_evidence(mapping, children, request_message_id, conversation_id
         if role not in {"assistant", "tool"}:
             return None
         following = children.get(node_id, [])
-        final = (role == "assistant" and message.get("channel") in {None, "final"}
+        final = (role == "assistant" and explicit_final_channel(message) is not False
                  and (not following or all(
                      isinstance(mapping.get(child), dict)
                      and isinstance(mapping[child].get("message"), dict)
@@ -403,7 +403,7 @@ def _completed_image_result(mapping, children, request_message_id, conversation_
                     if artifact not in artifacts:
                         artifacts.append(artifact)
         if role == "assistant" and message.get("end_turn") is True:
-            if (message.get("channel") != "final" or content.get("content_type") != "text"
+            if (explicit_final_channel(message) is not True or content.get("content_type") != "text"
                     or not isinstance(parts, list) or not all(isinstance(part, str) for part in parts)
                     or "".join(parts).strip() or not artifacts):
                 return None
@@ -1606,7 +1606,7 @@ class ConversationBindingService:
         result = {key: cursor[key] for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id", "parent_message_id")}
         if (message.get("id") != current or message.get("author", {}).get("role") != "assistant"
                 or message.get("status") != "finished_successfully" or message.get("end_turn") is not True
-                or message.get("channel") not in (None, "final")):
+                or explicit_final_channel(message) is False):
             return {**result, "binding_status": "unknown", "status": "running"}
         content = message.get("content") or {}
         parts = content.get("parts")
@@ -1753,7 +1753,7 @@ class ConversationBindingService:
                 text = "".join(parts).strip() if (
                     message.get("id") == node_id
                     and terminal
-                    and message.get("channel") in (None, "final")
+                    and explicit_final_channel(message) is not False
                     and isinstance(parts, list)
                     and parts
                     and all(isinstance(part, str) for part in parts)

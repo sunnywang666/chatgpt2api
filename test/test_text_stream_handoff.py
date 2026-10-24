@@ -9,7 +9,7 @@ from services.account_request_pacing import AccountRequestDeadlineExceeded
 from services import openai_backend_api as backend_module
 from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, _StreamHandoff
 from services.pool_admission import _safe_stream_handoff_event_metadata
-from services.protocol.conversation import conversation_events
+from services.protocol.conversation import conversation_events, is_visible_assistant_message
 from services.request_context import current_request
 
 
@@ -290,6 +290,38 @@ def test_handoff_rejects_conflicting_parent_or_metadata_reasoning_phase():
         "metadata": {"channel": "analysis"},
         "content": {"content_type": "text", "parts": ["must not accept"]},
     }}}))
+
+    assert handoff.terminal_seen is False
+    assert handoff.terminal_cursor() is None
+
+
+@pytest.mark.parametrize(("message", "containers", "expected"), [
+    ({"channel": " FINAL "}, (), True),
+    ({}, (), None),
+    ({}, ({"metadata": {"channel": "analysis"}},), False),
+    ({"channel": "final", "metadata": {"channel": "analysis"}}, (), False),
+    ({"channel": "analysis", "metadata": {"channel": "final"}}, (), False),
+    ({"channel": 1}, (), False),
+])
+def test_final_phase_requires_normalized_nonconflicting_message_and_metadata(message, containers, expected):
+    assert backend_module.explicit_final_channel(message, *containers) is expected
+
+
+def test_visible_assistant_message_does_not_ignore_conflicting_frame_metadata_phase():
+    message = {"author": {"role": "assistant"}, "channel": " FINAL "}
+    assert is_visible_assistant_message(message)
+    assert not is_visible_assistant_message(message, {"metadata": {"channel": "analysis"}})
+
+
+def test_handoff_rejects_final_text_when_wrapped_frame_metadata_conflicts():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps({"v": {
+        "conversation_id": "conversation-1", "metadata": {"channel": "analysis"}, "message": {
+            "id": "final", "parent": "original-user", "author": {"role": "assistant"},
+            "status": "finished_successfully", "end_turn": True, "channel": " FINAL ",
+            "content": {"content_type": "text", "parts": ["must not certify"]},
+        },
+    }}))
 
     assert handoff.terminal_seen is False
     assert handoff.terminal_cursor() is None

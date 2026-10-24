@@ -82,6 +82,30 @@ def migration(tmp_path, count=1):
     return service, admission, backend, legacy
 
 
+@pytest.mark.parametrize(("channel", "metadata_channel", "succeeded"), [
+    (" FINAL ", "final", True),
+    (None, "final", True),
+    (None, "analysis", False),
+    ("final", "analysis", False),
+    ("analysis", "final", False),
+])
+def test_original_result_reader_uses_shared_final_phase_resolution(tmp_path, channel, metadata_channel, succeeded):
+    _service, _admission, backend, legacy = migration(tmp_path)
+    upstream = document(legacy[0])
+    message = upstream["mapping"][upstream["current_node"]]["message"]
+    message["content"]["parts"] = ["complete original result"]
+    if channel is None:
+        message.pop("channel")
+    else:
+        message["channel"] = channel
+    message["metadata"] = {"channel": metadata_channel}
+
+    result = ConversationBindingService._read_text_request_result(backend, legacy[0], document=upstream)
+
+    assert (result["status"] == "succeeded") is succeeded
+    assert (result.get("content") == "complete original result") is succeeded
+
+
 def test_nine_legacy_unknowns_keep_results_and_order_but_release_proven_ended_turns(tmp_path):
     service, admission, backend, legacy = migration(tmp_path, 9)
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 9
