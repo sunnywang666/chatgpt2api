@@ -32,7 +32,7 @@ def bound_chat(monkeypatch):
         def _headers(self, path, extra):
             return extra
 
-        def _get_conversation(self, chat):
+        def _get_conversation(self, chat, *, deadline_monotonic=None):
             assert chat == "original-chat"
             state.calls.append("read")
             if state.read_error:

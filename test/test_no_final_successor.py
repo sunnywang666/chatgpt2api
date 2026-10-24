@@ -572,7 +572,7 @@ def test_fresh_tail_is_used_and_rechecked_without_rewriting_original(task, bound
         yield {"type": "conversation.delta", "conversation_id": "original-chat", "delta": "new answer"}
     monkeypatch.setattr(module, "conversation_events", events)
     monkeypatch.setattr(ConversationBindingService, "_read_text_request_result", staticmethod(
-        lambda backend, receipt: {"status": "succeeded", "content": "new answer", "parent_message_id": "new-answer"}))
+        lambda backend, receipt, *, deadline_monotonic: {"status": "succeeded", "content": "new answer", "parent_message_id": "new-answer"}))
     h.service.submit("owner", h.envelope)
     h.admission.execute(h.admission.claim_next())
     result = row(h.service, "successor")

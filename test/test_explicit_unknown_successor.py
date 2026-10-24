@@ -267,9 +267,9 @@ def test_real_paced_send_checks_after_cooldown_and_saves_only_own_result(task, b
     sends = []
     backend_type = binding.OpenAIBackendAPI
     original_get = backend_type._get_conversation
-    def get(backend, chat_id, *, _send=None):
+    def get(backend, chat_id, *, _send=None, deadline_monotonic=None):
         if _send is None:
-            return original_get(backend, chat_id)
+            return original_get(backend, chat_id, deadline_monotonic=deadline_monotonic)
         return OpenAIBackendAPI._get_conversation(backend, chat_id, _send=_send)
     monkeypatch.setattr(backend_type, "_get_conversation", get)
     monkeypatch.setattr(backend_type, "_image_active_timeout", lambda self, value: value, raising=False)
