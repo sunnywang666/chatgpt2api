@@ -384,6 +384,12 @@ class _StreamHandoff:
             return
         original = self._clean_id(self.original_message_id)
         message_id = self._clean_id(message.get("id"))
+        if self.terminal_message_id and self.terminal_message_id != message_id:
+            # The caller already established an original-branch terminal.
+            # A second terminal invalidates the cursor even if its snapshot
+            # omits visible content; do not keep the first answer's cursor.
+            self._invalidate_terminal_cursor()
+            return
         conversation_id = self._event_conversation_id(event)
         expected_conversation_id = (
             self.handoff_conversation_id or self.resume_conversation_id or self.expected_conversation_id
@@ -398,12 +404,6 @@ class _StreamHandoff:
             return
         text = "".join(parts)
         if not text:
-            return
-        if self.terminal_message_id and self.terminal_message_id != message_id:
-            # More than one visible final on a branch is not a cursor proof.
-            # Keep streaming behavior unchanged, but make the service use its
-            # existing authoritative GET rather than choose between finals.
-            self._invalidate_terminal_cursor()
             return
         if self.terminal_message_id and self.terminal_text != text:
             # A changed completed snapshot cannot safely replace a cursor that

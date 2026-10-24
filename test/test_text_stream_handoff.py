@@ -371,6 +371,47 @@ def test_backend_clears_cached_terminal_after_later_foreign_conversation_event()
     assert backend.text_stream_terminal is None
 
 
+@pytest.mark.parametrize("second_content", [{}, {"content": {"content_type": "text", "parts": []}}])
+def test_later_original_terminal_without_visible_text_revokes_cursor_and_uses_get(monkeypatch, second_content):
+    from contextlib import nullcontext
+    from services import conversation_binding_service as binding_module
+
+    initial = Response([
+        _line({"type": "resume_conversation_token", "kind": "topic", "conversation_id": "conversation-1"}),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "final-a", "parent": "original-user", "author": {"role": "assistant"},
+            "channel": "final", "status": "finished_successfully", "end_turn": True,
+            "content": {"content_type": "text", "parts": ["answer"]},
+        }}}),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "final-b", "parent": "original-user", "author": {"role": "assistant"},
+            "channel": "final", "status": "finished_successfully", "end_turn": True,
+            **second_content,
+        }}}),
+        b"data: [DONE]",
+    ])
+    backend = _backend(initial)
+    parent_reads = []
+    backend.get_conversation_parent_message_id = lambda conversation_id: (
+        parent_reads.append(conversation_id) or "read-parent")
+    backend.close = lambda: None
+    monkeypatch.setattr(binding_module, "OpenAIBackendAPI", lambda access_token: backend)
+    monkeypatch.setattr(binding_module.account_service, "get_bound_account_identity", lambda *_args, **_kwargs: "account-a")
+    monkeypatch.setattr(binding_module.account_service, "get_bound_text_access_token", lambda *_args, **_kwargs: "token-a")
+    monkeypatch.setattr(binding_module.account_service, "conversation_binding_lock", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(binding_module.account_service, "mark_text_used", lambda *_args, **_kwargs: None)
+
+    result = binding_module.ConversationBindingService().complete_text({
+        "provider_binding_id": "binding-a", "provider_account_identity": "account-a",
+        "client_conversation_id": "chain-a", "_request_message_id": "original-user",
+        "messages": [{"role": "user", "content": "write"}],
+    })
+
+    assert backend.text_stream_terminal is None
+    assert parent_reads == ["conversation-1"]
+    assert result["parent_message_id"] == "read-parent"
+
+
 def test_handoff_rejects_foreign_parent_edges_before_an_idless_conversation_final():
     handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
     handoff.observe(json.dumps({"v": {"conversation_id": "conversation-2", "message": {
