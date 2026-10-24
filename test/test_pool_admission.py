@@ -635,6 +635,39 @@ class AdmissionTests(unittest.TestCase):
         with self.store.connect() as db:
             return self.store.read_receipt(db, kind, owner, name)
 
+    def observe_successor_scan_wait(self, request_id, predicate):
+        """Expose the real loop's scan and subsequent Event.wait without waking it."""
+        observed, waiting = threading.Event(), threading.Event()
+        real_event, real_claim = self.admission._event, self.admission.claim_next
+
+        class ObservedEvent:
+            def set(_self):
+                real_event.set()
+
+            def clear(_self):
+                real_event.clear()
+
+            def wait(_self, timeout=None):
+                if observed.is_set():
+                    waiting.set()
+                return real_event.wait(timeout)
+
+        def claim_next():
+            claim = real_claim()
+            receipt = self.read("text", "happy", request_id)
+            if receipt is not None and predicate[0](receipt):
+                observed.set()
+            return claim
+
+        self.admission._event = ObservedEvent()
+        self.admission.claim_next = claim_next
+
+        def restore():
+            self.admission._event = real_event
+            self.admission.claim_next = real_claim
+
+        return observed, waiting, restore
+
     def test_pending_public_successor_claims_immediately_and_rechecks_original_before_send(self):
         session = {"client_conversation_id": "public-chain", "_public_route": "chat", "_public_session_ref": "public-chain"}
         self.submit("first", **session)
@@ -666,6 +699,150 @@ class AdmissionTests(unittest.TestCase):
         sent = self.calls[0][2]
         self.assertEqual(sent["parent_message_id"], "answer-0")
         self.assertEqual(sent["conversation_id"], "chat-0")
+
+    def test_loop_wakes_and_sends_due_public_successor_after_predecessor_finishes(self):
+        """A completed sequential turn releases its already-queued successor."""
+        first_started, release_first, second_sent = threading.Event(), threading.Event(), threading.Event()
+
+        def runner(body, on_cursor):
+            context = current_request.get()
+            context.before_send()
+            self.calls.append((context.owner, context.request_id, body))
+            if context.request_id == "first":
+                first_started.set()
+                self.assertTrue(release_first.wait(2))
+                return {"content": "first result", "provider_binding_id": "binding-0",
+                        "provider_account_identity": "account-0", "conversation_id": "chat-0",
+                        "parent_message_id": "first-parent", "upstream_outcome": "completed"}
+            second_sent.set()
+            return {"content": "second result", "provider_binding_id": "binding-0",
+                    "provider_account_identity": "account-0", "conversation_id": "chat-0",
+                    "parent_message_id": "second-parent", "upstream_outcome": "completed"}
+
+        self.text.runner = runner
+        session = {"client_conversation_id": "wake-chain", "_public_route": "chat",
+                   "_public_session_ref": "wake-chain"}
+        self.submit("first", **session)
+        predicate = [lambda receipt: receipt.get("_public_previous_waiting") is True]
+        successor_scanned, successor_waiting, restore = self.observe_successor_scan_wait("second", predicate)
+        self.admission.start()
+        try:
+            self.assertTrue(first_started.wait(1))
+            accepted = self.submit("second", **session, _previous_request_id="first")
+            self.assertEqual(accepted["status"], "queued")
+            self.assertTrue(successor_scanned.wait(1))
+            self.assertTrue(successor_waiting.wait(1), "B submit wake must be consumed before A finishes")
+            started_at = time.monotonic()
+            release_first.set()
+            self.assertTrue(second_sent.wait(.75), "completion wake must not wait for the one-second loop timeout")
+            self.assertLess(time.monotonic() - started_at, .75)
+            self.assertEqual([request_id for _, request_id, _ in self.calls], ["first", "second"])
+            deadline = time.monotonic() + 1
+            second = self.read("text", "happy", "second")
+            while second["status"] != "succeeded" and time.monotonic() < deadline:
+                time.sleep(.01)
+                second = self.read("text", "happy", "second")
+            self.assertEqual(second["status"], "succeeded")
+            self.assertEqual(second["provider_account_identity"], "account-0")
+            self.assertEqual(second["conversation_id"], "chat-0")
+            self.assertEqual(second["_submission_parent_message_id"], "first-parent")
+        finally:
+            release_first.set()
+            self.admission.stop()
+            if self.admission._recovery_thread is not None:
+                self.admission._recovery_thread.join(2)
+            restore()
+
+    def test_loop_keeps_public_successor_queued_after_unknown_predecessor(self):
+        """Wakeups must not turn an UNKNOWN original into a successor send."""
+        from services.conversation_binding_service import ConversationBindingError
+
+        first_started, release_first, second_sent = threading.Event(), threading.Event(), threading.Event()
+
+        def runner(body, on_cursor):
+            context = current_request.get()
+            context.before_send()
+            if context.request_id == "first":
+                first_started.set()
+                self.assertTrue(release_first.wait(2))
+                raise ConversationBindingError("fixture unknown", code="CONVERSATION_OUTCOME_UNKNOWN")
+            second_sent.set()
+            return {"content": "must not send"}
+
+        self.text.runner = runner
+        session = {"client_conversation_id": "unknown-chain", "_public_route": "chat",
+                   "_public_session_ref": "unknown-chain"}
+        self.submit("first", **session)
+        predicate = [lambda receipt: receipt.get("_public_previous_waiting") is True]
+        successor_scanned, successor_waiting, restore = self.observe_successor_scan_wait("second", predicate)
+        self.admission.start()
+        try:
+            self.assertTrue(first_started.wait(1))
+            self.submit("second", **session, _previous_request_id="first")
+            self.assertTrue(successor_scanned.wait(1))
+            self.assertTrue(successor_waiting.wait(1))
+            successor_scanned.clear()
+            predicate[0] = lambda receipt: (
+                receipt.get("_public_previous_waiting_reason") == "CHAT_PREVIOUS_REQUEST_UNKNOWN")
+            release_first.set()
+            self.assertTrue(successor_scanned.wait(.75), "A completion wake must rescan B")
+            self.assertEqual(self.read("text", "happy", "first")["status"], "unknown")
+            self.assertFalse(second_sent.is_set())
+            second = self.read("text", "happy", "second")
+            self.assertEqual(second["status"], "queued")
+            self.assertEqual(second["_public_previous_waiting_reason"], "CHAT_PREVIOUS_REQUEST_UNKNOWN")
+        finally:
+            release_first.set()
+            self.admission.stop()
+            if self.admission._recovery_thread is not None:
+                self.admission._recovery_thread.join(2)
+            restore()
+
+    def test_loop_keeps_public_successor_queued_until_account_pacing_is_due(self):
+        """Completion wake reevaluates B but never bypasses its account clock."""
+        first_started, release_first, second_sent = threading.Event(), threading.Event(), threading.Event()
+
+        def runner(body, on_cursor):
+            context = current_request.get()
+            context.before_send()
+            if context.request_id == "first":
+                first_started.set()
+                self.assertTrue(release_first.wait(2))
+                return {"content": "first result", "provider_binding_id": "binding-0",
+                        "provider_account_identity": "account-0", "conversation_id": "chat-0",
+                        "parent_message_id": "first-parent", "upstream_outcome": "completed"}
+            second_sent.set()
+            return {"content": "must not send"}
+
+        self.text.runner = runner
+        session = {"client_conversation_id": "paced-chain", "_public_route": "chat",
+                   "_public_session_ref": "paced-chain"}
+        self.submit("first", **session)
+        predicate = [lambda receipt: receipt.get("_public_previous_waiting") is True]
+        successor_scanned, successor_waiting, restore = self.observe_successor_scan_wait("second", predicate)
+        self.admission.start()
+        try:
+            self.assertTrue(first_started.wait(1))
+            self.submit("second", **session, _previous_request_id="first")
+            self.assertTrue(successor_scanned.wait(1))
+            self.assertTrue(successor_waiting.wait(1))
+            successor_scanned.clear()
+            predicate[0] = lambda receipt: (
+                receipt.get("status") == "queued" and not receipt.get("_public_previous_waiting"))
+            self.admission.pacing = lambda _account, now: {"next_at": now + 60}
+            release_first.set()
+            self.assertTrue(successor_scanned.wait(.75), "A completion wake must re-evaluate paced B")
+            self.assertEqual(self.read("text", "happy", "first")["status"], "succeeded")
+            self.assertFalse(second_sent.is_set())
+            second = self.read("text", "happy", "second")
+            self.assertEqual(second["status"], "queued")
+            self.assertNotIn("_public_previous_waiting", second)
+        finally:
+            release_first.set()
+            self.admission.stop()
+            if self.admission._recovery_thread is not None:
+                self.admission._recovery_thread.join(2)
+            restore()
 
     def test_completed_image_with_iso_creation_time_cannot_stop_text_recovery(self):
         self.image("saved-image")
