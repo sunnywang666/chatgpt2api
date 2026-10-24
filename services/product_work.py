@@ -646,6 +646,11 @@ def _missing_node_chain(store, db, parent, receipt, members, now):
     # Do not turn this narrow exception into a generic cleanup of paused,
     # claimed, completion-owned, or later-mutated historical work.
     controls = ("_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of")
+    # R/P are only retired through the immutable successor proof.  Preserve
+    # their existing no-claim constraint; only successful result receipts may
+    # retain the normal attribution claim after execution has ended.
+    if original.get("_claim_id") or rejected.get("_claim_id"):
+        return None
     # Terminal receipts deliberately retain their old admission claim for
     # attribution.  `_claims` recognizes that retired claim while retaining
     # the block for executing, reserved, or otherwise ambiguous turns.
