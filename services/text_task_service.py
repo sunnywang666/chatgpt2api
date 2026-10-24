@@ -1845,6 +1845,17 @@ class TextTaskService:
                     # readable again.
                     "recovery_requires_new_conversation": requires_new_conversation,
                 }
+                if (current.get("status") == "unknown"
+                        and current.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+                        and current.get("upstream_outcome") is None
+                        and recovery_reason == TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
+                        and recovered_anchor.get("_upstream_terminal") is True
+                        and isinstance(recovered_anchor.get(TURN_END_EVIDENCE_FIELD), dict)):
+                    # Legacy sent receipts may omit this outcome. Normalize it
+                    # only after validating this original turn's own end proof,
+                    # so an exact saved successor can resolve product closure.
+                    # The original stays UNKNOWN; no claim or result is erased.
+                    changes["upstream_outcome"] = "unknown"
             elif (recovered or {}).get("status") == "queued":
                 # Legacy multi-image recovery has saved every submitted slot.
                 # Its unsent remainder competes in the original admission queue.
