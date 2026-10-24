@@ -24,6 +24,7 @@ from services.openai_backend_api import (
     ImagePollTimeoutError,
     OpenAIBackendAPI,
     _is_content_policy_error,
+    explicit_final_channel,
 )
 from utils.helper import (
     IMAGE_MODELS,
@@ -527,7 +528,7 @@ def assistant_message_text(message: dict[str, Any]) -> str:
     return ""
 
 
-def is_visible_assistant_message(message: dict[str, Any]) -> bool:
+def is_visible_assistant_message(message: dict[str, Any], *containers: object) -> bool:
     """Return whether an upstream assistant message is intended for the user."""
     author = message.get("author")
     if not isinstance(author, dict):
@@ -547,8 +548,9 @@ def is_visible_assistant_message(message: dict[str, Any]) -> bool:
         return False
 
     # Reasoning and other internal channels must not leak into API text output.
-    channel = str(message.get("channel") or "").strip().lower()
-    if channel and channel != "final":
+    # Legacy messages with no explicit phase remain compatible, but metadata
+    # cannot silently contradict a visible final channel.
+    if explicit_final_channel(message, *containers) is False:
         return False
 
     return True
@@ -619,7 +621,7 @@ def assistant_raw_text(event: dict[str, Any], current_text: str = "", history_te
         if not isinstance(candidate, dict):
             continue
         message = candidate.get("message")
-        if not isinstance(message, dict) or not is_visible_assistant_message(message):
+        if not isinstance(message, dict) or not is_visible_assistant_message(message, candidate):
             continue
         text = assistant_message_text(message)
         if text:
@@ -636,7 +638,7 @@ def event_assistant_text(event: dict[str, Any], history_text: str = "") -> str:
         if not isinstance(candidate, dict):
             continue
         message = candidate.get("message")
-        if isinstance(message, dict) and is_visible_assistant_message(message):
+        if isinstance(message, dict) and is_visible_assistant_message(message, candidate):
             return strip_history(assistant_message_text(message), history_text)
     return ""
 
@@ -1055,7 +1057,7 @@ def _stream_image_terminal_result(backend, event, request_message_id, file_ids, 
         current = (document.get("mapping", {}).get(document.get("current_node")) or {}).get("message") or {}
         if (current.get("author", {}).get("role") != "assistant"
                 or current.get("status") != "finished_successfully"
-                or current.get("end_turn") is not True or current.get("channel") not in (None, "final")):
+                or current.get("end_turn") is not True or explicit_final_channel(current) is False):
             return False
         records = backend._extract_image_tool_records(document, request_message_id)
         if ({x for record in records for x in record["file_ids"]} != set(file_ids)
@@ -1574,7 +1576,7 @@ def _generate_bound_single_image(
             and author.get("role") == "assistant"
             and message.get("status") == "finished_successfully"
             and message.get("end_turn") is True
-            and message.get("channel") in {None, "final"}
+            and explicit_final_channel(message) is not False
             and children
         )
         image_tool_final = False

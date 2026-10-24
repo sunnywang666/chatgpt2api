@@ -115,6 +115,36 @@ EDITABLE_FILE_PSD_OUTPUT_DIR = "data/files/psd"
 EDITABLE_FILE_PPT_OUTPUT_DIR = "data/files/ppt"
 
 
+def explicit_final_channel(*containers: object) -> bool | None:
+    """Resolve explicit message/frame phase without treating conflicts as final.
+
+    A missing channel remains compatible with legacy final messages.  Once a
+    channel is supplied, however, every message or metadata copy must agree on
+    ``final`` after whitespace/case normalization.  This pure helper lives
+    here because the protocol module already imports this backend module.
+    """
+    channels: set[str] = set()
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        values = [container]
+        metadata = container.get("metadata")
+        if isinstance(metadata, dict):
+            values.append(metadata)
+        for value_container in values:
+            if "channel" not in value_container:
+                continue
+            value = value_container.get("channel")
+            if value is None or isinstance(value, str) and not value.strip():
+                continue
+            if not isinstance(value, str):
+                return False
+            channels.add(value.strip().lower())
+    if not channels:
+        return None
+    return len(channels) == 1 and "final" in channels
+
+
 @dataclass
 class _StreamHandoff:
     """Ephemeral, same-stack evidence for one result-only WS continuation.
@@ -204,22 +234,7 @@ class _StreamHandoff:
 
     @classmethod
     def _explicit_final_channel(cls, event: dict[str, Any], message: dict[str, Any]) -> bool | None:
-        """Preserve explicit message or metadata phase; unknown stays compatible."""
-        channels: set[str] = set()
-        invalid = False
-        for container in cls._event_containers(event, message):
-            if "channel" not in container:
-                continue
-            value = container.get("channel")
-            if value is None or isinstance(value, str) and not value.strip():
-                continue
-            if not isinstance(value, str):
-                invalid = True
-                continue
-            channels.add(value.strip().lower())
-        if invalid or len(channels) != 1:
-            return False if invalid or channels else None
-        return next(iter(channels)) == "final"
+        return explicit_final_channel(*cls._event_containers(event, message))
 
     @classmethod
     def _event_conversation_id(cls, event: dict[str, Any]) -> str:
