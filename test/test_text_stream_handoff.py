@@ -31,6 +31,18 @@ class Response:
     def close(self):
         self.closed = True
 
+
+class RaisingResponse(Response):
+    """Yield bounded SSE evidence, then fail while reading its body."""
+    def __init__(self, lines=(), error=None, body=None):
+        super().__init__(lines, body=body)
+        self.error = error or ConnectionError("stream body closed")
+
+    def iter_lines(self):
+        yield from self.lines
+        raise self.error
+
+
 class StageContext:
     def __init__(self):
         self.stages = []
@@ -93,6 +105,7 @@ class Session:
         self.impersonate = "chrome110"
         self.proxies = {"all": "socks5h://bound-proxy.example:1080"}
         self.cookies = {"session": "bound"}
+        self.closed = False
 
     def post(self, url, **kwargs):
         self.post_calls.append((url, kwargs))
@@ -106,6 +119,9 @@ class Session:
         self.ws_calls.append((url, kwargs))
         self.ws = self.ws_type(self.frames)
         return self.ws
+
+    def close(self):
+        self.closed = True
 
 
 class FailingHandoffSession(Session):
@@ -222,6 +238,84 @@ def test_handoff_transport_error_stays_unknown_and_records_no_exception_text():
     assert [data["handoff_stage"] for data in fields] == ["candidate_bound", "ws_endpoint_get_entered", "ws_transport_error"]
     assert len(backend.session.get_calls) == 1 and backend.session.ws_calls == []
     assert "PRIVATE" not in json.dumps(fields)
+
+
+def test_eligible_handoff_continues_after_sse_body_transport_error_without_second_post():
+    initial = RaisingResponse([
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE",
+               "conversation_id": "conversation-1"}),
+        _line(_ste()),
+    ])
+    backend = _backend(initial, frames=[_ws_frame()])
+    context = StageContext()
+    token = current_request.set(context)
+    try:
+        payloads = list(backend.stream_conversation(prompt="fixture"))
+    finally:
+        current_request.reset(token)
+
+    assert payloads[-1] == "[DONE]"
+    assert any("final-leaf" in payload for payload in payloads)
+    assert len(backend.session.post_calls) == 1
+    assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+    stages = [fields["handoff_stage"] for stage, fields in context.stages if stage == "stream_handoff"]
+    assert stages == [
+        "candidate_bound", "ws_endpoint_get_entered", "ws_endpoint_get_completed", "ws_connected",
+        "ws_subscribed", "ws_terminal",
+    ]
+
+
+@pytest.mark.parametrize("candidate", [
+    [],
+    [_line(_ste(top_level=True, conflict=True))],
+])
+def test_sse_body_transport_error_without_an_eligible_handoff_preserves_original_error(candidate):
+    initial = RaisingResponse([
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE",
+               "conversation_id": "conversation-1"}),
+        *candidate,
+    ])
+    backend = _backend(initial, frames=[_ws_frame()])
+
+    with pytest.raises(ConnectionError, match="stream body closed"):
+        list(backend.stream_conversation(prompt="fixture"))
+
+    assert len(backend.session.post_calls) == 1
+    assert backend.session.get_calls == backend.session.ws_calls == []
+
+
+def test_explicit_upstream_error_never_opens_handoff_or_becomes_a_terminal():
+    from utils.helper import UpstreamHTTPError
+
+    initial = RaisingResponse([
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE",
+               "conversation_id": "conversation-1"}),
+        _line(_ste()),
+    ], error=UpstreamHTTPError("/backend-api/conversation", 500, {"error": "opaque"}))
+    backend = _backend(initial, frames=[_ws_frame()])
+
+    with pytest.raises(UpstreamHTTPError):
+        list(backend.stream_conversation(prompt="fixture"))
+
+    assert len(backend.session.post_calls) == 1
+    assert backend.session.get_calls == backend.session.ws_calls == []
+
+
+@pytest.mark.parametrize("failure", ["endpoint", "empty", "foreign_branch"])
+def test_failed_handoff_after_sse_transport_error_preserves_the_original_exception(failure):
+    original_error = ConnectionError("original body failure")
+    initial = RaisingResponse(_initial_events(handoff=False, ste=True).lines[:-1], error=original_error)
+    frames = [] if failure == "empty" else [_ws_frame().replace("original-user", "foreign-user")]
+    backend = _backend(initial, frames=frames)
+    if failure == "endpoint":
+        backend.session = FailingHandoffSession(initial, backend.session.ws_url)
+
+    with pytest.raises(ConnectionError) as caught:
+        list(backend.stream_conversation(prompt="fixture"))
+
+    assert caught.value is original_error
+    assert len(backend.session.post_calls) == 1
+    assert backend.text_stream_terminal is None
 
 
 def test_handoff_timeline_whitelist_drops_arbitrary_fields_and_values():
@@ -442,6 +536,64 @@ def test_later_original_terminal_without_visible_text_revokes_cursor_and_uses_ge
     assert backend.text_stream_terminal is None
     assert parent_reads == ["conversation-1"]
     assert result["parent_message_id"] == "read-parent"
+
+
+@pytest.mark.parametrize("exact_complete", [False, True])
+def test_transport_handoff_terminal_still_uses_binding_exact_reader(monkeypatch, exact_complete):
+    """WS terminal ends transport only; the saved request branch owns success."""
+    from contextlib import nullcontext
+    from services import conversation_binding_service as binding_module
+
+    initial = RaisingResponse([
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE",
+               "conversation_id": "conversation-1"}),
+        _line(_ste()),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "thought-leaf", "author": {"role": "assistant"}, "parent": "original-user",
+        }}}),
+    ])
+    backend = _backend(initial, frames=[_ws_frame()])
+    backend.close = lambda: None
+    exact_reads = []
+
+    def exact_reader(_backend, receipt, **_kwargs):
+        exact_reads.append(dict(receipt))
+        if not exact_complete:
+            return {"status": "running", "recovery_reason": "REQUEST_RESULT_INCOMPLETE"}
+        return {
+            "status": "succeeded", "binding_status": "bound", "content": "saved exact result",
+            "provider_binding_id": "binding-a", "provider_account_identity": "account-a",
+            "client_conversation_id": "chain-a", "conversation_id": "conversation-1",
+            "parent_message_id": "saved-final",
+        }
+
+    monkeypatch.setattr(binding_module, "OpenAIBackendAPI", lambda access_token: backend)
+    monkeypatch.setattr(binding_module.ConversationBindingService, "_read_text_request_result", staticmethod(exact_reader))
+    monkeypatch.setattr(binding_module.account_service, "get_bound_account_identity", lambda *_args, **_kwargs: "account-a")
+    monkeypatch.setattr(binding_module.account_service, "get_bound_text_access_token", lambda *_args, **_kwargs: "token-a")
+    monkeypatch.setattr(binding_module.account_service, "conversation_binding_lock", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(binding_module.account_service, "mark_text_used", lambda *_args, **_kwargs: None)
+
+    body = {
+        "provider_binding_id": "binding-a", "provider_account_identity": "account-a",
+        "client_conversation_id": "chain-a", "_request_message_id": "original-user",
+        "_public_session_ref": "public-session", "_route": "chat", "_operation": "text",
+        "messages": [{"role": "user", "content": "write"}],
+    }
+
+    service = binding_module.ConversationBindingService()
+    if exact_complete:
+        result = service.complete_text(body)
+        assert result["content"] == "saved exact result"
+        assert result["_upstream_terminal"] is True
+    else:
+        with pytest.raises(binding_module.ConversationBindingError) as caught:
+            service.complete_text(body)
+        assert caught.value.code == "CONVERSATION_OUTCOME_UNKNOWN"
+        assert caught.value.recovery_reason == "REQUEST_RESULT_INCOMPLETE"
+    assert len(exact_reads) == 1
+    assert exact_reads[0]["request_message_id"] == "original-user"
+    assert len(backend.session.post_calls) == len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
 
 
 def test_handoff_rejects_foreign_parent_edges_before_an_idless_conversation_final():
@@ -879,18 +1031,71 @@ def test_unconfirmed_catchup_done_keeps_same_subscription_for_later_live_termina
     assert backend.session.ws.closed is True
 
 
-def test_handoff_uses_one_monotonic_sixty_second_budget_for_get_connect_and_receive(monkeypatch):
+def _handoff_with_elapsed_setup(monkeypatch, *, connect_seconds=39.5, subscribe_seconds=0.0):
     backend = _backend(_initial_events(), frames=[_ws_frame()])
-    handoff = backend.__class__.__dict__["_consume_stream_handoff"]
-    from services import openai_backend_api as module
-    ticks = iter((100.0, 100.0, 120.0, 130.0))
-    monkeypatch.setattr(module.time, "monotonic", lambda: next(ticks))
-    state = module._StreamHandoff(
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(backend_module.time, "monotonic", lambda: clock.now)
+    original_get, original_connect = backend.session.get, backend.session.ws_connect
+    original_send = backend._handoff_ws_send
+
+    def get(*args, **kwargs):
+        result = original_get(*args, **kwargs)
+        clock.now += 20.0
+        return result
+
+    def connect(*args, **kwargs):
+        result = original_connect(*args, **kwargs)
+        clock.now += connect_seconds
+        return result
+
+    def subscribe(ws, data):
+        original_send(ws, data)
+        clock.now += subscribe_seconds
+
+    monkeypatch.setattr(backend.session, "get", get)
+    monkeypatch.setattr(backend.session, "ws_connect", connect)
+    monkeypatch.setattr(backend, "_handoff_ws_send", subscribe)
+    deadlines = []
+    def receive(ws, deadline, max_bytes):
+        deadlines.append(deadline)
+        return ws.recv_str()
+    monkeypatch.setattr(backend, "_handoff_ws_text", receive)
+    state = backend_module._StreamHandoff(
         expected_conversation_id="conversation-1", original_message_id="original-user",
         resume_conversation_id="conversation-1", handoff_conversation_id="conversation-1",
         turn_exchange_id="turn-1", topic_id="conversation-turn-turn-1", handoff_count=1,
     )
+    return backend, state, deadlines
 
-    assert list(handoff(backend, state, 1000.0))[-1] == "[DONE]"
+
+@pytest.mark.parametrize("request_deadline,expected_receive_deadline", [(1000.0, 219.5), (180.0, 180.0)])
+def test_handoff_setup_does_not_consume_receive_window_or_extend_original_deadline(
+        monkeypatch, request_deadline, expected_receive_deadline):
+    backend, state, deadlines = _handoff_with_elapsed_setup(monkeypatch)
+
+    assert list(backend._consume_stream_handoff(state, request_deadline))[-1] == "[DONE]"
     assert backend.session.get_calls[0][1]["timeout"] == 60.0
     assert backend.session.ws_calls[0][1]["timeout"] == 40.0
+    assert deadlines == [expected_receive_deadline]
+
+
+@pytest.mark.parametrize("connect_seconds,subscribe_seconds,subscribed", [
+    (41.0, 0.0, False),
+    (39.5, 1.0, True),
+])
+def test_late_setup_cannot_restart_receive_budget(monkeypatch, connect_seconds, subscribe_seconds, subscribed):
+    backend, state, deadlines = _handoff_with_elapsed_setup(
+        monkeypatch, connect_seconds=connect_seconds, subscribe_seconds=subscribe_seconds,
+    )
+    assert list(backend._consume_stream_handoff(state, 1000.0)) == []
+    assert bool(backend.session.ws.sent) is subscribed
+    assert deadlines == []
+    assert backend.session.ws.terminated is True
+
+
+def test_handoff_refuses_an_exhausted_global_deadline_before_setup():
+    backend = _backend(_initial_events(), frames=[_ws_frame()])
+    handoff = SimpleNamespace(topic_id="conversation-turn-turn-1")
+
+    assert list(backend._consume_stream_handoff(handoff, time.monotonic() - 0.01)) == []
+    assert backend.session.post_calls == backend.session.get_calls == backend.session.ws_calls == []
