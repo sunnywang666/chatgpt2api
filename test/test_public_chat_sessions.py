@@ -828,6 +828,7 @@ def test_late_sender_error_does_not_replace_same_id_success(public_chat):
 
 @pytest.mark.parametrize('readback', [
     'missing_request', 'invalid_mapping', 'ambiguous', 'foreign_conversation', 'foreign_parent', 'incomplete',
+    'read_deadline',
 ])
 def test_sequential_readback_errors_keep_original_unknown_until_get_recovers(tmp_path, readback):
     from services.openai_backend_api import OpenAIBackendAPI
@@ -865,7 +866,10 @@ def test_sequential_readback_errors_keep_original_unknown_until_get_recovers(tmp
             'original-final': answer,
         }}
         if not valid_readback:
-            if readback == 'missing_request':
+            if readback == 'read_deadline':
+                from services.account_request_pacing import AccountRequestDeadlineExceeded
+                raise AccountRequestDeadlineExceeded('fixture original read deadline')
+            elif readback == 'missing_request':
                 result['mapping'] = {}
             elif readback == 'invalid_mapping':
                 result['mapping'] = None
@@ -907,7 +911,8 @@ def test_sequential_readback_errors_keep_original_unknown_until_get_recovers(tmp
         assert original['status'] == 'unknown'
         assert original['error_code'] == 'CONVERSATION_OUTCOME_UNKNOWN'
         assert original['original_failure_phase'] == 'cursor_read'
-        assert original['original_exception_category'] == ('empty_result' if readback == 'incomplete' else 'provider_error')
+        assert original['original_exception_category'] == (
+            'empty_result' if readback == 'incomplete' else 'timeout' if readback == 'read_deadline' else 'provider_error')
         assert original['_submission_started'] is True
         assert original['provider_binding_id'] == 'original-binding'
         assert original['provider_account_identity'] == 'original-account'

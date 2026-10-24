@@ -2591,17 +2591,23 @@ class ConversationBindingService:
                             "client_conversation_id": client_conversation_id, "conversation_id": returned_conversation_id,
                             "request_message_id": backend.text_request_message_id,
                             "request_parent_message_id": getattr(backend, "text_request_parent_message_id", ""),
-                        })
-                    except ConversationBindingError as exc:
+                        }, deadline_monotonic=time.monotonic() + self.RECOVERY_EXACT_READ_TIMEOUT_SECONDS)
+                    except Exception as exc:
                         # The model turn was sent. An unproven GET result must
                         # retain occupancy and original-request recovery, even
                         # when the returned document has a foreign cursor.
+                        # The same read budget also covers account lock/FIFO
+                        # waits. Do not fall through to the generic latest-cursor
+                        # fallback, which would start a second, unbounded read.
                         raise ConversationBindingError(
                             "original sequential response could not be verified",
                             code="CONVERSATION_OUTCOME_UNKNOWN",
                             provider_binding_id=binding_id, provider_account_identity=account_identity,
                             conversation_id=returned_conversation_id,
-                            original_failure_phase=failure_phase, original_exception_category="provider_error",
+                            original_failure_phase=failure_phase,
+                            original_exception_category=("provider_error" if isinstance(exc, ConversationBindingError)
+                                                         else _text_failure_category(exc)),
+                            original_http_status=exc.status_code if isinstance(exc, UpstreamHTTPError) else None,
                         ) from exc
                     if recovered.get("status") != "succeeded":
                         failure = ConversationBindingError(

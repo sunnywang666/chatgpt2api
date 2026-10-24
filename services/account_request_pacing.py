@@ -264,7 +264,7 @@ class AccountRequestClock:
             os.fsync(handle.fileno())
         temporary.replace(self.state_path)
 
-    def _ordinary_read_turn(self, owner, now, delay):
+    def _ordinary_read_turn(self, owner, now, delay, *, deadline=None):
         # Sleeping outside the send lock is essential, but waking readers must
         # not race for every read edge: a busy reader could starve other results.
         # Keep FIFO reservations in the existing cross-process clock. Renew at
@@ -272,12 +272,16 @@ class AccountRequestClock:
         queue = [entry for entry in self.ordinary_read_queue if entry["until"] > now]
         changed = len(queue) != len(self.ordinary_read_queue)
         entry = next((entry for entry in queue if entry["owner"] == owner), None)
+        expires = now + max(0, delay) + 30
+        if deadline is not None:
+            expires = min(expires, deadline)
         if entry is None:
-            entry = {"owner": owner, "until": now + max(0, delay) + 30}
+            entry = {"owner": owner, "until": expires}
             queue.append(entry)
             changed = True
-        elif entry["until"] < now + max(0, delay) + 5:
-            entry["until"] = now + max(0, delay) + 30
+        elif (entry["until"] < now + max(0, delay) + 5
+              or deadline is not None and entry["until"] > deadline):
+            entry["until"] = expires
             changed = True
         self.ordinary_read_queue = queue
         self.ordinary_read_wait_until = max(entry["until"] for entry in queue)
@@ -543,6 +547,7 @@ class AccountRequestClock:
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
         original_read_owner = current_original_read_owner.get() if is_conversation_read else None
         ordinary_owner = (original_read_owner or uuid.uuid4().hex) if is_conversation_read and not read_owner else None
+        ordinary_registered = False
         read_slot = None
         read_slot_transferred = False
         read_slot_release_lock = threading.Lock()
@@ -723,7 +728,9 @@ class AccountRequestClock:
                     elif is_conversation_read:
                         if self.archive_read_owner and self.archive_read_until > now:
                             read_delay = max(read_delay, self.archive_read_until - now)
-                        if not self._ordinary_read_turn(ordinary_owner, now, read_delay):
+                        ordinary_turn = self._ordinary_read_turn(ordinary_owner, now, read_delay, deadline=deadline_at)
+                        ordinary_registered = True
+                        if not ordinary_turn:
                             # Give the reserved reader time to wake. Do not
                             # consume another full upstream interval locally,
                             # or add a whole second to fractional HTTP pacing.
@@ -749,6 +756,7 @@ class AccountRequestClock:
                               wait_reason)
             clock_held = True
             response = None
+            completed_read = False
             try:
                 self._expire_backoff()
                 wait_for_send_edge("account request deadline elapsed during cooldown wait")
@@ -916,10 +924,18 @@ class AccountRequestClock:
                                     reservation_error = reservation_error or exc
                         finally:
                             response = outcome.get("response")
+                            completed_read = (floor_durable and is_conversation_read
+                                              and not kwargs.get("stream")
+                                              and reservation_error is None and "error" not in outcome
+                                              and getattr(response, "status_code", None) == 200)
                             # This is result/cooldown reconciliation, not a new
                             # send admission. It can outlast the send budget;
                             # discarding a received 429 would lose its cooldown.
-                            if not clock_held:
+                            # A buffered 200 has no outcome-specific pacing
+                            # update: its send floor is already durable. Return
+                            # that original result without waiting for another
+                            # clock holder or saving a stale state snapshot.
+                            if not clock_held and not completed_read:
                                 self.lock.acquire()
                                 clock_held = True
                         if "error" in outcome:
@@ -954,7 +970,7 @@ class AccountRequestClock:
                     context.record_stage("response_headers_received", status_code=response.status_code,
                                          upstream_request_id=safe_id)
             finally:
-                if not clock_held and response is not None:
+                if not clock_held and response is not None and not completed_read:
                     response.close()
                 if clock_held:
                     self.lock.release()
@@ -1030,15 +1046,26 @@ class AccountRequestClock:
         finally:
             if not read_slot_transferred:
                 release_read_slot()
-            if ordinary_owner:
+            if ordinary_owner and ordinary_registered:
                 # Deadline/preflight/transport failure must not leave a live
                 # caller's place blocking the following result reader.
+                # Never wait indefinitely after the caller's deadline. Its
+                # own FIFO reservation expires by that same deadline, so a
+                # contended cleanup can safely leave it for the normal sweep.
+                cleanup_held = False
                 try:
-                    with self.lock:
+                    remaining = remaining_budget()
+                    cleanup_held = (self.lock.acquire() if remaining is None else
+                                    self.lock.acquire(timeout=remaining) if remaining > 0 else
+                                    self.lock.acquire(blocking=False))
+                    if cleanup_held:
                         self._release_ordinary_read(ordinary_owner)
                 except Exception as exc:
                     logger.warning({"event": "result_read_reservation_cleanup_failed",
                                     "account": self.account_key, "error_type": type(exc).__name__})
+                finally:
+                    if cleanup_held:
+                        self.lock.release()
 
 
 def rate_limited_event(line) -> bool:
