@@ -257,6 +257,161 @@ def test_handoff_parent_edges_are_bounded_and_conflicts_cannot_prove_original_br
     assert handoff.terminal_seen is False
 
 
+def test_handoff_accepts_metadata_parent_chain_and_keeps_a_final_text_cursor():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps({"type": "resume_conversation_token", "kind": "topic",
+                                "conversation_id": "conversation-1"}))
+    handoff.observe(json.dumps({"v": {"conversation_id": "conversation-1", "message": {
+        "id": "thought", "author": {"role": "assistant"},
+        "metadata": {"parent_id": "original-user", "channel": "analysis"},
+    }}}))
+    handoff.observe(json.dumps({"v": {"conversation_id": "conversation-1", "message": {
+        "id": "final", "author": {"role": "assistant"}, "status": "finished_successfully",
+        "end_turn": True, "metadata": {"parent_id": "thought", "channel": "final"},
+        "content": {"content_type": "text", "parts": ["complete answer"]},
+    }}}))
+
+    assert handoff.terminal_seen is True
+    assert handoff.terminal_cursor() == {
+        "conversation_id": "conversation-1", "message_id": "final",
+        "text": "complete answer", "original_message_id": "original-user",
+    }
+
+
+def test_handoff_rejects_conflicting_parent_or_metadata_reasoning_phase():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps({"v": {"conversation_id": "conversation-1", "message": {
+        "id": "conflicted", "author": {"role": "assistant"}, "parent": "original-user",
+        "metadata": {"parent_id": "other-user"},
+    }}}))
+    handoff.observe(json.dumps({"v": {"conversation_id": "conversation-1", "message": {
+        "id": "final", "author": {"role": "assistant"}, "parent": "conflicted",
+        "status": "finished_successfully", "end_turn": True, "channel": "final",
+        "metadata": {"channel": "analysis"},
+        "content": {"content_type": "text", "parts": ["must not accept"]},
+    }}}))
+
+    assert handoff.terminal_seen is False
+    assert handoff.terminal_cursor() is None
+
+
+def test_handoff_never_certifies_an_idless_final_after_a_valid_parent_chain():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps({"v": {"conversation_id": "conversation-1", "message": {
+        "id": "thought", "author": {"role": "assistant"}, "parent_id": "original-user",
+    }}}))
+    handoff.observe(json.dumps({"v": {"conversation_id": "conversation-1", "message": {
+        "id": "", "author": {"role": "assistant"}, "parent_id": "thought",
+        "status": "finished_successfully", "end_turn": True, "metadata": {"channel": "final"},
+        "content": {"content_type": "text", "parts": ["must not certify"]},
+    }}}))
+
+    assert handoff.terminal_cursor() is None
+
+
+def test_handoff_certificate_is_permanently_invalidated_by_later_conflicts_or_finals():
+    def observe(handoff, message):
+        handoff.observe(json.dumps({"v": {"conversation_id": "conversation-1", "message": message}}))
+
+    def certified():
+        handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+        observe(handoff, {"id": "thought", "author": {"role": "assistant"}, "parent": "original-user"})
+        observe(handoff, {"id": "final-a", "author": {"role": "assistant"}, "parent": "thought",
+                          "status": "finished_successfully", "end_turn": True, "channel": "final",
+                          "content": {"content_type": "text", "parts": ["answer"]}})
+        assert handoff.terminal_cursor() is not None
+        return handoff
+
+    parent_conflict = certified()
+    observe(parent_conflict, {"id": "thought", "author": {"role": "assistant"}, "parent": "other-user"})
+    assert parent_conflict.terminal_cursor() is None
+
+    phase_conflict = certified()
+    observe(phase_conflict, {"id": "final-a", "author": {"role": "assistant"}, "parent": "thought",
+                             "status": "finished_successfully", "end_turn": True,
+                             "metadata": {"channel": "analysis"},
+                             "content": {"content_type": "thoughts", "parts": ["hidden"]}})
+    assert phase_conflict.terminal_cursor() is None
+
+    body_conflict = certified()
+    observe(body_conflict, {"id": "final-a", "author": {"role": "assistant"}, "parent": "thought",
+                            "status": "finished_successfully", "end_turn": True, "channel": "final",
+                            "content": {"content_type": "text", "parts": ["changed"]}})
+    assert body_conflict.terminal_cursor() is None
+
+    multiple_finals = certified()
+    observe(multiple_finals, {"id": "final-b", "author": {"role": "assistant"}, "parent": "thought",
+                              "status": "finished_successfully", "end_turn": True, "channel": "final",
+                              "content": {"content_type": "text", "parts": ["second"]}})
+    observe(multiple_finals, {"id": "final-c", "author": {"role": "assistant"}, "parent": "thought",
+                              "status": "finished_successfully", "end_turn": True, "channel": "final",
+                              "content": {"content_type": "text", "parts": ["third"]}})
+    assert multiple_finals.terminal_cursor() is None
+
+
+def test_backend_clears_cached_terminal_after_later_foreign_conversation_event():
+    initial = Response([
+        _line({"type": "resume_conversation_token", "kind": "topic", "conversation_id": "conversation-1"}),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "thought", "author": {"role": "assistant"}, "parent": "original-user",
+        }}}),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "final", "author": {"role": "assistant"}, "parent": "thought",
+            "status": "finished_successfully", "end_turn": True, "channel": "final",
+            "content": {"content_type": "text", "parts": ["answer"]},
+        }}}),
+        _line({"v": {"conversation_id": "conversation-2", "message": {
+            "id": "foreign", "author": {"role": "assistant"}, "parent": "original-user",
+        }}}),
+        b"data: [DONE]",
+    ])
+    backend = _backend(initial)
+
+    assert list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))[-1] == "[DONE]"
+    assert backend.text_stream_terminal is None
+
+
+def test_handoff_rejects_foreign_parent_edges_before_an_idless_conversation_final():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps({"v": {"conversation_id": "conversation-2", "message": {
+        "id": "foreign-thought", "author": {"role": "assistant"}, "parent": "original-user",
+    }}}))
+    handoff.observe(json.dumps({"v": {"message": {
+        "id": "final", "author": {"role": "assistant"}, "parent": "foreign-thought",
+        "status": "finished_successfully", "end_turn": True, "channel": "final",
+        "content": {"content_type": "text", "parts": ["must not accept"]},
+    }}}))
+
+    assert handoff.invalid is True
+    assert handoff._parents == {}
+    assert handoff.terminal_seen is False
+    assert handoff.terminal_cursor() is None
+
+
+def test_handoff_rejects_conflicting_or_malformed_conversation_fields():
+    for outer, inner in (("conversation-1", "conversation-2"), ("conversation-1", {"id": "conversation-1"})):
+        handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+        handoff.observe(json.dumps({"conversation_id": outer, "v": {
+            "conversation_id": inner, "message": {
+                "id": "final", "parent": "original-user", "author": {"role": "assistant"},
+                "channel": "final", "status": "finished_successfully", "end_turn": True,
+                "content": {"content_type": "text", "parts": ["answer"]},
+            },
+        }}))
+        assert handoff.invalid is True
+        assert handoff.terminal_cursor() is None
+
+
+def test_handoff_never_certifies_the_request_user_as_its_own_answer():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps({"conversation_id": "conversation-1", "message": {
+        "id": "original-user", "parent": "root", "author": {"role": "assistant"},
+        "channel": "final", "status": "finished_successfully", "end_turn": True,
+        "content": {"content_type": "text", "parts": ["answer"]},
+    }}))
+    assert handoff.terminal_cursor() is None
+
+
 def test_handoff_subscribes_once_and_closes_without_a_second_conversation_post():
     backend = _backend(_initial_events(), frames=[_ws_frame()])
 

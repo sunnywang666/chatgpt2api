@@ -142,6 +142,14 @@ class _StreamHandoff:
     _parents: dict[str, str] = field(default_factory=dict)
     _conflicted_parent_ids: set[str] = field(default_factory=set)
     _message_phases: dict[str, tuple[bool | None, bool | None]] = field(default_factory=dict)
+    # Kept only on this backend instance.  It is deliberately not recorded in
+    # diagnostics or a receipt: ConversationBindingService may use it only
+    # while it is still assembling this exact stream.
+    terminal_message_id: str = ""
+    terminal_conversation_id: str = ""
+    terminal_text: str = ""
+    terminal_original_message_id: str = ""
+    _terminal_cursor_invalid: bool = False
 
     @staticmethod
     def _clean_id(value: object) -> str:
@@ -155,20 +163,112 @@ class _StreamHandoff:
         message = frame.get("message")
         return message if isinstance(message, dict) else {}
 
+    @staticmethod
+    def _frame(event: dict[str, Any]) -> dict[str, Any]:
+        value = event.get("v")
+        return value if isinstance(value, dict) and isinstance(value.get("message"), dict) else event
+
+    @classmethod
+    def _event_containers(cls, event: dict[str, Any], message: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+        """Return only protocol containers that may carry branch/phase fields."""
+        frame = cls._frame(event)
+        containers: list[dict[str, Any]] = [frame]
+        if message is not frame:
+            containers.append(message)
+        for container in tuple(containers):
+            metadata = container.get("metadata")
+            if isinstance(metadata, dict):
+                containers.append(metadata)
+        return tuple(containers)
+
+    @classmethod
+    def _normalized_parent(cls, event: dict[str, Any], message: dict[str, Any]) -> tuple[str, bool]:
+        """Return one bounded parent ID, rejecting conflicting protocol fields."""
+        parents: set[str] = set()
+        invalid = False
+        for container in cls._event_containers(event, message):
+            for key in ("parent", "parent_id"):
+                if key not in container:
+                    continue
+                value = container.get(key)
+                if value is None or isinstance(value, str) and not value.strip():
+                    continue
+                parent = cls._clean_id(value)
+                if not parent:
+                    invalid = True
+                else:
+                    parents.add(parent)
+        if invalid or len(parents) != 1:
+            return "", bool(parents) or invalid
+        return next(iter(parents)), False
+
+    @classmethod
+    def _explicit_final_channel(cls, event: dict[str, Any], message: dict[str, Any]) -> bool | None:
+        """Preserve explicit message or metadata phase; unknown stays compatible."""
+        channels: set[str] = set()
+        invalid = False
+        for container in cls._event_containers(event, message):
+            if "channel" not in container:
+                continue
+            value = container.get("channel")
+            if value is None or isinstance(value, str) and not value.strip():
+                continue
+            if not isinstance(value, str):
+                invalid = True
+                continue
+            channels.add(value.strip().lower())
+        if invalid or len(channels) != 1:
+            return False if invalid or channels else None
+        return next(iter(channels)) == "final"
+
     @classmethod
     def _event_conversation_id(cls, event: dict[str, Any]) -> str:
         value = event.get("v")
         return cls._clean_id(event.get("conversation_id") or (
             value.get("conversation_id") if isinstance(value, dict) else ""))
 
-    def _assistant_terminal(self, message: dict[str, Any]) -> bool:
+    def _invalidate_terminal_cursor(self) -> None:
+        """Make a stream certificate permanently unusable after conflicting evidence."""
+        self._terminal_cursor_invalid = True
+        self.terminal_message_id = ""
+        self.terminal_conversation_id = ""
+        self.terminal_text = ""
+        self.terminal_original_message_id = ""
+
+    def _known_conversation_id(self) -> str:
+        return self.handoff_conversation_id or self.resume_conversation_id or self.expected_conversation_id
+
+    def _matches_known_conversation(self, event: dict[str, Any]) -> bool:
+        expected = self._known_conversation_id()
+        value = event.get("v")
+        containers = (event, value) if isinstance(value, dict) else (event,)
+        identities: set[str] = set()
+        malformed = False
+        for container in containers:
+            raw = container.get("conversation_id")
+            if raw is None or raw == "":
+                continue
+            identity = self._clean_id(raw)
+            if identity:
+                identities.add(identity)
+            else:
+                malformed = True
+        if (malformed or len(identities) > 1
+                or expected and identities and identities != {expected}):
+            self.invalid = True
+            self._invalidate_terminal_cursor()
+            return False
+        return True
+
+    def _assistant_terminal(self, event: dict[str, Any], message: dict[str, Any]) -> bool:
         # A finished reasoning message is not the final answer. Some terminal
         # patches omit channel/content: retain known phase evidence for the
         # same bounded parent graph instead of forgetting it on such a patch.
         message_id = self._clean_id(message.get("id"))
         channel_final, content_text = self._message_phases.get(message_id, (None, None))
-        if message.get("channel") is not None:
-            channel_final = message["channel"] == "final"
+        explicit_channel = self._explicit_final_channel(event, message)
+        if explicit_channel is not None:
+            channel_final = explicit_channel
         content = message.get("content")
         if isinstance(content, dict) and content.get("content_type") is not None:
             content_text = content["content_type"] == "text"
@@ -226,16 +326,18 @@ class _StreamHandoff:
         self._set_handoff(self.candidate_source, conversation_id,
                           self.candidate_turn_exchange_id)
 
-    def _on_original_branch(self, message: dict[str, Any]) -> bool:
+    def _on_original_branch(self, event: dict[str, Any], message: dict[str, Any]) -> bool:
         """Require streamed terminal evidence to reach this request's user node."""
         original = self._clean_id(self.original_message_id)
         message_id = self._clean_id(message.get("id"))
-        parent = self._clean_id(message.get("parent"))
+        parent, parent_conflict = self._normalized_parent(event, message)
         # A later user turn is a branch boundary.  Remember thought/tool edges
         # from this SSE frame, but never connect a new user turn back to the
         # original request merely because it shares the same conversation.
         author = message.get("author") if isinstance(message.get("author"), dict) else {}
-        if (message_id and parent
+        if message_id and parent_conflict:
+            self._conflicted_parent_ids.add(message_id)
+        elif (message_id and parent
                 and not (message_id != original and author.get("role") == "user")):
             existing = self._parents.get(message_id)
             if existing is None:
@@ -261,6 +363,77 @@ class _StreamHandoff:
                 return False
         return False
 
+    def _terminal_still_on_original_branch(self) -> bool:
+        original = self._clean_id(self.terminal_original_message_id)
+        current = self._clean_id(self.terminal_message_id)
+        if not original or not current:
+            return False
+        for _ in range(_STREAM_HANDOFF_MAX_PARENT_EDGES):
+            if current in self._conflicted_parent_ids:
+                return False
+            if current == original:
+                return True
+            current = self._parents.get(current, "")
+            if not current:
+                return False
+        return False
+
+    def _remember_terminal(self, event: dict[str, Any], message: dict[str, Any]) -> None:
+        """Save an in-stack cursor only for a complete, visible original result."""
+        if self._terminal_cursor_invalid:
+            return
+        original = self._clean_id(self.original_message_id)
+        message_id = self._clean_id(message.get("id"))
+        conversation_id = self._event_conversation_id(event)
+        expected_conversation_id = (
+            self.handoff_conversation_id or self.resume_conversation_id or self.expected_conversation_id
+        )
+        content = message.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if (not original or not message_id or message_id == original or not expected_conversation_id
+                or conversation_id and conversation_id != expected_conversation_id
+                or self._explicit_final_channel(event, message) is not True
+                or not isinstance(content, dict) or content.get("content_type") != "text"
+                or not isinstance(parts, list) or not parts or not all(isinstance(part, str) for part in parts)):
+            return
+        text = "".join(parts)
+        if not text:
+            return
+        if self.terminal_message_id and self.terminal_message_id != message_id:
+            # More than one visible final on a branch is not a cursor proof.
+            # Keep streaming behavior unchanged, but make the service use its
+            # existing authoritative GET rather than choose between finals.
+            self._invalidate_terminal_cursor()
+            return
+        if self.terminal_message_id and self.terminal_text != text:
+            # A changed completed snapshot cannot safely replace a cursor that
+            # was already certified for this stream.
+            self._invalidate_terminal_cursor()
+            return
+        self.terminal_message_id = message_id
+        self.terminal_conversation_id = expected_conversation_id
+        self.terminal_text = text
+        self.terminal_original_message_id = original
+
+    def terminal_cursor(self) -> dict[str, str] | None:
+        if (self.invalid or self._terminal_cursor_invalid
+                or not (self.terminal_message_id and self.terminal_conversation_id
+                and self.terminal_text and self.terminal_original_message_id)):
+            return None
+        if not self._terminal_still_on_original_branch():
+            self._invalidate_terminal_cursor()
+            return None
+        channel_final, content_text = self._message_phases.get(self.terminal_message_id, (None, None))
+        if channel_final is False or content_text is False:
+            self._invalidate_terminal_cursor()
+            return None
+        return {
+            "conversation_id": self.terminal_conversation_id,
+            "message_id": self.terminal_message_id,
+            "text": self.terminal_text,
+            "original_message_id": self.terminal_original_message_id,
+        }
+
     def accepts_ws_payload(self, payload: str) -> bool:
         """Admit only the handoff conversation's frames after its first ID."""
         if self.invalid:
@@ -272,6 +445,8 @@ class _StreamHandoff:
         except (TypeError, ValueError):
             return False
         if not isinstance(event, dict):
+            return False
+        if not self._matches_known_conversation(event):
             return False
         value = event.get("v")
         conversation_id = self._clean_id(
@@ -288,12 +463,18 @@ class _StreamHandoff:
         else:
             self.ws_conversation_locked = True
         message = self._message(event)
-        on_original_branch = self._on_original_branch(message)
-        if self._assistant_terminal(message):
+        on_original_branch = self._on_original_branch(event, message)
+        assistant_terminal = self._assistant_terminal(event, message)
+        if (self.terminal_message_id
+                and self._clean_id(message.get("id")) == self.terminal_message_id
+                and (not assistant_terminal or not on_original_branch)):
+            self._invalidate_terminal_cursor()
+        if assistant_terminal:
             if not on_original_branch:
                 return False
             self.terminal_seen = True
             self.ws_terminal_seen = True
+            self._remember_terminal(event, message)
         return True
 
     def observe(self, payload: str) -> None:
@@ -305,14 +486,10 @@ class _StreamHandoff:
             return
         if not isinstance(event, dict):
             return
-        message = self._message(event)
-        on_original_branch = self._on_original_branch(message)
-        if self._assistant_terminal(message) and on_original_branch:
-            # A final can sit below a thinking/tool chain, but an unrelated
-            # historical branch may not suppress this turn's handoff.
-            self.terminal_seen = True
         event_type = event.get("type")
         if event_type == "resume_conversation_token":
+            if not self._matches_known_conversation(event):
+                return
             conversation_id = self._event_conversation_id(event)
             kind = event.get("kind")
             if (kind != "topic" or not conversation_id
@@ -322,6 +499,10 @@ class _StreamHandoff:
                 self.resume_conversation_id = conversation_id
                 self.resume_token_kind = kind
                 self._finalize_handoff_candidate()
+            return
+        if not self._matches_known_conversation(event):
+            return
+        if self.invalid:
             return
         if event_type == "server_ste_metadata":
             self.handoff_count += 1
@@ -335,22 +516,39 @@ class _StreamHandoff:
             self._record_handoff_candidate(
                 "server_ste_metadata", self._event_conversation_id(event), top_turn or nested_turn)
             return
-        if event_type != "stream_handoff":
+        if event_type == "stream_handoff":
+            self.handoff_count += 1
+            conversation_id = self._clean_id(event.get("conversation_id"))
+            turn_exchange_id = self._clean_id(event.get("turn_exchange_id"))
+            options = event.get("options")
+            subscribe_options = [option for option in options if isinstance(option, dict)
+                                 and option.get("type") == "subscribe_ws_topic"] if isinstance(options, list) else []
+            topics = [self._clean_id(option.get("topic_id")) for option in subscribe_options]
+            topics = [topic for topic in topics if topic]
+            if (self.handoff_count != 1 or not conversation_id or not turn_exchange_id
+                    or len(subscribe_options) != 1 or len(topics) != 1
+                    or topics[0] != _STREAM_HANDOFF_TOPIC_PREFIX + turn_exchange_id):
+                self.invalid = True
+                return
+            self._record_handoff_candidate("stream_handoff", conversation_id, turn_exchange_id)
             return
-        self.handoff_count += 1
-        conversation_id = self._clean_id(event.get("conversation_id"))
-        turn_exchange_id = self._clean_id(event.get("turn_exchange_id"))
-        options = event.get("options")
-        subscribe_options = [option for option in options if isinstance(option, dict)
-                             and option.get("type") == "subscribe_ws_topic"] if isinstance(options, list) else []
-        topics = [self._clean_id(option.get("topic_id")) for option in subscribe_options]
-        topics = [topic for topic in topics if topic]
-        if (self.handoff_count != 1 or not conversation_id or not turn_exchange_id
-                or len(subscribe_options) != 1 or len(topics) != 1
-                or topics[0] != _STREAM_HANDOFF_TOPIC_PREFIX + turn_exchange_id):
-            self.invalid = True
+        # Before a resume/expected conversation exists, do not let an explicitly
+        # named foreign conversation establish parent edges.  Legacy bare
+        # snapshots remain observable but cannot produce a reusable cursor.
+        if not self._known_conversation_id() and self._event_conversation_id(event):
             return
-        self._record_handoff_candidate("stream_handoff", conversation_id, turn_exchange_id)
+        message = self._message(event)
+        on_original_branch = self._on_original_branch(event, message)
+        assistant_terminal = self._assistant_terminal(event, message)
+        if (self.terminal_message_id
+                and self._clean_id(message.get("id")) == self.terminal_message_id
+                and (not assistant_terminal or not on_original_branch)):
+            self._invalidate_terminal_cursor()
+        if assistant_terminal and on_original_branch:
+            # A final can sit below a thinking/tool chain, but an unrelated
+            # historical branch may not suppress this turn's handoff.
+            self.terminal_seen = True
+            self._remember_terminal(event, message)
 
     @property
     def diagnostic_stage(self) -> str:
@@ -3443,6 +3641,9 @@ class OpenAIBackendAPI:
             **({"_account_request_preflight": pre_send_check} if pre_send_check is not None else {}),
         )
         ensure_ok(response, path)
+        # This certificate belongs to this one stream only.  Never let a prior
+        # call on a reused backend instance supply a later cursor.
+        self.text_stream_terminal = None
         handoff = _StreamHandoff(
             expected_conversation_id=conversation_id,
             original_message_id=str(getattr(self, "text_request_message_id", "") or ""),
@@ -3461,6 +3662,7 @@ class OpenAIBackendAPI:
                 request_message_id=str(getattr(self, "text_request_message_id", "") or ""),
             ):
                 handoff.observe(payload)
+                self.text_stream_terminal = handoff.terminal_cursor()
                 if payload == "[DONE]":
                     # A protocol consumer stops at DONE. Defer this one until
                     # the same-turn WS handoff has either supplied its own
@@ -3736,7 +3938,9 @@ class OpenAIBackendAPI:
                 except (TypeError, ValueError):
                     continue
                 for payload in self._handoff_encoded_payloads(frame, handoff.topic_id):
-                    if not handoff.accepts_ws_payload(payload):
+                    accepted = handoff.accepts_ws_payload(payload)
+                    self.text_stream_terminal = handoff.terminal_cursor()
+                    if not accepted:
                         if handoff.invalid:
                             self._record_stream_handoff_stage("ws_payload_rejected", frames=frames,
                                                               total_bytes=total_bytes)
@@ -3759,6 +3963,7 @@ class OpenAIBackendAPI:
                         # yield can inject GeneratorExit into this frame.
                         self._record_stream_handoff_stage("ws_terminal", frames=frames,
                                                           total_bytes=total_bytes, terminal_seen=True)
+                        self.text_stream_terminal = handoff.terminal_cursor()
                         yield payload
                         return True
                     yield payload

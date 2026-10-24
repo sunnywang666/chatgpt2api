@@ -15,7 +15,7 @@ from curl_cffi.requests.exceptions import RequestException
 from services.account_service import account_service
 from services.account_request_pacing import AccountReadRetryBudgetInsufficient
 from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
-from services.protocol.conversation import conversation_events
+from services.protocol.conversation import conversation_events, sanitize_output_text
 from services.request_context import bounded_lock, operation_budget, current_operation_deadline
 from utils.helper import UpstreamHTTPError
 from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
@@ -785,6 +785,39 @@ class ConversationBindingService:
     RECOVERY_EXACT_READ_TIMEOUT_SECONDS = 60.0
     RECOVERY_DISPATCH_CLOCK_SKEW_SECONDS = 30.0
     RECOVERY_COVERAGE_VERSION = 1
+
+    @staticmethod
+    def _stream_terminal_cursor(backend: OpenAIBackendAPI, body: dict[str, Any],
+                                conversation_id: str, content: str) -> dict[str, str] | None:
+        """Reuse only this stack's fully verified visible terminal cursor.
+
+        Product/public/sequential flows retain their existing exact document
+        read: their cursor proof must include the persisted request branch, not
+        merely the live stream.  Ordinary bound chat can avoid a redundant
+        current-node read when the protocol assembler and handoff certificate
+        agree byte-for-byte after the same output sanitization.
+        """
+        if (body.get("_public_session_ref") or body.get("_supersedes_request_message_id")
+                or body.get("product_work") is not None):
+            return None
+        cursor = getattr(backend, "text_stream_terminal", None)
+        if not isinstance(cursor, dict):
+            return None
+        expected_original = str(getattr(backend, "text_request_message_id", "") or "").strip()
+        body_original = str(body.get("_request_message_id") or "").strip()
+        candidate_conversation = cursor.get("conversation_id")
+        candidate_message = cursor.get("message_id")
+        candidate_text = cursor.get("text")
+        candidate_original = cursor.get("original_message_id")
+        if (not expected_original or body_original and body_original != expected_original
+                or candidate_original != expected_original
+                or candidate_conversation != conversation_id
+                or not isinstance(candidate_message, str) or not candidate_message.strip()
+                or not isinstance(candidate_text, str)):
+            return None
+        if sanitize_output_text(candidate_text).strip() != content:
+            return None
+        return {"conversation_id": candidate_conversation, "message_id": candidate_message}
 
     @operation_budget(60.0)
     def set_archived(self, body: dict[str, Any], archived: bool) -> dict[str, Any]:
@@ -2585,6 +2618,19 @@ class ConversationBindingService:
                         original_exception_category="empty_result",
                     )
                 failure_phase = "cursor_read"
+                stream_cursor = self._stream_terminal_cursor(
+                    backend, body, returned_conversation_id, content,
+                )
+                if stream_cursor is not None:
+                    account_service.mark_text_used(access_token)
+                    return {
+                        "content": content,
+                        "provider_binding_id": binding_id,
+                        "provider_account_identity": account_identity,
+                        "conversation_id": returned_conversation_id,
+                        "parent_message_id": stream_cursor["message_id"],
+                        "binding_status": "bound",
+                    }
                 next_parent_message_id = backend.get_conversation_parent_message_id(
                     returned_conversation_id
                 )

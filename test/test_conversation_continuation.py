@@ -983,6 +983,114 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         self.assertEqual(second_call["conversation_id"], "conversation-1")
         self.assertEqual(second_call["parent_message_id"], "message-2")
 
+    def test_ordinary_text_reuses_matching_verified_stream_terminal_without_cursor_get(self) -> None:
+        service = ConversationBindingService()
+
+        class FakeBackend:
+            instances = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.text_stream_terminal = {
+                    "conversation_id": "conversation-1", "message_id": "final-message",
+                    "text": "complete answer", "original_message_id": "request-user",
+                }
+                self.parent_reads = 0
+                self.__class__.instances.append(self)
+
+            def get_conversation_parent_message_id(self, _conversation_id: str) -> str:
+                self.parent_reads += 1
+                raise AssertionError("matching stream terminal must not read cursor")
+
+            def close(self) -> None:
+                pass
+
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                       return_value="account-opaque-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                       return_value="token-a"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                       return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.account_service.mark_text_used") as mark_used,
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FakeBackend),
+            mock.patch("services.conversation_binding_service.conversation_events", return_value=iter([
+                {"type": "conversation.delta", "conversation_id": "conversation-1", "delta": "complete answer"},
+            ])),
+        ):
+            result = service.complete_text({
+                "provider_binding_id": "cb-account-a", "provider_account_identity": "account-opaque-a",
+                "client_conversation_id": "workbench-conversation-1", "_request_message_id": "request-user",
+                "messages": [{"role": "user", "content": "write"}],
+            })
+
+        self.assertEqual(result["content"], "complete answer")
+        self.assertEqual(result["parent_message_id"], "final-message")
+        self.assertEqual(FakeBackend.instances[0].parent_reads, 0)
+        mark_used.assert_called_once_with("token-a")
+
+    def test_ordinary_text_falls_back_when_verified_stream_text_differs(self) -> None:
+        service = ConversationBindingService()
+
+        class FakeBackend:
+            instances = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.text_stream_terminal = {
+                    "conversation_id": "conversation-1", "message_id": "final-message",
+                    "text": "different answer", "original_message_id": "request-user",
+                }
+                self.parent_reads = 0
+                self.__class__.instances.append(self)
+
+            def get_conversation_parent_message_id(self, conversation_id: str) -> str:
+                self.parent_reads += 1
+                return "read-parent" if conversation_id == "conversation-1" else ""
+
+            def close(self) -> None:
+                pass
+
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                       return_value="account-opaque-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                       return_value="token-a"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                       return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.account_service.mark_text_used"),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FakeBackend),
+            mock.patch("services.conversation_binding_service.conversation_events", return_value=iter([
+                {"type": "conversation.delta", "conversation_id": "conversation-1", "delta": "complete answer"},
+            ])),
+        ):
+            result = service.complete_text({
+                "provider_binding_id": "cb-account-a", "provider_account_identity": "account-opaque-a",
+                "client_conversation_id": "workbench-conversation-1", "_request_message_id": "request-user",
+                "messages": [{"role": "user", "content": "write"}],
+            })
+
+        self.assertEqual(result["parent_message_id"], "read-parent")
+        self.assertEqual(FakeBackend.instances[0].parent_reads, 1)
+
+    def test_verified_stream_cursor_is_excluded_from_public_and_product_paths(self) -> None:
+        backend = SimpleNamespace(
+            text_request_message_id="request-user",
+            text_stream_terminal={
+                "conversation_id": "conversation-1", "message_id": "final-message",
+                "text": "complete answer", "original_message_id": "request-user",
+            },
+        )
+        for body in (
+            {"_public_session_ref": "public-session"},
+            {"product_work": {"product_ref": "product-1", "step_ref": "copy"}},
+            {"_supersedes_request_message_id": "older-request"},
+        ):
+            self.assertIsNone(ConversationBindingService._stream_terminal_cursor(
+                backend, {**body, "_request_message_id": "request-user"},
+                "conversation-1", "complete answer",
+            ))
+
     def test_project_binding_can_create_independent_conversations_on_same_account(self) -> None:
         service = ConversationBindingService()
 
