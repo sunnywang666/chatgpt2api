@@ -95,7 +95,7 @@ def patch_bound_runner(monkeypatch, h, *, before_send_change=None, before_send_d
             self.text_request_message_id = ""
             self.text_cursor_callback = None
             self.text_pre_send_check = None
-        def _get_conversation(self, conversation_id, _send=None):
+        def _get_conversation(self, conversation_id, _send=None, *, deadline_monotonic=None):
             assert conversation_id == h.body["conversation_id"]
             calls.append("read")
             return deepcopy(h.document)

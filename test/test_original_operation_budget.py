@@ -128,6 +128,179 @@ def cursor(session="blocked"):
             "parent_message_id": "final", "request_message_id": "user", "request_parent_message_id": "root"}
 
 
+@pytest.mark.parametrize("wait_at", ["account_lock", "account_cooldown", "registered_cleanup_lock", "http"])
+def test_sent_bound_text_exact_read_has_one_budget_and_keeps_original_recovery(
+        local_upstream, monkeypatch, wait_at):
+    import services.account_request_pacing as pacing
+    from services.conversation_binding_service import ConversationBindingError
+
+    state = local_upstream
+    service = ConversationBindingService()
+    service.RECOVERY_EXACT_READ_TIMEOUT_SECONDS = .15
+    state.accounts.mark_text_used = lambda *_args, **_kwargs: None
+    state.backend("fixture-token")  # Instantiate the real shared account clock.
+    clock = next(iter(pacing._clocks.values()))
+    sends = []
+    worker = None
+    registered = threading.Event()
+    registration_unlocked, continue_waiter = threading.Event(), threading.Event()
+    register_read = clock._ordinary_read_turn
+    release_clock = clock.lock.release
+
+    def register(*args, **kwargs):
+        result = register_read(*args, **kwargs)
+        registered.set()
+        return result
+
+    monkeypatch.setattr(clock, "_ordinary_read_turn", register)
+
+    def release_after_registration():
+        release_clock()
+        if (wait_at == "registered_cleanup_lock" and threading.current_thread() is worker
+                and registered.is_set() and not registration_unlocked.is_set()):
+            registration_unlocked.set()
+            assert continue_waiter.wait(2)
+
+    monkeypatch.setattr(clock.lock, "release", release_after_registration)
+
+    def original_stream(backend, **_kwargs):
+        sends.append(backend.text_request_message_id)
+        backend.text_request_parent_message_id = "root"
+        yield {"type": "conversation.delta", "conversation_id": "original", "delta": "partial"}
+
+    monkeypatch.setattr("services.conversation_binding_service.conversation_events", original_stream)
+    if wait_at == "account_lock":
+        clock.lock.acquire()
+    elif wait_at in {"account_cooldown", "registered_cleanup_lock"}:
+        with clock.lock:
+            clock.cooldown_until = time.monotonic() + 60
+            clock._save()
+    else:
+        state.block = ("GET", "/backend-api/conversation/original")
+    failures, results = [], []
+
+    def run():
+        try:
+            results.append(service.complete_text({
+                "provider_binding_id": "binding", "provider_account_identity": "account",
+                "client_conversation_id": "sent-bound", "_request_message_id": "user",
+                "_public_session_ref": "public", "messages": [{"role": "user", "content": "fixture"}],
+            }))
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    cleanup_locked = False
+    try:
+        if wait_at == "registered_cleanup_lock":
+            assert registration_unlocked.wait(1)
+            cleanup_locked = clock.lock.acquire(timeout=1)
+            assert cleanup_locked
+            continue_waiter.set()
+        worker.join(2)
+        finished_without_unlock = not worker.is_alive()
+        calls_before_unlock = list(state.calls)
+        if cleanup_locked:
+            assert all(entry["until"] <= time.monotonic() for entry in clock.ordinary_read_queue)
+    finally:
+        continue_waiter.set()
+        if wait_at == "account_lock" or cleanup_locked:
+            clock.lock.release()
+        if wait_at in {"account_cooldown", "registered_cleanup_lock"}:
+            with clock.lock:
+                clock.cooldown_until = 0
+                clock._save()
+        state.block = None
+        state.release.set()
+        worker.join(2)
+
+    assert finished_without_unlock, "post-stream query must not wait indefinitely or start a second cursor read"
+    assert not worker.is_alive() and not results
+    assert len(failures) == 1 and isinstance(failures[0], ConversationBindingError)
+    assert failures[0].code == "CONVERSATION_OUTCOME_UNKNOWN"
+    assert failures[0].original_failure_phase == "cursor_read"
+    assert failures[0].original_exception_category == "timeout"
+    assert failures[0].conversation_id == "original"
+    assert calls_before_unlock == ([("GET", "/backend-api/conversation/original")] if wait_at == "http" else [])
+    assert state.backends[-1]._closed
+    assert sends == ["user"]
+
+    # Recovery reads the same original result without generating a replacement.
+    service.RECOVERY_EXACT_READ_TIMEOUT_SECONDS = 60.0
+    assert service.read_text_request(cursor("sent-bound"))["content"] == "original answer"
+    assert len(state.calls) == len(calls_before_unlock) + 1
+    assert sends == ["user"]
+
+
+@pytest.mark.parametrize("status", [200, 429])
+def test_sent_result_200_does_not_wait_for_reconciliation_lock_but_429_is_preserved(
+        local_upstream, monkeypatch, status):
+    import services.account_request_pacing as pacing
+    from services.conversation_binding_service import ConversationBindingError
+
+    state = local_upstream
+    service = ConversationBindingService()
+    state.status = status
+    state.block = ("GET", "/backend-api/conversation/original")
+    state.accounts.mark_text_used = lambda *_args, **_kwargs: None
+    state.backend("fixture-token")
+    clock = next(iter(pacing._clocks.values()))
+    sends, results, failures = [], [], []
+
+    def stream(backend, **_kwargs):
+        sends.append(backend.text_request_message_id)
+        backend.text_request_parent_message_id = "root"
+        yield {"type": "conversation.delta", "conversation_id": "original", "delta": "partial"}
+
+    monkeypatch.setattr("services.conversation_binding_service.conversation_events", stream)
+
+    def run():
+        try:
+            results.append(service.complete_text({
+                "provider_binding_id": "binding", "provider_account_identity": "account",
+                "client_conversation_id": "original-result", "_request_message_id": "user",
+                "_public_session_ref": "public", "messages": [{"role": "user", "content": "fixture"}],
+            }))
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    held = False
+    try:
+        assert state.blocked.wait(1)
+        held = clock.lock.acquire(timeout=1)
+        assert held  # The read has durably saved its send floor and released the clock.
+        if status == 200:
+            clock.cooldown_until = time.monotonic() + 60
+            clock._save()  # Simulate a newer request's cooldown while this GET receives.
+        state.release.set()
+        worker.join(2)
+        finished_while_clock_held = not worker.is_alive()
+    finally:
+        state.release.set()
+        if held:
+            clock.lock.release()
+        worker.join(2)
+
+    assert not worker.is_alive()
+    assert finished_while_clock_held is (status == 200)
+    assert state.calls == [("GET", "/backend-api/conversation/original")]
+    assert sends == ["user"]
+    with clock.lock:
+        assert (clock.cooldown_until if status == 200 else clock._read_cooldown_until()) > time.monotonic()
+    if status == 200:
+        assert not failures and results[0]["content"] == "original answer"
+        assert results[0]["_upstream_terminal"] is True
+    else:
+        assert not results and len(failures) == 1
+        assert isinstance(failures[0], ConversationBindingError)
+        assert failures[0].code == "CONVERSATION_OUTCOME_UNKNOWN"
+        assert failures[0].original_http_status == 429
+        assert clock.conversation_read_rate_failures == 1
+
+
 @pytest.mark.parametrize("method", ["read_text_request", "read_text", "archive"])
 def test_real_session_lock_timeout_does_not_send_and_other_session_advances(local_upstream, method):
     state = local_upstream

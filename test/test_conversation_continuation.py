@@ -1254,7 +1254,7 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
                 self.reads = 0
                 self.parent_reads = 0
 
-            def _get_conversation(self, conversation_id: str) -> dict:
+            def _get_conversation(self, conversation_id: str, *, deadline_monotonic: float) -> dict:
                 self.test_case.assertEqual(conversation_id, "conversation-1")
                 self.reads += 1
                 return document
@@ -1303,7 +1303,7 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
                     self.access_token = access_token
                     self.reads = 0
 
-                def _get_conversation(self, conversation_id: str) -> dict:
+                def _get_conversation(self, conversation_id: str, *, deadline_monotonic: float) -> dict:
                     self.reads += 1
                     return document
 
@@ -1376,7 +1376,7 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
                 self.reads = 0
                 self.parent_reads = 0
 
-            def _get_conversation(self, conversation_id: str) -> dict:
+            def _get_conversation(self, conversation_id: str, *, deadline_monotonic: float) -> dict:
                 self.test_case.assertEqual(conversation_id, "conversation-1")
                 self.reads += 1
                 if self.reads == 1:

@@ -271,7 +271,7 @@ def test_plain_no_final_resume_sends_once_from_the_verified_tail_and_preserves_o
     monkeypatch.setattr(module.OpenAIBackendAPI, "_get_conversation", read)
     monkeypatch.setattr(module, "conversation_events", events)
     monkeypatch.setattr(ConversationBindingService, "_read_text_request_result", staticmethod(
-        lambda _backend, _receipt: {"status": "succeeded", "content": "synthetic answer", "parent_message_id": "new-answer"}
+        lambda _backend, _receipt, *, deadline_monotonic: {"status": "succeeded", "content": "synthetic answer", "parent_message_id": "new-answer"}
     ))
 
     h.service.resume_unsent_successor("owner", "successor", h.envelope)

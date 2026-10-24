@@ -1005,6 +1005,9 @@ class AccountRequestPacingTests(unittest.TestCase):
              patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
             clock = AccountRequestClock("account", Path(tmp) / "clock.json")
             response = Response()
+            # A received limit still requires durable shared cooldown merging;
+            # a buffered 200 now returns without this unnecessary second lock.
+            response.status_code = 429
             original = clock.lock.acquire
             acquiring = 0
             def acquire(*args, **kwargs):
