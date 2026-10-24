@@ -43,6 +43,7 @@ NON_TEXT_RESULT_FIELD = "_non_text_result"
 TURN_END_EVIDENCE_FIELD = "_turn_end_evidence"
 RESULT_OBSERVATION_FIELD = "_original_result_observation"
 OBSERVED_CONTENT_TYPES = frozenset({"text", "code", "execution_output", "thoughts", "reasoning_recap"})
+_VERIFIED_EXACT_INCOMPLETE = object()
 
 
 def _content_observation(content):
@@ -710,6 +711,7 @@ class ConversationBindingError(RuntimeError):
         conversation_id: str = "",
         parent_message_id: str = "",
         recovery_reason: str = "",
+        recovery_observation: dict[str, Any] | None = None,
         recovery_scan: dict[str, Any] | None = None,
         recovery_coverage_version: int | None = None,
         recovery_read_error: dict[str, Any] | None = None,
@@ -730,6 +732,10 @@ class ConversationBindingError(RuntimeError):
         self.conversation_id = conversation_id
         self.parent_message_id = parent_message_id
         self.recovery_reason = recovery_reason
+        # This remains private until TextTaskService validates it again against
+        # the durable request identity.  Only complete_text marks its own exact
+        # branch-read observation as eligible for that path below.
+        self.recovery_observation = recovery_observation
         self.recovery_scan = recovery_scan
         self.recovery_read_error = safe_recovery_read_error(recovery_read_error)
         self.recovery_coverage_version = recovery_coverage_version
@@ -2598,12 +2604,23 @@ class ConversationBindingService:
                             original_failure_phase=failure_phase, original_exception_category="provider_error",
                         ) from exc
                     if recovered.get("status") != "succeeded":
-                        raise ConversationBindingError(
+                        failure = ConversationBindingError(
                             "original sequential response is not complete", code="CONVERSATION_OUTCOME_UNKNOWN",
                             provider_binding_id=binding_id, provider_account_identity=account_identity,
                             conversation_id=returned_conversation_id,
                             original_failure_phase=failure_phase, original_exception_category="empty_result",
+                            recovery_reason=recovered.get("recovery_reason", ""),
+                            recovery_observation=recovered.get(RESULT_OBSERVATION_FIELD),
                         )
+                        # A running result from this exact, bound branch is
+                        # safe diagnostic evidence only.  The durable sender
+                        # still records UNKNOWN and leaves all capacity and
+                        # continuation decisions to the normal recovery path.
+                        if (recovered.get("status") == "running"
+                                and recovered.get("recovery_reason")
+                                == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value):
+                            failure._verified_exact_incomplete = _VERIFIED_EXACT_INCOMPLETE
+                        raise failure
                     account_service.mark_text_used(access_token)
                     return {**recovered, "_upstream_terminal": True}
                 content = "".join(parts).strip()

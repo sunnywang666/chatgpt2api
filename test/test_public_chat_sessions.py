@@ -682,8 +682,152 @@ def test_company_ingress_continuation_keeps_real_owner_and_cursor(company):
     assert sent['conversation_id']=='private-conversation' and sent['parent_message_id']=='private-answer'
 
 
+def incomplete_observation(body, conversation_id='sender-conversation'):
+    return {
+        'conversation_id': conversation_id,
+        'request_message_id': body['_request_message_id'],
+        'upstream_updated_at': 1.0,
+        'nodes': [{
+            'id': 'assistant-running', 'role': 'assistant', 'status': 'in_progress',
+            'end_turn': False, 'text_chars': 0, 'content_type': 'text',
+            'content_items': 0, 'finished_items': 0,
+        }],
+    }
+
+
+@pytest.mark.parametrize('kind', ['unmarked', 'foreign_identity', 'invalid_observation'])
+def test_sender_only_persists_trusted_first_incomplete_observation(public_chat, kind):
+    from services.conversation_binding_service import _VERIFIED_EXACT_INCOMPLETE
+
+    h = public_chat
+
+    def upstream(body, on_cursor):
+        cursor = {
+            'provider_binding_id': 'sender-binding',
+            'provider_account_identity': 'sender-account',
+            'conversation_id': 'sender-conversation',
+        }
+        on_cursor(cursor)
+        error = ConversationBindingError(
+            'untrusted incomplete result', code='CONVERSATION_OUTCOME_UNKNOWN',
+            **cursor, original_failure_phase='cursor_read',
+            original_exception_category='empty_result',
+            recovery_reason='REQUEST_RESULT_INCOMPLETE',
+            recovery_observation=(
+                {'raw': 'untrusted'} if kind == 'invalid_observation'
+                else incomplete_observation(body)
+            ),
+        )
+        if kind != 'unmarked':
+            error._verified_exact_incomplete = _VERIFIED_EXACT_INCOMPLETE
+        if kind == 'foreign_identity':
+            error.provider_account_identity = 'foreign-account'
+        raise error
+
+    h.tasks.runner = upstream
+    assert post(h, turn(f'untrusted-{kind}')).status_code == 202
+    h.queue.run()
+
+    receipt = h.tasks.read(h.key_a['id'], f'untrusted-{kind}')
+    with h.tasks._db() as db:
+        raw = h.tasks.store.read_receipt(db, 'text', h.key_a['id'], f'untrusted-{kind}')
+    assert receipt['status'] == 'unknown'
+    assert receipt['error_code'] == 'CONVERSATION_OUTCOME_UNKNOWN'
+    assert raw.get('recovery_reason') is None
+    assert raw.get('_original_result_observation') is None
+    assert raw.get('_result_observation_started_at') is None
+
+
+def test_late_sender_error_does_not_replace_later_incomplete_observation(public_chat):
+    from services.conversation_binding_service import _VERIFIED_EXACT_INCOMPLETE
+
+    h = public_chat
+    request_id = 'late-after-observation'
+    owner = h.key_a['id']
+
+    def upstream(body, on_cursor):
+        cursor = {
+            'provider_binding_id': 'sender-binding',
+            'provider_account_identity': 'sender-account',
+            'conversation_id': 'sender-conversation',
+        }
+        on_cursor(cursor)
+        observed = incomplete_observation(body)
+        h.tasks._update(
+            owner, request_id, status='running', _submission_started=True,
+            recovery_reason='REQUEST_RESULT_INCOMPLETE', recovery_attempt=4,
+            recovery_next_at=123.0, _original_result_observation=observed,
+            _result_observation_started_at=50.0, _result_last_checked_at=75.0,
+            _result_last_progress_at=60.0, _result_no_progress_reads=2,
+        )
+        error = ConversationBindingError(
+            'late incomplete result', code='CONVERSATION_OUTCOME_UNKNOWN',
+            **cursor, original_failure_phase='cursor_read',
+            original_exception_category='empty_result',
+            recovery_reason='REQUEST_RESULT_INCOMPLETE',
+            recovery_observation=incomplete_observation(body),
+        )
+        error._verified_exact_incomplete = _VERIFIED_EXACT_INCOMPLETE
+        raise error
+
+    h.tasks.runner = upstream
+    assert post(h, turn(request_id)).status_code == 202
+    h.queue.run()
+
+    with h.tasks._db() as db:
+        receipt = h.tasks.store.read_receipt(db, 'text', owner, request_id)
+    assert receipt['status'] == 'unknown'
+    assert receipt['recovery_attempt'] == 4
+    assert receipt['recovery_next_at'] == 123.0
+    assert receipt['_original_result_observation']['nodes'][0]['id'] == 'assistant-running'
+    assert receipt['_result_observation_started_at'] == 50.0
+    assert receipt['_result_last_checked_at'] == 75.0
+    assert receipt['_result_last_progress_at'] == 60.0
+    assert receipt['_result_no_progress_reads'] == 2
+
+
+def test_late_sender_error_does_not_replace_same_id_success(public_chat):
+    from services.conversation_binding_service import _VERIFIED_EXACT_INCOMPLETE
+
+    h = public_chat
+    request_id = 'late-sender-error'
+    owner = h.key_a['id']
+
+    def upstream(body, on_cursor):
+        cursor = {
+            'provider_binding_id': 'sender-binding',
+            'provider_account_identity': 'sender-account',
+            'conversation_id': 'sender-conversation',
+        }
+        on_cursor(cursor)
+        h.tasks._update(
+            owner, request_id, status='succeeded', content='recovered first',
+            parent_message_id='final-message', binding_status='bound', **cursor,
+        )
+        error = ConversationBindingError(
+            'late incomplete result', code='CONVERSATION_OUTCOME_UNKNOWN',
+            **cursor, original_failure_phase='cursor_read',
+            original_exception_category='empty_result',
+            recovery_reason='REQUEST_RESULT_INCOMPLETE',
+            recovery_observation=incomplete_observation(body),
+        )
+        error._verified_exact_incomplete = _VERIFIED_EXACT_INCOMPLETE
+        raise error
+
+    h.tasks.runner = upstream
+    assert post(h, turn(request_id)).status_code == 202
+    h.queue.run()
+
+    receipt = h.tasks.read(owner, request_id)
+    assert receipt['status'] == 'succeeded'
+    assert receipt['content'] == 'recovered first'
+    assert receipt['parent_message_id'] == 'final-message'
+    assert receipt.get('recovery_reason') is None
+    assert receipt.get('_original_result_observation') is None
+
+
 @pytest.mark.parametrize('readback', [
-    'missing_request', 'invalid_mapping', 'ambiguous', 'foreign_conversation', 'foreign_parent',
+    'missing_request', 'invalid_mapping', 'ambiguous', 'foreign_conversation', 'foreign_parent', 'incomplete',
 ])
 def test_sequential_readback_errors_keep_original_unknown_until_get_recovers(tmp_path, readback):
     from services.openai_backend_api import OpenAIBackendAPI
@@ -697,9 +841,10 @@ def test_sequential_readback_errors_keep_original_unknown_until_get_recovers(tmp
     }]))
     accounts, store, admission = build(tmp_path)
     service = ConversationBindingService()
+    now = [1000.0]
     tasks = TextTaskService(store.path, runner=service.complete_text,
                             recovery_reader=service.read_text_request, admission=admission,
-                            clock=lambda: 1000.0)
+                            clock=lambda: now[0])
     admission.register('text', lambda ctx, body: tasks._run(ctx.owner, ctx.request_id, body))
     backend = object.__new__(OpenAIBackendAPI)
     backend.access_token = 'fixture-token'
@@ -732,6 +877,13 @@ def test_sequential_readback_errors_keep_original_unknown_until_get_recovers(tmp
                 result['conversation_id'] = 'foreign-chat'
             elif readback == 'foreign_parent':
                 result['mapping'][user]['parent'] = 'foreign-parent'
+            elif readback == 'incomplete':
+                result['mapping'].pop('original-final')
+                result['mapping']['assistant-running'] = {'parent': user, 'message': {
+                    'id': 'assistant-running', 'author': {'role': 'assistant'},
+                    'status': 'in_progress', 'end_turn': False,
+                    'content': {'content_type': 'text', 'parts': []},
+                }}
         return result
 
     backend._get_conversation = Mock(side_effect=document)
@@ -755,13 +907,23 @@ def test_sequential_readback_errors_keep_original_unknown_until_get_recovers(tmp
         assert original['status'] == 'unknown'
         assert original['error_code'] == 'CONVERSATION_OUTCOME_UNKNOWN'
         assert original['original_failure_phase'] == 'cursor_read'
-        assert original['original_exception_category'] == 'provider_error'
+        assert original['original_exception_category'] == ('empty_result' if readback == 'incomplete' else 'provider_error')
         assert original['_submission_started'] is True
         assert original['provider_binding_id'] == 'original-binding'
         assert original['provider_account_identity'] == 'original-account'
         assert original['conversation_id'] == 'original-chat'
         assert original['request_parent_message_id'] == backend.text_request_parent_message_id
         assert original.get('parent_message_id') != 'foreign-parent'
+        if readback == 'incomplete':
+            assert original['recovery_reason'] == 'REQUEST_RESULT_INCOMPLETE'
+            assert original['recovery_error_code'] == 'UPSTREAM_OUTCOME_UNKNOWN'
+            assert original['recovery_attempt'] == 1
+            assert original['recovery_next_at'] == 1030.0
+            assert original['_original_result_observation']['request_message_id'] == original['request_message_id']
+            assert original['_result_no_progress_reads'] == 0
+            now[0] = 1031.0
+        else:
+            assert original.get('recovery_reason') is None
         assert admission.resource_snapshot()['chat_turn']['inflight'] == 1
 
         valid_readback = True

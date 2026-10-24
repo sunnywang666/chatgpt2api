@@ -35,6 +35,7 @@ from services.conversation_binding_service import (
     safe_no_final_guard_diagnostic,
     safe_recovery_read_error,
     TURN_END_EVIDENCE_FIELD,
+    _VERIFIED_EXACT_INCOMPLETE,
     conversation_binding_service,
     is_recovery_image_pointer,
 )
@@ -2414,7 +2415,8 @@ class TextTaskService:
             )
             return self._public(updated)
 
-    def _update(self, owner, request_id, *, classify_before_send=False, **changes):
+    def _update(self, owner, request_id, *, classify_before_send=False,
+                sender_verified_incomplete=None, **changes):
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
@@ -2433,6 +2435,48 @@ class TextTaskService:
                 # original evidence. Only the exact-ID recovery path may adopt
                 # its subsequently verified upstream result.
                 return
+            if sender_verified_incomplete is not None:
+                exc = sender_verified_incomplete
+                first_observation = (
+                    receipt.get("status") == "running"
+                    and receipt.get("_submission_started") is True
+                    and receipt.get("recovery_reason") is None
+                    and receipt.get("recovery_next_at") is None
+                    and receipt.get("recovery_attempt") in (None, 0)
+                    and all(receipt.get(field) is None for field in (
+                        "_original_result_observation", "_result_observation_started_at",
+                        "_result_last_checked_at", "_result_last_progress_at",
+                        "_result_no_progress_reads",
+                    ))
+                )
+                verified_incomplete = (
+                    exc.code == "CONVERSATION_OUTCOME_UNKNOWN"
+                    and getattr(exc, "_verified_exact_incomplete", None) is _VERIFIED_EXACT_INCOMPLETE
+                    and exc.original_failure_phase == "cursor_read"
+                    and exc.original_exception_category == "empty_result"
+                    and exc.recovery_reason == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
+                    and exc.provider_binding_id == receipt.get("provider_binding_id")
+                    and exc.provider_account_identity == receipt.get("provider_account_identity")
+                    and exc.conversation_id == receipt.get("conversation_id")
+                )
+                observation = (self._safe_result_observation(getattr(exc, "recovery_observation", None), receipt)
+                               if verified_incomplete and first_observation else None)
+                if observation is not None:
+                    now = self._now()
+                    attempt = 1
+                    changes.update(
+                        recovery_attempt=attempt,
+                        recovery_next_at=now + self._result_recovery_backoff(receipt, attempt),
+                        recovery_error_code="UPSTREAM_OUTCOME_UNKNOWN",
+                        recovery_phase="read_text_request",
+                        recovery_reason=TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value,
+                        recovery_no_result_reads=0,
+                        _original_result_observation=observation,
+                        _result_observation_started_at=now,
+                        _result_last_checked_at=now,
+                        _result_last_progress_at=None,
+                        _result_no_progress_reads=0,
+                    )
             if classify_before_send and receipt.get("_submission_started") is False:
                 changes.update(upstream_outcome="not_sent", _turn_reserved=False)
             if changes.get("status") == "succeeded":
@@ -5314,6 +5358,7 @@ class TextTaskService:
             model_not_found = exc.code == "MODEL_NOT_FOUND"
             self._update(
                 owner, request_id, **cursor, **diagnostic,
+                sender_verified_incomplete=exc,
                 classify_before_send=exc.code not in {"CONVERSATION_OUTCOME_UNKNOWN", "MODEL_NOT_FOUND"},
                 status="unknown" if exc.code == "CONVERSATION_OUTCOME_UNKNOWN" else "failed",
                 error_code=exc.code,
