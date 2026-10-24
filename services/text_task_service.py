@@ -1369,12 +1369,12 @@ class TextTaskService:
 
     @classmethod
     def _qualified_stalled_incomplete_capacity_boundary(cls, receipt, now):
-        """Return whether an observed stagnant original frees only account capacity.
+        """Return whether an observed original ended its local capacity window.
 
         This is a read-only planner predicate. It does not establish an upstream
         terminal result, alter the receipt, release its physical conversation,
-        or change recovery cadence. A fresh original observation that progresses
-        clears the persisted wait marker before this predicate is consulted.
+        or change recovery cadence. Later original observations continue result
+        recovery without reopening the first observation's capacity window.
         Pausing further reads does not invalidate this independent capacity
         proof; the default wait/continuation paths still reject paused work.
         """
@@ -1439,10 +1439,10 @@ class TextTaskService:
                 or last_progress is not None and (type(last_progress) not in (int, float)
                                                    or not math.isfinite(last_progress) or last_progress <= 0)
                 or type(last_checked) not in (int, float) or not math.isfinite(last_checked) or last_checked <= 0
-                or type(reads) is not int or reads < cls.UNRECOVERABLE_QUALIFIED_READS):
+                or type(reads) is not int or reads < 0):
             return False
-        progress = last_progress if last_progress is not None else started
-        if not (started <= progress <= wait_ended <= last_checked <= now):
+        if (not (started <= wait_ended <= now and started <= last_checked <= now)
+                or last_progress is not None and not started <= last_progress <= last_checked):
             return False
         recovery_id = receipt.get("recovery_claim_id")
         recovery_at = receipt.get("recovery_claimed_at")
@@ -1461,10 +1461,12 @@ class TextTaskService:
                     or recovery_at > recovery_until
                     or (recovery_until > now and not (last_checked <= recovery_at <= now))):
                 return False
-        # A later snapshot clock cannot rehabilitate an early/stale marker:
-        # the marker itself must have been recorded after the existing window.
-        if (wait_ended - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS
-                or now - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS):
+        # The first exact observation is the single, absolute local-capacity
+        # window. Later reads can refresh the original result evidence, but
+        # neither unchanged nor progressed observations can reclaim a slot
+        # that this window has already released.
+        if (wait_ended - started < cls.UNRECOVERABLE_MIN_AGE_SECONDS
+                or now - started < cls.UNRECOVERABLE_MIN_AGE_SECONDS):
             return False
         return True
 
@@ -1586,16 +1588,26 @@ class TextTaskService:
             return False  # A legacy executor without a lease cannot be fenced.
         if receipt.get("recovery_reason") == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value:
             # A stale upstream label can end the foreground result wait, but
-            # does not prove the upstream turn ended. The foreground marker
-            # keeps UNKNOWN and the original lease; a separate planner-only
-            # predicate may free local account capacity only after strict,
-            # persisted original-observation evidence.
-            progress = receipt.get("_result_last_progress_at") or receipt.get("_result_observation_started_at")
+            # does not prove the upstream turn ended. The first exact branch
+            # observation starts one absolute local-capacity window; later
+            # observations continue recovery without reoccupying that slot.
+            started = receipt.get("_result_observation_started_at")
+            last_checked = receipt.get("_result_last_checked_at")
+            last_progress = receipt.get("_result_last_progress_at")
             reads = receipt.get("_result_no_progress_reads")
-            if (not observed or receipt.get("_result_wait_ended_at") is not None
-                    or type(progress) not in (int, float) or not math.isfinite(progress)
-                    or now - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS
-                    or type(reads) is not int or reads < cls.UNRECOVERABLE_QUALIFIED_READS):
+            observation = cls._safe_result_observation(
+                receipt.get("_original_result_observation"), receipt,
+            )
+            if (receipt.get("_result_wait_ended_at") is not None
+                    or observation is None
+                    or type(started) not in (int, float) or not math.isfinite(started)
+                    or type(last_checked) not in (int, float) or not math.isfinite(last_checked)
+                    or last_progress is not None and (type(last_progress) not in (int, float)
+                                                      or not math.isfinite(last_progress))
+                    or not (0 < started <= last_checked <= now)
+                    or last_progress is not None and not started <= last_progress <= last_checked
+                    or now - started < cls.UNRECOVERABLE_MIN_AGE_SECONDS
+                    or type(reads) is not int or reads < 0):
                 return False
             receipt.update(_result_wait_ended_at=now, updated_at=now)
             return True
@@ -1932,11 +1944,6 @@ class TextTaskService:
                 # Only identity-safe original progress/first observation or an
                 # authoritative terminal result takes the local slot back.
                 updated.pop("_result_read_capacity_released_at", None)
-            if observed and changed:
-                # A verified original-branch change puts the local account
-                # boundary back on hold. It does not alter UNKNOWN, the
-                # original turn, or recovery timing.
-                updated.pop("_result_wait_ended_at", None)
             # A process can die after sending and persisting its cursor. Once
             # the original result is recovered, fence only its expired sending
             # lease; otherwise the stale execution flag prevents completion.
@@ -3925,6 +3932,14 @@ class TextTaskService:
         runner still reads the original branch before and at the send edge.
         """
         if not cls._qualified_stalled_incomplete_capacity_boundary(previous, now):
+            return False
+        # Ending local generation occupancy is not permission to send a child.
+        # Explicit continuation still requires three unchanged exact reads and
+        # a full stagnant window proved by the latest read. The capacity marker
+        # can now predate later progress, so it cannot supply that separate proof.
+        progress = previous.get("_result_last_progress_at") or previous["_result_observation_started_at"]
+        if (previous["_result_no_progress_reads"] < cls.UNRECOVERABLE_QUALIFIED_READS
+                or previous["_result_last_checked_at"] - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS):
             return False
         # Legacy sent Chat receipts can omit the outcome or retain an earlier
         # not_sent label. Reuse the original-result recovery proof for those

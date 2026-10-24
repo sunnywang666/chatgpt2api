@@ -88,7 +88,7 @@ def test_pause_keeps_proven_capacity_released_without_recovery_or_same_chat_send
 
 
 @pytest.mark.parametrize("progress", [False, True])
-def test_pause_during_stalled_read_keeps_only_unchanged_capacity_proof(tmp_path, progress):
+def test_pause_during_stalled_read_preserves_ended_capacity_window_even_with_progress(tmp_path, progress):
     from test.test_stalled_text_diagnostics import incomplete_reader
 
     service, admission, backend = released_original(tmp_path, "stalled")
@@ -103,8 +103,8 @@ def test_pause_during_stalled_read_keeps_only_unchanged_capacity_proof(tmp_path,
     assert service.read("owner", "old-0")["status"] == "unknown"
     paused = raw(service)
     assert paused["_recovery_paused"] is True
-    assert admission.resource_snapshot()["chat_turn"]["inflight"] == (1 if progress else 0)
-    assert ("_result_wait_ended_at" in paused) is not progress
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
+    assert "_result_wait_ended_at" in paused
     service.recovery_reader = Mock()
     admission.clock.now += 301
     service.recover("owner", "old-0", True)
