@@ -389,6 +389,144 @@ def test_capacity_contributing_originals_precede_history_without_losing_account_
     assert set(calls) == set(started)
 
 
+def test_shared_fifo_block_does_not_let_history_skip_current_in_later_scan(recovery, monkeypatch):
+    """A released read cannot replace a blocked contributor's FIFO turn."""
+    from services import account_request_pacing as pacing
+    from services.config import config
+
+    r = recovery
+    r.original("current", 0, "current")
+    histories = [f"history-{index}" for index in range(4)]
+    for request_id in histories:
+        r.original(request_id, 0, request_id)
+        r.text._update("owner", request_id, status="failed", error_code="RESULT_UNRECOVERABLE",
+                       upstream_outcome="unknown", _execution_wait_ended_at=r.clock())
+
+    started = {request_id: threading.Event() for request_id in histories}
+    allow = {request_id: threading.Event() for request_id in histories}
+    consumed = {request_id: threading.Event() for request_id in histories}
+    current_sent = threading.Event()
+    sent = []
+    r.admission._recovery_contributor_streak["account-0"] = 3
+    r.admission.pacing = None
+
+    def read(_owner, request_id):
+        if request_id in started:
+            started[request_id].set()
+            assert allow[request_id].wait(2)
+        _, clock = pacing._clock_for_account("upstream-0")
+        clock.request(lambda method, *_args, **_kwargs: (
+            sent.append((method, request_id)) or SimpleNamespace(status_code=200, headers={})
+        ), "GET", "https://provider/conversation/" + request_id)
+        if request_id in consumed:
+            consumed[request_id].set()
+        else:
+            current_sent.set()
+
+    real_dispatch = r.admission._dispatch_original_read
+
+    def dispatch_after_current_attempt(kind, owner, request_id, function, receipt):
+        dispatched = real_dispatch(kind, owner, request_id, function, receipt)
+        if request_id == "current":
+            active = next((history for history in histories
+                           if started[history].is_set() and not consumed[history].is_set()), None)
+            if active is not None:
+                allow[active].set()
+                assert consumed[active].wait(1)
+        return dispatched
+
+    r.admission.recoveries["text"] = read
+    monkeypatch.setattr(pacing, "DATA_DIR", r.store.path.parent)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    monkeypatch.setattr(pacing.time, "monotonic", r.clock)
+    monkeypatch.setattr(pacing.time, "time", r.clock)
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 45))
+    monkeypatch.setattr(type(config), "account_conversation_read_burst", property(lambda _: 1))
+
+    try:
+        with patch.object(r.admission, "_dispatch_original_read", side_effect=dispatch_after_current_attempt):
+            for _ in range(4):
+                r.admission.recover_one(background=True)
+                if current_sent.wait(1):
+                    break
+                # A later scan reaches the exact due edge of whichever
+                # original held the previous scan's FIFO ticket.
+                r.clock.now += 45
+        assert current_sent.is_set()
+        assert [request_id for _, request_id in sent].index("current") <= 1
+    finally:
+        for event in allow.values():
+            event.set()
+
+
+def test_physical_current_conflict_still_allows_history_fallback(recovery):
+    """Only shared FIFO contention suppresses later lanes in a scan."""
+    from services.pool_admission import physical_conversation_key
+
+    r = recovery
+    current = r.original("current", 0, "occupied-conversation")
+    r.original("history", 0, "independent-history")
+    r.text._update("owner", "history", status="failed", error_code="RESULT_UNRECOVERABLE",
+                   upstream_outcome="unknown", _execution_wait_ended_at=r.clock())
+    key = physical_conversation_key(current)
+    history_started = threading.Event()
+
+    def read(_owner, request_id):
+        if request_id == "history":
+            history_started.set()
+
+    r.admission.pacing = lambda _account, now: {"next_at": now}
+    r.admission.recoveries["text"] = read
+    with r.admission._original_read_lock:
+        r.admission._original_reads.add(key)
+    try:
+        r.admission.recover_one(background=True)
+        assert history_started.wait(1)
+    finally:
+        with r.admission._original_read_lock:
+            r.admission._original_reads.discard(key)
+
+
+def test_dispatch_exception_clears_fifo_scan_context_before_explicit_read(recovery, monkeypatch):
+    """A failed scan cannot make the next explicit reader inherit its block."""
+    from services import account_request_pacing as pacing
+    from services.config import config
+
+    r = recovery
+    r.original("current", 0, "current")
+    r.original("history", 0, "history")
+    r.text._update("owner", "history", status="failed", error_code="RESULT_UNRECOVERABLE",
+                   upstream_outcome="unknown", _execution_wait_ended_at=r.clock())
+    account = r.admission._rows()[0]
+    r.admission.pacing = None
+    monkeypatch.setattr(pacing, "DATA_DIR", r.store.path.parent)
+    monkeypatch.setattr(pacing, "_clocks", {})
+    monkeypatch.setattr(pacing.time, "monotonic", r.clock)
+    monkeypatch.setattr(pacing.time, "time", r.clock)
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 45))
+    monkeypatch.setattr(type(config), "account_conversation_read_burst", property(lambda _: 1))
+    assert pacing.reserve_account_original_read(account, "original-result:prior-ticket")
+
+    real_dispatch = r.admission._dispatch_original_read
+
+    def dispatch_then_fail(kind, owner, request_id, function, receipt):
+        if request_id == "current":
+            return real_dispatch(kind, owner, request_id, function, receipt)
+        raise RuntimeError("fixture dispatch failure")
+
+    r.admission.recoveries["text"] = lambda *_args: None
+    with patch.object(r.admission, "_dispatch_original_read", side_effect=dispatch_then_fail):
+        with pytest.raises(RuntimeError, match="fixture dispatch failure"):
+            r.admission.recover_one(background=True)
+
+    assert not hasattr(r.admission._recovery_fifo_scan, "blocked_accounts")
+    assert pacing.release_account_original_read(account, "original-result:prior-ticket")
+    explicit = r.original("explicit", 0, "explicit")
+    assert r.admission.read_original_if_ready("owner", "explicit", lambda *_args: "read", explicit) == "read"
+
+
 def test_transferred_empty_roots_do_not_precede_later_capacity_contributor(recovery):
     r = recovery
     # The exact same-session retry proof moves each root's local turn to its

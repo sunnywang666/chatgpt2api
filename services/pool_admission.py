@@ -872,6 +872,10 @@ class PoolAdmission:
         # An initial capacity-recovery head start must not permanently exclude
         # an account that has only released originals and cannot earn a streak.
         self._recovery_contributor_warmup = 0
+        # Scoped to one recovery scan. A shared FIFO block must not let a
+        # later lane create a new future ticket before the next scan applies
+        # the current-vs-history priority again.
+        self._recovery_fifo_scan = threading.local()
         self._event = threading.Event()
         self._stop = threading.Event()
         self._thread = None
@@ -984,7 +988,14 @@ class PoolAdmission:
                     from services.account_request_pacing import reserve_account_original_read
                     # Nonblocking account lock; no reader slot is held until
                     # this original is at the FIFO head and its clock is due.
-                    if not reserve_account_original_read(account, read_owner):
+                    scan_blocked = getattr(self._recovery_fifo_scan, "blocked_accounts", None)
+                    account_key = (account.get("provider_account_identity") or account.get("provider_binding_id")
+                                   or f"{kind}:{owner}:{request_id}")
+                    if not reserve_account_original_read(
+                            account, read_owner,
+                            allow_new=scan_blocked is None or account_key not in scan_blocked):
+                        if scan_blocked is not None:
+                            scan_blocked.add(account_key)
                         return False
                 else:
                     now = float(self.clock())
@@ -1192,44 +1203,53 @@ class PoolAdmission:
             start = (accounts.index(self._recovery_account_cursor) + 1) % len(accounts)
             accounts = accounts[start:] + accounts[:start]
 
-        image_dispatched = False
-        # Snapshot the one-time head start at scan entry. Thereafter all due
-        # accounts share rotation; mixed accounts retain their own 3:1 bias.
-        include_released_accounts = self._recovery_contributor_warmup >= _ORIGINAL_READ_CONTRIBUTOR_BURST
-        while True:
-            preferred = []
-            for account in accounts:
-                contributing, released = by_account[account]
-                if released and self._recovery_contributor_streak.get(account, 0) >= _ORIGINAL_READ_CONTRIBUTOR_BURST:
-                    preferred.append((account, 1))
-                elif contributing:
-                    preferred.append((account, 0))
-                elif released and include_released_accounts:
-                    preferred.append((account, 1))
-            if not preferred:
-                preferred = [(account, 1) for account in accounts if by_account[account][1]]
-            if not preferred:
-                return
-            # One candidate per account per round preserves account rotation.
-            # Reevaluate after each round so even a single burst-capable scan
-            # cannot admit a fourth contributor ahead of its released original.
-            for account, priority in preferred:
-                kind, owner, request_id, function, receipt, _ = by_account[account][priority].popleft()
-                # Image recovery owns a separate async worker; retain its
-                # one-dispatch-per-scan cadence.
-                if kind == "image" and image_dispatched:
-                    continue
-                if self._dispatch_original_read(kind, owner, request_id, function, receipt):
-                    if kind == "image":
-                        image_dispatched = True
-                    self._recovery_account_cursor = account
-                    self._recovery_contributor_streak[account] = (
-                        min(_ORIGINAL_READ_CONTRIBUTOR_BURST,
-                            self._recovery_contributor_streak.get(account, 0) + 1)
-                        if priority == 0 else 0)
-                    if priority == 0:
-                        self._recovery_contributor_warmup = min(
-                            _ORIGINAL_READ_CONTRIBUTOR_BURST, self._recovery_contributor_warmup + 1)
+        missing = object()
+        previous_blocked = getattr(self._recovery_fifo_scan, "blocked_accounts", missing)
+        self._recovery_fifo_scan.blocked_accounts = set()
+        try:
+            image_dispatched = False
+            # Snapshot the one-time head start at scan entry. Thereafter all due
+            # accounts share rotation; mixed accounts retain their own 3:1 bias.
+            include_released_accounts = self._recovery_contributor_warmup >= _ORIGINAL_READ_CONTRIBUTOR_BURST
+            while True:
+                preferred = []
+                for account in accounts:
+                    contributing, released = by_account[account]
+                    if released and self._recovery_contributor_streak.get(account, 0) >= _ORIGINAL_READ_CONTRIBUTOR_BURST:
+                        preferred.append((account, 1))
+                    elif contributing:
+                        preferred.append((account, 0))
+                    elif released and include_released_accounts:
+                        preferred.append((account, 1))
+                if not preferred:
+                    preferred = [(account, 1) for account in accounts if by_account[account][1]]
+                if not preferred:
+                    return
+                # One candidate per account per round preserves account rotation.
+                # Reevaluate after each round so even a single burst-capable scan
+                # cannot admit a fourth contributor ahead of its released original.
+                for account, priority in preferred:
+                    kind, owner, request_id, function, receipt, _ = by_account[account][priority].popleft()
+                    # Image recovery owns a separate async worker; retain its
+                    # one-dispatch-per-scan cadence.
+                    if kind == "image" and image_dispatched:
+                        continue
+                    if self._dispatch_original_read(kind, owner, request_id, function, receipt):
+                        if kind == "image":
+                            image_dispatched = True
+                        self._recovery_account_cursor = account
+                        self._recovery_contributor_streak[account] = (
+                            min(_ORIGINAL_READ_CONTRIBUTOR_BURST,
+                                self._recovery_contributor_streak.get(account, 0) + 1)
+                            if priority == 0 else 0)
+                        if priority == 0:
+                            self._recovery_contributor_warmup = min(
+                                _ORIGINAL_READ_CONTRIBUTOR_BURST, self._recovery_contributor_warmup + 1)
+        finally:
+            if previous_blocked is missing:
+                del self._recovery_fifo_scan.blocked_accounts
+            else:
+                self._recovery_fifo_scan.blocked_accounts = previous_blocked
 
     def run_recovery(self, context, function, args):
         done = threading.Event()

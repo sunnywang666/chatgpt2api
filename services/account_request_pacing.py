@@ -1148,12 +1148,16 @@ def _clock_for_account(identity):
     return key, clock
 
 
-def reserve_account_original_read(account, owner):
+def reserve_account_original_read(account, owner, *, allow_new=True):
     """Book one due original read in the existing ordinary-read FIFO.
 
     The caller does not receive a worker slot until this ticket is first and
     the persisted account clock is due.  Only one such dormant ticket per
     account is allowed, so a recovery backlog cannot fill the ordinary queue.
+    A dispatcher that has already encountered shared FIFO contention in its
+    current scan may set ``allow_new`` false: an existing ticket can still
+    reach its send edge, but another lane cannot book a later ticket before
+    the next scan re-applies scheduling priority.
     """
     identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
     if not identity or not isinstance(owner, str) or not owner.startswith(_ORIGINAL_READ_OWNER_PREFIX):
@@ -1178,6 +1182,9 @@ def reserve_account_original_read(account, owner):
                           if entry["owner"].startswith(_ORIGINAL_READ_OWNER_PREFIX)
                           and entry["owner"] != owner), None)
             if other is not None:
+                return False
+            own = next((entry for entry in queue if entry["owner"] == owner), None)
+            if own is None and not allow_new:
                 return False
             ready = max(clock.next_request, clock.cooldown_until, clock._read_ready(now))
             first = clock._ordinary_read_turn(owner, now, max(0.0, ready - now))
