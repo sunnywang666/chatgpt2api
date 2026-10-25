@@ -402,6 +402,12 @@ def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
         recovery["deferred"] = True
     if recovery:
         result["recovery"] = recovery
+    send_hold = receipt.get("send_hold")
+    if isinstance(send_hold, dict):
+        state = send_hold.get("state")
+        version = send_hold.get("version")
+        if state in {"active", "held", "expired"} and type(version) is int and version >= 0:
+            result["send_hold"] = {"state": state, "version": version}
     execution = safe_public_execution(receipt.get("execution"))
     if execution:
         result["execution"] = execution

@@ -100,7 +100,7 @@ async def external_image_boundary(request: Request, call_next):
     elif request.method == "POST" and re.fullmatch(r"/api/image-tasks/[^/]+/work", path):
         chat_body_limit = 1024
         chat_body_error = "IMAGE_WORK_BODY_TOO_LARGE"
-    if request.method == "POST" and re.fullmatch(r"/api/(?:chat-requests|image-tasks|conversation-bindings/text-requests)/[^/]+/recovery-control", path):
+    if request.method == "POST" and re.fullmatch(r"/api/(?:chat-requests|image-tasks|conversation-bindings/text-requests)/[^/]+/(?:recovery-control|send-hold)", path):
         chat_body_limit = 1024
         chat_body_error = "RECOVERY_CONTROL_BODY_TOO_LARGE"
     if chat_body_limit is not None:
@@ -109,7 +109,7 @@ async def external_image_boundary(request: Request, call_next):
         # absent. Hold the slot through downstream JSON parsing so a caller
         # cannot multiply the bounded body allocation with concurrent reads.
         legacy_control = (not is_external(request) and bool(re.fullmatch(
-            r"/api/(?:image-tasks|conversation-bindings/text-requests)/[^/]+/recovery-control"
+            r"/api/(?:image-tasks|conversation-bindings/text-requests)/[^/]+/(?:recovery-control|send-hold)"
             r"|/api/image-tasks/[^/]+/completion", path)))
         _, rejected = _ordinary_chat_identity(request, ordinary_only=not legacy_control)
         if rejected is not None:

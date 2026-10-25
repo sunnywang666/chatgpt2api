@@ -4,6 +4,7 @@ from api.product_works import ProductWorkInput, product_identity
 from services.work_lifecycle import WorkLifecycleError
 
 from api.recovery_control import RecoveryControlRequest, update_recovery_control
+from api.send_hold_control import SendHoldRequest, update_send_hold
 
 from services.request_context import trusted_source
 
@@ -533,6 +534,13 @@ def create_router() -> APIRouter:
         response.headers["Cache-Control"] = "private, no-store"
         return await update_recovery_control(text_task_service, "text", str(identity.get("id") or "anonymous"),
                                              request_id, body)
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/send-hold")
+    async def control_bound_text_send_hold(request_id: str, body: SendHoldRequest, response: Response,
+                                           authorization: str | None = Header(default=None)):
+        identity = require_identity(authorization)
+        response.headers["Cache-Control"] = "private, no-store"
+        return await update_send_hold(text_task_service, str(identity.get("id") or "anonymous"), request_id, body)
 
     @router.post("/api/conversation-bindings/text-requests/{request_id}/recover")
     async def recover_bound_text_request(

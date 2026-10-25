@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from api.recovery_control import RecoveryControlRequest, update_recovery_control
+from api.send_hold_control import SendHoldRequest, update_send_hold
 
 from services.request_context import trusted_source
 
@@ -438,6 +439,13 @@ def create_router() -> APIRouter:
         response.headers["Cache-Control"] = "private, no-store"
         return await update_recovery_control(text_task_service, "text", _owner(identity),
                                              _validated_request_id(request_id), body)
+
+    @router.post("/api/chat-requests/{request_id}/send-hold")
+    async def control_chat_send_hold(request_id: str, body: SendHoldRequest, request: Request,
+                                     response: Response, authorization: str | None = Header(default=None)):
+        identity = _ordinary_identity(authorization, request)
+        response.headers["Cache-Control"] = "private, no-store"
+        return await update_send_hold(text_task_service, _owner(identity), _validated_request_id(request_id), body)
 
     @router.post("/api/chat-requests/{request_id}/recover")
     async def recover_chat_request(

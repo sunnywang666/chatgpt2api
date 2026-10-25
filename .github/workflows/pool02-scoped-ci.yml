@@ -13,6 +13,11 @@ on:
       - .github/workflows/docker-publish.yml
       - tools/ci/provider-company-queue-fallback.sh
       - api/product_works.py
+      - api/ai.py
+      - api/chat_requests.py
+      - api/company_requests.py
+      - api/external_images.py
+      - api/send_hold_control.py
       - services/account_request_pacing.py
       - services/account_service.py
       - services/oauth_login_service.py
@@ -60,6 +65,10 @@ on:
       - test/test_stalled_text_diagnostics.py
       - test/test_sent_outcome_consistency.py
       - test/test_recovery_control.py
+      - test/test_send_hold_control.py
+      - test/test_company_requests.py
+      - test/test_public_chat_api.py
+      - test/test_key_policy_http.py
       - test/test_unknown_turn_recovery.py
       - test/test_image_metadata_refresh_liveness.py
       - test/test_product_work.py
@@ -135,6 +144,10 @@ jobs:
             test/test_stalled_text_diagnostics.py \
             test/test_sent_outcome_consistency.py \
             test/test_recovery_control.py \
+            test/test_send_hold_control.py \
+            test/test_company_requests.py \
+            test/test_public_chat_api.py \
+            test/test_key_policy_http.py \
             test/test_original_operation_budget.py \
             test/test_product_compact_successor.py \
             test/test_product_fairness.py \

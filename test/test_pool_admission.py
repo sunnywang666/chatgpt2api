@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from services.account_service import AccountService
 from services.model_service import ModelRoute
 from services.storage.json_storage import JSONStorageBackend
-from services.task_store import TaskStore
+from services.task_store import SendHoldRejected, TaskStore
 from services.pool_admission import PoolAdmission
 from services.request_context import current_request, AdmissionLost
 from services.text_task_service import TextTaskService
@@ -2620,6 +2620,124 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "queued")
         self.assertEqual(receipt["_execution_timeline"][-1]["phase"], "before_submit")
         self.assertFalse(receipt["_submission_started"])
+
+    def test_send_hold_skips_exact_original_then_releases_same_input_and_id(self):
+        self.submit("held")
+        self.submit("independent", owner="other")
+        with self.store.connect() as db:
+            before = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", ("happy", "held")).fetchone()[0]
+        hold = self.store.set_text_send_hold("happy", "held", True, expected_version=0)
+        self.assertEqual(hold["state"], "held")
+        independent = self.admission.claim_next()
+        self.assertEqual(independent.request_id, "independent")
+        self.admission.execute(independent)
+        self.assertEqual(self.store.set_text_send_hold("happy", "held", False, expected_version=hold["version"])["state"], "active")
+        context = self.admission.claim_next()
+        self.assertEqual((context.owner, context.request_id), ("happy", "held"))
+        with self.store.connect() as db:
+            after = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", ("happy", "held")).fetchone()[0]
+        self.assertEqual(after, before)
+        self.assertFalse(self.read("text", "happy", "held")["_submission_started"])
+
+    def test_send_hold_preserves_same_conversation_order_but_not_independent_work(self):
+        self.submit("held")
+        self.submit("following")
+        self.submit("independent", owner="other")
+        with self.store.transaction() as db:
+            for request_id, sequence in (("held", 1), ("following", 2)):
+                receipt = self.store.read_receipt(db, "text", "happy", request_id)
+                receipt.update(provider_account_identity="account-0", provider_binding_id="binding-0",
+                               conversation_id="same-conversation", _sequence=sequence)
+                self.store.write_receipt(db, "text", "happy", request_id, receipt)
+        self.store.set_text_send_hold("happy", "held", True, expected_version=0)
+        self.assertEqual(self.admission.claim_next().request_id, "independent")
+        self.assertIsNone(self.admission.claim_next())
+
+    def test_send_hold_and_claim_have_deterministic_writer_ordering(self):
+        self.submit("hold-first")
+        original_write = self.store.write_receipt
+        hold_writer, release_hold, claim_done = threading.Event(), threading.Event(), threading.Event()
+        hold_result, claim_result = {}, {}
+
+        def hold_first_write(db, kind, owner, request_id, receipt):
+            if request_id == "hold-first" and receipt.get("_send_hold") is True:
+                hold_writer.set()
+                self.assertTrue(release_hold.wait(2))
+            return original_write(db, kind, owner, request_id, receipt)
+
+        with patch.object(self.store, "write_receipt", side_effect=hold_first_write):
+            holder = threading.Thread(target=lambda: hold_result.setdefault(
+                "value", self.store.set_text_send_hold("happy", "hold-first", True, expected_version=0)))
+            holder.start()
+            self.assertTrue(hold_writer.wait(2))
+            claimer = threading.Thread(target=lambda: (claim_result.setdefault("value", self.admission.claim_next()), claim_done.set()))
+            claimer.start()
+            self.assertFalse(claim_done.wait(.05))
+            release_hold.set()
+            holder.join(2)
+            claimer.join(2)
+        self.assertEqual(hold_result["value"]["state"], "held")
+        self.assertIsNone(claim_result["value"])
+
+        self.submit("claim-first")
+        original_snapshot = self.admission._snapshot
+        claim_writer, release_claim, hold_done = threading.Event(), threading.Event(), threading.Event()
+        claim_result, hold_result = {}, {}
+
+        def claim_first_snapshot(*args, **kwargs):
+            claim_writer.set()
+            self.assertTrue(release_claim.wait(2))
+            return original_snapshot(*args, **kwargs)
+
+        with patch.object(self.admission, "_snapshot", side_effect=claim_first_snapshot):
+            claimer = threading.Thread(target=lambda: claim_result.setdefault("value", self.admission.claim_next()))
+            claimer.start()
+            self.assertTrue(claim_writer.wait(2))
+
+            def hold_after_claim_writer():
+                try:
+                    hold_result["value"] = self.store.set_text_send_hold("happy", "claim-first", True, expected_version=0)
+                except SendHoldRejected as exc:
+                    hold_result["value"] = exc.code
+                finally:
+                    hold_done.set()
+
+            holder = threading.Thread(target=hold_after_claim_writer)
+            holder.start()
+            self.assertFalse(hold_done.wait(.05))
+            release_claim.set()
+            claimer.join(2)
+            holder.join(2)
+        self.assertIsNotNone(claim_result["value"])
+        self.assertEqual(hold_result["value"], "SEND_HOLD_IN_FLIGHT")
+
+    def test_send_hold_final_guard_rejects_a_stale_held_receipt(self):
+        self.submit("guard")
+        context = self.admission.claim_next()
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "text", "happy", "guard")
+            receipt["_send_hold"] = True
+            self.store.write_receipt(db, "text", "happy", "guard", receipt)
+        with self.assertRaisesRegex(AdmissionLost, "send hold"):
+            context.before_send()
+        self.assertFalse(self.read("text", "happy", "guard")["_submission_started"])
+
+    def test_send_hold_deadline_expires_without_revival(self):
+        self.submit("deadline")
+        with self.store.transaction() as db:
+            receipt = self.store.read_receipt(db, "text", "happy", "deadline")
+            receipt["_scheduling"] = {"wait_deadline": datetime.fromtimestamp(
+                self.clock.now + 1, timezone.utc).isoformat()}
+            self.store.write_receipt(db, "text", "happy", "deadline", receipt)
+        with patch("services.task_store.time.time", return_value=self.clock.now):
+            self.store.set_text_send_hold("happy", "deadline", True, expected_version=0)
+        self.clock.now += 2
+        self.assertIsNone(self.admission.claim_next())
+        with patch("services.task_store.time.time", return_value=self.clock.now), \
+                self.assertRaisesRegex(SendHoldRejected, "SEND_HOLD_WAIT_DEADLINE_EXCEEDED"):
+            self.store.set_text_send_hold("happy", "deadline", False, expected_version=1)
+        receipt = self.read("text", "happy", "deadline")
+        self.assertEqual((receipt["status"], receipt["error_code"]), ("failed", "WAIT_DEADLINE_EXCEEDED"))
 
 
 if __name__ == "__main__":

@@ -50,10 +50,8 @@ def test_public_recovery_real_sqlite_contention_preserves_original(public_chat, 
     reader = Mock(side_effect=read_original)
     f.tasks.recovery_reader = reader
     connect = f.tasks.store._connect
-    def short_busy_timeout():
-        db = connect()
-        db.execute("PRAGMA busy_timeout=10")
-        return db
+    def short_busy_timeout(*, busy_timeout_secs=30.0):
+        return connect(busy_timeout_secs=min(busy_timeout_secs, 0.01))
     monkeypatch.setattr(f.tasks.store, "_connect", short_busy_timeout)
     path = "/api/chat-requests/locked-original/recover"
     with sqlite3.connect(f.tasks.store.path) as writer:
@@ -493,7 +491,7 @@ def test_durable_public_chat_submit_query_reuse_conflict_and_owner_isolation(pub
     assert first.json()["status"] == "queued"
     assert set(first.json()) <= {
         "request_id", "route", "model", "status", "content", "error_code",
-        "created_at", "updated_at", "started_at", "finished_at", "recovery", "execution",
+        "created_at", "updated_at", "started_at", "finished_at", "recovery", "execution", "send_hold",
     }
     assert "secret" not in first.text
     assert len(public_chat.queue.calls) == 1
