@@ -5,7 +5,7 @@ It never generates, owns credentials, or replaces an original receipt.
 """
 from __future__ import annotations
 
-from services.request_context import operation_budget
+from services.request_context import ARCHIVE_OPERATION_BUDGET_SECONDS, operation_budget
 
 import hashlib
 import json
@@ -441,7 +441,7 @@ class WorkLifecycleService:
         if admission is not None:
             admission.wake()
 
-    @operation_budget(60.0)
+    @operation_budget(ARCHIVE_OPERATION_BUDGET_SECONDS)
     def _run_claim(self, work, claim, account_key, reservations):
         archive = work["archive"]
         request_id = archive["request_id"]
@@ -470,7 +470,8 @@ class WorkLifecycleService:
                     if work.get("_product_archive_parent"):
                         service = self.text if work["kind"] == "text" else self.images
                         from services.product_work import locking_product_conversations
-                        with locking_product_conversations([work["target"]]):
+                        with locking_product_conversations(
+                                [work["target"]], budget_seconds=ARCHIVE_OPERATION_BUDGET_SECONDS):
                             check_and_renew_archive()
                             result = service.archive_product_work(work["owner"], request_id, archive["desired"])
                         valid = (result.get("request_id") == request_id

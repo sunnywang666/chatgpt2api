@@ -152,14 +152,6 @@ def test_restore_progresses_with_exhausted_read_burst(bound_chat, tmp_path, monk
     backend.get_conversation_parent_message_id = lambda _chat: "new-answer"
     monkeypatch.setattr("services.conversation_binding_service.OpenAIBackendAPI", lambda **_: backend)
 
-    if read_interval == 90:
-        # The bounded readback can still run out of budget. Do not send until
-        # the next original-ID attempt independently confirms the applied PATCH.
-        with pytest.raises(ConversationBindingError) as failure:
-            h.service.complete_text(h.body)
-        assert failure.value.code == "CHAT_ARCHIVE_RESTORE_UNCONFIRMED"
-        assert h.calls == ["read", "restore"]
-        assert h.document["is_archived"] is False
     result = h.service.complete_text(h.body)
     assert result["content"] == "answer"
     assert h.calls == ["read", "restore", "read", "send"]

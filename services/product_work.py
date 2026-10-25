@@ -75,16 +75,21 @@ def _physical_lock_keys(receipts):
 
 
 @contextmanager
-def locking_product_conversations(receipts):
+def locking_product_conversations(receipts, *, budget_seconds=60.0):
     """Serialize ownership and raw archive for a physical conversation.
 
     Call outside SQLite transactions. Reuse the account service's in-process
     mutex map, with a separate namespace from generation's client cursor locks.
+    The default remains the normal 60-second ProductWork lock budget; archive
+    execution passes its already bounded archive-chain budget explicitly.
     """
     from services.account_service import account_service
     from services.request_context import bounded_lock, operation_deadline
+    if (type(budget_seconds) not in (int, float) or not math.isfinite(budget_seconds)
+            or budget_seconds <= 0):
+        raise ValueError("finite product conversation lock budget required")
     keys = _physical_lock_keys(list(receipts))
-    with operation_deadline(time.monotonic() + 60.0), ExitStack() as stack:
+    with operation_deadline(time.monotonic() + float(budget_seconds)), ExitStack() as stack:
         locks = [account_service.conversation_binding_lock("product-archive:" + account, conversation)
                  for account, conversation in keys]
         seen = set()
