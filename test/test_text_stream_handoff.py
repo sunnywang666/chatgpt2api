@@ -539,7 +539,11 @@ def test_later_original_terminal_without_visible_text_revokes_cursor_and_uses_ge
 
 
 @pytest.mark.parametrize("exact_complete", [False, True])
-def test_transport_handoff_terminal_still_uses_binding_exact_reader(monkeypatch, exact_complete):
+@pytest.mark.parametrize("request_kind", ["public_session", "product_work"])
+@pytest.mark.parametrize("terminal_shape", ["snapshot", "sparse", "path_batch"])
+def test_transport_handoff_terminal_still_uses_binding_exact_reader(
+    monkeypatch, exact_complete, request_kind, terminal_shape,
+):
     """WS terminal ends transport only; the saved request branch owns success."""
     from contextlib import nullcontext
     from services import conversation_binding_service as binding_module
@@ -552,7 +556,17 @@ def test_transport_handoff_terminal_still_uses_binding_exact_reader(monkeypatch,
             "id": "thought-leaf", "author": {"role": "assistant"}, "parent": "original-user",
         }}}),
     ])
-    backend = _backend(initial, frames=[_ws_frame()])
+    frame = _ws_frame()
+    if terminal_shape != "snapshot":
+        encoded = "\n".join([
+            *(_line(e).decode() for e in [_final_start(), *_terminal_updates(terminal_shape)]),
+            "data: [DONE]",
+        ])
+        frame = json.dumps({"type": "reply", "reply": {
+            "topic_id": "conversation-turn-turn-1",
+            "catchups": [{"payload": {"payload": {"encoded_item": encoded}}}],
+        }})
+    backend = _backend(initial, frames=[frame])
     backend.close = lambda: None
     exact_reads = []
 
@@ -577,9 +591,13 @@ def test_transport_handoff_terminal_still_uses_binding_exact_reader(monkeypatch,
     body = {
         "provider_binding_id": "binding-a", "provider_account_identity": "account-a",
         "client_conversation_id": "chain-a", "_request_message_id": "original-user",
-        "_public_session_ref": "public-session", "_route": "chat", "_operation": "text",
+        "_route": "chat", "_operation": "text",
         "messages": [{"role": "user", "content": "write"}],
     }
+    if request_kind == "public_session":
+        body["_public_session_ref"] = "public-session"
+    else:
+        body["product_work"] = {"product_ref": "product-a", "step_ref": "copy"}
 
     service = binding_module.ConversationBindingService()
     if exact_complete:
@@ -883,6 +901,155 @@ def test_explicit_final_text_update_replaces_same_message_reasoning_phase():
     handoff.observe(json.dumps({"message": message}))
     assert handoff.terminal_seen is True
     assert len(handoff._message_phases) <= len(handoff._parents)
+
+
+def _final_start(**fields):
+    return {"v": {"conversation_id": "conversation-1", "message": {
+        "id": "final-leaf", "parent": "original-user", "author": {"role": "assistant"},
+        "status": "in_progress", "end_turn": False, "channel": "final",
+        "content": {"content_type": "text", "parts": ["complete answer"]}, **fields,
+    }}}
+
+
+def _terminal_updates(shape):
+    if shape == "sparse":
+        return [{"v": {"message": {"id": "final-leaf", "status": "finished_successfully", "end_turn": True}}}]
+    if shape == "split_sparse":
+        return [{"message": {"id": "final-leaf", "status": "finished_successfully"}},
+                {"message": {"id": "final-leaf", "end_turn": True}}]
+    patches = [{"p": "/message/status", "o": "replace", "v": "finished_successfully"},
+               {"p": "/message/end_turn", "o": "replace", "v": True}]
+    return [{"o": "patch", "v": patches}] if shape == "path_batch" else patches
+
+
+@pytest.mark.parametrize("phase", ["initial_sse", "ws_catchup", "ws_live"])
+@pytest.mark.parametrize("shape", ["sparse", "split_sparse", "path_batch", "path_split"])
+def test_same_message_sparse_terminal_finishes_real_protocol_without_waiting_again(phase, shape):
+    """Identical complete output must not wait another WS budget for omitted fields."""
+    events = [_final_start(), *_terminal_updates(shape)]
+    initial = _initial_events(handoff=False, ste=True)
+    frames = []
+    if phase == "initial_sse":
+        initial.lines[-1:-1] = list(map(_line, events))
+    elif phase == "ws_catchup":
+        encoded = "\n".join([*(_line(e).decode() for e in events), "data: [DONE]"])
+        frames = [json.dumps({"type": "reply", "reply": {"topic_id": "conversation-turn-turn-1",
+            "catchups": [{"payload": {"payload": {"encoded_item": encoded}}}]}})]
+    else:
+        frames = [json.dumps({"type": "message", "topic_id": "conversation-turn-turn-1",
+            "payload": {"payload": {"encoded_item": _line(e).decode()}}}) for e in events]
+        frames.append(json.dumps({"type": "message", "topic_id": "conversation-turn-turn-1",
+            "payload": {"payload": {"encoded_item": "data: [DONE]"}}}))
+    backend = _backend(initial, frames=frames)
+    context = StageContext()
+    token = current_request.set(context)
+    try:
+        received = list(conversation_events(backend, prompt="fixture"))
+    finally:
+        current_request.reset(token)
+    assert "".join(e.get("delta", "") for e in received) == "complete answer"
+    assert backend.text_stream_terminal == {
+        "conversation_id": "conversation-1", "message_id": "final-leaf",
+        "original_message_id": "original-user", "text": "complete answer",
+    }
+    stages = [d["handoff_stage"] for s, d in context.stages if s == "stream_handoff"]
+    assert "ws_no_terminal" not in stages and "ws_budget_exhausted" not in stages
+    assert len(backend.session.post_calls) == 1
+    assert len(backend.session.ws_calls) == (0 if phase == "initial_sse" else 1)
+    if phase != "initial_sse":
+        assert stages[-1] == "ws_terminal" and backend.session.ws.closed
+
+
+@pytest.mark.parametrize("fields", [
+    {"channel": "analysis"}, {"content": {"content_type": "thoughts", "parts": ["thinking"]}},
+    {"author": {"role": "user"}}, {"recipient": "web"},
+    {"metadata": {"channel": "analysis"}},
+    {"metadata": {"is_visually_hidden_from_conversation": True}},
+    {"parent": "other-user"}, {"author": {}},
+])
+@pytest.mark.parametrize("shape", ["sparse", "path_batch"])
+def test_sparse_terminal_never_promotes_reasoning_tools_or_foreign_branch(fields, shape):
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps(_final_start(**fields)))
+    for e in _terminal_updates(shape):
+        handoff.observe(json.dumps(e))
+    assert handoff.terminal_cursor() is None and not handoff.terminal_seen
+
+
+@pytest.mark.parametrize("intervening", [
+    {"message": {"id": "later-user", "parent": "original-user", "author": {"role": "user"}}},
+    {"message": {"id": "another-leaf", "parent": "original-user"}},
+    {"message": {"author": {"role": "assistant"}}},
+    {"message": {}},
+    {"v": {"message": {}}},
+    {"v": {"message": None}},
+    {"p": "/message/id", "o": "replace", "v": "unverified-leaf"},
+    {"p": "/message", "o": "remove"},
+    {"conversation_id": "conversation-other", "message": {"id": "final-leaf"}},
+])
+def test_idless_terminal_patch_cannot_borrow_a_previous_message_or_conversation(intervening):
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps(_final_start()))
+    handoff.observe(json.dumps(intervening))
+    for e in _terminal_updates("path_split"):
+        handoff.observe(json.dumps(e))
+    assert handoff.terminal_cursor() is None and not handoff.terminal_seen
+
+
+def test_sparse_patch_reconstructs_exact_body_and_demotion_revokes_done():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps({
+        "type": "resume_conversation_token", "kind": "topic", "conversation_id": "conversation-1"}))
+    handoff.observe(json.dumps(_handoff()))
+    assert handoff.accepts_ws_payload(json.dumps(_final_start()))
+    assert handoff.accepts_ws_payload(json.dumps({"p": "/message/content/parts/0", "o": "append", "v": " plus tail"}))
+    for e in _terminal_updates("path_split"):
+        assert handoff.accepts_ws_payload(json.dumps(e))
+    assert handoff.terminal_cursor()["text"] == "complete answer plus tail"
+    assert handoff.accepts_ws_payload("[DONE]")
+    assert handoff.accepts_ws_payload(json.dumps({"p": "/message/channel", "o": "replace", "v": "analysis"}))
+    assert handoff.terminal_cursor() is None
+    assert not handoff.accepts_ws_payload("[DONE]")
+
+
+def test_terminal_paths_need_a_message_anchor_and_cannot_cross_later_user_boundary():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    for e in _terminal_updates("path_split"):
+        handoff.observe(json.dumps(e))
+    assert not handoff.terminal_seen
+    handoff.observe(json.dumps(_final_start(id="later-user", author={"role": "user"})))
+    handoff.observe(json.dumps({"message": {"id": "later-user", "author": {"role": "assistant"}}}))
+    handoff.observe(json.dumps(_final_start(parent="later-user")))
+    for e in _terminal_updates("sparse"):
+        handoff.observe(json.dumps(e))
+    assert handoff.terminal_cursor() is None and not handoff.terminal_seen
+
+
+@pytest.mark.parametrize("envelope", [
+    {"channel": "analysis"}, {"metadata": {"channel": "analysis"}},
+    {"parent": "foreign-user"}, {"metadata": {"parent_id": "foreign-user"}},
+])
+@pytest.mark.parametrize("phase", ["initial_sse", "ws_catchup"])
+def test_terminal_patch_keeps_envelope_phase_and_parent_evidence(envelope, phase):
+    patch = {**_terminal_updates("path_batch")[0], **envelope}
+    events = [_final_start(), patch]
+    initial = _initial_events(handoff=False, ste=True)
+    if phase == "initial_sse":
+        initial.lines[-1:-1] = list(map(_line, events))
+    encoded = "\n".join([*(_line(e).decode() for e in events), "data: [DONE]"])
+    backend = _backend(initial, frames=[json.dumps({"type": "reply", "reply": {
+        "topic_id": "conversation-turn-turn-1", "catchups": [{"payload": {"payload": {"encoded_item": encoded}}}],
+    }})])
+    context = StageContext()
+    token = current_request.set(context)
+    try:
+        list(conversation_events(backend, prompt="fixture"))
+    finally:
+        current_request.reset(token)
+    assert backend.text_stream_terminal is None
+    stages = [d["handoff_stage"] for s, d in context.stages if s == "stream_handoff"]
+    assert "ws_terminal" not in stages and "ws_no_terminal" in stages
+    assert len(backend.session.post_calls) == 1
 
 
 def test_terminal_from_an_old_branch_does_not_suppress_this_turns_handoff():
