@@ -804,6 +804,69 @@ def test_background_registered_read_reserves_fifo_then_claims_at_the_read_edge(r
     assert not clock.ordinary_read_queue and not r.admission._original_reads
 
 
+def test_bound_http_get_defers_paced_original_then_background_saves_same_answer(recovery, monkeypatch):
+    """The normal WBOZ GET must use admission before spending a recovery attempt."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api import ai
+
+    r = recovery
+    explicit_original(r, "http-original", recovery_attempt=7)
+    explicit_original(r, "http-other-account", 1)
+    pacing, calls = prepare_explicit_recovery(r, monkeypatch)
+    _, clock = pacing._clock_for_account("upstream-0")
+    clock.request(lambda *_a, **_k: SimpleNamespace(status_code=200, headers={}),
+                  "GET", "https://provider/conversation/previous")
+    original_reader = r.text.recovery_reader
+
+    def bounded_reader(receipt):
+        # Fail immediately if the API bypasses admission; fake time must not
+        # hang a test by sleeping through the real account's pacing interval.
+        if receipt["provider_account_identity"] == "account-0" and clock._read_ready(r.clock()) > r.clock():
+            raise TimeoutError("original read entered before its account was ready")
+        return original_reader(receipt)
+
+    reader = Mock(side_effect=bounded_reader)
+    r.text.recovery_reader = reader
+    monkeypatch.setattr(ai, "text_task_service", r.text)
+    monkeypatch.setattr(ai, "require_identity", lambda token: {"id": token, "role": "admin"})
+    app = FastAPI()
+    app.include_router(ai.create_router())
+    with r.store.connect() as db:
+        before = db.execute("SELECT request_hash,receipt FROM requests WHERE id=?", ("http-original",)).fetchone()
+    with TestClient(app) as client:
+        path = "/api/conversation-bindings/text-requests/http-original"
+        for _ in range(2):
+            response = client.get(path, headers={"Authorization": "owner"})
+            assert response.status_code == 200
+            assert response.json().get("recovery_deferred") is True
+            assert response.json()["status"] == "unknown"
+        reader.assert_not_called()
+        with r.store.connect() as db:
+            assert db.execute("SELECT request_hash,receipt FROM requests WHERE id=?", ("http-original",)).fetchone() == before
+        assert len(clock.ordinary_read_queue) == 1
+        assert not r.admission._original_reads
+        assert client.get(path, headers={"Authorization": "other"}).json() == {
+            "request_id": "http-original", "status": "not_found"}
+        other = client.get("/api/conversation-bindings/text-requests/http-other-account",
+                           headers={"Authorization": "owner"})
+        assert other.json()["content"] == "original final"
+        assert calls == [("GET", "http-other-account")]
+
+        finished = threading.Event()
+        monkeypatch.setattr(r.admission, "wake", finished.set)
+        r.clock.now += 45
+        r.admission.recover_one(background=True)
+        assert finished.wait(2)
+        saved = client.get(path, headers={"Authorization": "owner"}).json()
+        assert saved["status"] == "succeeded" and saved["content"] == "original final"
+        assert saved["request_id"] == "http-original"
+        assert saved["request_message_id"] == "message-http-original"
+        assert calls == [("GET", "http-other-account"), ("GET", "http-original")]
+        assert not clock.ordinary_read_queue and not r.admission._original_reads
+        assert len(r.queue.calls) == 2  # Original fixtures remain; no generation/replay.
+
+
 def test_explicit_and_background_recovery_share_physical_read_exclusion(recovery, monkeypatch):
     r = recovery
     receipt = explicit_original(r, "shared-original")
@@ -822,6 +885,62 @@ def test_explicit_and_background_recovery_share_physical_read_exclusion(recovery
     assert finished.wait(2)
     assert r.text.read_snapshot("owner", "shared-original")["status"] == "succeeded"
     assert calls == [("GET", "shared-original")] and not r.admission._original_reads
+
+
+@pytest.mark.parametrize("changes", [
+    {"_attempt_finished_at": 900, "_attempt_reason": "ORIGINAL_RESULT_NO_FINAL",
+     "recovery_reason": "REQUEST_RESULT_NOT_FOUND"},
+    {"_recovery_paused": True},
+    {"status": "succeeded", "content": "already saved", "_submission_started": True},
+])
+def test_bound_http_get_keeps_stopped_or_saved_original_local(recovery, monkeypatch, changes):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api import ai
+    r = recovery
+    explicit_original(r, "local-original")
+    r.text._update("owner", "local-original", **changes)
+    _, calls = prepare_explicit_recovery(r, monkeypatch)
+    monkeypatch.setattr(ai, "text_task_service", r.text)
+    monkeypatch.setattr(ai, "require_identity", lambda _: {"id": "owner", "role": "admin"})
+    app = FastAPI()
+    app.include_router(ai.create_router())
+    with TestClient(app) as client:
+        result = client.get("/api/conversation-bindings/text-requests/local-original")
+    assert result.status_code == 200
+    assert result.json()["status"] == changes.get("status", "unknown")
+    if "content" in changes:
+        assert result.json()["content"] == "already saved"
+    assert not calls and not r.admission._original_reads
+    assert len(r.queue.calls) == 1
+
+
+def test_bound_http_get_writer_contention_returns_retryable_without_upstream_read(recovery, monkeypatch):
+    import sqlite3
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api import ai
+    r = recovery
+    explicit_original(r, "http-busy-original")
+    pacing, calls = prepare_explicit_recovery(r, monkeypatch)
+    connect = r.text.store._connect
+    def bounded_connect(**kwargs):
+        db = connect(**kwargs)
+        db.execute("PRAGMA busy_timeout=10")
+        return db
+    monkeypatch.setattr(r.text.store, "_connect", bounded_connect)
+    monkeypatch.setattr(ai, "text_task_service", r.text)
+    monkeypatch.setattr(ai, "require_identity", lambda _: {"id": "owner", "role": "admin"})
+    app = FastAPI()
+    app.include_router(ai.create_router())
+    with TestClient(app) as client, sqlite3.connect(r.store.path) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        result = client.get("/api/conversation-bindings/text-requests/http-busy-original")
+    assert result.status_code == 503
+    assert result.json()["detail"] == {"code": "TEXT_RECOVERY_LEASE_BUSY", "retryable": True,
+                                       "lease_acquired": False, "upstream_read_started": False}
+    assert not calls and not r.admission._original_reads
+    assert not pacing._clock_for_account("upstream-0")[1].ordinary_read_queue
 
 
 @pytest.mark.parametrize("change", [

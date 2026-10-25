@@ -517,7 +517,18 @@ def create_router() -> APIRouter:
     @router.get("/api/conversation-bindings/text-requests/{request_id}")
     async def read_bound_text_request(request_id: str, authorization: str | None = Header(default=None)):
         identity = require_identity(authorization)
-        return await run_in_threadpool(text_task_service.read, str(identity.get("id") or "anonymous"), request_id)
+        # Ordinary polling must share the background reader's admission. A
+        # paced original keeps its FIFO ticket without claiming a read early.
+        # Unlike explicit recovery, this never reopens an ended attempt.
+        try:
+            return await run_in_threadpool(
+                text_task_service.recover, str(identity.get("id") or "anonymous"), request_id,
+            )
+        except TextRecoveryLeaseBusy as exc:
+            raise HTTPException(status_code=503, detail={
+                "code": "TEXT_RECOVERY_LEASE_BUSY", "retryable": True,
+                "lease_acquired": False, "upstream_read_started": False,
+            }) from exc
 
     @router.get("/api/conversation-bindings/text-requests/{request_id}/snapshot")
     async def snapshot_bound_text_request(request_id: str, response: Response,
