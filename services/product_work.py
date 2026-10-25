@@ -778,6 +778,7 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
         if not native_chain:
             return None
         ancestors = [native_chain["original"], native_chain["parent"]]
+    advanced_by_own_successor = False
     if incomplete:
         # Child success never terminates the original. Only the original
         # reader's exact persisted terminal-empty proof can waive UNKNOWN;
@@ -797,14 +798,54 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
             and ended["final_message_id"] != ended["request_message_id"]
             and type(ended.get("observed_at")) in {int, float}
             and math.isfinite(ended["observed_at"]) and 0 < ended["observed_at"] <= now)
+        # This is deliberately not another terminal-result case.  The bound
+        # original reader may prove that its still-UNKNOWN branch advanced to
+        # this exact, locally-owned compact child.  Keep the original UNKNOWN
+        # and use that branch observation only as a ProductWork close waiver.
+        advanced = original.get("_completed_successor_evidence")
+        successor_ended = receipt.get("_turn_end_evidence")
+        advanced_by_own_successor = bool(
+            original.get("status") == "unknown"
+            and original.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
+            and original.get("recovery_reason") == "REQUEST_CONVERSATION_ADVANCED"
+            and original.get("upstream_outcome") in {None, "unknown"}
+            and original.get("upstream_unfinished") is False
+            and original.get("_upstream_terminal") is not True
+            and not original.get("_turn_end_evidence")
+            and isinstance(advanced, dict)
+            and set(advanced) == {"conversation_id", "request_message_id", "successor_request_message_id",
+                                  "successor_final_message_id", "observed_at"}
+            and all(isinstance(advanced.get(key), str) and advanced[key].strip() for key in (
+                "conversation_id", "request_message_id", "successor_request_message_id",
+                "successor_final_message_id"))
+            and advanced["conversation_id"] == original.get("conversation_id")
+            and advanced["request_message_id"] == original.get("request_message_id")
+            and advanced["successor_request_message_id"] == receipt.get("request_message_id")
+            and advanced["successor_final_message_id"] == receipt.get("parent_message_id")
+            and advanced["successor_request_message_id"] != advanced["request_message_id"]
+            and advanced["successor_final_message_id"] != advanced["successor_request_message_id"]
+            and type(advanced.get("observed_at")) in {int, float}
+            and math.isfinite(advanced["observed_at"]) and 0 < advanced["observed_at"] <= now
+            and isinstance(successor_ended, dict)
+            and set(successor_ended) == {"conversation_id", "request_message_id", "final_message_id", "observed_at"}
+            and all(isinstance(successor_ended.get(key), str) and successor_ended[key].strip() for key in (
+                "conversation_id", "request_message_id", "final_message_id"))
+            and successor_ended["conversation_id"] == receipt.get("conversation_id")
+            and successor_ended["request_message_id"] == receipt.get("request_message_id")
+            and successor_ended["final_message_id"] == receipt.get("parent_message_id")
+            and successor_ended["final_message_id"] != successor_ended["request_message_id"]
+            and type(successor_ended.get("observed_at")) in {int, float}
+            and math.isfinite(successor_ended["observed_at"])
+            and 0 < successor_ended["observed_at"] <= advanced["observed_at"])
     else:
         original_ended = (original.get("status") == "failed"
                           and original.get("error_code") == "RESULT_UNRECOVERABLE"
                           and not original.get("_upstream_terminal")
                           and TextTaskService._no_final_successor_source(original, now))
     if (original.get("request_id") != original_id
-            or not original_ended
-            or original.get("upstream_outcome") != "unknown"
+            or not (original_ended or advanced_by_own_successor)
+            or (original.get("upstream_outcome") not in {None, "unknown"} if advanced_by_own_successor
+                else original.get("upstream_outcome") != "unknown")
             or original.get("_supersedes_no_final") is True
             or original.get("upstream_unfinished")
             or any(key in original for key in ("content", "result", "data"))
@@ -876,9 +917,45 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
     ).fetchall()
     if len(children) != 1 or children[0][0] != successor_id:
         return None
+    if advanced_by_own_successor:
+        descendants = db.execute(
+            "SELECT id FROM requests WHERE owner=? AND "
+            "(json_extract(receipt,'$._supersedes_request_id')=? OR json_extract(receipt,'$._codex_fallback_of')=?)",
+            (parent["owner"], successor_id, successor_id),
+        ).fetchall()
+        if descendants:
+            return None
     member_ids = {(member["kind"], row.get("request_id") or row.get("id")) for member, row in members}
     if not {("text", item["request_id"]) for item in chain_members} <= member_ids:
         return None
+    if advanced_by_own_successor:
+        chain_ids = {("text", parent["owner"], original_id), ("text", parent["owner"], successor_id)}
+        registered = {(member["kind"], member["owner"], member["request_id"]) for member, _ in members}
+        all_rows = list(store.receipts(db))
+        all_receipts = [other for _, _, _, other in all_rows]
+        controls = ("_executing", "_turn_reserved", "recovery_claim_id", "_recovery_claim_id",
+                    "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of")
+        # A finished, registered step before the original is historical work,
+        # not a competing successor. Everything else in the same physical
+        # conversation remains a conflict, including another owner's receipt.
+        def safe_predecessor(kind, owner, request_id, other):
+            return bool(
+                (kind, owner, request_id) in registered
+                and owner == parent["owner"]
+                and type(other.get("_sequence")) is int
+                and other["_sequence"] > 0 and other["_sequence"] < original["_sequence"]
+                and other.get("status") in {"succeeded", "success"}
+                and other.get("upstream_outcome") == "completed"
+                and other.get("upstream_unfinished") is not True
+                and other.get("_upstream_terminal") is True
+                and not _claims(other)
+                and not any(other.get(key) for key in controls)
+                and not _unresolved(other, all_receipts))
+        if any(_same_conversation(other, receipt)
+               and (kind, owner, request_id) not in chain_ids
+               and not safe_predecessor(kind, owner, request_id, other)
+               for kind, owner, request_id, other in all_rows):
+            return None
     member_refs = {member["request_id"]: member for member, _ in members if member["kind"] == "text"}
     metadata = original_body.get("product_work")
     attempt_steps = reconciled and receipt.get(TextTaskService._RECONCILED_ATTEMPT_STEP) is True
@@ -908,7 +985,8 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
             metadata = _metadata(parent, member["step_ref"])
             if item.get("_product_work") != metadata or original_body.get("product_work") != metadata:
                 return None
-    return {"original": original, "successor": receipt, "resolved": [*ancestors, original]}
+    return {"original": original, "successor": receipt, "resolved": [*ancestors, original],
+            "advanced_by_own_successor": advanced_by_own_successor}
 
 
 def _codex_rejected_retry_chain(store, db, parent, receipt, members):
@@ -1086,6 +1164,16 @@ class ProductWorkService:
             if chain:
                 waived.update(item["request_id"] for item in chain["resolved"])
         return waived
+
+    def _owned_advanced_successor_chains(self, db, parent, members):
+        """Return only compact children proven by the original-reader branch proof."""
+        chains = {}
+        now = float(self.clock())
+        for _, receipt in members:
+            chain = _no_final_successor_chain(self.store, db, parent, receipt, members, now)
+            if chain and chain.get("advanced_by_own_successor"):
+                chains[receipt["request_id"]] = chain
+        return chains
 
     def _codex_rejected_retry_waivers(self, db, parent, members):
         waived = set()
@@ -1390,6 +1478,7 @@ class ProductWorkService:
                 raise WorkLifecycleError(reasons[0])
             targets = {}
             chains = self._missing_node_chains(db, parent, members)
+            advanced_chains = self._owned_advanced_successor_chains(db, parent, members)
             chain_member_ids = set()
             special_targets = {}
             members_by_identity = {(member["kind"], member["request_id"]): (member, receipt)
@@ -1405,14 +1494,27 @@ class ProductWorkService:
                 if canonical in special_targets and special_targets[canonical] != target:
                     raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
                 special_targets[canonical] = target
+            for chain in advanced_chains.values():
+                archive_member, archive = members_by_identity[("text", chain["successor"]["request_id"])]
+                chain_member_ids.update(("text", chain[name]["request_id"])
+                                        for name in ("original", "successor"))
+                canonical = archive["provider_account_identity"], archive["conversation_id"]
+                target = archive_member["kind"], archive_member["request_id"]
+                if canonical in special_targets and special_targets[canonical] != target:
+                    raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
+                special_targets[canonical] = target
+            chains.update(advanced_chains)
             for member, receipt in members:
                 identity = member["kind"], member["request_id"]
                 if identity in chain_member_ids:
                     chain = chains.get(receipt.get("request_id"))
                     if not chain:
                         continue
-                    member, receipt = members_by_identity[(chain["archive_member"]["kind"],
-                                                           chain["archive_member"]["request_id"])]
+                    if chain.get("advanced_by_own_successor"):
+                        member, receipt = members_by_identity[("text", chain["successor"]["request_id"])]
+                    else:
+                        member, receipt = members_by_identity[(chain["archive_member"]["kind"],
+                                                               chain["archive_member"]["request_id"])]
                 if _cancelled_unsent_step(self.store, db, parent, member, receipt):
                     continue
                 if _unsent(receipt) and outcome == "cancelled":
@@ -1482,6 +1584,12 @@ class ProductWorkService:
             if (child["target"].get("provider_account_identity") == archive["provider_account_identity"]
                     and child["target"].get("conversation_id") == archive["conversation_id"]
                     and (child["kind"], child["last_request_id"]) != (archive_member["kind"], archive_member["request_id"])):
+                raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
+        for chain in self._owned_advanced_successor_chains(db, parent, members).values():
+            successor = chain["successor"]
+            if (child["target"].get("provider_account_identity") == successor["provider_account_identity"]
+                    and child["target"].get("conversation_id") == successor["conversation_id"]
+                    and (child["kind"], child["last_request_id"]) != ("text", successor["request_id"])):
                 raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
         receipt = self.store.read_receipt(db, child["kind"], child["owner"], child["last_request_id"])
         if not receipt or any(receipt.get(k) != v for k, v in child["target"].items()):

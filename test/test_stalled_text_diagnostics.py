@@ -390,6 +390,124 @@ def test_external_progress_requires_verified_same_chain_completed_successor(tmp_
     assert "content" not in result and "_turn_end_evidence" not in result
 
 
+@pytest.mark.parametrize("later", ["in_progress", "timeout"])
+def test_advanced_read_persists_only_branch_ids_and_invalidates_on_later_observation(tmp_path, monkeypatch, later):
+    service, admission, backend, _ = migration(tmp_path)
+    monkeypatch.setattr("services.conversation_binding_service.time.time", service.clock)
+    original = saved(service)
+    doc = external_continuation(document(original))
+    service.recovery_reader = lambda receipt: ConversationBindingService._read_text_request_result(
+        None, receipt, document=doc)
+    service.recover("owner", "old-0")
+    current = saved(service)
+    proof = current["_completed_successor_evidence"]
+    assert proof == {"conversation_id": original["conversation_id"],
+        "request_message_id": original["request_message_id"],
+        "successor_request_message_id": "external-user", "successor_final_message_id": "external-final",
+        "observed_at": service.clock()}
+    assert current["status"] == "unknown" and current["upstream_outcome"] == "unknown"
+    assert current.get("_upstream_terminal") is not True and "_turn_end_evidence" not in current
+    assert "PRIVATE_LATER" not in json.dumps(current) and "content" not in current
+    restarted = TextTaskService(service.path, admission=admission, clock=service.clock,
+                                recovery_reader=service.recovery_reader)
+    assert saved(restarted)["_completed_successor_evidence"] == proof
+    # An unrelated/manual later user is only observed; no ownership, slot or
+    # final-result permission is inferred by the reader itself.
+    assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
+    doc["mapping"]["external-final"]["message"].update(status="in_progress", end_turn=False)
+    if later == "timeout":
+        def fail_read(_receipt):
+            raise TimeoutError("fixture original read deadline")
+        restarted.recovery_reader = fail_read
+    service.clock.now = current["recovery_next_at"] + 1
+    restarted.recover("owner", "old-0")
+    assert "_completed_successor_evidence" not in saved(restarted)
+    assert saved(restarted)["status"] == "unknown" and backend.mock_calls == []
+
+
+@pytest.mark.parametrize("case", ["multiple_users", "active_tool", "stale_current"])
+def test_advanced_diagnostic_does_not_supply_unambiguous_owned_successor_proof(tmp_path, case):
+    service, _, _, _ = migration(tmp_path)
+    original = saved(service)
+    doc = external_continuation(document(original))
+    if case == "multiple_users":
+        doc["mapping"]["middle-user"] = {"parent": doc["mapping"]["external-user"]["parent"],
+            "message": {"id": "middle-user", "author": {"role": "user"}}}
+        doc["mapping"]["external-user"]["parent"] = "middle-user"
+    elif case == "active_tool":
+        doc["mapping"]["active-tool"] = {"parent": doc["mapping"]["external-user"]["parent"],
+            "message": {"id": "active-tool", "author": {"role": "tool"}, "status": "in_progress"}}
+        doc["mapping"]["external-user"]["parent"] = "active-tool"
+    else:
+        doc["mapping"]["future-user"] = {"parent": "external-final",
+            "message": {"id": "future-user", "author": {"role": "user"}}}
+    result = ConversationBindingService._read_text_request_result(None, original, document=doc)
+    assert result["recovery_reason"] == "REQUEST_CONVERSATION_ADVANCED"
+    assert "_completed_successor_evidence" not in result
+    assert "_turn_end_evidence" not in result and "content" not in result
+
+
+@pytest.mark.parametrize("output", ["missing", "active", "wrong_tool", "complete", "thought_bridge"])
+@pytest.mark.parametrize("segment", ["original", "successor"])
+def test_advanced_proof_requires_completed_output_for_stale_assistant_tool_call(tmp_path, output, segment):
+    service, _, _, _ = migration(tmp_path)
+    original = saved(service)
+    doc = external_continuation(document(original))
+    call_id = doc["mapping"]["external-user"]["parent"]
+    next_id = "external-user"
+    if segment == "successor":
+        call_id, next_id = "child-call", "external-final"
+        doc["mapping"][call_id] = {"parent": "external-user", "message": {
+            "id": call_id, "author": {"role": "assistant"}}}
+        doc["mapping"][next_id]["parent"] = call_id
+    call = doc["mapping"][call_id]["message"]
+    call.update(status="in_progress", end_turn=False, channel="analysis", recipient="python",
+                content={"content_type": "code", "text": "fixture_call()"})
+    if output != "missing":
+        parent = call_id
+        if output == "thought_bridge":
+            doc["mapping"]["bridge"] = {"parent": parent, "message": {
+                "id": "bridge", "author": {"role": "assistant"}, "status": "in_progress",
+                "channel": "analysis", "content": {"content_type": "thoughts", "thoughts": []}}}
+            parent = "bridge"
+        doc["mapping"]["tool-output"] = {"parent": parent, "message": {
+            "id": "tool-output", "author": {"role": "tool", "name": "other" if output == "wrong_tool" else "python"},
+            "status": "in_progress" if output == "active" else "finished_successfully",
+            "content": {"content_type": "execution_output", "text": "fixture output"},
+            "metadata": {"is_complete": True}}}
+        doc["mapping"][next_id]["parent"] = "tool-output"
+    result = ConversationBindingService._read_text_request_result(None, original, document=doc)
+    assert result["recovery_reason"] == (
+        "REQUEST_CONVERSATION_ADVANCED" if segment == "original" or output in {"complete", "thought_bridge"}
+        else "REQUEST_RESULT_INCOMPLETE")
+    assert ("_completed_successor_evidence" in result) == (output in {"complete", "thought_bridge"})
+    assert "_turn_end_evidence" not in result and "content" not in result
+
+
+@pytest.mark.parametrize("case", ["account", "binding", "client", "original", "conversation", "same_id",
+                                  "extra_field", "nan_time", "bool_time", "reason", "status", "binding_status"])
+def test_advanced_successor_proof_rejects_identity_and_shape_drift(tmp_path, case):
+    service, _, _, _ = migration(tmp_path)
+    original = saved(service)
+    result = ConversationBindingService._read_text_request_result(
+        None, original, document=external_continuation(document(original)))
+    proof = result["_completed_successor_evidence"]
+    if case in {"account", "binding", "client"}:
+        result[{"account": "provider_account_identity", "binding": "provider_binding_id",
+                "client": "client_conversation_id"}[case]] = "wrong"
+    elif case == "original": proof["request_message_id"] = "wrong"
+    elif case == "conversation": proof["conversation_id"] = "wrong"
+    elif case == "same_id": proof["successor_request_message_id"] = proof["request_message_id"]
+    elif case == "extra_field": proof["content"] = "must not store"
+    elif case == "nan_time": proof["observed_at"] = float("nan")
+    elif case == "bool_time": proof["observed_at"] = True
+    elif case == "reason": result["recovery_reason"] = "REQUEST_RESULT_INCOMPLETE"
+    elif case == "binding_status": result["binding_status"] = "bound"
+    else: result["status"] = "running"
+    recovered, code, _, _ = TextTaskService._safe_recovery_result(result, original)
+    assert recovered is None and code == "RECOVERY_INVALID_RESULT"
+
+
 def incomplete_reader(backend, mutate=None):
     def read(row):
         doc = document(row)
