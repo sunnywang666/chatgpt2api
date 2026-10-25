@@ -1074,6 +1074,64 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(before, self.store.path.read_bytes())
         self.assertEqual(self.admission.claim_next().request_id, "queued")
 
+    def assert_sent_text_keeps_capacity_until_result(self, transport_error=False):
+        from services.account_request_pacing import AccountRequestClock
+        from services.config import config
+        from services.request_context import executing
+
+        self.write_accounts(2)  # Spare global workers must not hide an account overflow.
+        self.admission.settings = lambda: {"image_account_concurrency": 4,
+                                          "chat_account_concurrency": 1,
+                                          "codex_max_concurrency": 4}
+        for name in ("original", "next"):
+            self.submit(name, provider_account_identity="account-0", provider_binding_id="binding-0")
+        original = self.admission.claim_next()
+        sends = []
+
+        class Response:
+            status_code, headers = 200, {}
+            def close(self):
+                pass
+            def iter_lines(self):
+                yield b'data: {"type":"message"}'
+
+        def send(*args, **kwargs):
+            sends.append(original.request_id)
+            if transport_error:
+                raise TimeoutError("fixture transport stopped after submission")
+            return Response()
+
+        clock = AccountRequestClock("fixture", self.root / "clock.json")
+        with patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+             executing(original):
+            if transport_error:
+                with self.assertRaises(TimeoutError):
+                    clock.request(send, "POST", "https://provider/backend-api/conversation", stream=True)
+            else:
+                response = clock.request(send, "POST", "https://provider/backend-api/conversation", stream=True)
+                response.close()  # Actual pacing callback; result classification has not run yet.
+
+        self.assertEqual(original.receipt()["status"], "running")
+        self.assertFalse(original.receipt()["_turn_reserved"])
+        self.assertEqual(self.admission.resource_snapshot()["accounts"][0]["chat_turn"]["occupied"], 1)
+        self.assertIsNone(self.admission.claim_next())
+        self.text._update("happy", "original", status="unknown", upstream_outcome="unknown", _executing=False)
+        self.assertIsNone(self.admission.claim_next())
+        self.assertEqual(self.admission.resource_snapshot()["accounts"][0]["chat_turn"]["occupied"], 1)
+        self.text._update("happy", "original", status="succeeded", content="original saved answer")
+        following = self.admission.claim_next()
+        self.assertEqual(following.request_id, "next")
+        following.before_send()
+        self.assertEqual(self.admission.resource_snapshot()["accounts"][0]["chat_turn"]["occupied"], 1)
+        self.assertEqual(sends, ["original"])
+
+    def test_sent_text_stream_close_cannot_admit_an_extra_turn_before_result(self):
+        self.assert_sent_text_keeps_capacity_until_result()
+
+    def test_sent_text_transport_failure_cannot_admit_an_extra_turn_before_result(self):
+        self.assert_sent_text_keeps_capacity_until_result(transport_error=True)
+
     def assert_capacity_read_does_not_deadlock_claim(self, read):
         from services.config import ConfigStore
         path = self.root / "config.json"

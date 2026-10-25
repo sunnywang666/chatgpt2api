@@ -58,6 +58,7 @@ on:
       - test/test_background_original_reads.py
       - test/test_pool_admission.py
       - test/test_stalled_text_diagnostics.py
+      - test/test_sent_outcome_consistency.py
       - test/test_recovery_control.py
       - test/test_unknown_turn_recovery.py
       - test/test_image_metadata_refresh_liveness.py
@@ -132,6 +133,7 @@ jobs:
             test/test_pool_admission.py \
             test/test_auth_tls_verification.py \
             test/test_stalled_text_diagnostics.py \
+            test/test_sent_outcome_consistency.py \
             test/test_recovery_control.py \
             test/test_original_operation_budget.py \
             test/test_product_compact_successor.py \
