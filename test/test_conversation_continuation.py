@@ -2825,6 +2825,19 @@ class ProductConversationArchiveTests(unittest.TestCase):
              mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend):
             return ConversationBindingService().set_archived(body, archived)
 
+    def product_archive(self, backend, archived=True, account_identity="account"):
+        body = {"provider_binding_id": "binding", "provider_account_identity": "account",
+                "client_conversation_id": "work", "conversation_id": "chat-a",
+                "parent_message_id": "original", "_product_work_key": "product-work"}
+        backend.close = mock.Mock()
+        accounts = mock.Mock()
+        accounts.get_bound_account_identity.return_value = account_identity
+        accounts.get_bound_text_access_token.return_value = "test-token"
+        accounts.conversation_binding_lock.return_value = nullcontext()
+        with mock.patch("services.conversation_binding_service.account_service", accounts), \
+             mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend):
+            return ConversationBindingService().set_archived(body, archived)
+
     def test_public_archive_and_restore_use_one_preflight_and_one_readback(self):
         for desired in (True, False):
             with self.subTest(desired=desired):
@@ -2853,6 +2866,14 @@ class ProductConversationArchiveTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, "CONVERSATION_BINDING_MISMATCH")
                 backend.session.patch.assert_not_called()
                 backend._get_conversation.assert_called_once()
+
+    def test_product_archive_preflight_cursor_drift_keeps_binding_mismatch(self):
+        backend = self.backend([{"mapping": {"original": {}}, "current_node": "newer", "is_archived": False}])
+        with self.assertRaises(ConversationBindingError) as error:
+            self.product_archive(backend)
+        self.assertEqual(error.exception.code, "CONVERSATION_BINDING_MISMATCH")
+        backend.session.patch.assert_not_called()
+        backend._get_conversation.assert_called_once()
 
     def test_public_archive_other_failures_are_not_preflight_mismatch(self):
         cases = [

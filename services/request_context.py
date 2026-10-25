@@ -16,6 +16,11 @@ current_archive_step = ContextVar("provider_archive_step", default=None)
 current_original_read_owner = ContextVar("provider_original_read_owner", default=None)
 _FAIR_SOURCE = re.compile(r"^(?:user|company):[0-9a-f]{64}$")
 
+# Archiving a conversation needs a fresh precheck and, after a mutation, a
+# fresh readback.  Keep its finite chain budget aligned with the account
+# pacer's existing 240-second archive-read ceiling.
+ARCHIVE_OPERATION_BUDGET_SECONDS = 240.0
+
 
 class AdmissionLost(RuntimeError):
     """The original claim is no longer allowed to send."""

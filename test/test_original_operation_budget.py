@@ -50,7 +50,7 @@ def local_upstream(tmp_path, monkeypatch):
             elif self.path == "/asset":
                 payload = None
             else:
-                payload = {"conversation_id": "original", "current_node": "final", "is_archived": state.archived,
+                payload = {"conversation_id": "original", "current_node": getattr(state, "current_node", "final"), "is_archived": state.archived,
                            "mapping": {"user": {"parent": "root", "message": {
                                "id": "user", "author": {"role": "user"}}},
                            "final": {"parent": "user", "message": {"id": "final", "author": {"role": "assistant"},
@@ -126,6 +126,51 @@ def cursor(session="blocked"):
     return {"provider_binding_id": "binding", "provider_account_identity": "account",
             "client_conversation_id": session, "conversation_id": "original",
             "parent_message_id": "final", "request_message_id": "user", "request_parent_message_id": "root"}
+
+
+def product_archive_stack(tmp_path):
+    """Build the real ProductWork archive branch, including its physical lock."""
+    from services.product_work import ProductWorkService
+    from services.work_lifecycle import WorkLifecycleService
+    from test.test_pool_admission import Clock, build
+
+    (tmp_path / "accounts.json").write_text(json.dumps([{
+        "access_token": "fixture", "account_id": "physical", "provider_account_identity": "account",
+        "conversation_binding_ids": ["binding"], "type": "Plus", "status": "正常", "quota": 99,
+        "source_type": "web",
+    }]))
+    clock = Clock()
+    _, store, admission = build(tmp_path, clock)
+    text = TextTaskService(store.path, runner=lambda *_: pytest.fail("no generation"), clock=clock, admission=admission)
+    admission.register("text", lambda ctx, body: text._run(ctx.owner, ctx.request_id, body))
+    body = {"client_request_id": "product-result", "client_conversation_id": "product-session",
+            "provider_binding_id": "binding", "provider_account_identity": "account",
+            "conversation_id": "original", "parent_message_id": "previous", "model": "fixture-text",
+            "messages": [{"role": "user", "content": "retained product instruction"}],
+            "product_work": {"product_ref": "product", "step_ref": "copy"}}
+    text.submit("owner", body, source="internal:content")
+    with store.transaction() as db:
+        receipt = store.read_receipt(db, "text", "owner", "product-result")
+        receipt.update(status="succeeded", upstream_outcome="completed", upstream_unfinished=False,
+                       content="saved product result", parent_message_id="final", _upstream_terminal=True,
+                       _submission_started=True, _executing=False, _turn_reserved=False,
+                       _claim_id=None, _claim_until=None, send_count=1)
+        store.write_receipt(db, "text", "owner", "product-result", receipt)
+    images = SimpleNamespace()
+    product = ProductWorkService(text, images, clock=clock)
+    lifecycle = WorkLifecycleService(text, images, clock=clock)
+    identity = {"id": "owner", "role": "admin", "_trusted_source": "internal:content"}
+    assert product.close(identity, "product", results_saved=True)["state"] == "closing"
+    return product, lifecycle, clock, identity
+
+
+def raw_product_archive(product, identity, product_ref="product"):
+    """Read the archive child's durable state, not the public aggregate."""
+    with product.store.connect() as db:
+        parent = product._load(db, identity, product_ref)
+        keys = parent["archive_keys"]
+        assert len(keys) == 1
+        return product.store.runtime(db, keys[0])["archive"]
 
 
 @pytest.mark.parametrize("wait_at", ["account_lock", "account_cooldown", "registered_cleanup_lock", "http"])
@@ -569,6 +614,137 @@ def test_archive_applied_patch_timeout_remains_unknown_then_reads_before_any_ret
         assert service.process_one()
     assert service.get("text", {"id": "one"}, "A-1")["archive"]["status"] == "confirmed"
     assert [method for method, _ in state.calls] == ["GET", "PATCH", "GET"]
+
+
+def test_archive_lifecycle_budget_covers_two_paced_reads_without_overriding_shorter_caller_deadline(
+        runtime, local_upstream, monkeypatch):
+    """The real archive stack needs one read credit before and after PATCH."""
+    import services.account_request_pacing as pacing
+    import services.request_context as request_context
+    from services.config import config
+
+    service, _, clock, _, _, add = runtime
+    state = local_upstream
+    now = [1000.0]
+    monkeypatch.setattr(pacing.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(pacing.time, "time", lambda: now[0])
+    monkeypatch.setattr(request_context.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0.0))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 90.0))
+    monkeypatch.setattr(type(config), "account_conversation_read_burst", property(lambda _: 1))
+    monkeypatch.setattr(pacing.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+
+    binding = ConversationBindingService()
+    def archive(_owner, rid, desired):
+        result = binding.set_archived({**cursor("archive"), "_product_work_key": "product-work"}, desired)
+        return {"request_id": rid, "archived": result["archived"],
+                "conversation": {"client_conversation_id": "A"}}
+
+    # This documents the pre-fix 60-second chain limit using the same real
+    # pacer and binding call: precheck and PATCH fit, but readback cannot.
+    with operation_deadline(now[0] + 60):
+        with pytest.raises(AccountRequestDeadlineExceeded):
+            archive("one", "A-1", True)
+    assert [method for method, _ in state.calls] == ["GET", "PATCH"]
+    assert state.archived is True
+
+    # A new archive attempt starts from the same unarchived fixture state. The
+    # lifecycle -> binding -> backend path must retain the 240-second chain
+    # budget and use the second 90-second read credit for confirmation.
+    state.calls.clear()
+    state.transport_attempts.clear()
+    state.archived = False
+    pacing._clocks.clear()
+    now[0] = 1000.0
+    add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    service.text.set_public_session_archived = archive
+    assert service.process_one()
+    assert service.get("text", {"id": "one"}, "A-1")["archive"]["status"] == "confirmed"
+    assert [method for method, _ in state.calls] == ["GET", "PATCH", "GET"]
+    assert now[0] >= 1090
+    assert all((sum(attempt["timeout"]) if isinstance(attempt["timeout"], tuple) else attempt["timeout"]) <= 240
+               for attempt in state.transport_attempts)
+
+
+def test_product_archive_cursor_mismatch_persists_reason_without_patch(runtime, local_upstream):
+    service, _, _, _, _, add = runtime
+    state = local_upstream
+    state.current_node = "newer"
+    binding = ConversationBindingService()
+
+    def archive(_owner, rid, desired):
+        result = binding.set_archived({**cursor("archive"), "_product_work_key": "product-work"}, desired)
+        return {"request_id": rid, "archived": result["archived"],
+                "conversation": {"client_conversation_id": "A"}}
+
+    add("A-1")
+    service.update("text", {"id": "one"}, "A-1", "completed", True)
+    service.text.set_public_session_archived = archive
+    assert service.process_one()
+    archive_state = service.get("text", {"id": "one"}, "A-1")["archive"]
+    assert archive_state["status"] == "unknown"
+    assert archive_state["error_code"] == "CONVERSATION_BINDING_MISMATCH"
+    assert [method for method, _ in state.calls] == ["GET"]
+    assert state.archived is False
+
+
+def test_real_product_archive_budget_covers_two_paced_reads_and_persists_cursor_reason(
+        tmp_path, local_upstream, monkeypatch):
+    """Exercise _product_archive_parent -> physical lock -> TextTaskService."""
+    import services.account_request_pacing as pacing
+    import services.request_context as request_context
+    from services.config import config
+
+    product, lifecycle, clock, identity = product_archive_stack(tmp_path)
+    state = local_upstream
+    now = [1000.0]
+    monkeypatch.setattr(pacing.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(pacing.time, "time", lambda: now[0])
+    monkeypatch.setattr(request_context.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(pacing.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(type(config), "account_request_interval_secs", property(lambda _: 0.0))
+    monkeypatch.setattr(type(config), "account_conversation_read_interval_secs", property(lambda _: 90.0))
+    monkeypatch.setattr(type(config), "account_conversation_read_burst", property(lambda _: 1))
+
+    # The old 60-second chain can issue the precheck and PATCH but cannot
+    # obtain the second capacity-one read credit for verification.
+    with operation_deadline(now[0] + 60):
+        assert lifecycle.process_one()
+    archive = raw_product_archive(product, identity)
+    assert archive["status"] == "unknown"
+    assert [method for method, _ in state.calls] == ["GET", "PATCH"]
+    assert state.archived is True
+
+    # Re-enter the same durable archive work using its normal 240-second
+    # lifecycle budget. Preserve the original shorter-caller result above, but
+    # reset only the synthetic upstream outcome for this confirmation path.
+    state.calls.clear()
+    state.transport_attempts.clear()
+    state.archived = False
+    pacing._clocks.clear()
+    now[0] = 1000.0
+    clock.now += 3
+    assert lifecycle.process_one()
+    assert product.get(identity, "product")["state"] == "completed"
+    assert [method for method, _ in state.calls] == ["GET", "PATCH", "GET"]
+    assert now[0] >= 1090
+
+    # The exact same real ProductWork branch preserves a typed pre-PATCH
+    # cursor rejection and never sends a PATCH.
+    resumed = product.resume(identity, "product", expected_version=1)
+    assert resumed["state"] == "active"
+    assert product.close(identity, "product", results_saved=True,
+                         expected_version=resumed["version"])["state"] == "closing"
+    state.calls.clear()
+    state.archived = False
+    state.current_node = "newer"
+    clock.now += 3
+    assert lifecycle.process_one()
+    rejected = raw_product_archive(product, identity)
+    assert rejected["status"] == "unknown"
+    assert rejected["error_code"] == "CONVERSATION_BINDING_MISMATCH"
+    assert [method for method, _ in state.calls] == ["GET"]
 
 
 def test_product_multilock_timeout_releases_only_acquired_locks(local_upstream):

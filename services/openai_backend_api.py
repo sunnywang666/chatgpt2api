@@ -26,8 +26,9 @@ from PIL import Image
 from services.account_service import account_service
 from services.account_request_pacing import AccountRequestDeadlineExceeded, pace_account_session, retry_after_seconds
 from services.config import config
-from services.request_context import (observing_archive_step, operation_budget, operation_remaining,
-                                      operation_request_options, current_operation_deadline)
+from services.request_context import (ARCHIVE_OPERATION_BUDGET_SECONDS, observing_archive_step,
+                                      operation_budget, operation_remaining, operation_request_options,
+                                      current_operation_deadline)
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, is_supported_image_model, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -1826,7 +1827,7 @@ class OpenAIBackendAPI:
             raise RuntimeError("upstream conversation has no authoritative current_node")
         return parent_message_id
 
-    @operation_budget(60.0)
+    @operation_budget(ARCHIVE_OPERATION_BUDGET_SECONDS)
     def set_conversation_archived(self, conversation_id: str, parent_message_id: str, archived: bool,
                                   *, validate_document=None, _restore_precheck_document=None) -> Dict[str, Any]:
         """Change visibility only after checking the original conversation and cursor."""

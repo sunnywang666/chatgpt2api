@@ -16,7 +16,8 @@ from services.account_service import account_service
 from services.account_request_pacing import AccountReadRetryBudgetInsufficient
 from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI, explicit_final_channel
 from services.protocol.conversation import conversation_events, sanitize_output_text
-from services.request_context import bounded_lock, operation_budget, current_operation_deadline
+from services.request_context import (ARCHIVE_OPERATION_BUDGET_SECONDS, bounded_lock,
+                                      operation_budget, current_operation_deadline)
 from utils.helper import UpstreamHTTPError
 from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
 
@@ -855,7 +856,7 @@ class ConversationBindingService:
             return None
         return {"conversation_id": candidate_conversation, "message_id": candidate_message}
 
-    @operation_budget(60.0)
+    @operation_budget(ARCHIVE_OPERATION_BUDGET_SECONDS)
     def set_archived(self, body: dict[str, Any], archived: bool) -> dict[str, Any]:
         binding = body["provider_binding_id"]
         if account_service.get_bound_account_identity(binding) != body["provider_account_identity"]:
@@ -870,7 +871,7 @@ class ConversationBindingService:
                 try:
                     result = backend.set_conversation_archived(body["conversation_id"], body["parent_message_id"], archived)
                 except ConversationArchiveCursorMismatch:
-                    if body.get("_public_session_ref"):
+                    if body.get("_public_session_ref") or body.get("_product_work_key"):
                         raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH") from None
                     raise
                 return {**body, **result}
