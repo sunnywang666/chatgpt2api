@@ -11,6 +11,7 @@ from services.request_context import current_request
 from services.task_store import SendHoldConflict, SendHoldRejected, TaskStore
 from services.text_task_service import TextTaskService
 from test.test_company_requests import CONNECTOR, body, company
+from test.test_text_task_service import QueuedExecutor
 
 
 def _raw(service, owner, request_id):
@@ -121,7 +122,11 @@ def test_legacy_api_hold_then_release_drives_real_pool_claim_and_same_id_send(co
     ({"status": "running", "_claim_id": "live", "_claim_until": 9999999999, "_executing": True, "_turn_reserved": True}, "SEND_HOLD_IN_FLIGHT"),
 ])
 def test_send_hold_rejects_sent_unknown_success_or_live_claim_without_mutation(tmp_path, changes, code):
-    service = TextTaskService(tmp_path / "tasks.sqlite3")
+    # This checks the hold transaction, not an independently executing sender.
+    # Retain the accepted input without racing the real background executor.
+    queue = QueuedExecutor()
+    runner = Mock(side_effect=AssertionError("rejection fixture must not generate"))
+    service = TextTaskService(tmp_path / "tasks.sqlite3", runner=runner, executor=queue)
     service.submit("owner", {"client_request_id": "original", "client_conversation_id": "original-session", "model": "gpt-text",
                               "messages": [{"role": "user", "content": "private"}]})
     with service.store.transaction() as db:
@@ -133,6 +138,8 @@ def test_send_hold_rejects_sent_unknown_success_or_live_claim_without_mutation(t
         service.store.set_text_send_hold("owner", "original", True, expected_version=0)
     assert error.value.code == code
     assert _raw(service, "owner", "original") == before
+    runner.assert_not_called()
+    assert len(queue.calls) == 1
 
 
 def test_send_hold_cas_cannot_allow_a_late_release(tmp_path):
