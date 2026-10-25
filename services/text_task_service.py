@@ -25,6 +25,7 @@ from pathlib import Path
 from services.config import DATA_DIR
 from services.conversation_binding_service import (
     ConversationBindingError,
+    COMPLETED_SUCCESSOR_EVIDENCE_FIELD,
     NON_TEXT_RESULT_FIELD,
     OBSERVED_CONTENT_TYPES,
     RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
@@ -1137,6 +1138,30 @@ class TextTaskService:
             observation = cls._safe_result_observation(recovered.get("_original_result_observation"), receipt or {})
             if observation is not None and recovered.get("recovery_reason") == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value:
                 anchor["_original_result_observation"] = observation
+            successor_evidence = recovered.get(COMPLETED_SUCCESSOR_EVIDENCE_FIELD)
+            if successor_evidence is not None:
+                receipt = receipt or {}
+                fields = {"conversation_id", "request_message_id", "successor_request_message_id",
+                          "successor_final_message_id", "observed_at"}
+                if (status != "unknown"
+                        or recovered.get("binding_status") != "unknown"
+                        or recovered.get("recovery_reason") != TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value
+                        or not isinstance(successor_evidence, dict) or set(successor_evidence) != fields
+                        or any(not isinstance(successor_evidence.get(k), str)
+                               or not 1 <= len(successor_evidence[k]) <= 200
+                               or successor_evidence[k] != successor_evidence[k].strip()
+                               for k in fields - {"observed_at"})
+                        or len({successor_evidence[k] for k in fields - {"observed_at", "conversation_id"}}) != 3
+                        or successor_evidence["request_message_id"] != receipt.get("request_message_id")
+                        or successor_evidence["conversation_id"] != receipt.get("conversation_id")
+                        or successor_evidence["conversation_id"] != recovered.get("conversation_id")
+                        or type(successor_evidence["observed_at"]) not in {int, float}
+                        or not math.isfinite(successor_evidence["observed_at"])
+                        or successor_evidence["observed_at"] <= 0
+                        or any(not receipt.get(k) or recovered.get(k) != receipt[k]
+                               for k in ("provider_binding_id", "provider_account_identity", "client_conversation_id"))):
+                    return None, "RECOVERY_INVALID_RESULT", "read_text_result", None
+                anchor[COMPLETED_SUCCESSOR_EVIDENCE_FIELD] = dict(successor_evidence)
             scan = cls._safe_recovery_scan(recovered.get(RECOVERY_CONVERSATION_SCAN_FIELD))
             if scan is not None:
                 anchor[RECOVERY_CONVERSATION_SCAN_FIELD] = scan
@@ -1791,7 +1816,8 @@ class TextTaskService:
                 recovered_anchor = {
                     key: value for key, value in (recovered or {}).items()
                     if (
-                        key in {RECOVERY_CONVERSATION_SCAN_FIELD, TURN_END_EVIDENCE_FIELD, "_upstream_terminal", "_turn_reserved"}
+                        key in {RECOVERY_CONVERSATION_SCAN_FIELD, TURN_END_EVIDENCE_FIELD,
+                                COMPLETED_SUCCESSOR_EVIDENCE_FIELD, "_upstream_terminal", "_turn_reserved"}
                         or key == "_retry_cursor" and not current.get("_completion", {}).get("replacement_id")
                         or key == "_empty_reply_evidence" and not current.get("_completion", {}).get("replacement_id")
                         or key == RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD
@@ -1938,9 +1964,19 @@ class TextTaskService:
                 # read so the bounded same-session completion policy can
                 # use its fresh cursor after the investigation window.
                 changes["_result_last_checked_at"] = now
+            # A later observation/failure must not leave an old branch proof
+            # usable for archive. Deferred reads never reach this claim finish.
+            successor_evidence = (
+                (recovered or {}).get(COMPLETED_SUCCESSOR_EVIDENCE_FIELD)
+                if error_code == "UPSTREAM_OUTCOME_UNKNOWN"
+                and recovery_reason == TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value else None)
+            if successor_evidence is not None:
+                changes[COMPLETED_SUCCESSOR_EVIDENCE_FIELD] = successor_evidence
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}
+            if successor_evidence is None:
+                updated.pop(COMPLETED_SUCCESSOR_EVIDENCE_FIELD, None)
             if bounded_read_failure:
                 # This claim completed an exact original-result GET and could
                 # not read it. Preserve the first marker across later errors

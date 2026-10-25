@@ -41,6 +41,7 @@ class TextRecoveryReason(str, Enum):
 _ACTIVE_TEXT_RESULT_STATUSES = frozenset({"in_progress", "running", "pending", "queued"})
 NON_TEXT_RESULT_FIELD = "_non_text_result"
 TURN_END_EVIDENCE_FIELD = "_turn_end_evidence"
+COMPLETED_SUCCESSOR_EVIDENCE_FIELD = "_completed_successor_evidence"
 RESULT_OBSERVATION_FIELD = "_original_result_observation"
 OBSERVED_CONTENT_TYPES = frozenset({"text", "code", "execution_output", "thoughts", "reasoning_recap"})
 _VERIFIED_EXACT_INCOMPLETE = object()
@@ -179,6 +180,54 @@ def _request_parent_matches_receipt(
     )
 
 
+def _completed_tool_call_output(mapping, children, node_id, message):
+    """Pair a stale assistant call with its exact completed tool output."""
+    author = message.get("author")
+    role = author.get("role") if isinstance(author, dict) else None
+    content = message.get("content")
+    if not (role == "assistant" and isinstance(content, dict)
+                and content.get("content_type") == "code" and isinstance(content.get("text"), str)
+                and message.get("status") == "in_progress" and message.get("end_turn") is not True
+                and message.get("channel") in (None, "analysis")
+                and isinstance(message.get("recipient"), str) and message["recipient"].strip()
+                and message["recipient"].strip() != "all"):
+        return False
+    following = children.get(node_id, [])
+    tool_node = mapping.get(following[0]) if len(following) == 1 else None
+    tool = tool_node.get("message") if isinstance(tool_node, dict) else None
+    # The persisted view can place one assistant thought snapshot
+    # between a call and its output. It is transparent only on the
+    # same unique chain; another call, branch or terminal is not.
+    if (isinstance(tool, dict) and tool.get("id") == following[0]
+            and isinstance(tool.get("author"), dict)
+            and tool["author"].get("role") == "assistant"
+            and isinstance(tool.get("content"), dict)
+            and tool["content"].get("content_type") == "thoughts"
+            and tool.get("status") in {"in_progress", "finished_successfully"}
+            and tool.get("end_turn") is not True
+            and tool.get("channel") in (None, "analysis")
+            and tool.get("recipient") in (None, "all")):
+        following = children.get(following[0], [])
+        tool_node = mapping.get(following[0]) if len(following) == 1 else None
+        tool = tool_node.get("message") if isinstance(tool_node, dict) else None
+    # Some completed tool calls retain an active assistant code node.
+    # Require its exact, completed tool output before considering the
+    # later nonempty final. This exception never establishes empty
+    # reply evidence or permits another generation attempt.
+    return bool(
+        isinstance(tool, dict) and tool.get("id") == following[0]
+        and isinstance(tool.get("author"), dict)
+        and tool["author"].get("role") == "tool"
+        and tool["author"].get("name") == message["recipient"]
+        and tool.get("status") == "finished_successfully"
+        and isinstance(tool.get("content"), dict)
+        and tool["content"].get("content_type") == "execution_output"
+        and isinstance(tool["content"].get("text"), str)
+        and isinstance(tool.get("metadata"), dict)
+        and tool["metadata"].get("is_complete") is True
+    )
+
+
 def _completed_request_turn(mapping, children, request_message_id, conversation_id, *, allow_completed_tool_call=False,
                             allow_completed_commentary=False):
     """Positive terminal evidence for the exact original branch, even without a usable answer."""
@@ -205,47 +254,8 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
                            and content.get("content_type") in {"thoughts", "reasoning_recap"}
                            and message.get("status") == "in_progress"
                            and message.get("end_turn") is not True)
-        stale_tool_call = False
-        if (allow_completed_tool_call and role == "assistant" and isinstance(content, dict)
-                and content.get("content_type") == "code" and isinstance(content.get("text"), str)
-                and message.get("status") == "in_progress" and message.get("end_turn") is not True
-                and message.get("channel") in (None, "analysis")
-                and isinstance(message.get("recipient"), str) and message["recipient"].strip()
-                and message["recipient"].strip() != "all"):
-            following = children.get(node_id, [])
-            tool_node = mapping.get(following[0]) if len(following) == 1 else None
-            tool = tool_node.get("message") if isinstance(tool_node, dict) else None
-            # The persisted view can place one assistant thought snapshot
-            # between a call and its output. It is transparent only on the
-            # same unique chain; another call, branch or terminal is not.
-            if (isinstance(tool, dict) and tool.get("id") == following[0]
-                    and isinstance(tool.get("author"), dict)
-                    and tool["author"].get("role") == "assistant"
-                    and isinstance(tool.get("content"), dict)
-                    and tool["content"].get("content_type") == "thoughts"
-                    and tool.get("status") in {"in_progress", "finished_successfully"}
-                    and tool.get("end_turn") is not True
-                    and tool.get("channel") in (None, "analysis")
-                    and tool.get("recipient") in (None, "all")):
-                following = children.get(following[0], [])
-                tool_node = mapping.get(following[0]) if len(following) == 1 else None
-                tool = tool_node.get("message") if isinstance(tool_node, dict) else None
-            # Some completed tool calls retain an active assistant code node.
-            # Require its exact, completed tool output before considering the
-            # later nonempty final. This exception never establishes empty
-            # reply evidence or permits another generation attempt.
-            stale_tool_call = bool(
-                isinstance(tool, dict) and tool.get("id") == following[0]
-                and isinstance(tool.get("author"), dict)
-                and tool["author"].get("role") == "tool"
-                and tool["author"].get("name") == message["recipient"]
-                and tool.get("status") == "finished_successfully"
-                and isinstance(tool.get("content"), dict)
-                and tool["content"].get("content_type") == "execution_output"
-                and isinstance(tool["content"].get("text"), str)
-                and isinstance(tool.get("metadata"), dict)
-                and tool["metadata"].get("is_complete") is True
-            )
+        stale_tool_call = (allow_completed_tool_call
+                           and _completed_tool_call_output(mapping, children, node_id, message))
         if (role not in {"assistant", "tool"}
                 or message.get("status") != "finished_successfully" and not (stale_reasoning or stale_tool_call)):
             return None
@@ -266,7 +276,8 @@ def _completed_request_turn(mapping, children, request_message_id, conversation_
                     "final_message_id": node_id, "observed_at": time.time()}
 
 
-def _completed_external_successor(mapping, children, request_message_id, current_node, conversation_id):
+def _completed_external_successor(mapping, children, request_message_id, current_node, conversation_id,
+                                  *, with_evidence=False):
     """A later user turn completed on the same unambiguous current chain.
 
     This is diagnostic evidence only: it neither ends the original turn nor
@@ -275,6 +286,7 @@ def _completed_external_successor(mapping, children, request_message_id, current
     if not isinstance(current_node, str):
         return False
     node_id, seen, later_user = current_node, set(), None
+    later_users, active_tool = [], False
     while node_id != request_message_id:
         if not node_id or node_id in seen or len(seen) >= 128:
             return False
@@ -289,14 +301,32 @@ def _completed_external_successor(mapping, children, request_message_id, current
             return False
         if role == "user" and later_user is None:
             later_user = node_id
+        if role == "user":
+            later_users.append(node_id)
+        if role == "tool" and message.get("status") != "finished_successfully":
+            active_tool = True
+        if (role == "assistant" and message.get("status") != "finished_successfully"
+                and message.get("recipient") not in (None, "all")
+                and not _completed_tool_call_output(mapping, children, node_id, message)):
+            active_tool = True
         parent = node.get("parent")
         if not isinstance(parent, str) or children.get(parent) != [node_id]:
             return False
         node_id = parent
     if not later_user:
         return False
-    ended = _completed_request_turn(mapping, children, later_user, conversation_id)
-    return bool(ended and ended["final_message_id"] == current_node)
+    ended = _completed_request_turn(mapping, children, later_user, conversation_id,
+                                    allow_completed_tool_call=True)
+    completed = bool(ended and ended["final_message_id"] == current_node)
+    if not with_evidence:
+        return completed
+    # This proves which later turn was observed, not that the old turn ended.
+    # Lifecycle may only use it after matching an owned, frozen successor.
+    if not completed or len(later_users) != 1 or active_tool or children.get(current_node):
+        return None
+    return {"conversation_id": conversation_id, "request_message_id": request_message_id,
+            "successor_request_message_id": later_user, "successor_final_message_id": current_node,
+            "observed_at": ended["observed_at"]}
 
 
 def _empty_reply_evidence(mapping, children, request_message_id, conversation_id, current_node):
@@ -1812,6 +1842,10 @@ class ConversationBindingService:
                 "status": "running" if active_result_seen and not advanced else "unknown",
                 "recovery_reason": recovery_reason,
                 "_retry_cursor": continuation,
+                **({COMPLETED_SUCCESSOR_EVIDENCE_FIELD: successor_evidence}
+                   if advanced and (successor_evidence := _completed_external_successor(
+                       mapping, children, request_message_id, document.get("current_node"), conversation_id,
+                       with_evidence=True)) else {}),
                 **({RESULT_OBSERVATION_FIELD: observation} if active_result_seen
                    and (observation := _result_observation(mapping, children, request_message_id, conversation_id,
                                                           document.get("current_node"))) else {}),

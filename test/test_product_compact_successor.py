@@ -55,6 +55,214 @@ def ended_original(h, monkeypatch):
     return original
 
 
+def advanced_to_own_successor(h, monkeypatch):
+    """Persist the original reader's exact, redacted local-branch proof."""
+    original, _successor = compact(h, True)
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        successor = h.service.store.read_receipt(db, "text", "owner", "successor")
+        # Preserve the explicit legacy boundary observed on the real receipt;
+        # recovery must carry it through without a post-read repair.
+        original["upstream_unfinished"] = False
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+        # The fixture runner normally returns only the final cursor. Model the
+        # bound send/read path's persisted child-user parent before reading it.
+        successor["request_parent_message_id"] = "active"
+        h.service.store.write_receipt(db, "text", "owner", "successor", successor)
+    document = deepcopy(h.document)
+    active = document["mapping"]["active"]
+    active["children"] = [successor["request_message_id"]]
+    document["mapping"][successor["request_message_id"]] = {
+        "parent": "active", "children": [successor["parent_message_id"]], "message": {
+            "id": successor["request_message_id"], "author": {"role": "user"},
+            "status": "finished_successfully", "end_turn": True,
+            "content": {"content_type": "text", "parts": ["compact child"]},
+        },
+    }
+    document["mapping"][successor["parent_message_id"]] = {
+        "parent": successor["request_message_id"], "children": [], "message": {
+            "id": successor["parent_message_id"], "author": {"role": "assistant"},
+            "status": "finished_successfully", "end_turn": True, "channel": "final",
+            "content": {"content_type": "text", "parts": [successor["content"]]},
+        },
+    }
+    document["current_node"] = successor["parent_message_id"]
+    monkeypatch.setattr("services.conversation_binding_service.time.time", h.clock)
+    child_read = ConversationBindingService._read_text_request_result(None, successor, document=document)
+    assert child_read["status"] == "succeeded" and child_read["content"] == successor["content"]
+    assert child_read["_turn_end_evidence"]["final_message_id"] == successor["parent_message_id"]
+    with h.service.store.transaction() as db:
+        successor = h.service.store.read_receipt(db, "text", "owner", "successor")
+        successor["_turn_end_evidence"] = child_read["_turn_end_evidence"]
+        h.service.store.write_receipt(db, "text", "owner", "successor", successor)
+    h.service.recovery_reader = lambda receipt: ConversationBindingService._read_text_request_result(
+        None, receipt, document=document)
+    h.service.recover("owner", "old")
+    original = row(h.service)
+    assert original["upstream_unfinished"] is False
+    assert original["status"] == "unknown"
+    assert original["recovery_reason"] == "REQUEST_CONVERSATION_ADVANCED"
+    assert original["_completed_successor_evidence"] == {
+        "conversation_id": original["conversation_id"],
+        "request_message_id": original["request_message_id"],
+        "successor_request_message_id": successor["request_message_id"],
+        "successor_final_message_id": successor["parent_message_id"],
+        "observed_at": h.clock(),
+    }
+    return original, row(h.service, "successor")
+
+
+def add_finished_gallery(h):
+    """Attach an already-finished earlier product step on the same Chat."""
+    original = row(h.service)
+    body = h.service.store.load_input(original["_input_ref"])
+    body.update(client_request_id="gallery", product_work={"product_ref": "fixture-product", "step_ref": "gallery"})
+    h.service.submit("owner", body, source="internal:content")
+    with h.service.store.transaction() as db:
+        gallery = h.service.store.read_receipt(db, "text", "owner", "gallery")
+        old = h.service.store.read_receipt(db, "text", "owner", "old")
+        successor = h.service.store.read_receipt(db, "text", "owner", "successor")
+        gallery.update(status="succeeded", upstream_outcome="completed", content="saved gallery review",
+                       _upstream_terminal=True, _executing=False, _turn_reserved=False,
+                       _claim_id=None, _claim_until=None, _sequence=4746)
+        old["_sequence"] = 5945
+        successor["_sequence"] = 7122
+        h.service.store.write_receipt(db, "text", "owner", "gallery", gallery)
+        h.service.store.write_receipt(db, "text", "owner", "old", old)
+        h.service.store.write_receipt(db, "text", "owner", "successor", successor)
+    return row(h.service, "gallery")
+
+
+def add_later_product_member(h, request_id="later"):
+    """Attach a deliberately later same-conversation member without supersession."""
+    original = row(h.service)
+    body = h.service.store.load_input(original["_input_ref"])
+    body.update(client_request_id=request_id, product_work={"product_ref": "fixture-product", "step_ref": request_id})
+    h.service.submit("owner", body, source="internal:content")
+    with h.service.store.transaction() as db:
+        later = h.service.store.read_receipt(db, "text", "owner", request_id)
+        successor = h.service.store.read_receipt(db, "text", "owner", "successor")
+        later.update(status="succeeded", upstream_outcome="completed", content="later result",
+                     _upstream_terminal=True, _executing=False, _turn_reserved=False,
+                     _claim_id=None, _claim_until=None, _sequence=successor["_sequence"] + 1)
+        h.service.store.write_receipt(db, "text", "owner", request_id, later)
+    return row(h.service, request_id)
+
+
+def test_incomplete_advanced_own_successor_closes_archives_and_resumes(product_no_final, monkeypatch):
+    h = product_no_final
+    original, successor = advanced_to_own_successor(h, monkeypatch)
+    gallery = add_finished_gallery(h)
+    original = row(h.service)
+    successor = row(h.service, "successor")
+    assert gallery["_sequence"] < original["_sequence"] < successor["_sequence"]
+    product, lifecycle, calls, identity = product_lifecycle(h)
+
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    assert lifecycle.process_one()
+    assert product.get(identity, "fixture-product")["state"] == "completed"
+    assert calls == [("owner", "successor", True)]
+    # The branch proof only waives ProductWork close; it never rewrites the
+    # original's UNKNOWN/ADVANCED lifecycle or turns it terminal.
+    assert row(h.service) == original
+    assert row(h.service)["recovery_reason"] == "REQUEST_CONVERSATION_ADVANCED"
+    assert "_upstream_terminal" not in row(h.service)
+    restarted = ProductWorkService(lifecycle.text, lifecycle.images, clock=h.clock)
+    assert restarted.resume(identity, "fixture-product", 1)["state"] == "active"
+    assert row(h.service, "successor")["_turn_end_evidence"] == successor["_turn_end_evidence"]
+
+
+@pytest.mark.parametrize("drift", [
+    "no_proof", "wrong_child", "wrong_final", "input_hash", "original_hash", "product", "step",
+    "sibling", "late_member", "foreign_same_conversation", "live_claim", "paused", "unfinished_gallery",
+    "unfinished_boundary_missing", "unfinished_boundary_true",
+])
+def test_incomplete_advanced_close_rejects_unowned_or_changed_branch(product_no_final, monkeypatch, drift):
+    h = product_no_final
+    advanced_to_own_successor(h, monkeypatch)
+    if drift == "unfinished_gallery":
+        add_finished_gallery(h)
+    elif drift == "late_member":
+        add_later_product_member(h)
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        successor = h.service.store.read_receipt(db, "text", "owner", "successor")
+        if drift == "no_proof":
+            original.pop("_completed_successor_evidence")
+        elif drift == "unfinished_boundary_missing":
+            original.pop("upstream_unfinished")
+        elif drift == "unfinished_boundary_true":
+            original["upstream_unfinished"] = True
+        elif drift == "wrong_child":
+            original["_completed_successor_evidence"]["successor_request_message_id"] = "external-user"
+        elif drift == "wrong_final":
+            original["_completed_successor_evidence"]["successor_final_message_id"] = "external-final"
+        elif drift in {"input_hash", "original_hash"}:
+            db.execute("UPDATE requests SET request_hash='wrong' WHERE owner='owner' AND id=?",
+                       ("old" if drift == "original_hash" else "successor",))
+        elif drift == "product":
+            successor["_product_work_key"] = "wrong-product"
+        elif drift == "step":
+            successor["_product_work"] = {**successor["_product_work"], "step_ref": "other-step"}
+        elif drift == "sibling":
+            duplicate = {**successor, "request_id": drift}
+            duplicate["_supersedes_request_id"] = "old"
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("owner", drift, "different", json.dumps(duplicate)))
+        elif drift == "foreign_same_conversation":
+            foreign = {**successor, "request_id": "successor"}
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("other-owner", "successor", "different", json.dumps(foreign)))
+        elif drift == "live_claim":
+            successor.update(recovery_claim_id="live-reader", recovery_lease_until=h.clock()+60)
+        elif drift == "unfinished_gallery":
+            gallery = h.service.store.read_receipt(db, "text", "owner", "gallery")
+            gallery.update(status="unknown", upstream_outcome="unknown", upstream_unfinished=True,
+                           _upstream_terminal=False)
+            h.service.store.write_receipt(db, "text", "owner", "gallery", gallery)
+        else:
+            original["_recovery_paused"] = True
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+        h.service.store.write_receipt(db, "text", "owner", "successor", successor)
+    product, _, calls, identity = product_lifecycle(h)
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_"):
+        product.close(identity, "fixture-product", results_saved=True)
+    assert calls == []
+
+
+def test_incomplete_advanced_archive_rechecks_original_branch_proof(product_no_final, monkeypatch):
+    h = product_no_final
+    advanced_to_own_successor(h, monkeypatch)
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        original["_completed_successor_evidence"]["successor_final_message_id"] = "changed-final"
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+    assert not lifecycle.process_one()
+    assert calls == []
+    assert product.get(identity, "fixture-product")["state"] == "closing"
+
+
+def test_incomplete_advanced_archive_rejects_later_same_product_member(product_no_final, monkeypatch):
+    h = product_no_final
+    original, _successor = advanced_to_own_successor(h, monkeypatch)
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    with h.service.store.transaction() as db:
+        parent = h.service.store.runtime(db, original["_product_work_key"])
+        successor = h.service.store.read_receipt(db, "text", "owner", "successor")
+        later = {**successor, "request_id": "post-close-later", "_sequence": successor["_sequence"] + 1,
+                 "_supersedes_request_id": None,
+                 "_product_work": {"product_ref": "fixture-product", "step_ref": "post-close-later"}}
+        parent["members"].append({"kind": "text", "owner": "owner", "request_id": "post-close-later",
+                                  "step_ref": "post-close-later"})
+        h.service.store.set_runtime(db, parent["key"], parent)
+        db.execute("INSERT INTO requests VALUES(?,?,?,?)",
+                   ("owner", "post-close-later", "different", json.dumps(later)))
+    assert not lifecycle.process_one()
+    assert calls == []
+    assert product.get(identity, "fixture-product")["state"] == "closing"
+
+
 @pytest.mark.parametrize("incomplete", [False, True])
 @pytest.mark.parametrize("product_no_final", [None, {
     "organization_id": "company", "subject_id": "alice", "root_workflow_id": "root-a",
