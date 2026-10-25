@@ -42,7 +42,7 @@ from services.conversation_binding_service import (
 )
 
 
-from services.task_store import TaskStore, recovery_control
+from services.task_store import TaskStore, recovery_control, send_hold_control
 from services.request_context import current_request, AdmissionLost
 from services.account_service import account_service
 from utils.upstream_error import safe_upstream_response_ids
@@ -560,6 +560,7 @@ class TextTaskService:
             result["no_final_guard"] = no_final_guard
         result.pop("execution", None)
         result["recovery_control"] = recovery_control(receipt)
+        result["send_hold"] = send_hold_control(receipt)
         if receipt.get("_product_work"):
             result["product_work"] = {"protocol": "product-work-v1", **receipt["_product_work"]}
         if receipt.get("_codex_origin_request_id"):
@@ -5120,6 +5121,8 @@ class TextTaskService:
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()
             receipt = json.loads(row[0])
             claim = body.get("_admission_claim")
+            if receipt.get("_send_hold") is True:
+                return
             if claim:
                 if receipt.get("_claim_id") != claim or receipt["status"] != "running":
                     return

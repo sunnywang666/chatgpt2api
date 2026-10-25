@@ -1792,6 +1792,8 @@ class PoolAdmission:
             fair_subgroup = fair_group if product_fair_source is not None else None
             if product_fair_source is not None:
                 fair_group = product_fair_root
+            if r.get("_send_hold") is True:
+                continue
             requests.append(WaitingRequest(
                 RequestRef(owner, kind, request_id), product_fair_source or r.get("_source") or "key:" + owner,
                 continuation_sequences.get((owner, request_id), int(r.get("_sequence") or 0)),
@@ -2166,6 +2168,8 @@ class PoolAdmission:
         works, _ = workflow_scheduling.state_snapshot(self.store, db)
         parents = product_work.state_snapshot(self.store, db)
         for item in self.store.receipts(db, statuses=statuses):
+            if item[3].get("_send_hold") is True:
+                continue
             work = works.get(item[3].get("_work_key")) or {}
             parent = parents.get(item[3].get("_product_work_key")) or {}
             if work.get("state", "active") == "active" and parent.get("state", "active") in {"queued", "active"}:
@@ -2475,6 +2479,8 @@ class PoolAdmission:
             r = self.store.read_receipt(db, ref.kind, ref.owner, ref.request_id)
             if r.get("status") != "queued" or not r.get("_input_ref"):
                 return None
+            if r.get("_send_hold") is True:
+                return None
             if ref.kind == "text":
                 # A stale queue status never reopens a model POST after its
                 # durable send fence. Preserve the original as UNKNOWN for
@@ -2757,6 +2763,8 @@ class PoolAdmission:
             if (r is None or r.get("_claim_id") != context.claim or r.get("status") != "running"
                     or float(r.get("_claim_until") or 0) <= now):
                 raise AdmissionLost("original task claim expired")
+            if r.get("_send_hold") is True:
+                raise AdmissionLost("original task send hold is active")
             from services.generation_completion import replacement_send_allowed
             if not replacement_send_allowed(self.store, db, context.kind, context.owner, context.request_id, r):
                 raise AdmissionLost("completion original changed before send")

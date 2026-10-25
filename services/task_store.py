@@ -42,6 +42,74 @@ def recovery_control(receipt):
             "version": version if type(version) is int and version >= 0 else None}
 
 
+_SEND_EVIDENCE_STAGES = frozenset({
+    "send_guard_passed", "send_call_started", "response_headers_received", "first_output", "task_finished",
+    "stream_finished", "stream_handoff", "artifact_saved", "upstream_terminal",
+})
+
+
+def send_hold_control(receipt):
+    """Public projection of a narrow, pre-send-only operator hold."""
+    version = receipt.get("_send_hold_version", 0)
+    expired = receipt.get("error_code") == "WAIT_DEADLINE_EXCEEDED"
+    return {
+        "state": "expired" if expired else "held" if receipt.get("_send_hold") is True else "active",
+        "version": version if type(version) is int and version >= 0 else None,
+    }
+
+
+class SendHoldConflict(Exception):
+    def __init__(self, control):
+        super().__init__("Send hold changed; no update was applied")
+        self.control = control
+
+
+class SendHoldRejected(Exception):
+    def __init__(self, code, control):
+        super().__init__(code)
+        self.code = code
+        self.control = control
+
+
+def _has_send_evidence(receipt):
+    timeline = receipt.get("_execution_timeline")
+    nonzero_or_invalid = lambda value: value is not None and (type(value) is not int or value != 0)
+    return bool(
+        receipt.get("_submission_started") is True
+        or receipt.get("_last_sent_sequence") is not None
+        or nonzero_or_invalid(receipt.get("_send_sequence"))
+        or nonzero_or_invalid(receipt.get("send_count"))
+        or receipt.get("upstream_submission_started") is True
+        or receipt.get("upstream_outcome") not in (None, "not_sent", "not_submitted")
+        or receipt.get("upstream_unfinished") is True
+        or any(receipt.get(field) is not None for field in ("content", "result", "data"))
+        or isinstance(timeline, list) and any(
+            isinstance(item, dict) and item.get("stage") in _SEND_EVIDENCE_STAGES for item in timeline
+        )
+    )
+
+
+def _send_hold_eligible(receipt):
+    """A deliberately strict proof that this original has not crossed send."""
+    timeline = receipt.get("_execution_timeline")
+    return bool(
+        receipt.get("_route", "chat") == "chat"
+        and receipt.get("_operation", "text") == "text"
+        and not receipt.get("_forward_protocol") and not receipt.get("_forward")
+        and receipt.get("status") in {"queued", "not_started"}
+        and isinstance(receipt.get("_input_ref"), str) and bool(receipt["_input_ref"])
+        and receipt.get("_submission_started") is False
+        and receipt.get("_turn_reserved") is False
+        and receipt.get("_executing") is not True
+        and receipt.get("_claim_id") is None and receipt.get("_claim_until") in (None, 0)
+        and receipt.get("recovery_claim_id") is None and receipt.get("_recovery_claim_id") is None
+        and receipt.get("recovery_lease_until") is None and receipt.get("_recovery_claim_until") is None
+        and receipt.get("error_code") is None
+        and isinstance(timeline, list) and all(isinstance(item, dict) for item in timeline)
+        and not _has_send_evidence(receipt)
+    )
+
+
 class RecoveryControlConflict(Exception):
     def __init__(self, control):
         super().__init__("Recovery control changed; no update was applied")
@@ -96,6 +164,40 @@ class TaskStore:
             receipt["_recovery_control_version"] = version + 1
             self.write_receipt(db, kind, owner, request_id, receipt)
             return recovery_control(receipt)
+
+    def set_text_send_hold(self, owner, request_id, held, expected_version):
+        """Atomically hold/release one exact original before its first send."""
+        with self.transaction() as db:
+            receipt = self.read_receipt(db, "text", owner, request_id)
+            if receipt is None:
+                return None
+            control = send_hold_control(receipt)
+            version = control["version"]
+            if (version is None or type(expected_version) is not int
+                    or expected_version != version):
+                raise SendHoldConflict(control)
+            if control["state"] == "expired":
+                raise SendHoldRejected("SEND_HOLD_WAIT_DEADLINE_EXCEEDED", control)
+            if not _send_hold_eligible(receipt):
+                if (receipt.get("status") == "running" or receipt.get("_claim_id") is not None
+                        or receipt.get("_executing") is True or receipt.get("_turn_reserved") is True):
+                    code = "SEND_HOLD_IN_FLIGHT"
+                elif _has_send_evidence(receipt) or receipt.get("status") in {"unknown", "succeeded"}:
+                    code = "SEND_HOLD_ALREADY_SUBMITTED"
+                else:
+                    code = "SEND_HOLD_NOT_ELIGIBLE"
+                raise SendHoldRejected(code, control)
+            deadline = (receipt.get("_scheduling") or {}).get("wait_deadline")
+            if deadline:
+                from services.workflow_scheduling import timestamp
+                if time.time() >= timestamp(deadline):
+                    raise SendHoldRejected("SEND_HOLD_WAIT_DEADLINE_EXCEEDED", {**control, "state": "expired"})
+            if receipt.get("_send_hold") is not held:
+                receipt["_send_hold"] = held
+                receipt["_send_hold_updated_at"] = time.time()
+            receipt["_send_hold_version"] = version + 1
+            self.write_receipt(db, "text", owner, request_id, receipt)
+            return send_hold_control(receipt)
 
     def __init__(self, path: Path):
         self.path = Path(path)
