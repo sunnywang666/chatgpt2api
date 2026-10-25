@@ -10,6 +10,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from services.text_task_service import TextTaskService
+from services.pool_admission import (original_turn_ended,
+                                     _verified_saved_incomplete_successor_parents)
 from test.test_pool_admission import build, Clock
 from test.test_text_task_service import QueuedExecutor
 
@@ -1028,6 +1030,93 @@ def test_sent_compact_leaf_keeps_current_read_priority_and_preserves_three_to_on
     # The verified sent child is P0 despite its capacity-release observation.
     # Three P0 reads (including that child) still give released history a turn.
     assert admitted[:4] == [child_id, "contributor-0", "contributor-1", parent_id]
+
+
+def test_saved_compact_child_prioritizes_only_its_unfinished_original_read(recovery):
+    """A saved compact result expedites its old original read, not closure."""
+    r = recovery
+    parent_id, child_id = compact_incomplete_leaf(r)
+    product = {"product_ref": "fixture-product", "step_ref": "content.copy"}
+    for request_id in (parent_id, child_id):
+        r.text._update("owner", request_id, _product_work_key="work:fixture-product",
+                       _product_work=product)
+    r.text._update("owner", child_id, status="succeeded", upstream_outcome="completed",
+                   content="saved compact copy", _turn_reserved=False, _executing=False,
+                   recovery_claim_id=None, recovery_claimed_at=None, recovery_lease_until=None)
+    with r.store.connect() as db:
+        rows = [(owner, rid, digest, json.loads(raw)) for owner, rid, digest, raw in
+                db.execute("SELECT owner,id,request_hash,receipt FROM requests")]
+    assert ("owner", parent_id) in _verified_saved_incomplete_successor_parents(rows)
+    for index in range(2):
+        r.original(f"contributor-{index}")
+        r.text._update("owner", f"contributor-{index}", recovery_next_at=index + 1)
+
+    admitted = []
+    r.admission.recoveries["text"] = lambda *_: None
+    with patch.object(r.admission, "_dispatch_original_read",
+                      side_effect=lambda kind, owner, request_id, function, receipt:
+                      admitted.append(request_id) or True):
+        r.admission.recover_one(background=True)
+
+    assert admitted[0] == parent_id
+    with r.store.connect() as db:
+        parent = r.store.read_receipt(db, "text", "owner", parent_id)
+    assert parent["status"] == "unknown"
+    assert not original_turn_ended("text", parent)
+
+
+@pytest.mark.parametrize("invalid", [
+    "empty", "claim", "completion", "wrong-product-key", "wrong-product-step",
+    "hash", "audit-hash", "wrong-binding", "sibling",
+])
+def test_saved_compact_child_without_strict_chain_stays_released_history(recovery, invalid):
+    r = recovery
+    parent_id, child_id = compact_incomplete_leaf(r)
+    product = {"product_ref": "fixture-product", "step_ref": "content.copy"}
+    for request_id in (parent_id, child_id):
+        r.text._update("owner", request_id, _product_work_key="work:fixture-product",
+                       _product_work=product)
+    changes = {"status": "succeeded", "upstream_outcome": "completed",
+               "content": "saved compact copy", "_turn_reserved": False, "_executing": False,
+               "recovery_claim_id": None, "recovery_claimed_at": None, "recovery_lease_until": None}
+    if invalid == "empty":
+        changes["content"] = ""
+    elif invalid == "claim":
+        changes["_claim_id"] = "still-live"
+        changes["_claim_until"] = r.clock() + 30
+    elif invalid == "completion":
+        changes["_completion"] = {"state": "checking_original"}
+    elif invalid == "wrong-product-key":
+        changes["_product_work_key"] = "work:other-product"
+    elif invalid == "wrong-product-step":
+        changes["_product_work"] = {"product_ref": "fixture-product", "step_ref": "other.copy"}
+    elif invalid == "hash":
+        changes["_supersedes_input_hash"] = "wrong-hash"
+    elif invalid == "audit-hash":
+        changes["_derived_input"] = {"kind": "combined_copy_compact_v1",
+                                      "original_input_hash": "wrong-hash"}
+    elif invalid == "wrong-binding":
+        changes["provider_binding_id"] = "other-binding"
+    elif invalid == "sibling":
+        r.original("saved-sibling", 0, "compact-conversation")
+        r.text._update("owner", "saved-sibling", _supersedes_request_id=parent_id,
+                       status="succeeded", upstream_outcome="completed", content="other saved copy")
+    r.text._update("owner", child_id, **changes)
+    with r.store.connect() as db:
+        rows = [(owner, rid, digest, json.loads(raw)) for owner, rid, digest, raw in
+                db.execute("SELECT owner,id,request_hash,receipt FROM requests")]
+    assert ("owner", parent_id) not in _verified_saved_incomplete_successor_parents(rows)
+    r.original("ordinary-contributor")
+    r.text._update("owner", "ordinary-contributor", recovery_next_at=1)
+
+    admitted = []
+    r.admission.recoveries["text"] = lambda *_: None
+    with patch.object(r.admission, "_dispatch_original_read",
+                      side_effect=lambda kind, owner, request_id, function, receipt:
+                      admitted.append(request_id) or True):
+        r.admission.recover_one(background=True)
+
+    assert admitted[0] == "ordinary-contributor"
 
 
 @pytest.mark.parametrize("invalid", [

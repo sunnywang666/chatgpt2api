@@ -61,8 +61,8 @@ _SAFE_STREAM_HANDOFF_STAGES = frozenset({
 _EXPIRED_UNSENT_BEFORE_SEND = object()
 
 
-def _verified_current_incomplete_leaves(text_rows):
-    """Return sent compact-successor leaves safe to keep in the contributor lane.
+def _verified_incomplete_compact_links(text_rows):
+    """Return immutable direct parent/child compact links from one snapshot.
 
     This is intentionally a receipt-snapshot check, not the full supersede
     validator.  Original-result reads must remain available after the child
@@ -84,12 +84,11 @@ def _verified_current_incomplete_leaves(text_rows):
             if isinstance(parent_id, str) and parent_id:
                 descendants.setdefault((owner, parent_id), set()).add(request_id)
 
-    verified = set()
+    verified = []
     for (owner, request_id), successor in receipts.items():
         parent_id = successor.get("_supersedes_request_id")
         audit = successor.get("_derived_input")
-        if (not TextTaskService._normal_sent_chat_result_recovery(successor)
-                or successor.get("_supersedes_incomplete") is not True
+        if (successor.get("_supersedes_incomplete") is not True
                 or successor.get("_supersedes_no_final") is True
                 or not isinstance(parent_id, str) or not parent_id
                 or not isinstance(audit, dict)
@@ -114,7 +113,50 @@ def _verified_current_incomplete_leaves(text_rows):
                 or descendants.get(parent_key) != {request_id}
                 or descendants.get((owner, request_id))):
             continue
-        verified.add((owner, request_id))
+        verified.append((owner, parent_id, parent, successor))
+    return tuple(verified)
+
+
+def _verified_current_incomplete_leaves(text_rows):
+    """Return sent compact-successor leaves safe to keep in the contributor lane."""
+    from services.text_task_service import TextTaskService
+
+    return frozenset(
+        (owner, successor["request_id"])
+        for owner, _parent_id, _parent, successor in _verified_incomplete_compact_links(text_rows)
+        if TextTaskService._normal_sent_chat_result_recovery(successor)
+    )
+
+
+def _verified_saved_incomplete_successor_parents(text_rows):
+    """Return old originals whose one saved compact child needs an exact final read.
+
+    This only changes recovery scheduling priority.  A saved child is never
+    treated as a terminal result for its old request or as a product close
+    waiver; the old request remains subject to its normal exact-result reader.
+    """
+    controls = ("_executing", "_turn_reserved", "recovery_claim_id", "_recovery_claim_id",
+                "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of",
+                "upstream_unfinished")
+    leases = ("_claim_id", "_claim_until", "recovery_claimed_at", "recovery_lease_until",
+              "_recovery_claim_id", "_recovery_claim_until")
+    verified = set()
+    for owner, parent_id, parent, successor in _verified_incomplete_compact_links(text_rows):
+        product_key = parent.get("_product_work_key")
+        product_step = parent.get("_product_work")
+        if (successor.get("status") != "succeeded"
+                or successor.get("upstream_outcome") != "completed"
+                or not isinstance(successor.get("content"), str) or not successor["content"].strip()
+                or any(successor.get(key) for key in controls)
+                or any(successor.get(key) is not None for key in leases)
+                or not isinstance(product_key, str) or not product_key
+                or successor.get("_product_work_key") != product_key
+                or not isinstance(product_step, dict)
+                or not all(isinstance(product_step.get(key), str) and product_step[key]
+                           for key in ("product_ref", "step_ref"))
+                or successor.get("_product_work") != product_step):
+            continue
+        verified.add((owner, parent_id))
     return frozenset(verified)
 
 
@@ -1093,6 +1135,7 @@ class PoolAdmission:
                          for owner, request_id, request_hash, raw in db.execute(
                              "SELECT owner,id,request_hash,receipt FROM requests")]
             verified_current_incomplete_leaves = _verified_current_incomplete_leaves(text_rows)
+            verified_saved_incomplete_successor_parents = _verified_saved_incomplete_successor_parents(text_rows)
             text_receipts = [("text", owner, request_id, receipt)
                              for owner, request_id, _request_hash, receipt in text_rows]
             image_receipts = [("image", receipt["owner_id"], receipt["id"], receipt)
@@ -1150,12 +1193,14 @@ class PoolAdmission:
         if background:
             self._dispatch_recovery_candidates(
                 candidates.values(), transferred_empty_turns, now,
-                verified_current_incomplete_leaves=verified_current_incomplete_leaves)
+                verified_current_incomplete_leaves=verified_current_incomplete_leaves,
+                verified_saved_incomplete_successor_parents=verified_saved_incomplete_successor_parents)
         if not background and lifecycle is not None:
             lifecycle.process_one(background=True)
 
     def _dispatch_recovery_candidates(self, candidates, transferred_empty_turns, now,
-                                      *, verified_current_incomplete_leaves=frozenset()):
+                                      *, verified_current_incomplete_leaves=frozenset(),
+                                      verified_saved_incomplete_successor_parents=frozenset()):
         from services.text_task_service import TextTaskService
 
         def recovery_priority(candidate):
@@ -1185,7 +1230,9 @@ class PoolAdmission:
             return 0 if (active and (owner, request_id) not in transferred_empty_turns
                          and not original_turn_ended(kind, receipt)
                          and not wait_ended and not released
-                         and (not stalled or (owner, request_id) in verified_current_incomplete_leaves)) else 1
+                         and (not stalled
+                              or (owner, request_id) in verified_current_incomplete_leaves
+                              or (owner, request_id) in verified_saved_incomplete_successor_parents)) else 1
 
         by_account = {}
         for candidate in sorted(candidates, key=lambda candidate: candidate[-1]):
