@@ -130,8 +130,12 @@ def test_unknown_callback_does_not_correct_unsent_or_nonordinary_text(tmp_path, 
     assert saved["upstream_outcome"] == "not_sent"
 
 
-def test_sent_unknown_history_with_stale_not_sent_releases_only_account_capacity(tmp_path):
+@pytest.mark.parametrize("reads", [0, 2, 3])
+def test_sent_unknown_history_with_stale_not_sent_releases_only_account_capacity(tmp_path, reads):
     service, admission, backend, original = historical_stalled_not_sent(tmp_path)
+    # Capacity uses the qualified observation window; successor creation keeps
+    # its separate unchanged-read requirement.
+    update_receipt(service, _result_no_progress_reads=reads)
     saved = receipt(service)
 
     assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved, admission.clock.now)
@@ -147,7 +151,7 @@ def test_sent_unknown_history_with_stale_not_sent_releases_only_account_capacity
 
 
 @pytest.mark.parametrize("case, changes", [
-    ("missing_stall_evidence", {"_result_no_progress_reads": 2}),
+    ("missing_stall_evidence", {"_result_no_progress_reads": None}),
     ("incomplete_recovery_lease", {"recovery_claim_id": "active", "recovery_lease_until": 999999}),
     ("truly_unsent", {"_submission_started": False}),
     ("missing_unknown_error", {"error_code": "RESULT_UNRECOVERABLE"}),

@@ -1625,7 +1625,14 @@ class PoolAdmission:
             if turn_active and not resource:
                 unknown_unbound = True
             route = r.get("_route", "chat")
-            if resource and turn_active and (unknown or r.get("_turn_reserved", True)):
+            # Closing a text POST stream releases its transport reservation
+            # before the runner persists success/UNKNOWN. Keep the submitted
+            # turn counted through that gap; otherwise another claim can send
+            # and the later UNKNOWN transition restores an extra occupied slot.
+            text_result_pending = (kind == "text" and route == "chat"
+                                   and r.get("_operation", "text") == "text"
+                                   and r.get("_submission_started") is True)
+            if resource and turn_active and (unknown or r.get("_turn_reserved", True) or text_result_pending):
                 key = route + "_turn:" + resource
                 occupied[key] = occupied.get(key, 0) + 1
                 if (kind == "text" and route == "chat" and r.get("_operation") != "image"
