@@ -1,4 +1,5 @@
 import base64
+import copy
 import json
 import math
 import mimetypes
@@ -173,6 +174,9 @@ class _StreamHandoff:
     _parents: dict[str, str] = field(default_factory=dict)
     _conflicted_parent_ids: set[str] = field(default_factory=set)
     _message_phases: dict[str, tuple[bool | None, bool | None]] = field(default_factory=dict)
+    # Patches address the current message, never the last assistant in a
+    # conversation. Keep one bounded snapshot, not a second conversation cache.
+    _message_frame: dict[str, Any] = field(default_factory=dict)
     # Kept only on this backend instance.  It is deliberately not recorded in
     # diagnostics or a receipt: ConversationBindingService may use it only
     # while it is still assembling this exact stream.
@@ -197,7 +201,107 @@ class _StreamHandoff:
     @staticmethod
     def _frame(event: dict[str, Any]) -> dict[str, Any]:
         value = event.get("v")
-        return value if isinstance(value, dict) and isinstance(value.get("message"), dict) else event
+        return value if isinstance(value, dict) and "message" in value else event
+
+    def _assembled_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Assemble supported sparse updates before testing terminal evidence.
+
+        A message ID switch discards the old body/author/phase. ID-less path
+        operations require an established current message in this same stream;
+        unsupported message operations discard that context rather than letting
+        a later terminal patch accidentally certify stale state.
+        """
+        message = self._message(event)
+        if "message" in self._frame(event):
+            message_id = self._clean_id(message.get("id"))
+            if not message_id:
+                self._message_frame = {}
+                self._invalidate_terminal_cursor()
+                return event
+            frame = self._frame(event)
+            previous = self._message_frame.get("message", {})
+            if previous.get("id") != message_id:
+                self._message_frame = {}
+            merged = copy.deepcopy(self._message_frame)
+            for key, value in frame.items():
+                if key in {"message", "metadata"} and isinstance(value, dict):
+                    target = merged.get(key)
+                    target = target if isinstance(target, dict) else {}
+                    for name, field_value in value.items():
+                        if (key == "message" and name in {"author", "content", "metadata"}
+                                and isinstance(field_value, dict) and isinstance(target.get(name), dict)):
+                            target[name].update(copy.deepcopy(field_value))
+                        else:
+                            target[name] = copy.deepcopy(field_value)
+                    merged[key] = target
+                else:
+                    merged[key] = copy.deepcopy(value)
+        else:
+            operations = event.get("v") if event.get("o") == "patch" else [event]
+            if not isinstance(operations, list) or not any(
+                    isinstance(op, dict) and "p" in op for op in operations):
+                return event
+            if not self._message_frame:
+                return event
+            merged = copy.deepcopy(self._message_frame)
+            # A patch envelope can carry phase or parent evidence as well as
+            # the operations. Never let the retained final phase hide a new
+            # explicit analysis channel or conflicting branch on that frame.
+            for key in ("channel", "parent", "parent_id", "metadata"):
+                if key in event:
+                    if key == "metadata" and isinstance(event[key], dict) and isinstance(merged.get(key), dict):
+                        merged[key].update(copy.deepcopy(event[key]))
+                    else:
+                        merged[key] = copy.deepcopy(event[key])
+            supported = {
+                "/message/status", "/message/end_turn", "/message/channel",
+                "/message/parent", "/message/parent_id", "/message/author/role",
+                "/message/recipient", "/message/content/content_type",
+                "/message/content/parts/0", "/message/metadata/channel",
+                "/message/metadata/parent", "/message/metadata/parent_id",
+                "/message/metadata/is_visually_hidden_from_conversation",
+            }
+            for operation in operations:
+                path = operation.get("p") if isinstance(operation, dict) else None
+                op = operation.get("o") if isinstance(operation, dict) else None
+                if (path not in supported or op not in {"replace", "append", "remove"}
+                        or op == "append" and path != "/message/content/parts/0"):
+                    self._message_frame = {}
+                    self._invalidate_terminal_cursor()
+                    return event
+                keys = path.strip("/").split("/")
+                target = merged
+                for key in keys[:-1]:
+                    target = target.get(key) if isinstance(target, dict) else None
+                    if target is None:
+                        break
+                key = keys[-1]
+                if key == "0" and isinstance(target, list) and target and isinstance(target[0], str):
+                    value = operation.get("v")
+                    if op == "remove":
+                        target.pop(0)
+                    elif isinstance(value, str):
+                        target[0] = target[0] + value if op == "append" else value
+                    else:
+                        self._message_frame = {}
+                        self._invalidate_terminal_cursor()
+                        return event
+                elif isinstance(target, dict) and op != "append":
+                    if op == "remove":
+                        target.pop(key, None)
+                    else:
+                        target[key] = copy.deepcopy(operation.get("v"))
+                else:
+                    self._message_frame = {}
+                    self._invalidate_terminal_cursor()
+                    return event
+        # Reuse the existing stream byte bound even for initial SSE snapshots.
+        if len(json.dumps(merged).encode("utf-8")) > STREAM_HANDOFF_WS_MAX_BYTES:
+            self._message_frame = {}
+            self._invalidate_terminal_cursor()
+            return event
+        self._message_frame = merged
+        return merged
 
     @classmethod
     def _event_containers(cls, event: dict[str, Any], message: dict[str, Any]) -> tuple[dict[str, Any], ...]:
@@ -246,6 +350,8 @@ class _StreamHandoff:
     def _invalidate_terminal_cursor(self) -> None:
         """Make a stream certificate permanently unusable after conflicting evidence."""
         self._terminal_cursor_invalid = True
+        self.terminal_seen = False
+        self.ws_terminal_seen = False
         self.terminal_message_id = ""
         self.terminal_conversation_id = ""
         self.terminal_text = ""
@@ -297,7 +403,10 @@ class _StreamHandoff:
         return (message.get("status") == "finished_successfully"
                 and message.get("end_turn") is True
                 and isinstance(message.get("author"), dict)
-                and message["author"].get("role") == "assistant")
+                and message["author"].get("role") == "assistant"
+                and message.get("recipient") in (None, "", "all")
+                and not (isinstance(message.get("metadata"), dict)
+                         and message["metadata"].get("is_visually_hidden_from_conversation") is True))
 
     def _set_handoff(self, source: str, conversation_id: str, turn_exchange_id: str) -> None:
         if self.handoff_source or source not in {"stream_handoff", "server_ste_metadata"}:
@@ -351,6 +460,8 @@ class _StreamHandoff:
         # from this SSE frame, but never connect a new user turn back to the
         # original request merely because it shares the same conversation.
         author = message.get("author") if isinstance(message.get("author"), dict) else {}
+        if message_id and message_id != original and author.get("role") == "user":
+            self._conflicted_parent_ids.add(message_id)
         if message_id and parent_conflict:
             self._conflicted_parent_ids.add(message_id)
         elif (message_id and parent
@@ -478,6 +589,7 @@ class _StreamHandoff:
             return False
         else:
             self.ws_conversation_locked = True
+        event = self._assembled_event(event)
         message = self._message(event)
         on_original_branch = self._on_original_branch(event, message)
         assistant_terminal = self._assistant_terminal(event, message)
@@ -553,6 +665,7 @@ class _StreamHandoff:
         # snapshots remain observable but cannot produce a reusable cursor.
         if not self._known_conversation_id() and self._event_conversation_id(event):
             return
+        event = self._assembled_event(event)
         message = self._message(event)
         on_original_branch = self._on_original_branch(event, message)
         assistant_terminal = self._assistant_terminal(event, message)
