@@ -5428,6 +5428,8 @@ class TextTaskService:
                 status="unknown" if exc.code == "CONVERSATION_OUTCOME_UNKNOWN" else "failed",
                 error_code=exc.code,
                 finished_at=self._now(),
+                **({"waiting": {"reason": "original_result_read_queued"}}
+                   if getattr(exc, "_original_read_queued", False) else {}),
                 **({
                     # The typed upstream HTTP response proves a send even if a
                     # legacy caller did not record its send boundary.
