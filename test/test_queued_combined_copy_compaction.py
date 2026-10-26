@@ -20,6 +20,7 @@ from services.request_context import AdmissionLost, current_request
 from services.storage.json_storage import JSONStorageBackend
 from services.task_store import TaskStore
 from services.text_task_service import TextTaskService
+from test.test_combined_copy_derivation import WBOZ_CURRENT_CASES
 
 
 class Clock:
@@ -211,6 +212,70 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
         self.assertEqual(self.sent[0]["messages"], body["messages"])
         self.assertFalse(any(item.get("stage") == "retained_input_compacted"
                              for item in self.receipt("new-json")["_execution_timeline"]))
+
+    def test_current_or_future_json_compact_input_first_sends_byte_for_byte(self):
+        cases = list(WBOZ_CURRENT_CASES)
+        future = deepcopy(WBOZ_CURRENT_CASES[0])
+        future["name"] = "future-prompt-wording"
+        payload = json.loads(future["input"]["messages"][0]["content"][0]["text"])
+        payload["category_attribute_instructions"] = payload["category_attribute_instructions"].replace(
+            "Return no row", "Return no category row", 1)
+        future["input"]["messages"][0]["content"][0]["text"] = compact_json(payload)
+        cases.append(future)
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                request_id = "current-json-" + case["name"]
+                body = queued_copy_body(request_id)
+                body.update(deepcopy(case["input"]), client_request_id=request_id)
+                self.submit(body)
+                before = self.store.load_input(self.receipt(request_id)["_input_ref"])
+                hash_before = self.stored_hash(request_id)
+
+                self.admission.execute(self.claim())
+
+                after = self.receipt(request_id)
+                self.assertEqual(self.sent[-1]["messages"], before["messages"])
+                self.assertEqual(self.store.load_input(after["_input_ref"]), before)
+                self.assertEqual(self.stored_hash(request_id), hash_before)
+                self.assertFalse(any(item.get("stage") == "retained_input_compacted"
+                                     for item in after["_execution_timeline"]))
+
+    def test_corrupt_current_json_reference_is_not_an_unsolicited_first_send_transform(self):
+        body = queued_copy_body("corrupt-current-json")
+        payload = json.loads(WBOZ_CURRENT_CASES[0]["input"]["messages"][0]["content"][0]["text"])
+        frozen = json.loads(payload["category_attribute_instructions"].split("\nFrozen attribute preparations: ", 1)[1])
+        frozen["branch_sets"][0]["reply_preparation_index"] = 1
+        payload["category_attribute_instructions"] = payload["category_attribute_instructions"].split(
+            "\nFrozen attribute preparations: ", 1)[0] + "\nFrozen attribute preparations: " + compact_json(frozen)
+        body["messages"][0]["content"][0]["text"] = compact_json(payload)
+        self.submit(body)
+
+        self.admission.execute(self.claim())
+
+        sent = self.receipt("corrupt-current-json")
+        self.assertEqual(self.sent[0]["messages"], body["messages"])
+        self.assertNotEqual(sent["status"], "failed")
+        self.assertFalse(any(item.get("stage") == "retained_input_compacted"
+                             for item in sent["_execution_timeline"]))
+
+    def test_current_compact_input_is_excluded_from_temporary_firstsend_trial(self):
+        body = queued_copy_body("current-trial")
+        body.update(deepcopy(WBOZ_CURRENT_CASES[0]["input"]), client_request_id="current-trial",
+                    product_work={"product_ref": "product-current", "step_ref": "copy"})
+        self.submit(body)
+        self.admission.settings = lambda: {
+            "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "temporary_firstsend_model_trial": {
+                "account_identity": "account-0", "request_id": "current-trial", "expires_at": 1100,
+            },
+        }
+
+        with patch.object(self.admission, "_fresh_bound_firstsend_model_capability") as fresh:
+            self.admission.execute(self.claim())
+
+        fresh.assert_not_called()
+        self.assertEqual((self.sent[0]["model"], self.sent[0]["thinking_effort"]), (MODEL, EFFORT))
+        self.assertNotIn("effective_model", self.receipt("current-trial").get("_temporary_firstsend_model_trial") or {})
 
     def test_existing_send_marker_and_lost_claim_do_not_receive_compaction(self):
         self.submit()

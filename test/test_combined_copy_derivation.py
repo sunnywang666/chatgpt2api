@@ -1,13 +1,15 @@
-"""Retained legacy combined-copy compaction stays one explicit no-final child."""
+"""Retained combined-copy handling stays one explicit no-final child."""
 from copy import deepcopy
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from services.category_directory_derivation import compact_json
-from services.combined_copy_derivation import (KIND, LEGACY_BOUNDARY, LEGACY_SUFFIX, MODEL, EFFORT,
+from services.combined_copy_derivation import (KIND, LEGACY_BOUNDARY, LEGACY_SUFFIX, CURRENT_SUFFIX, MODEL, EFFORT,
                                                 compact_retained_messages, derive_combined_copy_input,
+                                                is_current_combined_copy_input,
                                                 is_legacy_combined_copy_input,
                                                 recognize_compact_retained_messages)
 from services.conversation_binding_service import ConversationBindingError
@@ -34,6 +36,11 @@ def legacy_prompt(rows, *, json_envelope=True):
     return compact_json({"task": "copy", "source_facts": {"title": "Synthetic fixture", "count": 2},
                          "keep_nested": {"enabled": True, "labels": ["a", "b"]},
                          "category_attribute_instructions": instruction})
+
+
+WBOZ_CURRENT_CASES = tuple(json.loads(
+    (Path(__file__).parent / "fixtures" / "wboz-current-combined-copy.json").read_text(encoding="utf-8")
+)["cases"])
 
 
 def install(h, rows=None):
@@ -120,6 +127,59 @@ def test_new_json_contract_passes_through_recognizer_without_compaction(task):
     assert is_legacy_combined_copy_input(body) is False
     assert recognize_compact_retained_messages(body) is None
     with pytest.raises(ConversationBindingError): compact_retained_messages(body)
+
+
+@pytest.mark.parametrize("case", WBOZ_CURRENT_CASES, ids=lambda case: case["name"])
+def test_current_json_contract_derives_losslessly_for_wboz_producer_fixture(task, case):
+    h = install(task); body = deepcopy(h.body)
+    body.update(deepcopy(case["input"]))
+    before = deepcopy(body)
+
+    assert is_legacy_combined_copy_input(body) is False
+    assert is_current_combined_copy_input(body) is True
+    messages, proof = compact_retained_messages(body)
+    saved, derived = derive_combined_copy_input(body, "successor", "old", {"kind": KIND})
+
+    assert messages == before["messages"]
+    assert saved["messages"] == before["messages"]
+    assert proof == derived
+    assert proof["preparation_count"] == len(case["preparations"])
+    assert proof["evidence_set_count"] == case["evidenceSetCount"]
+    assert saved["continue_after_no_final"] is True
+    assert before == body
+
+
+@pytest.mark.parametrize("change", ["branch_reference", "reply_reference", "empty_evidence", "unused_evidence",
+                                      "empty_payload_branch", "duplicate_key", "changed_prompt"])
+def test_current_json_contract_rejects_corrupt_references_before_derivation(task, change):
+    h = install(task); body = deepcopy(h.body)
+    fixture = WBOZ_CURRENT_CASES[-1] if change == "empty_payload_branch" else WBOZ_CURRENT_CASES[0]
+    payload = json.loads(fixture["input"]["messages"][0]["content"][0]["text"])
+    frozen = json.loads(payload["category_attribute_instructions"].split("\nFrozen attribute preparations: ", 1)[1])
+    if change == "branch_reference":
+        frozen["preparations"][0]["branch_set_index"] = 9
+    elif change == "reply_reference":
+        frozen["branch_sets"][0]["reply_preparation_index"] = 1
+    elif change == "empty_evidence":
+        frozen["branch_sets"][1]["evidence_set_index"] = 0
+    elif change == "unused_evidence":
+        frozen["evidence_sets"].append(deepcopy(frozen["evidence_sets"][0]))
+    elif change == "empty_payload_branch":
+        frozen["branch_sets"].append({"target_platform": "ozon", "source_variant_id": None, "schema": []})
+    elif change == "duplicate_key":
+        encoded = compact_json(frozen).replace('"branch_set_index":0', '"branch_set_index":0,"branch_set_index":0', 1)
+        payload["category_attribute_instructions"] = CURRENT_SUFFIX + "\nFrozen attribute preparations: " + encoded
+        body["messages"][0]["content"][0]["text"] = compact_json(payload)
+    else:
+        payload["category_attribute_instructions"] = payload["category_attribute_instructions"].replace(
+            "Return no row", "Also summarize. Return no row", 1)
+        body["messages"][0]["content"][0]["text"] = compact_json(payload)
+    if change not in {"duplicate_key", "changed_prompt"}:
+        payload["category_attribute_instructions"] = CURRENT_SUFFIX + "\nFrozen attribute preparations: " + compact_json(frozen)
+        body["messages"][0]["content"][0]["text"] = compact_json(payload)
+    assert is_current_combined_copy_input(body) is True
+    with pytest.raises(ConversationBindingError):
+        compact_retained_messages(body)
 
 
 def test_our_compact_output_passes_through_lightweight_recognizer(task):

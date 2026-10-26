@@ -13,7 +13,7 @@ from services.combined_copy_derivation import KIND, MODEL, EFFORT
 from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
 from services.request_context import current_request
 from services.text_task_service import TextTaskService
-from test.test_combined_copy_derivation import branch, legacy_prompt
+from test.test_combined_copy_derivation import WBOZ_CURRENT_CASES, branch, legacy_prompt
 from test.test_explicit_unknown_successor import task, row, update
 from test.test_pool_admission import build
 
@@ -48,12 +48,16 @@ def incomplete_document(original, *, change=None):
     return document
 
 
-def install_incomplete(h):
-    h.body.update(model=MODEL, thinking_effort=EFFORT, messages=[{"role": "user", "content": [
-        {"type": "text", "text": legacy_prompt([branch(0), branch(1)])},
-        {"type": "text", "text": '{"image_ref":"source-a"}'},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}},
-    ]}])
+def install_incomplete(h, *, prompt=None, input_body=None):
+    if input_body is not None:
+        h.body.update(deepcopy(input_body))
+    else:
+        prompt = legacy_prompt([branch(0), branch(1)]) if prompt is None else prompt
+        h.body.update(model=MODEL, thinking_effort=EFFORT, messages=[{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "text", "text": '{"image_ref":"source-a"}'},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}},
+        ]}])
     with h.service.store.transaction() as db:
         original = h.service.store.read_receipt(db, "text", "owner", "old")
         original.update(_input_ref=h.service.store.save_input(h.body), model=MODEL, thinking_effort=EFFORT)
@@ -256,6 +260,20 @@ def test_incomplete_mode_is_closed_idempotent_and_rejects_queued_resume(incomple
                 {**h.envelope, "messages": []}):
         with pytest.raises(ValidationError):
             ConversationBindingTextRequest.model_validate(bad)
+
+
+@pytest.mark.parametrize("case", WBOZ_CURRENT_CASES, ids=lambda case: case["name"])
+def test_current_compact_incomplete_successor_retains_original_messages_and_idempotency(task, case):
+    h = install_incomplete(task, input_body=case["input"])
+    original_body = h.service.store.load_input(row(h.service)["_input_ref"])
+    first = h.service.submit("owner", h.envelope)
+    saved = h.service.store.load_input(row(h.service, "successor")["_input_ref"])
+
+    assert saved["messages"] == original_body["messages"]
+    assert first["derived_input"]["kind"] == KIND
+    assert first["derived_input"]["preparation_count"] == len(case["preparations"])
+    assert first["derived_input"]["evidence_set_count"] == case["evidenceSetCount"]
+    assert h.service.submit("owner", h.envelope) == first
 
 
 @pytest.mark.parametrize("change", [
