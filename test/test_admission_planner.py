@@ -5,10 +5,12 @@ from pathlib import Path
 from services.admission_planner import *
 
 
-def request(n=0, source='happy', owner=None, account=None, group=None, fair_group=None, state='queued', operation='image', route='chat', model='fixture-model'):
+def request(n=0, source='happy', owner=None, account=None, group=None, fair_group=None, product_lane=None,
+            state='queued', operation='image', route='chat', model='fixture-model'):
     return WaitingRequest(RequestRef(owner or source, operation, f'request-{n}'), source, n, route, model, operation,
                           True, state=state, bound_account=account, order_group=group,
                           fair_group=fair_group,
+                          product_lane=product_lane,
                           needs=(Need('workers'),))
 
 
@@ -64,6 +66,20 @@ def apply_in_fixture(snapshot, dispatch, *, finish_turn=False):
 class PlannerTests(unittest.TestCase):
     def test_ready_item_is_selected(self):
         self.assertEqual(choose_next(fixture(),100).dispatch.account, 'account-0')
+
+    def test_trusted_product_lane_keeps_fresh_products_in_the_last_phase(self):
+        image = request(1, source='listing', fair_group='product-continuation:image', product_lane='continuation')
+        fresh = request(2, source='listing', fair_group='product-new', product_lane='new')
+        ordinary = request(3, source='listing', fair_group=None)
+        snap = replace(fixture(requests=[fresh, image]),
+                       last_group_by_source=(('listing', 'workflow:product-new'),))
+        # A cursor toward fresh work cannot jump its last phase ahead of a
+        # trusted image continuation.
+        self.assertEqual(choose_next(snap, 100).dispatch.ref, image.ref)
+        after_continuation = replace(snap, requests=(image, ordinary), last_source='listing',
+                                    last_group_by_source=(('listing', 'workflow:product-continuation:image'),))
+        # Non-product traffic remains in the same primary fair phase.
+        self.assertEqual(choose_next(after_continuation, 100).dispatch.ref, ordinary.ref)
 
     def test_no_fixed_global_four_cap(self):
         jobs = [request(i) for i in range(30)]

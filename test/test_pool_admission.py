@@ -1829,7 +1829,10 @@ class AdmissionTests(unittest.TestCase):
             {"id": "happy", "role": "admin", "external_image_client": True,
              "_trusted_source": source},
             client_task_id="main-image", prompt="private image input", model="gpt-image-2", size=None,
-            product_work={"product_ref": "main-image", "step_ref": "image"},
+            # The image is a later AI step of the claimed product, so it must
+            # retain that product admission marker rather than consume a new
+            # product slot.
+            product_work={"product_ref": "older-copy", "step_ref": "image"},
         )
 
         first = self.admission.claim_next()

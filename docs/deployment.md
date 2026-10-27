@@ -49,12 +49,23 @@
 不能据此重发。后来读到真实新进展会重新计入占位，迟到完整答案仍沿原 ID 保存。
 
 `GET /api/product-works/capabilities` 保留 `capacity_source=eligible_chat_turn_total`
-以兼容现有调用方的能力检查，该值仅表示共用账号池的容量来源，不再表示商品数量上限。
-新增 `admission_scope=account_execution`、`product_count_limit=null` 和
-`retained_products_consume_capacity=false` 明确这一语义。
-资源快照的 `products.admission_limited=false`；旧 `slots_total`、`slots_free` 为 `null`
-表示不适用，`slots_held` 仅统计保留归属的商品。调用方不能据这些商品统计自行拦截提交，
-应按原回执的等待状态和账号执行资源判断。
+以兼容现有调用方的能力检查。`admission_scope=product` 和数值型
+`product_count_limit` 表示按可用物理账号的 Chat 容量限制同时进行 AI 的商品数。
+同款在文案、主图等 AI 步骤之间保留名额，已就绪的同款接续先于新商品准入；
+`close` 确认结果已保存后释放 AI 名额，归档和发布不继续占用该名额。
+资源快照的 `products.admission_limited=true`，`slots_total`、`slots_held`、
+`slots_free` 分别表示商品 AI 容量、实际占用和剩余名额；`lifecycle_slots_held`
+单独统计保留原任务归属的记录。历史归属和 UNKNOWN 防重发证据本身不占活动名额。
+
+`admission_control=true` 表示支持 `POST /api/product-works/admission-control`，
+输入为原 `product_ref`、布尔值 `paused` 和独立控制版本 `expected_version`。
+暂停时若原执行领取仍有效，控制状态为 `pausing` 并继续保留名额；领取结束后才为
+`paused` 并释放。恢复须沿原身份及版本执行，不能用暂停清除在途请求或重发结果未知的步骤。
+ProductWork 顶层旧 `slot_held` 仍表示归属；活动准入应读取独立的
+`admission_control.slot_held`，不能混用二者。
+
+部署接续方前先部署并读回 Provider 的上述能力；旧 Provider 未声明能力时，调用方不能
+声称商品名额控制已生效。文档和测试通过不代表部署或原批次已经恢复。
 
 ### 取消一条确定未发送的商品文字步骤
 

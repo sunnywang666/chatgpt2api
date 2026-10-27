@@ -130,6 +130,170 @@ def test_actual_chat_capacity_is_shared_across_sources_and_claim_is_atomic(runti
     assert admission.claim_next() is None
 
 
+def test_admission_pause_is_cas_fenced_and_reacquires_only_via_claim(runtime):
+    text_submit(runtime, "pause-me", product="paused-product")
+    service = ProductWorkService(runtime[4], runtime[5], clock=runtime[0])
+    identity = {"id": "owner-a", "role": "admin", "_trusted_source": SOURCE_A}
+
+    paused = service.admission_control(identity, "paused-product", True, 0)
+    assert paused["admission_control"] == {"state": "paused", "version": 1, "slot_held": False}
+    assert runtime[3].claim_next() is None
+    with pytest.raises(Exception, match="PRODUCT_WORK_ADMISSION_VERSION_CONFLICT"):
+        service.admission_control(identity, "paused-product", True, 0)
+
+    resumed = service.admission_control(identity, "paused-product", False, 1)
+    assert resumed["admission_control"] == {"state": "active", "version": 2, "slot_held": False}
+    claimed = runtime[3].claim_next()
+    assert claimed and claimed.request_id == "pause-me"
+    assert parent(runtime, receipt(runtime, "text", "owner-a", "pause-me"))["admission_control"]["slot_held"]
+
+
+def test_pause_keeps_live_admission_until_lease_ends_then_releases(runtime):
+    text_submit(runtime, "live", product="live-product")
+    claimed = runtime[3].claim_next()
+    assert claimed and claimed.request_id == "live"
+    service = ProductWorkService(runtime[4], runtime[5], clock=runtime[0])
+    identity = {"id": "owner-a", "role": "admin", "_trusted_source": SOURCE_A}
+    pausing = service.admission_control(identity, "live-product", True, 0)
+    assert pausing["admission_control"] == {"state": "pausing", "version": 1, "slot_held": True}
+    with runtime[2].transaction() as db:
+        current = runtime[2].read_receipt(db, "text", "owner-a", "live")
+        from services.work_lifecycle import WorkLifecycleError
+        with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_NOT_ACTIVE"):
+            from services import product_work
+            product_work.before_send(runtime[2], db, current)
+    finish(runtime, "text", "owner-a", "live")
+    # A safe GET must report the expired/finished pause as paused even before
+    # a later admission transaction persists that projection.
+    assert service.get(identity, "live-product")["admission_control"] == {
+        "state": "paused", "version": 1, "slot_held": False}
+    text_submit(runtime, "other", owner="owner-b", source=SOURCE_B, product="other-product")
+    next_claim = runtime[3].claim_next()
+    assert next_claim and next_claim.request_id == "other"
+    assert parent(runtime, receipt(runtime, "text", "owner-a", "live"))["admission_control"] == {
+        "state": "paused", "version": 1, "slot_held": False}
+
+
+def test_resume_cannot_drop_a_live_pausing_lease_or_overadmit(runtime):
+    text_submit(runtime, "a", product="product-a")
+    claim_a = runtime[3].claim_next()
+    assert claim_a and claim_a.request_id == "a"
+    # Restrict the physical denominator to A's account.  A's admission marker
+    # must remain counted while pause is still waiting for its lease to end.
+    account = receipt(runtime, "text", "owner-a", "a")["provider_account_identity"]
+    disabled = "fixture-token-1" if account == "account-0" else "fixture-token-0"
+    runtime[1].update_account(disabled, {"managed_disabled": True}, quiet=True)
+    text_submit(runtime, "b", owner="owner-b", source=SOURCE_B, product="product-b")
+    service = ProductWorkService(runtime[4], runtime[5], clock=runtime[0])
+    identity = {"id": "owner-a", "role": "admin", "_trusted_source": SOURCE_A}
+    assert service.admission_control(identity, "product-a", True, 0)["admission_control"] == {
+        "state": "pausing", "version": 1, "slot_held": True}
+    from services.work_lifecycle import WorkLifecycleError
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_ADMISSION_PAUSING"):
+        service.admission_control(identity, "product-a", False, 1)
+    assert service.get(identity, "product-a")["admission_control"] == {
+        "state": "pausing", "version": 1, "slot_held": True}
+    assert runtime[3].resource_snapshot()["products"]["slots_held"] == 1
+    assert runtime[3].claim_next() is None
+
+    # GET projects this as paused/version 1; one matching resume CAS atomically
+    # normalizes it and makes the product eligible to acquire a fresh slot.
+    runtime[0].now += runtime[3].CLAIM_SECONDS + 1
+    assert service.get(identity, "product-a")["admission_control"] == {
+        "state": "paused", "version": 1, "slot_held": False}
+    resumed = service.admission_control(identity, "product-a", False, 1)
+    assert resumed["admission_control"] == {"state": "active", "version": 2, "slot_held": False}
+
+
+def test_product_capacity_releases_only_after_completed_close(runtime):
+    """The actual 24-turn configuration replenishes only its three closures."""
+    runtime[3].settings = lambda: {"image_account_concurrency": 4, "codex_max_concurrency": 4,
+                                   "chat_account_concurrency": 12}
+    jobs = [(f"product-{number}", f"owner-{number}", SOURCE_A if number % 2 else SOURCE_B)
+            for number in range(28)]
+    for request_id, owner, source in jobs:
+        text_submit(runtime, request_id, owner=owner, source=source, product=request_id + "-product")
+    claimed = [runtime[3].claim_next() for _ in range(24)]
+    assert len({item.request_id for item in claimed}) == 24
+    assert runtime[3].claim_next() is None
+    service = ProductWorkService(runtime[4], runtime[5], clock=runtime[0])
+    sources = {owner: source for _request_id, owner, source in jobs}
+    for item in claimed[:3]:
+        finish(runtime, "text", item.owner, item.request_id)
+        # This fixture models a completed local result with no physical archive
+        # target; the archive-pending close release has its own regression.
+        update_receipt(runtime, "text", item.owner, item.request_id, upstream_outcome="not_sent")
+        closed = service.close({"id": item.owner, "role": "admin", "_trusted_source": sources[item.owner]},
+                               item.request_id + "-product")
+        assert closed["admission_control"]["slot_held"] is False
+    replenished = [runtime[3].claim_next() for _ in range(3)]
+    assert all(replenished)
+    assert {item.request_id for item in replenished}.isdisjoint({item.request_id for item in claimed})
+    assert runtime[3].claim_next() is None
+
+
+def test_restart_retains_product_admission_between_ai_steps(runtime):
+    text_submit(runtime, "first", product="same-product", step="copy")
+    first = runtime[3].claim_next()
+    assert first and first.request_id == "first"
+    finish(runtime, "text", "owner-a", "first")
+    restarted = TextTaskService(runtime[2].path, admission=runtime[3], clock=runtime[0])
+    restarted.submit("owner-a", {"client_request_id": "second", "client_conversation_id": "session-second",
+                     "model": "fixture-text", "messages": [{"role": "user", "content": "synthetic"}],
+                     "product_work": {"product_ref": "same-product", "step_ref": "image-copy"}}, source=SOURCE_A)
+    assert runtime[3].resource_snapshot()["products"]["slots_held"] == 1
+    second = runtime[3].claim_next()
+    assert second and second.request_id == "second"
+
+
+def test_ready_continuations_stay_ahead_of_fresh_products_when_cursor_favors_new(runtime):
+    # Four physical Chat turns leave fresh capacity available; priority rather
+    # than a full cap must still select the two retained continuations first.
+    runtime[3].settings = lambda: {"image_account_concurrency": 4, "codex_max_concurrency": 4,
+                                   "chat_account_concurrency": 2}
+    text_submit(runtime, "a-seed", product="product-a")
+    text_submit(runtime, "b-seed", owner="owner-b", product="product-b")
+    seeded = [runtime[3].claim_next(), runtime[3].claim_next()]
+    assert {item.request_id for item in seeded} == {"a-seed", "b-seed"}
+    for item in seeded:
+        finish(runtime, "text", item.owner, item.request_id)
+    text_submit(runtime, "a-next", product="product-a", step="second")
+    text_submit(runtime, "b-next", owner="owner-b", product="product-b", step="second")
+    text_submit(runtime, "fresh-a", owner="owner-c", product="fresh-a")
+    text_submit(runtime, "fresh-b", owner="owner-d", product="fresh-b")
+    with runtime[2].transaction() as db:
+        runtime[2].set_runtime(db, "fairness", {
+            "source": SOURCE_A, "account": "account-0", "owners": {},
+            "groups": {SOURCE_A: "workflow:product-new"}, "subgroups": {},
+        })
+    chosen = [runtime[3].claim_next(), runtime[3].claim_next()]
+    assert {item.request_id for item in chosen} == {"a-next", "b-next"}
+
+
+def test_legacy_live_claim_counts_but_paused_unknown_history_does_not(runtime):
+    text_submit(runtime, "old-paused", product="old-paused")
+    text_submit(runtime, "old-live", owner="owner-b", source=SOURCE_B, product="old-live")
+    with runtime[2].transaction() as db:
+        paused = runtime[2].read_receipt(db, "text", "owner-a", "old-paused")
+        paused.update(status="unknown", upstream_outcome="unknown", _recovery_paused=True)
+        runtime[2].write_receipt(db, "text", "owner-a", "old-paused", paused)
+        paused_parent = runtime[2].runtime(db, paused["_product_work_key"])
+        paused_parent.update(state="active", slot_held=True)
+        paused_parent.pop("admission_control", None)
+        runtime[2].set_runtime(db, paused_parent["key"], paused_parent)
+        live = runtime[2].read_receipt(db, "text", "owner-b", "old-live")
+        live.update(status="running", _claim_id="legacy-live", _claim_until=runtime[0].now + 30,
+                    _executing=True, _turn_reserved=True)
+        runtime[2].write_receipt(db, "text", "owner-b", "old-live", live)
+        live_parent = runtime[2].runtime(db, live["_product_work_key"])
+        live_parent.update(state="active", slot_held=True)
+        live_parent.pop("admission_control", None)
+        runtime[2].set_runtime(db, live_parent["key"], live_parent)
+    assert runtime[3].resource_snapshot()["products"]["slots_held"] == 1
+    runtime[0].now += 31
+    assert runtime[3].resource_snapshot()["products"]["slots_held"] == 0
+
+
 @pytest.mark.parametrize("claim_first", [False, True])
 def test_cancel_step_and_real_admission_cannot_both_win(runtime, claim_first):
     from services.work_lifecycle import WorkLifecycleError
@@ -171,8 +335,9 @@ def test_rejected_parent_releases_one_slot_without_rewriting_receipt_and_recover
     # GET is a projection only: it reports retained parent identity without
     # releasing the historical rejection outside the normal claim transaction.
     snapshot = admission.resource_snapshot()
-    assert snapshot["products"] == {"slots_total": None, "slots_held": 1, "slots_free": None,
-                                    "admission_limited": False, "queued_products": 1, "active_products": 1}
+    assert snapshot["products"] == {"slots_total": 1, "slots_held": 1, "slots_free": 0,
+                                    "lifecycle_slots_held": 1, "admission_limited": True,
+                                    "queued_products": 1, "active_products": 1}
     assert parent(runtime, original) == original_parent
 
     next_claim = admission.claim_next()
@@ -283,18 +448,23 @@ def test_capacity_shrink_blocks_new_work_only_while_actual_chat_is_occupied(runt
     assert admission.claim_next() is None
 
 
-def test_retained_product_parents_do_not_block_a_25th_new_product(runtime):
-    """Lifecycle-held parents are identity state, not an admission pool."""
+def test_legacy_retained_product_history_does_not_block_a_new_product(runtime):
+    """Only a live pre-marker claim counts; retained legacy history does not."""
     admission = runtime[3]
     for number in range(25):
         request_id = f"retained-{number}"
         text_submit(runtime, request_id, product=f"retained-product-{number}")
         held_parent(runtime, "text", "owner-a", request_id)
         finish(runtime, "text", "owner-a", request_id)
+        with runtime[2].transaction() as db:
+            row = runtime[2].read_receipt(db, "text", "owner-a", request_id)
+            saved = runtime[2].runtime(db, row["_product_work_key"])
+            saved.pop("admission_control", None)  # pre-marker durable parent
+            runtime[2].set_runtime(db, saved["key"], saved)
 
     snapshot = admission.resource_snapshot()
-    assert snapshot["products"] == {"slots_total": None, "slots_held": 25, "slots_free": None,
-                                    "admission_limited": False, "queued_products": 0, "active_products": 25}
+    assert snapshot["products"]["slots_held"] == 0
+    assert snapshot["products"]["lifecycle_slots_held"] == 25
 
     text_submit(runtime, "new-product", owner="owner-b", source=SOURCE_B, product="new-product")
     claimed = admission.claim_next()

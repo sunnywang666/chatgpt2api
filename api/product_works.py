@@ -87,6 +87,13 @@ class ResumeProductWork(BaseModel):
     expected_version: int = Field(strict=True, ge=1)
 
 
+class AdmissionControlProductWork(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    product_ref: str = Field(strict=True, min_length=1, max_length=200)
+    paused: bool = Field(strict=True)
+    expected_version: int = Field(strict=True, ge=0)
+
+
 class CancelUnsentTextStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
     product_ref: str = Field(strict=True, min_length=1, max_length=200)
@@ -131,17 +138,16 @@ def create_router():
         response.headers["Cache-Control"] = "private, no-store"
         try:
             product_identity(require_identity(authorization, request=request), request)
-            get_product_work_service()
+            service = get_product_work_service()
         except WorkLifecycleError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
         return {"protocol": "product-work-v1", "shared_capacity_scope": "provider",
-                # Keep the legacy account-capacity source for existing callers.
-                # It no longer defines a total number of unfinished products.
                 "capacity_source": "eligible_chat_turn_total", "cross_kind": True,
-                "admission_scope": "account_execution", "product_count_limit": None,
-                "retained_products_consume_capacity": False,
+                "admission_scope": "product",
+                "product_count_limit": service.product_capacity_limit(),
+                "retained_products_consume_capacity": True,
                 "close_after_archive": True, "adoption": True, "resume": True,
-                "cancel_unsent_text_step": True}
+                "cancel_unsent_text_step": True, "admission_control": True}
 
     @router.get("/api/product-works")
     async def status(request: Request, response: Response,
@@ -167,6 +173,12 @@ def create_router():
                      authorization: str | None = Header(default=None)):
         return await invoke(request, authorization, response, "resume", body.product_ref,
                             expected_version=body.expected_version)
+
+    @router.post("/api/product-works/admission-control")
+    async def admission_control(body: AdmissionControlProductWork, request: Request, response: Response,
+                                authorization: str | None = Header(default=None)):
+        return await invoke(request, authorization, response, "admission_control", body.product_ref,
+                            body.paused, body.expected_version)
 
     @router.post("/api/product-works/adopt")
     async def adopt(body: AdoptProductWork, request: Request, response: Response,

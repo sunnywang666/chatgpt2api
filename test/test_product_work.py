@@ -76,6 +76,17 @@ def test_shared_text_image_close_waits_for_every_archive_and_restart(runtime):
         service.close(IDENTITY, "P", outcome="failed")
 
 
+def test_close_releases_admission_before_archive_confirmation(runtime):
+    service, lifecycle, _, _, calls, _, add = runtime
+    add("text", conversation="archive-pending")
+    closing = service.close(IDENTITY, "P")
+    assert closing["state"] == "closing" and closing["cleanup_pending"] is True
+    assert closing["slot_held"] is True  # lifecycle/archive ownership
+    assert closing["admission_control"] == {"state": "active", "version": 0, "slot_held": False}
+    assert calls == []
+    assert lifecycle.process_one()
+
+
 def test_archive_unknown_retains_slot_and_retries_original_target(runtime):
     service, lifecycle, _, now, calls, fail, add = runtime
     add("text")

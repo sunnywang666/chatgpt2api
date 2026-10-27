@@ -4,6 +4,7 @@ A product retains ownership until its durable conversation archives are confirme
 except for a proved no-conversation model rejection returned to the queue.
 The legacy slot_held flag tracks that ownership, not a generation-capacity unit.
 Each actual request is admitted against account resources by PoolAdmission.
+Independent admission_control retains a product AI slot between its steps.
 No result, input hash, request sequence or ordinary work identity is replaced.
 """
 from __future__ import annotations
@@ -275,6 +276,66 @@ def _save(store, db, parent):
     store.set_runtime(db, parent["key"], parent)
 
 
+def admission_control(parent):
+    """Return the durable product-admission state without reusing lifecycle slots.
+
+    Older parents deliberately have no admission marker.  They are not counted
+    merely because they retained a lifecycle/archive owner; the admission
+    transaction recognizes a genuinely live legacy claim separately.
+    """
+    value = parent.get("admission_control")
+    if (isinstance(value, dict) and value.get("state") in {"active", "pausing", "paused"}
+            and type(value.get("version")) is int and value["version"] >= 0
+            and type(value.get("slot_held")) is bool):
+        return dict(value)
+    return {"state": "active", "version": 0, "slot_held": False}
+
+
+def admission_slot_held(parent):
+    return admission_control(parent)["slot_held"]
+
+
+def _live_product_claim(receipt, now):
+    """True only for an unexpired executing/reserved generation, never history."""
+    until = receipt.get("_claim_until")
+    return bool(receipt.get("status") == "running" and receipt.get("_claim_id")
+                and isinstance(until, (int, float)) and not isinstance(until, bool) and until > now
+                and (receipt.get("_executing") or receipt.get("_turn_reserved")))
+
+
+def legacy_live_admission(parent, receipts, now):
+    """Compatibility count for a pre-marker parent that is actually executing."""
+    return ("admission_control" not in parent and parent.get("state") == "active"
+            and any(_live_product_claim(receipt, now) for receipt in receipts))
+
+
+def reconcile_paused_admission_slots(store, db, receipts=None, *, now=None):
+    """Finish an explicit pause once its already-live lease has ended.
+
+    This is intentionally called from the existing admission transaction.  It
+    never releases active/UNKNOWN work and it never infers a pause from old
+    recovery flags or archive state.
+    """
+    now = time.time() if now is None else float(now)
+    rows = list(store.receipts(db)) if receipts is None else list(receipts)
+    by_parent = {}
+    for _kind, _owner, _request_id, receipt in rows:
+        if isinstance(receipt, dict) and isinstance(receipt.get("_product_work_key"), str):
+            by_parent.setdefault(receipt["_product_work_key"], []).append(receipt)
+    changed = 0
+    for key, parent in state_snapshot(store, db).items():
+        control = admission_control(parent)
+        if ("admission_control" not in parent or control["state"] != "pausing"
+                or control["slot_held"] is not True):
+            continue
+        if any(_live_product_claim(receipt, now) for receipt in by_parent.get(key, ())):
+            continue
+        parent["admission_control"] = {**control, "state": "paused", "slot_held": False}
+        _save(store, db, parent)
+        changed += 1
+    return changed
+
+
 def _attached(store, db, receipt):
     key = receipt.get("_product_work_key")
     if not key:
@@ -299,7 +360,9 @@ def before_send(store, db, receipt):
             if not member or not _cancelled_unsent_step(store, db, parent, member, receipt):
                 raise WorkLifecycleError("PRODUCT_WORK_CANCEL_STEP_PROOF_INVALID")
             raise WorkLifecycleError("PRODUCT_WORK_STEP_CANCELLED")
-    if parent and (parent["state"] != "active" or not parent.get("slot_held")):
+    control = admission_control(parent) if parent else None
+    if parent and (parent["state"] != "active" or not parent.get("slot_held")
+                   or control["state"] != "active" or not control["slot_held"]):
         raise WorkLifecycleError("PRODUCT_WORK_NOT_ACTIVE")
     if parent:
         _check_physical(store, db, receipt, parent["key"])
@@ -311,9 +374,13 @@ def record_slot(store, db, receipt, held=True):
     if parent and held and parent["state"] not in {"queued", "active"}:
         raise WorkLifecycleError("PRODUCT_WORK_NOT_ACTIVE")
     if parent and held:
+        control = admission_control(parent)
+        if control["state"] != "active":
+            raise WorkLifecycleError("PRODUCT_WORK_ADMISSION_PAUSED")
         _check_physical(store, db, receipt, parent["key"])
     if parent and held:
-        parent.update(state="active", slot_held=True)
+        parent.update(state="active", slot_held=True,
+                      admission_control={**control, "slot_held": True})
         _save(store, db, parent)
     # Ordinary turn completion/failure does not release product ownership.
     return parent
@@ -474,7 +541,8 @@ def ensure_product_work(store, db, kind, owner, request_id, receipt, product_wor
         parent = {"key": key, "owner": owner, "source": source, "product_ref": metadata["product_ref"],
                   "state": "queued", "slot_held": False, "members": [], "archive_keys": [],
                   "results_saved": False, "outcome": None, "cleanup_pending": False,
-                  "created_at": time.time()}
+                  "created_at": time.time(),
+                  "admission_control": {"state": "active", "version": 0, "slot_held": False}}
         if metadata.get("fairness") is not None:
             parent["fairness"] = metadata["fairness"]
     parent["members"].append(member)
@@ -1059,6 +1127,13 @@ class ProductWorkService:
     def __init__(self, text_service, image_service, *, clock=time.time):
         self.text, self.images, self.store, self.clock = text_service, image_service, text_service.store, clock
 
+    def product_capacity_limit(self):
+        admission = getattr(self.text, "admission", None)
+        read = getattr(admission, "product_capacity_limit", None)
+        # Lightweight legacy adapters may expose product work but not a pool;
+        # zero is safer than advertising an invented admission capacity.
+        return int(read()) if callable(read) else 0
+
     def _load(self, db, identity, product_ref):
         source = require_product_source(identity)
         key = _key(source, str(identity["id"]), _ref(product_ref))
@@ -1255,6 +1330,12 @@ class ProductWorkService:
 
     def _projection(self, db, parent):
         members = self._members(db, parent)
+        control = admission_control(parent)
+        # GET remains read-only, but must not report a completed pause lease as
+        # live.  The next admission transaction persists this same transition.
+        if (control["state"] == "pausing"
+                and not any(_live_product_claim(receipt, float(self.clock())) for _member, receipt in members)):
+            control = {**control, "state": "paused", "slot_held": False}
         archives = [self.store.runtime(db, key) for key in parent.get("archive_keys", [])]
         confirmed = sum(bool(row and (row.get("archive") or {}).get("status") == "confirmed") for row in archives)
         reasons = self._reasons(db, parent, members)
@@ -1276,6 +1357,7 @@ class ProductWorkService:
                 "version": parent.get("version", 1),
                 "slot_held": bool(parent["slot_held"]), "results_saved": bool(parent.get("results_saved")),
                 "outcome": parent.get("outcome"), "cleanup_pending": bool(parent.get("cleanup_pending")),
+                "admission_control": control,
                 "members": projected_members,
                 "archive": {"total": len(archives), "confirmed": confirmed, "pending": len(archives) - confirmed},
                 "blocked_reasons": sorted(set(reasons))}
@@ -1391,8 +1473,13 @@ class ProductWorkService:
                     key: parent.get(key) for key in ("outcome", "results_saved", "results_saved_at",
                                                      "archive_keys", "updated_at")},
                     "members": [dict(member) for member in parent["members"]]})
+                # Reopening preserves lifecycle/physical ownership.  It
+                # creates no admission reservation: the queued successor must
+                # reacquire that independently in PoolAdmission's claim.
+                control = admission_control(parent)
                 parent.update(version=version + 1, resumed_from_version=version, state="active",
                               slot_held=True, results_saved=False, outcome=None, cleanup_pending=False,
+                              admission_control={**control, "state": "active", "slot_held": False},
                               archive_keys=[], updated_at=float(self.clock()))
                 parent.pop("results_saved_at", None)
                 _save(self.store, db, parent)
@@ -1454,6 +1541,9 @@ class ProductWorkService:
                         {"product_ref": product_ref, "step_ref": step}, source=source)
                     if (not _unsent(receipt) and not _rejected_without_conversation(member["kind"], receipt)
                             and parent["state"] in {"queued", "active"}):
+                        # This is lifecycle/physical ownership evidence only.
+                        # Adoption never reserves the new product-capacity
+                        # marker; a future send claims it atomically.
                         parent.update(state="active", slot_held=True)
                         _save(self.store, db, parent)
                     self.store.write_receipt(db, member["kind"], owner, rid, receipt)
@@ -1547,8 +1637,13 @@ class ProductWorkService:
                       and not (outcome == "cancelled" and receipt.get("status") == "cancelled")):
                     raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_REQUIRED")
             now = float(self.clock())
+            control = admission_control(parent)
+            # AI completion releases product admission before archive or later
+            # publication work.  The lifecycle slot stays intact until the
+            # existing archive closeout decides otherwise.
             parent.update(state="closing", outcome=outcome, results_saved=True, results_saved_at=now,
-                          cleanup_pending=bool(targets), updated_at=now)
+                          cleanup_pending=bool(targets), updated_at=now,
+                          admission_control={**control, "slot_held": False})
             for canonical, (member, receipt) in targets.items():
                 archive_identity = [parent["key"], canonical]
                 if version > 1:
@@ -1572,6 +1667,53 @@ class ProductWorkService:
         if admission:
             admission.wake()
         return result
+
+    def admission_control(self, identity, product_ref, paused, expected_version):
+        """CAS pause/resume for admission only; never sends or reserves a turn."""
+        if type(paused) is not bool or type(expected_version) is not int or expected_version < 0:
+            raise WorkLifecycleError("PRODUCT_WORK_ADMISSION_VERSION_INVALID", 400)
+        with self.store.transaction() as db:
+            parent = self._load(db, identity, product_ref)
+            control = admission_control(parent)
+            if control["version"] != expected_version:
+                raise WorkLifecycleError("PRODUCT_WORK_ADMISSION_VERSION_CONFLICT")
+            members = self._members(db, parent)
+            if paused:
+                if control["state"] in {"pausing", "paused"}:
+                    return self._projection(db, parent)
+                live = any(_live_product_claim(receipt, float(self.clock())) for _member, receipt in members)
+                parent["admission_control"] = {
+                    "state": "pausing" if live else "paused",
+                    "version": control["version"] + 1,
+                    # A pre-marker parent can already have a genuine live
+                    # claim.  Preserve that occupancy through the lease even
+                    # though it had no durable marker before this control.
+                    "slot_held": bool(live),
+                }
+            else:
+                if control["state"] == "active":
+                    return self._projection(db, parent)
+                if control["state"] == "pausing":
+                    # Never turn a still-live paused lease into an unheld
+                    # active product: its original worker can still reach the
+                    # send edge.  Once the lease is observably over, this
+                    # exact versioned resume may normalize the pause and
+                    # compete for capacity normally in the same transaction.
+                    if any(_live_product_claim(receipt, float(self.clock())) for _member, receipt in members):
+                        raise WorkLifecycleError("PRODUCT_WORK_ADMISSION_PAUSING")
+                    # Normalize this transient state in the same transaction
+                    # without consuming a version, then honor this exact CAS
+                    # resume as paused(version) -> active(version + 1).
+                    control = {**control, "state": "paused", "slot_held": False}
+                if control["state"] != "paused" or control["slot_held"]:
+                    raise WorkLifecycleError("PRODUCT_WORK_ADMISSION_PAUSING")
+                # Resume authorizes the existing durable parent to compete for
+                # a new admission slot; it cannot revive a paused send claim.
+                parent["admission_control"] = {
+                    "state": "active", "version": control["version"] + 1, "slot_held": False,
+                }
+            _save(self.store, db, parent)
+            return self._projection(db, parent)
 
     def load_archive_target(self, db, child):
         parent = self.store.runtime(db, child["_product_archive_parent"])
