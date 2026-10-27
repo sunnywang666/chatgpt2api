@@ -349,7 +349,12 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
             body["product_work"] = {"product_ref": "product-" + request_id, "step_ref": "copy"}
             bodies.append(self.submit(body))
         self.admission.settings = lambda: {
+            # Three independent product parents are intentional here.  This
+            # verifies one account may select each exact first-send trial
+            # target; it must not accidentally exercise the separate product
+            # admission cap with the fixture's default one Chat turn.
             "revision": 7, "image_account_concurrency": 4, "codex_max_concurrency": 4,
+            "chat_account_concurrency": 3,
             "temporary_firstsend_model_trial": {"targets": [
                 {"account_identity": "account-0", "request_id": "batch-a"},
                 {"account_identity": "account-0", "request_id": "batch-b"},

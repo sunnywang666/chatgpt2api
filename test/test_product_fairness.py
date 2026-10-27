@@ -40,6 +40,11 @@ def test_person_lane_matches_company_identity_and_owner_stays_unchanged(runtime)
 
 
 def test_multikey_people_roots_rotate_without_default_concurrency_one(runtime):
+    # This fairness fixture intentionally exercises eight independent products;
+    # give its two physical Chat accounts their configured four slots each.
+    runtime[3].settings = lambda: {"image_account_concurrency": 4,
+                                   "codex_max_concurrency": 4,
+                                   "chat_account_concurrency": 4}
     for person in ("alice", "bob"):
         for root in ("one", "two"):
             for i in range(4):

@@ -128,9 +128,10 @@ def test_parent_api_strict_auth_and_durable_close(services, monkeypatch):
     caps = client.get("/api/product-works/capabilities", headers=headers)
     assert caps.json()["shared_capacity_scope"] == "provider"
     assert caps.json()["capacity_source"] == "eligible_chat_turn_total"
-    assert caps.json()["admission_scope"] == "account_execution"
-    assert caps.json()["product_count_limit"] is None
-    assert caps.json()["retained_products_consume_capacity"] is False
+    assert caps.json()["admission_scope"] == "product"
+    assert caps.json()["product_count_limit"] == 0
+    assert caps.json()["retained_products_consume_capacity"] is True
+    assert caps.json()["admission_control"] is True
     assert caps.json()["resume"] is True
     assert caps.json()["cancel_unsent_text_step"] is True
     assert caps.headers["cache-control"] == "private, no-store"
@@ -147,6 +148,32 @@ def test_parent_api_strict_auth_and_durable_close(services, monkeypatch):
     assert cancel.status_code == 200, cancel.text
     assert cancel.json()["state"] == "cancelled"
     assert text.read("owner", "text-1")["status"] == "cancelled"
+
+
+def test_admission_control_route_uses_separate_zero_based_cas(services, monkeypatch):
+    text, _, service = services
+    text.submit("owner", text_body(), source=IDENTITY["_trusted_source"])
+    monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
+    monkeypatch.setattr(product_works, "get_product_work_service", lambda: service)
+    app = FastAPI(); app.include_router(product_works.create_router())
+    client = TestClient(app)
+    headers = {"x-workbench-consumer": "wb-to-ozon"}
+    base = {"product_ref": META["product_ref"], "paused": True, "expected_version": 0}
+    for invalid in ({"paused": 1}, {"expected_version": -1}, {"expected_version": True},
+                    {"expected_version": "0"}, {"extra": True}):
+        assert client.post("/api/product-works/admission-control", headers=headers,
+                           json={**base, **invalid}).status_code == 422
+    paused = client.post("/api/product-works/admission-control", headers=headers, json=base)
+    assert paused.status_code == 200
+    assert paused.headers["cache-control"] == "private, no-store"
+    assert paused.json()["admission_control"] == {"state": "paused", "version": 1, "slot_held": False}
+    stale = client.post("/api/product-works/admission-control", headers=headers, json=base)
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "PRODUCT_WORK_ADMISSION_VERSION_CONFLICT"
+    resumed = client.post("/api/product-works/admission-control", headers=headers,
+                          json={**base, "paused": False, "expected_version": 1})
+    assert resumed.status_code == 200
+    assert resumed.json()["admission_control"] == {"state": "active", "version": 2, "slot_held": False}
 
 
 def test_cancel_step_route_rejects_unauthorized_or_expanded_scope_without_mutation(services, monkeypatch):

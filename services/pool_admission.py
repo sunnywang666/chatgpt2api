@@ -1432,6 +1432,32 @@ class PoolAdmission:
         read = getattr(self.accounts, "admission_accounts", None)
         return read() if read else self.accounts.list_accounts()
 
+    def _product_capacity_limit(self, rows, settings):
+        """Capacity of existing unique physical Chat turns, excluding trials."""
+        identities = {}
+        for account in rows:
+            identity = str(account.get("provider_account_identity") or "")
+            if identity:
+                identities[identity] = identities.get(identity, 0) + 1
+        keys = set()
+        for account in rows:
+            identity = str(account.get("provider_account_identity") or "")
+            if (not identity or identities.get(identity) != 1 or account.get("managed_disabled")
+                    or account.get("status") in {"禁用", "异常", "限流"}
+                    or str(account.get("source_type") or "web") not in {"web", "oauth_login", "password"}
+                    or not account.get("access_token")
+                    or self.accounts._normalize_account_type(account.get("type"))
+                    not in {"Plus", "Pro", "ProLite", "Team", "Enterprise"}):
+                continue
+            keys.add(account_clock_key(account))
+        # Match ordinary chat_turn.capacity, while deliberately excluding the
+        # one-request temporary second-slot trial from general product slots.
+        return len(keys) * max(1, int(settings.get("chat_account_concurrency", 1)))
+
+    def product_capacity_limit(self):
+        with self._settings_guard(), self._account_guard():
+            return self._product_capacity_limit(self._rows(), self._settings())
+
     @staticmethod
     def _empty_turn_transfers(receipts):
         """Return proven empty roots whose local turn moved to one child."""
@@ -1502,6 +1528,20 @@ class PoolAdmission:
         from services.text_task_service import TextTaskService
         works, workflow_clocks = workflow_state or ({}, {})
         product_works = product_state or {}
+        product_capacity = self._product_capacity_limit(rows, settings)
+        product_members = {}
+        for _kind, _owner, _request_id, receipt in receipts:
+            if isinstance(receipt, dict) and isinstance(receipt.get("_product_work_key"), str):
+                product_members.setdefault(receipt["_product_work_key"], []).append(receipt)
+        # Explicit admission markers survive ordinary AI-turn gaps.  A legacy
+        # parent counts only during a genuine live claim, never for retained
+        # archive/history ownership or paused/UNKNOWN history.
+        product_occupied = sum(
+            bool(parent.get("state") == "active" and (
+                product_work.admission_slot_held(parent)
+                or product_work.legacy_live_admission(parent, product_members.get(key, ()), now)))
+            for key, parent in product_works.items() if isinstance(parent, dict)
+        )
         # Product parents are opt-in and intentionally separate from generic
         # work rows: one product may contain both text and image originals.
         # Retained parents track ownership/closeout, not generation capacity.
@@ -1720,6 +1760,7 @@ class PoolAdmission:
                 r, works, workflow_clocks, ordered_receipts, now, active_by_work=active_work_counts)
             thread_resources.extend(scheduling_resources)
             product_needs = ()
+            product_lane = None
             product_fair_group = None
             product_fair_source = None
             product_fair_root = None
@@ -1738,10 +1779,18 @@ class PoolAdmission:
                         product_fair_root = parent["fairness"]["root_workflow_id"]
                     except (product_work.WorkLifecycleError, KeyError, TypeError):
                         valid_parent = False
-                if valid_parent and parent.get("state") == "active" and parent.get("slot_held") is True:
+                control = product_work.admission_control(parent) if valid_parent else None
+                if valid_parent and control["state"] != "active":
+                    dependency = "product_admission_paused:" + hashlib.sha256(
+                        (owner + "\0" + kind + "\0" + request_id).encode()).hexdigest()
+                    thread_resources.append(Resource(dependency, 0, 0, now))
+                    product_needs = (Need(dependency),)
+                elif valid_parent and parent.get("state") == "active":
                     product_fair_group = "product-continuation"
+                    product_lane = "continuation"
                 elif valid_parent and parent.get("state") == "queued" and parent.get("slot_held") is False:
                     product_fair_group = "product-new"
+                    product_lane = "new"
                 else:
                     # Do not dispatch a closed, mismatched, or otherwise
                     # invalid parent while preserving its original receipt.
@@ -1749,6 +1798,11 @@ class PoolAdmission:
                         (owner + "\0" + kind + "\0" + request_id).encode()).hexdigest()
                     thread_resources.append(Resource(dependency, 0, 0, now))
                     product_needs = (Need(dependency),)
+                if valid_parent and control["state"] == "active" and not control["slot_held"]:
+                    # Continuations keep their own fair lane, but a resumed or
+                    # adopted product must reacquire capacity through this
+                    # claim transaction before any next turn can run.
+                    product_needs += (Need("product_admission"),)
             physical_needs = ()
             physical = physical_conversation_key(r)
             if physical:
@@ -1809,6 +1863,7 @@ class PoolAdmission:
                 # second top-level caller turn by using multiple key owners.
                 fair_group=fair_group,
                 fair_subgroup=fair_subgroup,
+                product_lane=product_lane,
                 ready_at=max(float(r.get("_ready_at") or 0), scheduling_ready),
                 needs=thread_needs + physical_needs + product_needs + tuple(scheduling_needs) + (Need("execution_input_bytes", max(1, int(r.get("_input_bytes") or 1))),)
                       + ((Need("chat_executor"),) if kind == "text" and route == "chat" and r.get("_operation") != "image" else ())
@@ -1817,7 +1872,8 @@ class PoolAdmission:
         codex_used = sum(value for key, value in occupied.items() if key.startswith("codex_turn:"))
         resources = {"execution_input_bytes": Resource("execution_input_bytes", self.MAX_ACTIVE_INPUT_BYTES, active_bytes, now),
                      "chat_executor": Resource("chat_executor", self.text_workers or 0, active_text, now),
-                     "codex_server": Resource("codex_server", int(settings.get("codex_max_concurrency", 4)), codex_used, now)}
+                     "codex_server": Resource("codex_server", int(settings.get("codex_max_concurrency", 4)), codex_used, now),
+                     "product_admission": Resource("product_admission", product_capacity, product_occupied, now)}
         resources.update({resource.key: resource for resource in thread_resources})
         offers = []
         scoped_extra_turn = None
@@ -2093,11 +2149,15 @@ class PoolAdmission:
                 "workflows": {"slots_held": sum(bool(w.get("slot_held")) for w in workflow_state[0].values()),
                               "active_work": sum(w.get("state") == "active" for w in workflow_state[0].values()),
                               "paused_work": sum(w.get("state") == "paused" for w in workflow_state[0].values())},
-                # Legacy slot fields remain readable, but only slots_held is
-                # a lifecycle count. There is no product-count admission cap.
-                "products": {"admission_limited": False, "slots_total": None,
-                             "slots_held": sum(parent.get("slot_held") is True for parent in product_parents),
-                             "slots_free": None,
+                "products": {"admission_limited": True,
+                             "slots_total": resources["product_admission"].capacity,
+                             "slots_held": resources["product_admission"].occupied,
+                             "slots_free": (None if resources["product_admission"].occupied is None else max(
+                                 0, resources["product_admission"].capacity - resources["product_admission"].occupied)),
+                             # Existing lifecycle ownership remains observable
+                             # separately; archive/history cannot be mistaken
+                             # for a product-admission reservation.
+                             "lifecycle_slots_held": sum(parent.get("slot_held") is True for parent in product_parents),
                              "queued_products": sum(parent.get("state") == "queued" for parent in product_parents),
                              "active_products": sum(parent.get("state") == "active" for parent in product_parents)},
                 "queue": {"mode": "durable_original_receipts", "queued": len(queued), "by_source": sources,
@@ -2398,6 +2458,7 @@ class PoolAdmission:
             receipts = list(self.store.receipts(db))
             workflow_scheduling.expire_unsent(self.store, db, receipts, now)
             self._recover_claims(db, receipts, now)
+            product_work.reconcile_paused_admission_slots(self.store, db, receipts, now=now)
             bind_waiting_threads(self.store, db, receipts)
             from services.text_task_service import bind_waiting_public_sessions
             bind_waiting_public_sessions(self.store, db, receipts)

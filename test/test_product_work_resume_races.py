@@ -63,10 +63,10 @@ def test_archive_lock_finishes_before_resume_and_old_callback_cannot_confirm_v2(
         return original_archive(*args)
 
     @contextmanager
-    def observe_physical_lock(receipts):
+    def observe_physical_lock(receipts, **kwargs):
         if threading.current_thread().name == "product-work-resume-race":
             resume_acquiring.set()
-        with original_lock(receipts):
+        with original_lock(receipts, **kwargs):
             yield
 
     def record_archive_confirmation(account_key):

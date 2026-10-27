@@ -33,6 +33,7 @@ def test_resume_completed_product_preserves_originals_and_recloses_latest_cursor
     assert resumed["state"] == "active"
     assert resumed["version"] == 2
     assert resumed["slot_held"] is True
+    assert resumed["admission_control"] == {"state": "active", "version": 0, "slot_held": False}
     assert resumed["results_saved"] is False
     assert resumed["outcome"] is None
     assert resumed["archive"] == {"total": 0, "confirmed": 0, "pending": 0}

@@ -138,6 +138,9 @@ class WaitingRequest:
     fair_group: str | None = None
     needs: tuple[Need, ...] = () # global worker/memory demands, distinct from Offer
     fair_subgroup: str | None = None  # existing text/image lanes within a trusted root
+    # Trusted product-parent classification from PoolAdmission.  Planner never
+    # infers this from a workflow/fairness string supplied by another feature.
+    product_lane: str | None = None
 
     def __post_init__(self) -> None:
         for value in (self.source, self.route, self.model, self.operation):
@@ -149,6 +152,8 @@ class WaitingRequest:
         for value in (self.bound_account, self.order_group, self.fair_group, self.fair_subgroup):
             if value is not None:
                 _name(value)
+        if self.product_lane not in {None, 'new', 'continuation'}:
+            raise InvalidSnapshot('invalid product lane')
         _unique_needs(self.needs)
 
 
@@ -428,28 +433,41 @@ def choose_next(snapshot: Snapshot, now: float) -> Selection:
             wakeups.append(wake)
         return None
 
-    sources = _rotate([r.source for r in pending], snapshot.last_source)
-    for source in sources:
-        source_pending = [r for r in pending if r.source == source]
-        owners = _rotate([r.ref.owner for r in source_pending],
-                         dict(snapshot.last_owner_by_source).get(source))
-        owner_position = {owner: index for index, owner in enumerate(owners)}
-        # The legacy lane retains owner/sequence order when it is the only
-        # lane, but participates in this same rotation when scheduled work is
-        # present.  A workflow ID can never collide with the legacy cursor.
-        grouped: dict[str, list[WaitingRequest]] = {}
-        for request in source_pending:
-            grouped.setdefault(fairness_lane(request.fair_group), []).append(request)
-        for lane in _rotate(list(grouped), dict(snapshot.last_group_by_source).get(source)):
-            subgroups: dict[str, list[WaitingRequest]] = {}
-            for request in grouped[lane]:
-                subgroups.setdefault(fairness_lane(request.fair_subgroup), []).append(request)
-            cursor = fairness_subgroup_key(source, grouped[lane][0].fair_group)
-            for subgroup in _rotate(list(subgroups), dict(snapshot.last_subgroup_by_group).get(cursor)):
-                requests_in_group = sorted(subgroups[subgroup],
-                                           key=lambda r: (owner_position[r.ref.owner], r.sequence, r.ref))
-                for request in requests_in_group:
-                    dispatch = select_request(request)
-                    if dispatch is not None:
-                        return Selection(dispatch, tuple(deferred), None)
+    def scan(candidate_requests):
+        """Select within a phase while retaining the normal source rotation."""
+        sources = _rotate([r.source for r in candidate_requests], snapshot.last_source)
+        for source in sources:
+            source_pending = [r for r in candidate_requests if r.source == source]
+            owners = _rotate([r.ref.owner for r in source_pending],
+                             dict(snapshot.last_owner_by_source).get(source))
+            owner_position = {owner: index for index, owner in enumerate(owners)}
+            grouped: dict[str, list[WaitingRequest]] = {}
+            for request in source_pending:
+                grouped.setdefault(fairness_lane(request.fair_group), []).append(request)
+            for lane in _rotate(list(grouped), dict(snapshot.last_group_by_source).get(source)):
+                subgroups: dict[str, list[WaitingRequest]] = {}
+                for request in grouped[lane]:
+                    subgroups.setdefault(fairness_lane(request.fair_subgroup), []).append(request)
+                cursor = fairness_subgroup_key(source, grouped[lane][0].fair_group)
+                for subgroup in _rotate(list(subgroups), dict(snapshot.last_subgroup_by_group).get(cursor)):
+                    requests_in_group = sorted(subgroups[subgroup],
+                                               key=lambda r: (owner_position[r.ref.owner], r.sequence, r.ref))
+                    for request in requests_in_group:
+                        dispatch = select_request(request)
+                        if dispatch is not None:
+                            return dispatch
+        return None
+
+    # Existing continuations and true non-product traffic share the established
+    # source/group rotation.  Fresh products are a separate last phase, so a
+    # cursor pointing at a product-new workflow cannot jump ahead of ready
+    # continuations. `product_lane` is trusted adapter data, never a name
+    # inferred from another workflow's fair_group.
+    primary = [request for request in pending if request.product_lane != 'new']
+    fresh_products = [request for request in pending if request.product_lane == 'new']
+    dispatch = scan(primary)
+    if dispatch is None:
+        dispatch = scan(fresh_products)
+    if dispatch is not None:
+        return Selection(dispatch, tuple(deferred), None)
     return Selection(None, tuple(deferred), min(wakeups) if wakeups else None)
