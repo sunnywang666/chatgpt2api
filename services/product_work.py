@@ -4,6 +4,7 @@ A product retains ownership until its durable conversation archives are confirme
 except for a proved no-conversation model rejection returned to the queue.
 The legacy slot_held flag tracks that ownership, not a generation-capacity unit.
 Each actual request is admitted against account resources by PoolAdmission.
+Independent admission_control retains a product AI slot between its steps.
 No result, input hash, request sequence or ordinary work identity is replaced.
 """
 from __future__ import annotations
@@ -1695,9 +1696,9 @@ class ProductWorkService:
                 if control["state"] == "pausing":
                     # Never turn a still-live paused lease into an unheld
                     # active product: its original worker can still reach the
-                    # send edge.  Once the lease is observably over, publish
-                    # the paused state first; a separate versioned resume may
-                    # then compete for capacity normally.
+                    # send edge.  Once the lease is observably over, this
+                    # exact versioned resume may normalize the pause and
+                    # compete for capacity normally in the same transaction.
                     if any(_live_product_claim(receipt, float(self.clock())) for _member, receipt in members):
                         raise WorkLifecycleError("PRODUCT_WORK_ADMISSION_PAUSING")
                     # Normalize this transient state in the same transaction

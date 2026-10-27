@@ -325,8 +325,16 @@ or mark the business task complete. Products with unknown results, existing
 conversations, or unfinished members retain their protection. The management
 `/api/workbench/ai/pool/resources` response reports these lifecycle counts in
 `products`, separately from physical Chat turns and generic `workflows`.
-`products.admission_limited=false` and null `slots_total`/`slots_free` mean
-there is no product-count budget; `slots_held` is only retained ownership.
+`products.admission_limited=true` and numeric `slots_total`/`slots_free` describe
+the concurrent product AI budget. `products.slots_held` counts active admission;
+`products.lifecycle_slots_held` separately counts retained lifecycle ownership.
+A product keeps its AI admission between steps, then releases it when saved AI
+results are closed or an explicit admission pause has no live execution lease.
+Archive/publication work and retained historical UNKNOWN evidence do not by
+themselves occupy this budget. The ProductWork object's legacy top-level
+`slot_held` still represents lifecycle ownership; use its independent
+`admission_control` state/version for pause and resume. See the
+[deployment contract](deployment.md) for capability checks and deployment order.
 
 After a product has completed with saved results and confirmed archives, callers
 can use the [versioned product resume API](deployment.md#已完成商品沿原会话接续)
