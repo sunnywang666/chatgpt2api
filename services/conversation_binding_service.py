@@ -2621,13 +2621,42 @@ class ConversationBindingService:
                     # proves our turn finished. Use this request's unique branch.
                     failure_phase = "cursor_read"
                     try:
-                        recovered = self._read_text_request_result(backend, {
+                        original_cursor = {
                             "provider_binding_id": binding_id, "provider_account_identity": account_identity,
                             "client_conversation_id": client_conversation_id, "conversation_id": returned_conversation_id,
                             "request_message_id": backend.text_request_message_id,
                             "request_parent_message_id": getattr(backend, "text_request_parent_message_id", ""),
-                        }, deadline_monotonic=time.monotonic() + self.RECOVERY_EXACT_READ_TIMEOUT_SECONDS)
+                        }
+                        def read_original(_owner=None, _request_id=None):
+                            return self._read_text_request_result(backend, original_cursor,
+                                deadline_monotonic=time.monotonic() + self.RECOVERY_EXACT_READ_TIMEOUT_SECONDS)
+                        from services.request_context import current_request
+                        context = current_request.get()
+                        admission = getattr(context, "admission", None)
+                        admit = getattr(admission, "read_original_if_ready", None)
+                        admitted = NotImplemented
+                        if (callable(admit) and callable(getattr(context, "receipt", None))
+                                and getattr(context, "kind", None) == "text"
+                                and getattr(context, "claim", None)):
+                            receipt = context.receipt()
+                            if (receipt and receipt.get("_claim_id") == context.claim
+                                    and receipt.get("_submission_started") is True
+                                    and all(receipt.get(key) == original_cursor[key] for key in (
+                                        "provider_binding_id", "provider_account_identity", "client_conversation_id",
+                                        "conversation_id", "request_message_id"))):
+                                admitted = admit(context.owner, context.request_id, read_original, receipt)
+                        if admitted is False:
+                            pending = ConversationBindingError(
+                                "original result read is waiting for admission",
+                                code="CONVERSATION_OUTCOME_UNKNOWN", provider_binding_id=binding_id,
+                                provider_account_identity=account_identity, conversation_id=returned_conversation_id,
+                                original_failure_phase=failure_phase)
+                            pending._original_read_queued = True
+                            raise pending
+                        recovered = read_original() if admitted is NotImplemented else admitted
                     except Exception as exc:
+                        if isinstance(exc, ConversationBindingError) and getattr(exc, "_original_read_queued", False):
+                            raise
                         # The model turn was sent. An unproven GET result must
                         # retain occupancy and original-request recovery, even
                         # when the returned document has a foreign cursor.
