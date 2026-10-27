@@ -8,19 +8,23 @@ from services.conversation_binding_service import ConversationBindingService
 from services.product_work import ProductWorkService
 from services.text_task_service import TextTaskService
 from services.work_lifecycle import WorkLifecycleError
-from test.test_combined_copy_derivation import branch, legacy_prompt
+from test.test_combined_copy_derivation import WBOZ_CURRENT_CASES, branch, legacy_prompt
 from test.test_incomplete_compact_successor import install_incomplete
 from test.test_no_final_successor import (product_no_final, product_lifecycle,
     complete_product_no_final_successor)
 from test.test_explicit_unknown_successor import row, update
 
 
-def compact(h, incomplete=False):
+def compact(h, incomplete=False, *, prompt=None, input_body=None):
+    prompt = legacy_prompt([branch(0), branch(1)]) if prompt is None else prompt
     h.body = h.service.store.load_input(row(h.service)["_input_ref"])
-    h.body.update(model="gpt-5-6-thinking", thinking_effort="high", messages=[{
-        "role": "user", "content": [{"type": "text", "text": legacy_prompt([branch(0), branch(1)])},
-        {"type": "text", "text": '{"image_ref":"source-a"}'},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}}]}])
+    if input_body is not None:
+        h.body.update(deepcopy(input_body))
+    else:
+        h.body.update(model="gpt-5-6-thinking", thinking_effort="high", messages=[{
+            "role": "user", "content": [{"type": "text", "text": prompt},
+            {"type": "text", "text": '{"image_ref":"source-a"}'},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}}]}])
     with h.service.store.transaction() as db:
         original = h.service.store.read_receipt(db, "text", "owner", "old")
         original.update(_input_ref=h.service.store.save_input(h.body), model=h.body["model"],
@@ -32,7 +36,7 @@ def compact(h, incomplete=False):
         db.execute("UPDATE requests SET request_hash=? WHERE owner='owner' AND id='old'",
                    (TextTaskService._submission_identity("owner", h.body)[1],))
     if incomplete:
-        install_incomplete(h)
+        install_incomplete(h, prompt=prompt, input_body=input_body)
     else:
         h.envelope = {k: v for k, v in h.body.items() if k in TextTaskService.SUPERSEDE_FIELDS}
         h.envelope.update(client_request_id="successor", supersedes_request_id="old",
@@ -295,6 +299,21 @@ def test_compact_save_close_readback_restart_resume(product_no_final, monkeypatc
     with h.service.store.connect() as db:
         parent = h.service.store.runtime(db, original["_product_work_key"])
     assert parent.get("fairness") == original["_product_work"].get("fairness")
+
+
+@pytest.mark.parametrize("case", WBOZ_CURRENT_CASES, ids=lambda case: case["name"])
+def test_current_compact_no_final_close_revalidation_keeps_frozen_input(product_no_final, monkeypatch, case):
+    h = product_no_final
+    original, successor = compact(h, input_body=case["input"])
+    product, lifecycle, calls, identity = product_lifecycle(h)
+
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    assert lifecycle.process_one()
+    assert calls == [("owner", "successor", True)]
+    assert h.service.store.load_input(row(h.service)["_input_ref"])["messages"] == h.body["messages"]
+    assert h.service.store.load_input(row(h.service, "successor")["_input_ref"])["messages"] == h.body["messages"]
+    assert row(h.service, "successor")["content"] == successor["content"]
+    assert row(h.service) == original
 
 
 @pytest.mark.parametrize("incomplete", [False, True])
