@@ -172,6 +172,183 @@ class AdmissionTests(unittest.TestCase):
         self.assertFalse(recovery is not None and recovery.is_alive())
         self.assertGreaterEqual(scan_count[0], 2)
 
+    def test_daemon_saves_result_and_replenishes_without_consumer_polling(self):
+        """The consumer can disconnect after acceptance; Provider owns progress."""
+        first_started, release_first = threading.Event(), threading.Event()
+        finished = {name: threading.Event() for name in ("first", "next")}
+        sends = []
+
+        def runner(body, on_cursor):
+            context = current_request.get()
+            context.before_send()
+            sends.append(context.request_id)
+            if context.request_id == "first":
+                first_started.set()
+                self.assertTrue(release_first.wait(5))
+            else:
+                # The next send observes the first result already committed.
+                with self.store.connect() as db:
+                    saved = self.store.read_receipt(db, "text", "happy", "first")
+                self.assertEqual(saved["status"], "succeeded")
+                self.assertEqual(saved["content"], "saved-first")
+            return {"content": "saved-" + context.request_id}
+
+        self.text.runner = runner
+        execute = self.admission.execute
+        def observed_execute(context):
+            try:
+                execute(context)
+            finally:
+                finished[context.request_id].set()
+        self.admission.execute = observed_execute
+        self.submit("first")
+        self.submit("next")
+        with patch.object(self.text, "read", side_effect=AssertionError("consumer read is not required")), \
+             patch.object(self.admission, "_start_image_capability_refresh", return_value=None):
+            self.admission.start()
+            try:
+                self.assertTrue(first_started.wait(3))
+                self.assertEqual(sends, ["first"])
+                with self.store.connect() as db:
+                    self.assertEqual(self.store.read_receipt(db, "text", "happy", "next")["status"], "queued")
+                release_first.set()
+                self.assertTrue(finished["next"].wait(3))
+                self.assertTrue(finished["first"].wait(3))
+            finally:
+                release_first.set()
+                self.admission.stop()
+                for event in finished.values():
+                    event.wait(3)
+                if self.admission._recovery_thread is not None:
+                    self.admission._recovery_thread.join(2)
+        self.assertEqual(sends, ["first", "next"])
+        restarted = TextTaskService(self.store.path, runner=lambda *_a, **_k: self.fail("must not resend"))
+        for name in finished:
+            saved = restarted.read_snapshot("happy", name)
+            self.assertEqual(saved["status"], "succeeded")
+            self.assertEqual(saved["content"], "saved-" + name)
+
+    def test_image_daemon_saves_result_and_replenishes_without_consumer_polling(self):
+        first_started, release_first = threading.Event(), threading.Event()
+        finished = {name: threading.Event() for name in ("image-first", "image-next")}
+        sends = []
+        self.admission.settings = lambda: {"image_account_concurrency": 1, "codex_max_concurrency": 1}
+
+        def generate(payload):
+            context = current_request.get()
+            context.before_send()
+            sends.append(context.request_id)
+            if context.request_id == "image-first":
+                first_started.set()
+                self.assertTrue(release_first.wait(5))
+            else:
+                with self.store.connect() as db:
+                    saved = self.store.read_receipt(db, "image", "happy", "image-first")
+                self.assertEqual(saved["status"], "success")
+                self.assertEqual(saved["data"], [{"b64_json": "aGVsbG8="}])
+            return {"data": [{"b64_json": "aGVsbG8="}],
+                    "_provider_binding_id": payload["provider_binding_id"],
+                    "_provider_account_identity": payload["provider_account_identity"],
+                    "_conversation_id": "chat-" + context.request_id,
+                    "_parent_message_id": "final-" + context.request_id}
+
+        self.images = ImageTaskService(self.root / "image_tasks.json", admission=self.admission,
+                                       store=self.store, generation_handler=generate)
+        self.admission.register("image", lambda ctx, body: self.images._run_task(
+            ctx.owner + ":" + ctx.request_id, body["mode"], body["payload"], body["identity"], "gpt-image-2"))
+        execute = self.admission.execute
+        def observed_execute(context):
+            try:
+                execute(context)
+            finally:
+                finished[context.request_id].set()
+        self.admission.execute = observed_execute
+        self.image("image-first")
+        self.image("image-next")
+        with patch.object(self.images, "list_tasks", side_effect=AssertionError("consumer read is not required")), \
+             patch.object(self.admission, "_start_image_capability_refresh", return_value=None):
+            self.admission.start()
+            try:
+                self.assertTrue(first_started.wait(3))
+                self.assertEqual(sends, ["image-first"])
+                release_first.set()
+                self.assertTrue(finished["image-next"].wait(3))
+                self.assertTrue(finished["image-first"].wait(3))
+            finally:
+                release_first.set()
+                self.admission.stop()
+                for event in finished.values():
+                    event.wait(3)
+                if self.admission._recovery_thread is not None:
+                    self.admission._recovery_thread.join(2)
+        self.assertEqual(sends, ["image-first", "image-next"])
+        with self.store.connect() as db:
+            for name in finished:
+                saved = self.store.read_receipt(db, "image", "happy", name)
+                self.assertEqual(saved["status"], "success")
+                self.assertEqual(saved["data"], [{"b64_json": "aGVsbG8="}])
+
+    def test_restarted_daemon_recovers_original_and_replenishes_without_consumer(self):
+        """Persisted UNKNOWN needs only the Provider's original-read worker."""
+        from unittest.mock import Mock
+        from test.test_unknown_turn_recovery import document
+
+        self.submit("original")
+        self.text._update(
+            "happy", "original", status="unknown", _submission_started=True,
+            _turn_reserved=True, _executing=False, upstream_outcome="unknown",
+            provider_binding_id="binding-0", provider_account_identity="account-0",
+            conversation_id="original-conversation", request_message_id="original-user",
+            request_parent_message_id="parent", recovery_next_at=0,
+        )
+        self.submit("next-after-recovery")
+        self.assertIsNone(self.admission.claim_next())
+        original_reads, sends = [], []
+        finished = threading.Event()
+
+        def reader(receipt):
+            original_reads.append(receipt["request_id"])
+            upstream = document(receipt)
+            upstream["mapping"][upstream["current_node"]]["message"]["content"]["parts"] = ["recovered-original"]
+            return ConversationBindingService._read_text_request_result(Mock(), receipt, document=upstream)
+
+        def runner(body, on_cursor):
+            context = current_request.get()
+            context.before_send()
+            sends.append(context.request_id)
+            return {"content": "next-result"}
+
+        # Rebuild the service from disk before starting the ordinary daemon.
+        self.text = TextTaskService(self.store.path, runner=runner, recovery_reader=reader,
+                                    admission=self.admission, clock=self.clock)
+        self.admission.recoveries["text"] = self.text.read
+        execute = self.admission.execute
+        def observed_execute(context):
+            try:
+                execute(context)
+            finally:
+                finished.set()
+        self.admission.execute = observed_execute
+        with patch.object(self.admission, "_start_image_capability_refresh", return_value=None):
+            self.admission.start()
+            try:
+                self.assertTrue(finished.wait(4))
+            finally:
+                self.admission.stop()
+                if self.admission._recovery_thread is not None:
+                    self.admission._recovery_thread.join(2)
+        self.assertEqual(original_reads, ["original"])
+        self.assertEqual(sends, ["next-after-recovery"])
+        with self.store.connect() as db:
+            original = self.store.read_receipt(db, "text", "happy", "original")
+            following = self.store.read_receipt(db, "text", "happy", "next-after-recovery")
+        self.assertEqual(original["status"], "succeeded")
+        self.assertEqual(original["content"], "recovered-original")
+        self.assertEqual(original["request_message_id"], "original-user")
+        self.assertFalse(original["_turn_reserved"])
+        self.assertEqual(following["status"], "succeeded")
+        self.assertEqual(following["content"], "next-result")
+
     def test_recovery_candidate_reads_preserve_terminal_payloads_and_late_completion(self):
         large_saved = [{"b64_json": "completed-payload-must-not-be-decoded" * 10000}]
         rows = {

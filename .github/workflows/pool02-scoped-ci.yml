@@ -18,6 +18,7 @@ on:
       - api/company_requests.py
       - api/external_images.py
       - api/send_hold_control.py
+      - api/task_results.py
       - services/account_request_pacing.py
       - services/account_service.py
       - services/oauth_login_service.py
@@ -81,6 +82,7 @@ on:
       - test/test_reconcile_queued_successor.py
       - test/test_ci_fallback_workflow.py
       - test/test_ci_fallback_observer.py
+      - test/test_task_results.py
   workflow_dispatch:
     inputs:
       source_sha:
@@ -189,4 +191,5 @@ jobs:
             test/test_recovery_scan_progress.py \
             test/test_reconcile_queued_successor.py \
             test/test_ci_fallback_workflow.py \
-            test/test_ci_fallback_observer.py
+            test/test_ci_fallback_observer.py \
+            test/test_task_results.py
