@@ -19,6 +19,9 @@ on:
       - api/external_images.py
       - api/send_hold_control.py
       - api/task_results.py
+      - api/generation_completion.py
+      - services/generation_completion.py
+      - test/test_generation_completion.py
       - services/account_request_pacing.py
       - services/account_service.py
       - services/oauth_login_service.py
@@ -160,6 +163,7 @@ jobs:
             test/test_explicit_unknown_successor.py \
             test/test_public_chat_sessions.py \
             test/test_work_lifecycle.py \
+            test/test_generation_completion.py \
             test/test_no_final_successor.py \
             test/test_combined_copy_derivation.py \
             test/test_account_request_pacing.py \
