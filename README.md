@@ -215,6 +215,27 @@ environment:
 
 已有 SSE 通知协议仍为 `task-notification-v1`，只提示结果可能就绪。工作台收到提示后通过上述只读接口核实，再幂等保存业务成果并推进下一步；通知丢失时可有界补读。旧查询接口保持兼容，其可能触发原结果恢复或清理的行为不属于本接口的只读保证。
 
+### 工作台的结果读取、原结果补取与重新尝试
+
+这三种操作必须由调用方明确区分。现有接口已经支持原结果补取，无需为了统一名称增加另一套恢复状态机：
+
+| 意图 | 现有入口 | 边界 |
+| --- | --- | --- |
+| 读取已保存结果 | `GET /api/task-results/{kind}/{request_id}` | 纯读取；正常状态检查和通知后的核实使用它。 |
+| 补取原文字答案 | `POST /api/conversation-bindings/text-requests/{request_id}/recover` | 按原 owner、请求和会话读取；受原暂停、租约与退避约束，不创建新生成请求。 |
+| 补取原图片结果或继续下载 | `POST /api/image-tasks/{task_id}/resume-poll` | 继续原任务的查询或下载；不创建新生图请求。 |
+| 读取保存的图片 | `GET /api/image-tasks/{task_id}/images/{index}` | 按原所有者和成功回执授权下载；不重新生图。 |
+
+补取入口的 `allow_unrecoverable_retry` 默认为 `false`。它与 completion 的 `allow_unconfirmed_retry` 不是同一权限；不能仅因名称含 retry 就互相替换。已有明确允许重新检查原结果的分支应显式调用补取入口，普通结果读取不得暗中升级为补取。补取返回 HTTP 200 也可能仍为等待、延期或结果未知，调用方必须检查回执，不能据此推进为成功。
+
+重新尝试目前有不同的适用范围，不能将一种入口的权限套用到另一种：
+
+- 内部绑定文本通过 `POST /api/conversation-bindings/text` 的 `retry_unsent_request_id` 或 `supersedes_request_id` 引用原请求。调用方提供后继请求 ID 和既定绑定身份，Provider 从保存的原输入重建请求并检查 hash、原请求资格、活动占用、会话顺序和单后继；不允许凭普通 UNKNOWN 或仅 HTTP 超时重发。`retry_unsent_request_id` 是特定已证未发场景的新子请求，不等同于任意原 ID 重排。
+- 普通客户端的 `POST /api/chat-requests/{id}/completion` 和 `POST /api/image-tasks/{id}/completion` 使用既有有界 completion 内核。内部管理员图片只允许受限的原结果补取，不能通过此入口授权 replacement；内部绑定文本也不能冒充普通 Chat receipt 进入该策略。公司入口保持其既有原任务恢复及成果确认限制。
+- 工作台可先接入上表的纯读和明确补取，保留当前重新尝试的严格分支。内部绑定任务的通用新尝试入口仍未实现；在替代入口提供等价保护并通过验证之前，不删除既有后继协议，也不通过改写 receipt 的 route、伪造未发送状态或放宽权限来适配。
+
+工作台保留商品质量判断、业务重试预算、原业务 ID、成果采用与发布；账号池保留原输入、实际收发、账号与物理会话顺序、原结果保存及防重。商品属性或文案派生规则迁移不属于接口改名，需在消费者接齐后单独验证。
+
 ## API
 
 所有 AI 接口都需要请求头：
