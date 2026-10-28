@@ -969,6 +969,184 @@ def test_admin_image_completion_does_not_queue_a_proven_not_sent_original(failed
     assert service.text.admission.claim_next() is None
 
 
+def test_bound_image_retry_takes_over_automatic_budget_without_unknown_replacement(failed_unsent_image):
+    service = failed_unsent_image
+    admin = {"id": "admin", "role": "admin"}
+    with service.store.transaction() as db:
+        receipt = service.store.read_receipt(db, "image", "owner", "repair-image")
+        source = service.store.load_input(receipt["_input_ref"])
+        source["identity"] = admin
+        receipt.update(owner_id="admin", _input_ref=service.store.save_input(source),
+                       _completion={"state": "checking_original", "allow_unconfirmed_retry": False,
+                                    "automatic_failure_retry": True, "max_extra_requests": 1, "next_at": 0})
+        service.store.write_receipt(db, "image", "admin", "repair-image", receipt)
+        db.execute("DELETE FROM image_requests WHERE task_key=?", ("owner:repair-image",))
+
+    first = service.start("image", admin, "repair-image", trusted_bound_retry=True)
+    assert first["original_status"] == "queued"
+    with service.store.connect() as db:
+        current = service.store.read_receipt(db, "image", "admin", "repair-image")
+    assert current["_completion"]["bound_retry"] is True
+    assert current["_completion"]["max_extra_requests"] == 0
+    assert "automatic_failure_retry" not in current["_completion"]
+    assert current["_completion"]["allow_unconfirmed_retry"] is False
+
+    with service.store.transaction() as db:
+        current = service.store.read_receipt(db, "image", "admin", "repair-image")
+        current.update(status="unknown", upstream_outcome="unknown", _submission_started=True,
+                       upstream_submission_started=True,
+                       _execution_timeline=[{"stage": "send_call_started", "at": service.clock()}],
+                       _completion_read_at=service.clock())
+        service.store.write_receipt(db, "image", "admin", "repair-image", current)
+    service.clock.now += service.STALL_SECONDS + service.INVESTIGATION_SECONDS + 1
+    service.advance("image", "admin", "repair-image")
+    with service.store.connect() as db:
+        current = service.store.read_receipt(db, "image", "admin", "repair-image")
+        assert "replacement_id" not in current["_completion"]
+        assert db.execute("SELECT count(*) FROM image_requests WHERE task_key LIKE 'admin:%'").fetchone()[0] == 1
+
+
+def test_admin_bound_text_default_recover_reads_original_without_child_or_send(setup, monkeypatch):
+    import api.generation_completion as api
+
+    service, _, calls = setup
+    admin = {"id": "admin", "role": "admin"}
+    with service.store.transaction() as db:
+        receipt = service.store.read_receipt(db, "text", "owner", "old-0")
+        body = service.store.load_input(receipt["_input_ref"])
+        body.pop("_public_route", None); body.pop("_public_session_ref", None)
+        receipt.update(_input_ref=service.store.save_input(body), status="unknown",
+                       error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_outcome="unknown",
+                       _recovery_paused=True, _executing=False, _turn_reserved=False)
+        receipt.pop("route", None); receipt.pop("_public_session_ref", None)
+        db.execute("UPDATE requests SET owner='admin' WHERE owner='owner' AND id='old-0'")
+        service.store.write_receipt(db, "text", "admin", "old-0", receipt)
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id=?",
+                   (service.text._submission_identity("admin", body)[1], "admin", "old-0"))
+
+    monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
+    monkeypatch.setattr(api, "require_identity", lambda *_args, **_kwargs: admin)
+    monkeypatch.setattr(api, "require_chat_text_policy", lambda *_args, **_kwargs: None)
+    app = FastAPI(); app.include_router(api.create_router("text"))
+    response = TestClient(app).post("/api/chat-requests/old-0/completion", json={})
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "unknown" and calls == []
+    with service.store.connect() as db:
+        assert service.store.read_receipt(db, "text", "admin", "old-0")["status"] == "unknown"
+        assert db.execute("SELECT count(*) FROM requests WHERE owner='admin' AND id != 'old-0'").fetchone()[0] == 0
+
+
+def test_admin_bound_text_no_final_retry_is_idempotent_and_result_get_reads_child(setup, monkeypatch):
+    import api.generation_completion as api
+    import api.task_results as task_results
+
+    service, _, calls = setup
+    admin = {"id": "admin", "role": "admin"}
+    with service.store.transaction() as db:
+        receipt = service.store.read_receipt(db, "text", "owner", "old-0")
+        body = service.store.load_input(receipt["_input_ref"])
+        body.pop("_public_route", None); body.pop("_public_session_ref", None)
+        body.update(provider_binding_id=receipt["provider_binding_id"],
+                    provider_account_identity=receipt["provider_account_identity"],
+                    conversation_id=receipt["conversation_id"],
+                    parent_message_id=receipt["request_parent_message_id"])
+        receipt.update(_input_ref=service.store.save_input(body), status="failed", error_code="RESULT_UNRECOVERABLE",
+                       upstream_outcome="unknown", recovery_reason="REQUEST_RESULT_NOT_FOUND",
+                       recovery_no_result_reads=3, _attempt_reason="ORIGINAL_RESULT_NO_FINAL",
+                       _attempt_finished_at=service.clock(), _execution_wait_ended_at=service.clock(),
+                       _submission_started=True, _last_sent_sequence=0, send_count=1,
+                       _expected_sends=1, _executing=False, _claim_id=None, _claim_until=None,
+                       recovery_claim_id=None, recovery_lease_until=None,
+                       _recovery_claim_id=None, _recovery_claim_until=None, _turn_reserved=False,
+                       parent_message_id=body["parent_message_id"])
+        for key in ("route", "_public_session_ref", "_work_key", "_completion", "_completion_of",
+                    "_recovery_paused", "_recovery_suppressed"):
+            receipt.pop(key, None)
+        db.execute("UPDATE requests SET owner='admin' WHERE owner='owner' AND id='old-0'")
+        service.store.write_receipt(db, "text", "admin", "old-0", receipt)
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id=?",
+                   (service.text._submission_identity("admin", body)[1], "admin", "old-0"))
+
+    monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
+    monkeypatch.setattr(api, "require_identity", lambda *_args, **_kwargs: admin)
+    monkeypatch.setattr(api, "require_chat_text_policy", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(task_results, "text_task_service", service.text)
+    monkeypatch.setattr(task_results, "require_identity", lambda *_args, **_kwargs: admin)
+    monkeypatch.setattr(task_results, "require_chat_text_policy", lambda *_args, **_kwargs: None)
+    app = FastAPI(); app.include_router(api.create_router("text")); app.include_router(task_results.create_router())
+    client = TestClient(app)
+    first = client.post("/api/chat-requests/old-0/completion", json={"action": "retry"})
+    assert first.status_code == 200, first.text
+    child_id = first.json()["attempt_id"]
+    assert first.json() == {"protocol": "task-attempt-v1", "kind": "text", "original_id": "old-0",
+                            "attempt_id": child_id, "status": "queued", "result_ready": False,
+                            "existing": False, "created": True}
+    repeat = client.post("/api/chat-requests/old-0/completion", json={"action": "retry"})
+    assert repeat.status_code == 200 and repeat.json()["attempt_id"] == child_id
+    assert repeat.json()["existing"] is True and calls == []
+    with service.store.transaction() as db:
+        child = service.store.read_receipt(db, "text", "admin", child_id)
+        child.update(status="failed", error_code="RESULT_UNRECOVERABLE", upstream_outcome="unknown")
+        service.store.write_receipt(db, "text", "admin", child_id, child)
+    unknown = client.post("/api/chat-requests/old-0/completion", json={"action": "retry"})
+    saved_unknown = client.get(f"/api/task-results/text/{child_id}")
+    assert unknown.json()["status"] == saved_unknown.json()["status"] == "unknown"
+    assert unknown.json()["attempt_id"] == child_id and unknown.json()["result_ready"] is False
+    with service.store.transaction() as db:
+        child = service.store.read_receipt(db, "text", "admin", child_id)
+        child.update(status="succeeded", content="saved child", upstream_outcome="completed")
+        service.store.write_receipt(db, "text", "admin", child_id, child)
+    result = client.get(f"/api/task-results/text/{child_id}")
+    assert result.status_code == 200 and result.json()["result"] == {"content": "saved child"}
+    assert result.json()["result_ready"] is True
+
+
+def test_admin_image_retry_api_reuses_same_id_and_preserves_unknown(failed_unsent_image, monkeypatch):
+    import api.generation_completion as api
+
+    service = failed_unsent_image
+    admin = {"id": "admin", "role": "admin"}
+    with service.store.transaction() as db:
+        receipt = service.store.read_receipt(db, "image", "owner", "repair-image")
+        source = service.store.load_input(receipt["_input_ref"])
+        source["identity"] = admin
+        receipt.update(owner_id="admin", _input_ref=service.store.save_input(source))
+        receipt.pop("_completion", None)
+        service.store.write_receipt(db, "image", "admin", "repair-image", receipt)
+        db.execute("DELETE FROM image_requests WHERE task_key=?", ("owner:repair-image",))
+    monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
+    monkeypatch.setattr(api, "require_identity", lambda *_args, **_kwargs: admin)
+    monkeypatch.setattr(api, "require_image_policy", lambda *_args, **_kwargs: None)
+    app = FastAPI(); app.include_router(api.create_router("image")); client = TestClient(app)
+    first = client.post("/api/image-tasks/repair-image/completion", json={"action": "retry"})
+    assert first.status_code == 200 and first.json()["attempt_id"] == "repair-image"
+    assert first.json()["created"] is True and first.json()["status"] == "queued"
+    repeat = client.post("/api/image-tasks/repair-image/completion", json={"action": "retry"})
+    assert repeat.status_code == 200 and repeat.json()["existing"] is True and repeat.json()["created"] is False
+    with service.store.transaction() as db:
+        receipt = service.store.read_receipt(db, "image", "admin", "repair-image")
+        receipt.update(status="unknown", upstream_outcome="unknown", _submission_started=True,
+                       upstream_submission_started=True)
+        service.store.write_receipt(db, "image", "admin", "repair-image", receipt)
+    unknown = client.post("/api/image-tasks/repair-image/completion", json={"action": "retry"})
+    assert unknown.status_code == 200 and unknown.json()["status"] == "unknown"
+    assert unknown.json()["existing"] is True and unknown.json()["created"] is False
+    with service.store.transaction() as db:
+        receipt = service.store.read_receipt(db, "image", "admin", "repair-image")
+        receipt.update(status="success", upstream_outcome="completed", data=[{"b64_json": "aW1hZ2U="}])
+        service.store.write_receipt(db, "image", "admin", "repair-image", receipt)
+    service.advance("image", "admin", "repair-image")
+    completed = client.post("/api/image-tasks/repair-image/completion", json={"action": "retry"})
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["attempt_id"] == "repair-image"
+    assert completed.json()["result_ready"] is True and completed.json()["existing"] is True
+    assert completed.json()["created"] is False
+    with service.store.connect() as db:
+        receipt = service.store.read_receipt(db, "image", "admin", "repair-image")
+        assert "replacement_id" not in receipt["_completion"]
+        assert db.execute("SELECT count(*) FROM image_requests WHERE task_key LIKE 'admin:%'").fetchone()[0] == 1
+
+
 def test_api_owner_isolation_and_explicit_saved_reviewed_ack(setup, monkeypatch):
     import api.generation_completion as api
     service, admission, calls = setup

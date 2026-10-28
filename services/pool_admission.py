@@ -2834,6 +2834,32 @@ class PoolAdmission:
                 original_work = self.store.runtime(db, original.get("_work_key", ""))
                 if original_work and original_work.get("state") != "active":
                     raise AdmissionLost("WORK_NOT_ACTIVE")
+            if context.kind == "text" and r.get("_retry_unsent_of"):
+                # _run validates this relationship before binding/network I/O.
+                # Re-run the same retained-input and original-eligibility
+                # derivation at the irreversible send edge: P may have been
+                # paused or its input/hash may have changed after that first
+                # check but before this transaction.
+                from services.conversation_binding_service import ConversationBindingError
+                from services.text_task_service import TextTaskService
+                original_id = r["_retry_unsent_of"]
+                row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                 (context.owner, original_id)).fetchone()
+                try:
+                    if not row or r.get("_retry_unsent_input_hash") != row[0]:
+                        raise ValueError
+                    original = json.loads(row[1])
+                    retained = self.store.load_input(original["_input_ref"])
+                    stored = self.store.load_input(r["_input_ref"])
+                    envelope = {key: stored.get(key) for key in TextTaskService.RETRY_UNSENT_FIELDS}
+                    expected = TextTaskService._unsent_retry_body_at(
+                        context.owner, original_id, row[0], original, retained, envelope,
+                        context.request_id, now=now,
+                    )
+                    if stored != expected:
+                        raise ValueError
+                except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
+                    raise AdmissionLost("unsent retry original changed before send") from None
             requested = r.get("_requested_account_identity")
             if (r.get("_requested_account_ref") and not requested
                     or requested and r.get("provider_account_identity") != requested):

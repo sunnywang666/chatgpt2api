@@ -3388,18 +3388,19 @@ class TextTaskService:
                 return False
         return True
 
-    def _unsent_retry_body(self, owner, original_id, original_hash, original, retained, envelope, request_id):
+    @classmethod
+    def _unsent_retry_body_at(cls, owner, original_id, original_hash, original, retained, envelope, request_id, *, now):
         """Derive the sole permitted child input without exposing P's messages."""
         def invalid():
             raise ConversationBindingError("unsent retry envelope is invalid", code="CHAT_UNSENT_RETRY_INVALID")
-        if (set(envelope) != self.RETRY_UNSENT_FIELDS or not owner
+        if (set(envelope) != cls.RETRY_UNSENT_FIELDS or not owner
                 or any(not isinstance(envelope.get(key), str) or not envelope[key].strip()
-                      or envelope[key] != envelope[key].strip() for key in self.RETRY_UNSENT_FIELDS)
+                      or envelope[key] != envelope[key].strip() for key in cls.RETRY_UNSENT_FIELDS)
                 or request_id != envelope.get("client_request_id")
                 or original_id != envelope.get("retry_unsent_request_id")
                 or request_id == original_id
-                or self._submission_identity(owner, retained) != (original_id, original_hash)
-                or not self._known_unsent_binding_retry_source(original, self._now())):
+                or cls._submission_identity(owner, retained) != (original_id, original_hash)
+                or not cls._known_unsent_binding_retry_source(original, now)):
             invalid()
         # Four durable binding identities cannot be rebound.  B is a fresh
         # parent cursor and is validated by the normal binding runner outside
@@ -3440,6 +3441,10 @@ class TextTaskService:
                 "conversation_id": envelope["conversation_id"],
                 "parent_message_id": envelope["parent_message_id"],
                 "product_work": new_product}
+
+    def _unsent_retry_body(self, owner, original_id, original_hash, original, retained, envelope, request_id):
+        return self._unsent_retry_body_at(owner, original_id, original_hash, original, retained, envelope,
+                                          request_id, now=self._now())
 
     def _unsent_retry_input(self, owner, envelope):
         request_id = envelope.get("client_request_id")
@@ -4174,6 +4179,93 @@ class TextTaskService:
         if other:
             reject("CHAT_UNSENT_RETRY_CONFLICT")
         receipt.update(_retry_unsent_of=original_id, _retry_unsent_input_hash=row[0])
+
+    def retry_bound_attempt(self, owner, request_id):
+        """Resolve the original or its sole child, or authorize one strict retry."""
+        def ready(receipt):
+            return bool(receipt.get("status") == "succeeded"
+                        and isinstance(receipt.get("content"), str) and receipt["content"].strip())
+
+        def snapshot():
+            # Selection/cancellation shares the final send transaction. Never
+            # decide to cancel from an earlier read-only snapshot.
+            with self.store.transaction() as db:
+                row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                 (owner, request_id)).fetchone()
+                if not row:
+                    raise ConversationBindingError("request not found", code="CHAT_REQUEST_NOT_FOUND")
+                original = json.loads(row[1])
+                children = db.execute(
+                    "SELECT receipt FROM requests WHERE owner=? AND "
+                    "(json_extract(receipt,'$._retry_unsent_of')=? OR "
+                    "json_extract(receipt,'$._supersedes_request_id')=?) LIMIT 2",
+                    (owner, request_id, request_id),
+                ).fetchall()
+                if len(children) > 1:
+                    raise ConversationBindingError("bound retry has conflicting children", code="CHAT_SUPERSEDE_CONFLICT")
+                if children:
+                    child = json.loads(children[0][0])
+                    timeline = child.get("_execution_timeline")
+                    unsent = (
+                        child.get("_submission_started") is False
+                        and child.get("upstream_submission_started") in (None, False)
+                        and type(child.get("send_count", 0)) is int and child.get("send_count", 0) == 0
+                        and child.get("_last_sent_sequence") is None
+                        and child.get("upstream_outcome") in (None, "not_sent", "not_submitted")
+                        and not child.get("upstream_unfinished")
+                        and isinstance(timeline, list)
+                        and all(isinstance(event, dict) and event.get("stage") in {
+                            "accepted", "execution_claimed", "task_finished"} for event in timeline)
+                        and (child.get("status") in {"queued", "running"}
+                             or child.get("status") == "failed" and child.get("upstream_outcome") == "not_sent")
+                    )
+                    if ready(original) and unsent:
+                        from services.generation_completion import cancel_unsubmitted_replacement
+                        cancel_unsubmitted_replacement(self.store, db, "text", owner, request_id,
+                                                       original, child["request_id"], child)
+                        return row[0], original, {"attempt": self._public(original), "existing": True,
+                                                  "result_ready": True}
+                    # Sent or ambiguous children keep their identity. An old
+                    # answer cannot silently replace an in-flight attempt.
+                    return row[0], original, {"attempt": self._public(child), "existing": True,
+                                              "result_ready": ready(child)}
+                if ready(original):
+                    return row[0], original, {"attempt": self._public(original), "existing": True,
+                                              "result_ready": True}
+                return row[0], original, None
+
+        request_hash, original, selected = snapshot()
+        if selected:
+            return selected
+        now = self._now()
+        if self._known_unsent_binding_retry_source(original, now):
+            # Network reads stay outside SQLite's write transaction. Acceptance
+            # and before_send revalidate this original/input after the read.
+            cursor = conversation_binding_service.bound_unsent_retry_cursor(original)
+            retained = self.store.load_input(original["_input_ref"])
+            child_id = "bound-retry-" + uuid.uuid4().hex
+            envelope = {"retry_unsent_request_id": request_id, "client_request_id": child_id, **cursor}
+            body = self._unsent_retry_body(owner, request_id, request_hash, original, retained, envelope, child_id)
+        elif self._no_final_successor_source(original, now):
+            retained = self.store.load_input(original["_input_ref"])
+            if self._submission_identity(owner, retained) != (request_id, request_hash):
+                raise ConversationBindingError("original input changed", code="CHAT_BOUND_RETRY_NOT_ELIGIBLE")
+            body = {**retained, "client_request_id": "bound-retry-" + uuid.uuid4().hex,
+                    "supersedes_request_id": request_id, "continue_after_no_final": True}
+        else:
+            raise ConversationBindingError("bound retry is not eligible", code="CHAT_BOUND_RETRY_NOT_ELIGIBLE")
+        try:
+            attempt = self._submit_prepared(owner, body, source=original.get("_source"))
+            return {"attempt": attempt, "existing": False, "result_ready": ready(attempt)}
+        except ConversationBindingError as exc:
+            if exc.code not in {"CHAT_SUPERSEDE_ORIGINAL_FOUND", "CHAT_UNSENT_RETRY_CONFLICT", "CHAT_SUPERSEDE_CONFLICT"}:
+                raise
+            # A concurrent submit or late original may have won. Re-resolve
+            # under the same send fence instead of changing a sent child's ID.
+            _, _, selected = snapshot()
+            if selected:
+                return selected
+            raise
 
     @classmethod
     def _completed_historical_successor(cls, db, owner, previous_id, previous, original, now):
@@ -5217,6 +5309,10 @@ class TextTaskService:
                     except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
                         raise ConversationBindingError("unsent retry original changed",
                                                        code="CHAT_UNSENT_RETRY_ORIGINAL_CHANGED") from None
+                # The runner uses this execution-only original at both its
+                # initial bound-session read and the backend's pre-send read.
+                # It is never added to the immutable child input.
+                body = {**body, "_bound_unsent_retry_original": original}
             if receipt.get("_supersedes_request_id"):
                 with self.store.transaction() as db:
                     previous = self._validate_supersede(self.store, db, owner, receipt, self._now())
