@@ -20,7 +20,7 @@ from services.request_context import AdmissionLost, current_request
 from services.storage.json_storage import JSONStorageBackend
 from services.task_store import TaskStore
 from services.text_task_service import TextTaskService
-from test.test_combined_copy_derivation import WBOZ_CURRENT_CASES
+from test.test_combined_copy_derivation import WBOZ_CURRENT_CASES, WBOZ_STRUCTURED_CASES
 
 
 class Clock:
@@ -214,7 +214,7 @@ class QueuedCombinedCopyCompactionTests(unittest.TestCase):
                              for item in self.receipt("new-json")["_execution_timeline"]))
 
     def test_current_or_future_json_compact_input_first_sends_byte_for_byte(self):
-        cases = list(WBOZ_CURRENT_CASES)
+        cases = list(WBOZ_CURRENT_CASES) + [dict(case, name="structured-" + case["name"]) for case in WBOZ_STRUCTURED_CASES]
         future = deepcopy(WBOZ_CURRENT_CASES[0])
         future["name"] = "future-prompt-wording"
         payload = json.loads(future["input"]["messages"][0]["content"][0]["text"])
