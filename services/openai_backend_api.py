@@ -211,6 +211,30 @@ class _StreamHandoff:
         unsupported message operations discard that context rather than letting
         a later terminal patch accidentally certify stale state.
         """
+        # The protocol adapter accepts a bare string value as a text append.
+        # Apply the same update to this stream's anchored message so its final
+        # cursor cannot certify only the prefix of the delivered answer.
+        if set(event) == {"v"} and isinstance(event["v"], str):
+            current = self._message_frame.get("message", {})
+            content = current.get("content", {})
+            if not current:
+                return event
+            if not isinstance(content, dict) or content.get("content_type") != "text":
+                self._message_frame = {}
+                self._invalidate_terminal_cursor()
+                return event
+            parts = content.get("parts")
+            # The protocol appends to its whole accumulated text, whereas a
+            # parts/0 patch targets just one part. Only equate those operations
+            # for a single known text part. The protocol ignores shorthand
+            # deltas before any text has arrived.
+            if not isinstance(parts, list) or len(parts) != 1 or not isinstance(parts[0], str):
+                self._message_frame = {}
+                self._invalidate_terminal_cursor()
+                return event
+            if not parts[0]:
+                return event
+            event = {"p": "/message/content/parts/0", "o": "append", "v": event["v"]}
         message = self._message(event)
         if "message" in self._frame(event):
             message_id = self._clean_id(message.get("id"))
@@ -260,6 +284,7 @@ class _StreamHandoff:
                 "/message/content/parts/0", "/message/metadata/channel",
                 "/message/metadata/parent", "/message/metadata/parent_id",
                 "/message/metadata/is_visually_hidden_from_conversation",
+                "/message/metadata/is_complete",
             }
             for operation in operations:
                 path = operation.get("p") if isinstance(operation, dict) else None
@@ -271,6 +296,17 @@ class _StreamHandoff:
                     return event
                 keys = path.strip("/").split("/")
                 target = merged
+                # is_complete is descriptive metadata, never terminal proof.
+                # Its arrival must not erase the already-bound message before
+                # the independent status/end_turn/final-channel updates arrive.
+                if path == "/message/metadata/is_complete":
+                    if op != "remove" and type(operation.get("v")) is not bool:
+                        self._message_frame = {}
+                        self._invalidate_terminal_cursor()
+                        return event
+                    message_target = merged.get("message")
+                    if isinstance(message_target, dict) and "metadata" not in message_target:
+                        message_target["metadata"] = {}
                 for key in keys[:-1]:
                     target = target.get(key) if isinstance(target, dict) else None
                     if target is None:

@@ -1012,6 +1012,86 @@ def test_sparse_patch_reconstructs_exact_body_and_demotion_revokes_done():
     assert not handoff.accepts_ws_payload("[DONE]")
 
 
+@pytest.mark.parametrize("phase", ["initial_sse", "ws_catchup"])
+@pytest.mark.parametrize("updates", [
+    [{"v": " plus tail"}],
+    [{"p": "/message/metadata/is_complete", "o": "replace", "v": True}],
+    [{"v": " plus tail"}, {"p": "/message/metadata/is_complete", "o": "replace", "v": True}],
+])
+def test_content_delta_and_completion_metadata_preserve_exact_terminal(phase, updates):
+    events = [_final_start(metadata={}), *updates, *_terminal_updates("path_split")]
+    expected = "complete answer" + (" plus tail" if any(set(e) == {"v"} for e in updates) else "")
+    initial = _initial_events(handoff=False, ste=True)
+    frames = []
+    if phase == "initial_sse":
+        initial.lines[-1:-1] = list(map(_line, events))
+    else:
+        encoded = "\n".join([*(_line(e).decode() for e in events), "data: [DONE]"])
+        frames = [json.dumps({"type": "reply", "reply": {"topic_id": "conversation-turn-turn-1",
+            "catchups": [{"payload": {"payload": {"encoded_item": encoded}}}]}})]
+    backend = _backend(initial, frames=frames)
+    received = list(conversation_events(backend, prompt="fixture"))
+    assert "".join(e.get("delta", "") for e in received) == expected
+    assert backend.text_stream_terminal == {
+        "conversation_id": "conversation-1", "message_id": "final-leaf",
+        "original_message_id": "original-user", "text": expected,
+    }
+    assert len(backend.session.post_calls) == 1
+    assert len(backend.session.ws_calls) == (0 if phase == "initial_sse" else 1)
+
+
+@pytest.mark.parametrize("fields", [
+    {"channel": "analysis"}, {"parent": "foreign-user"},
+    {"content": {"content_type": "thoughts", "parts": ["thinking"]}},
+    {"author": {"role": "tool"}},
+])
+def test_completion_metadata_and_short_delta_do_not_certify_nonfinal_message(fields):
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps(_final_start(metadata={}, **fields)))
+    handoff.observe(json.dumps({"v": " plus tail"}))
+    handoff.observe(json.dumps({"p": "/message/metadata/is_complete", "o": "replace", "v": True}))
+    assert handoff.terminal_cursor() is None and not handoff.terminal_seen
+    for e in _terminal_updates("path_split"):
+        handoff.observe(json.dumps(e))
+    assert handoff.terminal_cursor() is None and not handoff.terminal_seen
+
+
+@pytest.mark.parametrize("parts, expected", [
+    (["prefix", " middle"], "prefix middle tail"),
+    ([""], ""),
+])
+def test_short_delta_unsupported_or_empty_parts_cannot_certify_wrong_text(parts, expected):
+    events = [_final_start(content={"content_type": "text", "parts": parts}),
+              {"v": " tail"}, *_terminal_updates("path_split")]
+    initial = _initial_events(handoff=False, ste=True)
+    initial.lines[-1:-1] = list(map(_line, events))
+    backend = _backend(initial)
+    received = list(conversation_events(backend, prompt="fixture"))
+    assert "".join(e.get("delta", "") for e in received) == expected
+    assert backend.text_stream_terminal is None
+    assert len(backend.session.post_calls) == 1
+
+
+def test_completion_metadata_without_container_preserves_anchor_but_does_not_finish():
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps(_final_start()))
+    handoff.observe(json.dumps({"p": "/message/metadata/is_complete", "o": "replace", "v": True}))
+    assert handoff.terminal_cursor() is None and not handoff.terminal_seen
+    for event in _terminal_updates("path_split"):
+        handoff.observe(json.dumps(event))
+    assert handoff.terminal_cursor()["text"] == "complete answer"
+
+
+@pytest.mark.parametrize("value", [None, "true", 1, {}, []])
+def test_malformed_completion_metadata_drops_anchor(value):
+    handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    handoff.observe(json.dumps(_final_start()))
+    handoff.observe(json.dumps({"p": "/message/metadata/is_complete", "o": "replace", "v": value}))
+    for event in _terminal_updates("path_split"):
+        handoff.observe(json.dumps(event))
+    assert handoff.terminal_cursor() is None and not handoff.terminal_seen
+
+
 def test_terminal_paths_need_a_message_anchor_and_cannot_cross_later_user_boundary():
     handoff = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
     for e in _terminal_updates("path_split"):
