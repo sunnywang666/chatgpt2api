@@ -43,6 +43,11 @@ WBOZ_CURRENT_CASES = tuple(json.loads(
 )["cases"])
 
 
+WBOZ_STRUCTURED_CASES = tuple(json.loads(
+    (Path(__file__).parent / "fixtures" / "wboz-structured-combined-copy.json").read_text(encoding="utf-8")
+)["cases"])
+
+
 def install(h, rows=None):
     rows = rows or [branch(0), branch(1, category="Brooch", variant="two")]
     h.body.update(model=MODEL, thinking_effort=EFFORT, messages=[{"role": "user", "content": [
@@ -129,7 +134,7 @@ def test_new_json_contract_passes_through_recognizer_without_compaction(task):
     with pytest.raises(ConversationBindingError): compact_retained_messages(body)
 
 
-@pytest.mark.parametrize("case", WBOZ_CURRENT_CASES, ids=lambda case: case["name"])
+@pytest.mark.parametrize("case", WBOZ_CURRENT_CASES + WBOZ_STRUCTURED_CASES, ids=lambda case: case["name"])
 def test_current_json_contract_derives_losslessly_for_wboz_producer_fixture(task, case):
     h = install(task); body = deepcopy(h.body)
     body.update(deepcopy(case["input"]))
@@ -330,3 +335,33 @@ def test_bound_runner_preserves_same_account_and_chat_with_fresh_send_guard(task
     assert observed[0]["conversation_id"] == h.body["conversation_id"] and observed[0]["model"] == MODEL
     finished = h.service.submit("owner", h.envelope)
     assert finished["status"] == "succeeded" and finished["derived_input"] == proof
+
+
+@pytest.mark.parametrize("change", ["branch_reference", "reply_reference", "empty_evidence", "unused_evidence",
+                                      "empty_payload_branch", "duplicate_key", "changed_prompt", "extra_field"])
+def test_structured_contract_keeps_strict_reference_and_instruction_validation(task, change):
+    h = install(task); body = deepcopy(h.body)
+    fixture = WBOZ_STRUCTURED_CASES[-1] if change == "empty_payload_branch" else WBOZ_STRUCTURED_CASES[0]
+    payload = json.loads(fixture["input"]["messages"][0]["content"][0]["text"])
+    frozen = payload["category_attribute_instructions"]
+    if change == "branch_reference":
+        frozen["preparations"][0]["branch_set_index"] = 9
+    elif change == "reply_reference":
+        frozen["branch_sets"][0]["reply_preparation_index"] = 1
+    elif change == "empty_evidence":
+        frozen["branch_sets"][1]["evidence_set_index"] = 0
+    elif change == "unused_evidence":
+        frozen["evidence_sets"].append(deepcopy(frozen["evidence_sets"][0]))
+    elif change == "empty_payload_branch":
+        frozen["branch_sets"].append({"target_platform": "ozon", "source_variant_id": None, "schema": []})
+    elif change == "changed_prompt":
+        frozen["instructions"][0] += " Invent missing facts."
+    elif change == "extra_field":
+        frozen["override"] = True
+    encoded = compact_json(payload)
+    if change == "duplicate_key":
+        encoded = encoded.replace('"branch_set_index":0', '"branch_set_index":0,"branch_set_index":0', 1)
+    body["messages"][0]["content"][0]["text"] = encoded
+    assert is_current_combined_copy_input(body) is True
+    with pytest.raises(ConversationBindingError):
+        compact_retained_messages(body)
