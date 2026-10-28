@@ -1957,6 +1957,93 @@ class ConversationBindingService:
             reject("CHAT_SUPERSEDE_CURSOR_CHANGED")
 
     @staticmethod
+    def _check_bound_unsent_retry_cursor(document, receipt, retry_parent_message_id):
+        """Prove a fresh parent without treating a pre-send P as a late result."""
+        def reject(code="CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE"):
+            raise ConversationBindingError("bound unsent retry cursor is unavailable", code=code)
+
+        conversation_id = receipt.get("conversation_id")
+        original_parent = receipt.get("parent_message_id")
+        original_user = receipt.get("request_message_id")
+        if (not all(isinstance(value, str) and value.strip() for value in (
+                conversation_id, original_parent, original_user, retry_parent_message_id))
+                or retry_parent_message_id == original_parent):
+            reject()
+        try:
+            ConversationBindingService._check_superseded_original(
+                document, conversation_id, retry_parent_message_id, original_user,
+            )
+        except ConversationBindingError as exc:
+            if exc.code in {"CHAT_SUPERSEDE_ORIGINAL_FOUND", "CHAT_SUPERSEDE_CURSOR_CHANGED"}:
+                reject()
+            raise
+        mapping = document["mapping"]
+        reverse_children = {}
+        for child_id, candidate in mapping.items():
+            parent_id = candidate.get("parent") if isinstance(candidate, dict) else None
+            if isinstance(parent_id, str) and parent_id:
+                reverse_children.setdefault(parent_id, []).append(child_id)
+        node_id, seen = retry_parent_message_id, set()
+        while node_id != original_parent:
+            if node_id in seen:
+                reject()
+            seen.add(node_id)
+            node = mapping.get(node_id)
+            message = node.get("message") if isinstance(node, dict) else None
+            parent_id = node.get("parent") if isinstance(node, dict) else None
+            if (not isinstance(message, dict) or message.get("id") != node_id
+                    or (message.get("author") or {}).get("role") == "user"
+                    or not isinstance(parent_id, str) or not parent_id or parent_id not in mapping):
+                reject()
+            if message.get("status") != "finished_successfully":
+                reject()
+            children = node.get("children")
+            if not isinstance(children, list) or children != reverse_children.get(node_id, []):
+                reject()
+            parent = mapping[parent_id]
+            children = parent.get("children") if isinstance(parent, dict) else None
+            if (not isinstance(children, list) or children != [node_id]
+                    or reverse_children.get(parent_id, []) != [node_id]):
+                reject()
+            node_id = parent_id
+        anchor = mapping.get(original_parent)
+        anchor_message = anchor.get("message") if isinstance(anchor, dict) else None
+        if (not isinstance(anchor_message, dict) or anchor_message.get("id") != original_parent
+                or anchor.get("children") != reverse_children.get(original_parent, [])):
+            reject()
+        return {"conversation_id": conversation_id, "original_parent_message_id": original_parent,
+                "retry_parent_message_id": retry_parent_message_id, "original_request_message_id": original_user}
+
+    @operation_budget(60.0)
+    def bound_unsent_retry_cursor(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Read and prove a fresh retry cursor without submitting a message."""
+        keys = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
+                "conversation_id", "parent_message_id", "request_message_id")
+        if any(not isinstance(receipt.get(key), str) or not receipt[key].strip() for key in keys):
+            raise ConversationBindingError("bound unsent retry cursor is unavailable",
+                                           code="CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE")
+        binding_id = receipt["provider_binding_id"]
+        if account_service.get_bound_account_identity(binding_id) != receipt["provider_account_identity"]:
+            raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
+        token = account_service.get_bound_text_access_token(binding_id, model="auto")
+        with bounded_lock(account_service.conversation_binding_lock(binding_id, receipt["client_conversation_id"])):
+            backend = OpenAIBackendAPI(access_token=token)
+            try:
+                document = backend._get_conversation(receipt["conversation_id"])
+                retry_parent = document.get("current_node") if isinstance(document, dict) else None
+                proof = self._check_bound_unsent_retry_cursor(document, receipt, retry_parent)
+                return {key: receipt[key] for key in (
+                    "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id",
+                )} | {"parent_message_id": proof["retry_parent_message_id"]}
+            except ConversationBindingError:
+                raise
+            except Exception as exc:
+                raise ConversationBindingError("bound unsent retry cursor read is unavailable",
+                                               code="CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE") from exc
+            finally:
+                backend.close()
+
+    @staticmethod
     def _incomplete_compact_successor_tail(backend, document, original):
         """Read one still-incomplete original branch without treating it as no-final.
 
@@ -2438,6 +2525,21 @@ class ConversationBindingService:
                         raise ConversationBindingError("original conversation restore is unconfirmed",
                                                        code="CHAT_SUPERSEDE_READ_UNAVAILABLE")
                 backend.text_pre_send_check = check_original
+            elif body.get("_bound_unsent_retry_original"):
+                def check_bound_unsent_retry(send):
+                    original = body["_bound_unsent_retry_original"]
+                    try:
+                        fresh = backend._get_conversation(conversation_id, _send=send)
+                        self._check_bound_unsent_retry_cursor(fresh, original, parent_message_id)
+                    except ConversationBindingError:
+                        raise
+                    except Exception as exc:
+                        raise ConversationBindingError("bound unsent retry cursor changed",
+                                                       code="CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE") from exc
+                    if fresh.get("is_archived"):
+                        raise ConversationBindingError("original conversation restore is unconfirmed",
+                                                       code="CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE")
+                backend.text_pre_send_check = check_bound_unsent_retry
             elif body.get("_failed_retry_original"):
                 def check_failed_retry(send):
                     from services.generation_completion import retry_cursor, retry_evidence
@@ -2559,6 +2661,10 @@ class ConversationBindingService:
                                 self._check_missing_successor_replacement_absent(
                                     document, body["_missing_successor_attempt_message_id"],
                                 )
+                    elif body.get("_bound_unsent_retry_original"):
+                        self._check_bound_unsent_retry_cursor(
+                            document, body["_bound_unsent_retry_original"], parent_message_id,
+                        )
                     if not isinstance(document, dict) or type(document.get("is_archived")) is not bool:
                         raise ConversationBindingError("original conversation visibility is unconfirmed",
                                                        code="CHAT_ARCHIVE_RESTORE_UNCONFIRMED")

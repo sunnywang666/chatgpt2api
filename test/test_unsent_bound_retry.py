@@ -1,6 +1,7 @@
 """One fresh-ID retry for a proved pre-send binding mismatch (no upstream I/O)."""
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from contextlib import nullcontext
 import json
 from unittest.mock import AsyncMock
 
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 
 from api.ai import ConversationBindingTextRequest
 from services.conversation_binding_service import ConversationBindingError
+from services.conversation_binding_service import ConversationBindingService
 from services.request_context import current_request
 from services.text_task_service import TextTaskService
 from test.test_pool_admission import Clock, build
@@ -167,6 +169,126 @@ def test_execution_rechecks_original_and_never_sends_after_drift(retry):
     admission.execute(context)
     assert sent == []
     assert read(service, "N")["error_code"] == "CHAT_UNSENT_RETRY_ORIGINAL_CHANGED"
+
+
+def test_send_guard_rechecks_original_after_run_validation_before_post(retry):
+    service, admission, store, _, _, envelope, sent, _, _ = retry
+    service.submit("owner", envelope, source=SOURCE)
+
+    def pause_between_run_and_send(body, on_cursor):
+        with store.transaction() as db:
+            original = store.read_receipt(db, "text", "owner", "P")
+            original["_recovery_paused"] = True
+            store.write_receipt(db, "text", "owner", "P", original)
+        current_request.get().before_send()
+        sent.append(body)
+        return {"content": "must not post"}
+
+    service.runner = pause_between_run_and_send
+    context = admission.claim_next()
+    assert context and context.request_id == "N"
+    admission.execute(context)
+    assert sent == []
+    assert read(service, "N")["upstream_outcome"] == "not_sent"
+
+
+def test_bound_unsent_cursor_requires_absent_original_and_single_nonuser_chain(retry):
+    service, _, store, _, _, _, _, _, _ = retry
+    with store.transaction() as db:
+        original = store.read_receipt(db, "text", "owner", "P")
+        original["request_message_id"] = "P-user"
+        store.write_receipt(db, "text", "owner", "P", original)
+    document = {
+        "conversation_id": "conversation-0", "is_archived": False, "current_node": "B",
+        "mapping": {
+            "A": {"parent": "root", "children": ["B"], "message": {
+                "id": "A", "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True}},
+            "B": {"parent": "A", "children": [], "message": {
+                "id": "B", "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True}},
+            "root": {"parent": None, "children": ["A"], "message": {"id": "root", "author": {"role": "user"}}},
+        },
+    }
+    proof = ConversationBindingService._check_bound_unsent_retry_cursor(document, original, "B")
+    assert proof["retry_parent_message_id"] == "B"
+    document["mapping"]["B"]["message"]["author"] = {"role": "user"}
+    with pytest.raises(ConversationBindingError) as error:
+        ConversationBindingService._check_bound_unsent_retry_cursor(document, original, "B")
+    assert error.value.code == "CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE"
+
+    document["mapping"]["B"]["message"]["author"] = {"role": "assistant"}
+    document["mapping"]["B"]["message"]["status"] = "finished_successfully"
+    document["mapping"]["X"] = {"parent": "A", "children": [], "message": {
+        "id": "X", "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True}}
+    with pytest.raises(ConversationBindingError) as error:
+        ConversationBindingService._check_bound_unsent_retry_cursor(document, original, "B")
+    assert error.value.code == "CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE"
+
+    document["mapping"].pop("X")
+    document["mapping"]["A"]["children"] = ["tool"]
+    document["mapping"]["tool"] = {"parent": "A", "children": ["B"], "message": {
+        "id": "tool", "author": {"role": "tool"}, "status": "in_progress", "end_turn": False}}
+    document["mapping"]["B"]["parent"] = "tool"
+    with pytest.raises(ConversationBindingError) as error:
+        ConversationBindingService._check_bound_unsent_retry_cursor(document, original, "B")
+    assert error.value.code == "CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE"
+
+
+def test_bound_retry_uses_verified_fresh_cursor_and_reuses_attempt_after_restart(retry, monkeypatch):
+    import services.conversation_binding_service as binding_module
+
+    service, admission, store, clock, _, _, _, _, root = retry
+    with store.transaction() as db:
+        original = store.read_receipt(db, "text", "owner", "P")
+        original["request_message_id"] = "P-user"
+        store.write_receipt(db, "text", "owner", "P", original)
+    document = {
+        "conversation_id": "conversation-0", "is_archived": False, "current_node": "B",
+        "mapping": {
+            "root": {"parent": None, "children": ["A"], "message": {"id": "root", "author": {"role": "user"}}},
+            "A": {"parent": "root", "children": ["B"], "message": {
+                "id": "A", "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True}},
+            "B": {"parent": "A", "children": [], "message": {
+                "id": "B", "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": True}},
+        },
+    }
+    class Backend:
+        def __init__(self, **_kwargs):
+            pass
+        def _get_conversation(self, _conversation_id):
+            return deepcopy(document)
+        def close(self):
+            pass
+    monkeypatch.setattr(binding_module, "OpenAIBackendAPI", Backend)
+    monkeypatch.setattr(binding_module.account_service, "get_bound_account_identity", lambda _binding: "account-0")
+    monkeypatch.setattr(binding_module.account_service, "get_bound_text_access_token", lambda *_args, **_kwargs: "fixture")
+    monkeypatch.setattr(binding_module.account_service, "conversation_binding_lock", lambda *_args: nullcontext())
+
+    first = service.retry_bound_attempt("owner", "P")
+    assert first["existing"] is False and first["result_ready"] is False
+    child_id = first["attempt"]["request_id"]
+    child = read(service, child_id)
+    assert child["_retry_unsent_of"] == "P" and child["parent_message_id"] == "B"
+
+    with store.transaction() as db:
+        original = store.read_receipt(db, "text", "owner", "P")
+        original.update(_recovery_paused=True, status="unknown", upstream_outcome="unknown")
+        store.write_receipt(db, "text", "owner", "P", original)
+    restarted = TextTaskService(service.store.path, runner=service.runner, admission=admission, clock=clock)
+    replay = restarted.retry_bound_attempt("owner", "P")
+    assert replay["existing"] is True and replay["attempt"]["request_id"] == child_id
+    with store.transaction() as db:
+        child = store.read_receipt(db, "text", "owner", child_id)
+        child.update(status="unknown", upstream_outcome="unknown", _submission_started=True, send_count=1)
+        store.write_receipt(db, "text", "owner", child_id, child)
+        original = store.read_receipt(db, "text", "owner", "P")
+        original.update(status="succeeded", content="late original", upstream_outcome="completed")
+        store.write_receipt(db, "text", "owner", "P", original)
+    after_late_original = restarted.retry_bound_attempt("owner", "P")
+    assert after_late_original["attempt"]["request_id"] == child_id
+    assert after_late_original["result_ready"] is False
+    with restarted.store.connect() as db:
+        assert db.execute("SELECT count(*) FROM requests WHERE owner=? AND json_extract(receipt,'$._retry_unsent_of')=?",
+                          ("owner", "P")).fetchone()[0] == 1
 
 
 def test_retained_hash_and_fresh_parent_failure_never_send(retry):

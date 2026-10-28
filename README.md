@@ -231,10 +231,35 @@ environment:
 重新尝试目前有不同的适用范围，不能将一种入口的权限套用到另一种：
 
 - 内部绑定文本通过 `POST /api/conversation-bindings/text` 的 `retry_unsent_request_id` 或 `supersedes_request_id` 引用原请求。调用方提供后继请求 ID 和既定绑定身份，Provider 从保存的原输入重建请求并检查 hash、原请求资格、活动占用、会话顺序和单后继；不允许凭普通 UNKNOWN 或仅 HTTP 超时重发。`retry_unsent_request_id` 是特定已证未发场景的新子请求，不等同于任意原 ID 重排。
-- 普通客户端的 `POST /api/chat-requests/{id}/completion` 和 `POST /api/image-tasks/{id}/completion` 使用既有有界 completion 内核。内部管理员图片只允许受限的原结果补取，不能通过此入口授权 replacement；内部绑定文本也不能冒充普通 Chat receipt 进入该策略。公司入口保持其既有原任务恢复及成果确认限制。
-- 工作台可先接入上表的纯读和明确补取，保留当前重新尝试的严格分支。内部绑定任务的通用新尝试入口仍未实现；在替代入口提供等价保护并通过验证之前，不删除既有后继协议，也不通过改写 receipt 的 route、伪造未发送状态或放宽权限来适配。
+- 普通客户端的 `POST /api/chat-requests/{id}/completion` 和 `POST /api/image-tasks/{id}/completion` 保持既有有界 completion 契约，公司入口保持既有原任务恢复及成果确认限制。内部绑定任务不得通过伪造普通 Chat receipt、改写 route 或未发送状态进入普通客户端策略。
+- 工作台的内部管理员调用使用同一组 completion 路径，但必须明确区分 `action: "recover"` 与 `action: "retry"`：前者仅补取原请求，后者才请求账号池核验并执行受控的新尝试。新尝试不接受替换提示词、模型、绑定身份或调用方声称的未发送证明；账号池读取保存的原输入和真实回执，继续执行原有资格、会话顺序、单后继、暂停与发送前校验。普通 UNKNOWN、HTTP 超时及仅有旧查询游标均不能授权重发。内部调用不开放 `allow_unconfirmed_retry`。
+- 文本 `ORIGINAL_RESULT_NO_FINAL` 继续使用既有的有限补读与后继资格策略，并在发送前核对原会话分支。这表示符合该策略的受控重试，不表示账号池已证明上游生成被取消；迟到成功或分支变化仍须阻止再次发送。
+- 上述内部命令不改变工作台的业务重试预算。消费者应先接纯读和明确命令，验证相同请求的重复调用、重启及迟到结果，再删除对应重复编排；旧后继协议在兼容迁移完成前保留。
+
+内部 `retry` 的请求体只接受 `{"action":"retry"}`，返回 `task-attempt-v1`：
+
+```json
+{
+  "protocol": "task-attempt-v1",
+  "kind": "text",
+  "original_id": "original-request",
+  "attempt_id": "provider-selected-attempt",
+  "status": "queued",
+  "result_ready": false,
+  "existing": false,
+  "created": true
+}
+```
+
+`attempt_id` 是后续纯读的对象，可能为已成功的原请求、既有后继或本次安排的尝试。`created` 只描述本次是否安排尝试，不证明请求已经发给上游，更不证明业务成果已保存。`status` 复用 `task-results-v1` 的状态投影，未知结果不报作失败；最终可采用结果仍通过该纯读接口核实。
+
+此入口的当前范围有意受限：文本复用既有 no-final 单后继策略，或严格的未发送绑定失败重试。后一种由 Provider 在原绑定会话内证明原请求节点不存在、旧游标至新游标为同一条无新用户消息的链，且新游标是当前已结束的末端；发送前再次核验。缺少这些证据时返回 `CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE`，不能拿失败前的旧游标重放，也不能把前序回合的回答当成本请求结果。图片只将严格证实未发送的原任务按原 ID 重排，新增后继预算为零；该次发送以后若结果为 UNKNOWN，不允许再凭先前的重试命令创建第二次生成。新 `retry` 不授予普通或公司密钥。
 
 工作台保留商品质量判断、业务重试预算、原业务 ID、成果采用与发布；账号池保留原输入、实际收发、账号与物理会话顺序、原结果保存及防重。商品属性或文案派生规则迁移不属于接口改名，需在消费者接齐后单独验证。
+
+当前 `category_directory_parent_v1`、`attributes_required_only_v4` 和 `combined_copy_compact_v1` 仍分别由 `services/category_directory_derivation.py`、`services/required_attributes_derivation.py`、`services/combined_copy_derivation.py` 提供兼容实现。迁移目标是让工作台持有这些纯业务变换，Provider 只校验原输入身份、冻结新尝试的输入并负责执行。工作台已有的图片 URL、业务 hash 和当前提示词 builder 不能重建历史请求的原 inline 图片和精确 prompt；替代协议须能按原 owner/binding 取得保留输入，提交时核对 Provider 原 input hash，并保留同 ID 幂等和单后继限制。该迁移尚未由 completion 命令完成，旧实现暂不删除。
+
+迁移验收复用 `test/test_category_directory_successor.py`、`test/test_required_attributes_successor.py`、`test/test_combined_copy_derivation.py`、`test/test_incomplete_compact_successor.py` 及现有 WBOZ combined-copy fixtures。尤其当前 structured copy 已是正式输入契约，应原样保留；迁移不同时压缩提示词、改变字段或替换图片。旧 receipt 与已创建 child 继续可读，不要求重新生成来升级协议。
 
 ## API
 
