@@ -315,9 +315,10 @@ def project_text_execution(receipt: dict[str, Any]) -> dict[str, Any]:
 def project_public_chat_receipt(receipt: object) -> dict[str, Any]:
     if not isinstance(receipt, dict):
         raise PublicChatContractError("CHAT_RECEIPT_INVALID", "chat request receipt is invalid")
+    route = receipt.get("_route")
     result: dict[str, Any] = {
         "request_id": str(receipt.get("request_id") or ""),
-        "route": "chat",
+        "route": route if route in {"chat", "codex"} else "chat",
         "model": str(receipt.get("model") or ""),
         "status": str(receipt.get("status") or "unknown"),
     }

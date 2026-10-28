@@ -146,6 +146,7 @@ async def external_image_boundary(request: Request, call_next):
         }
         or request.method == "GET" and re.fullmatch(r"/api/chat-requests/[^/]+", path)
         or request.method == "GET" and re.fullmatch(r"/api/chat-requests/[^/]+/snapshot", path)
+        or request.method == "GET" and re.fullmatch(r"/api/task-results/(?:text|image)/[^/]+", path)
         or request.method == "GET" and re.fullmatch(r"/api/(chat-requests|image-tasks)/[^/]+/events", path)
         or request.method in {"GET", "POST"} and re.fullmatch(r"/api/(chat-requests|image-tasks)/[^/]+/completion", path)
         or request.method == "GET" and re.fullmatch(r"/api/chat-requests/[^/]+/work", path)
