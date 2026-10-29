@@ -24,6 +24,8 @@ on:
       - test/test_generation_completion.py
       - test/test_bound_completion_api.py
       - test/test_bound_unsent_execution.py
+      - test/test_workbench_derived_input.py
+      - test/test_workbench_derived_api.py
       - services/account_request_pacing.py
       - services/account_service.py
       - services/oauth_login_service.py
@@ -168,6 +170,8 @@ jobs:
             test/test_generation_completion.py \
             test/test_bound_completion_api.py \
             test/test_bound_unsent_execution.py \
+            test/test_workbench_derived_input.py \
+            test/test_workbench_derived_api.py \
             test/test_no_final_successor.py \
             test/test_combined_copy_derivation.py \
             test/test_account_request_pacing.py \

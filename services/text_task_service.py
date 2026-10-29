@@ -637,6 +637,11 @@ class TextTaskService:
             result["continue_after_incomplete"] = True
         if receipt.get("_derived_input"):
             result["derived_input"] = receipt["_derived_input"]
+        workbench_audit = TextTaskService._public_workbench_derived_audit(
+            receipt.get(TextTaskService._WORKBENCH_DERIVED_MARKER)
+        )
+        if workbench_audit is not None:
+            result["workbench_derived_input"] = workbench_audit
         missing_attempt = TextTaskService._missing_successor_attempt(receipt)
         if missing_attempt:
             result["missing_successor_resume"] = {
@@ -2596,6 +2601,298 @@ class TextTaskService:
     REJECTED_SUPERSEDE_FIELDS = frozenset({"supersedes_request_id", "client_request_id", "client_conversation_id"})
     MISSING_NODE_RETRY_FIELD = "continue_before_queued_image_id"
     MISSING_NODE_RETRY_FIELDS = REJECTED_SUPERSEDE_FIELDS | frozenset({MISSING_NODE_RETRY_FIELD})
+    _WORKBENCH_DERIVED_PROTOCOL = "workbench-derived-input-v1"
+    _WORKBENCH_DERIVED_MARKER = "_workbench_derived_input"
+    _WORKBENCH_DERIVED_MODES = frozenset({"413_request_missing", "no_final", "incomplete"})
+    _WORKBENCH_DERIVED_SOURCE = "internal:listing"
+
+    @classmethod
+    def _workbench_derived_error(cls, code="CHAT_WORKBENCH_DERIVED_INPUT_INVALID"):
+        raise ConversationBindingError("workbench-derived input is invalid", code=code)
+
+    @classmethod
+    def _require_workbench_derived_source(cls, source):
+        if source != cls._WORKBENCH_DERIVED_SOURCE:
+            cls._workbench_derived_error("CHAT_WORKBENCH_DERIVED_SOURCE_REQUIRED")
+
+    @staticmethod
+    def _same_nontext_message_parts(original, candidate):
+        """Allow Workbench to replace text only; preserve every media part/order."""
+        if type(original) is not type(candidate):
+            return False
+        if isinstance(original, list):
+            return len(original) == len(candidate) and all(
+                TextTaskService._same_nontext_message_parts(left, right)
+                for left, right in zip(original, candidate)
+            )
+        if isinstance(original, dict):
+            if set(original) != set(candidate):
+                return False
+            if original.get("type") == "text":
+                try:
+                    label = json.loads(original.get("text", ""))
+                except (TypeError, ValueError):
+                    label = None
+                # These labels bind the following media item to its evidence;
+                # they are not business prose that Workbench may rewrite.
+                if isinstance(label, dict) and set(label) == {"image_ref"} and isinstance(label.get("image_ref"), str):
+                    return original == candidate
+                return isinstance(original.get("text"), str) and isinstance(candidate.get("text"), str) and all(
+                    key == "text" or TextTaskService._same_nontext_message_parts(original[key], candidate[key])
+                    for key in original
+                )
+            if (isinstance(original.get("role"), str) and isinstance(original.get("content"), str)
+                    and isinstance(candidate.get("content"), str)):
+                return all(key == "content" or TextTaskService._same_nontext_message_parts(
+                    original[key], candidate[key]
+                ) for key in original)
+            return all(TextTaskService._same_nontext_message_parts(original[key], candidate[key]) for key in original)
+        return original == candidate
+
+    @staticmethod
+    def _json_exportable(value):
+        """Bound text normally contains data URLs; never invent a bytes export."""
+        if value is None or type(value) in (bool, int, str):
+            return True
+        if type(value) is float:
+            return math.isfinite(value)
+        if isinstance(value, list):
+            return all(TextTaskService._json_exportable(item) for item in value)
+        if isinstance(value, dict):
+            return all(isinstance(key, str) and TextTaskService._json_exportable(item)
+                       for key, item in value.items())
+        return False
+
+    @classmethod
+    def _bound_workbench_retained_input(cls, owner, request_id, request_hash, receipt, body):
+        """Accept only a durable private chat input still bound to its receipt.
+
+        A completed receipt's ``parent_message_id`` may be the returned final
+        cursor.  The input is tied to the submitted cursor instead, so never
+        use that mutable field as the retained-input proof.
+        """
+        fields = ("provider_binding_id", "provider_account_identity", "client_conversation_id",
+                  "conversation_id")
+        submitted_parent = receipt.get("_submission_parent_message_id")
+        if submitted_parent is None:
+            submitted_parent = receipt.get("request_parent_message_id")
+        return bool(
+            isinstance(receipt, dict) and receipt.get("request_id") == request_id
+            and cls._submission_identity(owner, body) == (request_id, request_hash)
+            and cls._json_exportable(body)
+            and receipt.get("_route", "chat") == "chat"
+            and receipt.get("_operation", "text") == "text"
+            and not any(receipt.get(field) for field in (
+                "_forward_protocol", "_forward", "_public_session_ref", "_public_route", "_editable",
+                "_codex_origin_request_id", "_codex_fallback_of", "_codex_continue_of",
+                "_codex_rejected_retry_of",
+            ))
+            and not any(body.get(field) for field in (
+                "_forward", "_forward_protocol", "_public_session_ref", "_public_route", "_editable",
+            ))
+            and not any(str(field).startswith("_codex") for field in body)
+            and body.get("_route", "chat") == "chat" and body.get("_operation", "text") == "text"
+            and all(isinstance(body.get(field), str) and body[field]
+                    and receipt.get(field) == body[field] for field in fields)
+            and isinstance(body.get("parent_message_id"), str) and body["parent_message_id"]
+            and submitted_parent == body["parent_message_id"]
+        )
+
+    @classmethod
+    def _workbench_derived_mode_eligible(cls, original, mode, now):
+        # A paused/suppressed recovery branch is not an authority to derive or
+        # send a child, including the otherwise terminal 413 path.
+        if any(original.get(field) for field in ("_recovery_paused", "_recovery_suppressed")):
+            return False
+        if mode == "no_final":
+            return cls._no_final_successor_source(original, now)
+        if mode == "incomplete":
+            return cls._incomplete_compact_successor_source(original, now)
+        return bool(
+            original.get("original_http_status") == 413
+            and original.get("original_failure_phase") == "stream_open"
+            and original.get("original_upstream_request_stage") == "conversation"
+            and original.get("original_exception_category") == "http"
+            and original.get("_submission_started") is True
+        )
+
+    @classmethod
+    def _workbench_derived_marker(cls, *, original_input_hash, child_input_hash, mode, derivation_kind):
+        return {
+            "protocol": cls._WORKBENCH_DERIVED_PROTOCOL,
+            "original_input_hash": original_input_hash,
+            "child_input_hash": child_input_hash,
+            "mode": mode,
+            "derivation_kind": derivation_kind,
+        }
+
+    @classmethod
+    def _public_workbench_derived_audit(cls, marker):
+        """Project only the fixed Workbench provenance record from a receipt."""
+        fields = {"protocol", "original_input_hash", "child_input_hash", "mode", "derivation_kind"}
+        if (not isinstance(marker, dict) or set(marker) != fields
+                or marker.get("protocol") != cls._WORKBENCH_DERIVED_PROTOCOL
+                or marker.get("mode") not in cls._WORKBENCH_DERIVED_MODES
+                or not all(isinstance(marker.get(field), str) and marker[field].strip()
+                           for field in ("original_input_hash", "child_input_hash", "derivation_kind"))):
+            return None
+        return {field: marker[field] for field in (
+            "protocol", "original_input_hash", "child_input_hash", "mode", "derivation_kind"
+        )}
+
+    @classmethod
+    def _workbench_derived_body(cls, original, original_id, original_hash, payload):
+        required = {"client_request_id", "original_input_hash", "messages", "model", "thinking_effort",
+                    "mode", "derivation_kind"}
+        if (not isinstance(payload, dict) or set(payload) != required
+                or not isinstance(payload.get("client_request_id"), str) or not payload["client_request_id"].strip()
+                or len(payload["client_request_id"]) > 200 or payload["client_request_id"] != payload["client_request_id"].strip()
+                or payload["client_request_id"] == original_id
+                or payload.get("original_input_hash") != original_hash
+                or not isinstance(payload.get("messages"), list)
+                or not isinstance(payload.get("model"), str) or not payload["model"].strip()
+                or not isinstance(payload.get("thinking_effort"), str) or not payload["thinking_effort"].strip()
+                or payload.get("mode") not in cls._WORKBENCH_DERIVED_MODES
+                or not isinstance(payload.get("derivation_kind"), str) or not payload["derivation_kind"].strip()
+                or len(payload["derivation_kind"]) > 128
+                or any(original.get(field) is not None for field in (
+                    "supersedes_request_id", "retry_unsent_request_id", "derived_input",
+                    "continue_after_no_final", "continue_after_incomplete", cls._WORKBENCH_DERIVED_MARKER,
+                ))):
+            cls._workbench_derived_error()
+        if not all(isinstance(original.get(field), str) and original[field] for field in (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id",
+                "conversation_id", "parent_message_id")):
+            cls._workbench_derived_error()
+        if not isinstance(original.get("messages"), list) or not cls._same_nontext_message_parts(
+                original["messages"], payload["messages"]):
+            cls._workbench_derived_error()
+        body = deepcopy(original)
+        body.update(
+            client_request_id=payload["client_request_id"],
+            supersedes_request_id=original_id,
+            messages=deepcopy(payload["messages"]),
+            model=payload["model"],
+            thinking_effort=payload["thinking_effort"],
+            **{cls._WORKBENCH_DERIVED_MARKER: {
+                "protocol": cls._WORKBENCH_DERIVED_PROTOCOL,
+                "original_input_hash": original_hash,
+                "mode": payload["mode"],
+                "derivation_kind": payload["derivation_kind"],
+            }},
+        )
+        if payload["mode"] == "no_final":
+            body["continue_after_no_final"] = True
+        elif payload["mode"] == "incomplete":
+            body["continue_after_incomplete"] = True
+        return body
+
+    @classmethod
+    def _workbench_derived_body_from_stored(cls, original, original_id, original_hash, stored):
+        marker = stored.get(cls._WORKBENCH_DERIVED_MARKER) if isinstance(stored, dict) else None
+        if not isinstance(marker, dict):
+            cls._workbench_derived_error()
+        payload = {
+            "client_request_id": stored.get("client_request_id"),
+            "original_input_hash": marker.get("original_input_hash"),
+            "messages": stored.get("messages"),
+            "model": stored.get("model"),
+            "thinking_effort": stored.get("thinking_effort"),
+            "mode": marker.get("mode"),
+            "derivation_kind": marker.get("derivation_kind"),
+        }
+        expected = cls._workbench_derived_body(original, original_id, original_hash, payload)
+        if stored != expected:
+            cls._workbench_derived_error()
+        return expected
+
+    def read_retained_input(self, owner, request_id, *, source):
+        """Return one exact owner-scoped durable input for trusted Workbench use."""
+        self._require_workbench_derived_source(source)
+        with self._db() as db:
+            row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                             (owner, request_id)).fetchone()
+            if not row:
+                self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_NOT_FOUND")
+            try:
+                receipt = json.loads(row[1])
+                body = self.store.load_input(receipt["_input_ref"])
+                if not self._bound_workbench_retained_input(owner, request_id, row[0], receipt, body):
+                    raise ValueError
+            except (OSError, ValueError, TypeError, KeyError):
+                self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_UNAVAILABLE")
+        return {"protocol": "task-input-v1", "kind": "text", "request_id": request_id,
+                "input_hash": row[0], "input": body}
+
+    def prepare_workbench_derived_input(self, owner, request_id, payload, *, source):
+        """Freeze a Workbench-built child without accepting caller bindings/cursors."""
+        self._require_workbench_derived_source(source)
+        with self._db() as db:
+            row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                             (owner, request_id)).fetchone()
+            if not row:
+                self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_NOT_FOUND")
+            try:
+                original = json.loads(row[1])
+                retained = self.store.load_input(original["_input_ref"])
+                if not self._bound_workbench_retained_input(owner, request_id, row[0], original, retained):
+                    raise ValueError
+                body = self._workbench_derived_body(retained, request_id, row[0], payload)
+                child_id, child_hash = self._submission_identity(owner, body)
+                existing = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                      (owner, child_id)).fetchone()
+                if existing:
+                    saved = json.loads(existing[1])
+                    stored = self.store.load_input(saved["_input_ref"])
+                    if existing[0] != child_hash or stored != body:
+                        raise ConversationBindingError("request identity already has different input",
+                                                       code="CONVERSATION_REQUEST_CONFLICT")
+                    expected_marker = self._workbench_derived_marker(
+                        original_input_hash=row[0], child_input_hash=child_hash,
+                        mode=payload["mode"], derivation_kind=payload["derivation_kind"],
+                    )
+                    if saved.get(self._WORKBENCH_DERIVED_MARKER) != expected_marker:
+                        self._workbench_derived_error()
+            except ConversationBindingError:
+                raise
+            except (OSError, ValueError, TypeError, KeyError):
+                self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_UNAVAILABLE")
+        return body
+
+    def validate_workbench_derived_input(self, owner, request_id, payload, *, source):
+        """Pure local idempotency check for the API before content review/send."""
+        body = self.prepare_workbench_derived_input(owner, request_id, payload, source=source)
+        child_id, child_hash = self._submission_identity(owner, body)
+        with self._db() as db:
+            existing = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                                  (owner, child_id)).fetchone()
+            if not existing:
+                # This is intentionally only a read-side transaction.  It
+                # builds the same ephemeral receipt used by submit so an
+                # ineligible new child never reaches an external content
+                # review, while an exact existing child above stays idempotent.
+                candidate = {
+                    "request_id": child_id,
+                    "client_conversation_id": body["client_conversation_id"],
+                    "_route": body.get("_route", "chat"),
+                    "_operation": body.get("_operation", "text"),
+                }
+                self._prepare_supersede(db, owner, body, candidate)
+                return None
+            try:
+                receipt = json.loads(existing[1])
+                stored = self.store.load_input(receipt["_input_ref"])
+                if existing[0] != child_hash or stored != body:
+                    raise ValueError
+            except (OSError, ValueError, TypeError, KeyError):
+                self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_UNAVAILABLE")
+            return self._public(receipt)
+
+    def submit_workbench_derived_input(self, owner, request_id, payload, *, source):
+        body = self.prepare_workbench_derived_input(owner, request_id, payload, source=source)
+        from services.product_work import locking_product_conversations
+        with locking_product_conversations([body] if body.get("product_work") else []):
+            return self._submit_prepared(owner, body, source=source)
 
     @staticmethod
     def _rejected_chat_successor_source(receipt, *, allow_no_final_successor=False):
@@ -3611,6 +3908,7 @@ class TextTaskService:
             and audit.get("original_thinking_effort") == "standard"
             and successor.get("model") == audit.get("model") == "gpt-5-6-thinking"
             and audit.get("thinking_effort") == "high")
+        workbench_upgrade = isinstance(successor.get(TextTaskService._WORKBENCH_DERIVED_MARKER), dict)
         shared = bool(previous and successor.get("_supersedes_request_id") == previous.get("request_id")
             and successor.get("request_id") != previous.get("request_id")
             and successor.get("_supersedes_input_hash") and successor.get("_input_ref")
@@ -3618,7 +3916,7 @@ class TextTaskService:
             and successor.get("_route", "chat") == previous.get("_route", "chat") == "chat"
             and successor.get("_operation", "text") == previous.get("_operation", "text") == "text"
             and not successor.get("_forward_protocol") and not previous.get("_forward_protocol")
-            and (model_upgrade if attributes_upgrade else successor.get("model") == previous.get("model"))
+            and (model_upgrade if attributes_upgrade else workbench_upgrade or successor.get("model") == previous.get("model"))
             and (not compact_upgrade or successor.get("_supersedes_no_final") is True
                  or successor.get("_supersedes_incomplete") is True))
         if not shared:
@@ -3721,7 +4019,37 @@ class TextTaskService:
             )
         elif TextTaskService._RECONCILED_QUEUED_SUCCESSOR in successor:
             reject("CHAT_SUPERSEDE_INVALID")
-        if successor.get("_derived_input"):
+        if successor.get(TextTaskService._WORKBENCH_DERIVED_MARKER):
+            audit = successor[TextTaskService._WORKBENCH_DERIVED_MARKER]
+            if (not isinstance(audit, dict) or set(audit) != {
+                    "protocol", "original_input_hash", "child_input_hash", "mode", "derivation_kind"}
+                    or audit.get("protocol") != TextTaskService._WORKBENCH_DERIVED_PROTOCOL
+                    or audit.get("original_input_hash") != row[0]
+                    or audit.get("mode") not in TextTaskService._WORKBENCH_DERIVED_MODES
+                    or not isinstance(audit.get("derivation_kind"), str) or not audit["derivation_kind"].strip()
+                    or not isinstance(audit.get("child_input_hash"), str)):
+                reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
+            if not TextTaskService._workbench_derived_mode_eligible(previous, audit["mode"], now):
+                reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
+            try:
+                stored = successor.get("_workbench_derived_body")
+                if stored is None:
+                    stored = store.load_input(successor["_input_ref"])
+                expected = TextTaskService._workbench_derived_body_from_stored(
+                    original_body, previous_id, row[0], stored,
+                )
+                child_id, child_hash = TextTaskService._submission_identity(owner, expected)
+                if (child_id != successor.get("request_id") or child_hash != audit["child_input_hash"]
+                        or expected.get("_workbench_derived_input", {}).get("mode") != audit["mode"]
+                        or expected.get("_workbench_derived_input", {}).get("derivation_kind")
+                        != audit["derivation_kind"]):
+                    raise ValueError
+                saved = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?", (owner, child_id)).fetchone()
+                if saved and saved[0] != child_hash:
+                    raise ValueError
+            except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
+                reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
+        elif successor.get("_derived_input"):
             kind = successor["_derived_input"].get("kind")
             no_final_derived = kind in {"attributes_required_only_v4", "combined_copy_compact_v1"}
             incomplete_derived = kind == "combined_copy_compact_v1" and successor.get("_supersedes_incomplete") is True
@@ -4046,9 +4374,13 @@ class TextTaskService:
         missing_node_model_retry = (not direct_rejected_model and not model_rejection_retry
             and self.MISSING_NODE_RETRY_FIELD in body
             and self._rejected_missing_node_successor_source(self.store, db, owner, original, self._now()))
+        workbench_marker = body.get(self._WORKBENCH_DERIVED_MARKER)
+        if workbench_marker is not None and not isinstance(workbench_marker, dict):
+            reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
+        workbench_derived = workbench_marker is not None
         native_sequence = None
         native_no_final_source = None
-        if body.get("continue_after_no_final") is True:
+        if not workbench_derived and body.get("continue_after_no_final") is True:
             acceptance_sequence = self.store.runtime(db, "acceptance_sequence", 0)
             native_sequence = (acceptance_sequence + 1
                                if type(acceptance_sequence) is int and acceptance_sequence >= 0 else None)
@@ -4061,7 +4393,22 @@ class TextTaskService:
             # for the candidate revalidation and final insert below.
             receipt["_sequence"] = native_sequence
         rejected_model = direct_rejected_model or model_rejection_retry or missing_node_model_retry
-        if rejected_model:
+        if workbench_derived:
+            try:
+                retained = self.store.load_input(original["_input_ref"])
+                expected = self._workbench_derived_body_from_stored(retained, previous_id, row[0], body)
+                child_id, child_hash = self._submission_identity(owner, expected)
+                marker = expected[self._WORKBENCH_DERIVED_MARKER]
+                if (expected != body or child_id != body.get("client_request_id")
+                        or not self._workbench_derived_mode_eligible(original, marker["mode"], self._now())):
+                    raise ValueError
+            except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
+                reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
+            receipt[self._WORKBENCH_DERIVED_MARKER] = self._workbench_derived_marker(
+                original_input_hash=row[0], child_input_hash=child_hash,
+                mode=marker["mode"], derivation_kind=marker["derivation_kind"],
+            )
+        elif rejected_model:
             try:
                 retained = self.store.load_input(original["_input_ref"])
             except (OSError, ValueError, TypeError, KeyError):
@@ -4118,6 +4465,8 @@ class TextTaskService:
             receipt["_supersedes_incomplete"] = True
         # This placeholder is used only for validation, never saved or exposed.
         candidate = {**receipt, "_input_ref": True}
+        if workbench_derived:
+            candidate["_workbench_derived_body"] = body
         self._validate_supersede(self.store, db, owner, candidate, self._now())
         from services.pool_admission import unfinished
         # Do not move an intervening queued/unknown turn ahead of this explicit successor.

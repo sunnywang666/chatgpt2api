@@ -251,13 +251,38 @@ environment:
 }
 ```
 
-`attempt_id` 是后续纯读的对象，可能为已成功的原请求、既有后继或本次安排的尝试。`created` 只描述本次是否安排尝试，不证明请求已经发给上游，更不证明业务成果已保存。`status` 复用 `task-results-v1` 的状态投影，未知结果不报作失败；最终可采用结果仍通过该纯读接口核实。
+`attempt_id` 是后续纯读的对象，可能为已成功的原请求、既有后继或本次安排的尝试。`created` 只描述本次是否安排尝试，不证明请求已经发给上游，更不证明业务成果已保存。`status` 复用 `task-result-v1` 的状态投影，未知结果不报作失败；最终可采用结果仍通过该纯读接口核实。
+
+如果内部 `retry` 的响应丢失，可用 `GET /api/chat-requests/{original_id}/completion?action=retry`（图片为 `/api/image-tasks/{original_id}/completion?action=retry`）纯读找回已持久化的尝试。该查询仅向内部管理员开放，返回相同 `task-attempt-v1` 身份，固定 `existing:true`、`created:false`；不发送、不查询上游、不取消子请求或清理占用。文本按原 owner 及唯一合法 child 关联读取，已发或 UNKNOWN 的 child 不被迟到原答案覆盖；图片只查回已决定的同 ID 尝试，不能接管其他 replacement。未发现已决定尝试且原请求未成功时返回 `404 TASK_ATTEMPT_NOT_FOUND`，冲突返回 `409 TASK_ATTEMPT_CONFLICT`。404 不是未发送证明，不能因此重新 POST。调用方仍须持久保存原业务与 `attempt_id` 的关系，再通过 task-results 采用成果。不带 `action=retry` 的普通 completion GET 保持既有行为，不属于此纯读保证。
 
 此入口的当前范围有意受限：文本复用既有 no-final 单后继策略，或严格的未发送绑定失败重试。后一种由 Provider 在原绑定会话内证明原请求节点不存在、旧游标至新游标为同一条无新用户消息的链，且新游标是当前已结束的末端；发送前再次核验。缺少这些证据时返回 `CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE`，不能拿失败前的旧游标重放，也不能把前序回合的回答当成本请求结果。图片只将严格证实未发送的原任务按原 ID 重排，新增后继预算为零；该次发送以后若结果为 UNKNOWN，不允许再凭先前的重试命令创建第二次生成。新 `retry` 不授予普通或公司密钥。
 
 工作台保留商品质量判断、业务重试预算、原业务 ID、成果采用与发布；账号池保留原输入、实际收发、账号与物理会话顺序、原结果保存及防重。商品属性或文案派生规则迁移不属于接口改名，需在消费者接齐后单独验证。
 
-当前 `category_directory_parent_v1`、`attributes_required_only_v4` 和 `combined_copy_compact_v1` 仍分别由 `services/category_directory_derivation.py`、`services/required_attributes_derivation.py`、`services/combined_copy_derivation.py` 提供兼容实现。迁移目标是让工作台持有这些纯业务变换，Provider 只校验原输入身份、冻结新尝试的输入并负责执行。工作台已有的图片 URL、业务 hash 和当前提示词 builder 不能重建历史请求的原 inline 图片和精确 prompt；替代协议须能按原 owner/binding 取得保留输入，提交时核对 Provider 原 input hash，并保留同 ID 幂等和单后继限制。该迁移尚未由 completion 命令完成，旧实现暂不删除。
+`category_directory_parent_v1`、`attributes_required_only_v4` 和 `combined_copy_compact_v1` 仍分别由 `services/category_directory_derivation.py`、`services/required_attributes_derivation.py`、`services/combined_copy_derivation.py` 提供旧调用的兼容实现。工作台持有迁移后的纯业务变换，Provider 只校验原输入身份、冻结新尝试的输入并负责执行。已有图片 URL、业务 hash 和当前提示词 builder 不能重建历史请求的原 inline 图片和精确 prompt；迁移使用下述原输入与派生接口，不能由 completion 命令替代。消费者接齐及验证前，旧实现继续保留。
+
+#### 工作台读取原输入与提交业务派生
+
+这两个入口仅向认证的内部管理员开放，并要求 `X-Workbench-Consumer: listing` 产生可信 `internal:listing` 来源；公司及外部入口不可使用。返回均禁止缓存。
+
+- `GET /api/conversation-bindings/text-requests/{original_id}/retained-input`：纯读持久化输入，返回 `{protocol:"task-input-v1", kind:"text", request_id, input_hash, input}`。Provider 校验原 owner、请求 ID、输入 hash、绑定、账号、会话和提交时游标；不查询上游、不恢复或发送。不可导出的输入与身份不一致均拒绝，不能改用当前提示词重建。`input_hash` 是 Provider 的原输入身份，跨语言调用方应原样回传，不以 JSON 重新序列化替代它。
+- `POST /api/conversation-bindings/text-requests/{original_id}/derived-successor`：仅接受下方七个字段。工作台计算业务内容；Provider 从原输入继承账号、绑定、会话、游标、图片和 `product_work` 的原 step。图片内容、顺序及 `image_ref` 标签不可改。`derivation_kind` 仅为业务审计名称，Provider 不按该名称运行商品规则。
+
+```json
+{
+  "client_request_id": "stable-child-request-id",
+  "original_input_hash": "<retained-input 返回的 64 位 hash>",
+  "messages": [{"role": "user", "content": "工作台派生后的内容，保留原消息及媒体结构"}],
+  "model": "auto",
+  "thinking_effort": "high",
+  "mode": "no_final",
+  "derivation_kind": "workbench-business-rule-v1"
+}
+```
+
+`mode` 仅允许 `413_request_missing`、`no_final`、`incomplete`，仍须满足各自原有资格。普通 UNKNOWN、超时和暂停不能获得重发权限；内容审查后及实际发送前继续检查原结果、租约、会话顺序与原/子输入 hash。相同 child ID 和输入返回既有回执，不重复审查或发送；改内容必须拒绝。同一原请求仍只允许一个合法 child。
+
+POST 返回既有文本回执，并附 `workbench_derived_input`：`{protocol:"workbench-derived-input-v1", original_input_hash, child_input_hash, mode, derivation_kind}`。内部管理员的后续 `task-result-v1` 纯读保留该审计字段；它与旧 `derived_input` 分开。工作台保存自己的业务派生证明，并按原业务身份幂等采用结果。新的 no-final/incomplete child 仍须通过原 ProductWork 关联检查才可关闭与归档，不凭生成成功直接关闭业务。
 
 迁移验收复用 `test/test_category_directory_successor.py`、`test/test_required_attributes_successor.py`、`test/test_combined_copy_derivation.py`、`test/test_incomplete_compact_successor.py` 及现有 WBOZ combined-copy fixtures。尤其当前 structured copy 已是正式输入契约，应原样保留；迁移不同时压缩提示词、改变字段或替换图片。旧 receipt 与已创建 child 继续可读，不要求重新生成来升级协议。
 

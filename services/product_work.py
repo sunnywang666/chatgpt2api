@@ -957,6 +957,7 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
             or original_body.get("derived_input") is not None):
         return None
     audit = receipt.get("_derived_input")
+    workbench_audit = receipt.get(TextTaskService._WORKBENCH_DERIVED_MARKER)
     reconciled = receipt.get(TextTaskService._RECONCILED_QUEUED_SUCCESSOR) is True
     if reconciled:
         if incomplete or ancestors or audit is not None:
@@ -966,6 +967,27 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
                 store, db, parent["owner"], receipt, original, original_row[0], original_body, now,
             )
         except ConversationBindingError:
+            return None
+    elif workbench_audit is not None:
+        # Workbench may supply the business text/model only.  The child still
+        # has to rederive from the retained original and the fixed provenance
+        # marker; ProductWork never accepts a caller-created chain proof.
+        expected_mode = "incomplete" if incomplete else "no_final"
+        if (audit is not None or ancestors or not isinstance(workbench_audit, dict)
+                or workbench_audit.get("mode") != expected_mode):
+            return None
+        try:
+            expected_body = TextTaskService._workbench_derived_body_from_stored(
+                original_body, original_id, original_row[0], successor_body,
+            )
+            expected_audit = TextTaskService._workbench_derived_marker(
+                original_input_hash=original_row[0], child_input_hash=successor_row[0],
+                mode=expected_mode,
+                derivation_kind=expected_body[TextTaskService._WORKBENCH_DERIVED_MARKER]["derivation_kind"],
+            )
+        except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
+            return None
+        if workbench_audit != expected_audit or successor_body != expected_body:
             return None
     elif audit is not None:
         allowed = {"combined_copy_compact_v1"} if incomplete else {

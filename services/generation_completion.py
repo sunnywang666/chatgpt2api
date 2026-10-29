@@ -8,6 +8,7 @@ SQLite transaction. Ordinary result reads never authorize another model send.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import time
 import uuid
@@ -330,6 +331,88 @@ class GenerationCompletionService:
         if not pure:
             raise CompletionError("COMPLETION_PURE_GENERATION_REQUIRED")
         return row
+
+    @staticmethod
+    def _bound_text_attempt(root, root_hash, request_id, child_id, child, *, retained_parent=None):
+        """Validate one already-persisted bound retry without selecting it.
+
+        This is intentionally narrower than a general successor lookup: the
+        GET surface must report a durable retry decision, never infer one from
+        arbitrary conversation history.
+        """
+        if (not isinstance(child, dict) or child.get("request_id") != child_id
+                or child_id == request_id
+                or any(child.get(field) != root.get(field) or not child.get(field) for field in (
+                    "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"))):
+            return False
+        if child.get("_retry_unsent_of") == request_id:
+            return child.get("_retry_unsent_input_hash") == root_hash
+        if child.get("_supersedes_request_id") != request_id:
+            return False
+        # The public parent advances when a late answer arrives.  Legacy rows
+        # without a submission cursor must use their verified retained input.
+        expected_parent = root.get("_submission_parent_message_id") or retained_parent
+        return bool(
+            bool(expected_parent) and child.get("_supersedes_input_hash") == root_hash
+            and child.get("_supersedes_request_message_id") == root.get("request_message_id")
+            and child.get("_submission_parent_message_id") == expected_parent
+        )
+
+    def read_bound_attempt(self, kind, identity, request_id):
+        """Read a previously decided admin bound attempt without reconciling.
+
+        No write transaction, task read, scheduler wake, upstream call, selection or
+        cancellation is allowed here.  A missing attempt is deliberately not a
+        proof that the original was never sent.
+        """
+        owner = str(identity["id"])
+        with self.store.connect() as db:
+            # All identity and child checks use one read-only snapshot.
+            db.execute("BEGIN")
+            root = self._root(db, kind, owner, request_id, trusted_bound_retry=True)
+            if kind == "image":
+                state = root.get("_completion") or {}
+                if state.get("replacement_id") or state.get("selected_id") not in {None, request_id}:
+                    raise CompletionError("TASK_ATTEMPT_CONFLICT", 409)
+                if successful(kind, root):
+                    return root
+                if state.get("bound_retry") is True:
+                    return root
+                raise CompletionError("TASK_ATTEMPT_NOT_FOUND", 404)
+
+            root_row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                                  (owner, request_id)).fetchone()
+            if not root_row:
+                raise CompletionError("TASK_ATTEMPT_NOT_FOUND", 404)
+
+            children = db.execute(
+                "SELECT id,receipt FROM requests WHERE owner=? AND "
+                "(json_extract(receipt,'$._retry_unsent_of')=? OR "
+                "json_extract(receipt,'$._supersedes_request_id')=?) LIMIT 2",
+                (owner, request_id, request_id),
+            ).fetchall()
+            if len(children) > 1:
+                raise CompletionError("TASK_ATTEMPT_CONFLICT", 409)
+            if not children:
+                if successful(kind, root):
+                    return root
+                raise CompletionError("TASK_ATTEMPT_NOT_FOUND", 404)
+            child_id, raw_child = children[0]
+            try:
+                child = json.loads(raw_child)
+            except (TypeError, ValueError):
+                raise CompletionError("TASK_ATTEMPT_CONFLICT", 409) from None
+            retained_parent = None
+            if child.get("_supersedes_request_id") and not root.get("_submission_parent_message_id"):
+                retained = self._load_verified_input(db, kind, owner, request_id, root)
+                retained_parent = retained.get("parent_message_id")
+            if not self._bound_text_attempt(root, root_row[0], request_id, child_id, child,
+                                            retained_parent=retained_parent):
+                raise CompletionError("TASK_ATTEMPT_CONFLICT", 409)
+            if (successful(kind, root) and child.get("error_code") == "COMPLETION_ORIGINAL_RECOVERED"
+                    and child.get("upstream_outcome") == "not_sent"):
+                return root
+            return child
 
     @staticmethod
     def _bound_image_retry_candidate(root):
