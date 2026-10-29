@@ -253,6 +253,8 @@ environment:
 
 `attempt_id` 是后续纯读的对象，可能为已成功的原请求、既有后继或本次安排的尝试。`created` 只描述本次是否安排尝试，不证明请求已经发给上游，更不证明业务成果已保存。`status` 复用 `task-result-v1` 的状态投影，未知结果不报作失败；最终可采用结果仍通过该纯读接口核实。
 
+如果内部 `retry` 的响应丢失，可用 `GET /api/chat-requests/{original_id}/completion?action=retry`（图片为 `/api/image-tasks/{original_id}/completion?action=retry`）纯读找回已持久化的尝试。该查询仅向内部管理员开放，返回相同 `task-attempt-v1` 身份，固定 `existing:true`、`created:false`；不发送、不查询上游、不取消子请求或清理占用。文本按原 owner 及唯一合法 child 关联读取，已发或 UNKNOWN 的 child 不被迟到原答案覆盖；图片只查回已决定的同 ID 尝试，不能接管其他 replacement。未发现已决定尝试且原请求未成功时返回 `404 TASK_ATTEMPT_NOT_FOUND`，冲突返回 `409 TASK_ATTEMPT_CONFLICT`。404 不是未发送证明，不能因此重新 POST。调用方仍须持久保存原业务与 `attempt_id` 的关系，再通过 task-results 采用成果。不带 `action=retry` 的普通 completion GET 保持既有行为，不属于此纯读保证。
+
 此入口的当前范围有意受限：文本复用既有 no-final 单后继策略，或严格的未发送绑定失败重试。后一种由 Provider 在原绑定会话内证明原请求节点不存在、旧游标至新游标为同一条无新用户消息的链，且新游标是当前已结束的末端；发送前再次核验。缺少这些证据时返回 `CHAT_BOUND_RETRY_CURSOR_UNAVAILABLE`，不能拿失败前的旧游标重放，也不能把前序回合的回答当成本请求结果。图片只将严格证实未发送的原任务按原 ID 重排，新增后继预算为零；该次发送以后若结果为 UNKNOWN，不允许再凭先前的重试命令创建第二次生成。新 `retry` 不授予普通或公司密钥。
 
 工作台保留商品质量判断、业务重试预算、原业务 ID、成果采用与发布；账号池保留原输入、实际收发、账号与物理会话顺序、原结果保存及防重。商品属性或文案派生规则迁移不属于接口改名，需在消费者接齐后单独验证。

@@ -1,11 +1,13 @@
 """Explicit ordinary-client authorization, separate from original-result reads."""
 from typing import Literal
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from api.support import require_identity
+from api.external_images import is_external
 from api.key_policy import require_chat_text_policy, require_codex_endpoint, require_image_policy
 from api.task_results import _status as task_result_status
 from services.conversation_binding_service import ConversationBindingError
@@ -71,8 +73,33 @@ def create_router(kind):
         return identity, service, row
 
     @router.get(path)
-    async def read_completion(request_id: str, request: Request, authorization: str | None = Header(default=None)):
-        identity, service, _row = authorize(request, authorization, request_id)
+    async def read_completion(request_id: str, request: Request, authorization: str | None = Header(default=None),
+                              action: Literal["retry"] | None = Query(default=None)):
+        internal_retry = action == "retry"
+        identity, service, _row = authorize(request, authorization, request_id,
+                                            enforce_policy=internal_retry,
+                                            admin_bound_action="retry" if internal_retry else None)
+        if internal_retry:
+            if (getattr(request.state, "company_identity", None) is not None
+                    or identity.get("role") != "admin" or is_external(request)):
+                raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
+            try:
+                attempt = await run_in_threadpool(service.read_bound_attempt, kind, identity, request_id)
+                attempt_id = attempt.get("request_id") or attempt.get("id")
+                if not isinstance(attempt_id, str) or not attempt_id:
+                    raise HTTPException(409, detail={"code": "TASK_ATTEMPT_CONFLICT"})
+                return JSONResponse({
+                    "protocol": "task-attempt-v1", "kind": kind, "original_id": request_id,
+                    "attempt_id": attempt_id, "status": task_result_status(kind, attempt),
+                    "result_ready": bool(
+                        attempt.get("status") == ("succeeded" if kind == "text" else "success")
+                        and (isinstance(attempt.get("content"), str) and attempt["content"].strip()
+                             if kind == "text" else attempt.get("data"))
+                    ),
+                    "existing": True, "created": False,
+                }, headers={"Cache-Control": "private, no-store"})
+            except WorkLifecycleError as exc:
+                raise HTTPException(exc.status, detail={"code": exc.code}) from None
         try:
             return await run_in_threadpool(service.read, kind, identity, request_id)
         except WorkLifecycleError as exc:
