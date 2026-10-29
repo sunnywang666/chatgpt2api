@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typing import Literal
 
 from api.product_works import ProductWorkInput, product_identity
 from services.work_lifecycle import WorkLifecycleError
@@ -162,6 +163,18 @@ class ConversationBindingTextRequest(BaseModel):
         ):
             raise ValueError("explicit successor requires only original binding and request identities")
         return self
+
+
+class WorkbenchDerivedSuccessorRequest(BaseModel):
+    """Business content only; Provider supplies the immutable transport identity."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    client_request_id: str = Field(min_length=1, max_length=200)
+    original_input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    messages: list[dict[str, object]] = Field(min_length=1)
+    model: str = Field(min_length=1, max_length=200)
+    thinking_effort: str = Field(min_length=1, max_length=100)
+    mode: Literal["413_request_missing", "no_final", "incomplete"]
+    derivation_kind: str = Field(min_length=1, max_length=128)
 
 
 class TextRequestRecoveryRequest(BaseModel):
@@ -715,6 +728,53 @@ def create_router() -> APIRouter:
                 str(identity.get("id") or "anonymous"), request_id, body.model_dump(mode="python"))
         except ConversationBindingError as exc:
             raise HTTPException(409, detail={"code": exc.code}) from exc
+
+    def workbench_input_identity(request, authorization):
+        identity = require_identity(authorization, request=request)
+        source = trusted_source(identity, request)
+        if (identity.get("role") != "admin" or source != "internal:listing"
+                or getattr(request.state, "company_identity", None) or is_external(request)):
+            raise HTTPException(404, detail={"code": "TASK_NOT_FOUND"})
+        require_chat_text_policy(identity)
+        return identity, source
+
+    @router.get("/api/conversation-bindings/text-requests/{request_id}/retained-input")
+    async def read_workbench_retained_input(request_id: str, request: Request, response: Response,
+                                           authorization: str | None = Header(default=None)):
+        identity, source = workbench_input_identity(request, authorization)
+        response.headers["Cache-Control"] = "private, no-store"
+        try:
+            return await run_in_threadpool(text_task_service.read_retained_input,
+                str(identity.get("id") or "anonymous"), request_id, source=source)
+        except ConversationBindingError as exc:
+            raise HTTPException(404 if exc.code == "CHAT_WORKBENCH_DERIVED_INPUT_NOT_FOUND" else 409,
+                                detail={"code": exc.code}) from None
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/derived-successor")
+    async def submit_workbench_derived_successor(request_id: str, body: WorkbenchDerivedSuccessorRequest,
+                                                request: Request, response: Response,
+                                                authorization: str | None = Header(default=None)):
+        identity, source = workbench_input_identity(request, authorization)
+        response.headers["Cache-Control"] = "private, no-store"
+        owner = str(identity.get("id") or "anonymous")
+        payload = body.model_dump(mode="python")
+        try:
+            existing = await run_in_threadpool(text_task_service.validate_workbench_derived_input,
+                owner, request_id, payload, source=source)
+            if existing is not None:
+                return existing
+            preview = request_text(payload["messages"])
+            await filter_or_log(LoggedCall(identity,
+                "/api/conversation-bindings/text-requests/derived-successor", payload["model"],
+                "绑定会话文本", request_text=preview), preview)
+            # Submission repeats original/child checks after optional review.
+            return await run_in_threadpool(text_task_service.submit_workbench_derived_input,
+                owner, request_id, payload, source=source)
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        except ConversationBindingError as exc:
+            raise HTTPException(404 if exc.code == "CHAT_WORKBENCH_DERIVED_INPUT_NOT_FOUND" else 409,
+                                detail={"code": exc.code}) from None
 
     @router.post("/api/conversation-bindings/text-requests/{request_id}/reconcile-queued-successor")
     async def reconcile_queued_bound_successor(request_id: str, body: ReconcileQueuedSuccessorRequest,
