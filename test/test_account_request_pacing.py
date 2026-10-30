@@ -47,6 +47,62 @@ class Context:
         return {"model": "gpt-5 fixture", "operation": "text", "source": "key:test"}
 
 
+class LocalAttemptTimingTests(unittest.TestCase):
+    def test_attempt_log_separates_wait_guard_marker_and_network_time(self):
+        from services import account_request_pacing as pacing
+        now = [100.0]
+        clock = AccountRequestClock("timing-fixture")
+        clock.next_request = 102.0
+        context = Context("timing")
+        turn_acquire, clock_acquire = clock.turn_lock.acquire, clock.lock.acquire
+
+        def acquire_turn(*args, **kwargs):
+            result = turn_acquire(*args, **kwargs)
+            now[0] += .25
+            return result
+
+        def acquire_clock(*args, **kwargs):
+            result = clock_acquire(*args, **kwargs)
+            now[0] += .75
+            return result
+
+        def guard():
+            now[0] += 3.0
+
+        def stage(name, **fields):
+            if name == "send_call_started":
+                now[0] += .2
+
+        sent = []
+
+        def send(*args, **kwargs):
+            sent.append((args, kwargs))
+            now[0] += .4
+            return Response()
+
+        with patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+             patch.object(pacing.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+             patch.object(clock.turn_lock, "acquire", side_effect=acquire_turn), \
+             patch.object(clock.lock, "acquire", side_effect=acquire_clock), \
+             patch.object(context, "before_send", side_effect=guard), \
+             patch.object(context, "record_stage", side_effect=stage), \
+             patch.object(pacing.logger, "info") as log, executing(context):
+            response = clock.request(send, "POST", "https://provider/backend-api/conversation",
+                                     json={"model": "test", "secret_fixture": "never-log-input"})
+        attempts = [call.args[0] for call in log.call_args_list
+                    if call.args[0].get("event") == "account_http_attempt"]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(attempts), 1)
+        for field, expected in {"turn_wait_secs": .25, "clock_wait_secs": .75,
+                                "pace_wait_secs": 1., "send_guard_secs": 3.,
+                                "send_marker_secs": .2, "headers_elapsed_secs": .4}.items():
+            self.assertAlmostEqual(attempts[0][field], expected)
+        self.assertNotIn("never-log-input", json.dumps(attempts))
+
+
 class ReadBurstAndCapacityTests(unittest.TestCase):
     def test_busy_read_slot_does_not_make_ready_post_yield_to_fifo_reader(self):
         from services.account_request_pacing import AccountRequestDeadlineExceeded

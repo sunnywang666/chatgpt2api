@@ -21,6 +21,7 @@ from services.request_context import current_request, AdmissionLost
 from services.text_task_service import TextTaskService
 from services.conversation_binding_service import ConversationBindingService
 from services.image_task_service import ImageTaskService
+from services import product_work, workflow_scheduling
 
 
 class Clock:
@@ -1590,6 +1591,79 @@ class AdmissionTests(unittest.TestCase):
         self.assertIn("earlier_group_request_unfinished",
                       self.read("text", "happy", "successor")["waiting"]["reasons"])
 
+    def test_succeeded_same_session_original_releases_queued_successor(self):
+        self.submit("original", client_conversation_id="same")
+        self.submit("successor", client_conversation_id="same")
+
+        self.admission.execute(self.admission.claim_next())
+
+        original = self.read("text", "happy", "original")
+        self.assertEqual(original["status"], "succeeded")
+        successor = self.admission.claim_next()
+        self.assertIsNotNone(successor)
+        self.assertEqual(successor.request_id, "successor")
+
+    def test_unknown_turn_uses_remaining_capacity_without_overclaiming_same_variant(self):
+        self.admission.settings = lambda: {
+            "chat_account_concurrency": 3,
+            "image_account_concurrency": 4,
+            "codex_max_concurrency": 4,
+        }
+        self.submit("sent")
+        sent = self.admission.claim_next()
+        sent.before_send()
+        self.text._update("happy", "sent", status="unknown", upstream_outcome="unknown", _executing=False)
+        for request_id in ("queued-1", "queued-2", "queued-3"):
+            self.submit(request_id)
+
+        claimed = [self.admission.claim_next(), self.admission.claim_next()]
+
+        self.assertEqual({context.request_id for context in claimed}, {"queued-1", "queued-2"})
+        self.assertIsNone(self.admission.claim_next())
+        self.assertEqual(self.read("text", "happy", "queued-3")["status"], "queued")
+        account = self.admission.resource_snapshot()["accounts"][0]["chat_turn"]
+        self.assertEqual((account["capacity"], account["occupied"]), (3, 3))
+
+    def test_paused_unknown_still_blocks_same_session_successor(self):
+        self.submit("original", client_conversation_id="same")
+        self.submit("successor", client_conversation_id="same")
+        with self.store.transaction() as db:
+            original = self.store.read_receipt(db, "text", "happy", "original")
+            original.update(status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                            _recovery_paused=True, _attempt_finished_at=self.clock())
+            self.store.write_receipt(db, "text", "happy", "original", original)
+        self.assertIsNone(self.admission.claim_next())
+        self.assertIn("earlier_group_request_unfinished",
+                      self.read("text", "happy", "successor")["waiting"]["reasons"])
+
+    def test_snapshot_skips_only_planner_terminal_records(self):
+        """Terminal history remains in the input but is not a planner request."""
+        for request_id in ("succeeded", "failed-known", "paused-unknown", "failed-unknown", "queued"):
+            self.submit(request_id, client_conversation_id="projection-" + request_id)
+        with self.store.transaction() as db:
+            succeeded = self.store.read_receipt(db, "text", "happy", "succeeded")
+            succeeded.update(status="succeeded", content="saved", upstream_outcome="completed")
+            self.store.write_receipt(db, "text", "happy", "succeeded", succeeded)
+            failed_known = self.store.read_receipt(db, "text", "happy", "failed-known")
+            failed_known.update(status="failed", error_code="INPUT_REJECTED", upstream_outcome="not_sent")
+            self.store.write_receipt(db, "text", "happy", "failed-known", failed_known)
+            paused = self.store.read_receipt(db, "text", "happy", "paused-unknown")
+            paused.update(status="unknown", _recovery_paused=True, _attempt_finished_at=self.clock())
+            self.store.write_receipt(db, "text", "happy", "paused-unknown", paused)
+            failed_unknown = self.store.read_receipt(db, "text", "happy", "failed-unknown")
+            failed_unknown.update(status="failed", error_code="RESULT_UNRECOVERABLE", upstream_outcome="unknown")
+            self.store.write_receipt(db, "text", "happy", "failed-unknown", failed_unknown)
+            receipts = list(self.store.receipts(db))
+            snapshot = self.admission._snapshot(
+                self.rows, receipts, self.admission.settings(), {"fixture-text": {"Plus"}}, self.clock(),
+                self.store.runtime(db, "fairness", {}),
+                workflow_scheduling.state_snapshot(self.store, db), product_work.state_snapshot(self.store, db), db=db,
+            )
+        request_ids = {request.ref.request_id for request in snapshot.requests}
+        self.assertNotIn("succeeded", request_ids)
+        self.assertNotIn("failed-known", request_ids)
+        self.assertTrue({"paused-unknown", "failed-unknown", "queued"} <= request_ids)
+
     def test_restart_loads_actual_multimodal_input_and_claims_once(self):
         self.submit("original", messages=[{"role": "user", "content": [(b"original image", "image.png", "image/png")]}])
         _, _, restarted = build(self.root, self.clock)
@@ -2292,6 +2366,51 @@ class AdmissionTests(unittest.TestCase):
             self.assertIsNone(self.admission.claim_next())
         writes.assert_not_called()
         self.assertEqual(self.read("text", "happy", "blocked-diagnostic")["waiting"], initial)
+
+    def test_large_paused_queue_builds_one_offer_per_account_capability(self):
+        """Paused history remains visible, but cannot multiply identical offers."""
+        self.write_accounts(4)
+        self.admission.settings = lambda: {
+            "chat_account_concurrency": 6,
+            "image_account_concurrency": 4,
+            "codex_max_concurrency": 4,
+        }
+        self.submit("dispatchable")
+        with self.store.transaction() as db:
+            for index in range(1244):
+                request_id = "paused-" + str(index)
+                work_key = "work:paused-" + str(index)
+                receipt = {
+                    "id": request_id,
+                    "request_id": request_id,
+                    "status": "queued",
+                    "_route": "chat",
+                    "_operation": "text",
+                    "model": "fixture-text",
+                    "_source": "fixture",
+                    "_work_key": work_key,
+                    "_sequence": index + 2,
+                    "client_conversation_id": "paused-session-" + str(index),
+                    "_input_bytes": 1,
+                    "created_at": self.clock(),
+                    "_submission_started": False,
+                }
+                db.execute("INSERT INTO requests(owner,id,request_hash,receipt) VALUES(?,?,?,?)",
+                           ("paused-owner", request_id, "paused-hash-" + str(index), json.dumps(receipt)))
+                self.store.set_runtime(db, work_key, {"key": work_key, "state": "paused", "slot_held": False})
+            for index in range(1015):
+                key = "product_work:paused-" + str(index)
+                self.store.set_runtime(db, key, {"key": key, "state": "paused", "owner": "paused-owner"})
+
+        from services.admission_planner import Offer
+        with patch("services.pool_admission.Offer", wraps=Offer) as offers:
+            context = self.admission.claim_next()
+
+        self.assertEqual(context.request_id, "dispatchable")
+        # Four accounts × the one queued (chat, fixture-text, text) capability.
+        # The 1,244 paused rows still receive their existing work-state deferral.
+        self.assertEqual(offers.call_count, 4)
+        self.assertIn("work_not_active", self.read("text", "paused-owner", "paused-0")["waiting"]["reasons"])
 
     def test_waiting_diagnostic_unknown_resource_family_is_redacted(self):
         from services.admission_planner import OfferDiagnostic, ResourceBlock

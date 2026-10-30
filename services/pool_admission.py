@@ -1735,6 +1735,16 @@ class PoolAdmission:
             # but do not place it in the planner's claimable queued set.
             state = ("unknown" if unknown else "queued" if status == "queued"
                      else "active" if status == "not_started" or active else "succeeded")
+            # Keep every receipt above through the authoritative lineage,
+            # physical-conversation, UNKNOWN, product-member and resource
+            # projections.  Once those projections are complete, a terminal
+            # record cannot be selected or become an order head in
+            # ``choose_next``.  Do not construct scheduler constraints and a
+            # WaitingRequest for it while the admission writer is held.
+            # In particular, FAILED-with-unknown and paused UNKNOWN both have
+            # ``state == 'unknown'`` and stay in the planner.
+            if state == "succeeded":
+                continue
             thread_needs = ()
             if kind == "image" and r.get("_image_thread"):
                 _, blocked = predecessor_state(r, image_receipts.get(owner, {}))
@@ -1876,6 +1886,16 @@ class PoolAdmission:
                      "product_admission": Resource("product_admission", product_capacity, product_occupied, now)}
         resources.update({resource.key: resource for resource in thread_resources})
         offers = []
+        # Offers are account capabilities, not per-request state.  The planner
+        # already identifies them by this same tuple, so building one for every
+        # queued receipt only extends the claim transaction while preserving no
+        # additional admission, pause, UNKNOWN or send-boundary information.
+        # Keep every request in the snapshot: its own needs remain the source
+        # of order, work, product and capacity deferrals.
+        offer_variants = tuple(sorted({
+            (request.route, request.model, request.operation)
+            for request in requests if request.state == "queued"
+        }))
         scoped_extra_turn = None
         trial = settings.get("temporary_chat_second_slot")
         trial_active = (isinstance(trial, dict)
@@ -1926,17 +1946,14 @@ class PoolAdmission:
             native_pending = any(isinstance(v, dict) and v.get("state") in {"pending", "unknown"}
                                  for v in (account.get("codex_affinities") or {}).values())
             resources[codex_key] = Resource(codex_key, 1, max(occupied.get(codex_key, 0), int(native_pending)), now)
-            for request in requests:
-                if request.state != "queued":
-                    continue
-                model = request.model
-                if request.route == "codex":
-                    eligible = self.codex is not None and self.codex._eligible_account(account, "" if request.operation == "image" else model, allow_probe=False) is not None
-                    if request.operation == "image":
+            for route, model, operation in offer_variants:
+                if route == "codex":
+                    eligible = self.codex is not None and self.codex._eligible_account(account, "" if operation == "image" else model, allow_probe=False) is not None
+                    if operation == "image":
                         eligible = (eligible and account.get("source_type") == "codex"
                                     and image_capacity(account, settings, model) > 0)
                     decision = self.codex.quota_decision(account, model) if eligible and hasattr(self.codex, "quota_decision") else {}
-                    offers.append(Offer(identity, "codex", model, request.operation,
+                    offers.append(Offer(identity, "codex", model, operation,
                                         (Need(codex_key), Need("codex_server")), enabled=bool(eligible),
                                         preference=0 if decision.get("quota_bucket") == "gpt-reserve" else 1))
                     continue
@@ -1950,7 +1967,7 @@ class PoolAdmission:
                 if identity_counts.get(identity) != 1:
                     ineligible.append("identity_not_unique")
                 enabled = not disabled and chat_saved and paid and identity_counts.get(identity) == 1
-                if request.operation == "image":
+                if operation == "image":
                     from utils.helper import is_codex_image_model, split_image_model
                     required_plan, _ = split_image_model(model)
                     model_plan_allowed = (not required_plan
@@ -1980,7 +1997,7 @@ class PoolAdmission:
                     if isinstance(limit, dict) and limit.get("feature_name") == model and limit.get("remaining") == 0:
                         enabled = False
                         ineligible.append("model_limit_zero")
-                offers.append(Offer(identity, "chat", model, request.operation, needs, enabled=bool(enabled),
+                offers.append(Offer(identity, "chat", model, operation, needs, enabled=bool(enabled),
                                     ineligible_reasons=tuple(dict.fromkeys(ineligible))))
         if self.text_workers is None:
             # Execution threads follow the same usable physical account turns.
