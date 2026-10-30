@@ -1,7 +1,26 @@
 from pathlib import Path
+from fnmatch import fnmatchcase
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_pool_ci_pushes_check_development_without_replaying_main_merges():
+    workflow = (ROOT / ".github/workflows/pool02-scoped-ci.yml").read_text()
+    # The workflow uses a plain list of positive branch globs. actionlint checks
+    # YAML validity; exercise the declared filters against actual ref examples.
+    push = workflow.split("  push:\n", 1)[1].split("  workflow_dispatch:\n", 1)[0]
+    branch_list = push.split("    branches:\n", 1)[1].split("    paths:\n", 1)[0]
+    patterns = re.findall(r"^      - ([^\n]+)$", branch_list, re.MULTILINE)
+    assert patterns
+    for branch, expected in [
+        ("codex/provider-retained-input-20261029", True),
+        ("codex/nested/fix", True),
+        ("main", False),
+        ("release", False),
+    ]:
+        assert any(fnmatchcase(branch, pattern) for pattern in patterns) == expected, branch
 
 
 def test_pool_ci_dispatch_is_exact_source_and_company_by_default():
