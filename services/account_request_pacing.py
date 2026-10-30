@@ -469,18 +469,30 @@ class AccountRequestClock:
         if not isinstance(deadline_at, (int, float)) or isinstance(deadline_at, bool):
             deadline_at = None
 
+        # Existing attempt logs separate local waiting from upstream response
+        # time without adding a receipt write or changing any pacing decision.
+        local_started_at = time.time()
+        local_seconds = {"clock_wait_secs": 0.0, "turn_wait_secs": 0.0,
+                         "pace_wait_secs": 0.0, "send_guard_secs": 0.0,
+                         "send_marker_secs": 0.0}
+
         def remaining_budget() -> float | None:
             if deadline_at is None:
                 return None
             return float(deadline_at) - time.monotonic()
 
         def acquire_with_budget(lock) -> None:
-            remaining = remaining_budget()
-            if remaining is None:
-                lock.acquire()
-                return
-            if remaining <= 0 or not lock.acquire(timeout=remaining):
-                raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
+            started = time.monotonic()
+            try:
+                remaining = remaining_budget()
+                if remaining is None:
+                    lock.acquire()
+                    return
+                if remaining <= 0 or not lock.acquire(timeout=remaining):
+                    raise AccountRequestDeadlineExceeded("account request deadline elapsed before upstream send")
+            finally:
+                key = "turn_wait_secs" if lock is self.turn_lock else "clock_wait_secs"
+                local_seconds[key] += max(0.0, time.monotonic() - started)
 
         def cap_timeout_before_send() -> None:
             remaining = remaining_budget()
@@ -509,6 +521,7 @@ class AccountRequestClock:
             else:
                 time.sleep(delay)
             elapsed = max(0.0, time.monotonic() - started_wait)
+            local_seconds["pace_wait_secs"] += elapsed
             if credit and elapsed:
                 local_wait(elapsed)
                 if deadline_at is not None:
@@ -646,6 +659,8 @@ class AccountRequestClock:
                              "method": verb if verb in {"GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "OPTIONS"} else "OTHER",
                              "phase": send_phase, "endpoint_kind": endpoint_kind, "started_at": started_at,
                              "headers_elapsed_secs": round(time.monotonic() - started, 6),
+                             "local_started_at": local_started_at,
+                             **{key: round(value, 6) for key, value in local_seconds.items()},
                              "status_code": status if isinstance(status, int) and not isinstance(status, bool) else None,
                              "outcome": "response" if response is not None else "transport_error",
                              "transport_error_type": transport_error, "transport_error_code": transport_code,
@@ -814,7 +829,11 @@ class AccountRequestClock:
                     # The metadata GET does not bypass the account request pace.
                     wait_for_send_edge("deadline elapsed after preflight")
                 if context is not None and is_turn:
-                    context.before_send()
+                    started_guard = time.monotonic()
+                    try:
+                        context.before_send()
+                    finally:
+                        local_seconds["send_guard_secs"] += max(0.0, time.monotonic() - started_guard)
                 if callable(before_send):
                     before_send()
                 if archive_guard is not None:
@@ -859,7 +878,11 @@ class AccountRequestClock:
                 # part of the declared budget; cap once more at the send edge.
                 cap_timeout_before_send()
                 if context is not None and is_turn and hasattr(context, "record_stage"):
-                    context.record_stage("send_call_started")
+                    started_marker = time.monotonic()
+                    try:
+                        context.record_stage("send_call_started")
+                    finally:
+                        local_seconds["send_marker_secs"] += max(0.0, time.monotonic() - started_marker)
                 sent_at = time.monotonic()
                 try:
                     if concurrent_io:
