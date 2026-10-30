@@ -764,6 +764,120 @@ class AccountRequestPacingTests(unittest.TestCase):
                 self.assertEqual(errors, [])
                 self.assertEqual(len(sent), 2, "metadata or original result was replayed")
 
+    def test_canonical_bootstrap_releases_clock_after_persisting_floor(self):
+        for bootstrap_url in ("https://provider", "https://provider/"):
+            for peer_method, peer_path, peer_body in (
+                ("POST", "/backend-api/sentinel/chat-requirements/prepare", {"p": "fixture"}),
+                ("GET", "/backend-api/conversation/original", None),
+            ):
+                with self.subTest(bootstrap_url=bootstrap_url, peer_path=peer_path), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: .05)), \
+                 patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+                    state = Path(tmp) / "clock.json"
+                    entered, release, peer_sent = threading.Event(), threading.Event(), threading.Event()
+                    errors, starts, persisted_floors = [], [], []
+
+                    def send(method, url, **kwargs):
+                        starts.append((method, url, time.monotonic()))
+                        if url == bootstrap_url:
+                            entered.set()
+                            if not release.wait(3):
+                                raise TimeoutError("bootstrap was not released")
+                        else:
+                            persisted_floors.append(AccountRequestClock("account", state).next_request)
+                            peer_sent.set()
+                        return Response()
+
+                    def bootstrap():
+                        try:
+                            AccountRequestClock("account", state).request(send, "GET", bootstrap_url)
+                        except BaseException as exc:
+                            errors.append(exc)
+
+                    def peer():
+                        try:
+                            AccountRequestClock("account", state).request(
+                                send, peer_method, "https://provider" + peer_path, json=peer_body,
+                            )
+                        except BaseException as exc:
+                            errors.append(exc)
+
+                    worker, follower = threading.Thread(target=bootstrap), threading.Thread(target=peer)
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(1))
+                        follower.start()
+                        self.assertTrue(peer_sent.wait(2), "slow bootstrap blocked the next legal account request")
+                        self.assertTrue(worker.is_alive())
+                        self.assertEqual(len(starts), 2)
+                        self.assertGreaterEqual(starts[1][2] - starts[0][2], .045)
+                        self.assertGreaterEqual(persisted_floors[0], starts[0][2] + .045)
+                    finally:
+                        release.set()
+                        worker.join(4)
+                        follower.join(4)
+                    self.assertFalse(worker.is_alive() or follower.is_alive())
+                    self.assertEqual(errors, [])
+
+    def test_noncanonical_root_and_requirements_post_retain_send_fence(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        cases = (
+            ("GET", "/?bootstrap=1", None),
+            ("GET", "/?", None),
+            ("GET", "?", None),
+            ("GET", "////", None),
+            ("GET", "/backend-api/other", None),
+            ("POST", "/", {}),
+            ("POST", "/backend-api/sentinel/chat-requirements/prepare", {"p": "fixture"}),
+        )
+        for method, path_suffix, body in cases:
+            with self.subTest(method=method, path=path_suffix), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                 patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+                state = Path(tmp) / "clock.json"
+                entered, release = threading.Event(), threading.Event()
+                sent, errors = [], []
+
+                def send(request_method, url, **kwargs):
+                    sent.append((request_method, url))
+                    entered.set()
+                    if not release.wait(3):
+                        raise TimeoutError("locked request was not released")
+                    return Response()
+
+                def locked_request():
+                    try:
+                        AccountRequestClock("account", state).request(
+                            send, method, "https://provider" + path_suffix, json=body,
+                        )
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                def result_read():
+                    try:
+                        AccountRequestClock("account", state).request(
+                            send, "GET", "https://provider/backend-api/conversation/original",
+                            _account_request_deadline_monotonic=time.monotonic() + .05,
+                        )
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                worker, reader = threading.Thread(target=locked_request), threading.Thread(target=result_read)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    reader.start()
+                    time.sleep(.1)
+                    self.assertEqual(len(sent), 1, "noncanonical root or requirements POST escaped the send fence")
+                finally:
+                    release.set()
+                    worker.join(4)
+                    reader.join(4)
+                self.assertFalse(worker.is_alive() or reader.is_alive())
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], AccountRequestDeadlineExceeded)
+
     def test_waiting_fifo_reader_rechecks_at_fractional_http_pace(self):
         for http_interval, expected_wait in ((.1, .1), (.5, .5), (5, 1)):
             with self.subTest(http_interval=http_interval):
@@ -825,6 +939,7 @@ class AccountRequestPacingTests(unittest.TestCase):
 
     def test_late_metadata_or_result_does_not_erase_concurrent_429(self):
         for slow_path, limited_path, scope in (
+            ("/", "/conversation/original", "conversation_read"),
             ("/backend-api/me", "/conversation/original", "conversation_read"),
             ("/conversation/original", "/backend-api/me", "account"),
             ("/backend-api/accounts/check/v4-2023-04-27", "/backend-api/me", "account"),
