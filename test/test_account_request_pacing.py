@@ -103,6 +103,156 @@ class LocalAttemptTimingTests(unittest.TestCase):
         self.assertNotIn("never-log-input", json.dumps(attempts))
 
 
+class ResponseReceiptLockTests(unittest.TestCase):
+    def test_header_receipt_wait_does_not_block_other_preparation_or_lose_send_floor(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: .05)), \
+                 patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+                path = Path(directory) / "clock.json"
+                first_clock = AccountRequestClock("receipt-lock", path)
+                entered, release, peer_sent = threading.Event(), threading.Event(), threading.Event()
+                errors, responses, starts = [], [], []
+
+                class WaitingReceipt(Context):
+                    def record_stage(self, stage, **fields):
+                        if stage == "response_headers_received":
+                            entered.set()
+                            if not release.wait(3):
+                                raise TimeoutError("receipt test was not released")
+                        super().record_stage(stage, **fields)
+
+                context = WaitingReceipt("first")
+                first_response = Response()
+
+                def send_first(*args, **kwargs):
+                    starts.append(time.monotonic())
+                    return first_response
+
+                def run_first():
+                    try:
+                        with executing(context):
+                            responses.append(first_clock.request(send_first, "POST",
+                                "https://provider/backend-api/conversation", stream=streaming))
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                def run_peer():
+                    try:
+                        other = AccountRequestClock("receipt-lock", path)
+                        def send(*args, **kwargs):
+                            starts.append(time.monotonic())
+                            peer_sent.set()
+                            return Response()
+                        other.request(send, "POST", "https://provider/backend-api/sentinel/chat-requirements",
+                                      _account_request_deadline_monotonic=time.monotonic() + 1)
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                first = threading.Thread(target=run_first)
+                peer = threading.Thread(target=run_peer)
+                first.start()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    # The response is not exposed, and its generation capacity
+                    # remains reserved, until this receipt write completes.
+                    self.assertFalse(responses)
+                    self.assertEqual(context.released, 0)
+                    peer.start()
+                    self.assertTrue(peer_sent.wait(2), "receipt I/O still holds the account clock")
+                    self.assertGreaterEqual(starts[1] - starts[0], .045)
+                    restarted = AccountRequestClock("receipt-lock", path)
+                    self.assertGreaterEqual(restarted.next_request, starts[1] + .045)
+                finally:
+                    release.set()
+                    first.join(3)
+                    if peer.ident is not None:
+                        peer.join(3)
+                self.assertFalse(errors)
+                self.assertEqual(responses, [first_response])
+                self.assertEqual(context.stages[:3],
+                                 ["before_send", "send_call_started", "response_headers_received"])
+                if streaming:
+                    self.assertEqual(context.released, 0)
+                    list(first_response.iter_lines())
+                    self.assertLess(context.stages.index("response_headers_received"),
+                                    context.stages.index("first_output"))
+                self.assertEqual(context.released, 1)
+
+    def test_429_cooldown_is_durable_before_header_receipt_wait(self):
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            path = Path(directory) / "clock.json"
+            entered, release = threading.Event(), threading.Event()
+            errors = []
+
+            class WaitingReceipt(Context):
+                def record_limit(self, observed):
+                    self.limit = observed
+
+                def record_stage(self, stage, **fields):
+                    if stage == "response_headers_received":
+                        entered.set()
+                        if not release.wait(3):
+                            raise TimeoutError("receipt test was not released")
+                    super().record_stage(stage, **fields)
+
+            context = WaitingReceipt("limited")
+            limited = Response()
+            limited.status_code, limited.headers = 429, {"Retry-After": "123"}
+
+            def run_first():
+                try:
+                    with executing(context):
+                        AccountRequestClock("limited", path).request(lambda *a, **k: limited,
+                            "POST", "https://provider/backend-api/conversation")
+                except BaseException as exc:
+                    errors.append(exc)
+
+            worker = threading.Thread(target=run_first)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                restarted = AccountRequestClock("limited", path)
+                self.assertGreater(restarted.cooldown_until - time.monotonic(), 120)
+                self.assertEqual(restarted.last_rate_limit_evidence["retry_after_seconds"], 123)
+                sent = []
+                with self.assertRaises(AccountRequestDeadlineExceeded):
+                    restarted.request(lambda *a, **k: sent.append(True), "GET",
+                        "https://provider/backend-api/models",
+                        _account_request_deadline_monotonic=time.monotonic() + .05)
+                self.assertFalse(sent)
+            finally:
+                release.set()
+                worker.join(3)
+            self.assertFalse(errors)
+            self.assertIn("response_headers_received", context.stages)
+
+    def test_header_receipt_failure_closes_original_response_without_resending(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                clock, response, context = AccountRequestClock("receipt-failure"), Response(), Context("failed")
+                stages, sent = [], []
+                def record(stage, **fields):
+                    stages.append(stage)
+                    if stage == "response_headers_received":
+                        raise OSError("receipt write failed")
+                def send(*args, **kwargs):
+                    sent.append(True)
+                    return response
+                with patch.object(context, "record_stage", side_effect=record), executing(context):
+                    with self.assertRaises(OSError):
+                        clock.request(send, "POST", "https://provider/backend-api/conversation", stream=streaming)
+                self.assertEqual(sent, [True])
+                self.assertIn("send_call_started", stages)
+                self.assertTrue(response.closed)
+                self.assertEqual(context.released, 1)
+                self.assertTrue(clock.lock.acquire(blocking=False))
+                clock.lock.release()
+
+
 class ReadBurstAndCapacityTests(unittest.TestCase):
     def test_busy_read_slot_does_not_make_ready_post_yield_to_fifo_reader(self):
         from services.account_request_pacing import AccountRequestDeadlineExceeded

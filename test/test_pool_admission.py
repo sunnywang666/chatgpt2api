@@ -1664,6 +1664,86 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn("failed-known", request_ids)
         self.assertTrue({"paused-unknown", "failed-unknown", "queued"} <= request_ids)
 
+    def test_capacity_only_snapshot_matches_full_chat_turns(self):
+        self.write_accounts(2)
+        self.admission.settings = lambda: {
+            "chat_account_concurrency": 2,
+            "image_account_concurrency": 4,
+            "codex_max_concurrency": 4,
+        }
+        for request_id, account in (("running", "account-0"), ("paused", "account-0"),
+                                    ("failed-unknown", "account-1")):
+            self.submit(request_id, provider_account_identity=account,
+                        provider_binding_id="binding-" + account.rsplit("-", 1)[1])
+        with self.store.transaction() as db:
+            running = self.store.read_receipt(db, "text", "happy", "running")
+            running.update(status="running", _executing=True, _claim_id="live", _claim_until=self.clock() + 30,
+                           _submission_started=True, _turn_reserved=True)
+            self.store.write_receipt(db, "text", "happy", "running", running)
+            paused = self.store.read_receipt(db, "text", "happy", "paused")
+            paused.update(status="unknown", _recovery_paused=True, _attempt_finished_at=self.clock())
+            self.store.write_receipt(db, "text", "happy", "paused", paused)
+            failed = self.store.read_receipt(db, "text", "happy", "failed-unknown")
+            failed.update(status="failed", error_code="RESULT_UNRECOVERABLE", upstream_outcome="unknown")
+            self.store.write_receipt(db, "text", "happy", "failed-unknown", failed)
+        self.terminal_empty_correction_pair()
+        with self.store.connect() as db:
+            receipts = list(self.store.receipts(db))
+            rows, settings = self.admission._rows(), self.admission.settings()
+            full = self.admission._snapshot(
+                rows, receipts, settings, {"fixture-text": {"Plus"}}, self.clock(),
+                self.store.runtime(db, "fairness", {}),
+                workflow_scheduling.state_snapshot(self.store, db), product_work.state_snapshot(self.store, db), db=db,
+            )
+            capacity = self.admission._snapshot(rows, receipts, settings, {}, self.clock(), {}, db=db,
+                                                capacity_only=True)
+        turns = lambda snapshot: sorted((resource.key, resource.capacity, resource.occupied, resource.next_at)
+                                        for resource in snapshot.resources if resource.key.startswith("chat_turn:"))
+        self.assertEqual(turns(capacity), turns(full))
+
+    def test_final_guard_capacity_projection_serializes_with_next_claim(self):
+        self.write_accounts(2)
+        self.admission.settings = lambda: {
+            "chat_account_concurrency": 1,
+            "image_account_concurrency": 4,
+            "codex_max_concurrency": 4,
+        }
+        self.submit("first", owner="first")
+        self.submit("second", owner="second")
+        first = self.admission.claim_next()
+        entered, release, guard_done = threading.Event(), threading.Event(), threading.Event()
+        result, errors = {}, []
+        original_snapshot = self.admission._snapshot
+
+        def hold_capacity_snapshot(*args, **kwargs):
+            if kwargs.get("capacity_only"):
+                entered.set()
+                if not release.wait(2):
+                    raise TimeoutError("test did not release final guard")
+            return original_snapshot(*args, **kwargs)
+
+        with patch.object(self.admission, "_snapshot", side_effect=hold_capacity_snapshot):
+            guard = threading.Thread(target=lambda: (first.before_send(), guard_done.set()))
+            guard.start()
+            self.assertTrue(entered.wait(2))
+
+            def claim():
+                try:
+                    result["context"] = self.admission.claim_next()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            claimer = threading.Thread(target=claim)
+            claimer.start()
+            time.sleep(.05)
+            self.assertTrue(claimer.is_alive())
+            release.set()
+            guard.join(2)
+            claimer.join(2)
+        self.assertTrue(guard_done.is_set())
+        self.assertEqual(errors, [])
+        self.assertEqual(result["context"].request_id, "second")
+
     def test_restart_loads_actual_multimodal_input_and_claims_once(self):
         self.submit("original", messages=[{"role": "user", "content": [(b"original image", "image.png", "image/png")]}])
         _, _, restarted = build(self.root, self.clock)
