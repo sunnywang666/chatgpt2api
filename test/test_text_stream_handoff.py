@@ -956,7 +956,12 @@ def test_same_message_sparse_terminal_finishes_real_protocol_without_waiting_aga
     assert "ws_no_terminal" not in stages and "ws_budget_exhausted" not in stages
     assert len(backend.session.post_calls) == 1
     assert len(backend.session.ws_calls) == (0 if phase == "initial_sse" else 1)
-    if phase != "initial_sse":
+    if phase == "initial_sse":
+        # The original SSE already certified this turn's terminal result.
+        # It must keep the output/cursor above while avoiding the redundant
+        # pre-save candidate-bound receipt stage.
+        assert stages == []
+    else:
         assert stages[-1] == "ws_terminal" and backend.session.ws.closed
 
 
@@ -1134,8 +1139,18 @@ def test_terminal_patch_keeps_envelope_phase_and_parent_evidence(envelope, phase
 
 def test_terminal_from_an_old_branch_does_not_suppress_this_turns_handoff():
     backend = _backend(_initial_events(terminal=True, terminal_parent="old-user"), frames=[_ws_frame()])
+    context = StageContext()
+    token = current_request.set(context)
+    try:
+        assert list(backend.stream_conversation(prompt="fixture"))[-1] == "[DONE]"
+    finally:
+        current_request.reset(token)
 
-    assert list(backend.stream_conversation(prompt="fixture"))[-1] == "[DONE]"
+    stages = [data["handoff_stage"] for stage, data in context.stages if stage == "stream_handoff"]
+    assert stages == [
+        "candidate_bound", "ws_endpoint_get_entered", "ws_endpoint_get_completed",
+        "ws_connected", "ws_subscribed", "ws_terminal",
+    ]
     assert len(backend.session.get_calls) == 1
     assert len(backend.session.ws_calls) == 1
 

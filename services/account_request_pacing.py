@@ -527,7 +527,10 @@ class AccountRequestClock:
                 if deadline_at is not None:
                     deadline_at += elapsed
 
-        path = urlparse(str(url)).path.rstrip("/")
+        request_target = str(url).split("#", 1)[0]
+        parsed_url = urlparse(request_target)
+        raw_path = parsed_url.path
+        path = raw_path.rstrip("/")
         is_turn = str(method).upper() == "POST" and (path.endswith("/conversation") or path.endswith("/responses"))
         context = current_request.get()
         phase = "conversation" if is_turn else "prepare" if path.endswith("/conversation/prepare") else "account_read"
@@ -539,13 +542,18 @@ class AccountRequestClock:
         elif "/conversation/" in path and "/attachment/" not in path and str(method).upper() == "GET":
             phase = "conversation_read"
         is_conversation_read = phase == "conversation_read"
-        # Only the three read-only account observations used by get_user_info
-        # may receive outside the pacing lock. Other account_read operations
+        # Only explicitly identified read-only account observations may receive
+        # outside the pacing lock.  A conversation bootstrap is a canonical
+        # root GET only: do not normalize query, repeated-slash, POST, or other
+        # account paths into this allowance.  Other account_read operations
         # include writes and authentication; the phase alone is not sufficient.
         metadata_kind = {
             ("GET", "/backend-api/me"): "account_profile",
             ("GET", "/backend-api/accounts/check/v4-2023-04-27"): "account_subscription",
         }.get((str(method).upper(), path))
+        if (str(method).upper() == "GET" and raw_path in {"", "/"}
+                and not parsed_url.query and "?" not in request_target):
+            metadata_kind = "account_bootstrap"
         body = kwargs.get("json")
         if (str(method).upper() == "POST" and path == "/backend-api/conversation/init"
                 and isinstance(body, dict)

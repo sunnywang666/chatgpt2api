@@ -3864,7 +3864,13 @@ class OpenAIBackendAPI:
             # Only ConversationBindingService's retained text path opts into
             # result-only WS continuation; text prompts may still contain
             # reference images, so do not infer this from ``images``.
-            if handoff_enabled:
+            # An original-branch terminal was already observed from this SSE
+            # stream.  `eligible` is false in that case, so there is no
+            # continuation transport to diagnose.  Do not put a second,
+            # purely diagnostic receipt write ahead of saving the completed
+            # answer.  Keep every non-terminal case durable: it may still
+            # enter the bounded WS recovery path below.
+            if handoff_enabled and not handoff.terminal_seen:
                 self._record_stream_handoff_stage(handoff.diagnostic_stage)
             if handoff.eligible and handoff_enabled:
                 handoff_done = yield from self._consume_stream_handoff(handoff, request_deadline)
