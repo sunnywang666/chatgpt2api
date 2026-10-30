@@ -112,6 +112,7 @@ class ResponseReceiptLockTests(unittest.TestCase):
                 path = Path(directory) / "clock.json"
                 first_clock = AccountRequestClock("receipt-lock", path)
                 entered, release, peer_sent = threading.Event(), threading.Event(), threading.Event()
+                peer_done = threading.Event()
                 errors, responses, starts = [], [], []
 
                 class WaitingReceipt(Context):
@@ -148,6 +149,8 @@ class ResponseReceiptLockTests(unittest.TestCase):
                                       _account_request_deadline_monotonic=time.monotonic() + 1)
                     except BaseException as exc:
                         errors.append(exc)
+                    finally:
+                        peer_done.set()
 
                 first = threading.Thread(target=run_first)
                 peer = threading.Thread(target=run_peer)
@@ -161,6 +164,11 @@ class ResponseReceiptLockTests(unittest.TestCase):
                     peer.start()
                     self.assertTrue(peer_sent.wait(2), "receipt I/O still holds the account clock")
                     self.assertGreaterEqual(starts[1] - starts[0], .045)
+                    # The send callback fires before the durable actual-start
+                    # correction. Read that floor only after request returns,
+                    # while the first response receipt is still blocked.
+                    self.assertTrue(peer_done.wait(2))
+                    self.assertFalse(errors)
                     restarted = AccountRequestClock("receipt-lock", path)
                     self.assertGreaterEqual(restarted.next_request, starts[1] + .045)
                 finally:
