@@ -5,7 +5,6 @@ run-name: Provider POOL-02 ${{ inputs.source_sha || github.sha }}${{ inputs.gith
 on:
   push:
     branches:
-      - main
       - codex/**
     paths:
       - .github/workflows/pool02-scoped-ci.yml
@@ -93,7 +92,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Exact trusted push commit to test
+        description: Exact trusted commit to test, including a changed merge result on main
         required: true
         type: string
       github_hosted:
@@ -107,6 +106,8 @@ permissions:
 
 jobs:
   scoped-chat-admission:
+    # Trusted development pushes are checked before merge. An unchanged merge
+    # reuses that result; a changed merge result can be checked by exact dispatch.
     # Only pushes created in this repository reach the persistent company runner.
     # Review external contributions first, then bring approved code into a trusted
     # main or codex/** branch with write access; fork PRs never execute here.
