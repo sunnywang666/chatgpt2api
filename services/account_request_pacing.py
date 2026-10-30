@@ -989,14 +989,21 @@ class AccountRequestClock:
                 if concurrent_io and reservation_error is not None:
                     response.close()
                     raise reservation_error
-                if context is not None and is_turn and hasattr(context, "record_stage"):
-                    context.record_stage("response_headers_received", status_code=response.status_code,
-                                         upstream_request_id=safe_id)
             finally:
                 if not clock_held and response is not None and not completed_read:
                     response.close()
                 if clock_held:
                     self.lock.release()
+            # The send floor and any HTTP 429 cooldown are already durable.
+            # Receipt I/O must finish before returning the response, but must
+            # not keep unrelated preparation requests behind this account lock.
+            if context is not None and is_turn and hasattr(context, "record_stage"):
+                try:
+                    context.record_stage("response_headers_received", status_code=response.status_code,
+                                         upstream_request_id=safe_id)
+                except BaseException:
+                    response.close()
+                    raise
             if is_turn and kwargs.get("stream") and 200 <= response.status_code < 300:
                 close = response.close
                 def close_turn():

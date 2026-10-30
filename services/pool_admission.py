@@ -1524,7 +1524,8 @@ class PoolAdmission:
                 indexed.setdefault((owner, *values), set()).add((kind, request_id))
         return indexed
 
-    def _snapshot(self, rows, receipts, settings, types, now, cursor, workflow_state=None, product_state=None, *, db=None):
+    def _snapshot(self, rows, receipts, settings, types, now, cursor, workflow_state=None, product_state=None, *, db=None,
+                  capacity_only=False):
         from services.text_task_service import TextTaskService
         works, workflow_clocks = workflow_state or ({}, {})
         product_works = product_state or {}
@@ -1553,25 +1554,30 @@ class PoolAdmission:
         # head forever. This is a planner-only projection, never a status edit.
         text_receipts = {(owner, request_id): r for kind, owner, request_id, r in receipts
                          if kind == "text"}
-        # The missing-node C proof needs to reject any unfinished receipt in
-        # its exact physical conversation.  `receipts` is already the current
-        # transaction snapshot; index it once instead of re-decoding the full
-        # database for every C while the admission writer is held.
-        missing_node_unfinished = self._missing_node_unfinished_by_conversation(receipts)
-        missing_node_retry_valid = {}
-
-        def valid_missing_node_retry(owner, request_id, receipt):
-            key = (owner, request_id)
-            if key not in missing_node_retry_valid:
-                missing_node_retry_valid[key] = TextTaskService._missing_node_model_rejection_retry(
-                    self.store, db, owner, receipt, now,
-                    unfinished_by_conversation=missing_node_unfinished)
-            return missing_node_retry_valid[key]
         released_order_heads, transferred_empty_turns = self._empty_turn_transfers(receipts)
+        # A final Chat send guard consumes only one account-turn resource.
+        # Keep the same authoritative receipt/UNKNOWN/empty-transfer occupancy
+        # projection below, but avoid planner-only lineage, fairness and
+        # request construction while its SQLite writer transaction is held.
+        if not capacity_only:
+            # The missing-node C proof needs to reject any unfinished receipt
+            # in its exact physical conversation.  `receipts` is already the
+            # current transaction snapshot; index it once instead of
+            # re-decoding the full database for every C while the admission
+            # writer is held.
+            missing_node_unfinished = self._missing_node_unfinished_by_conversation(receipts)
+            missing_node_retry_valid = {}
+
+            def valid_missing_node_retry(owner, request_id, receipt):
+                key = (owner, request_id)
+                if key not in missing_node_retry_valid:
+                    missing_node_retry_valid[key] = TextTaskService._missing_node_model_rejection_retry(
+                        self.store, db, owner, receipt, now,
+                        unfinished_by_conversation=missing_node_unfinished)
+                return missing_node_retry_valid[key]
+        else:
+            missing_node_retry_valid = {}
         successors = {}
-        for (owner, request_id), r in text_receipts.items():
-            if r.get("_supersedes_request_id"):
-                successors.setdefault((owner, r["_supersedes_request_id"]), []).append((request_id, r))
         # Only an exact incomplete compact continuation inherits its original
         # acceptance position for planner ordering.  This is a projection: the
         # successor retains its own durable sequence and identity.  A model
@@ -1579,10 +1585,14 @@ class PoolAdmission:
         # chain never gets an older queue position.
         continuation_sequences = {}
         children_by_parent = {}
-        for (owner, request_id), receipt in text_receipts.items():
-            parent_id = receipt.get("_supersedes_request_id") or receipt.get("_codex_fallback_of")
-            if isinstance(parent_id, str) and parent_id:
-                children_by_parent.setdefault((owner, parent_id), []).append((request_id, receipt))
+        if not capacity_only:
+            for (owner, request_id), r in text_receipts.items():
+                if r.get("_supersedes_request_id"):
+                    successors.setdefault((owner, r["_supersedes_request_id"]), []).append((request_id, r))
+            for (owner, request_id), receipt in text_receipts.items():
+                parent_id = receipt.get("_supersedes_request_id") or receipt.get("_codex_fallback_of")
+                if isinstance(parent_id, str) and parent_id:
+                    children_by_parent.setdefault((owner, parent_id), []).append((request_id, receipt))
         if successors:
             from services.text_task_service import TextTaskService
             for key, candidates in successors.items():
@@ -1627,7 +1637,7 @@ class PoolAdmission:
                             and type(previous.get("_sequence")) is int):
                         continuation_sequences[(key[0], request_id)] = previous["_sequence"]
         missing_node_image_links = {}
-        if db is not None:
+        if db is not None and not capacity_only:
             from services.text_task_service import TextTaskService
             for (owner, request_id), receipt in text_receipts.items():
                 image_id = receipt.get(TextTaskService.MISSING_NODE_RETRY_FIELD)
@@ -1648,10 +1658,11 @@ class PoolAdmission:
         image_retry_predecessors = {(owner, image_id): request_id
                                     for (owner, request_id), image_id in missing_node_image_links.items()}
         physical_pending = {}
-        for kind, owner, request_id, receipt in receipts:
-            key = physical_conversation_key(receipt)
-            if key and unfinished(kind, receipt) and (owner, request_id) not in released_order_heads:
-                physical_pending.setdefault(key, []).append((kind, owner, request_id, receipt))
+        if not capacity_only:
+            for kind, owner, request_id, receipt in receipts:
+                key = physical_conversation_key(receipt)
+                if key and unfinished(kind, receipt) and (owner, request_id) not in released_order_heads:
+                    physical_pending.setdefault(key, []).append((kind, owner, request_id, receipt))
         by_identity = {str(a.get("provider_account_identity") or ""): a for a in rows}
         identity_counts = {}
         for row in rows:
@@ -1667,11 +1678,12 @@ class PoolAdmission:
         requests = []
         thread_resources = []
         image_receipts = {}
-        for kind, owner, request_id, r in receipts:
-            if kind == "image":
-                image_receipts.setdefault(owner, {})[request_id] = r
-        ordered_receipts = [row for row in receipts if (row[1], row[2]) not in released_order_heads]
-        active_work_counts = workflow_scheduling.active_work_counts(ordered_receipts)
+        if not capacity_only:
+            for kind, owner, request_id, r in receipts:
+                if kind == "image":
+                    image_receipts.setdefault(owner, {})[request_id] = r
+            ordered_receipts = [row for row in receipts if (row[1], row[2]) not in released_order_heads]
+            active_work_counts = workflow_scheduling.active_work_counts(ordered_receipts)
         for kind, owner, request_id, r in receipts:
             status = r.get("status")
             pending = unfinished(kind, r)
@@ -1730,6 +1742,8 @@ class PoolAdmission:
             if resource and image_generation_active(kind, r, active):
                 key = "image:" + resource
                 occupied[key] = occupied.get(key, 0) + 1
+            if capacity_only:
+                continue
             # A durable not_started original has no proof that its first send
             # may be resumed. Keep it as a non-terminal conversation barrier,
             # but do not place it in the planner's claimable queued set.
@@ -1946,6 +1960,8 @@ class PoolAdmission:
             native_pending = any(isinstance(v, dict) and v.get("state") in {"pending", "unknown"}
                                  for v in (account.get("codex_affinities") or {}).values())
             resources[codex_key] = Resource(codex_key, 1, max(occupied.get(codex_key, 0), int(native_pending)), now)
+            if capacity_only:
+                continue
             for route, model, operation in offer_variants:
                 if route == "codex":
                     eligible = self.codex is not None and self.codex._eligible_account(account, "" if operation == "image" else model, allow_probe=False) is not None
@@ -1999,6 +2015,8 @@ class PoolAdmission:
                         ineligible.append("model_limit_zero")
                 offers.append(Offer(identity, "chat", model, operation, needs, enabled=bool(enabled),
                                     ineligible_reasons=tuple(dict.fromkeys(ineligible))))
+        if capacity_only:
+            return Snapshot(uuid.uuid4().hex, now, now + 1, tuple(resources.values()), (), ())
         if self.text_workers is None:
             # Execution threads follow the same usable physical account turns.
             # The retained-input memory ceiling still bounds all work; image
@@ -3071,9 +3089,7 @@ class PoolAdmission:
                         seen.add(key)
                 snapshot = self._snapshot(
                     self._rows(), capacity_receipts, self._settings(), {}, now,
-                    self.store.runtime(db, "fairness", {}),
-                    workflow_scheduling.state_snapshot(self.store, db),
-                    product_work.state_snapshot(self.store, db), db=db,
+                    {}, db=db, capacity_only=True,
                 )
                 resources = {resource.key: resource for resource in snapshot.resources}
                 turn = resources.get("chat_turn:" + account_clock_key(selected))
