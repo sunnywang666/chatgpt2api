@@ -14,6 +14,7 @@ from services.text_task_service import TextTaskService
 from services.image_task_service import ImageTaskService, _request_hash
 from services.product_work import ProductWorkService
 from services.work_lifecycle import WorkLifecycleError
+from test.test_original_operation_budget import local_upstream
 
 
 IDENTITY = {"id": "owner", "role": "admin", "_trusted_source": "internal:wb-to-ozon"}
@@ -422,6 +423,53 @@ def test_unowned_raw_archive_keeps_legacy_behavior(services, monkeypatch):
     app = FastAPI(); app.include_router(ai.create_router())
     response = TestClient(app).post("/api/conversation-bindings/archive", json=bound)
     assert response.status_code == 200 and response.json()["archived"] is True
+
+
+@pytest.mark.parametrize(("precheck_delay", "expected_status", "expected_methods"), [
+    (90.0, 200, ["GET", "PATCH", "GET"]),
+    (241.0, 503, []),
+])
+def test_raw_archive_http_entry_keeps_full_budget_through_paced_precheck(
+        services, local_upstream, monkeypatch, precheck_delay, expected_status, expected_methods):
+    """A raw archive's physical lock must not shorten its verified 240s chain."""
+    import services.account_request_pacing as pacing
+    import services.request_context as request_context
+
+    text, _, _ = services
+    state = local_upstream
+    now = [1000.0]
+    monkeypatch.setattr(pacing.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(pacing.time, "time", lambda: now[0])
+    monkeypatch.setattr(request_context.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(pacing.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+
+    # Instantiate the real shared account clock, then make the archive's
+    # precheck wait longer than the old 60-second product-lock deadline.
+    state.backend("fixture-token")
+    clock = next(iter(pacing._clocks.values()))
+    with clock.lock:
+        clock.cooldown_until = now[0] + precheck_delay
+        clock._save()
+
+    bound = {"provider_binding_id": "binding", "provider_account_identity": "account",
+             "client_conversation_id": "original-client", "conversation_id": "original",
+             "parent_message_id": "final"}
+    monkeypatch.setattr(ai, "require_identity", lambda *a, **k: IDENTITY)
+    monkeypatch.setattr(ai, "text_task_service", text)
+    app = FastAPI(); app.include_router(ai.create_router())
+    response = TestClient(app).post("/api/conversation-bindings/archive", json=bound)
+
+    assert response.status_code == expected_status, response.text
+    assert [method for method, _ in state.calls] == expected_methods
+    if expected_status == 200:
+        assert response.json()["archived"] is True
+        assert now[0] >= 1090.0
+    else:
+        assert response.json()["detail"]["code"] == "CONVERSATION_ARCHIVE_UNCONFIRMED"
+        assert now[0] == 1000.0
+    assert all(attempt["deadline"] <= 1240.0 for attempt in state.transport_attempts)
+    assert all((sum(attempt["timeout"]) if isinstance(attempt["timeout"], tuple) else attempt["timeout"]) <= 240
+               for attempt in state.transport_attempts)
 
 
 @pytest.mark.parametrize("kind", ["text", "image"])

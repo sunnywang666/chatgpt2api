@@ -7,7 +7,7 @@ from services.work_lifecycle import WorkLifecycleError
 from api.recovery_control import RecoveryControlRequest, update_recovery_control
 from api.send_hold_control import SendHoldRequest, update_send_hold
 
-from services.request_context import trusted_source
+from services.request_context import ARCHIVE_OPERATION_BUDGET_SECONDS, trusted_source
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
@@ -488,7 +488,7 @@ def create_router() -> APIRouter:
             from services.request_context import guarding_archive
             # Use physical identity, not the caller's client-session alias.
             # Product attachment cannot commit halfway through this archive.
-            with locking_product_conversations([payload]):
+            with locking_product_conversations([payload], budget_seconds=ARCHIVE_OPERATION_BUDGET_SECONDS):
                 require_legacy_conversation()
                 with guarding_archive(require_legacy_conversation):
                     return conversation_binding_service.archive(payload)
