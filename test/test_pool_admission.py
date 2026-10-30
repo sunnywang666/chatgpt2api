@@ -881,6 +881,16 @@ class AdmissionTests(unittest.TestCase):
     def test_loop_wakes_and_sends_due_public_successor_after_predecessor_finishes(self):
         """A completed sequential turn releases its already-queued successor."""
         first_started, release_first, second_sent = threading.Event(), threading.Event(), threading.Event()
+        finished = {request_id: threading.Event() for request_id in ("first", "second")}
+        execute = self.admission.execute
+
+        def tracked_execute(context):
+            try:
+                return execute(context)
+            finally:
+                finished[context.request_id].set()
+
+        self.admission.execute = tracked_execute
 
         def runner(body, on_cursor):
             context = current_request.get()
@@ -927,6 +937,12 @@ class AdmissionTests(unittest.TestCase):
         finally:
             release_first.set()
             self.admission.stop()
+            # A succeeded receipt precedes artifact_saved and execute cleanup.
+            # Keep the fixture DB alive until both daemon executions finish.
+            if first_started.is_set():
+                self.assertTrue(finished["first"].wait(2))
+            if second_sent.is_set():
+                self.assertTrue(finished["second"].wait(2))
             if self.admission._recovery_thread is not None:
                 self.admission._recovery_thread.join(2)
             restore()
