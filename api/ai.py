@@ -1,4 +1,6 @@
 from __future__ import annotations
+import hashlib
+import json
 from typing import Literal
 
 from api.product_works import ProductWorkInput, product_identity
@@ -488,9 +490,16 @@ def create_router() -> APIRouter:
             from services.request_context import guarding_archive
             # Use physical identity, not the caller's client-session alias.
             # Product attachment cannot commit halfway through this archive.
+            archive_read_owner = "direct-archive:" + hashlib.sha256(json.dumps({
+                "provider_account_identity": payload["provider_account_identity"],
+                "provider_binding_id": payload["provider_binding_id"],
+                "conversation_id": payload["conversation_id"],
+                "parent_message_id": payload["parent_message_id"],
+                "archived": True,
+            }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             with locking_product_conversations([payload], budget_seconds=ARCHIVE_OPERATION_BUDGET_SECONDS):
                 require_legacy_conversation()
-                with guarding_archive(require_legacy_conversation):
+                with guarding_archive(require_legacy_conversation, read_owner=archive_read_owner):
                     return conversation_binding_service.archive(payload)
 
         try:

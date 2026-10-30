@@ -383,7 +383,7 @@ def test_raw_archive_cannot_bypass_product_close_or_repeat_completed_archive(ser
 
 
 def test_raw_archive_rechecks_product_adopted_while_waiting(services, monkeypatch):
-    from services.request_context import current_archive_guard
+    from services.request_context import current_archive_guard, current_archive_read_owner
     text, _, _ = services
     text.submit("owner", text_body(), source=IDENTITY["_trusted_source"])
     bound = {"provider_binding_id": "binding", "provider_account_identity": "account",
@@ -391,9 +391,10 @@ def test_raw_archive_rechecks_product_adopted_while_waiting(services, monkeypatc
              "parent_message_id": "original-answer"}
     monkeypatch.setattr(ai, "require_identity", lambda *a, **k: IDENTITY)
     monkeypatch.setattr(ai, "text_task_service", text)
-    sent = []
+    sent, archive_owners = [], []
 
     def waiting_archive(payload):
+        archive_owners.append(current_archive_read_owner.get())
         text._update("owner", "text-1", **bound)
         current_archive_guard.get()()
         sent.append(payload)
@@ -403,26 +404,37 @@ def test_raw_archive_rechecks_product_adopted_while_waiting(services, monkeypatc
     app = FastAPI(); app.include_router(ai.create_router())
     response = TestClient(app).post("/api/conversation-bindings/archive", json=bound)
     assert response.status_code == 409 and not sent
+    assert len(archive_owners) == 1 and archive_owners[0].startswith("direct-archive:")
 
 
 def test_unowned_raw_archive_keeps_legacy_behavior(services, monkeypatch):
-    from services.request_context import current_archive_guard
+    from services.request_context import current_archive_guard, current_archive_read_owner
     text, _, _ = services
     monkeypatch.setattr(ai, "require_identity", lambda *a, **k: IDENTITY)
     monkeypatch.setattr(ai, "text_task_service", text)
     bound = {"provider_binding_id": "binding", "provider_account_identity": "account",
              "client_conversation_id": "original-client", "conversation_id": "original-chat",
              "parent_message_id": "original-answer"}
+    expected_payloads = (bound, bound, {**bound, "parent_message_id": "different-answer"})
+
+    archive_owners = []
 
     def archive(payload):
+        archive_owners.append(current_archive_read_owner.get())
         current_archive_guard.get()()
-        assert payload == bound
+        assert payload == expected_payloads[len(archive_owners) - 1]
         return {**payload, "archived": True}
 
     monkeypatch.setattr(ai.conversation_binding_service, "archive", archive)
     app = FastAPI(); app.include_router(ai.create_router())
-    response = TestClient(app).post("/api/conversation-bindings/archive", json=bound)
-    assert response.status_code == 200 and response.json()["archived"] is True
+    client = TestClient(app)
+    for payload in expected_payloads:
+        response = client.post("/api/conversation-bindings/archive", json=payload)
+        assert response.status_code == 200 and response.json()["archived"] is True
+    assert archive_owners[0] == archive_owners[1]
+    assert archive_owners[0].startswith("direct-archive:")
+    assert archive_owners[2].startswith("direct-archive:")
+    assert archive_owners[2] != archive_owners[0]
 
 
 @pytest.mark.parametrize(("precheck_delay", "expected_status", "expected_methods"), [
@@ -442,6 +454,14 @@ def test_raw_archive_http_entry_keeps_full_budget_through_paced_precheck(
     monkeypatch.setattr(pacing.time, "time", lambda: now[0])
     monkeypatch.setattr(request_context.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(pacing.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    request_owners = []
+    clock_request = pacing.AccountRequestClock.request
+
+    def observe_archive_owner(self, send, method, url, **kwargs):
+        request_owners.append(request_context.current_archive_read_owner.get())
+        return clock_request(self, send, method, url, **kwargs)
+
+    monkeypatch.setattr(pacing.AccountRequestClock, "request", observe_archive_owner)
 
     # Instantiate the real shared account clock, then make the archive's
     # precheck wait longer than the old 60-second product-lock deadline.
@@ -464,6 +484,9 @@ def test_raw_archive_http_entry_keeps_full_budget_through_paced_precheck(
     if expected_status == 200:
         assert response.json()["archived"] is True
         assert now[0] >= 1090.0
+        assert len(request_owners) == 3
+        assert request_owners[0].startswith("direct-archive:")
+        assert request_owners == [request_owners[0]] * 3
     else:
         assert response.json()["detail"]["code"] == "CONVERSATION_ARCHIVE_UNCONFIRMED"
         assert now[0] == 1000.0
