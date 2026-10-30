@@ -752,6 +752,13 @@ class ExecutionContext:
     def before_send(self):
         self.admission.before_send(self)
 
+    def before_send_with_marker(self):
+        """Commit the final send fence and its pre-transport intent together."""
+        entry = self.admission.before_send(self, send_call_started=True)
+        if entry is not None:
+            logger.info({"event": "pool_execution_stage", **entry})
+        return entry
+
     def image_capability_refresh(self):
         return self.admission.image_capability_refresh(self)
 
@@ -2756,10 +2763,10 @@ class PoolAdmission:
             still_original()
         return run
 
-    def before_send(self, context):
+    def before_send(self, context, *, send_call_started=False):
         while True:
             try:
-                guarded = self._before_send_guard(context)
+                guarded = self._before_send_guard(context, send_call_started=send_call_started)
                 if guarded is _EXPIRED_UNSENT_BEFORE_SEND:
                     raise AdmissionLost("WAIT_DEADLINE_EXCEEDED")
                 return guarded
@@ -2816,7 +2823,7 @@ class PoolAdmission:
                         workflow_scheduling.release_provisional_slot(self.store, db, r)
                 raise
 
-    def _before_send_guard(self, context):
+    def _before_send_guard(self, context, *, send_call_started=False):
         # Resolve capability outside account/store locks, then recheck the exact
         # selected row under the send guard. Discovery failure must fail closed.
         with self.store.connect() as db:
@@ -2846,6 +2853,9 @@ class PoolAdmission:
                     selected_route = self._types(execution_model)
                 except Exception:
                     raise AdmissionLost("selected Chat model discovery unavailable before send") from None
+        # Match `record_stage`'s existing settings read, but do it before this
+        # transaction obtains SQLite's writer lock.
+        marker_settings = self._settings() if send_call_started else None
         with self._settings_guard(), self.store.transaction() as db, self._account_guard():
             now = float(self.clock())
             r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
@@ -3143,9 +3153,32 @@ class PoolAdmission:
                                  "effective_model": _FIRSTSEND_TRIAL_MODEL,
                                  "effective_thinking_effort": _FIRSTSEND_TRIAL_EFFORT})
             timeline.append({"stage": "send_guard_passed", "at": now, **send_observation})
+            marker = None
+            if send_call_started:
+                accepted = next((item.get("at") for item in timeline
+                                 if item.get("stage") == "accepted"), r.get("created_ts") or r.get("created_at"))
+                claimed = next((item.get("at") for item in timeline
+                                if item.get("stage") == "execution_claimed"), None)
+                marker = {
+                    "stage": "send_call_started",
+                    "at": time.time(),
+                    "request_ref": hashlib.sha256((context.owner + ":" + context.request_id).encode()).hexdigest()[:24],
+                    "account_ref": safe_account_ref(r.get("provider_account_identity")),
+                    "model": r.get("model"),
+                    "operation": r.get("_operation", "image" if context.kind == "image" else "text"),
+                    "source": r.get("_source"),
+                    "input_bytes": r.get("_input_bytes"),
+                    "queue_wait_seconds": max(0, claimed - accepted) if type(accepted) in (int, float) and type(claimed) in (int, float) else None,
+                    "config_revision": marker_settings.get("revision") if isinstance(marker_settings, dict) else None,
+                }
+                # This is durable pre-transport intent, not proof that HTTP has
+                # started. `_submission_started` retains the same UNKNOWN/no-replay
+                # boundary if the clock floor cannot subsequently be persisted.
+                timeline.append(marker)
             r.update(_submission_started=True, _last_sent_sequence=sequence, _turn_reserved=True,
                      _claim_until=now + self.CLAIM_SECONDS, _execution_timeline=timeline[-32:])
             self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
+            return marker
 
     def _start_claim_heartbeat(self, context, done, *, name):
         """Renew a fenced claim without letting a busy writer consume its lease."""
