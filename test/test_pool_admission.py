@@ -13,11 +13,12 @@ from unittest.mock import patch
 from datetime import datetime, timezone
 
 from services.account_service import AccountService
+from services.account_request_pacing import AccountRequestClock
 from services.model_service import ModelRoute
 from services.storage.json_storage import JSONStorageBackend
 from services.task_store import SendHoldRejected, TaskStore
 from services.pool_admission import PoolAdmission
-from services.request_context import current_request, AdmissionLost
+from services.request_context import current_request, AdmissionLost, executing
 from services.text_task_service import TextTaskService
 from services.conversation_binding_service import ConversationBindingService
 from services.image_task_service import ImageTaskService
@@ -3114,8 +3115,126 @@ class AdmissionTests(unittest.TestCase):
             receipt["_send_hold"] = True
             self.store.write_receipt(db, "text", "happy", "guard", receipt)
         with self.assertRaisesRegex(AdmissionLost, "send hold"):
-            context.before_send()
-        self.assertFalse(self.read("text", "happy", "guard")["_submission_started"])
+            context.before_send_with_marker()
+        receipt = self.read("text", "happy", "guard")
+        self.assertFalse(receipt["_submission_started"])
+        self.assertFalse(any(event["stage"] == "send_call_started"
+                             for event in receipt["_execution_timeline"]))
+
+    def test_final_guard_commits_send_marker_in_its_single_receipt_write(self):
+        original_write = self.store.write_receipt
+
+        def capture_writes(writes):
+            def capture_write(*args, **kwargs):
+                writes.append((args[3], args[4].get("_submission_started")))
+                return original_write(*args, **kwargs)
+            return capture_write
+
+        # This is the exact former split: final guard then a separate marker
+        # receipt write. Keep it as the compatibility baseline for the merged
+        # real-context path below.
+        self.submit("legacy-marker")
+        legacy = self.admission.claim_next()
+        legacy_writes = []
+        with patch.object(self.store, "write_receipt", side_effect=capture_writes(legacy_writes)):
+            legacy.before_send()
+            legacy.record_stage("send_call_started")
+        self.assertEqual(legacy_writes, [("legacy-marker", True), ("legacy-marker", True)])
+        self.admission.update_claim(legacy, status="succeeded", upstream_outcome="completed",
+                                    upstream_unfinished=False, _turn_reserved=False)
+
+        self.submit("marker")
+        context = self.admission.claim_next()
+        writes = []
+        with patch.object(self.store, "write_receipt", side_effect=capture_writes(writes)):
+            marker = context.before_send_with_marker()
+        receipt = self.read("text", "happy", "marker")
+        stages = [event["stage"] for event in receipt["_execution_timeline"]]
+        self.assertEqual(writes, [("marker", True)])
+        self.assertEqual(stages[-2:], ["send_guard_passed", "send_call_started"])
+        self.assertEqual(marker["stage"], "send_call_started")
+        self.assertTrue(receipt["_submission_started"] and receipt["_turn_reserved"])
+
+    def test_paced_send_skips_second_marker_writer_while_sqlite_is_busy(self):
+        from services.config import config
+        self.submit("marker-contention")
+        context = self.admission.claim_next()
+        clock = AccountRequestClock("marker-contention", self.root / "marker-clock.json")
+        writer_started, release_writer, sent = threading.Event(), threading.Event(), threading.Event()
+        peer = []
+        original_commit = context.before_send_with_marker
+
+        def hold_writer():
+            with self.store.transaction() as db:
+                self.store.set_runtime(db, "marker-contention-writer", {"held": True})
+                writer_started.set()
+                release_writer.wait(3)
+
+        def commit_then_contend():
+            marker = original_commit()
+            worker = threading.Thread(target=hold_writer)
+            peer.append(worker)
+            worker.start()
+            self.assertTrue(writer_started.wait(2))
+            return marker
+
+        context.before_send_with_marker = commit_then_contend
+
+        class Response:
+            status_code = 200
+            headers = {}
+
+            def close(self):
+                return None
+
+        response, errors = [], []
+
+        def run():
+            try:
+                with executing(context):
+                    response.append(clock.request(
+                        lambda *_args, **_kwargs: (sent.set(), Response())[1],
+                        "POST", "https://provider/backend-api/conversation", json={"model": "fixture-text"},
+                    ))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            worker = threading.Thread(target=run)
+            worker.start()
+            try:
+                self.assertTrue(sent.wait(2), "second marker write waited behind SQLite contention")
+            finally:
+                release_writer.set()
+                worker.join(3)
+                for thread in peer:
+                    thread.join(3)
+        self.assertFalse(errors)
+        self.assertEqual(len(response), 1)
+        self.assertEqual(sum(event["stage"] == "send_call_started"
+                             for event in self.read("text", "happy", "marker-contention")["_execution_timeline"]), 1)
+
+    def test_clock_floor_persistence_failure_keeps_committed_marker_unknown_and_unsent(self):
+        self.submit("marker-floor-failure")
+        context = self.admission.claim_next()
+        clock = AccountRequestClock("marker-floor-failure", self.root / "marker-failure-clock.json")
+        sent = []
+
+        def would_send(_context, _body):
+            clock.request(lambda *_args, **_kwargs: sent.append(True), "POST",
+                          "https://provider/backend-api/conversation", json={"model": "fixture-text"})
+
+        self.admission.register("text", would_send)
+        with patch.object(clock, "_save", side_effect=OSError("fixture floor persistence failed")):
+            self.admission.execute(context)
+        receipt = self.read("text", "happy", "marker-floor-failure")
+        self.assertEqual(sent, [])
+        self.assertEqual((receipt["status"], receipt["error_code"]), ("unknown", "CONVERSATION_OUTCOME_UNKNOWN"))
+        self.assertTrue(receipt["_submission_started"])
+        self.assertTrue(any(event["stage"] == "send_call_started"
+                            for event in receipt["_execution_timeline"]))
+        self.assertIsNone(self.admission.claim_next())
 
     def test_send_hold_deadline_expires_without_revival(self):
         self.submit("deadline")

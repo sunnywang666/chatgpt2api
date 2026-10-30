@@ -772,6 +772,7 @@ class AccountRequestClock:
             clock_held = True
             response = None
             completed_read = False
+            marker_persisted = False
             try:
                 self._expire_backoff()
                 wait_for_send_edge("account request deadline elapsed during cooldown wait")
@@ -831,7 +832,12 @@ class AccountRequestClock:
                 if context is not None and is_turn:
                     started_guard = time.monotonic()
                     try:
-                        context.before_send()
+                        commit_marker = getattr(context, "before_send_with_marker", None)
+                        if callable(commit_marker):
+                            commit_marker()
+                            marker_persisted = True
+                        else:
+                            context.before_send()
                     finally:
                         local_seconds["send_guard_secs"] += max(0.0, time.monotonic() - started_guard)
                 if callable(before_send):
@@ -877,7 +883,8 @@ class AccountRequestClock:
                 # Saving pacing state and the submission receipt can consume
                 # part of the declared budget; cap once more at the send edge.
                 cap_timeout_before_send()
-                if context is not None and is_turn and hasattr(context, "record_stage"):
+                if (context is not None and is_turn and not marker_persisted
+                        and hasattr(context, "record_stage")):
                     started_marker = time.monotonic()
                     try:
                         context.record_stage("send_call_started")
