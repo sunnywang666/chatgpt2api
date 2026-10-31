@@ -17,7 +17,7 @@ from services.account_request_pacing import AccountReadRetryBudgetInsufficient
 from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI, explicit_final_channel
 from services.protocol.conversation import conversation_events, sanitize_output_text
 from services.request_context import (ARCHIVE_OPERATION_BUDGET_SECONDS, bounded_lock,
-                                      operation_budget, current_operation_deadline)
+                                      operation_budget, current_operation_deadline, current_request)
 from utils.helper import UpstreamHTTPError
 from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
 
@@ -2442,8 +2442,26 @@ class ConversationBindingService:
         except RuntimeError as exc:
             raise ConversationBindingError(str(exc)) from exc
 
+        # Backend construction only creates this request's in-memory session
+        # and pacing binding; it does not open an upstream request.  Keep the
+        # cursor checks and every transport operation under the conversation
+        # lock, but do not make another continuation wait for local setup.
+        context = current_request.get()
+        backend_started_at = time.monotonic()
+        backend = OpenAIBackendAPI(access_token=access_token)
+        record_timing = getattr(context, "record_attempt_timing", None)
+        if callable(record_timing):
+            try:
+                record_timing(backend_construct_secs=max(0.0, time.monotonic() - backend_started_at))
+            except Exception:
+                pass  # Optional diagnostics never affect a continuation.
+        binding_lock_requested_at = time.monotonic()
         with account_service.conversation_binding_lock(binding_id, client_conversation_id):
-            backend = OpenAIBackendAPI(access_token=access_token)
+            if callable(record_timing):
+                try:
+                    record_timing(binding_lock_wait_secs=max(0.0, time.monotonic() - binding_lock_requested_at))
+                except Exception:
+                    pass  # Optional diagnostics never affect a continuation.
             backend.retain_bound_conversation = True
             backend.text_request_message_id = str(body.get("_request_message_id") or "")
             # WS continuation is a text-only result-consumption feature.  The
@@ -2814,7 +2832,6 @@ class ConversationBindingService:
                 raise
             except Exception as exc:
                 if body.get("_supersedes_request_message_id"):
-                    from services.request_context import current_request
                     context = current_request.get()
                     if context is not None and not context.receipt().get("_submission_started"):
                         raise ConversationBindingError("successor pre-send check did not complete",

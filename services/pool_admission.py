@@ -9,7 +9,7 @@ from __future__ import annotations
 from services.image_thread import bind_waiting_threads, predecessor_state
 
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import math
@@ -745,9 +745,23 @@ def image_generation_active(kind, receipt, active):
 
 
 class ExecutionContext:
-    def __init__(self, admission, kind, owner, request_id, claim):
+    def __init__(self, admission, kind, owner, request_id, claim, *, claimed_at=None):
         self.admission, self.kind, self.owner = admission, kind, owner
         self.request_id, self.claim = request_id, claim
+        self.claimed_at = claimed_at
+        self._attempt_timing = {}
+
+    def record_attempt_timing(self, **timing):
+        """Keep local timing on this execution only; receipt writes stay unchanged."""
+        for name, value in timing.items():
+            if (name in {"backend_construct_secs", "binding_lock_wait_secs",
+                         "final_guard_writer_wait_secs", "final_guard_transaction_secs"}
+                    and isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) and value >= 0):
+                self._attempt_timing[name] = value
+
+    def attempt_timing_fields(self):
+        return dict(self._attempt_timing)
 
     def before_send(self):
         self.admission.before_send(self)
@@ -1434,6 +1448,32 @@ class PoolAdmission:
         # AccountService owns this lock, including the persisted-account
         # refresh. Synthetic adapters can provide an equivalent transaction.
         return getattr(self.accounts, "admission_transaction", nullcontext)()
+
+    @contextmanager
+    def _final_guard_transaction(self, context):
+        """Time the existing writer boundary without persisting telemetry."""
+        with self._settings_guard():
+            writer_requested_at = time.monotonic()
+            writer_acquired_at = None
+            record = getattr(context, "record_attempt_timing", None)
+            try:
+                with self.store.transaction() as db:
+                    writer_acquired_at = time.monotonic()
+                    if callable(record):
+                        try:
+                            record(final_guard_writer_wait_secs=max(0.0, writer_acquired_at - writer_requested_at))
+                        except Exception:
+                            pass  # Optional diagnostics never affect the send guard.
+                    with self._account_guard():
+                        yield db
+            finally:
+                # This runs after Transaction.__exit__, so it includes the
+                # receipt commit/fsync but cannot replace a storage exception.
+                if writer_acquired_at is not None and callable(record):
+                    try:
+                        record(final_guard_transaction_secs=max(0.0, time.monotonic() - writer_acquired_at))
+                    except Exception:
+                        pass
 
     def _rows(self):
         read = getattr(self.accounts, "admission_accounts", None)
@@ -2677,7 +2717,7 @@ class PoolAdmission:
                 subgroups[fairness_subgroup_key(pick.source, selected_group)] = fairness_lane(selected.fair_subgroup)
             self.store.set_runtime(db, "fairness", {"source": pick.source, "account": pick.account,
                                                       "owners": owners, "groups": groups, "subgroups": subgroups})
-            return ExecutionContext(self, ref.kind, ref.owner, ref.request_id, claim)
+            return ExecutionContext(self, ref.kind, ref.owner, ref.request_id, claim, claimed_at=now)
 
     def update_claim(self, context, **changes):
         with self.store.transaction() as db:
@@ -2856,7 +2896,7 @@ class PoolAdmission:
         # Match `record_stage`'s existing settings read, but do it before this
         # transaction obtains SQLite's writer lock.
         marker_settings = self._settings() if send_call_started else None
-        with self._settings_guard(), self.store.transaction() as db, self._account_guard():
+        with self._final_guard_transaction(context) as db:
             now = float(self.clock())
             r = self.store.read_receipt(db, context.kind, context.owner, context.request_id)
             # Preserve the former whole-queue expiry ordering for this exact
@@ -3365,11 +3405,15 @@ class PoolAdmission:
                                  _ready_at=float(self.clock()) + 1)
                         reset_unsent_image_attempt(context.kind, r)
                     self.store.write_receipt(db, context.kind, context.owner, context.request_id, r)
+            # The durable terminal/unsent transition is now visible to the
+            # planner.  Wake independent work before writing the optional
+            # terminal timeline observation; the latter must never delay a
+            # newly-free account or executor slot.
+            self.wake()
             try:
                 context.record_outcome()
             except Exception:
                 logger.warning({"event": "pool_outcome_unavailable", "layer": "provider"})
-            self.wake()
 
 
 def configure_original_task_admission():

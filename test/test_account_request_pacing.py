@@ -46,6 +46,9 @@ class Context:
     def log_fields(self):
         return {"model": "gpt-5 fixture", "operation": "text", "source": "key:test"}
 
+    def attempt_timing_fields(self):
+        return getattr(self, "_attempt_timing", {})
+
 
 class LocalAttemptTimingTests(unittest.TestCase):
     def test_attempt_log_separates_wait_guard_marker_and_network_time(self):
@@ -54,6 +57,9 @@ class LocalAttemptTimingTests(unittest.TestCase):
         clock = AccountRequestClock("timing-fixture")
         clock.next_request = 102.0
         context = Context("timing")
+        context.claimed_at = 1000099.0
+        context._attempt_timing = {"backend_construct_secs": .4, "binding_lock_wait_secs": .6,
+                                   "final_guard_writer_wait_secs": .8, "final_guard_transaction_secs": 1.2}
         turn_acquire, clock_acquire = clock.turn_lock.acquire, clock.lock.acquire
 
         def acquire_turn(*args, **kwargs):
@@ -81,6 +87,7 @@ class LocalAttemptTimingTests(unittest.TestCase):
             return Response()
 
         with patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+             patch.object(pacing.time, "time", side_effect=lambda: 1000000 + now[0]), \
              patch.object(pacing.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
              patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
              patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
@@ -98,9 +105,28 @@ class LocalAttemptTimingTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
         for field, expected in {"turn_wait_secs": .25, "clock_wait_secs": .75,
                                 "pace_wait_secs": 1., "send_guard_secs": 3.,
-                                "send_marker_secs": .2, "headers_elapsed_secs": .4}.items():
+                                "send_marker_secs": .2, "post_guard_to_http_secs": .2,
+                                "claim_to_local_start_secs": 1., "claim_to_http_secs": 6.2,
+                                "backend_construct_secs": .4, "binding_lock_wait_secs": .6,
+                                "final_guard_writer_wait_secs": .8, "final_guard_transaction_secs": 1.2,
+                                "headers_elapsed_secs": .4}.items():
             self.assertAlmostEqual(attempts[0][field], expected)
         self.assertNotIn("never-log-input", json.dumps(attempts))
+
+    def test_attempt_log_omits_nonfinite_claim_and_context_timings(self):
+        from services import account_request_pacing as pacing
+        clock = AccountRequestClock("timing-fixture-nonfinite")
+        context = Context("timing")
+        context.claimed_at = float("nan")
+        context._attempt_timing = {"backend_construct_secs": float("inf"), "binding_lock_wait_secs": -1}
+        with patch.object(pacing.logger, "info") as log, executing(context):
+            clock.request(lambda *_args, **_kwargs: Response(), "GET", "https://provider/")
+        attempt = next(call.args[0] for call in log.call_args_list
+                       if call.args[0].get("event") == "account_http_attempt")
+        self.assertNotIn("claim_to_local_start_secs", attempt)
+        self.assertNotIn("claim_to_http_secs", attempt)
+        self.assertNotIn("backend_construct_secs", attempt)
+        self.assertNotIn("binding_lock_wait_secs", attempt)
 
 
 class ResponseReceiptLockTests(unittest.TestCase):
@@ -337,7 +363,7 @@ class ReadBurstAndCapacityTests(unittest.TestCase):
         now, starts = [10000.0], []
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
-             patch.object(pacing.time, "time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(pacing.time, "time", side_effect=lambda: now[0]), \
              patch.object(pacing.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
              patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
              patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 45)), \
@@ -355,6 +381,79 @@ class ReadBurstAndCapacityTests(unittest.TestCase):
                     lambda *a, **k: starts.append(now[0]) or Response(),
                     "GET", "https://provider/conversation/original")
             self.assertEqual(starts[-1], 10090.0)
+
+    def test_archive_preget_patch_ordinary_confirm_scales_without_changing_fifo(self):
+        from services import account_request_pacing as pacing
+        from services.request_context import guarding_archive
+        for interval, expected in ((45, [10000.0, 10000.0, 10045.0, 10090.0]),
+                                   (30, [10000.0, 10000.0, 10030.0, 10060.0])):
+            with self.subTest(interval=interval), tempfile.TemporaryDirectory() as directory:
+                now, sent = [10000.0], []
+                with patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+                     patch.object(pacing.time, "time", side_effect=lambda: 1700000000 + now[0]), \
+                     patch.object(pacing.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
+                     patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+                     patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+                     patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: interval)):
+                    clock = AccountRequestClock("fixture", Path(directory) / "clock.json")
+                    def send(method, url, **_kwargs):
+                        sent.append((method, url.rsplit("/", 1)[-1], now[0]))
+                        return Response()
+                    with guarding_archive(lambda: None, read_owner="archive-work"):
+                        clock.request(send, "GET", "https://provider/backend-api/conversation/archive")
+                        clock.request(send, "PATCH", "https://provider/backend-api/conversation/archive",
+                                      json={"is_archived": True})
+                    clock.request(send, "GET", "https://provider/backend-api/conversation/original")
+                    with guarding_archive(lambda: None, read_owner="archive-work"):
+                        clock.request(send, "GET", "https://provider/backend-api/conversation/archive")
+                self.assertEqual([at for _, _, at in sent], expected)
+                self.assertEqual([method for method, _, _ in sent], ["GET", "PATCH", "GET", "GET"])
+
+    def test_interval_downgrade_does_not_repay_persisted_read_debt_early(self):
+        from services import account_request_pacing as pacing
+        now, sent = [10000.0], []
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+             patch.object(pacing.time, "time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(pacing.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 45)), \
+             patch.object(type(config), "account_conversation_read_burst", property(lambda _: 1)):
+            path = Path(directory) / "clock.json"
+            AccountRequestClock("fixture", path).request(
+                lambda *_args, **_kwargs: sent.append(now[0]) or Response(),
+                "GET", "https://provider/backend-api/conversation/original")
+            with patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 30)):
+                AccountRequestClock("fixture", path).request(
+                    lambda *_args, **_kwargs: sent.append(now[0]) or Response(),
+                    "GET", "https://provider/backend-api/conversation/original")
+        self.assertEqual(sent, [10000.0, 10045.0])
+
+    def test_retry_after_read_backoff_doubles_across_reload(self):
+        from services import account_request_pacing as pacing
+        now, sent = [10000.0], []
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+             patch.object(pacing.time, "time", side_effect=lambda: now[0]), \
+             patch.object(pacing.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0)):
+            path = Path(directory) / "clock.json"
+            def limited(*_args, **_kwargs):
+                sent.append(now[0])
+                response = Response()
+                response.status_code, response.headers = 429, {"Retry-After": "7"}
+                return response
+            AccountRequestClock("fixture", path).request(limited, "GET", "https://provider/backend-api/conversation/original")
+            reloaded = AccountRequestClock("fixture", path)
+            self.assertEqual(reloaded.cooldown_until, 10060.0)
+            reloaded.request(limited, "GET", "https://provider/backend-api/conversation/original")
+            final = AccountRequestClock("fixture", path)
+        self.assertEqual(sent, [10000.0, 10060.0])
+        self.assertEqual(final.cooldown_until, 10180.0)
+        self.assertEqual(final.rate_failures, 2)
 
     def test_per_account_inflight_cap_releases_after_transport(self):
         with tempfile.TemporaryDirectory() as directory, \
