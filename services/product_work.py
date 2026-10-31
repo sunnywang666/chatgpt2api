@@ -802,17 +802,164 @@ def _missing_node_chain(store, db, parent, receipt, members, now):
             "archive": archive, "archive_member": archive_member}
 
 
-def _no_final_successor_chain(store, db, parent, receipt, members, now):
+def _normal_product_tail(store, db, parent, member, tail, previous, used_steps, now, *, pending=False, capacity=False):
+    """Validate the frozen normal step, independent of business text semantics."""
+    from services.text_task_service import TextTaskService
+    from services.conversation_binding_service import ConversationBindingError
+    try:
+        body = store.load_input(tail["_input_ref"])
+        row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                         (parent["owner"], member["request_id"])).fetchone()
+        identity = TextTaskService._submission_identity(parent["owner"], body)
+    except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
+        return False
+    keys = ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id")
+    metadata = _metadata(parent, member["step_ref"])
+    if (not row or member["kind"] != "text" or member["owner"] != parent["owner"]
+            or tail.get("request_id") != member["request_id"]
+            or not isinstance(tail.get("request_message_id"), str) or not tail["request_message_id"]
+            or identity != (member["request_id"], row[0])
+            or tail.get("_product_work_key") != parent["key"] or _source(tail) != parent["source"]
+            or tail.get("_source") != previous.get("_source")
+            or tail.get("_product_work") != metadata or body.get("product_work") != metadata
+            or member["step_ref"] in used_steps
+            or any(not previous.get(key) or tail.get(key) != previous[key] or body.get(key) != previous[key]
+                   for key in keys)
+            or body.get("parent_message_id") != previous.get("parent_message_id")
+            or tail.get("request_parent_message_id") != previous.get("parent_message_id")
+            or tail.get("_submission_parent_message_id", body.get("parent_message_id")) != previous.get("parent_message_id")
+            or type(tail.get("_sequence")) is not int
+            or tail["_sequence"] <= previous.get("_sequence", 0)
+            or tail.get("_route", "chat") != "chat" or tail.get("_operation", "text") != "text"
+            or tail.get("_forward_protocol") or tail.get("_public_session_ref")
+            or any(tail.get(key) for key in ("_supersedes_request_id", "_codex_fallback_of", "_derived_input",
+                       TextTaskService._WORKBENCH_DERIVED_MARKER, "_completion", "_completion_of",
+                       "_same_session_retry_of", "_retry_unsent_of", "_terminal_empty_correction_of",
+                       "_recovery_paused", "_recovery_suppressed", "recovery_claim_id", "_recovery_claim_id")
+                   if not capacity or key not in {"recovery_claim_id", "_recovery_claim_id"})
+            or any(body.get(key) is not None for key in ("supersedes_request_id", "derived_input",
+                       "continue_after_incomplete", "continue_after_no_final", TextTaskService._WORKBENCH_DERIVED_MARKER))):
+        return False
+    if pending:
+        return (tail.get("status") in {"queued", "running"} and tail.get("_submission_started") is False
+                and tail.get("parent_message_id") == previous.get("parent_message_id")
+                and not tail.get("_send_hold"))
+    if capacity and tail.get("status") in {"running", "unknown"}:
+        # This releases only the already completed predecessor's local slot.
+        # The sent leaf keeps its own execution/UNKNOWN occupancy and never
+        # becomes a completed lifecycle member through this projection.
+        return (tail.get("_submission_started") is True
+                and type(tail.get("_last_sent_sequence")) is int
+                and tail["_last_sent_sequence"] >= 0)
+    ended = tail.get("_turn_end_evidence")
+    recovered_terminal = (isinstance(ended, dict)
+        and set(ended) == {"conversation_id", "request_message_id", "final_message_id", "observed_at"}
+        and ended["conversation_id"] == tail.get("conversation_id")
+        and ended["request_message_id"] == tail.get("request_message_id")
+        and ended["final_message_id"] == tail.get("parent_message_id")
+        and ended["request_message_id"] != ended["final_message_id"]
+        and type(ended["observed_at"]) in {int, float} and math.isfinite(ended["observed_at"])
+        and 0 < ended["observed_at"] <= now)
+    return (tail.get("status") == "succeeded" and tail.get("upstream_outcome") == "completed"
+            and tail.get("_submission_started") is True
+            and isinstance(tail.get("content"), str) and bool(tail["content"].strip())
+            and tail.get("upstream_unfinished") is not True
+            and (tail.get("_upstream_terminal") is True or recovered_terminal)
+            and not _claims(tail) and not tail.get("_executing") and not tail.get("_turn_reserved"))
+
+
+def advanced_continuation_required(store, db, receipt):
+    """A normal later step cannot bypass an unresolved incomplete predecessor."""
+    if receipt.get("_supersedes_request_id") or not receipt.get("_product_work_key"):
+        return False
+    parent = store.runtime(db, receipt["_product_work_key"])
+    if not parent:
+        return False
+    for member in parent.get("members", []):
+        if member["kind"] != "text":
+            continue
+        child = store.read_receipt(db, "text", member["owner"], member["request_id"]) or {}
+        if child.get("_supersedes_incomplete") is not True:
+            continue
+        if type(receipt.get("_sequence")) is not int or type(child.get("_sequence")) is not int:
+            return True
+        if receipt["_sequence"] <= child["_sequence"]:
+            continue
+        original = store.read_receipt(db, "text", member["owner"], child.get("_supersedes_request_id")) or {}
+        if original.get("status") != "succeeded" and original.get("_upstream_terminal") is not True:
+            return True
+    return False
+
+
+def advanced_continuation_chain(store, db, receipt, now):
+    """Read-only send proof for one new normal step after an owned completed chain."""
+    parent = store.runtime(db, receipt.get("_product_work_key", ""))
+    if (not parent or parent.get("state") != "active" or admission_control(parent)["state"] != "active"
+            or receipt.get("_supersedes_request_id")):
+        return None
+    members = []
+    for member in parent.get("members", []):
+        row = store.read_receipt(db, member["kind"], member["owner"], member["request_id"])
+        if not row or member["owner"] != parent["owner"] or _source(row) != parent["source"]:
+            return None
+        members.append((member, row))
+    for _, candidate in members:
+        if candidate.get("_supersedes_incomplete"):
+            chain = _no_final_successor_chain(store, db, parent, candidate, members, now,
+                                              pending=receipt)
+            if chain and chain["advanced_by_own_successor"]:
+                return chain
+    return None
+
+
+def advanced_capacity_originals(store, db, product_key, now):
+    """Recompute completed-prefix capacity transfer without changing UNKNOWN."""
+    parent = store.runtime(db, product_key)
+    if not parent or parent.get("state") not in {"active", "closing", "completed"} or admission_control(parent)["state"] != "active":
+        return set()
+    members = []
+    for member in parent.get("members", []):
+        receipt = store.read_receipt(db, member["kind"], member["owner"], member["request_id"])
+        if (not receipt or member["owner"] != parent["owner"]
+                or receipt.get("_product_work_key") != parent["key"] or _source(receipt) != parent["source"]):
+            return set()
+        members.append((member, receipt))
+    released = set()
+    for _, child in members:
+        if child.get("_supersedes_incomplete") is not True:
+            continue
+        chain = _no_final_successor_chain(store, db, parent, child, members, now)
+        if not chain and parent["state"] == "active":
+            # Only one registered sent leaf may be outside the last original
+            # GET's completed proof. All other foreign/later members still
+            # conflict in the shared frozen-chain validator.
+            leaves = [leaf for member, leaf in members
+                      if member["kind"] == "text" and leaf.get("_submission_started") is True
+                      and not leaf.get("_supersedes_request_id")
+                      and type(leaf.get("_sequence")) is int]
+            latest = max((leaf["_sequence"] for leaf in leaves), default=0)
+            leaves = [leaf for leaf in leaves if leaf["_sequence"] == latest]
+            if len(leaves) == 1:
+                chain = _no_final_successor_chain(store, db, parent, child, members, now,
+                                                  capacity_tail=leaves[0])
+        if chain and chain["advanced_by_own_successor"]:
+            released.add((parent["owner"], chain["original"]["request_id"]))
+    return released
+
+
+def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pending=None, capacity_tail=None):
     """Resolve one saved successor using the exact original recovery proof.
 
-    This is deliberately a lifecycle proof, not a call to the send-time
-    supersede validator.  Close and archive must re-read the frozen inputs,
-    hashes, ownership and live controls after the successor has completed.
+    Close and archive re-read frozen inputs, hashes, ownership and live
+    controls after the successor has completed. Send admission may nominate
+    one unsent member; capacity projection may nominate one already-sent leaf.
+    Neither nomination makes that member a completed lifecycle waiver.
     """
     from services.category_directory_derivation import derive_retained_input
     from services.conversation_binding_service import ConversationBindingError
     from services.text_task_service import TextTaskService
 
+    continuation = pending if pending is not None else capacity_tail
     successor_id = receipt.get("request_id")
     original_id = receipt.get("_supersedes_request_id")
     incomplete = receipt.get("_supersedes_incomplete") is True
@@ -877,6 +1024,22 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
         # and use that branch observation only as a ProductWork close waiver.
         advanced = original.get("_completed_successor_evidence")
         successor_ended = receipt.get("_turn_end_evidence")
+        advanced_fields = {"conversation_id", "request_message_id", "successor_request_message_id",
+                           "successor_final_message_id", "observed_at"}
+        tail_steps = advanced.get("tail_steps") if isinstance(advanced, dict) else None
+        parent_field = "successor_request_parent_message_id"
+        if isinstance(advanced, dict) and parent_field in advanced:
+            advanced_fields.add(parent_field)
+        valid_tail_steps = (
+            tail_steps is None
+            or isinstance(tail_steps, list) and 1 <= len(tail_steps) <= 32
+            and all(isinstance(step, dict) and set(step) == {"request_message_id", "final_message_id"}
+                    and all(isinstance(step.get(key), str) and step[key].strip()
+                            for key in ("request_message_id", "final_message_id"))
+                    and step["request_message_id"] != step["final_message_id"]
+                    for step in tail_steps)
+            and len({value for step in tail_steps for value in step.values()}) == 2 * len(tail_steps)
+        )
         advanced_by_own_successor = bool(
             original.get("status") == "unknown"
             and original.get("error_code") == "CONVERSATION_OUTCOME_UNKNOWN"
@@ -886,8 +1049,12 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
             and original.get("_upstream_terminal") is not True
             and not original.get("_turn_end_evidence")
             and isinstance(advanced, dict)
-            and set(advanced) == {"conversation_id", "request_message_id", "successor_request_message_id",
-                                  "successor_final_message_id", "observed_at"}
+            and set(advanced) == advanced_fields | ({"tail_steps"} if tail_steps is not None else set())
+            and valid_tail_steps
+            and (parent_field not in advanced or isinstance(advanced[parent_field], str)
+                 and bool(advanced[parent_field].strip())
+                 and advanced[parent_field] == receipt.get("request_parent_message_id"))
+            and (not tail_steps or parent_field in advanced)
             and all(isinstance(advanced.get(key), str) and advanced[key].strip() for key in (
                 "conversation_id", "request_message_id", "successor_request_message_id",
                 "successor_final_message_id"))
@@ -897,6 +1064,10 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
             and advanced["successor_final_message_id"] == receipt.get("parent_message_id")
             and advanced["successor_request_message_id"] != advanced["request_message_id"]
             and advanced["successor_final_message_id"] != advanced["successor_request_message_id"]
+            and (tail_steps is None or not any(
+                value in {advanced["request_message_id"], advanced["successor_request_message_id"],
+                          advanced["successor_final_message_id"]}
+                for step in tail_steps for value in step.values()))
             and type(advanced.get("observed_at")) in {int, float}
             and math.isfinite(advanced["observed_at"]) and 0 < advanced["observed_at"] <= now
             and isinstance(successor_ended, dict)
@@ -945,7 +1116,12 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
     if (any(any(item.get(key) != original.get(key) or not item.get(key) for key in keys)
             for item in chain_members)
             or any(item.get("_product_work_key") != parent["key"] for item in chain_members)
-            or any(_source(item) != parent["source"] for item in chain_members)):
+            or any(_source(item) != parent["source"] for item in chain_members)
+            or advanced_by_own_successor and any(item.get("_source") != parent["source"] for item in chain_members)):
+        return None
+    if any(any(body.get(key) != item.get(key) for key in (
+            "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"))
+            for item, body in ((original, original_body), (receipt, successor_body))):
         return None
     if (type(original.get("_sequence")) is not int or type(receipt.get("_sequence")) is not int
             or original["_sequence"] <= 0 or receipt["_sequence"] <= original["_sequence"]
@@ -1020,11 +1196,57 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
         ).fetchall()
         if descendants:
             return None
+    tail_rows = []
+    archive_member = next((member for member, row in members
+                           if member["kind"] == "text" and row.get("request_id") == successor_id), None)
+    archive = receipt
+    if advanced_by_own_successor and (tail_steps or continuation is not None):
+        if (not isinstance(receipt.get("_product_work"), dict)
+                or not isinstance(receipt["_product_work"].get("step_ref"), str)):
+            return None
+    if advanced_by_own_successor and tail_steps:
+        member_by_request = {}
+        for member, row in members:
+            if member["kind"] == "text":
+                member_by_request.setdefault(row.get("request_message_id"), []).append((member, row))
+        previous = receipt
+        used_steps = {receipt["_product_work"]["step_ref"]}
+        for proof in tail_steps:
+            found = member_by_request.get(proof["request_message_id"], [])
+            if len(found) != 1:
+                return None
+            member, tail = found[0]
+            if (tail.get("parent_message_id") != proof["final_message_id"]
+                    or not _normal_product_tail(store, db, parent, member, tail, previous, used_steps, now)
+                    or _unresolved(tail, [row for _, row in members])):
+                return None
+            tail_rows.append((member, tail))
+            used_steps.add(member["step_ref"])
+            previous = tail
+        archive_member, archive = tail_rows[-1]
+    if not isinstance(archive_member, dict):
+        return None
+    if continuation is not None:
+        pending_member = next((member for member, row in members
+                               if member["kind"] == "text" and row.get("request_id") == continuation.get("request_id")), None)
+        used_steps = {item["_product_work"]["step_ref"] for item in [receipt, *(row for _, row in tail_rows)]}
+        if (not advanced_by_own_successor or not pending_member
+                or "successor_request_parent_message_id" not in advanced
+                or sum(row.get("request_message_id") == continuation.get("request_message_id")
+                       for member, row in members if member["kind"] == "text") != 1
+                or not _normal_product_tail(store, db, parent, pending_member, continuation, archive,
+                                            used_steps, now, pending=pending is not None,
+                                            capacity=capacity_tail is not None)):
+            return None
+    chain_members.extend(row for _, row in tail_rows)
     member_ids = {(member["kind"], row.get("request_id") or row.get("id")) for member, row in members}
     if not {("text", item["request_id"]) for item in chain_members} <= member_ids:
         return None
     if advanced_by_own_successor:
-        chain_ids = {("text", parent["owner"], original_id), ("text", parent["owner"], successor_id)}
+        chain_ids = {("text", parent["owner"], item["request_id"])
+                     for item in chain_members}
+        if continuation is not None:
+            chain_ids.add(("text", parent["owner"], continuation["request_id"]))
         registered = {(member["kind"], member["owner"], member["request_id"]) for member, _ in members}
         all_rows = list(store.receipts(db))
         all_receipts = [other for _, _, _, other in all_rows]
@@ -1066,7 +1288,7 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
     elif (not isinstance(metadata, dict) or metadata != _metadata(parent, metadata.get("step_ref"))
             or any(item.get("_product_work") != metadata
                    or member_refs[item["request_id"]].get("step_ref") != metadata.get("step_ref")
-                   for item in chain_members)):
+                   for item in [*ancestors, original, receipt])):
         return None
     if ancestors:
         if any(not TextTaskService._supersede_order_link(previous, successor)
@@ -1080,8 +1302,9 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now):
             metadata = _metadata(parent, member["step_ref"])
             if item.get("_product_work") != metadata or original_body.get("product_work") != metadata:
                 return None
-    return {"original": original, "successor": receipt, "resolved": [*ancestors, original],
-            "advanced_by_own_successor": advanced_by_own_successor}
+    return {"original": original, "successor": receipt, "tail": [row for _, row in tail_rows],
+            "archive": archive, "archive_member": archive_member,
+            "resolved": [*ancestors, original], "advanced_by_own_successor": advanced_by_own_successor}
 
 
 def _codex_rejected_retry_chain(store, db, parent, receipt, members):
@@ -1597,6 +1820,7 @@ class ProductWorkService:
             chains = self._missing_node_chains(db, parent, members)
             advanced_chains = self._owned_advanced_successor_chains(db, parent, members)
             chain_member_ids = set()
+            advanced_chain_members = {}
             special_targets = {}
             members_by_identity = {(member["kind"], member["request_id"]): (member, receipt)
                                    for member, receipt in members}
@@ -1612,9 +1836,11 @@ class ProductWorkService:
                     raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
                 special_targets[canonical] = target
             for chain in advanced_chains.values():
-                archive_member, archive = members_by_identity[("text", chain["successor"]["request_id"])]
-                chain_member_ids.update(("text", chain[name]["request_id"])
-                                        for name in ("original", "successor"))
+                archive_member, archive = chain["archive_member"], chain["archive"]
+                for item in (chain["original"], chain["successor"], *chain["tail"]):
+                    identity = ("text", item["request_id"])
+                    chain_member_ids.add(identity)
+                    advanced_chain_members[identity] = chain
                 canonical = archive["provider_account_identity"], archive["conversation_id"]
                 target = archive_member["kind"], archive_member["request_id"]
                 if canonical in special_targets and special_targets[canonical] != target:
@@ -1625,10 +1851,12 @@ class ProductWorkService:
                 identity = member["kind"], member["request_id"]
                 if identity in chain_member_ids:
                     chain = chains.get(receipt.get("request_id"))
+                    if chain is None:
+                        chain = advanced_chain_members.get(identity)
                     if not chain:
                         continue
                     if chain.get("advanced_by_own_successor"):
-                        member, receipt = members_by_identity[("text", chain["successor"]["request_id"])]
+                        member, receipt = chain["archive_member"], chain["archive"]
                     else:
                         member, receipt = members_by_identity[(chain["archive_member"]["kind"],
                                                                chain["archive_member"]["request_id"])]
@@ -1755,10 +1983,10 @@ class ProductWorkService:
                     and (child["kind"], child["last_request_id"]) != (archive_member["kind"], archive_member["request_id"])):
                 raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
         for chain in self._owned_advanced_successor_chains(db, parent, members).values():
-            successor = chain["successor"]
-            if (child["target"].get("provider_account_identity") == successor["provider_account_identity"]
-                    and child["target"].get("conversation_id") == successor["conversation_id"]
-                    and (child["kind"], child["last_request_id"]) != ("text", successor["request_id"])):
+            archive_member, archive = chain["archive_member"], chain["archive"]
+            if (child["target"].get("provider_account_identity") == archive["provider_account_identity"]
+                    and child["target"].get("conversation_id") == archive["conversation_id"]
+                    and (child["kind"], child["last_request_id"]) != (archive_member["kind"], archive_member["request_id"])):
                 raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
         receipt = self.store.read_receipt(db, child["kind"], child["owner"], child["last_request_id"])
         if not receipt or any(receipt.get(k) != v for k, v in child["target"].items()):

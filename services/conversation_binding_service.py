@@ -323,11 +323,34 @@ def _completed_external_successor(mapping, children, request_message_id, current
         return completed
     # This proves which later turn was observed, not that the old turn ended.
     # Lifecycle may only use it after matching an owned, frozen successor.
-    if not completed or len(later_users) != 1 or active_tool or children.get(current_node):
+    if not completed or active_tool or children.get(current_node):
         return None
-    return {"conversation_id": conversation_id, "request_message_id": request_message_id,
-            "successor_request_message_id": later_user, "successor_final_message_id": current_node,
-            "observed_at": ended["observed_at"]}
+    turns = []
+    for user_id in reversed(later_users):
+        turn = _completed_request_turn(mapping, children, user_id, conversation_id,
+                                       allow_completed_tool_call=True)
+        if not turn:
+            return None
+        content = mapping[turn["final_message_id"]]["message"].get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if (not isinstance(content, dict) or content.get("content_type") != "text"
+                or not isinstance(parts, list) or not all(isinstance(part, str) for part in parts)
+                or not "".join(parts).strip()):
+            return None
+        turns.append(turn)
+    if any(mapping.get(turns[index + 1]["request_message_id"], {}).get("parent")
+           != turns[index]["final_message_id"] for index in range(len(turns) - 1)):
+        return None
+    evidence = {"conversation_id": conversation_id, "request_message_id": request_message_id,
+                "successor_request_message_id": turns[0]["request_message_id"],
+                "successor_request_parent_message_id": mapping[turns[0]["request_message_id"]]["parent"],
+                "successor_final_message_id": turns[0]["final_message_id"],
+                "observed_at": ended["observed_at"]}
+    if len(turns) > 1:
+        evidence["tail_steps"] = [{"request_message_id": turn["request_message_id"],
+                                   "final_message_id": turn["final_message_id"]}
+                                  for turn in turns[1:]]
+    return evidence
 
 
 def _empty_reply_evidence(mapping, children, request_message_id, conversation_id, current_node):

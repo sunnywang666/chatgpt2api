@@ -1149,15 +1149,37 @@ class TextTaskService:
                 receipt = receipt or {}
                 fields = {"conversation_id", "request_message_id", "successor_request_message_id",
                           "successor_final_message_id", "observed_at"}
+                tail_steps = successor_evidence.get("tail_steps") if isinstance(successor_evidence, dict) else None
+                parent_field = "successor_request_parent_message_id"
+                evidence_fields = fields | ({"tail_steps"} if tail_steps is not None else set())
+                if isinstance(successor_evidence, dict) and parent_field in successor_evidence:
+                    evidence_fields.add(parent_field)
+                valid_tail_steps = (
+                    tail_steps is None
+                    or isinstance(tail_steps, list) and 1 <= len(tail_steps) <= 32
+                    and all(isinstance(step, dict) and set(step) == {"request_message_id", "final_message_id"}
+                            and all(isinstance(step.get(key), str) and 1 <= len(step[key]) <= 200
+                                    and step[key] == step[key].strip()
+                                    for key in ("request_message_id", "final_message_id"))
+                            and step["request_message_id"] != step["final_message_id"]
+                            for step in tail_steps)
+                    and len({value for step in tail_steps for value in step.values()}) == 2 * len(tail_steps)
+                )
                 if (status != "unknown"
                         or recovered.get("binding_status") != "unknown"
                         or recovered.get("recovery_reason") != TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value
-                        or not isinstance(successor_evidence, dict) or set(successor_evidence) != fields
+                        or not isinstance(successor_evidence, dict) or set(successor_evidence) != evidence_fields
+                        or not valid_tail_steps
                         or any(not isinstance(successor_evidence.get(k), str)
                                or not 1 <= len(successor_evidence[k]) <= 200
                                or successor_evidence[k] != successor_evidence[k].strip()
-                               for k in fields - {"observed_at"})
+                               for k in evidence_fields - {"observed_at", "tail_steps"})
                         or len({successor_evidence[k] for k in fields - {"observed_at", "conversation_id"}}) != 3
+                        or tail_steps is not None and any(
+                            value in {successor_evidence["request_message_id"],
+                                      successor_evidence["successor_request_message_id"],
+                                      successor_evidence["successor_final_message_id"]}
+                            for step in tail_steps for value in step.values())
                         or successor_evidence["request_message_id"] != receipt.get("request_message_id")
                         or successor_evidence["conversation_id"] != receipt.get("conversation_id")
                         or successor_evidence["conversation_id"] != recovered.get("conversation_id")
