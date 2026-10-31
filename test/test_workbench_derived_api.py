@@ -1,5 +1,6 @@
 """Real HTTP and durable-input boundaries; no external service calls."""
 from copy import deepcopy
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,8 +12,107 @@ from services.work_lifecycle import WorkLifecycleError
 from test.test_category_directory_successor import install
 from test.test_explicit_unknown_successor import task, row, update
 from test.test_workbench_derived_input import payload
+from test.test_advanced_session_successor import advanced
+from test.test_no_final_successor import product_no_final
 
 PREFIX = "/api/conversation-bindings/text-requests/old"
+
+
+@pytest.fixture
+def advanced_http(advanced, monkeypatch):
+    h = advanced
+    monkeypatch.setattr(ai, "text_task_service", h.service)
+    monkeypatch.setattr(task_results, "text_task_service", h.service)
+    identity = lambda *_a, **_k: {"role": "admin", "id": "owner"}
+    monkeypatch.setattr(ai, "require_identity", identity)
+    monkeypatch.setattr(task_results, "require_identity", identity)
+    monkeypatch.setattr(ai, "trusted_source", lambda *_a: "internal:listing")
+    review = AsyncMock()
+    monkeypatch.setattr(ai, "filter_or_log", review)
+    app = FastAPI()
+    app.include_router(ai.create_router())
+    app.include_router(task_results.create_router())
+    with TestClient(app) as client:
+        yield h, review, client
+
+
+def test_advanced_wire_idempotency_and_saved_result_read(advanced_http):
+    h, review, client = advanced_http
+    before = deepcopy(row(h.service))
+    created = client.post(PREFIX + "/derived-successor", json=h.payload)
+    assert created.status_code == 200, created.text
+    first = created.json()
+    assert first["workbench_derived_input"]["mode"] == "advanced_new_session"
+    proof = first["advanced_session"]
+    assert proof["context_ref"] == h.payload["context_ref"]
+    assert proof["original_request_id"] == "old" and proof["child_request_id"] == "isolated"
+    assert proof["provider_binding_id"] is None and proof["conversation_id"] is None
+    assert proof["product_work"] == h.old["_product_work"]
+    assert client.post(PREFIX + "/derived-successor", json=h.payload).json() == first
+    result = client.get("/api/task-results/text/isolated").json()
+    assert result["result_ready"] is False and result["receipt"]["advanced_session"] == proof
+    assert row(h.service) == before and not h.sent
+    review.assert_awaited_once()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "null", "foreign_field", "malformed_hash", "wrong_mode"])
+def test_advanced_context_schema_fails_before_review(advanced_http, mutation):
+    h, review, client = advanced_http
+    request = deepcopy(h.payload)
+    if mutation == "missing": request.pop("context_ref")
+    elif mutation == "null": request["context_ref"] = None
+    elif mutation == "foreign_field": request["context_ref"]["conversation_id"] = "caller-cursor"
+    elif mutation == "malformed_hash": request["context_ref"]["result_sha256"] = "md5-not-sha256"
+    else: request["mode"] = "incomplete"
+    assert client.post(PREFIX + "/derived-successor", json=request).status_code == 422
+    assert row(h.service, "isolated") is None
+    review.assert_not_awaited()
+
+
+def test_advanced_actual_wire_with_scheduling_and_multiple_external_turns(advanced_http, tmp_path):
+    """Export actual HTTP serialization for the paired Workbench contract test."""
+    h, review, client = advanced_http
+    # ProductWork and nonempty legacy workflow scheduling are mutually exclusive.
+    # Preserve the real admission guard; this is the supported non-null wire shape.
+    scheduling = {}
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        body = h.service.store.load_input(original["_input_ref"])
+        body["_scheduling"] = scheduling
+        original["_scheduling"] = scheduling
+        original["_input_ref"] = h.service.store.save_input(body)
+        original["_completed_successor_evidence"]["tail_steps"] = [
+            {"request_message_id": "external-user-2", "final_message_id": "external-final-2"},
+            {"request_message_id": "external-user-3", "final_message_id": "external-final-3"}]
+        digest = h.service._submission_identity("owner", body)[1]
+        db.execute("UPDATE requests SET request_hash=?,receipt=? WHERE owner='owner' AND id='old'",
+                   (digest, json.dumps(original)))
+    h.payload["original_input_hash"] = digest
+    queued_response = client.post(PREFIX + "/derived-successor", json=h.payload)
+    assert queued_response.status_code == 200, queued_response.text
+    queued = queued_response.json()
+    assert queued["advanced_session"]["scheduling"] == scheduling
+    assert queued["advanced_session"]["original_head_message_id"] == "external-final-3"
+    assert queued["advanced_session"]["provider_binding_id"] is None
+    assert queued["advanced_session"]["conversation_id"] is None
+    with h.service.store.transaction() as db:
+        receipt = h.service.store.read_receipt(db, "text", "owner", "isolated")
+        receipt.update(status="succeeded", content="fixture complete business result", _submission_started=True,
+            _upstream_terminal=True, _executing=False, _turn_reserved=False,
+            provider_binding_id="fixture-new-binding", conversation_id="fixture-new-chat",
+            request_message_id="fixture-new-user", parent_message_id="fixture-new-final",
+            request_parent_message_id="fixture-new-root", _submission_parent_message_id="fixture-new-root")
+        h.service.store.write_receipt(db, "text", "owner", "isolated", receipt)
+    result_response = client.get("/api/task-results/text/isolated")
+    assert result_response.status_code == 200
+    result = result_response.json()
+    assert result["result_ready"] and result["receipt"]["advanced_session"]["conversation_id"] == "fixture-new-chat"
+    assert result["receipt"]["parent_message_id"] == "fixture-new-final"
+    for key in set(queued["advanced_session"]) - {"provider_binding_id", "conversation_id"}:
+        assert queued["advanced_session"][key] == result["receipt"]["advanced_session"][key]
+    (tmp_path / "advanced-queued.json").write_text(json.dumps(queued, ensure_ascii=False, indent=2) + "\n")
+    (tmp_path / "advanced-success-task-result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    assert not h.sent
 
 
 @pytest.fixture

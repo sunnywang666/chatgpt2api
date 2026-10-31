@@ -167,6 +167,13 @@ class ConversationBindingTextRequest(BaseModel):
         return self
 
 
+class WorkbenchContextReference(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    request_id: str = Field(min_length=1, max_length=200)
+    input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class WorkbenchDerivedSuccessorRequest(BaseModel):
     """Business content only; Provider supplies the immutable transport identity."""
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -175,8 +182,18 @@ class WorkbenchDerivedSuccessorRequest(BaseModel):
     messages: list[dict[str, object]] = Field(min_length=1)
     model: str = Field(min_length=1, max_length=200)
     thinking_effort: str = Field(min_length=1, max_length=100)
-    mode: Literal["413_request_missing", "no_final", "incomplete"]
+    mode: Literal["413_request_missing", "no_final", "incomplete", "advanced_new_session"]
     derivation_kind: str = Field(min_length=1, max_length=128)
+    context_ref: WorkbenchContextReference | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def context_for_new_session_only(self):
+        if self.mode == "advanced_new_session":
+            if self.context_ref is None:
+                raise ValueError("advanced new session requires a saved context reference")
+        elif "context_ref" in self.model_fields_set:
+            raise ValueError("context reference is only valid for advanced new session")
+        return self
 
 
 class TextRequestRecoveryRequest(BaseModel):

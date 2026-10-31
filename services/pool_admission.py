@@ -1717,16 +1717,22 @@ class PoolAdmission:
         advanced_released, advanced_blocked = set(), set()
         advanced_products = {item.get("_product_work_key") for _, _, _, item in receipts
                              if item.get("_completed_successor_evidence")
-                             or item.get("_supersedes_incomplete")}
+                             or item.get("_supersedes_incomplete")
+                             or product_work.advanced_session_required(item)}
         if db is not None and advanced_products:
             for product_key in advanced_products - {None}:
                 advanced_released.update(product_work.advanced_capacity_originals(
+                    self.store, db, product_key, now))
+                advanced_released.update(product_work.advanced_session_capacity_originals(
                     self.store, db, product_key, now))
             for kind, owner, request_id, candidate in receipts:
                 if (kind == "text" and candidate.get("_product_work_key") in advanced_products
                         and candidate.get("status") in {"queued", "running"}
                         and candidate.get("_submission_started") is False):
-                    if product_work.advanced_continuation_required(self.store, db, candidate):
+                    if product_work.advanced_session_required(candidate):
+                        if not product_work.advanced_session_send_ready(self.store, db, candidate, now):
+                            advanced_blocked.add((owner, request_id))
+                    elif product_work.advanced_continuation_required(self.store, db, candidate):
                         chain = product_work.advanced_continuation_chain(self.store, db, candidate, now)
                         if chain:
                             advanced_released.add((owner, chain["original"]["request_id"]))
@@ -2682,7 +2688,13 @@ class PoolAdmission:
                 raise AdmissionLost("requested Chat account changed before claim")
             # This only records a local account binding. It never probes or
             # refreshes an upstream credential in the claiming transaction.
-            binding = r.get("provider_binding_id") or (self.accounts.admission_binding(pick.account) if r.get("_route", "chat") == "chat" else None)
+            advanced_session = (ref.kind == "text" and product_work.advanced_session_required(r))
+            # A new-session successor is locked to the old account identity,
+            # not its old binding.  Reusing admission_binding here would turn
+            # the fresh-session request into the human-discussion conversation
+            # before ConversationBindingService can create its text binding.
+            binding = (None if advanced_session else r.get("provider_binding_id") or (
+                self.accounts.admission_binding(pick.account) if r.get("_route", "chat") == "chat" else None))
             rows = {a["provider_account_identity"]: a for a in self._rows()}
             claim = uuid.uuid4().hex
             timeline = list(r.get("_execution_timeline") or [])
@@ -2746,12 +2758,14 @@ class PoolAdmission:
                                                       "owners": owners, "groups": groups, "subgroups": subgroups})
             context = ExecutionContext(self, ref.kind, ref.owner, ref.request_id, claim, claimed_at=now)
             if ref.kind == "text" and r.get("_product_work_key"):
-                chain = product_work.advanced_continuation_chain(self.store, db, r, now)
+                chain = (product_work.advanced_session_chain(self.store, db, r, now)
+                         if advanced_session else product_work.advanced_continuation_chain(self.store, db, r, now))
                 if chain:
                     # In-memory claim expectation, never a persisted waiver.
                     # A late original success or proof removal must not make
                     # the final guard silently switch to another eligibility.
                     context.expected_advanced_original = chain["original"]["request_id"]
+                    context.expected_advanced_session = advanced_session
             return context
 
     def update_claim(self, context, **changes):
@@ -2947,9 +2961,14 @@ class PoolAdmission:
             if r.get("_send_hold") is True:
                 raise AdmissionLost("original task send hold is active")
             expected_original = getattr(context, "expected_advanced_original", None)
+            expected_advanced_session = getattr(context, "expected_advanced_session", False)
             if (expected_original is not None
+                    or context.kind == "text" and product_work.advanced_session_required(r)
                     or context.kind == "text" and product_work.advanced_continuation_required(self.store, db, r)):
-                chain = product_work.advanced_continuation_chain(self.store, db, r, now)
+                chain = (product_work.advanced_session_chain(self.store, db, r, now,
+                                                             require_binding=True, require_conversation=False)
+                         if expected_advanced_session or product_work.advanced_session_required(r)
+                         else product_work.advanced_continuation_chain(self.store, db, r, now))
                 if not chain or expected_original is not None and chain["original"]["request_id"] != expected_original:
                     raise AdmissionLost("owned successor chain changed before send")
             from services.generation_completion import replacement_send_allowed

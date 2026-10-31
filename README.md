@@ -266,7 +266,7 @@ environment:
 这两个入口仅向认证的内部管理员开放，并要求 `X-Workbench-Consumer: listing` 产生可信 `internal:listing` 来源；公司及外部入口不可使用。返回均禁止缓存。
 
 - `GET /api/conversation-bindings/text-requests/{original_id}/retained-input`：纯读持久化输入，返回 `{protocol:"task-input-v1", kind:"text", request_id, input_hash, input}`。Provider 校验原 owner、请求 ID、输入 hash、绑定、账号、会话和提交时游标；不查询上游、不恢复或发送。不可导出的输入与身份不一致均拒绝，不能改用当前提示词重建。`input_hash` 是 Provider 的原输入身份，跨语言调用方应原样回传，不以 JSON 重新序列化替代它。
-- `POST /api/conversation-bindings/text-requests/{original_id}/derived-successor`：仅接受下方七个字段。工作台计算业务内容；Provider 从原输入继承账号、绑定、会话、游标、图片和 `product_work` 的原 step。图片内容、顺序及 `image_ref` 标签不可改。`derivation_kind` 仅为业务审计名称，Provider 不按该名称运行商品规则。
+- `POST /api/conversation-bindings/text-requests/{original_id}/derived-successor`：普通模式接受下方七个字段。工作台计算业务内容；Provider 从原输入继承账号、绑定、会话、游标、图片和 `product_work` 的原 step。图片内容、顺序及 `image_ref` 标签不可改。`derivation_kind` 仅为业务审计名称，Provider 不按该名称运行商品规则。下方 `advanced_new_session` 是显式、独立的新会话后继模式，另需成功上下文引用。
 
 ```json
 {
@@ -280,9 +280,60 @@ environment:
 }
 ```
 
-`mode` 仅允许 `413_request_missing`、`no_final`、`incomplete`，仍须满足各自原有资格。普通 UNKNOWN、超时和暂停不能获得重发权限；内容审查后及实际发送前继续检查原结果、租约、会话顺序与原/子输入 hash。相同 child ID 和输入返回既有回执，不重复审查或发送；改内容必须拒绝。同一原请求仍只允许一个合法 child。
+原会话接续模式为 `413_request_missing`、`no_final`、`incomplete`，仍须满足各自原有资格。普通 UNKNOWN、超时和暂停不能获得重发权限；内容审查后及实际发送前继续检查原结果、租约、会话顺序与原/子输入 hash。相同 child ID 和输入返回既有回执，不重复审查或发送；改内容必须拒绝。同一原请求仍只允许一个合法 child。
 
 POST 返回既有文本回执，并附 `workbench_derived_input`：`{protocol:"workbench-derived-input-v1", original_input_hash, child_input_hash, mode, derivation_kind}`。内部管理员的后续 `task-result-v1` 纯读保留该审计字段；它与旧 `derived_input` 分开。工作台保存自己的业务派生证明，并按原业务身份幂等采用结果。新的 no-final/incomplete child 仍须通过原 ProductWork 关联检查才可关闭与归档，不凭生成成功直接关闭业务。
+
+#### 原会话已进入其他讨论后的显式新会话后继
+
+`advanced_new_session` 只接受已发送、没有原最终答案、本地执行结束且无活动恢复租约的
+`REQUEST_CONVERSATION_ADVANCED`。原会话须有完整、无分叉、已完成的后续讨论证据；
+创建时及实际发送前精确重读原图，新增消息、原答案迟到、身份或头节点变化均阻止本次发送。
+它不将原请求改成成功或 `INCOMPLETE`，不提供未知请求的通用重发权限。
+
+仍使用上述 endpoint 和七字段，设置 `mode:"advanced_new_session"`，额外提供：
+
+```json
+{
+  "context_ref": {
+    "request_id": "saved-gallery-request-id",
+    "input_hash": "<gallery retained-input 返回的 SHA256>",
+    "result_sha256": "<gallery 完整 content 原文 UTF8 的 SHA256>"
+  }
+}
+```
+
+成功上下文须属于同 owner、同账号、同原会话和同 ProductWork，其最终节点必须是原请求的提交父节点。
+工作台把已存原资料、原图、完整成功上下文和本次业务指令组装到 `messages`；Provider 核对图片及
+`image_ref` 的内容和顺序、成功结果原文、原输入 hash，不重新审核附图、不解释商品规则。
+原 `original_input_hash` 仍指待接续的原请求。已成功首轮的冻结输入可以尚无物理会话字段；
+输入内存在的身份字段仍须与成功回执一致，结果和原输入须能核实，才能导出或用作上下文。
+
+工作台先持久保存一个稳定的 `client_request_id`。Provider 原子登记唯一后继，沿用原商品、步骤、
+公平调度与账号，生成新的 client conversation，执行时创建新的 binding 和物理会话。
+同 ID 同输入幂等返回；不同 ID 不能竞争出第二个后继，失败也不会自动产生第三次尝试。
+
+回执另含 `advanced_session`，固定 `protocol:"advanced-session-successor-v1"`，及
+`original_request_id/original_input_hash/original_account_identity/original_binding_id/`
+`original_conversation_id/original_request_message_id/original_head_message_id`、
+`completed_successor_evidence`、`context_ref`、`product_work`、`scheduling`、
+`child_request_id/child_client_conversation_id`。
+这些字段首次受理后冻结。`completed_successor_evidence` 含原 conversation/request、首个后续
+request/提交父节点/final、`observed_at` 秒时间戳，可选 `tail_steps` 按序列出其余 request/final；
+原 head 等于最后一个 final。`product_work` 复用 `product_ref/step_ref/fairness`；
+`scheduling` 原样保留原输入值；当前 ProductWork 不接受非空 legacy workflow scheduling，
+合法值为 null 或空对象，不能清空真实约束来绕过原门禁。原 request message/head 来自 Provider 回执及图证据，
+不要求它们存在于 `retained-input.input`。
+
+同一 proof 内的 `provider_binding_id/conversation_id` 两个字段在 queued 时可为 null，执行后
+投影新回执身份；成功时必须非空、不同于原会话，且与回执相等。新账号必须仍等于原账号。
+工作台核验上述关系后采用新 `parent_message_id` 游标，不再要求它等于旧附图节点。
+内部纯读 `/api/task-results/text/{child_id}` 在 `receipt.advanced_session` 保留同一证明。
+
+旧 UNKNOWN、旧输入、成功附图及后续讨论均保留。新旧尝试不重复计算商品名额，实际在途仍受原保护。
+新后继发送后，旧答案迟到只保存于原请求，不覆盖后继；工作台只采用它记录的后继 ID。
+完成关闭仍核验新后继及正常后续步骤，自动归档只处理新业务会话，旧讨论会话保留原归属和直接归档保护。
+必须先部署两端兼容实现，再通过正式工作台入口验收原商品；代码和模拟测试不代表真实生成成功。
 
 迁移验收复用 `test/test_category_directory_successor.py`、`test/test_required_attributes_successor.py`、`test/test_combined_copy_derivation.py`、`test/test_incomplete_compact_successor.py` 及现有 WBOZ combined-copy fixtures。尤其当前 structured copy 已是正式输入契约，应原样保留；迁移不同时压缩提示词、改变字段或替换图片。旧 receipt 与已创建 child 继续可读，不要求重新生成来升级协议。
 
