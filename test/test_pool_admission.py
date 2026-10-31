@@ -3,12 +3,13 @@ import json
 import hashlib
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from datetime import datetime, timezone
 
@@ -2596,6 +2597,117 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(finished[0]["task_status"], "succeeded")
         self.assertEqual(finished[0]["queue_wait_seconds"], 0)
         self.assertEqual(len(self.calls), 1)
+
+    def test_terminal_commit_wakes_independent_claim_before_slow_outcome_observation(self):
+        first_saved, outcome_started, release_outcome, next_started = (
+            threading.Event(), threading.Event(), threading.Event(), threading.Event())
+
+        class WakeOnlyEvent:
+            def __init__(self):
+                self.event = threading.Event()
+
+            def clear(self):
+                self.event.clear()
+
+            def set(self):
+                self.event.set()
+
+            def wait(self, _timeout=None):
+                return self.event.wait()
+
+        self.admission._event = WakeOnlyEvent()
+
+        def runner(body, on_cursor):
+            context = current_request.get()
+            context.before_send()
+            if context.request_id == "first":
+                return {"content": "saved-first"}
+            with self.store.connect() as db:
+                saved = self.store.read_receipt(db, "text", "happy", "first")
+            self.assertEqual((saved["status"], saved["content"], saved["_executing"]),
+                             ("succeeded", "saved-first", False))
+            next_started.set()
+            return {"content": "saved-next"}
+
+        self.text.runner = runner
+        self.submit("first")
+        self.submit("next")
+        first = self.admission.claim_next()
+        original_record_outcome = first.record_outcome
+
+        def slow_record_outcome():
+            saved = first.receipt()
+            self.assertEqual((saved["status"], saved["_executing"]), ("succeeded", False))
+            first_saved.set()
+            outcome_started.set()
+            self.assertTrue(release_outcome.wait(3), "outcome observation was never released")
+            return original_record_outcome()
+
+        first.record_outcome = slow_record_outcome
+        self.admission.start()
+        worker = threading.Thread(target=self.admission.execute, args=(first,))
+        worker.start()
+        second_completed = False
+        try:
+            self.assertTrue(first_saved.wait(2))
+            self.assertTrue(outcome_started.wait(2))
+            # The old ordering wakes only after this blocked observation, so
+            # this independent request would remain queued here.
+            self.assertTrue(next_started.wait(.5))
+            release_outcome.set()
+            worker.join(3)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                saved = self.read("text", "happy", "next")
+                if (saved["status"] == "succeeded" and saved["_executing"] is False
+                        and any(stage.get("stage") == "task_finished"
+                                for stage in saved.get("_execution_timeline", []))):
+                    second_completed = True
+                    break
+                time.sleep(.01)
+            self.assertTrue(second_completed)
+        finally:
+            if not second_completed:
+                # Stop the real loop before releasing the slow observation so
+                # a failing old-order run cannot leave a late child worker.
+                self.admission.stop()
+            release_outcome.set()
+            worker.join(3)
+            if second_completed:
+                self.admission.stop()
+            if self.admission._recovery_thread is not None:
+                self.admission._recovery_thread.join(2)
+        self.assertFalse(worker.is_alive())
+
+    def test_final_guard_timing_includes_transaction_exit_commit(self):
+        now = [100.0]
+
+        class DelayedCommitStore:
+            @contextmanager
+            def transaction(self):
+                now[0] += 1  # writer acquisition
+                try:
+                    yield object()
+                finally:
+                    now[0] += 5  # commit/fsync after the guarded body
+
+        class TimingContext:
+            def __init__(self):
+                self.timing = {}
+
+            def record_attempt_timing(self, **timing):
+                self.timing.update(timing)
+
+        admission = PoolAdmission.__new__(PoolAdmission)
+        admission.store = DelayedCommitStore()
+        admission.settings = lambda: {}
+        admission.accounts = SimpleNamespace(admission_transaction=nullcontext)
+        context = TimingContext()
+        with patch("services.pool_admission.time.monotonic", side_effect=lambda: now[0]):
+            with admission._final_guard_transaction(context):
+                now[0] += 2
+        self.assertEqual(context.timing["final_guard_writer_wait_secs"], 1)
+        self.assertEqual(context.timing["final_guard_transaction_secs"], 7)
 
     def test_image_artifact_stage_follows_commit_and_does_not_repeat_on_read(self):
         from services.request_context import executing

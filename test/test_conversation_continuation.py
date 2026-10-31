@@ -12,6 +12,7 @@ from unittest import mock
 from types import SimpleNamespace
 
 from services import account_request_pacing as pacing
+from services.request_context import executing
 
 from services.openai_backend_api import ChatRequirements, ConversationArchiveCursorMismatch, OpenAIBackendAPI, StreamHardTimeoutError
 from services.conversation_binding_service import (
@@ -982,6 +983,108 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         second_call = conversation_events.call_args_list[1].kwargs
         self.assertEqual(second_call["conversation_id"], "conversation-1")
         self.assertEqual(second_call["parent_message_id"], "message-2")
+
+    def test_backend_setup_is_outside_binding_lock_but_stream_remains_locked(self) -> None:
+        service = ConversationBindingService()
+
+        class FailingTimingContext:
+            def record_attempt_timing(self, **_timing) -> None:
+                raise RuntimeError("diagnostic-only failure")
+
+        class ObservedLock:
+            held = False
+            entries = 0
+
+            def __enter__(self):
+                self.__class__.entries += 1
+                self.__class__.held = True
+                return self
+
+            def __exit__(self, *_args):
+                self.__class__.held = False
+
+        lock = ObservedLock()
+        constructed = []
+
+        class FakeBackend:
+            def __init__(self, access_token: str) -> None:
+                constructed.append((access_token, lock.held))
+                self.text_stream_terminal = None
+
+            def get_conversation_parent_message_id(self, conversation_id: str) -> str:
+                self.assert_lock_held()
+                return "message-2" if conversation_id == "conversation-1" else ""
+
+            @staticmethod
+            def assert_lock_held() -> None:
+                if not lock.held:
+                    raise AssertionError("cursor read escaped binding lock")
+
+            def close(self) -> None:
+                pass
+
+        def events(_backend, **_kwargs):
+            self.assertTrue(lock.held)
+            return iter([{"type": "conversation.delta", "delta": "ok", "conversation_id": "conversation-1"}])
+
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                       return_value="account-opaque-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                       return_value="token-a"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                       return_value=lock),
+            mock.patch("services.conversation_binding_service.account_service.mark_text_used"),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FakeBackend),
+            mock.patch("services.conversation_binding_service.conversation_events", side_effect=events),
+        ):
+            with executing(FailingTimingContext()):
+                result = service.complete_text({
+                    "provider_binding_id": "cb-account-a", "provider_account_identity": "account-opaque-a",
+                    "client_conversation_id": "workbench-conversation-1",
+                    "messages": [{"role": "user", "content": "write"}],
+                })
+
+        self.assertEqual(constructed, [("token-a", False)])
+        self.assertEqual(lock.entries, 1)
+        self.assertEqual(result["parent_message_id"], "message-2")
+
+    def test_backend_setup_failure_never_acquires_binding_lock(self) -> None:
+        service = ConversationBindingService()
+
+        class ObservedLock:
+            entries = 0
+
+            def __enter__(self):
+                self.__class__.entries += 1
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        lock = ObservedLock()
+
+        class FailingBackend:
+            def __init__(self, access_token: str) -> None:
+                raise RuntimeError("local backend setup failed")
+
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                       return_value="account-opaque-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                       return_value="token-a"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                       return_value=lock),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FailingBackend),
+            self.assertRaisesRegex(RuntimeError, "local backend setup failed"),
+        ):
+            service.complete_text({
+                "provider_binding_id": "cb-account-a", "provider_account_identity": "account-opaque-a",
+                "client_conversation_id": "workbench-conversation-1",
+                "messages": [{"role": "user", "content": "write"}],
+            })
+
+        self.assertEqual(lock.entries, 0)
 
     def test_ordinary_text_reuses_matching_verified_stream_terminal_without_cursor_get(self) -> None:
         service = ConversationBindingService()

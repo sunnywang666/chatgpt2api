@@ -474,7 +474,7 @@ class AccountRequestClock:
         local_started_at = time.time()
         local_seconds = {"clock_wait_secs": 0.0, "turn_wait_secs": 0.0,
                          "pace_wait_secs": 0.0, "send_guard_secs": 0.0,
-                         "send_marker_secs": 0.0}
+                         "send_marker_secs": 0.0, "post_guard_to_http_secs": 0.0}
 
         def remaining_budget() -> float | None:
             if deadline_at is None:
@@ -594,6 +594,28 @@ class AccountRequestClock:
         archive_observation = (current_archive_observation.get() or {}) if archive_guard is not None else {}
         request_ref = request_ref or archive_observation.get("request_ref")
 
+        def context_timing_fields(started_at):
+            """Project finite, request-local timings into the existing attempt log."""
+            fields = {}
+            claimed_at = getattr(context, "claimed_at", None) if context is not None else None
+            if (type(claimed_at) in (int, float) and math.isfinite(claimed_at)
+                    and math.isfinite(local_started_at) and math.isfinite(started_at)):
+                fields.update(
+                    claim_to_local_start_secs=round(max(0.0, local_started_at - claimed_at), 6),
+                    claim_to_http_secs=round(max(0.0, started_at - claimed_at), 6),
+                )
+            attempt_fields = getattr(context, "attempt_timing_fields", None) if context is not None else None
+            if callable(attempt_fields):
+                try:
+                    for key, value in attempt_fields().items():
+                        if (key in {"backend_construct_secs", "binding_lock_wait_secs",
+                                    "final_guard_writer_wait_secs", "final_guard_transaction_secs"}
+                                and type(value) in (int, float) and math.isfinite(value) and value >= 0):
+                            fields[key] = round(value, 6)
+                except Exception:
+                    pass  # Optional diagnostics never alter transport behavior.
+            return fields
+
         def observed_send(send_method, send_url, send_phase, *, read_started=None, **send_kwargs):
             # Count actual transport attempts, including metadata/preflight GETs.
             # Never log URLs, request bodies/headers, response bodies or exception
@@ -668,6 +690,7 @@ class AccountRequestClock:
                              "phase": send_phase, "endpoint_kind": endpoint_kind, "started_at": started_at,
                              "headers_elapsed_secs": round(time.monotonic() - started, 6),
                              "local_started_at": local_started_at,
+                             **context_timing_fields(started_at),
                              **{key: round(value, 6) for key, value in local_seconds.items()},
                              "status_code": status if isinstance(status, int) and not isinstance(status, bool) else None,
                              "outcome": "response" if response is not None else "transport_error",
@@ -781,6 +804,7 @@ class AccountRequestClock:
             response = None
             completed_read = False
             marker_persisted = False
+            post_guard_started = None
             try:
                 self._expire_backoff()
                 wait_for_send_edge("account request deadline elapsed during cooldown wait")
@@ -848,6 +872,7 @@ class AccountRequestClock:
                             context.before_send()
                     finally:
                         local_seconds["send_guard_secs"] += max(0.0, time.monotonic() - started_guard)
+                    post_guard_started = time.monotonic()
                 if callable(before_send):
                     before_send()
                 if archive_guard is not None:
@@ -899,6 +924,8 @@ class AccountRequestClock:
                     finally:
                         local_seconds["send_marker_secs"] += max(0.0, time.monotonic() - started_marker)
                 sent_at = time.monotonic()
+                if post_guard_started is not None:
+                    local_seconds["post_guard_to_http_secs"] += max(0.0, sent_at - post_guard_started)
                 try:
                     if concurrent_io:
                         # Keep the durable clock through the local transport-call
