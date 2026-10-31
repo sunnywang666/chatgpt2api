@@ -366,6 +366,16 @@ def before_send(store, db, receipt):
         raise WorkLifecycleError("PRODUCT_WORK_NOT_ACTIVE")
     if parent:
         _check_physical(store, db, receipt, parent["key"])
+        if receipt.get("_advanced_session") is not None:
+            members = []
+            for item in parent.get("members", []):
+                row = store.read_receipt(db, item["kind"], item["owner"], item["request_id"])
+                if not row:
+                    raise WorkLifecycleError("PRODUCT_WORK_BINDING_CONFLICT")
+                members.append((item, row))
+            if not _advanced_session_child(store, db, parent, receipt, members, time.time(), after_send=False,
+                                           require_binding=True, require_conversation=False):
+                raise WorkLifecycleError("PRODUCT_WORK_ADVANCED_SESSION_INVALID")
     return parent
 
 
@@ -480,6 +490,95 @@ def _successor(store, db, owner, previous, receipt):
     return False
 
 
+def _advanced_session_child(store, db, parent, receipt, members, now, *, after_send=False,
+                            require_binding=True, require_conversation=True,
+                            require_product_binding=True):
+    """Return the one proved replacement living in a fresh physical session.
+
+    Unlike the ordinary no-final successor, this is not an inference from a
+    local cursor.  The text-side helper owns the frozen old-session proof and
+    input hashes.  ProductWork adds only its durable ownership, membership and
+    physical-close rules.  In particular, a later success on the old request
+    may not retarget a close once the child has crossed its send boundary.
+    """
+    marker = receipt.get("_advanced_session")
+    if not isinstance(marker, dict):
+        return None
+    try:
+        from services.conversation_binding_service import ConversationBindingError
+        from services.advanced_session_successor import validate_successor, source_eligible
+        original = validate_successor(store, db, parent["owner"], receipt, now, after_send=after_send)
+    except (ConversationBindingError, OSError, ValueError, TypeError, KeyError, ImportError):
+        # The helper raises a transport-contract error for a bad frozen proof;
+        # malformed or unavailable evidence is never a ProductWork waiver.
+        return None
+    original_id = receipt.get("_supersedes_request_id")
+    child_id = receipt.get("request_id")
+    if (not isinstance(original, dict) or not isinstance(original_id, str) or not original_id
+            or not isinstance(child_id, str) or not child_id or original_id == child_id
+            or original.get("request_id") != original_id):
+        return None
+    if not after_send and not source_eligible(original, now):
+        return None
+    by_request = {row.get("request_id"): (member, row) for member, row in members
+                  if member.get("kind") == "text" and isinstance(row.get("request_id"), str)}
+    original_member = by_request.get(original_id)
+    child_member = by_request.get(child_id)
+    if not original_member or not child_member or child_member[1] != receipt:
+        return None
+    original_member, stored_original = original_member
+    child_member, _stored_child = child_member
+    metadata = _metadata(parent, child_member.get("step_ref"))
+    original_physical = ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id")
+    child_binding = receipt.get("provider_binding_id")
+    child_conversation = receipt.get("conversation_id")
+    child_is_fresh = (receipt.get("provider_account_identity") == original.get("provider_account_identity")
+                      and receipt.get("client_conversation_id") != original.get("client_conversation_id")
+                      and (not require_binding or isinstance(child_binding, str) and bool(child_binding)
+                           and child_binding != original.get("provider_binding_id"))
+                      and (not require_conversation or isinstance(child_conversation, str) and bool(child_conversation)
+                           and child_conversation != original.get("conversation_id")))
+    if (stored_original != original
+            or original_member.get("owner") != parent["owner"]
+            or child_member.get("owner") != parent["owner"]
+            or original_member.get("step_ref") != child_member.get("step_ref")
+            or original.get("_product_work_key") != parent["key"]
+            or receipt.get("_product_work_key") not in ({parent["key"]} if require_product_binding else {None, parent["key"]})
+            or _source(original) != parent["source"] or _source(receipt) != parent["source"]
+            or original.get("_product_work") != metadata
+            or (receipt.get("_product_work") != metadata if require_product_binding
+                else receipt.get("_product_work") is not None and receipt.get("_product_work") != metadata)
+            or not all(isinstance(original.get(key), str) and original[key] for key in original_physical)
+            or not child_is_fresh):
+        return None
+    # A migration is a one-child handoff, never a generic same-step fork.
+    children = db.execute(
+        "SELECT id FROM requests WHERE owner=? AND json_extract(receipt,'$._supersedes_request_id')=?",
+        (parent["owner"], original_id),
+    ).fetchall()
+    known = {row[0] for row in children}
+    if known not in ({child_id}, set()):
+        return None
+    return {"original": original, "original_member": original_member,
+            "successor": receipt, "successor_member": child_member,
+            "archive": receipt, "archive_member": child_member, "tail": []}
+
+
+def _advanced_session_registration(store, db, parent, previous, receipt, member, now):
+    """Validate the one same-step child before it is durably attached."""
+    if not isinstance(receipt.get("_advanced_session"), dict):
+        return False
+    members = [(item, store.read_receipt(db, item["kind"], item["owner"], item["request_id"]))
+               for item in parent.get("members", [])]
+    if any(row is None for _, row in members):
+        return False
+    return bool(_advanced_session_child(store, db, parent, receipt,
+                                        [*members, (member, receipt)], now, after_send=False,
+                                        require_binding=False, require_conversation=False,
+                                        require_product_binding=False)
+                and previous.get("request_id") == receipt.get("_supersedes_request_id"))
+
+
 def ensure_product_work(store, db, kind, owner, request_id, receipt, product_work, *, source=None):
     metadata = normalize_product_work(product_work)
     if metadata is None:
@@ -535,7 +634,12 @@ def ensure_product_work(store, db, kind, owner, request_id, receipt, product_wor
                 raise WorkLifecycleError("PRODUCT_WORK_STEP_CONFLICT")
             old = same_step[-1]
             previous = store.read_receipt(db, old["kind"], old["owner"], old["request_id"])
-            if old["kind"] != kind or not previous or not _successor(store, db, owner, previous, receipt):
+            advanced_registration = bool(
+                old["kind"] == kind and previous
+                and _advanced_session_registration(store, db, parent, previous, receipt, member, time.time())
+            )
+            if (old["kind"] != kind or not previous
+                    or not advanced_registration and not _successor(store, db, owner, previous, receipt)):
                 raise WorkLifecycleError("PRODUCT_WORK_STEP_CONFLICT")
     else:
         parent = {"key": key, "owner": owner, "source": source, "product_ref": metadata["product_ref"],
@@ -945,6 +1049,158 @@ def advanced_capacity_originals(store, db, product_key, now):
         if chain and chain["advanced_by_own_successor"]:
             released.add((parent["owner"], chain["original"]["request_id"]))
     return released
+
+
+def advanced_session_required(receipt):
+    """Whether this queued receipt claims the new-session exception."""
+    return isinstance(receipt.get("_advanced_session"), dict)
+
+
+def advanced_session_send_ready(store, db, receipt, now):
+    """Planner recheck for an unsent fresh-session child."""
+    if not advanced_session_required(receipt):
+        return False
+    parent = store.runtime(db, receipt.get("_product_work_key", ""))
+    if (not parent or parent.get("state") not in {"queued", "active"}
+            or admission_control(parent).get("state") != "active"):
+        return False
+    members = []
+    for member in parent.get("members", []):
+        row = store.read_receipt(db, member["kind"], member["owner"], member["request_id"])
+        if not row:
+            return False
+        members.append((member, row))
+    return bool(_advanced_session_child(store, db, parent, receipt, members, now, after_send=False,
+                                        require_binding=False, require_conversation=False))
+
+
+def advanced_session_chain(store, db, receipt, now, *, require_binding=False, require_conversation=False):
+    """Rebuild the one registered fresh-session relation for claim/send guards."""
+    if not advanced_session_required(receipt):
+        return None
+    parent = store.runtime(db, receipt.get("_product_work_key", ""))
+    if not parent:
+        return None
+    members = []
+    for member in parent.get("members", []):
+        row = store.read_receipt(db, member["kind"], member["owner"], member["request_id"])
+        if not row:
+            return None
+        members.append((member, row))
+    return _advanced_session_child(store, db, parent, receipt, members, now, after_send=False,
+                                   require_binding=require_binding,
+                                   require_conversation=require_conversation)
+
+
+def _advanced_session_original_live(receipt, now):
+    """True only for a root that can still reach a real send/result edge."""
+    if receipt.get("_executing") is True or receipt.get("_turn_reserved") is True:
+        return True
+    for claim, until in (("_claim_id", "_claim_until"),
+                         ("recovery_claim_id", "recovery_lease_until"),
+                         ("_recovery_claim_id", "_recovery_claim_until")):
+        value = receipt.get(until)
+        if receipt.get(claim):
+            if type(value) not in (int, float) or not math.isfinite(value) or value > now:
+                return True
+        elif value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value > now):
+            return True
+    return False
+
+
+def advanced_session_capacity_originals(store, db, product_key, now):
+    """Project the old UNKNOWN turn onto its one proved fresh-session child.
+
+    This is capacity accounting only.  A queued/running/UNKNOWN/succeeded child
+    replaces the old local turn for occupancy; a failed child immediately loses
+    the projection, so it cannot silently create another retry or erase the
+    old recovery obligation.
+    """
+    parent = store.runtime(db, product_key)
+    if (not parent or parent.get("state") not in {"queued", "active", "closing", "completed"}
+            or admission_control(parent)["state"] != "active"):
+        return set()
+    members = []
+    for member in parent.get("members", []):
+        receipt = store.read_receipt(db, member["kind"], member["owner"], member["request_id"])
+        if (not receipt or member.get("owner") != parent.get("owner")
+                or receipt.get("_product_work_key") != parent.get("key")
+                or _source(receipt) != parent.get("source")):
+            return set()
+        members.append((member, receipt))
+    released = set()
+    for _member, child in members:
+        if not advanced_session_required(child):
+            continue
+        submitted = child.get("_submission_started") is True
+        # An unsubmitted queued child is the only pre-send case.  Once it is
+        # submitted, the child's own running/UNKNOWN turn is counted normally.
+        # A failed child is deliberately excluded, restoring the old UNKNOWN.
+        if (child.get("status") not in ({"queued", "running"} if not submitted
+                                         else {"running", "unknown", "succeeded"})):
+            continue
+        chain = _advanced_session_child(store, db, parent, child, members, now, after_send=submitted,
+                                        require_binding=False, require_conversation=False)
+        if chain and not _advanced_session_original_live(chain["original"], now):
+            released.add((parent["owner"], chain["original"]["request_id"]))
+    return released
+
+
+def _advanced_session_terminal(receipt, now):
+    ended = receipt.get("_turn_end_evidence")
+    recovered_terminal = (isinstance(ended, dict)
+        and set(ended) == {"conversation_id", "request_message_id", "final_message_id", "observed_at"}
+        and ended.get("conversation_id") == receipt.get("conversation_id")
+        and ended.get("request_message_id") == receipt.get("request_message_id")
+        and ended.get("final_message_id") == receipt.get("parent_message_id")
+        and ended.get("final_message_id") != ended.get("request_message_id")
+        and type(ended.get("observed_at")) in {int, float}
+        and math.isfinite(ended["observed_at"]) and 0 < ended["observed_at"] <= now)
+    return bool(receipt.get("status") == "succeeded"
+                and receipt.get("upstream_outcome") == "completed"
+                and receipt.get("_submission_started") is True
+                and isinstance(receipt.get("content"), str) and receipt["content"].strip()
+                and receipt.get("upstream_unfinished") is not True
+                and (receipt.get("_upstream_terminal") is True or recovered_terminal)
+                and not _claims(receipt) and not receipt.get("_executing")
+                and not receipt.get("_turn_reserved"))
+
+
+def advanced_session_close_chain(store, db, parent, receipt, members, now):
+    """Return a saved child plus its normal fresh-session tail, if any.
+
+    This is intentionally narrower than ordinary continuation handling: it
+    waives only the exact old UNKNOWN root and never aliases its physical
+    conversation to the child.  The old conversation therefore remains owned
+    and recoverable but is excluded from automatic archive targets.
+    """
+    chain = _advanced_session_child(store, db, parent, receipt, members, now, after_send=True)
+    if not chain or not _advanced_session_terminal(receipt, now):
+        return None
+    child_member = chain["successor_member"]
+    child_sequence = receipt.get("_sequence")
+    if type(child_sequence) is not int:
+        return None
+    tail_rows = []
+    candidates = [(member, row) for member, row in members
+                  if member.get("kind") == "text" and _same_conversation(row, receipt)
+                  and row.get("request_id") != receipt.get("request_id")]
+    later = [(member, row) for member, row in candidates
+             if type(row.get("_sequence")) is int and row["_sequence"] > child_sequence]
+    if len(later) != len(candidates):
+        return None
+    previous = receipt
+    used_steps = {child_member.get("step_ref")}
+    for member, tail in sorted(later, key=lambda item: item[1]["_sequence"]):
+        if not _normal_product_tail(store, db, parent, member, tail, previous, used_steps, now):
+            return None
+        tail_rows.append((member, tail))
+        used_steps.add(member.get("step_ref"))
+        previous = tail
+    archive_member, archive = tail_rows[-1] if tail_rows else (child_member, receipt)
+    return {**chain, "tail": [row for _, row in tail_rows], "archive": archive,
+            "archive_member": archive_member,
+            "members": [chain["original"], receipt, *(row for _, row in tail_rows)]}
 
 
 def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pending=None, capacity_tail=None):
@@ -1500,6 +1756,72 @@ class ProductWorkService:
                 chains[receipt["request_id"]] = chain
         return chains
 
+    def _advanced_session_chains(self, db, parent, members):
+        """Return only saved fresh-session replacements for this parent."""
+        chains = {}
+        now = float(self.clock())
+        for _, receipt in members:
+            if not advanced_session_required(receipt):
+                continue
+            chain = advanced_session_close_chain(self.store, db, parent, receipt, members, now)
+            if chain:
+                chains[receipt["request_id"]] = chain
+        return chains
+
+    def _advanced_session_waivers(self, db, parent, members):
+        return {chain["original"]["request_id"]
+                for chain in self._advanced_session_chains(db, parent, members).values()}
+
+    def _advanced_session_retired_originals(self, parent, members):
+        """Old conversations that a registered new-session request may never archive.
+
+        This is deliberately weaker than a close waiver: malformed/failed
+        children do not resolve the old UNKNOWN or permit a successful close,
+        but they must not turn a failed/cancelled close into an archive of the
+        human-discussion conversation they were created to leave behind.
+        """
+        by_id = {row.get("request_id"): (member, row) for member, row in members
+                 if member.get("kind") == "text" and isinstance(row.get("request_id"), str)}
+        retired = []
+        for child_member, child in members:
+            marker = child.get("_advanced_session")
+            original_id = child.get("_supersedes_request_id")
+            if child_member.get("kind") != "text" or not isinstance(marker, dict) or not isinstance(original_id, str):
+                continue
+            found = by_id.get(original_id)
+            if not found:
+                continue
+            original_member, original = found
+            proof = marker
+            if (original_member.get("owner") != parent.get("owner")
+                    or child_member.get("owner") != parent.get("owner")
+                    or original_member.get("step_ref") != child_member.get("step_ref")
+                    or original.get("_product_work_key") != parent.get("key")
+                    or child.get("_product_work_key") != parent.get("key")
+                    or _source(original) != parent.get("source") or _source(child) != parent.get("source")
+                    or proof.get("original_request_id") != original_id
+                    or proof.get("child_request_id") != child.get("request_id")
+                    or proof.get("original_account_identity") != original.get("provider_account_identity")
+                    or proof.get("original_binding_id") != original.get("provider_binding_id")
+                    or proof.get("original_conversation_id") != original.get("conversation_id")
+                    or proof.get("product_work") != original.get("_product_work")
+                    or proof.get("product_work") != child.get("_product_work")
+                    or not original.get("conversation_id")):
+                continue
+            retired.append(original)
+        return retired
+
+    @staticmethod
+    def _advanced_session_marker_conflict(members, retired):
+        """A broken migration marker must block close, never restore old archive."""
+        retired_ids = {receipt.get("request_id") for receipt in retired}
+        for _member, receipt in members:
+            if advanced_session_required(receipt):
+                original_id = receipt.get("_supersedes_request_id")
+                if not isinstance(original_id, str) or original_id not in retired_ids:
+                    return True
+        return False
+
     def _codex_rejected_retry_waivers(self, db, parent, members):
         waived = set()
         for _, receipt in members:
@@ -1517,6 +1839,7 @@ class ProductWorkService:
         waived = self._missing_node_waivers(db, parent, owned)
         waived.update(self._no_final_successor_waivers(db, parent, owned))
         waived.update(self._codex_rejected_retry_waivers(db, parent, owned))
+        waived.update(self._advanced_session_waivers(db, parent, owned))
         for member, receipt in owned:
             if receipt.get(_CANCELLED_UNSENT_STEP) and not _cancelled_unsent_step(
                     self.store, db, parent, member, receipt):
@@ -1530,12 +1853,16 @@ class ProductWorkService:
         chains = self._missing_node_chains(db, parent, members)
         chains.update(self._closed_missing_node_chains(db, parent, members))
         waived = set()
+        if self._advanced_session_marker_conflict(
+                members, self._advanced_session_retired_originals(parent, members)):
+            reasons.add("PRODUCT_WORK_TURN_UNFINISHED")
         valid_continues = set()
         for chain in chains.values():
             waived.update(chain[name]["request_id"] for name in ("original", "rejected"))
             valid_continues.add(chain["continue"]["request_id"])
         waived.update(self._no_final_successor_waivers(db, parent, members))
         waived.update(self._codex_rejected_retry_waivers(db, parent, members))
+        waived.update(self._advanced_session_waivers(db, parent, members))
         from services.text_task_service import TextTaskService
         for member, receipt in members:
             cancelled_unsent = _cancelled_unsent_step(self.store, db, parent, member, receipt)
@@ -1819,8 +2146,11 @@ class ProductWorkService:
             targets = {}
             chains = self._missing_node_chains(db, parent, members)
             advanced_chains = self._owned_advanced_successor_chains(db, parent, members)
+            advanced_session_chains = self._advanced_session_chains(db, parent, members)
+            retired_advanced_session_originals = self._advanced_session_retired_originals(parent, members)
             chain_member_ids = set()
             advanced_chain_members = {}
+            advanced_session_members = {}
             special_targets = {}
             members_by_identity = {(member["kind"], member["request_id"]): (member, receipt)
                                    for member, receipt in members}
@@ -1846,9 +2176,29 @@ class ProductWorkService:
                 if canonical in special_targets and special_targets[canonical] != target:
                     raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
                 special_targets[canonical] = target
+            for chain in advanced_session_chains.values():
+                archive_member, archive = chain["archive_member"], chain["archive"]
+                for item in chain["members"]:
+                    advanced_session_members[("text", item["request_id"])] = chain
+                canonical = archive["provider_account_identity"], archive["conversation_id"]
+                target = archive_member["kind"], archive_member["request_id"]
+                if canonical in special_targets and special_targets[canonical] != target:
+                    raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
+                special_targets[canonical] = target
             chains.update(advanced_chains)
             for member, receipt in members:
                 identity = member["kind"], member["request_id"]
+                session_chain = advanced_session_members.get(identity)
+                if session_chain:
+                    member, receipt = members_by_identity[(session_chain["archive_member"]["kind"],
+                                                           session_chain["archive_member"]["request_id"])]
+                elif any(_same_conversation(receipt, original)
+                         for original in retired_advanced_session_originals):
+                    # The old physical session can contain a completed gallery
+                    # and non-product human discussion. Retain all receipts and
+                    # ownership, but never turn this product close into an
+                    # archive mutation of that conversation.
+                    continue
                 if identity in chain_member_ids:
                     chain = chains.get(receipt.get("request_id"))
                     if chain is None:

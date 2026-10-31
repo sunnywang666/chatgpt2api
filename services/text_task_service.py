@@ -642,6 +642,9 @@ class TextTaskService:
         )
         if workbench_audit is not None:
             result["workbench_derived_input"] = workbench_audit
+        if receipt.get("_advanced_session"):
+            from services.advanced_session_successor import public_proof
+            result["advanced_session"] = public_proof(receipt)
         missing_attempt = TextTaskService._missing_successor_attempt(receipt)
         if missing_attempt:
             result["missing_successor_resume"] = {
@@ -2625,7 +2628,7 @@ class TextTaskService:
     MISSING_NODE_RETRY_FIELDS = REJECTED_SUPERSEDE_FIELDS | frozenset({MISSING_NODE_RETRY_FIELD})
     _WORKBENCH_DERIVED_PROTOCOL = "workbench-derived-input-v1"
     _WORKBENCH_DERIVED_MARKER = "_workbench_derived_input"
-    _WORKBENCH_DERIVED_MODES = frozenset({"413_request_missing", "no_final", "incomplete"})
+    _WORKBENCH_DERIVED_MODES = frozenset({"413_request_missing", "no_final", "incomplete", "advanced_new_session"})
     _WORKBENCH_DERIVED_SOURCE = "internal:listing"
 
     @classmethod
@@ -2726,6 +2729,9 @@ class TextTaskService:
         # send a child, including the otherwise terminal 413 path.
         if any(original.get(field) for field in ("_recovery_paused", "_recovery_suppressed")):
             return False
+        if mode == "advanced_new_session":
+            from services.advanced_session_successor import source_eligible
+            return source_eligible(original, now)
         if mode == "no_final":
             return cls._no_final_successor_source(original, now)
         if mode == "incomplete":
@@ -2764,6 +2770,9 @@ class TextTaskService:
 
     @classmethod
     def _workbench_derived_body(cls, original, original_id, original_hash, payload):
+        if isinstance(payload, dict) and payload.get("mode") == "advanced_new_session":
+            # The isolated mode requires its context and transaction-scoped proof.
+            cls._workbench_derived_error()
         required = {"client_request_id", "original_input_hash", "messages", "model", "thinking_effort",
                     "mode", "derivation_kind"}
         if (not isinstance(payload, dict) or set(payload) != required
@@ -2839,7 +2848,9 @@ class TextTaskService:
             try:
                 receipt = json.loads(row[1])
                 body = self.store.load_input(receipt["_input_ref"])
-                if not self._bound_workbench_retained_input(owner, request_id, row[0], receipt, body):
+                from services.advanced_session_successor import retained_context_input
+                if (not self._bound_workbench_retained_input(owner, request_id, row[0], receipt, body)
+                        and not retained_context_input(owner, request_id, row[0], receipt, body)):
                     raise ValueError
             except (OSError, ValueError, TypeError, KeyError):
                 self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_UNAVAILABLE")
@@ -2859,7 +2870,13 @@ class TextTaskService:
                 retained = self.store.load_input(original["_input_ref"])
                 if not self._bound_workbench_retained_input(owner, request_id, row[0], original, retained):
                     raise ValueError
-                body = self._workbench_derived_body(retained, request_id, row[0], payload)
+                if payload.get("mode") == "advanced_new_session":
+                    from services.advanced_session_successor import build_body, FIELD
+                    prior = self.store.read_receipt(db, "text", owner, payload.get("client_request_id"))
+                    body = build_body(self.store, db, owner, request_id, payload, self._now(),
+                                      frozen_proof=prior.get(FIELD) if prior else None)
+                else:
+                    body = self._workbench_derived_body(retained, request_id, row[0], payload)
                 child_id, child_hash = self._submission_identity(owner, body)
                 existing = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
                                       (owner, child_id)).fetchone()
@@ -2912,6 +2929,15 @@ class TextTaskService:
 
     def submit_workbench_derived_input(self, owner, request_id, payload, *, source):
         body = self.prepare_workbench_derived_input(owner, request_id, payload, source=source)
+        if body.get("_advanced_session"):
+            from services.advanced_session_successor import check_fresh_read
+            with self._db() as db:
+                existing = self.store.read_receipt(db, "text", owner, body["client_request_id"])
+                original = self.store.read_receipt(db, "text", owner, request_id)
+            if existing is None:
+                # Exact-original network read is outside the write transaction;
+                # acceptance revalidates the unchanged durable proof afterwards.
+                check_fresh_read(self.recovery_reader(original), original, body["_advanced_session"])
         from services.product_work import locking_product_conversations
         with locking_product_conversations([body] if body.get("product_work") else []):
             return self._submit_prepared(owner, body, source=source)
@@ -3965,6 +3991,9 @@ class TextTaskService:
     @staticmethod
     def _validate_supersede(store, db, owner, successor, now):
         """Recheck the immutable original and live claims in the existing transaction."""
+        if successor.get("_advanced_session") is not None:
+            from services.advanced_session_successor import validate_successor
+            return validate_successor(store, db, owner, successor, now)
         def reject(code):
             raise ConversationBindingError("explicit original-request successor cannot advance", code=code)
         previous_id = successor.get("_supersedes_request_id")
@@ -4376,6 +4405,10 @@ class TextTaskService:
 
     def _prepare_supersede(self, db, owner, body, receipt):
         if "supersedes_request_id" not in body:
+            return
+        if body.get("_advanced_session") is not None:
+            from services.advanced_session_successor import prepare_receipt
+            prepare_receipt(self.store, db, owner, body, receipt, self._now())
             return
         previous_id = body["supersedes_request_id"]
         def reject(code):
@@ -5699,10 +5732,12 @@ class TextTaskService:
                     if self._missing_node_model_rejection_retry(self.store, db, owner, receipt, self._now()):
                         missing_node_original = self.store.read_receipt(
                             db, "text", owner, previous.get("_supersedes_request_id"))
+                if receipt.get("_advanced_session"):
+                    body = {**body, "_advanced_session_original": previous}
                 # A pre-conversation MODEL_NOT_FOUND retry has no upstream
                 # message to guard. It still revalidates the frozen original
                 # and bound identity above, then starts a new conversation.
-                if previous.get("conversation_id"):
+                if previous.get("conversation_id") and not receipt.get("_advanced_session"):
                     # A missing-node resume must guard the current submitted
                     # successor, not its historical predecessor.
                     guard_message_id = (receipt["request_message_id"] if missing_attempt

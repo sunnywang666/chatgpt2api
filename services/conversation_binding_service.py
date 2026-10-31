@@ -6,6 +6,7 @@ import math
 import re
 import time
 from copy import deepcopy
+from contextlib import ExitStack
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -2383,6 +2384,33 @@ class ConversationBindingService:
         if not ConversationBindingService._missing_successor_node_absent(mapping, replacement_user):
             raise ConversationBindingError("replacement successor already appeared", code="CHAT_SUPERSEDE_CURSOR_CHANGED")
 
+    @staticmethod
+    def _check_advanced_session_document(backend, document, original, proof):
+        """Recheck the old discussion without moving or restoring its cursor."""
+        def reject():
+            raise ConversationBindingError("advanced original conversation changed",
+                                           code="CHAT_ADVANCED_SESSION_CHANGED")
+        if (not isinstance(proof, dict) or proof.get("protocol") != "advanced-session-successor-v1"
+                or not isinstance(document, dict) or document.get("is_archived") is not False
+                or document.get("conversation_id") != proof.get("original_conversation_id")
+                or document.get("current_node") != proof.get("original_head_message_id")
+                or any(original.get(field) != proof.get(proof_field) for field, proof_field in (
+                    ("request_id", "original_request_id"),
+                    ("request_message_id", "original_request_message_id"),
+                    ("provider_binding_id", "original_binding_id"),
+                    ("provider_account_identity", "original_account_identity"),
+                    ("conversation_id", "original_conversation_id")))):
+            reject()
+        fresh = ConversationBindingService._read_text_request_result(backend, original, document=document)
+        expected = proof.get("completed_successor_evidence")
+        actual = fresh.get(COMPLETED_SUCCESSOR_EVIDENCE_FIELD)
+        if (fresh.get("status") != "unknown"
+                or fresh.get("recovery_reason") != TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value
+                or fresh.get("content") or not isinstance(expected, dict) or not isinstance(actual, dict)
+                or {k: v for k, v in actual.items() if k != "observed_at"}
+                   != {k: v for k, v in expected.items() if k != "observed_at"}):
+            reject()
+
     def complete_text(self, body: dict[str, Any], *, on_cursor=None) -> dict[str, Any]:
         binding_id = str(body.get("provider_binding_id") or "").strip()
         account_identity = str(body.get("provider_account_identity") or "").strip()
@@ -2479,7 +2507,16 @@ class ConversationBindingService:
             except Exception:
                 pass  # Optional diagnostics never affect a continuation.
         binding_lock_requested_at = time.monotonic()
-        with account_service.conversation_binding_lock(binding_id, client_conversation_id):
+        with ExitStack() as binding_locks:
+            lock_keys = {(binding_id, client_conversation_id)}
+            advanced_original = body.get("_advanced_session_original")
+            if advanced_original:
+                if account_identity != advanced_original.get("provider_account_identity"):
+                    raise ConversationBindingError("advanced successor account changed",
+                                                   code="CHAT_ADVANCED_SESSION_CHANGED")
+                lock_keys.add((advanced_original["provider_binding_id"], advanced_original["client_conversation_id"]))
+            for lock_binding, lock_client in sorted(lock_keys):
+                binding_locks.enter_context(account_service.conversation_binding_lock(lock_binding, lock_client))
             if callable(record_timing):
                 try:
                     record_timing(binding_lock_wait_secs=max(0.0, time.monotonic() - binding_lock_requested_at))
@@ -2492,13 +2529,28 @@ class ConversationBindingService:
             backend.text_stream_handoff_enabled = (
                 body.get("_route", "chat") == "chat" and body.get("_operation", "text") == "text"
             )
-            if body.get("_public_session_ref") or body.get("_supersedes_request_message_id"):
+            if body.get("_public_session_ref") or body.get("_supersedes_request_message_id") or advanced_original:
                 backend.text_cursor_callback = on_cursor
             missing_no_final_context = None
             native_no_final_prefix_context = None
             missing_node_context = None
             incomplete_context = None
-            if body.get("_supersedes_request_message_id"):
+            if advanced_original:
+                def check_advanced_session(send=None):
+                    try:
+                        if account_service.get_bound_account_identity(advanced_original["provider_binding_id"]) != account_identity:
+                            raise ConversationBindingError("advanced source account changed",
+                                                           code="CHAT_ADVANCED_SESSION_CHANGED")
+                        options = {"_send": send} if send is not None else {}
+                        fresh = backend._get_conversation(advanced_original["conversation_id"], **options)
+                        self._check_advanced_session_document(backend, fresh, advanced_original, body.get("_advanced_session"))
+                    except ConversationBindingError:
+                        raise
+                    except Exception as exc:
+                        raise ConversationBindingError("advanced original read unavailable",
+                                                       code="CHAT_ADVANCED_SESSION_READ_UNAVAILABLE") from exc
+                backend.text_pre_send_check = check_advanced_session
+            elif body.get("_supersedes_request_message_id"):
                 def check_original(send):
                     nonlocal missing_node_context
                     try:
@@ -2613,6 +2665,10 @@ class ConversationBindingService:
                 backend.text_pre_send_check = check_empty_retry
             failure_phase = "stream_open"
             try:
+                if advanced_original:
+                    # The new conversation has no upstream cursor yet. Its
+                    # source discussion must still match both here and at POST.
+                    check_advanced_session()
                 # All bound text consumers can resume an archived Chat. The
                 # public-session flag describes a client protocol, not whether
                 # the original upstream conversation needs restoring.
