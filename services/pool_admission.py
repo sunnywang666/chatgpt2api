@@ -1710,6 +1710,28 @@ class PoolAdmission:
                 key = physical_conversation_key(receipt)
                 if key and unfinished(kind, receipt) and (owner, request_id) not in released_order_heads:
                     physical_pending.setdefault(key, []).append((kind, owner, request_id, receipt))
+        # Revalidate the owned completed prefix independently of the newest
+        # leaf's queued/sent transition. Only the original slot transfers;
+        # the leaf's own running/UNKNOWN occupancy remains counted below.
+        # This projection also runs at the final send snapshot; no receipt ends.
+        advanced_released, advanced_blocked = set(), set()
+        advanced_products = {item.get("_product_work_key") for _, _, _, item in receipts
+                             if item.get("_completed_successor_evidence")
+                             or item.get("_supersedes_incomplete")}
+        if db is not None and advanced_products:
+            for product_key in advanced_products - {None}:
+                advanced_released.update(product_work.advanced_capacity_originals(
+                    self.store, db, product_key, now))
+            for kind, owner, request_id, candidate in receipts:
+                if (kind == "text" and candidate.get("_product_work_key") in advanced_products
+                        and candidate.get("status") in {"queued", "running"}
+                        and candidate.get("_submission_started") is False):
+                    if product_work.advanced_continuation_required(self.store, db, candidate):
+                        chain = product_work.advanced_continuation_chain(self.store, db, candidate, now)
+                        if chain:
+                            advanced_released.add((owner, chain["original"]["request_id"]))
+                        else:
+                            advanced_blocked.add((owner, request_id))
         by_identity = {str(a.get("provider_account_identity") or ""): a for a in rows}
         identity_counts = {}
         for row in rows:
@@ -1761,7 +1783,8 @@ class PoolAdmission:
                                                ))
             turn_active = (active and not original_turn_ended(kind, r) and not wait_ended and not empty_local_released
                            and not stalled_local_capacity_released
-                           and (owner, request_id) not in transferred_empty_turns)
+                           and (owner, request_id) not in transferred_empty_turns
+                           and (owner, request_id) not in advanced_released)
             if status == "running" and r.get("_executing") and float(r.get("_claim_until") or 0) > now:
                 active_bytes += int(r.get("_input_bytes") or 0)
                 if kind == "image" or r.get("_operation") == "image":
@@ -1807,6 +1830,10 @@ class PoolAdmission:
             if state == "succeeded":
                 continue
             thread_needs = ()
+            if (owner, request_id) in advanced_blocked:
+                dependency = "product_predecessor:" + hashlib.sha256((owner + "\0" + request_id).encode()).hexdigest()
+                thread_resources.append(Resource(dependency, 0, 0, now))
+                thread_needs += (Need(dependency),)
             if kind == "image" and r.get("_image_thread"):
                 _, blocked = predecessor_state(r, image_receipts.get(owner, {}))
                 dependency = "image_thread:" + hashlib.sha256((owner + "\0" + request_id).encode()).hexdigest()
@@ -2717,7 +2744,15 @@ class PoolAdmission:
                 subgroups[fairness_subgroup_key(pick.source, selected_group)] = fairness_lane(selected.fair_subgroup)
             self.store.set_runtime(db, "fairness", {"source": pick.source, "account": pick.account,
                                                       "owners": owners, "groups": groups, "subgroups": subgroups})
-            return ExecutionContext(self, ref.kind, ref.owner, ref.request_id, claim, claimed_at=now)
+            context = ExecutionContext(self, ref.kind, ref.owner, ref.request_id, claim, claimed_at=now)
+            if ref.kind == "text" and r.get("_product_work_key"):
+                chain = product_work.advanced_continuation_chain(self.store, db, r, now)
+                if chain:
+                    # In-memory claim expectation, never a persisted waiver.
+                    # A late original success or proof removal must not make
+                    # the final guard silently switch to another eligibility.
+                    context.expected_advanced_original = chain["original"]["request_id"]
+            return context
 
     def update_claim(self, context, **changes):
         with self.store.transaction() as db:
@@ -2911,6 +2946,12 @@ class PoolAdmission:
                 raise AdmissionLost("original task claim expired")
             if r.get("_send_hold") is True:
                 raise AdmissionLost("original task send hold is active")
+            expected_original = getattr(context, "expected_advanced_original", None)
+            if (expected_original is not None
+                    or context.kind == "text" and product_work.advanced_continuation_required(self.store, db, r)):
+                chain = product_work.advanced_continuation_chain(self.store, db, r, now)
+                if not chain or expected_original is not None and chain["original"]["request_id"] != expected_original:
+                    raise AdmissionLost("owned successor chain changed before send")
             from services.generation_completion import replacement_send_allowed
             if not replacement_send_allowed(self.store, db, context.kind, context.owner, context.request_id, r):
                 raise AdmissionLost("completion original changed before send")

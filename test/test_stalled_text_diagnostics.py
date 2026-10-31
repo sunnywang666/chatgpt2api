@@ -404,6 +404,7 @@ def test_advanced_read_persists_only_branch_ids_and_invalidates_on_later_observa
     assert proof == {"conversation_id": original["conversation_id"],
         "request_message_id": original["request_message_id"],
         "successor_request_message_id": "external-user", "successor_final_message_id": "external-final",
+        "successor_request_parent_message_id": doc["mapping"]["external-user"]["parent"],
         "observed_at": service.clock()}
     assert current["status"] == "unknown" and current["upstream_outcome"] == "unknown"
     assert current.get("_upstream_terminal") is not True and "_turn_end_evidence" not in current
@@ -485,7 +486,8 @@ def test_advanced_proof_requires_completed_output_for_stale_assistant_tool_call(
 
 
 @pytest.mark.parametrize("case", ["account", "binding", "client", "original", "conversation", "same_id",
-                                  "extra_field", "nan_time", "bool_time", "reason", "status", "binding_status"])
+                                  "extra_field", "nan_time", "bool_time", "reason", "status", "binding_status",
+                                  "empty_parent", "tail_empty", "tail_duplicate", "tail_extra"])
 def test_advanced_successor_proof_rejects_identity_and_shape_drift(tmp_path, case):
     service, _, _, _ = migration(tmp_path)
     original = saved(service)
@@ -499,6 +501,13 @@ def test_advanced_successor_proof_rejects_identity_and_shape_drift(tmp_path, cas
     elif case == "conversation": proof["conversation_id"] = "wrong"
     elif case == "same_id": proof["successor_request_message_id"] = proof["request_message_id"]
     elif case == "extra_field": proof["content"] = "must not store"
+    elif case == "empty_parent": proof["successor_request_parent_message_id"] = ""
+    elif case == "tail_empty": proof["tail_steps"] = []
+    elif case == "tail_duplicate": proof["tail_steps"] = [
+        {"request_message_id": "tail", "final_message_id": "answer"},
+        {"request_message_id": "tail", "final_message_id": "answer-2"}]
+    elif case == "tail_extra": proof["tail_steps"] = [
+        {"request_message_id": "tail", "final_message_id": "answer", "content": "private"}]
     elif case == "nan_time": proof["observed_at"] = float("nan")
     elif case == "bool_time": proof["observed_at"] = True
     elif case == "reason": result["recovery_reason"] = "REQUEST_RESULT_INCOMPLETE"
