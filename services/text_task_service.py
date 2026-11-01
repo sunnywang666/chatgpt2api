@@ -3049,7 +3049,13 @@ class TextTaskService:
 
                 diagnostic = {}
                 try:
-                    fresh = admit(owner, request_id, read_fresh_original, original, diagnostic=diagnostic)
+                    fresh = admit(
+                        owner, request_id, read_fresh_original, original, diagnostic=diagnostic,
+                        # This request has a 900-second caller budget.  The
+                        # admission wait leaves the existing 60-second fresh
+                        # read and response time outside its own budget.
+                        reservation_scope="advanced-preaccept", wait_for_ready_seconds=720.0,
+                    )
                 except AccountRequestDeadlineExceeded:
                     # This occurred before this invocation reaches
                     # _submit_prepared.  It is not evidence about a concurrent

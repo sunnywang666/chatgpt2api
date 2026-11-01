@@ -1247,12 +1247,15 @@ def _clock_for_account(identity):
     return key, clock
 
 
-def reserve_account_original_read(account, owner, *, allow_new=True, diagnostic=None):
+def reserve_account_original_read(account, owner, *, allow_new=True, diagnostic=None,
+                                  max_ticket_wait_seconds=None, allow_wait_behind=False):
     """Book one due original read in the existing ordinary-read FIFO.
 
     The caller does not receive a worker slot until this ticket is first and
-    the persisted account clock is due.  Only one such dormant ticket per
-    account is allowed, so a recovery backlog cannot fill the ordinary queue.
+    the persisted account clock is due.  Ordinary recovery keeps one dormant
+    ticket per account, so a recovery backlog cannot fill the ordinary queue.
+    The bounded advanced preaccept caller may explicitly queue behind that
+    head; it never creates an unbounded recovery backlog.
     A dispatcher that has already encountered shared FIFO contention in its
     current scan may set ``allow_new`` false: an existing ticket can still
     reach its send edge, but another lane cannot book a later ticket before
@@ -1266,6 +1269,12 @@ def reserve_account_original_read(account, owner, *, allow_new=True, diagnostic=
             diagnostic.update(reason=reason, **fields)
         return False
 
+    bounded_wait = None
+    if (type(max_ticket_wait_seconds) in (int, float)
+            and not isinstance(max_ticket_wait_seconds, bool)
+            and math.isfinite(max_ticket_wait_seconds)
+            and max_ticket_wait_seconds >= 0):
+        bounded_wait = float(max_ticket_wait_seconds)
     identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
     if not identity or not isinstance(owner, str) or not owner.startswith(_ORIGINAL_READ_OWNER_PREFIX):
         return deferred("ticket_invalid")
@@ -1285,29 +1294,60 @@ def reserve_account_original_read(account, owner, *, allow_new=True, diagnostic=
                 clock.ordinary_read_queue = queue
                 clock.ordinary_read_wait_until = max((entry["until"] for entry in queue), default=0.0)
                 clock._save()
+            own = next((entry for entry in queue if entry["owner"] == owner), None)
             other = next((entry for entry in queue
                           if entry["owner"].startswith(_ORIGINAL_READ_OWNER_PREFIX)
                           and entry["owner"] != owner), None)
-            if other is not None:
+            # A previously queued bounded preaccept ticket must not prevent
+            # the existing ordinary head from consuming its already-due turn.
+            # Conversely, an ordinary reader cannot jump ahead of that ticket.
+            own_is_head = bool(queue and queue[0]["owner"] == owner)
+            if other is not None and not allow_wait_behind and not own_is_head:
                 return deferred("fifo_other", account_clock_prefix=key[:12], ticket_state="other",
                                 ticket_retained=False)
-            own = next((entry for entry in queue if entry["owner"] == owner), None)
             if own is None and not allow_new:
                 return deferred("scan_blocked", account_clock_prefix=key[:12], ticket_state="none",
                                 ticket_retained=False)
             ready = max(clock.next_request, clock.cooldown_until, clock._read_ready(now))
-            first = clock._ordinary_read_turn(owner, now, max(0.0, ready - now))
+            due_seconds = max(0.0, ready - now)
+            # An explicit caller may wait for an already-reserved original
+            # read edge.  Do not leave its private FIFO ticket parked behind
+            # a longer account cooldown after that caller has returned.
+            if bounded_wait is not None and due_seconds > bounded_wait:
+                if own is not None:
+                    clock._release_ordinary_read(owner)
+                return deferred("clock_not_due", account_clock_prefix=key[:12],
+                                ticket_state="none", ticket_retained=False,
+                                read_due_in_ms=min(300000, int(round(due_seconds * 1000))))
+            # Advanced preaccept renews this short lease while it waits.  A
+            # process crash therefore cannot leave its private ticket parked
+            # for the full request budget.
+            ticket_deadline = (now + min(30.0, bounded_wait)
+                               if bounded_wait is not None and allow_wait_behind else
+                               (now + bounded_wait if bounded_wait is not None else None))
+            if own is not None and ticket_deadline is not None and allow_wait_behind:
+                # `_ordinary_read_turn` renews when less than five seconds
+                # remain.  A due ticket at exactly that boundary would
+                # otherwise expire before the advanced caller's next five-
+                # second physical-read poll.
+                lease_until = min(now + due_seconds + 30.0, ticket_deadline)
+                if own["until"] <= now + 5.0:
+                    own["until"] = lease_until
+                    clock.ordinary_read_wait_until = max(entry["until"] for entry in clock.ordinary_read_queue)
+                    clock._save()
+            first = clock._ordinary_read_turn(owner, now, max(0.0, ready - now), deadline=ticket_deadline)
             if not first:
                 position = next((index + 1 for index, entry in enumerate(clock.ordinary_read_queue)
                                  if entry["owner"] == owner), None)
                 return deferred("fifo_not_head", account_clock_prefix=key[:12], ticket_state="own",
-                                ticket_retained=True, fifo_position=position)
+                                ticket_retained=True, fifo_position=position,
+                                read_due_in_ms=min(300000, int(round(due_seconds * 1000))))
             if isinstance(ready, (int, float)) and math.isfinite(ready) and ready <= now:
                 return True
             if isinstance(ready, (int, float)) and math.isfinite(ready):
                 return deferred("clock_not_due", account_clock_prefix=key[:12], ticket_state="own",
                                 ticket_retained=True, fifo_position=1,
-                                read_due_in_ms=min(300000, max(0, int(round((ready - now) * 1000)))))
+                                read_due_in_ms=min(300000, int(round(due_seconds * 1000))))
             return deferred("clock_invalid", account_clock_prefix=key[:12], ticket_state="own",
                             ticket_retained=True, fifo_position=1)
         finally:
