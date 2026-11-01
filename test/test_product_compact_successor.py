@@ -5,6 +5,7 @@ import json
 import pytest
 
 from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
+from services.advanced_session_successor import source_eligible
 from services.product_work import ProductWorkService
 from services.request_context import current_request
 from services.text_task_service import TextTaskService
@@ -90,10 +91,6 @@ def advanced_to_own_successor(h, monkeypatch, *, workbench=False):
     with h.service.store.transaction() as db:
         original = h.service.store.read_receipt(db, "text", "owner", "old")
         successor = h.service.store.read_receipt(db, "text", "owner", "successor")
-        # Preserve the explicit legacy boundary observed on the real receipt;
-        # recovery must carry it through without a post-read repair.
-        original["upstream_unfinished"] = False
-        h.service.store.write_receipt(db, "text", "owner", "old", original)
         # The fixture runner normally returns only the final cursor. Model the
         # bound send/read path's persisted child-user parent before reading it.
         successor["request_parent_message_id"] = "active"
@@ -139,7 +136,45 @@ def advanced_to_own_successor(h, monkeypatch, *, workbench=False):
         "successor_final_message_id": successor["parent_message_id"],
         "observed_at": h.clock(),
     }
+    if workbench:
+        # The writer's persisted output, not a fixture-side repair, is the
+        # strict eligibility input consumed by the isolated successor path.
+        assert source_eligible(original, h.clock()) is True
     return original, row(h.service, "successor")
+
+
+def test_invalid_advanced_successor_evidence_does_not_clear_unfinished(product_no_final):
+    h = product_no_final
+    compact(h, True, workbench=True)
+    original = row(h.service)
+    assert original.get("upstream_unfinished") is None
+
+    # This resembles an advanced reader response, but mismatches the original
+    # submitted turn.  `_safe_recovery_result` must reject it before the
+    # writer is allowed to persist either the proof or the explicit boundary.
+    h.service.recovery_reader = lambda receipt: {
+        "status": "unknown",
+        "binding_status": "unknown",
+        "recovery_reason": "REQUEST_CONVERSATION_ADVANCED",
+        "conversation_id": receipt["conversation_id"],
+        "provider_binding_id": receipt["provider_binding_id"],
+        "provider_account_identity": receipt["provider_account_identity"],
+        "client_conversation_id": receipt["client_conversation_id"],
+        "_completed_successor_evidence": {
+            "conversation_id": receipt["conversation_id"],
+            "request_message_id": "wrong-original-request",
+            "successor_request_message_id": "external-user",
+            "successor_request_parent_message_id": "external-parent",
+            "successor_final_message_id": "external-final",
+            "observed_at": h.clock(),
+        },
+    }
+    h.service.recover("owner", "old")
+
+    saved = row(h.service)
+    assert saved.get("upstream_unfinished") is None
+    assert "_completed_successor_evidence" not in saved
+    assert saved["recovery_error_code"] == "RECOVERY_INVALID_RESULT"
 
 
 def add_finished_gallery(h):
