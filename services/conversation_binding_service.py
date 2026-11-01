@@ -1848,7 +1848,14 @@ class ConversationBindingService:
         provider_account_identity: str, client_conversation_id: str,
         source_request_message_id: str = "", source_message_id: str = "",
     ) -> dict[str, str]:
-        """Read a stable, explicitly adopted later human text turn; never send."""
+        """Read one exact, explicitly adopted later human text turn; never send.
+
+        The source is validated against one fresh complete conversation document.
+        This saves the observed source, not a promise that it stays unchanged.
+        Removing the second observation saves one read and its pacing wait;
+        neither approach atomically locks the remote conversation. Later
+        send/archive paths retain their own fresh cursor guards.
+        """
         supplied = (str(provider_binding_id).strip(), str(provider_account_identity).strip(),
                     str(client_conversation_id).strip())
         stored = tuple(str(receipt.get(key) or "").strip() for key in (
@@ -1871,7 +1878,7 @@ class ConversationBindingService:
                 backend = OpenAIBackendAPI(access_token=token)
                 with bounded_lock(account_service.conversation_binding_lock(supplied[0], supplied[2])):
                     deadline = operation_effective_deadline()
-                    first = self._manual_followup_text_result(
+                    return self._manual_followup_text_result(
                         receipt, backend._get_conversation(
                             conversation_id, deadline_monotonic=deadline, connect_timeout_secs=10.0,
                             minimum_budget_secs=10.0,
@@ -1881,26 +1888,6 @@ class ConversationBindingService:
                         ),
                         source_request_message_id=source_request_message_id, source_message_id=source_message_id,
                     )
-                    # The first account pacing wait may legitimately extend
-                    # this one manual read's local deadline.  Re-read it for
-                    # the stability GET; never reuse the stale 60-second
-                    # deadline captured before the first wait.
-                    deadline = operation_effective_deadline()
-                    second = self._manual_followup_text_result(
-                        receipt, backend._get_conversation(
-                            conversation_id, deadline_monotonic=deadline, connect_timeout_secs=10.0,
-                            minimum_budget_secs=10.0,
-                            local_wait=read_budget.record_local_pacing_wait,
-                            local_wait_credit_remaining=read_budget.reserve_local_wait_credit,
-                            local_wait_reservation_deadline=read_budget.reservation_deadline,
-                        ),
-                        source_request_message_id=first["source_request_message_id"],
-                        source_message_id=first["source_message_id"],
-                    )
-                    if second != first:
-                        raise ConversationBindingError("conversation changed during manual recovery",
-                                                       code="CHAT_MANUAL_RECOVERY_CHANGED")
-                    return first
             except AccountRequestDeadlineExceeded:
                 # This class is emitted before a GET enters transport.  It is
                 # a local manual-read deferral, never proof that an upstream
