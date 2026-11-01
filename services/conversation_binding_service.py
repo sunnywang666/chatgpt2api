@@ -51,6 +51,7 @@ COMPLETED_SUCCESSOR_EVIDENCE_FIELD = "_completed_successor_evidence"
 RESULT_OBSERVATION_FIELD = "_original_result_observation"
 OBSERVED_CONTENT_TYPES = frozenset({"text", "code", "execution_output", "thoughts", "reasoning_recap"})
 _VERIFIED_EXACT_INCOMPLETE = object()
+_VERIFIED_SENDER_READ = object()
 
 
 def _content_observation(content):
@@ -864,17 +865,18 @@ class ConversationBindingService:
 
     @staticmethod
     def _stream_terminal_cursor(backend: OpenAIBackendAPI, body: dict[str, Any],
-                                conversation_id: str, content: str) -> dict[str, str] | None:
+                                conversation_id: str, content: str, *,
+                                allow_product_work: bool = False) -> dict[str, str] | None:
         """Reuse only this stack's fully verified visible terminal cursor.
 
-        Product/public/sequential flows retain their existing exact document
-        read: their cursor proof must include the persisted request branch, not
-        merely the live stream.  Ordinary bound chat can avoid a redundant
-        current-node read when the protocol assembler and handoff certificate
-        agree byte-for-byte after the same output sanitization.
+        Public and sequential flows retain their existing exact document read.
+        ProductWork may opt in only after its own fresh pre-send document check:
+        its request user, parent cursor and bound conversation were all checked
+        before this exact POST.  In either case the protocol assembler and
+        handoff certificate must agree byte-for-byte after sanitization.
         """
         if (body.get("_public_session_ref") or body.get("_supersedes_request_message_id")
-                or body.get("product_work") is not None):
+                or (body.get("product_work") is not None and not allow_product_work)):
             return None
         cursor = getattr(backend, "text_stream_terminal", None)
         if not isinstance(cursor, dict):
@@ -894,6 +896,85 @@ class ConversationBindingService:
         if sanitize_output_text(candidate_text).strip() != content:
             return None
         return {"conversation_id": candidate_conversation, "message_id": candidate_message}
+
+    @staticmethod
+    def _product_work_stream_terminal_result(
+        backend: OpenAIBackendAPI,
+        body: dict[str, Any],
+        *,
+        binding_id: str,
+        account_identity: str,
+        client_conversation_id: str,
+        conversation_id: str,
+        content: str,
+    ) -> dict[str, Any] | None:
+        """Project a certified ProductWork stream final into exact-read shape.
+
+        ``complete_text`` has already fresh-read and checked the submitted
+        ProductWork parent immediately before the POST.  The certificate is
+        still narrow: it must bind that POST's original user and conversation
+        to one nonempty final assistant text node on the same unambiguous
+        branch.  Later sends and archive keep their independent fresh guards.
+        """
+        if (body.get("product_work") is None or body.get("_public_session_ref")
+                or body.get("_supersedes_request_message_id")):
+            return None
+        cursor = ConversationBindingService._stream_terminal_cursor(
+            backend, body, conversation_id, content, allow_product_work=True,
+        )
+        if cursor is None:
+            return None
+        original_message_id = str(getattr(backend, "text_request_message_id", "") or "").strip()
+        request_parent_message_id = str(
+            getattr(backend, "text_request_parent_message_id", "") or ""
+        ).strip()
+        # A terminal cursor alone proves neither the submitted user node nor
+        # its unique finished path.  The backend supplies a bounded, body-free
+        # structural trace from this same stream; rebuild the existing
+        # positive turn proof rather than treating a current-looking final as
+        # sufficient ProductWork authority.
+        branch = getattr(backend, "text_stream_branch", None)
+        if (not original_message_id or not request_parent_message_id
+                or not sanitize_output_text(content).strip()
+                or not isinstance(branch, dict)):
+            return None
+        original_node = branch.get(original_message_id)
+        original_message = original_node.get("message") if isinstance(original_node, dict) else None
+        original_author = original_message.get("author") if isinstance(original_message, dict) else None
+        observed_parent = str(original_node.get("parent") or "") if isinstance(original_node, dict) else ""
+        if (not isinstance(original_message, dict) or original_message.get("id") != original_message_id
+                or not isinstance(original_author, dict) or original_author.get("role") != "user"
+                or observed_parent != request_parent_message_id):
+            return None
+        children: dict[str, list[str]] = {}
+        for node_id, node in branch.items():
+            if not isinstance(node_id, str) or not isinstance(node, dict):
+                return None
+            message = node.get("message")
+            if not isinstance(message, dict) or message.get("id") != node_id:
+                return None
+            parent = node.get("parent")
+            if parent is not None and not isinstance(parent, str):
+                return None
+            if parent:
+                children.setdefault(parent, []).append(node_id)
+        ended = _completed_request_turn(
+            branch, children, original_message_id, conversation_id,
+        )
+        if not ended or ended["final_message_id"] != cursor["message_id"]:
+            return None
+        return {
+            "provider_binding_id": binding_id,
+            "provider_account_identity": account_identity,
+            "client_conversation_id": client_conversation_id,
+            "conversation_id": conversation_id,
+            "request_parent_message_id": request_parent_message_id,
+            "binding_status": "bound",
+            "status": "succeeded",
+            "parent_message_id": cursor["message_id"],
+            "content": content,
+            TURN_END_EVIDENCE_FIELD: ended,
+        }
 
     @operation_budget(ARCHIVE_OPERATION_BUDGET_SECONDS)
     def set_archived(self, body: dict[str, Any], archived: bool) -> dict[str, Any]:
@@ -2761,7 +2842,8 @@ class ConversationBindingService:
             backend.text_stream_handoff_enabled = (
                 body.get("_route", "chat") == "chat" and body.get("_operation", "text") == "text"
             )
-            if body.get("_public_session_ref") or body.get("_supersedes_request_message_id") or advanced_original:
+            if (body.get("_public_session_ref") or body.get("_supersedes_request_message_id")
+                    or advanced_original or body.get("product_work") is not None):
                 backend.text_cursor_callback = on_cursor
             missing_no_final_context = None
             native_no_final_prefix_context = None
@@ -3033,7 +3115,23 @@ class ConversationBindingService:
                         if delta:
                             parts.append(delta)
                 failure_phase = "result_check"
-                if not returned_conversation_id:
+                # A bounded stream handoff can explicitly yield its normal
+                # terminal marker after waiting for a result notification
+                # without receiving one.  That does not prove a result, but
+                # this original bound turn has enough stable identity to do
+                # its single exact branch read.  Do not extend this exception
+                # to stream/transport failures, which never reach here.
+                result_check_due = bool(getattr(backend, "text_result_check_due", False))
+                exact_request_message_id = str(
+                    getattr(backend, "text_request_message_id", "") or ""
+                ).strip()
+                due_exact_read = bool(
+                    result_check_due and conversation_id and exact_request_message_id
+                )
+                exact_conversation_id = returned_conversation_id or (
+                    conversation_id if due_exact_read else ""
+                )
+                if not exact_conversation_id:
                     raise ConversationBindingError(
                         "upstream response has no conversation_id",
                         code="CONVERSATION_OUTCOME_UNKNOWN",
@@ -3042,7 +3140,7 @@ class ConversationBindingService:
                         original_failure_phase=failure_phase,
                         original_exception_category="empty_result",
                     )
-                if conversation_id and returned_conversation_id != conversation_id:
+                if returned_conversation_id and conversation_id and returned_conversation_id != conversation_id:
                     raise ConversationBindingError(
                         "upstream conversation identity changed",
                         code="CONVERSATION_BINDING_MISMATCH",
@@ -3050,16 +3148,33 @@ class ConversationBindingService:
                         provider_account_identity=account_identity,
                         conversation_id=returned_conversation_id,
                     )
+                content = "".join(parts).strip()
+                if body.get("product_work") is not None and returned_conversation_id:
+                    certified = self._product_work_stream_terminal_result(
+                        backend, body,
+                        binding_id=binding_id,
+                        account_identity=account_identity,
+                        client_conversation_id=client_conversation_id,
+                        conversation_id=returned_conversation_id,
+                        content=content,
+                    )
+                    if certified is not None:
+                        account_service.mark_text_used(access_token)
+                        return {**certified, "_upstream_terminal": True}
                 if (body.get("_public_session_ref") or body.get("_supersedes_request_message_id")
-                        or body.get("product_work") is not None):
+                        or body.get("product_work") is not None or due_exact_read):
                     # Neither a socket EOF nor the conversation's latest answer
                     # proves our turn finished. Use this request's unique branch.
+                    # The explicit handoff due marker may reach this same
+                    # branch with no stream conversation event; then the
+                    # retained bound conversation supplies only the reader's
+                    # identity, never a synthetic success.
                     failure_phase = "cursor_read"
                     try:
                         recovered = self._read_text_request_result(backend, {
                             "provider_binding_id": binding_id, "provider_account_identity": account_identity,
-                            "client_conversation_id": client_conversation_id, "conversation_id": returned_conversation_id,
-                            "request_message_id": backend.text_request_message_id,
+                            "client_conversation_id": client_conversation_id, "conversation_id": exact_conversation_id,
+                            "request_message_id": exact_request_message_id,
                             "request_parent_message_id": getattr(backend, "text_request_parent_message_id", ""),
                         }, deadline_monotonic=time.monotonic() + self.RECOVERY_EXACT_READ_TIMEOUT_SECONDS)
                     except Exception as exc:
@@ -3069,21 +3184,26 @@ class ConversationBindingService:
                         # The same read budget also covers account lock/FIFO
                         # waits. Do not fall through to the generic latest-cursor
                         # fallback, which would start a second, unbounded read.
-                        raise ConversationBindingError(
+                        failure = ConversationBindingError(
                             "original sequential response could not be verified",
                             code="CONVERSATION_OUTCOME_UNKNOWN",
                             provider_binding_id=binding_id, provider_account_identity=account_identity,
-                            conversation_id=returned_conversation_id,
+                            conversation_id=exact_conversation_id,
                             original_failure_phase=failure_phase,
                             original_exception_category=("provider_error" if isinstance(exc, ConversationBindingError)
                                                          else _text_failure_category(exc)),
                             original_http_status=exc.status_code if isinstance(exc, UpstreamHTTPError) else None,
-                        ) from exc
+                        )
+                        failure._verified_sender_read = (
+                            _VERIFIED_SENDER_READ, exact_request_message_id,
+                            getattr(backend, "text_request_parent_message_id", ""), None, exc,
+                        )
+                        raise failure from exc
                     if recovered.get("status") != "succeeded":
                         failure = ConversationBindingError(
                             "original sequential response is not complete", code="CONVERSATION_OUTCOME_UNKNOWN",
                             provider_binding_id=binding_id, provider_account_identity=account_identity,
-                            conversation_id=returned_conversation_id,
+                            conversation_id=exact_conversation_id,
                             original_failure_phase=failure_phase, original_exception_category="empty_result",
                             recovery_reason=recovered.get("recovery_reason", ""),
                             recovery_observation=recovered.get(RESULT_OBSERVATION_FIELD),
@@ -3096,10 +3216,13 @@ class ConversationBindingService:
                                 and recovered.get("recovery_reason")
                                 == TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value):
                             failure._verified_exact_incomplete = _VERIFIED_EXACT_INCOMPLETE
+                        failure._verified_sender_read = (
+                            _VERIFIED_SENDER_READ, exact_request_message_id,
+                            getattr(backend, "text_request_parent_message_id", ""), recovered, None,
+                        )
                         raise failure
                     account_service.mark_text_used(access_token)
                     return {**recovered, "_upstream_terminal": True}
-                content = "".join(parts).strip()
                 if not content:
                     raise ConversationBindingError(
                         "upstream response was empty",

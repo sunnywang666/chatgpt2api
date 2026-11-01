@@ -57,6 +57,7 @@ _SAFE_STREAM_HANDOFF_STAGES = frozenset({
     "ws_endpoint_get_entered", "ws_endpoint_get_completed", "ws_endpoint_invalid",
     "ws_connected", "ws_subscribed", "ws_terminal", "ws_no_terminal",
     "ws_budget_exhausted", "ws_transport_error", "ws_payload_rejected",
+    "result_check_ready", "result_check_due",
 })
 
 
@@ -174,6 +175,11 @@ def _safe_stream_handoff_event_metadata(extra):
             fields[key] = value
     if type(extra.get("handoff_terminal_seen")) is bool:
         fields["handoff_terminal_seen"] = extra["handoff_terminal_seen"]
+    if extra.get("handoff_terminal_reason") in {
+        "no_terminal", "invalid_snapshot", "missing_identity", "missing_parent",
+        "parent_conflict", "final_channel_unconfirmed", "complete_candidate", "body_unconfirmed",
+    }:
+        fields["handoff_terminal_reason"] = extra["handoff_terminal_reason"]
     return fields
 
 

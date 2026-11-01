@@ -187,7 +187,7 @@ environment:
 
 对已停止的 no-final 文本后继，`CHAT_SUPERSEDE_CURSOR_CHANGED` 可附带有限的 `no_final_guard` 说明，帮助界面显示本次保护性拒绝的原因。该字段只在失败回执仍是该错误时出现，格式为 `code`、`phase`、`reason`、`message`；例如：`{"code":"CHAT_SUPERSEDE_CURSOR_CHANGED","phase":"pre_send_no_final_tail","reason":"current_node","message":"Conversation cursor changed"}`。`phase` 仅为 `initial_no_final_tail`、`pre_send_no_final_tail` 或 `context_changed`；前两种允许有限状态原因，`context_changed` 仅为 `current_node`。说明不包含游标、消息内容、账号、异常原文或会话图；它解释本次失败，不会自动重新发送或放宽原有保护。已结束的旧回执如果当时没有保存该说明，读取时不会补猜原因。
 
-携带 `product_work` 的文字任务在流结束后，使用原有的那次会话读取核实本次用户消息的唯一完成分支，正文和回复位置均取自该分支。后续对话推进不会改变原请求的结果；找不到原节点、分支不唯一或尚未完成时保留结果未知，继续按原请求查询，不重新生成。此核实不增加上游读取次数。
+携带 `product_work` 的普通文字任务优先采用本次流中已核实的原用户节点、实际父节点、唯一完成分支与非空正文；流证据不完整时，才读取原会话核实该分支。后续对话推进不会改变原请求的结果；找不到原节点、分支不唯一或尚未完成时保留结果未知，继续按原请求查询，不重新生成。公有会话和受控后继保留既有的精确会话读取要求。
 
 对已保存为 `unknown` 的原文字请求，工作台内部管理员可用 `POST /api/conversation-bindings/text-requests/{request_id}/manual-recover` 显式采用同一物理会话中后续人工 user→非空 final 文本。入口仅允许可信 `internal:listing`、非公司/非外部的管理员；body 必须提供原回执的 `provider_binding_id`、`provider_account_identity`、`client_conversation_id`，可用 `source_request_message_id`/`source_message_id` 锁定人工 user/final。Provider 从原回执取得 conversation，不接受 conversation ID、正文、重试输入或新的生成授权；每次人工采用只读取一次新鲜完整会话，校验原 user/parent、当前活动分支、唯一非空 final 及指定来源，随后以原回执 CAS 保存本次观察。取消第二次稳定性读取，意味着不再检测两个观察时点之间的远端变化；一次或两次读取均不能原子锁定远端会话。后继发送和归档各自保留实时游标检查，人工来源单独归档还会重新校验来源和正文。读取有 60 秒处理/网络预算，并只为这次读取中的本地账号 pacing/FIFO/并发等待共享最多 180 秒信用（总时限不超过 240 秒，继承更短 deadline 不延长）。429、上游回退、网络和锁等待不获得该信用；上游 429 仍保留其 `Retry-After` 语义。
 
@@ -220,6 +220,10 @@ environment:
 该 GET 直接读取持久化记录，不查询上游、不触发恢复、不重发、不清理占用，也不需要工作台通过轮询驱动任务执行。账号池的后台执行与原结果恢复负责保存结果和后续调度。恢复命令应显式调用既有恢复入口，不能由普通结果读取隐式触发；未知结果不授予重发权限。
 
 已有 SSE 通知协议仍为 `task-notification-v1`，只提示结果可能就绪。工作台收到提示后通过上述只读接口核实，再幂等保存业务成果并推进下一步；通知丢失时可有界补读。旧查询接口保持兼容，其可能触发原结果恢复或清理的行为不属于本接口的只读保证。
+
+账号池负责上游结果接收和保存：普通 ProductWork 文本的完整流结果，只有在本次原请求、实际提交父节点、唯一已结束分支和非空正文都能由流中证据确认时，才直接保存并发送现有就绪通知，省去重复读取会话。证据不足的完成信号只触发一次原请求结果读取，不采用未经核对的流正文，也不再先等待另一条实时连接。公有会话及受控后继仍保留各自的精确读取要求。
+
+已绑定文本在开始接收响应后等待最多 120 秒仍未完成时，结束本地流消费并查询原请求；这不表示上游停止，也不会重发。读取继续遵守真实上游限流与账号读取节奏。工作台通过纯读回执区分 `execution.result_state` 中的 `available`、`empty`、`incomplete`、`not_found`、`read_failed`、`unknown`，并结合 `phase`、`wait_state` 和已有恢复原因判断；读取超时或失败不能当作空回答。业务明确要求的受控后继仍由工作台发出意图，普通结果等待不需要工作台编排上游查询。
 
 ### 工作台的结果读取、原结果补取与重新尝试
 

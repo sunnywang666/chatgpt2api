@@ -7,7 +7,8 @@ import pytest
 from curl_cffi import CurlECode, CurlError, CurlWsFlag
 from services.account_request_pacing import AccountRequestDeadlineExceeded
 from services import openai_backend_api as backend_module
-from services.openai_backend_api import ChatRequirements, OpenAIBackendAPI, _StreamHandoff
+from services.openai_backend_api import (ChatRequirements, OpenAIBackendAPI,
+                                         StreamHardTimeoutError, _StreamHandoff)
 from services.pool_admission import _safe_stream_handoff_event_metadata
 from services.protocol.conversation import conversation_events, is_visible_assistant_message
 from services.request_context import current_request
@@ -43,6 +44,19 @@ class RaisingResponse(Response):
         raise self.error
 
 
+class TailGuardResponse(Response):
+    """Raise if a stream consumer reads beyond an expected terminal boundary."""
+    def __init__(self, lines=(), body=None):
+        super().__init__(lines, body=body)
+        self.read_count = 0
+
+    def iter_lines(self):
+        for line in self.lines:
+            self.read_count += 1
+            yield line
+        raise AssertionError("stream was read after its terminal boundary")
+
+
 class StageContext:
     def __init__(self):
         self.stages = []
@@ -70,6 +84,15 @@ class WebSocket:
     def terminate(self):
         self.terminated = True
         self.closed = True
+
+
+class TailGuardWebSocket(WebSocket):
+    """Fail if a completion-notice path asks the socket for another frame."""
+    def recv_str(self):
+        item = next(self.frames)
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 class FragmentWebSocket(WebSocket):
@@ -196,7 +219,7 @@ def _initial_events(*, conversation="conversation-1", handoff=True, ste=False, t
 def _ws_frame(topic="conversation-turn-turn-1"):
     encoded = "\n".join((
         'data: {"v":{"conversation_id":"conversation-1","message":{"id":"thought-leaf","author":{"role":"assistant"},"parent":"original-user"}}}',
-        'data: {"v":{"conversation_id":"conversation-1","message":{"id":"final-leaf","author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"parent":"thought-leaf"}}}',
+        'data: {"v":{"conversation_id":"conversation-1","message":{"id":"final-leaf","author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"parent":"thought-leaf","channel":"final","content":{"content_type":"text","parts":["complete answer"]}}}}',
         "data: [DONE]",
     ))
     return json.dumps({"type": "reply", "reply": {"topic_id": topic, "catchups": [
@@ -238,6 +261,252 @@ def test_handoff_transport_error_stays_unknown_and_records_no_exception_text():
     assert [data["handoff_stage"] for data in fields] == ["candidate_bound", "ws_endpoint_get_entered", "ws_transport_error"]
     assert len(backend.session.get_calls) == 1 and backend.session.ws_calls == []
     assert "PRIVATE" not in json.dumps(fields)
+
+
+def test_sse_completion_notice_without_parent_requests_exact_result_without_ws():
+    """A finished signal is a read trigger, never a branch certificate."""
+    response = TailGuardResponse([
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE",
+               "conversation_id": "conversation-1"}),
+        _line(_handoff()),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "unparented-final", "author": {"role": "assistant"},
+            "status": "finished_successfully", "end_turn": True, "channel": "final",
+            "content": {"content_type": "text", "parts": ["must be exact-read"]},
+        }}}),
+        b"data: [DONE]",
+    ])
+    backend = _backend(response, frames=[_ws_frame()])
+    context = StageContext()
+    token = current_request.set(context)
+    try:
+        payloads = list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))
+    finally:
+        current_request.reset(token)
+
+    assert payloads[-1] == "[DONE]"
+    assert backend.text_stream_terminal is None
+    assert backend.text_result_check_due is True
+    # The in-loop return must not consume the delimiter or wait for EOF.
+    assert response.read_count == 3
+    # The original send is the only POST; no WS or second generation begins.
+    assert len(backend.session.post_calls) == 1
+    assert backend.session.get_calls == backend.session.ws_calls == []
+    fields = [data for stage, data in context.stages if stage == "stream_handoff"]
+    assert len(fields) == 1
+    assert fields[0]["handoff_stage"] == "result_check_ready"
+    assert fields[0]["handoff_terminal_seen"] is False
+    assert fields[0]["handoff_terminal_reason"] == "missing_parent"
+
+
+def test_ws_completion_notice_without_original_branch_requests_exact_result():
+    backend = _backend(_initial_events(), frames=[json.dumps({"type": "reply", "reply": {
+        "topic_id": "conversation-turn-turn-1", "catchups": [{"payload": {"payload": {
+            "encoded_item": "\n".join((
+                'data: {"v":{"conversation_id":"conversation-1","message":{"id":"thought-leaf","author":{"role":"assistant"},"parent":"original-user"}}}',
+                'data: {"v":{"conversation_id":"conversation-1","message":{"id":"unparented-final","author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"channel":"final","content":{"content_type":"text","parts":["must be exact-read"]}}}}',
+                "data: [DONE]",
+            )),
+        }}}],
+    }})])
+    backend.session.ws_type = TailGuardWebSocket
+    backend.session.frames = [backend.session.frames[0], AssertionError("WS read after completion notice")]
+
+    assert list(backend.stream_conversation(prompt="fixture"))[-1] == "[DONE]"
+    assert backend.text_stream_terminal is None
+    assert backend.text_result_check_due is True
+    assert len(backend.session.post_calls) == len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+
+
+def test_strict_sse_terminal_stops_at_done_and_keeps_a_text_free_branch_snapshot():
+    response = TailGuardResponse([
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE",
+               "conversation_id": "conversation-1"}),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "original-user", "parent": "parent-before-request", "author": {"role": "user"},
+            "content": {"content_type": "text", "parts": ["PRIVATE prompt"]},
+        }}}),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "thought", "parent": "original-user", "author": {"role": "assistant"},
+            "status": "in_progress", "end_turn": False, "channel": "analysis",
+            "content": {"content_type": "thoughts", "parts": ["PRIVATE thought"]},
+        }}}),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "final", "parent": "thought", "author": {"role": "assistant"},
+            "status": "finished_successfully", "end_turn": True, "channel": "final",
+            "content": {"content_type": "text", "parts": ["PRIVATE answer"]},
+        }}}),
+        b"data: [DONE]",
+    ])
+    backend = _backend(response)
+
+    assert list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))[-1] == "[DONE]"
+    # DONE is the strict certificate boundary; the tail guard makes an EOF wait fail.
+    assert response.read_count == 5
+    assert backend.text_stream_terminal == {
+        "conversation_id": "conversation-1", "message_id": "final", "text": "PRIVATE answer",
+        "original_message_id": "original-user", "original_parent_message_id": "parent-before-request",
+    }
+    branch = backend.text_stream_branch
+    assert branch is not None
+    assert branch["original-user"]["parent"] == "parent-before-request"
+    assert branch["thought"]["message"]["content"] == {"content_type": "thoughts"}
+    assert branch["final"]["message"]["content"] == {"content_type": "text"}
+    assert "PRIVATE" not in json.dumps(branch)
+
+
+def test_first_strict_terminal_waits_for_done_and_later_conflict_revokes_it():
+    response = TailGuardResponse([
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE",
+               "conversation_id": "conversation-1"}),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "original-user", "parent": "root", "author": {"role": "user"},
+        }}}),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "first-final", "parent": "original-user", "author": {"role": "assistant"},
+            "status": "finished_successfully", "end_turn": True, "channel": "final",
+            "content": {"content_type": "text", "parts": ["first"]},
+        }}}),
+        _line({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "conflicting-final", "parent": "original-user", "author": {"role": "assistant"},
+            "status": "finished_successfully", "end_turn": True, "channel": "final",
+            "content": {"content_type": "text", "parts": ["second"]},
+        }}}),
+        b"data: [DONE]",
+    ])
+    backend = _backend(response)
+
+    assert list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))[-1] == "[DONE]"
+    # It read the conflicting final after the first valid-looking one, then
+    # refused adoption rather than returning early from the first final.
+    assert response.read_count == 4
+    assert backend.text_stream_terminal is None
+    assert backend.text_stream_branch is None
+    assert backend.text_result_check_due is True
+
+
+@pytest.mark.parametrize("shape", ["active_tool", "fork"])
+def test_stream_branch_retains_active_or_forked_structure_for_binding_to_reject(shape):
+    from services.conversation_binding_service import _completed_request_turn
+
+    events = [
+        {"v": {"conversation_id": "conversation-1", "message": {
+            "id": "original-user", "parent": "root", "author": {"role": "user"},
+        }}},
+    ]
+    if shape == "active_tool":
+        events.extend((
+            {"v": {"conversation_id": "conversation-1", "message": {
+                "id": "active-tool", "parent": "original-user", "author": {"role": "assistant"},
+                "status": "in_progress", "end_turn": False, "recipient": "python",
+                "content": {"content_type": "text", "parts": ["PRIVATE tool call"]},
+            }}},
+            {"v": {"conversation_id": "conversation-1", "message": {
+                "id": "final", "parent": "active-tool", "author": {"role": "assistant"},
+                "status": "finished_successfully", "end_turn": True, "channel": "final",
+                "content": {"content_type": "text", "parts": ["PRIVATE final"]},
+            }}},
+        ))
+    else:
+        events.extend((
+            {"v": {"conversation_id": "conversation-1", "message": {
+                "id": "thought", "parent": "original-user", "author": {"role": "assistant"},
+                "status": "in_progress", "end_turn": False, "channel": "analysis",
+                "content": {"content_type": "thoughts", "parts": ["PRIVATE thought"]},
+            }}},
+            {"v": {"conversation_id": "conversation-1", "message": {
+                "id": "final", "parent": "thought", "author": {"role": "assistant"},
+                "status": "finished_successfully", "end_turn": True, "channel": "final",
+                "content": {"content_type": "text", "parts": ["PRIVATE final"]},
+            }}},
+            {"v": {"conversation_id": "conversation-1", "message": {
+                "id": "active-tool", "parent": "thought", "author": {"role": "assistant"},
+                "status": "in_progress", "end_turn": False, "recipient": "python",
+                "content": {"content_type": "text", "parts": ["PRIVATE tool call"]},
+            }}},
+        ))
+    backend = _backend(Response([
+        _line({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE",
+               "conversation_id": "conversation-1"}),
+        *map(_line, events), b"data: [DONE]",
+    ]))
+
+    assert list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))[-1] == "[DONE]"
+    branch = backend.text_stream_branch
+    assert branch is not None and "active-tool" in branch and "final" in branch
+    assert "PRIVATE" not in json.dumps(branch)
+    children = {}
+    for node_id, node in branch.items():
+        parent = node["parent"]
+        if parent:
+            children.setdefault(parent, []).append(node_id)
+    assert _completed_request_turn(
+        branch, children, "original-user", "conversation-1", allow_completed_tool_call=True,
+    ) is None
+
+
+def test_stream_branch_overflow_or_parent_conflict_cannot_be_reused():
+    overflow = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    overflow.observe(json.dumps({"v": {"conversation_id": "conversation-1", "message": {
+        "id": "original-user", "parent": "root", "author": {"role": "user"},
+    }}}))
+    parent = "original-user"
+    for index in range(128):
+        node_id = f"thought-{index}"
+        overflow.observe(json.dumps({"v": {"conversation_id": "conversation-1", "message": {
+            "id": node_id, "parent": parent, "author": {"role": "assistant"},
+        }}}))
+        parent = node_id
+    assert overflow._branch_overflow is True
+    assert overflow.terminal_branch() is None
+
+    conflict = _StreamHandoff(expected_conversation_id="conversation-1", original_message_id="original-user")
+    for parent in ("root", "other-root"):
+        conflict.observe(json.dumps({"v": {"conversation_id": "conversation-1", "message": {
+            "id": "original-user", "parent": parent, "author": {"role": "user"},
+        }}}))
+    assert conflict._conflicted_parent_ids == {"original-user"}
+    assert conflict.terminal_branch() is None
+
+
+def test_silent_bound_stream_at_120_seconds_requests_exact_result_without_another_post(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(backend_module.time, "monotonic", lambda: clock.now)
+    backend = _backend(Response())
+
+    def capped(*_args, **_kwargs):
+        yield json.dumps({"type": "resume_conversation_token", "kind": "topic", "token": "PRIVATE",
+                          "conversation_id": "conversation-1"})
+        yield json.dumps(_handoff())
+        clock.now += 120.0
+        raise StreamHardTimeoutError("fixture stream deadline")
+
+    monkeypatch.setattr(backend, "_iter_sse_payloads_capped", capped)
+    payloads = list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))
+
+    assert payloads[-1] == "[DONE]"
+    assert backend.text_stream_terminal is None
+    assert backend.text_result_check_due is True
+    assert len(backend.session.post_calls) == 1
+    assert backend.session.get_calls == backend.session.ws_calls == []
+
+
+def test_generic_stream_timeout_keeps_its_original_error(monkeypatch):
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(backend_module.time, "monotonic", lambda: clock.now)
+    backend = _backend(Response())
+    backend.retain_bound_conversation = False
+
+    def capped(*_args, **_kwargs):
+        clock.now += 120.0
+        raise StreamHardTimeoutError("fixture stream deadline")
+
+    monkeypatch.setattr(backend, "_iter_sse_payloads_capped", capped)
+    with pytest.raises(StreamHardTimeoutError, match="fixture stream deadline"):
+        list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))
+    assert backend.text_result_check_due is False
+    assert len(backend.session.post_calls) == 1
+    assert backend.session.get_calls == backend.session.ws_calls == []
 
 
 def test_eligible_handoff_continues_after_sse_body_transport_error_without_second_post():
@@ -310,10 +579,15 @@ def test_failed_handoff_after_sse_transport_error_preserves_the_original_excepti
     if failure == "endpoint":
         backend.session = FailingHandoffSession(initial, backend.session.ws_url)
 
-    with pytest.raises(ConnectionError) as caught:
-        list(backend.stream_conversation(prompt="fixture"))
-
-    assert caught.value is original_error
+    if failure == "foreign_branch":
+        # A terminal-looking notification with no original branch is now an
+        # exact-read trigger, not a reason to preserve the stream exception.
+        assert list(backend.stream_conversation(prompt="fixture"))[-1] == "[DONE]"
+        assert backend.text_result_check_due is True
+    else:
+        with pytest.raises(ConnectionError) as caught:
+            list(backend.stream_conversation(prompt="fixture"))
+        assert caught.value is original_error
     assert len(backend.session.post_calls) == 1
     assert backend.text_stream_terminal is None
 
@@ -326,6 +600,12 @@ def test_handoff_timeline_whitelist_drops_arbitrary_fields_and_values():
     })
     assert fields == {"handoff_stage": "ws_terminal", "handoff_frame_count": 2,
                       "handoff_byte_count": 17, "handoff_terminal_seen": True}
+    assert _safe_stream_handoff_event_metadata({
+        "handoff_stage": "result_check_ready", "handoff_terminal_reason": "missing_parent",
+    }) == {"handoff_stage": "result_check_ready", "handoff_terminal_reason": "missing_parent"}
+    assert _safe_stream_handoff_event_metadata({
+        "handoff_stage": "result_check_ready", "handoff_terminal_reason": "PRIVATE_DIAGNOSTIC",
+    }) == {"handoff_stage": "result_check_ready"}
     assert _safe_stream_handoff_event_metadata({"handoff_stage": "PRIVATE"}) == {}
 
 
@@ -660,10 +940,12 @@ def test_handoff_subscribes_once_and_closes_without_a_second_conversation_post()
 
     payloads = list(backend.stream_conversation(prompt="fixture"))
 
-    assert payloads[-2:] == [
-        '{"v":{"conversation_id":"conversation-1","message":{"id":"final-leaf","author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"parent":"thought-leaf"}}}',
-        "[DONE]",
-    ]
+    assert json.loads(payloads[-2])["v"]["message"] == {
+        "id": "final-leaf", "author": {"role": "assistant"},
+        "status": "finished_successfully", "end_turn": True, "parent": "thought-leaf",
+        "channel": "final", "content": {"content_type": "text", "parts": ["complete answer"]},
+    }
+    assert payloads[-1] == "[DONE]"
     assert payloads.count("[DONE]") == 1
     assert len(backend.session.post_calls) == 1
     assert len(backend.session.get_calls) == 1
@@ -886,7 +1168,9 @@ def test_later_user_branch_never_turns_a_nonterminal_sse_parent_chain_into_origi
     ]), frames=[_ws_frame()])
 
     assert list(backend.stream_conversation(prompt="fixture", conversation_id="conversation-1"))[-1] == "[DONE]"
-    assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+    assert backend.text_stream_terminal is None
+    assert backend.text_result_check_due is True
+    assert backend.session.get_calls == backend.session.ws_calls == []
 
 
 def test_explicit_final_text_update_replaces_same_message_reasoning_phase():
@@ -1133,7 +1417,19 @@ def test_terminal_patch_keeps_envelope_phase_and_parent_evidence(envelope, phase
         current_request.reset(token)
     assert backend.text_stream_terminal is None
     stages = [d["handoff_stage"] for s, d in context.stages if s == "stream_handoff"]
-    assert "ws_terminal" not in stages and "ws_no_terminal" in stages
+    assert "ws_terminal" not in stages
+    if "channel" in envelope or "channel" in envelope.get("metadata", {}):
+        # An analysis-phase terminal is not itself a completion notice.
+        assert stages[-1] == "ws_transport_error"
+        assert backend.text_result_check_due is False
+        assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
+    else:
+        assert stages[-1] == "result_check_ready"
+        assert backend.text_result_check_due is True
+        if phase == "initial_sse":
+            assert backend.session.get_calls == backend.session.ws_calls == []
+        else:
+            assert len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
     assert len(backend.session.post_calls) == 1
 
 
@@ -1147,16 +1443,15 @@ def test_terminal_from_an_old_branch_does_not_suppress_this_turns_handoff():
         current_request.reset(token)
 
     stages = [data["handoff_stage"] for stage, data in context.stages if stage == "stream_handoff"]
-    assert stages == [
-        "candidate_bound", "ws_endpoint_get_entered", "ws_endpoint_get_completed",
-        "ws_connected", "ws_subscribed", "ws_terminal",
-    ]
-    assert len(backend.session.get_calls) == 1
-    assert len(backend.session.ws_calls) == 1
+    assert stages == ["result_check_ready"]
+    assert backend.text_stream_terminal is None
+    assert backend.text_result_check_due is True
+    assert backend.session.get_calls == backend.session.ws_calls == []
 
 
 def test_cross_conversation_ws_payload_is_discarded_and_stays_unknown():
-    backend = _backend(_initial_events(), frames=[_ws_frame().replace('conversation-1', 'conversation-other')])
+    foreign_final = _ws_frame().replace('conversation-1', 'conversation-other')
+    backend = _backend(_initial_events(), frames=[foreign_final])
 
     assert list(backend.stream_conversation(prompt="fixture")) == [
         json.dumps(event, separators=(",", ":")) for event in [
@@ -1164,6 +1459,8 @@ def test_cross_conversation_ws_payload_is_discarded_and_stays_unknown():
             _handoff(),
         ]
     ] + ["[DONE]"]
+    assert backend.text_stream_terminal is None
+    assert backend.text_result_check_due is False
     assert len(backend.session.ws_calls) == 1
 
 
@@ -1255,7 +1552,7 @@ def test_unconfirmed_ws_done_in_one_catchup_does_not_end_the_turn_before_late_fi
         {"payload": {"payload": {"encoded_item": "\n".join((
             'data: {"v":{"conversation_id":"conversation-1","message":{"id":"thought-leaf","author":{"role":"assistant"},"parent":"original-user"}}}',
             "data: [DONE]",
-            'data: {"v":{"conversation_id":"conversation-1","message":{"id":"final-leaf","author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"parent":"thought-leaf"}}}',
+            'data: {"v":{"conversation_id":"conversation-1","message":{"id":"final-leaf","author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"parent":"thought-leaf","channel":"final","content":{"content_type":"text","parts":["complete answer"]}}}}',
         ))}}},
     ]}})
     backend = _backend(_initial_events(), frames=[late])
@@ -1265,6 +1562,19 @@ def test_unconfirmed_ws_done_in_one_catchup_does_not_end_the_turn_before_late_fi
     final_index = next(index for index, payload in enumerate(payloads) if "final-leaf" in payload)
     assert "[DONE]" not in payloads[:final_index]
     assert payloads[-1] == "[DONE]"
+    assert backend.text_result_check_due is False
+
+
+def test_ws_done_without_completion_notice_keeps_the_existing_handoff_wait_path():
+    only_done = json.dumps({"type": "reply", "reply": {"topic_id": "conversation-turn-turn-1", "catchups": [
+        {"payload": {"payload": {"encoded_item": "data: [DONE]"}}},
+    ]}})
+    backend = _backend(_initial_events(), frames=[only_done])
+
+    assert list(backend.stream_conversation(prompt="fixture"))[-1] == "[DONE]"
+    assert backend.text_stream_terminal is None
+    assert backend.text_result_check_due is False
+    assert len(backend.session.post_calls) == len(backend.session.get_calls) == len(backend.session.ws_calls) == 1
 
 
 def test_unconfirmed_catchup_done_keeps_same_subscription_for_later_live_terminal():
@@ -1276,7 +1586,7 @@ def test_unconfirmed_catchup_done_keeps_same_subscription_for_later_live_termina
     ]}})
     live = json.dumps({"type": "message", "topic_id": "conversation-turn-turn-1", "payload": {"payload": {
         "encoded_item": "\n".join((
-            'data: {"v":{"conversation_id":"conversation-1","message":{"id":"final-leaf","author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"parent":"thought-leaf"}}}',
+            'data: {"v":{"conversation_id":"conversation-1","message":{"id":"final-leaf","author":{"role":"assistant"},"status":"finished_successfully","end_turn":true,"parent":"thought-leaf","channel":"final","content":{"content_type":"text","parts":["complete answer"]}}}}',
             "data: [DONE]",
         )),
     }}})

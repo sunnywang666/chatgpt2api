@@ -37,6 +37,7 @@ from services.conversation_binding_service import (
     safe_recovery_read_error,
     TURN_END_EVIDENCE_FIELD,
     _VERIFIED_EXACT_INCOMPLETE,
+    _VERIFIED_SENDER_READ,
     conversation_binding_service,
     is_recovery_image_pointer,
 )
@@ -2737,6 +2738,44 @@ class TextTaskService:
                         "_result_no_progress_reads",
                     ))
                 )
+                sender_read = getattr(exc, "_verified_sender_read", None)
+                if (first_observation
+                        and exc.code == "CONVERSATION_OUTCOME_UNKNOWN"
+                        and exc.original_failure_phase == "cursor_read"
+                        and isinstance(sender_read, tuple) and len(sender_read) == 5
+                        and sender_read[0] is _VERIFIED_SENDER_READ
+                        and sender_read[1] == receipt.get("request_message_id")
+                        and sender_read[2] == receipt.get("request_parent_message_id", "")
+                        and exc.provider_binding_id == receipt.get("provider_binding_id")
+                        and exc.provider_account_identity == receipt.get("provider_account_identity")
+                        and exc.conversation_id == receipt.get("conversation_id")):
+                    # Reuse the actual sender's first exact GET.  A diagnostic
+                    # must not require a second upstream read to become visible.
+                    # The marker is process-local; API dictionaries cannot mint it.
+                    recovered, read_error = sender_read[3:]
+                    anchor, code, phase, reason = {}, None, "read_text_request", None
+                    retry_after = None
+                    error_evidence = None
+                    if isinstance(read_error, Exception):
+                        code, retry_after = self._recovery_failure(read_error)
+                        if code == "UPSTREAM_OUTCOME_UNKNOWN":
+                            code = "RECOVERY_READ_FAILED"
+                        error_evidence = (safe_recovery_read_error(getattr(read_error, "recovery_read_error", None))
+                                          or self._generic_recovery_read_error(read_error))
+                    elif isinstance(recovered, dict) and recovered.get("status") in {"running", "unknown"}:
+                        anchor, code, phase, reason = self._safe_recovery_result(recovered, receipt)
+                    if code is not None:
+                        now = self._now()
+                        changes.update(
+                            **(anchor or {}), recovery_attempt=1,
+                            # Classification alone must not add a new waiting
+                            # period. Keep an actual upstream Retry-After; the
+                            # existing incomplete-result path handles thinking.
+                            recovery_next_at=now + retry_after if retry_after is not None else None,
+                            recovery_error_code=code, recovery_phase=phase,
+                            recovery_reason=reason, recovery_last_read_error=error_evidence,
+                            recovery_retry_after_seconds=retry_after,
+                        )
                 verified_incomplete = (
                     exc.code == "CONVERSATION_OUTCOME_UNKNOWN"
                     and getattr(exc, "_verified_exact_incomplete", None) is _VERIFIED_EXACT_INCOMPLETE
