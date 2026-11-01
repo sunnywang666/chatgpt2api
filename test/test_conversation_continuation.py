@@ -2762,6 +2762,65 @@ class TextResultRecoveryTests(unittest.TestCase):
                         self.assertEqual(clock.conversation_read_rate_failures, 0)
                         closed.assert_called_once()
 
+    def test_manual_followup_uses_one_paced_complete_document_read(self):
+        """One validated document consumes one read credit; it never sends a turn."""
+        now = [100.0]
+        fake_time = SimpleNamespace(
+            monotonic=lambda: now[0], time=lambda: 1_700_000_000 + now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        calls = []
+        document = self.request_document()
+
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(pacing, "time", fake_time), \
+             mock.patch.object(pacing, "config", SimpleNamespace(
+                 account_request_interval_secs=0,
+                 account_conversation_read_interval_secs=45,
+                 account_conversation_read_burst=1,
+                 account_conversation_read_max_inflight=0,
+             )):
+            clock = pacing.AccountRequestClock("fixture", Path(directory) / "clock.json")
+
+            def raw(method, url, **_kwargs):
+                calls.append((method, url, now[0]))
+                return SimpleNamespace(status_code=200, headers={}, json=lambda: document,
+                                       close=lambda: None)
+
+            backend = object.__new__(OpenAIBackendAPI)
+            backend.base_url = "https://fixture.invalid"
+            backend._headers = lambda _path, headers: headers
+            backend.session = SimpleNamespace(
+                get=lambda url, **kwargs: clock.request(raw, "GET", url, **kwargs),
+                close=mock.Mock(),
+            )
+            backend.close = mock.Mock()
+            with (
+                mock.patch("services.conversation_binding_service.time", fake_time),
+                mock.patch("services.request_context.time", fake_time),
+                mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                           return_value="account-one"),
+                mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                           return_value="synthetic-token"),
+                mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                           return_value=nullcontext()),
+                mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+            ):
+                adopted = ConversationBindingService().read_manual_text_followup(
+                    self.request_receipt(), provider_binding_id="binding-one",
+                    provider_account_identity="account-one", client_conversation_id="client-one",
+                )
+
+        self.assertEqual(adopted["source_request_message_id"], "later-user")
+        self.assertEqual(adopted["source_message_id"], "later-answer")
+        self.assertEqual(calls, [("GET", "https://fixture.invalid/backend-api/conversation/conversation-one", 100.0)])
+        # The one physical GET consumed exactly one 45-second credit.  A former
+        # stability GET would have advanced fake time to 145 before returning.
+        self.assertEqual(now[0], 100.0)
+        self.assertEqual(clock.next_conversation_read, 145.0)
+        self.assertEqual(clock.ordinary_read_queue, [])
+        backend.close.assert_called_once()
+
     def test_direct_read_preserves_first_error_when_retry_window_expires(self):
         from curl_cffi import CurlInfo
         from curl_cffi.requests.exceptions import SSLError

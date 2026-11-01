@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -1896,6 +1897,60 @@ def test_manual_text_recovery_rolls_back_and_manual_cursor_releases_waiting_succ
         advanced = service.store.read_receipt(db, "text", "owner", "next")
     assert advanced["parent_message_id"] == adopted["parent_message_id"]
     assert saved(service)["status"] == "succeeded" and saved(service)["parent_message_id"] == "original-late-final"
+
+
+def test_manual_text_recovery_saved_source_is_rechecked_before_archive_patch(tmp_path, monkeypatch):
+    """A one-read adoption remains fenced by the next irreversible boundary."""
+    from contextlib import nullcontext
+    from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI
+    import services.conversation_binding_service as bindings
+
+    service, _, _, legacy = migration(tmp_path)
+    row = legacy[0]
+    source = manual_source(row)
+    monkeypatch.setattr("services.text_task_service.conversation_binding_service.read_manual_text_followup",
+                        lambda *_args, **_kwargs: source)
+    manual = service.recover_manual_followup("owner", "old-0", **{
+        key: row[key] for key in ("provider_binding_id", "provider_account_identity", "client_conversation_id")
+    })["manual_result"]
+    changed = manual_followup_document(row)
+    changed["mapping"]["manual-final"]["message"]["content"]["parts"] = ["changed after adoption"]
+    patches = []
+
+    class Backend:
+        base_url = "https://fixture.invalid"
+        set_conversation_archived = OpenAIBackendAPI.set_conversation_archived
+
+        def __init__(self, **_kwargs):
+            self.session = SimpleNamespace(patch=self.patch)
+
+        def _headers(self, _path, headers):
+            return headers
+
+        def _get_conversation(self, conversation_id, **_kwargs):
+            assert conversation_id == row["conversation_id"]
+            return copy.deepcopy(changed)
+
+        def patch(self, *_args, **_kwargs):
+            patches.append(None)
+            return SimpleNamespace(status_code=200, headers={}, json=lambda: {})
+
+        def close(self):
+            pass
+
+    accounts = Mock()
+    accounts.get_bound_account_identity.return_value = row["provider_account_identity"]
+    accounts.get_bound_text_access_token.return_value = "fixture-token"
+    accounts.conversation_binding_lock.side_effect = lambda *_args: nullcontext()
+    monkeypatch.setattr(bindings, "account_service", accounts)
+    monkeypatch.setattr(bindings, "OpenAIBackendAPI", Backend)
+    with pytest.raises(ConversationArchiveCursorMismatch):
+        ConversationBindingService().set_archived({
+            **saved(service), "manual_result": manual,
+            "parent_message_id": manual["parent_message_id"],
+        }, True)
+    assert patches == []
+    assert saved(service)["manual_result"] == manual
 
 
 def test_manual_text_recovery_is_trusted_only_and_preserves_upstream_429(tmp_path, monkeypatch):
