@@ -519,6 +519,36 @@ class AdmissionTests(unittest.TestCase):
                 self.assertTrue(released.wait(2))
             self.assertEqual(AccountRequestClock(key[:12], path).ordinary_read_queue, [])
 
+    def test_preaccept_fifo_diagnostic_keeps_its_future_ticket(self):
+        from services import account_request_pacing as pacing
+        from services.account_request_pacing import AccountRequestClock
+        from services.config import config
+
+        now = [1000.0]
+        account = self.rows[0]
+        key = hashlib.sha256(account["account_id"].encode()).hexdigest()
+        path = self.root / "account_request_clocks" / f"{key}.json"
+        receipt = {"provider_account_identity": account["provider_account_identity"],
+                   "provider_binding_id": "binding-0", "client_conversation_id": "same-original",
+                   "conversation_id": "same-original"}
+        diagnostic = {}
+        with patch.object(pacing, "DATA_DIR", self.root), \
+             patch.object(pacing, "_clocks", {}), \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 90)):
+            clock = AccountRequestClock(key[:12], path)
+            clock.next_conversation_read = now[0] + 90
+            clock._save()
+            self.admission.pacing = None
+            self.assertFalse(self.admission.read_original_if_ready("happy", "same", lambda *_args: None, receipt,
+                                                                   diagnostic=diagnostic))
+            self.assertEqual(diagnostic, {"reason": "clock_not_due", "account_clock_prefix": key[:12],
+                                          "ticket_state": "own", "ticket_retained": True, "fifo_position": 1,
+                                          "read_due_in_ms": 90000})
+            self.assertEqual(len(AccountRequestClock(key[:12], path).ordinary_read_queue), 1)
+
     def test_active_physical_read_does_not_leave_another_receipts_ticket(self):
         from services import account_request_pacing as pacing
         from services.account_request_pacing import AccountRequestClock

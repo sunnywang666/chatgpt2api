@@ -57,7 +57,7 @@ def advanced(product_no_final):
     h.service.recovery_reader = lambda original: {**original, "status": "unknown"}
     # The PoolAdmission fixture uses a synthetic pacing callback, so model the
     # real FIFO's admitted read without changing any advanced-session proof.
-    h.admission.read_original_if_ready = lambda owner, request_id, reader, receipt: reader(owner, request_id)
+    h.admission.read_original_if_ready = lambda owner, request_id, reader, receipt, **_kwargs: reader(owner, request_id)
     return h
 
 
@@ -164,11 +164,40 @@ def test_preaccept_admission_unavailable_creates_no_child(advanced):
     assert row(h.service) == h.old
 
 
+def test_preaccept_deferred_logs_exact_fifo_reason_without_creating_child(advanced, monkeypatch):
+    from services import text_task_service as text_tasks
+
+    h = advanced
+    events = []
+    calls = []
+
+    def admit(_owner, _request_id, _reader, _receipt, *, diagnostic=None):
+        diagnostic.update(reason="fifo_not_head", account_clock_prefix="a" * 12,
+                          ticket_state="own", ticket_retained=True, fifo_position=2)
+        return False
+
+    h.admission.read_original_if_ready = admit
+    h.service.recovery_reader = lambda original: calls.append(original) or {**original, "status": "unknown"}
+    monkeypatch.setattr(text_tasks.logger, "info", events.append)
+
+    with pytest.raises(WorkLifecycleError) as error:
+        h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+
+    assert error.value.code == "CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED"
+    assert calls == []
+    assert events == [{"event": "advanced_preaccept_read_admission", "reason": "fifo_not_head",
+                       "root_ref": hashlib.sha256(b"owner\0old").hexdigest()[:24],
+                       "account_clock_prefix": "a" * 12, "ticket_state": "own",
+                       "ticket_retained": True, "fifo_position": 2}]
+    assert row(h.service, "isolated") is None
+    assert row(h.service) == h.old
+
+
 def test_preaccept_admitted_fresh_proof_submits_once(advanced):
     h = advanced
     admissions, reads = [], []
 
-    def admit(owner, request_id, reader, receipt):
+    def admit(owner, request_id, reader, receipt, **_kwargs):
         admissions.append((owner, request_id, receipt["request_id"]))
         return reader(owner, request_id)
 
@@ -191,7 +220,7 @@ def test_preaccept_read_deadline_creates_no_child(advanced):
     from services.account_request_pacing import AccountRequestDeadlineExceeded
 
     h = advanced
-    h.admission.read_original_if_ready = lambda *_args: (_ for _ in ()).throw(
+    h.admission.read_original_if_ready = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AccountRequestDeadlineExceeded("fixture read deadline"))
 
     with pytest.raises(WorkLifecycleError) as error:
@@ -210,7 +239,7 @@ def test_preaccept_deferred_http_response_has_no_child(advanced, monkeypatch):
     from api import ai
 
     h = advanced
-    h.admission.read_original_if_ready = lambda *_args: False
+    h.admission.read_original_if_ready = lambda *_args, **_kwargs: False
     monkeypatch.setattr(ai, "text_task_service", h.service)
     monkeypatch.setattr(ai, "require_identity", lambda *_a, **_kw: {"role": "admin", "id": "owner"})
     monkeypatch.setattr(ai, "trusted_source", lambda *_a: "internal:listing")
@@ -233,7 +262,7 @@ def test_preaccept_deferred_does_not_claim_global_absence(advanced, monkeypatch)
     submit_prepared = h.service._submit_prepared
     accepted = []
 
-    def concurrent_acceptance(*_args):
+    def concurrent_acceptance(*_args, **_kwargs):
         accepted.append(submit_prepared("owner", body, source="internal:listing"))
         return False
 
