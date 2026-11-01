@@ -317,7 +317,8 @@ def test_http_schema_is_internal_reference_only(retry, monkeypatch):
     service, _, _, _, _, envelope, _, _, _ = retry
     app = FastAPI(); app.include_router(api.create_router())
     monkeypatch.setattr(api, "text_task_service", service)
-    monkeypatch.setattr(api, "require_identity", lambda token: {"id": "owner", "role": "admin" if token == "internal" else "user"})
+    monkeypatch.setattr(api, "require_identity", lambda token, request=None: {
+        "id": "owner", "role": "admin" if token == "internal" else "user"})
     monkeypatch.setattr(api, "require_chat_text_policy", lambda _: None)
     monkeypatch.setattr(api, "trusted_source", lambda *_: SOURCE)
     review = AsyncMock(); monkeypatch.setattr(api, "filter_or_log", review)

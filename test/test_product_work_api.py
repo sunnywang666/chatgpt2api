@@ -1,5 +1,7 @@
 """API/receipt integration with no upstream calls or controller threads."""
 import json
+from contextlib import nullcontext
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -13,7 +15,7 @@ from api.image_inputs import _payload_from_fields
 from services.text_task_service import TextTaskService
 from services.image_task_service import ImageTaskService, _request_hash
 from services.product_work import ProductWorkService
-from services.work_lifecycle import WorkLifecycleError
+from services.work_lifecycle import WorkLifecycleError, WorkLifecycleService
 from test.test_original_operation_budget import local_upstream
 
 
@@ -59,6 +61,178 @@ def test_mixed_acceptance_shares_parent_without_generic_work_or_upstream(service
         image = text.store.read_receipt(db, "image", "owner", "image-1")
         assert text.store.load_input(image["_input_ref"])["payload"]["retain_conversation"] is True
     text.runner.assert_not_called(); images.generation_handler.assert_not_called()
+
+
+def test_manual_text_cursor_can_start_bound_product_image_without_rewriting_unknown_original(services, monkeypatch):
+    text, images, product = services
+    text.submit("owner", text_body(), source=IDENTITY["_trusted_source"])
+    manual = {
+        "status": "succeeded", "source": "manual_followup", "original_request_id": "text-1",
+        "provider_binding_id": "binding", "provider_account_identity": "account",
+        "client_conversation_id": "original-client", "conversation_id": "manual-conversation",
+        "source_request_message_id": "manual-user", "source_message_id": "manual-final",
+        "parent_message_id": "manual-final", "content": "approved title", "adopted_at": 1.0,
+    }
+    with text.store.transaction() as db:
+        original = text.store.read_receipt(db, "text", "owner", "text-1")
+        original.update(status="unknown", upstream_outcome="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                        request_message_id="original-user", request_parent_message_id="root",
+                        provider_binding_id="binding", provider_account_identity="account",
+                        conversation_id="manual-conversation", parent_message_id="original-cursor",
+                        manual_result=manual)
+        text.store.write_receipt(db, "text", "owner", "text-1", original)
+    # Manual-only is an explicit adopted terminal cursor, not a fabricated
+    # original success; ProductWork may close it through a fresh archive read.
+    assert "PRODUCT_WORK_TURN_UNFINISHED" not in product.get(IDENTITY, META["product_ref"])["blocked_reasons"]
+    copy_body = {**text_body("manual-copy", {**META, "step_ref": "copy"}),
+                 **{key: manual[key] for key in (
+                     "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id")},
+                 "parent_message_id": manual["parent_message_id"]}
+    text.submit("owner", copy_body, source=IDENTITY["_trusted_source"])
+    with text.store.transaction() as db:
+        copy = text.store.read_receipt(db, "text", "owner", "manual-copy")
+        copy.update(status="succeeded", upstream_outcome="completed", content="approved copy",
+                    parent_message_id="copy-final", _submission_started=True, _upstream_terminal=True)
+        text.store.write_receipt(db, "text", "owner", "manual-copy", copy)
+    image = images.submit_generation(
+        IDENTITY, client_task_id="manual-main-image", prompt="main image", model="gpt-image-2", size=None,
+        product_work={**META, "step_ref": "main-image"},
+        **{key: manual[key] for key in (
+            "provider_binding_id", "provider_account_identity", "client_conversation_id",
+            "conversation_id")}, parent_message_id="copy-final",
+    )
+    with text.store.connect() as db:
+        original = text.store.read_receipt(db, "text", "owner", "text-1")
+        image_row = text.store.read_receipt(db, "image", "owner", "manual-main-image")
+        saved_payload = text.store.load_input(image_row["_input_ref"])["payload"]
+    assert original["status"] == "unknown" and original["upstream_outcome"] == "unknown"
+    assert original["parent_message_id"] == "original-cursor" and original["manual_result"] == manual
+    assert image["status"] == "queued" and saved_payload["parent_message_id"] == "copy-final"
+    assert saved_payload["conversation_id"] == "manual-conversation"
+    # The generic text tail then image form one strict same-conversation chain.
+    with text.store.transaction() as db:
+        image_row = text.store.read_receipt(db, "image", "owner", "manual-main-image")
+        image_row.update(status="success", upstream_outcome="generated", binding_status="bound",
+                         data=[{"b64_json": "aW1hZ2U="}], upstream_unfinished=False,
+                         parent_message_id="image-final")
+        text.store.write_receipt(db, "image", "owner", "manual-main-image", image_row)
+    closing = product.close(IDENTITY, META["product_ref"], expected_version=1)
+    assert closing["state"] == "closing" and closing["archive"]["pending"] == 1
+    # Exercise the generic archive worker/ack, not only close's pending state.
+    def archive_image(owner, request_id, archived):
+        assert (owner, request_id, archived) == ("owner", "manual-main-image", True)
+        with text.store.connect() as db:
+            row = text.store.read_receipt(db, "image", owner, request_id)
+        assert row["parent_message_id"] == "image-final"
+        return {"request_id": request_id, "conversation_id": "manual-conversation", "archived": True}
+    monkeypatch.setattr(images, "archive_product_work", archive_image)
+    lifecycle = WorkLifecycleService(text, images)
+    assert lifecycle.process_one()
+    done = product.get(IDENTITY, META["product_ref"])
+    assert done["state"] == "completed" and not done["slot_held"] and not done["cleanup_pending"]
+    assert done["archive"] == {"total": 1, "confirmed": 1, "pending": 0}
+    with text.store.connect() as db:
+        after = text.store.read_receipt(db, "text", "owner", "text-1")
+    assert after == original
+
+
+@pytest.mark.parametrize("scenario", ["normal", "lost_readback", "changed_source", "alias_tail"])
+def test_manual_only_product_archive_uses_verified_source_and_recovers_confirmation(services, monkeypatch, scenario):
+    import services.conversation_binding_service as bindings
+    from services.openai_backend_api import OpenAIBackendAPI
+    from services.product_work import record_slot
+    from test.test_stalled_text_diagnostics import manual_followup_document
+
+    text, images, product = services
+    text.submit("owner", text_body(), source=IDENTITY["_trusted_source"])
+    with text.store.transaction() as db:
+        original = text.store.read_receipt(db, "text", "owner", "text-1")
+        original.update(status="unknown", upstream_outcome="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                        request_message_id="original-user", request_parent_message_id="root",
+                        provider_binding_id="binding", provider_account_identity="account",
+                        conversation_id="manual-conversation", parent_message_id="original-cursor")
+        record_slot(text.store, db, original)
+        text.store.write_receipt(db, "text", "owner", "text-1", original)
+    state = SimpleNamespace(document=manual_followup_document(original), patches=0, lose=False)
+    state.document["mapping"]["original-user"]["parent"] = "root"
+
+    class Backend:
+        base_url = "https://fixture.invalid"
+        set_conversation_archived = OpenAIBackendAPI.set_conversation_archived
+        def __init__(self, **_):
+            self.session = SimpleNamespace(patch=self.patch)
+        def _headers(self, _path, headers):
+            return headers
+        def _get_conversation(self, conversation_id, **_):
+            assert conversation_id == "manual-conversation"
+            if state.lose:
+                state.lose = False
+                raise TimeoutError("archive PATCH succeeded; readback interrupted")
+            return deepcopy(state.document)
+        def patch(self, url, **kwargs):
+            assert url.endswith("/conversation/manual-conversation")
+            assert kwargs["json"] == {"is_archived": True}
+            state.patches += 1
+            state.document["is_archived"] = True
+            state.lose = scenario == "lost_readback" and state.patches == 1
+            return SimpleNamespace(status_code=200)
+        def close(self):
+            pass
+
+    accounts = Mock()
+    accounts.get_bound_account_identity.return_value = "account"
+    accounts.get_bound_text_access_token.return_value = "fixture-token"
+    accounts.conversation_binding_lock.side_effect = lambda *_: nullcontext()
+    monkeypatch.setattr(bindings, "account_service", accounts)
+    monkeypatch.setattr(bindings, "OpenAIBackendAPI", Backend)
+    # The real manual service validates the fake transport's document and
+    # writes the result; the test does not inject a trusted manual_result.
+    result = text.recover_manual_followup("owner", "text-1", provider_binding_id="binding",
+        provider_account_identity="account", client_conversation_id="original-client")
+    assert result["manual_result"]["source_message_id"] == "manual-final"
+    with text.store.connect() as db:
+        adopted = text.store.read_receipt(db, "text", "owner", "text-1")
+    if scenario == "alias_tail":
+        foreign = {**text_body("alias-copy", {**META, "step_ref": "alias-copy"}),
+                   "provider_binding_id": "other-binding", "provider_account_identity": "account",
+                   "client_conversation_id": "other-alias", "conversation_id": "manual-conversation",
+                   "parent_message_id": "unrelated-parent"}
+        text.submit("owner", foreign, source=IDENTITY["_trusted_source"])
+        with text.store.transaction() as db:
+            tail = text.store.read_receipt(db, "text", "owner", "alias-copy")
+            tail.update(status="succeeded", upstream_outcome="completed", content="other answer",
+                        parent_message_id="other-final", _upstream_terminal=True)
+            text.store.write_receipt(db, "text", "owner", "alias-copy", tail)
+        with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_TURN_UNFINISHED"):
+            product.close(IDENTITY, META["product_ref"], expected_version=1)
+        assert state.patches == 0
+        return
+    if scenario == "changed_source":
+        state.document["mapping"]["manual-final"]["message"]["content"]["parts"] = ["changed answer"]
+    closing = product.close(IDENTITY, META["product_ref"], expected_version=1)
+    assert closing["state"] == "closing" and closing["slot_held"]
+    clock = [product.clock()]
+    lifecycle = WorkLifecycleService(text, images, clock=lambda: clock[0])
+    assert lifecycle.process_one()
+    current = product.get(IDENTITY, META["product_ref"])
+    if scenario == "changed_source":
+        assert current["state"] == "closing" and current["slot_held"]
+        assert current["archive"]["confirmed"] == 0 and state.patches == 0
+    else:
+        if scenario == "lost_readback":
+            assert current["state"] == "closing" and current["slot_held"]
+            assert current["archive"]["confirmed"] == 0 and state.patches == 1
+            clock[0] += 300
+            # Recreate the worker against the same durable state: its next
+            # precheck confirms the already archived source without PATCH.
+            lifecycle = WorkLifecycleService(text, images, clock=lambda: clock[0])
+            assert lifecycle.process_one()
+        done = product.get(IDENTITY, META["product_ref"])
+        assert done["state"] == "completed" and not done["slot_held"] and not done["cleanup_pending"]
+        assert done["archive"] == {"total": 1, "confirmed": 1, "pending": 0}
+        assert state.patches == 1
+    with text.store.connect() as db:
+        assert text.store.read_receipt(db, "text", "owner", "text-1") == adopted
 
 
 def test_original_ids_remain_idempotent_and_changed_product_conflicts(services):

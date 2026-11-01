@@ -20,7 +20,7 @@ from api.external_images import client_sync_result, validate_external_input, is_
 from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from api.key_policy import require_image_policy, require_chat_text_policy
-from utils.helper import is_image_chat_request, has_response_image_generation_tool
+from utils.helper import UpstreamHTTPError, is_image_chat_request, has_response_image_generation_tool
 from services.content_filter import check_request, request_shape, request_text
 from services.conversation_binding_service import (
     ConversationBindingError,
@@ -199,6 +199,17 @@ class WorkbenchDerivedSuccessorRequest(BaseModel):
 class TextRequestRecoveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     allow_unrecoverable_retry: bool = False
+
+
+class ManualTextRecoveryRequest(BaseModel):
+    """Explicit Workbench adoption authority; all cursor facts remain server-owned."""
+    model_config = ConfigDict(extra="forbid")
+
+    provider_binding_id: str = Field(..., min_length=1, max_length=300)
+    provider_account_identity: str = Field(..., min_length=1, max_length=300)
+    client_conversation_id: str = Field(..., min_length=1, max_length=300)
+    source_request_message_id: str | None = Field(default=None, min_length=1, max_length=300)
+    source_message_id: str | None = Field(default=None, min_length=1, max_length=300)
 
 
 class CodexTextFallbackRequest(BaseModel):
@@ -570,12 +581,17 @@ def create_router() -> APIRouter:
             }) from exc
 
     @router.get("/api/conversation-bindings/text-requests/{request_id}/snapshot")
-    async def snapshot_bound_text_request(request_id: str, response: Response,
+    async def snapshot_bound_text_request(request_id: str, request: Request, response: Response,
                                           authorization: str | None = Header(default=None)):
-        identity = require_identity(authorization)
+        identity = require_identity(authorization, request=request)
         response.headers["Cache-Control"] = "private, no-store"
+        include_manual = (identity.get("role") == "admin"
+                          and trusted_source(identity, request) == "internal:listing"
+                          and getattr(request.state, "company_identity", None) is None
+                          and not is_external(request))
         return await run_in_threadpool(text_task_service.read_snapshot,
-                                       str(identity.get("id") or "anonymous"), request_id)
+                                       str(identity.get("id") or "anonymous"), request_id,
+                                       include_manual_result=include_manual)
 
     @router.post("/api/conversation-bindings/text-requests/{request_id}/recovery-control")
     async def control_bound_text_recovery(request_id: str, body: RecoveryControlRequest, response: Response,
@@ -612,6 +628,40 @@ def create_router() -> APIRouter:
                 "code": "TEXT_RECOVERY_LEASE_BUSY", "retryable": True,
                 "lease_acquired": False, "upstream_read_started": False,
             }) from exc
+
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/manual-recover")
+    async def recover_manual_bound_text_request(
+        request_id: str,
+        body: ManualTextRecoveryRequest,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization, request=request)
+        # The durable lookup below is owner-scoped.  The caller may only state
+        # the bound account identity and optional exact source guards; it can
+        # never select a Provider conversation, content, or retry input.
+        if (identity.get("role") != "admin" or trusted_source(identity, request) != "internal:listing"
+                or getattr(request.state, "company_identity", None) is not None or is_external(request)):
+            raise HTTPException(status_code=404, detail={"code": "TASK_NOT_FOUND"})
+        try:
+            return await run_in_threadpool(
+                text_task_service.recover_manual_followup,
+                str(identity.get("id") or "anonymous"), request_id,
+                provider_binding_id=body.provider_binding_id,
+                provider_account_identity=body.provider_account_identity,
+                client_conversation_id=body.client_conversation_id,
+                source_request_message_id=body.source_request_message_id or "",
+                source_message_id=body.source_message_id or "",
+            )
+        except UpstreamHTTPError as exc:
+            if exc.status_code == 429:
+                retry_after = getattr(exc, "retry_after", None)
+                headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
+                raise HTTPException(status_code=429, detail={"code": "RECOVERY_RATE_LIMITED"},
+                                    headers=headers) from None
+            raise HTTPException(status_code=503, detail={"code": "CONVERSATION_READ_UNAVAILABLE"}) from None
+        except ConversationBindingError as exc:
+            raise HTTPException(status_code=409, detail={"code": exc.code}) from None
 
     @router.post("/api/conversation-bindings/text-requests/{request_id}/codex-fallback")
     async def fallback_bound_text_request(

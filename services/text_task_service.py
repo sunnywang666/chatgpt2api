@@ -66,16 +66,19 @@ def bind_waiting_public_sessions(store, db, receipts):
             continue
         previous = owned.get((owner, receipt.get("_previous_request_id"))) or {}
         reason = "CHAT_PREVIOUS_REQUEST_PENDING"
-        if previous.get("status") == "succeeded" and previous.get("upstream_outcome") != "unknown":
-            if not all(isinstance(previous.get(key), str) and previous[key] for key in fields):
+        manual = TextTaskService._manual_result(previous)
+        cursor = manual or previous
+        if ((previous.get("status") == "succeeded" and previous.get("upstream_outcome") != "unknown")
+                or manual is not None):
+            if not all(isinstance(cursor.get(key), str) and cursor[key] for key in fields):
                 reason = "CHAT_CONTINUATION_UNAVAILABLE"
             elif (receipt.get("_requested_account_identity")
                   and receipt["_requested_account_identity"] != previous["provider_account_identity"]):
                 receipt.update(status="failed", error_code="CHAT_ACCOUNT_SELECTION_CONFLICT", upstream_outcome="not_sent")
                 reason = "CHAT_ACCOUNT_SELECTION_CONFLICT"
             else:
-                receipt.update({key: previous[key] for key in fields})
-                receipt["_submission_parent_message_id"] = previous["parent_message_id"]
+                receipt.update({key: cursor[key] for key in fields})
+                receipt["_submission_parent_message_id"] = cursor["parent_message_id"]
                 receipt.pop("_public_previous_waiting", None)
                 receipt.pop("_public_previous_waiting_reason", None)
                 store.write_receipt(db, kind, owner, request_id, receipt)
@@ -193,6 +196,7 @@ class TextTaskService:
         "boot", "recovery_claim_id", "recovery_claimed_at", "recovery_lease_until",
         RECOVERY_CONVERSATION_SCAN_FIELD, RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
         NON_TEXT_RESULT_FIELD,
+        "manual_result",
     })
     _SAFE_RECOVERY_CODES = frozenset({
         "CONVERSATION_BINDING_UNAVAILABLE",
@@ -233,6 +237,83 @@ class TextTaskService:
         "RECOVERY_TRANSPORT_FAILED", "RECOVERY_RATE_LIMITED",
         "RECOVERY_AUTH_REQUIRED", "RECOVERY_READ_FAILED",
     })
+
+    @staticmethod
+    def _manual_result(receipt):
+        """Return the separately adopted cursor without changing original fact."""
+        value = receipt.get("manual_result") if isinstance(receipt, dict) else None
+        if not isinstance(value, dict) or set(value) != {
+            "status", "source", "original_request_id", "provider_binding_id",
+            "provider_account_identity", "client_conversation_id", "conversation_id",
+            "source_request_message_id", "source_message_id", "parent_message_id",
+            "content", "adopted_at",
+        }:
+            return None
+        if value.get("status") != "succeeded" or value.get("source") != "manual_followup":
+            return None
+        if value.get("original_request_id") != receipt.get("request_id"):
+            return None
+        if any(not isinstance(value.get(key), str) or not value[key].strip() for key in (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id",
+                "conversation_id", "source_request_message_id", "source_message_id",
+                "parent_message_id", "content")):
+            return None
+        if value["parent_message_id"] != value["source_message_id"]:
+            return None
+        if any(value.get(key) != receipt.get(key) for key in (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id")):
+            return None
+        adopted_at = value.get("adopted_at")
+        if (type(adopted_at) not in {int, float} or not math.isfinite(adopted_at) or adopted_at <= 0):
+            return None
+        return value
+
+    @classmethod
+    def _manual_recovery_eligible(cls, receipt):
+        """The manual cursor supplements one UNKNOWN original; it never replaces it."""
+        return bool(
+            receipt.get("status") in {"unknown", "failed"}
+            and receipt.get("upstream_outcome") == "unknown"
+            and receipt.get("status") != "succeeded"
+            and (not isinstance(receipt.get("content"), str) or not receipt["content"].strip())
+            and not any(receipt.get(key) for key in (
+                "_executing", "_claim_id", "recovery_claim_id", "_recovery_claim_id",
+            ))
+            and all(isinstance(receipt.get(key), str) and receipt[key].strip() for key in (
+                "request_id", "request_message_id", "provider_binding_id",
+                "provider_account_identity", "client_conversation_id", "conversation_id"))
+        )
+
+    @staticmethod
+    def _manual_original_status(receipt):
+        """Keep the explicit adoption response aligned with task-result-v1."""
+        if receipt.get("upstream_outcome") == "unknown" and receipt.get("status") in {"failed", "unknown"}:
+            return "unknown"
+        return receipt.get("status")
+
+    @staticmethod
+    def _manual_source_is_owned_elsewhere(store, db, owner, request_id, original, source):
+        """A later Provider task cannot be relabelled as a manual follow-up."""
+        for kind, other_owner, other_id, other in store.receipts(db):
+            if kind not in {"text", "image"} or (kind == "text" and other_owner == owner and other_id == request_id):
+                continue
+            # Owner-scoped lookup prevents disclosure, but Provider source
+            # ownership is global to its concrete account/conversation.
+            if other_owner != owner and any(other.get(key) != original.get(key) for key in (
+                    "provider_account_identity", "conversation_id")):
+                continue
+            if other.get("request_message_id") == source["source_request_message_id"]:
+                return True
+            if other.get("parent_message_id") == source["source_message_id"] or (
+                    other.get("_submission_parent_message_id") == source["source_message_id"]):
+                return True
+            existing = TextTaskService._manual_result(other) if kind == "text" else None
+            if existing and (
+                existing["source_request_message_id"] == source["source_request_message_id"]
+                or existing["source_message_id"] == source["source_message_id"]
+            ):
+                return True
+        return False
     _RECONCILED_QUEUED_SUCCESSOR = "_reconciled_queued_successor"
     _RECONCILED_ATTEMPT_STEP = "_reconciled_attempt_step"
     _RECONCILE_LINK_FIELDS = (
@@ -2133,13 +2214,20 @@ class TextTaskService:
                     "client_conversation_id", "conversation_id", "parent_message_id")
         if not receipt or any(not receipt.get(k) for k in required):
             raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_CURSOR_UNAVAILABLE")
-        conversation_binding_service.set_archived(receipt, archived)
+        manual = self._manual_result(receipt)
+        # Do not rewrite the UNKNOWN original.  The durable manual adoption is
+        # a separately fenced head; set_archived rechecks this exact cursor
+        # before the irreversible archive PATCH.
+        cursor_receipt = ({**receipt, "parent_message_id": manual["parent_message_id"]}
+                          if manual is not None else receipt)
+        conversation_binding_service.set_archived(cursor_receipt, archived)
         return {"request_id": request_id, "conversation_id": receipt["conversation_id"], "archived": archived}
 
     def restore_public_session(self, owner: str, request_id: str) -> dict[str, object]:
         return self.set_public_session_archived(owner, request_id, False)
 
-    def read_snapshot(self, owner: str, request_id: str, *, _deferred_original_read=False):
+    def read_snapshot(self, owner: str, request_id: str, *, _deferred_original_read=False,
+                      include_manual_result=False):
         """Return the persisted original without joining its recovery work.
 
         PoolAdmission owns automatic original-result recovery independently of
@@ -2161,11 +2249,105 @@ class TextTaskService:
             now = self._now()
             self._correct_historical_codex_request_rejection(receipt, now)
             result = self._local_read_projection(db, owner, row[0], receipt, now)
+            if include_manual_result:
+                result["manual_result"] = self._manual_result(receipt)
             if (_deferred_original_read and self._normal_sent_chat_result_recovery(receipt)
                     and not receipt.get("_recovery_paused") and not receipt.get("_recovery_suppressed")
                     and self._recovery_due(receipt, now)):
                 result["recovery_deferred"] = True
             return result
+
+    def recover_manual_followup(
+        self, owner: str, request_id: str, *, provider_binding_id: str,
+        provider_account_identity: str, client_conversation_id: str,
+        source_request_message_id: str = "", source_message_id: str = "",
+    ) -> dict[str, object]:
+        """Persist one user-authorized later text result beside an UNKNOWN root.
+
+        Network observation is deliberately outside the SQLite transaction;
+        the final writer rechecks the immutable original identity and outcome.
+        This keeps an original final (or another adopted source) authoritative.
+        """
+        supplied = tuple(str(value or "").strip() for value in (
+            provider_binding_id, provider_account_identity, client_conversation_id,
+        ))
+        if not all(supplied):
+            raise ConversationBindingError("complete conversation authority is required",
+                                           code="CHAT_MANUAL_RECOVERY_AUTHORITY_REQUIRED")
+        expected_user = str(source_request_message_id or "").strip()
+        expected_final = str(source_message_id or "").strip()
+        with self.store.transaction() as db:
+            original = self.store.read_receipt(db, "text", owner, request_id)
+            if original is None:
+                raise ConversationBindingError("request not found", code="CHAT_REQUEST_NOT_FOUND")
+            stored = tuple(str(original.get(key) or "").strip() for key in (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id",
+            ))
+            existing = self._manual_result(original)
+            if existing is not None:
+                if ((not expected_user or expected_user == existing["source_request_message_id"])
+                        and (not expected_final or expected_final == existing["source_message_id"])
+                        and stored == supplied):
+                    return {"request_id": request_id, "original_status": self._manual_original_status(original),
+                            "manual_result": existing}
+                raise ConversationBindingError("a different manual follow-up is already adopted",
+                                               code="CHAT_MANUAL_RECOVERY_CONFLICT")
+            if original.get("status") == "succeeded":
+                return {"request_id": request_id, "original_status": "succeeded", "manual_result": None}
+            if stored != supplied:
+                raise ConversationBindingError("conversation authority does not match the original request",
+                                               code="CONVERSATION_BINDING_MISMATCH")
+            if not self._manual_recovery_eligible(original):
+                raise ConversationBindingError("original request is not eligible for manual follow-up adoption",
+                                               code="CHAT_MANUAL_RECOVERY_NOT_ELIGIBLE")
+            expected = {key: original.get(key) for key in (
+                "status", "upstream_outcome", "content", "request_message_id", "request_parent_message_id",
+                "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id",
+            )}
+
+        source = conversation_binding_service.read_manual_text_followup(
+            original,
+            provider_binding_id=supplied[0], provider_account_identity=supplied[1],
+            client_conversation_id=supplied[2], source_request_message_id=expected_user,
+            source_message_id=expected_final,
+        )
+        with self.store.transaction() as db:
+            current = self.store.read_receipt(db, "text", owner, request_id)
+            if current is None:
+                raise ConversationBindingError("request not found", code="CHAT_REQUEST_NOT_FOUND")
+            existing = self._manual_result(current)
+            if existing is not None:
+                if (existing["source_request_message_id"] == source["source_request_message_id"]
+                        and existing["source_message_id"] == source["source_message_id"]):
+                    return {"request_id": request_id, "original_status": self._manual_original_status(current),
+                            "manual_result": existing}
+                raise ConversationBindingError("a different manual follow-up is already adopted",
+                                               code="CHAT_MANUAL_RECOVERY_CONFLICT")
+            if current.get("status") == "succeeded":
+                return {"request_id": request_id, "original_status": "succeeded", "manual_result": None}
+            if (not self._manual_recovery_eligible(current)
+                    or any(current.get(key) != value for key, value in expected.items())):
+                raise ConversationBindingError("original request changed during manual recovery",
+                                               code="CHAT_MANUAL_RECOVERY_CHANGED")
+            if self._manual_source_is_owned_elsewhere(self.store, db, owner, request_id, current, source):
+                raise ConversationBindingError("manual follow-up belongs to another Provider request",
+                                               code="CHAT_MANUAL_RECOVERY_OWNED_SOURCE")
+            manual_result = {
+                "status": "succeeded", "source": "manual_followup", "original_request_id": request_id,
+                "provider_binding_id": supplied[0], "provider_account_identity": supplied[1],
+                "client_conversation_id": supplied[2], "conversation_id": source["conversation_id"],
+                "source_request_message_id": source["source_request_message_id"],
+                "source_message_id": source["source_message_id"],
+                "parent_message_id": source["parent_message_id"], "content": source["content"],
+                "adopted_at": self._now(),
+            }
+            # One atomic receipt write: a disk failure leaves no adopted claim
+            # and does not change the original UNKNOWN status/result.
+            updated = dict(current)
+            updated["manual_result"] = manual_result
+            self.store.write_receipt(db, "text", owner, request_id, updated)
+            return {"request_id": request_id, "original_status": self._manual_original_status(current),
+                    "manual_result": manual_result}
 
     def _local_read_projection(self, db, owner, request_hash, receipt, now):
         result = self._public_with_product_cancellation(db, owner, request_hash, receipt)
@@ -4930,7 +5112,8 @@ class TextTaskService:
                     reject("COMPLETION_ORIGINAL_CURSOR_UNCONFIRMED")
             if terminal_empty and (not evidence or previous.get("model") != receipt.get("model")):
                 reject("CHAT_TERMINAL_EMPTY_UNVERIFIED")
-            if previous.get("status") != "succeeded" and not evidence:
+            manual = self._manual_result(previous)
+            if previous.get("status") != "succeeded" and not evidence and manual is None:
                 if (self.admission is not None and previous.get("status") in {"queued", "running"}
                         and previous.get("_public_session_ref") and not terminal_empty
                         and previous.get("upstream_outcome") != "unknown"):
@@ -4940,13 +5123,14 @@ class TextTaskService:
                     return
                 reject("CHAT_PREVIOUS_REQUEST_PENDING")
             anchors = ("provider_binding_id", "provider_account_identity", "conversation_id")
-            if not all(isinstance(previous.get(key), str) and previous[key] for key in anchors):
+            cursor = manual or previous
+            if not all(isinstance(cursor.get(key), str) and cursor[key] for key in anchors):
                 reject("CHAT_CONTINUATION_UNAVAILABLE")
             if (receipt.get("_requested_account_identity")
-                    and receipt["_requested_account_identity"] != previous["provider_account_identity"]):
+                    and receipt["_requested_account_identity"] != cursor["provider_account_identity"]):
                 reject("CHAT_ACCOUNT_SELECTION_CONFLICT")
-            receipt.update({key: previous[key] for key in anchors})
-            parent = evidence["retry_parent_message_id"] if evidence else previous.get("parent_message_id")
+            receipt.update({key: cursor[key] for key in anchors})
+            parent = evidence["retry_parent_message_id"] if evidence else cursor.get("parent_message_id")
             if not isinstance(parent, str) or not parent:
                 reject("CHAT_CONTINUATION_UNAVAILABLE")
             receipt["parent_message_id"] = parent
