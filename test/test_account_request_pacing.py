@@ -733,6 +733,31 @@ class ProductionOrdinaryReadEdgeTests(unittest.TestCase):
         self.assertLess(self.sent[-1][2], 10005)
         self.assertEqual(self.clock.ordinary_read_queue, [])
 
+    def test_archive_waiter_reloads_another_clock_instances_early_ordinary_release(self):
+        """The ProcessMutex reload after a bounded wait observes another worker's release."""
+        from services.request_context import guarding_archive
+        holder = AccountRequestClock("holder", self.clock.state_path)
+        with holder.lock:
+            holder.last_read_was_archive = True
+            self.assertTrue(holder._ordinary_read_turn("original-reader", self.now[0], 60))
+            holder._save()
+        waiter = AccountRequestClock("waiter", self.clock.state_path)
+
+        def release_from_other_clock(delay):
+            self.assertLessEqual(delay, 1.0)
+            releaser = AccountRequestClock("releaser", self.clock.state_path)
+            with releaser.lock:
+                releaser._release_ordinary_read("original-reader")
+            self.advance(delay)
+
+        with guarding_archive(lambda: None, read_owner="archive-next"), \
+             patch("services.account_request_pacing.time.sleep", side_effect=release_from_other_clock):
+            waiter.request(self.send, "GET", "https://provider/backend-api/conversation/archive-next",
+                           _account_request_deadline_monotonic=self.now[0] + 5)
+
+        self.assertEqual(self.sent, [("GET", "archive-next", 10001.0)])
+        self.assertEqual(waiter.ordinary_read_queue, [])
+
     def test_archive_read_rechecks_without_overtaking_other_archive_owner(self):
         """A different archive ticket is dynamic, but its current owner goes first."""
         from services.request_context import guarding_archive
