@@ -1247,7 +1247,7 @@ def _clock_for_account(identity):
     return key, clock
 
 
-def reserve_account_original_read(account, owner, *, allow_new=True):
+def reserve_account_original_read(account, owner, *, allow_new=True, diagnostic=None):
     """Book one due original read in the existing ordinary-read FIFO.
 
     The caller does not receive a worker slot until this ticket is first and
@@ -1258,18 +1258,26 @@ def reserve_account_original_read(account, owner, *, allow_new=True):
     reach its send edge, but another lane cannot book a later ticket before
     the next scan re-applies scheduling priority.
     """
+    def deferred(reason, **fields):
+        # This optional projection is used only by the advanced successor's
+        # preaccept caller. It observes this exact lock decision; it never
+        # changes the durable FIFO, clock, or return value.
+        if isinstance(diagnostic, dict):
+            diagnostic.update(reason=reason, **fields)
+        return False
+
     identity = str(account.get("account_id") or account.get("provider_account_identity") or account.get("access_token") or "")
     if not identity or not isinstance(owner, str) or not owner.startswith(_ORIGINAL_READ_OWNER_PREFIX):
-        return False
+        return deferred("ticket_invalid")
     try:
         # Retain the dispatcher's strict, read-only validation.  A future clock
         # can reserve a FIFO position, but an unreadable clock cannot book one.
         if account_pacing_snapshot(account, include_turn=False,
                                    include_conversation_read=True)["next_at"] is None:
-            return False
-        _, clock = _clock_for_account(identity)
+            return deferred("clock_invalid")
+        key, clock = _clock_for_account(identity)
         if not clock.lock.acquire(blocking=False):
-            return False
+            return deferred("clock_lock_busy", account_clock_prefix=key[:12])
         try:
             now = time.monotonic()
             queue = [entry for entry in clock.ordinary_read_queue if entry["until"] > now]
@@ -1281,17 +1289,31 @@ def reserve_account_original_read(account, owner, *, allow_new=True):
                           if entry["owner"].startswith(_ORIGINAL_READ_OWNER_PREFIX)
                           and entry["owner"] != owner), None)
             if other is not None:
-                return False
+                return deferred("fifo_other", account_clock_prefix=key[:12], ticket_state="other",
+                                ticket_retained=False)
             own = next((entry for entry in queue if entry["owner"] == owner), None)
             if own is None and not allow_new:
-                return False
+                return deferred("scan_blocked", account_clock_prefix=key[:12], ticket_state="none",
+                                ticket_retained=False)
             ready = max(clock.next_request, clock.cooldown_until, clock._read_ready(now))
             first = clock._ordinary_read_turn(owner, now, max(0.0, ready - now))
-            return first and ready <= now
+            if not first:
+                position = next((index + 1 for index, entry in enumerate(clock.ordinary_read_queue)
+                                 if entry["owner"] == owner), None)
+                return deferred("fifo_not_head", account_clock_prefix=key[:12], ticket_state="own",
+                                ticket_retained=True, fifo_position=position)
+            if isinstance(ready, (int, float)) and math.isfinite(ready) and ready <= now:
+                return True
+            if isinstance(ready, (int, float)) and math.isfinite(ready):
+                return deferred("clock_not_due", account_clock_prefix=key[:12], ticket_state="own",
+                                ticket_retained=True, fifo_position=1,
+                                read_due_in_ms=min(300000, max(0, int(round((ready - now) * 1000)))))
+            return deferred("clock_invalid", account_clock_prefix=key[:12], ticket_state="own",
+                            ticket_retained=True, fifo_position=1)
         finally:
             clock.lock.release()
     except (OSError, ValueError, TypeError, KeyError, OverflowError, AttributeError):
-        return False
+        return deferred("clock_unavailable")
 
 
 def release_account_original_read(account, owner):

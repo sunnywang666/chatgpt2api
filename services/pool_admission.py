@@ -1010,9 +1010,18 @@ class PoolAdmission:
             if self._stop.wait(1.0):
                 return
 
-    def _acquire_original_read(self, kind, owner, request_id, receipt, *, require_text_reservation=False):
-        if self._stop.is_set():
+    def _acquire_original_read(self, kind, owner, request_id, receipt, *, require_text_reservation=False,
+                               diagnostic=None):
+        def deferred(reason, **fields):
+            # Optional advanced-preaccept diagnostics only observe this exact
+            # branch. Background recovery leaves `diagnostic` unset and emits
+            # nothing; admission semantics remain the existing return values.
+            if isinstance(diagnostic, dict):
+                diagnostic.update(reason=reason, **fields)
             return False
+
+        if self._stop.is_set():
+            return deferred("stopped")
         # Do not fill the local workers with known pacing waits. The transport
         # still checks the same persisted clock immediately before its GET.
         with self._account_guard():
@@ -1021,6 +1030,8 @@ class PoolAdmission:
         if require_text_reservation and (
                 self.pacing is not None or account is None or account.get("managed_disabled")
                 or account.get("status") in {"禁用", "异常"}):
+            if isinstance(diagnostic, dict):
+                diagnostic["reason"] = ("configured_pacing" if self.pacing is not None else "account_unavailable")
             return NotImplemented
         read_owner = "original-result:" + hashlib.sha256(
             (self._original_read_ticket_nonce + "\0" + kind + "\0" + owner + "\0" + request_id).encode()
@@ -1042,11 +1053,11 @@ class PoolAdmission:
             # Check before booking: another receipt for this physical read
             # must not leave an unused FIFO head after the active GET starts.
             if key in self._original_reads:
-                return False
+                return deferred("physical_read_inflight")
             if account is not None:
                 if account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
                     release_read_ticket()
-                    return False
+                    return deferred("account_unavailable", ticket_retained=False)
                 if reserve_text_read:
                     from services.account_request_pacing import reserve_account_original_read
                     # Nonblocking account lock; no reader slot is held until
@@ -1056,7 +1067,8 @@ class PoolAdmission:
                                    or f"{kind}:{owner}:{request_id}")
                     if not reserve_account_original_read(
                             account, read_owner,
-                            allow_new=scan_blocked is None or account_key not in scan_blocked):
+                            allow_new=scan_blocked is None or account_key not in scan_blocked,
+                            diagnostic=diagnostic):
                         if scan_blocked is not None:
                             scan_blocked.add(account_key)
                         return False
@@ -1071,10 +1083,10 @@ class PoolAdmission:
                         pacing = account_pacing_snapshot(account, now, include_turn=False,
                                                          include_conversation_read=True)
                     if pacing.get("next_at") is None or pacing["next_at"] > now:
-                        return False
+                        return deferred("clock_not_due")
             if not self._original_read_slots.acquire(blocking=False):
                 release_read_ticket()
-                return False
+                return deferred("local_slot_busy", ticket_retained=False)
             self._original_reads.add(key)
 
         def release():
@@ -1094,7 +1106,7 @@ class PoolAdmission:
         finally:
             release()
 
-    def read_original_if_ready(self, owner, request_id, function, receipt):
+    def read_original_if_ready(self, owner, request_id, function, receipt, *, diagnostic=None):
         """Explicit reads share background FIFO admission before claiming work.
 
         False means deferred without touching the receipt. NotImplemented
@@ -1102,7 +1114,8 @@ class PoolAdmission:
         cannot pre-admit. A dormant FIFO ticket belongs to the original, so a
         deferred caller must leave it for the background dispatcher to adopt.
         """
-        permit = self._acquire_original_read("text", owner, request_id, receipt, require_text_reservation=True)
+        permit = self._acquire_original_read("text", owner, request_id, receipt, require_text_reservation=True,
+                                             diagnostic=diagnostic)
         if permit is NotImplemented:
             return NotImplemented
         if not permit:

@@ -43,8 +43,9 @@ from services.conversation_binding_service import (
 
 
 from services.task_store import TaskStore, recovery_control, send_hold_control
-from services.request_context import current_request, AdmissionLost
+from services.request_context import current_request, AdmissionLost, safe_account_ref
 from services.account_service import account_service
+from utils.log import logger
 from utils.upstream_error import safe_upstream_response_ids
 
 
@@ -3004,8 +3005,38 @@ class TextTaskService:
                 from services.account_request_pacing import AccountRequestDeadlineExceeded
                 from services.work_lifecycle import WorkLifecycleError
 
+                # Keep the public 503 contract intentionally opaque. This
+                # bounded stdout projection is for the one advanced preaccept
+                # read only; it carries no account identity, ticket owner,
+                # request body, URL, or credential.
+                def log_preaccept_deferred(reason, diagnostic=None):
+                    allowed = {
+                        "admission_unavailable", "stopped", "account_unavailable", "configured_pacing",
+                        "physical_read_inflight", "ticket_invalid", "clock_invalid", "clock_unavailable",
+                        "clock_lock_busy", "fifo_other", "scan_blocked", "fifo_not_head", "clock_not_due",
+                        "local_slot_busy", "preaccept_read_deadline",
+                    }
+                    fields = {"event": "advanced_preaccept_read_admission", "reason": reason if reason in allowed
+                              else "admission_unavailable", "root_ref": safe_account_ref(owner + "\0" + request_id)}
+                    observed = diagnostic if isinstance(diagnostic, dict) else {}
+                    prefix = observed.get("account_clock_prefix")
+                    if isinstance(prefix, str) and len(prefix) == 12 and all(char in "0123456789abcdef" for char in prefix):
+                        fields["account_clock_prefix"] = prefix
+                    if observed.get("ticket_state") in {"none", "own", "other"}:
+                        fields["ticket_state"] = observed["ticket_state"]
+                    if isinstance(observed.get("ticket_retained"), bool):
+                        fields["ticket_retained"] = observed["ticket_retained"]
+                    position = observed.get("fifo_position")
+                    if isinstance(position, int) and not isinstance(position, bool) and 0 < position <= 8:
+                        fields["fifo_position"] = position
+                    due = observed.get("read_due_in_ms")
+                    if isinstance(due, int) and not isinstance(due, bool) and 0 <= due <= 300000:
+                        fields["read_due_in_ms"] = due
+                    logger.info(fields)
+
                 admit = getattr(self.admission, "read_original_if_ready", None)
                 if not callable(admit):
+                    log_preaccept_deferred("admission_unavailable")
                     raise WorkLifecycleError("CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED", 503)
 
                 def read_fresh_original(_owner, _request_id):
@@ -3016,14 +3047,17 @@ class TextTaskService:
                         raise RuntimeError("advanced original read admission changed")
                     return self.recovery_reader(original)
 
+                diagnostic = {}
                 try:
-                    fresh = admit(owner, request_id, read_fresh_original, original)
+                    fresh = admit(owner, request_id, read_fresh_original, original, diagnostic=diagnostic)
                 except AccountRequestDeadlineExceeded:
                     # This occurred before this invocation reaches
                     # _submit_prepared.  It is not evidence about a concurrent
                     # same-ID invocation's durable child or upstream send.
+                    log_preaccept_deferred("preaccept_read_deadline", diagnostic)
                     raise WorkLifecycleError("CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED", 503) from None
                 if fresh is False or fresh is NotImplemented:
+                    log_preaccept_deferred(diagnostic.get("reason", "admission_unavailable"), diagnostic)
                     raise WorkLifecycleError("CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED", 503)
                 # Acceptance revalidates the unchanged durable proof afterwards.
                 check_fresh_read(fresh, original, body["_advanced_session"])
