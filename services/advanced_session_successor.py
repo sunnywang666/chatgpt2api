@@ -236,6 +236,84 @@ def public_proof(receipt):
             "conversation_id": receipt.get("conversation_id")}
 
 
+def reuse_allocated_child_binding(body, receipt):
+    """Attach one pre-send allocation to an execution copy, never the input."""
+    proof = receipt.get(FIELD)
+    if not isinstance(proof, dict) or proof.get("protocol") != PROTOCOL:
+        reject()
+    binding = receipt.get("provider_binding_id")
+    account = receipt.get("provider_account_identity")
+    conversation = receipt.get("conversation_id")
+    parent = receipt.get("parent_message_id")
+    if not binding:
+        if conversation or parent:
+            reject()
+        return body
+    if (not isinstance(binding, str) or not binding or account != proof.get("original_account_identity")
+            or receipt.get("_submission_started") is not False or conversation or parent
+            or body.get("provider_binding_id") not in (None, "", binding)
+            or body.get("provider_account_identity") != account
+            or body.get("conversation_id") or body.get("parent_message_id")):
+        reject()
+    # A retry may reuse an allocated binding before any conversation exists.
+    # Do not write this server-owned allocation into the frozen input body.
+    return {**body, "provider_binding_id": binding, "provider_account_identity": account}
+
+
+def validate_child_allocation_update(receipt, changes):
+    """Permit child cursor allocation once; never silently replace it."""
+    proof = receipt.get(FIELD)
+    if not isinstance(proof, dict) or proof.get("protocol") != PROTOCOL:
+        return
+    if not isinstance(changes, dict):
+        reject()
+    expected_account = proof.get("original_account_identity")
+    if receipt.get("provider_account_identity") != expected_account:
+        reject()
+    if "provider_account_identity" in changes and changes["provider_account_identity"] != expected_account:
+        reject()
+    expected_client = proof.get("child_client_conversation_id")
+    if receipt.get("client_conversation_id") != expected_client:
+        reject()
+    if "client_conversation_id" in changes and changes["client_conversation_id"] != expected_client:
+        reject()
+    for field, original_field in (("provider_binding_id", "original_binding_id"),
+                                  ("conversation_id", "original_conversation_id")):
+        current = receipt.get(field)
+        incoming = changes.get(field) if field in changes else current
+        if current:
+            if incoming != current:
+                reject()
+        elif incoming:
+            if not isinstance(incoming, str) or incoming == proof.get(original_field):
+                reject()
+        elif field in changes and incoming != current:
+            reject()
+    resulting_binding = changes.get("provider_binding_id", receipt.get("provider_binding_id"))
+    resulting_conversation = changes.get("conversation_id", receipt.get("conversation_id"))
+    if resulting_conversation and not resulting_binding:
+        reject()
+
+
+def child_failure_cursor(receipt, exc):
+    """Retain a matching post-send cursor without allocating from an error."""
+    if (not receipt.get("provider_binding_id")
+            or getattr(exc, "provider_binding_id", None) != receipt["provider_binding_id"]
+            or getattr(exc, "provider_account_identity", None) != receipt.get("provider_account_identity")):
+        return {}
+    cursor = {key: getattr(exc, key) for key in (
+        "provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id",
+    ) if getattr(exc, key, None)}
+    if (cursor.get("conversation_id") and receipt.get("_submission_started") is not True
+            or cursor.get("parent_message_id") and not cursor.get("conversation_id")):
+        return {}
+    try:
+        validate_child_allocation_update(receipt, cursor)
+    except ConversationBindingError:
+        return {}
+    return cursor
+
+
 def prepare_receipt(store, db, owner, body, receipt, now):
     from services.text_task_service import TextTaskService as Text
     proof = body.get(FIELD)
