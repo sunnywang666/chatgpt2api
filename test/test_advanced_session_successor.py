@@ -9,6 +9,7 @@ from services.advanced_session_successor import FIELD, MODE, validate_successor
 from services.conversation_binding_service import ConversationBindingError
 from services.product_work import _key
 from services.text_task_service import TextTaskService
+from services.work_lifecycle import WorkLifecycleError
 from test.test_no_final_successor import product_no_final
 from test.test_explicit_unknown_successor import row
 
@@ -54,6 +55,9 @@ def advanced(product_no_final):
                         "result_sha256": hashlib.sha256(gallery["content"].encode()).hexdigest()}}
     h.payload["messages"][0]["content"][0]["text"] = "Full replacement instruction\n" + gallery["content"]
     h.service.recovery_reader = lambda original: {**original, "status": "unknown"}
+    # The PoolAdmission fixture uses a synthetic pacing callback, so model the
+    # real FIFO's admitted read without changing any advanced-session proof.
+    h.admission.read_original_if_ready = lambda owner, request_id, reader, receipt: reader(owner, request_id)
     return h
 
 
@@ -142,6 +146,253 @@ def test_submit_is_atomic_unique_and_idempotent(advanced):
         h.service.submit_workbench_derived_input("owner", "old", different, source="internal:listing")
     assert row(h.service, "second-isolated") is None
     assert row(h.service) == h.old
+
+
+def test_preaccept_admission_unavailable_creates_no_child(advanced):
+    h = advanced
+    calls = []
+    h.service.recovery_reader = lambda original: calls.append(original) or {**original, "status": "unknown"}
+    h.service.admission = None
+
+    with pytest.raises(WorkLifecycleError) as error:
+        h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+
+    assert error.value.code == "CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED"
+    assert error.value.status == 503
+    assert calls == []
+    assert row(h.service, "isolated") is None
+    assert row(h.service) == h.old
+
+
+def test_preaccept_admitted_fresh_proof_submits_once(advanced):
+    h = advanced
+    admissions, reads = [], []
+
+    def admit(owner, request_id, reader, receipt):
+        admissions.append((owner, request_id, receipt["request_id"]))
+        return reader(owner, request_id)
+
+    def fresh(original):
+        reads.append(original["request_id"])
+        return {**original, "status": "unknown"}
+
+    h.admission.read_original_if_ready = admit
+    h.service.recovery_reader = fresh
+    result = h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+
+    assert result["status"] == "queued"
+    assert admissions == [("owner", "old", "old")]
+    assert reads == ["old"]
+    assert row(h.service, "isolated")["_submission_started"] is False
+    assert row(h.service) == h.old
+
+
+def test_preaccept_read_deadline_creates_no_child(advanced):
+    from services.account_request_pacing import AccountRequestDeadlineExceeded
+
+    h = advanced
+    h.admission.read_original_if_ready = lambda *_args: (_ for _ in ()).throw(
+        AccountRequestDeadlineExceeded("fixture read deadline"))
+
+    with pytest.raises(WorkLifecycleError) as error:
+        h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+
+    assert error.value.code == "CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED"
+    assert error.value.status == 503
+    assert row(h.service, "isolated") is None
+    assert row(h.service) == h.old
+
+
+def test_preaccept_deferred_http_response_has_no_child(advanced, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from unittest.mock import AsyncMock
+    from api import ai
+
+    h = advanced
+    h.admission.read_original_if_ready = lambda *_args: False
+    monkeypatch.setattr(ai, "text_task_service", h.service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_a, **_kw: {"role": "admin", "id": "owner"})
+    monkeypatch.setattr(ai, "trusted_source", lambda *_a: "internal:listing")
+    monkeypatch.setattr(ai, "filter_or_log", AsyncMock())
+    app = FastAPI()
+    app.include_router(ai.create_router())
+
+    with TestClient(app) as client:
+        response = client.post("/api/conversation-bindings/text-requests/old/derived-successor", json=h.payload)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED"}}
+    assert row(h.service, "isolated") is None
+    assert row(h.service) == h.old
+
+
+def test_preaccept_deferred_does_not_claim_global_absence(advanced, monkeypatch):
+    h = advanced
+    body = h.service.prepare_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+    submit_prepared = h.service._submit_prepared
+    accepted = []
+
+    def concurrent_acceptance(*_args):
+        accepted.append(submit_prepared("owner", body, source="internal:listing"))
+        return False
+
+    h.admission.read_original_if_ready = concurrent_acceptance
+    with pytest.raises(WorkLifecycleError) as error:
+        h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+
+    assert error.value.code == "CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED"
+    assert row(h.service, "isolated") is not None
+    # A subsequent identical request must return the durable concurrent receipt
+    # without attempting another submit/send boundary.
+    monkeypatch.setattr(h.service, "_submit_prepared", lambda *_a, **_kw: pytest.fail("submitted twice"))
+    assert h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing") == accepted[0]
+
+
+def test_concurrent_same_id_conflict_is_revalidated_before_existing_return(advanced, monkeypatch):
+    h = advanced
+    conflicting = {**h.payload, "model": "different-fixture-model"}
+    conflicting_body = h.service.prepare_workbench_derived_input(
+        "owner", "old", conflicting, source="internal:listing")
+    prepare = h.service.prepare_workbench_derived_input
+    submit_prepared = h.service._submit_prepared
+    inserted = False
+
+    def prepare_then_concurrently_accept(owner, request_id, payload, *, source):
+        nonlocal inserted
+        body = prepare(owner, request_id, payload, source=source)
+        if not inserted and payload is h.payload:
+            inserted = True
+            submit_prepared("owner", conflicting_body, source="internal:listing")
+        return body
+
+    monkeypatch.setattr(h.service, "prepare_workbench_derived_input", prepare_then_concurrently_accept)
+    with pytest.raises(ConversationBindingError) as error:
+        h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+
+    assert error.value.code == "CONVERSATION_REQUEST_CONFLICT"
+    assert row(h.service, "isolated")["model"] == "different-fixture-model"
+    assert row(h.service) == h.old
+
+
+def test_acceptance_observation_absent_is_local_only(advanced):
+    h = advanced
+    h.service.recovery_reader = lambda _original: pytest.fail("acceptance observation read upstream")
+
+    observed = h.service.observe_workbench_derived_acceptance(
+        "owner", "old", h.payload, source="internal:listing")
+
+    body = h.service.prepare_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+    assert observed == {
+        "state": "absent_at_observation",
+        "original_request_id": "old",
+        "client_request_id": "isolated",
+        "original_input_hash": h.payload["original_input_hash"],
+        "child_input_hash": TextTaskService._submission_identity("owner", body)[1],
+    }
+    assert row(h.service, "isolated") is None
+    assert row(h.service) == h.old
+    assert h.sent == []
+
+
+def test_acceptance_observation_returns_exact_existing_receipt(advanced, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from unittest.mock import AsyncMock
+    from api import ai
+
+    h = advanced
+    accepted = h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+    content_filter = AsyncMock()
+    monkeypatch.setattr(ai, "text_task_service", h.service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_a, **_kw: {"role": "admin", "id": "owner"})
+    monkeypatch.setattr(ai, "trusted_source", lambda *_a: "internal:listing")
+    monkeypatch.setattr(ai, "filter_or_log", content_filter)
+    app = FastAPI()
+    app.include_router(ai.create_router())
+
+    with TestClient(app) as client:
+        observed = client.post(
+            "/api/conversation-bindings/text-requests/old/derived-successor/acceptance", json=h.payload)
+
+    assert observed.status_code == 200, observed.text
+    assert observed.json() == accepted
+    content_filter.assert_not_awaited()
+
+
+def test_acceptance_observation_rejects_conflicting_existing_child(advanced):
+    h = advanced
+    h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+    changed = {**h.payload, "model": "different-fixture-model"}
+
+    with pytest.raises(ConversationBindingError) as error:
+        h.service.observe_workbench_derived_acceptance("owner", "old", changed, source="internal:listing")
+
+    assert error.value.code == "CONVERSATION_REQUEST_CONFLICT"
+
+
+def test_acceptance_http_is_restricted_and_requires_advanced_payload(advanced, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from api import ai
+
+    h = advanced
+    identity = {"role": "user", "id": "owner"}
+    monkeypatch.setattr(ai, "text_task_service", h.service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_a, **_kw: identity)
+    monkeypatch.setattr(ai, "trusted_source", lambda *_a: "internal:listing")
+    app = FastAPI()
+    app.include_router(ai.create_router())
+
+    with TestClient(app) as client:
+        forbidden = client.post(
+            "/api/conversation-bindings/text-requests/old/derived-successor/acceptance", json=h.payload)
+        identity["role"] = "admin"
+        malformed = client.post(
+            "/api/conversation-bindings/text-requests/old/derived-successor/acceptance",
+            json={key: value for key, value in h.payload.items() if key != "messages"},
+        )
+        legacy = {key: value for key, value in h.payload.items() if key != "context_ref"}
+        legacy["mode"] = "no_final"
+        not_advanced = client.post(
+            "/api/conversation-bindings/text-requests/old/derived-successor/acceptance", json=legacy)
+
+    assert forbidden.status_code == 404
+    assert malformed.status_code == 422
+    assert not_advanced.status_code == 409
+    assert not_advanced.json() == {"detail": {"code": "CHAT_ADVANCED_SESSION_INVALID"}}
+
+
+def test_ordinary_postaccept_unknown_retains_durable_send_boundary(tmp_path):
+    class Queue:
+        def __init__(self):
+            self.call = None
+
+        def submit(self, function, *args):
+            self.call = function, args
+
+        def run(self):
+            function, args = self.call
+            function(*args)
+
+    queue = Queue()
+    service = TextTaskService(tmp_path / "ordinary.sqlite3", executor=queue)
+    body = {"client_request_id": "ordinary", "client_conversation_id": "ordinary-client",
+            "messages": [{"role": "user", "content": "ordinary request"}]}
+
+    def unknown_after_send(_body, on_cursor):
+        service._update("owner", "ordinary", _submission_started=True, _turn_reserved=True)
+        raise ConversationBindingError("uncertain model outcome", code="CONVERSATION_OUTCOME_UNKNOWN")
+
+    service.runner = unknown_after_send
+    service.submit("owner", body)
+    queue.run()
+
+    with service.store.connect() as db:
+        receipt = service.store.read_receipt(db, "text", "owner", "ordinary")
+    assert receipt["status"] == "unknown"
+    assert receipt["error_code"] == "CONVERSATION_OUTCOME_UNKNOWN"
+    assert receipt["_submission_started"] is True
 
 
 def test_frozen_evidence_refresh_allows_timestamp_only(advanced):
