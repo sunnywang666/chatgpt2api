@@ -96,6 +96,7 @@ CODEX_RESPONSES_MODEL = "gpt-5.5"
 SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
 TEXT_STREAM_HARD_CAP_SECS = 300.0
+TEXT_RESULT_CHECK_AFTER_SECS = 120.0
 STREAM_HANDOFF_WS_MAX_SECS = 60.0
 STREAM_HANDOFF_WS_MAX_FRAMES = 128
 STREAM_HANDOFF_WS_MAX_BYTES = 1_048_576
@@ -174,6 +175,8 @@ class _StreamHandoff:
     _parents: dict[str, str] = field(default_factory=dict)
     _conflicted_parent_ids: set[str] = field(default_factory=set)
     _message_phases: dict[str, tuple[bool | None, bool | None]] = field(default_factory=dict)
+    _branch_messages: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _branch_overflow: bool = False
     # Patches address the current message, never the last assistant in a
     # conversation. Keep one bounded snapshot, not a second conversation cache.
     _message_frame: dict[str, Any] = field(default_factory=dict)
@@ -185,6 +188,10 @@ class _StreamHandoff:
     terminal_text: str = ""
     terminal_original_message_id: str = ""
     _terminal_cursor_invalid: bool = False
+    # A completion notice can justify a read, never adoption of its body.
+    # In particular its parent chain may be absent from this transport.
+    completion_notice_seen: bool = False
+    completion_notice_reason: str = "no_terminal"
 
     @staticmethod
     def _clean_id(value: object) -> str:
@@ -496,6 +503,23 @@ class _StreamHandoff:
         # from this SSE frame, but never connect a new user turn back to the
         # original request merely because it shares the same conversation.
         author = message.get("author") if isinstance(message.get("author"), dict) else {}
+        if (message_id and message_id not in self._branch_messages
+                and len(self._branch_messages) >= _STREAM_HANDOFF_MAX_PARENT_EDGES):
+            self._branch_overflow = True
+        if message_id and (message_id in self._branch_messages
+                           or len(self._branch_messages) < _STREAM_HANDOFF_MAX_PARENT_EDGES):
+            # Only the fields used by the existing exact-turn validator.
+            # This bounded in-stack view contains no prompt or answer text.
+            observed = {key: message[key] for key in ("id", "status", "end_turn", "channel", "recipient")
+                        if key in message}
+            observed["author"] = {"role": author.get("role")}
+            content = message.get("content")
+            if isinstance(content, dict):
+                observed["content"] = {"content_type": content.get("content_type")}
+            metadata = message.get("metadata")
+            if isinstance(metadata, dict) and "channel" in metadata:
+                observed["metadata"] = {"channel": metadata["channel"]}
+            self._branch_messages[message_id] = observed
         if message_id and message_id != original and author.get("role") == "user":
             self._conflicted_parent_ids.add(message_id)
         if message_id and parent_conflict:
@@ -540,6 +564,34 @@ class _StreamHandoff:
             if not current:
                 return False
         return False
+
+    def _observe_completion_notice(self, event, message, assistant_terminal, on_original_branch):
+        if not assistant_terminal:
+            return
+        self.completion_notice_seen = True
+        if self._terminal_cursor_invalid:
+            reason = "invalid_snapshot"
+        elif not self._clean_id(message.get("id")) or not self.original_message_id:
+            reason = "missing_identity"
+        elif not on_original_branch:
+            current = self._clean_id(message.get("id"))
+            reason = "missing_parent"
+            for _ in range(_STREAM_HANDOFF_MAX_PARENT_EDGES):
+                if current in self._conflicted_parent_ids:
+                    reason = "parent_conflict"
+                    break
+                current = self._parents.get(current, "")
+                if not current:
+                    break
+        elif self._explicit_final_channel(event, message) is not True:
+            reason = "final_channel_unconfirmed"
+        else:
+            content = message.get("content")
+            parts = content.get("parts") if isinstance(content, dict) else None
+            reason = ("complete_candidate" if isinstance(parts, list) and parts
+                      and all(isinstance(part, str) for part in parts) and "".join(parts)
+                      else "body_unconfirmed")
+        self.completion_notice_reason = reason
 
     def _remember_terminal(self, event: dict[str, Any], message: dict[str, Any]) -> None:
         """Save an in-stack cursor only for a complete, visible original result."""
@@ -595,7 +647,16 @@ class _StreamHandoff:
             "message_id": self.terminal_message_id,
             "text": self.terminal_text,
             "original_message_id": self.terminal_original_message_id,
+            **({"original_parent_message_id": self._parents[self.terminal_original_message_id]}
+               if self._parents.get(self.terminal_original_message_id) else {}),
         }
+
+    def terminal_branch(self) -> dict[str, Any] | None:
+        """Expose observed structure to the owning layer's existing validator."""
+        if self.terminal_cursor() is None or self._conflicted_parent_ids or self._branch_overflow:
+            return None
+        return {node_id: {"parent": self._parents.get(node_id), "message": copy.deepcopy(message)}
+                for node_id, message in self._branch_messages.items()}
 
     def accepts_ws_payload(self, payload: str) -> bool:
         """Admit only the handoff conversation's frames after its first ID."""
@@ -629,6 +690,7 @@ class _StreamHandoff:
         message = self._message(event)
         on_original_branch = self._on_original_branch(event, message)
         assistant_terminal = self._assistant_terminal(event, message)
+        self._observe_completion_notice(event, message, assistant_terminal, on_original_branch)
         if (self.terminal_message_id
                 and self._clean_id(message.get("id")) == self.terminal_message_id
                 and (not assistant_terminal or not on_original_branch)):
@@ -705,6 +767,7 @@ class _StreamHandoff:
         message = self._message(event)
         on_original_branch = self._on_original_branch(event, message)
         assistant_terminal = self._assistant_terminal(event, message)
+        self._observe_completion_notice(event, message, assistant_terminal, on_original_branch)
         if (self.terminal_message_id
                 and self._clean_id(message.get("id")) == self.terminal_message_id
                 and (not assistant_terminal or not on_original_branch)):
@@ -3816,6 +3879,8 @@ class OpenAIBackendAPI:
         # This certificate belongs to this one stream only.  Never let a prior
         # call on a reused backend instance supply a later cursor.
         self.text_stream_terminal = None
+        self.text_stream_branch = None
+        self.text_result_check_due = False
         handoff = _StreamHandoff(
             expected_conversation_id=conversation_id,
             original_message_id=str(getattr(self, "text_request_message_id", "") or ""),
@@ -3826,15 +3891,21 @@ class OpenAIBackendAPI:
         handoff_enabled = (getattr(self, "retain_bound_conversation", False)
                            and getattr(self, "text_stream_handoff_enabled", False)
                            and not is_supported_image_model(model))
+        # Start the fallback observation window after transport setup. Local
+        # admission/pacing is not time spent waiting for the model's answer.
+        result_check_deadline = (min(request_deadline, time.monotonic() + TEXT_RESULT_CHECK_AFTER_SECS)
+                                 if handoff_enabled else request_deadline)
         try:
             initial_done = False
-            remaining_stream_budget = max(0.001, request_deadline - time.monotonic())
+            remaining_stream_budget = max(0.001, result_check_deadline - time.monotonic())
             try:
                 for payload in self._iter_sse_payloads_capped(
                     response,
                     remaining_stream_budget,
                     timeout_error_type=StreamHardTimeoutError,
                     timeout_message=(
+                        f"conversation stream reached result-check window of {int(TEXT_RESULT_CHECK_AFTER_SECS)} seconds"
+                        if handoff_enabled else
                         f"conversation stream exceeded hard limit of {int(TEXT_STREAM_HARD_CAP_SECS)} seconds"
                     ),
                     observe_text=True,
@@ -3842,14 +3913,39 @@ class OpenAIBackendAPI:
                 ):
                     handoff.observe(payload)
                     self.text_stream_terminal = handoff.terminal_cursor()
+                    if (handoff_enabled and handoff.completion_notice_seen
+                            and self.text_stream_terminal is None):
+                        self._request_original_result_check(handoff, "result_check_ready")
+                        if payload != "[DONE]":
+                            yield payload
+                        yield "[DONE]"
+                        return
                     if payload == "[DONE]":
+                        if self.text_stream_terminal is not None:
+                            self.text_stream_branch = handoff.terminal_branch()
+                            yield payload
+                            return
                         # A protocol consumer stops at DONE. Defer this one until
                         # the same-turn WS handoff has either supplied its own
                         # terminal marker or declined safely.
                         initial_done = True
                         continue
                     yield payload
-            except (TimeoutError, OSError, CurlError, requests.exceptions.RequestException):
+            except (TimeoutError, OSError, CurlError, requests.exceptions.RequestException) as exc:
+                if (handoff_enabled and isinstance(exc, StreamHardTimeoutError)
+                        and time.monotonic() >= result_check_deadline):
+                    # Close local consumption and inspect this original once.
+                    # This is not a stopped upstream turn or an empty answer.
+                    if self.text_stream_terminal is None:
+                        self._request_original_result_check(handoff, "result_check_due")
+                    else:
+                        self.text_stream_branch = handoff.terminal_branch()
+                    yield "[DONE]"
+                    return
+                if handoff_enabled and handoff.completion_notice_seen:
+                    self._request_original_result_check(handoff, "result_check_ready")
+                    yield "[DONE]"
+                    return
                 # A broken SSE body can arrive after it has identified one
                 # exact, same-turn continuation topic.  The old normal-exit
                 # handoff below was unreachable in that case, leaving an
@@ -3860,7 +3956,7 @@ class OpenAIBackendAPI:
                 if not (handoff_enabled and handoff.eligible):
                     raise
                 self._record_stream_handoff_stage(handoff.diagnostic_stage)
-                handoff_done = yield from self._consume_stream_handoff(handoff, request_deadline)
+                handoff_done = yield from self._consume_stream_handoff(handoff, result_check_deadline)
                 if handoff_done:
                     return
                 raise
@@ -3877,14 +3973,25 @@ class OpenAIBackendAPI:
             # purely diagnostic receipt write ahead of saving the completed
             # answer.  Keep every non-terminal case durable: it may still
             # enter the bounded WS recovery path below.
+            if (handoff_enabled and handoff.completion_notice_seen
+                    and self.text_stream_terminal is None):
+                # A finished-answer notification with insufficient streamed
+                # proof should lead straight to the original result reader,
+                # not a second 60-second wait for the same notification.
+                self._request_original_result_check(handoff, "result_check_ready")
+                yield "[DONE]"
+                return
             if handoff_enabled and not handoff.terminal_seen:
                 self._record_stream_handoff_stage(handoff.diagnostic_stage)
             if handoff.eligible and handoff_enabled:
-                handoff_done = yield from self._consume_stream_handoff(handoff, request_deadline)
+                handoff_done = yield from self._consume_stream_handoff(handoff, result_check_deadline)
                 if initial_done and handoff_done:
                     return
             if initial_done:
+                self.text_stream_branch = handoff.terminal_branch()
                 yield "[DONE]"
+            elif self.text_stream_terminal is not None:
+                self.text_stream_branch = handoff.terminal_branch()
         finally:
             response.close()
 
@@ -4039,7 +4146,7 @@ class OpenAIBackendAPI:
 
     @staticmethod
     def _record_stream_handoff_stage(stage: str, *, frames: int = 0, total_bytes: int = 0,
-                                     terminal_seen: bool = False) -> None:
+                                     terminal_seen: bool = False, terminal_reason: str = "") -> None:
         """Best-effort fixed diagnostics; they never alter stream authority."""
         from services.request_context import current_request
         context = current_request.get()
@@ -4049,9 +4156,16 @@ class OpenAIBackendAPI:
             context.record_stage("stream_handoff", handoff_stage=stage,
                                  handoff_frame_count=frames,
                                  handoff_byte_count=total_bytes,
-                                 handoff_terminal_seen=terminal_seen)
+                                 handoff_terminal_seen=terminal_seen,
+                                 **({"handoff_terminal_reason": terminal_reason} if terminal_reason else {}))
         except Exception:
             pass
+
+    def _request_original_result_check(self, handoff: _StreamHandoff, stage: str) -> None:
+        self.text_result_check_due = True
+        self._record_stream_handoff_stage(
+            stage, terminal_seen=handoff.terminal_seen,
+            terminal_reason=handoff.completion_notice_reason)
 
     def _consume_stream_handoff(self, handoff: _StreamHandoff, request_deadline: float) -> Iterator[str]:
         """Consume one bounded, result-only WS handoff without a new model send.
@@ -4165,6 +4279,10 @@ class OpenAIBackendAPI:
                 for payload in self._handoff_encoded_payloads(frame, handoff.topic_id):
                     accepted = handoff.accepts_ws_payload(payload)
                     self.text_stream_terminal = handoff.terminal_cursor()
+                    if handoff.completion_notice_seen and self.text_stream_terminal is None:
+                        self._request_original_result_check(handoff, "result_check_ready")
+                        yield "[DONE]"
+                        return True
                     if not accepted:
                         if handoff.invalid:
                             self._record_stream_handoff_stage("ws_payload_rejected", frames=frames,
@@ -4189,6 +4307,7 @@ class OpenAIBackendAPI:
                         self._record_stream_handoff_stage("ws_terminal", frames=frames,
                                                           total_bytes=total_bytes, terminal_seen=True)
                         self.text_stream_terminal = handoff.terminal_cursor()
+                        self.text_stream_branch = handoff.terminal_branch()
                         yield payload
                         return True
                     yield payload

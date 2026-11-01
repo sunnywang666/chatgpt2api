@@ -20,6 +20,7 @@ from services.conversation_binding_service import (
     ConversationBindingService,
     RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
+    _VERIFIED_SENDER_READ,
 )
 from utils.helper import UpstreamHTTPError
 from services.protocol.conversation import (
@@ -1176,7 +1177,7 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         self.assertEqual(result["parent_message_id"], "read-parent")
         self.assertEqual(FakeBackend.instances[0].parent_reads, 1)
 
-    def test_verified_stream_cursor_is_excluded_from_public_and_product_paths(self) -> None:
+    def test_verified_stream_cursor_is_excluded_from_public_and_sequential_paths(self) -> None:
         backend = SimpleNamespace(
             text_request_message_id="request-user",
             text_stream_terminal={
@@ -1186,13 +1187,459 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         )
         for body in (
             {"_public_session_ref": "public-session"},
-            {"product_work": {"product_ref": "product-1", "step_ref": "copy"}},
             {"_supersedes_request_message_id": "older-request"},
         ):
             self.assertIsNone(ConversationBindingService._stream_terminal_cursor(
                 backend, {**body, "_request_message_id": "request-user"},
                 "conversation-1", "complete answer",
             ))
+
+    def test_due_silent_bound_stream_reads_original_branch_once_and_classifies_result(self) -> None:
+        def document_for(kind: str) -> dict:
+            if kind == "success":
+                final = {
+                    "id": "final", "author": {"role": "assistant"},
+                    "status": "finished_successfully", "end_turn": True, "channel": "final",
+                    "content": {"content_type": "text", "parts": ["exact answer"]},
+                }
+            elif kind == "thinking":
+                final = {
+                    "id": "thinking", "author": {"role": "assistant"},
+                    "status": "in_progress", "end_turn": False, "channel": "analysis",
+                    "content": {"content_type": "thoughts", "parts": ["working"]},
+                }
+            else:
+                final = {
+                    "id": "empty-final", "author": {"role": "assistant"},
+                    "status": "finished_successfully", "end_turn": True, "channel": "final",
+                    "content": {"content_type": "text", "parts": [""]},
+                }
+            return {
+                "conversation_id": "conversation-1", "current_node": final["id"],
+                "mapping": {
+                    "request-user": {"parent": "prior-parent", "message": {
+                        "id": "request-user", "author": {"role": "user"},
+                    }},
+                    final["id"]: {"parent": "request-user", "message": final},
+                },
+            }
+
+        for kind in ("success", "thinking", "empty"):
+            with self.subTest(kind=kind):
+                class FakeBackend:
+                    instances = []
+
+                    def __init__(self, access_token: str) -> None:
+                        self.access_token = access_token
+                        self.text_request_message_id = "request-user"
+                        self.text_request_parent_message_id = "prior-parent"
+                        self.text_result_check_due = True
+                        self.get_calls = []
+                        self.__class__.instances.append(self)
+
+                    def _get_conversation(self, conversation_id: str, **kwargs) -> dict:
+                        self.get_calls.append((conversation_id, kwargs))
+                        if "deadline_monotonic" not in kwargs:
+                            return {
+                                "conversation_id": "conversation-1", "current_node": "prior-parent",
+                                "is_archived": False,
+                            }
+                        return document_for(kind)
+
+                    def close(self) -> None:
+                        pass
+
+                with (
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                               return_value="account-opaque-a"),
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                               return_value="token-a"),
+                    mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                               return_value=nullcontext()),
+                    mock.patch("services.conversation_binding_service.account_service.mark_text_used") as mark_used,
+                    mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FakeBackend),
+                    mock.patch("services.conversation_binding_service.conversation_events", return_value=iter(())),
+                ):
+                    if kind == "success":
+                        result = ConversationBindingService().complete_text({
+                            "provider_binding_id": "cb-account-a", "provider_account_identity": "account-opaque-a",
+                            "client_conversation_id": "bound-conversation-1", "conversation_id": "conversation-1",
+                            "parent_message_id": "prior-parent", "_request_message_id": "request-user",
+                            "messages": [{"role": "user", "content": "write"}],
+                        })
+                    else:
+                        with self.assertRaises(ConversationBindingError) as captured:
+                            ConversationBindingService().complete_text({
+                                "provider_binding_id": "cb-account-a", "provider_account_identity": "account-opaque-a",
+                                "client_conversation_id": "bound-conversation-1", "conversation_id": "conversation-1",
+                                "parent_message_id": "prior-parent", "_request_message_id": "request-user",
+                                "messages": [{"role": "user", "content": "write"}],
+                            })
+
+                self.assertEqual(FakeBackend.instances[0].get_calls[0], ("conversation-1", {}))
+                result_reads = [call for call in FakeBackend.instances[0].get_calls
+                                if "deadline_monotonic" in call[1]]
+                self.assertEqual(len(result_reads), 1)
+                self.assertEqual(result_reads[0][0], "conversation-1")
+                self.assertEqual(len(FakeBackend.instances[0].get_calls), 2)
+                if kind == "success":
+                    self.assertEqual(result["content"], "exact answer")
+                    self.assertEqual(result["parent_message_id"], "final")
+                    self.assertEqual(result["status"], "succeeded")
+                    self.assertTrue(result["_upstream_terminal"])
+                    mark_used.assert_called_once_with("token-a")
+                else:
+                    self.assertEqual(captured.exception.code, "CONVERSATION_OUTCOME_UNKNOWN")
+                    self.assertEqual(captured.exception.original_failure_phase, "cursor_read")
+                    self.assertEqual(
+                        captured.exception.recovery_reason,
+                        (TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value if kind == "thinking"
+                         else TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value),
+                    )
+                    proof = captured.exception._verified_sender_read
+                    self.assertIs(proof[0], _VERIFIED_SENDER_READ)
+                    self.assertEqual(proof[1:3], ("request-user", "prior-parent"))
+                    self.assertEqual(proof[3]["recovery_reason"], captured.exception.recovery_reason)
+                    self.assertIsNone(proof[4])
+                    mark_used.assert_not_called()
+
+    def test_product_work_reuses_strict_stream_certificate_without_post_result_get(self) -> None:
+        service = ConversationBindingService()
+
+        class FakeBackend:
+            instances = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.text_request_message_id = "request-user"
+                self.text_request_parent_message_id = "prior-parent"
+                self.text_stream_terminal = {
+                    "conversation_id": "conversation-1", "message_id": "final-message",
+                    "text": "complete answer", "original_message_id": "request-user",
+                    "original_parent_message_id": "prior-parent",
+                }
+                self.text_stream_branch = {
+                    "request-user": {"parent": "prior-parent", "message": {
+                        "id": "request-user", "author": {"role": "user"},
+                    }},
+                    "thought": {"parent": "request-user", "message": {
+                        "id": "thought", "author": {"role": "assistant"},
+                        "status": "in_progress", "end_turn": False, "channel": "analysis",
+                        "content": {"content_type": "thoughts"},
+                    }},
+                    "final-message": {"parent": "thought", "message": {
+                        "id": "final-message", "author": {"role": "assistant"},
+                        "status": "finished_successfully", "end_turn": True, "channel": "final",
+                        "content": {"content_type": "text"},
+                    }},
+                }
+                self.get_calls = []
+                self.__class__.instances.append(self)
+
+            def _get_conversation(self, conversation_id: str, **kwargs) -> dict:
+                self.get_calls.append((conversation_id, kwargs))
+                return {
+                    "conversation_id": "conversation-1", "current_node": "prior-parent",
+                    "is_archived": False,
+                }
+
+            def get_conversation_parent_message_id(self, _conversation_id: str) -> str:
+                raise AssertionError("certified ProductWork final must not issue a post-stream cursor GET")
+
+            def close(self) -> None:
+                pass
+
+        events = mock.Mock(return_value=iter([
+            {"type": "conversation.delta", "conversation_id": "conversation-1", "delta": "complete answer"},
+        ]))
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                       return_value="account-opaque-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                       return_value="token-a"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                       return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.account_service.mark_text_used") as mark_used,
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FakeBackend),
+            mock.patch("services.conversation_binding_service.conversation_events", events),
+        ):
+            result = service.complete_text({
+                "provider_binding_id": "cb-account-a", "provider_account_identity": "account-opaque-a",
+                "client_conversation_id": "product-conversation-1", "conversation_id": "conversation-1",
+                "parent_message_id": "prior-parent", "_request_message_id": "request-user",
+                "product_work": {"product_ref": "product-1", "step_ref": "copy"},
+                "messages": [{"role": "user", "content": "write copy"}],
+            })
+
+        self.assertEqual(result["content"], "complete answer")
+        self.assertEqual(result["parent_message_id"], "final-message")
+        self.assertEqual(result["request_parent_message_id"], "prior-parent")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertTrue(result["_upstream_terminal"])
+        self.assertEqual(
+            {key: result["_turn_end_evidence"][key] for key in (
+                "conversation_id", "request_message_id", "final_message_id",
+            )},
+            {"conversation_id": "conversation-1", "request_message_id": "request-user",
+             "final_message_id": "final-message"},
+        )
+        self.assertEqual(FakeBackend.instances[0].get_calls, [("conversation-1", {})])
+        events.assert_called_once()
+        mark_used.assert_called_once_with("token-a")
+
+    def test_product_work_stream_branch_gaps_fall_back_to_exact_read(self) -> None:
+        post_document = {
+            "conversation_id": "conversation-1", "current_node": "read-final",
+            "mapping": {
+                "request-user": {"parent": "prior-parent", "message": {
+                    "id": "request-user", "author": {"role": "user"},
+                }},
+                "read-final": {"parent": "request-user", "message": {
+                    "id": "read-final", "author": {"role": "assistant"},
+                    "status": "finished_successfully", "end_turn": True, "channel": "final",
+                    "content": {"content_type": "text", "parts": ["read result"]},
+                }},
+            },
+        }
+
+        def branch_for(kind: str) -> dict:
+            branch = {
+                "request-user": {"parent": "prior-parent", "message": {
+                    "id": "request-user", "author": {"role": "user"},
+                }},
+                "final-message": {"parent": "request-user", "message": {
+                    "id": "final-message", "author": {"role": "assistant"},
+                    "status": "finished_successfully", "end_turn": True, "channel": "final",
+                    "content": {"content_type": "text"},
+                }},
+            }
+            if kind == "missing-parent":
+                branch["request-user"]["parent"] = None
+            elif kind == "wrong-parent":
+                branch["request-user"]["parent"] = "other-parent"
+            elif kind == "non-user":
+                branch["request-user"]["message"]["author"] = {"role": "assistant"}
+            elif kind == "fork":
+                branch["other-final"] = {"parent": "request-user", "message": {
+                    "id": "other-final", "author": {"role": "assistant"},
+                    "status": "finished_successfully", "end_turn": True, "channel": "final",
+                    "content": {"content_type": "text"},
+                }}
+            elif kind == "active-tool":
+                branch["final-message"]["parent"] = "active-tool"
+                branch["active-tool"] = {"parent": "request-user", "message": {
+                    "id": "active-tool", "author": {"role": "tool"},
+                    "status": "in_progress", "end_turn": False,
+                    "content": {"content_type": "execution_output"},
+                }}
+            return branch
+
+        for kind in ("missing-parent", "wrong-parent", "non-user", "fork", "active-tool", "blank"):
+            with self.subTest(kind=kind):
+                streamed = " \t" if kind == "blank" else "complete answer"
+
+                class FakeBackend:
+                    instances = []
+
+                    def __init__(self, access_token: str) -> None:
+                        self.access_token = access_token
+                        self.text_request_message_id = "request-user"
+                        self.text_request_parent_message_id = "prior-parent"
+                        self.text_stream_terminal = {
+                            "conversation_id": "conversation-1", "message_id": "final-message",
+                            "text": streamed, "original_message_id": "request-user",
+                            "original_parent_message_id": "prior-parent",
+                        }
+                        self.text_stream_branch = branch_for(kind)
+                        self.get_calls = []
+                        self.__class__.instances.append(self)
+
+                    def _get_conversation(self, conversation_id: str, **kwargs) -> dict:
+                        self.get_calls.append((conversation_id, kwargs))
+                        if "deadline_monotonic" not in kwargs:
+                            return {
+                                "conversation_id": "conversation-1", "current_node": "prior-parent",
+                                "is_archived": False,
+                            }
+                        return post_document
+
+                    def close(self) -> None:
+                        pass
+
+                with (
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                               return_value="account-opaque-a"),
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                               return_value="token-a"),
+                    mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                               return_value=nullcontext()),
+                    mock.patch("services.conversation_binding_service.account_service.mark_text_used") as mark_used,
+                    mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FakeBackend),
+                    mock.patch("services.conversation_binding_service.conversation_events", return_value=iter([
+                        {"type": "conversation.delta", "conversation_id": "conversation-1", "delta": streamed},
+                    ])),
+                ):
+                    result = ConversationBindingService().complete_text({
+                        "provider_binding_id": "cb-account-a", "provider_account_identity": "account-opaque-a",
+                        "client_conversation_id": "product-conversation-1", "conversation_id": "conversation-1",
+                        "parent_message_id": "prior-parent", "_request_message_id": "request-user",
+                        "product_work": {"product_ref": "product-1", "step_ref": "copy"},
+                        "messages": [{"role": "user", "content": "write copy"}],
+                    })
+
+                self.assertEqual(result["content"], "read result")
+                self.assertEqual(result["parent_message_id"], "read-final")
+                self.assertEqual(len(FakeBackend.instances[0].get_calls), 2)
+                self.assertIn("deadline_monotonic", FakeBackend.instances[0].get_calls[1][1])
+                mark_used.assert_called_once_with("token-a")
+
+    def test_product_work_incomplete_stream_certificate_uses_one_exact_result_get(self) -> None:
+        service = ConversationBindingService()
+        post_document = {
+            "conversation_id": "conversation-1", "current_node": "read-final",
+            "mapping": {
+                "request-user": {"parent": "prior-parent", "message": {
+                    "id": "request-user", "author": {"role": "user"},
+                }},
+                "read-final": {"parent": "request-user", "message": {
+                    "id": "read-final", "author": {"role": "assistant"},
+                    "status": "finished_successfully", "end_turn": True, "channel": "final",
+                    "content": {"content_type": "text", "parts": ["read result"]},
+                }},
+            },
+        }
+
+        class FakeBackend:
+            instances = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.text_request_message_id = "request-user"
+                self.text_request_parent_message_id = "prior-parent"
+                self.text_stream_terminal = {
+                    "conversation_id": "conversation-1", "message_id": "final-message",
+                    "text": "different answer", "original_message_id": "request-user",
+                }
+                self.get_calls = []
+                self.__class__.instances.append(self)
+
+            def _get_conversation(self, conversation_id: str, **kwargs) -> dict:
+                self.get_calls.append((conversation_id, kwargs))
+                if "deadline_monotonic" not in kwargs:
+                    return {
+                        "conversation_id": "conversation-1", "current_node": "prior-parent",
+                        "is_archived": False,
+                    }
+                return post_document
+
+            def close(self) -> None:
+                pass
+
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                       return_value="account-opaque-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                       return_value="token-a"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                       return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.account_service.mark_text_used") as mark_used,
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FakeBackend),
+            mock.patch("services.conversation_binding_service.conversation_events", return_value=iter([
+                {"type": "conversation.delta", "conversation_id": "conversation-1", "delta": "stream answer"},
+            ])),
+        ):
+            result = service.complete_text({
+                "provider_binding_id": "cb-account-a", "provider_account_identity": "account-opaque-a",
+                "client_conversation_id": "product-conversation-1", "conversation_id": "conversation-1",
+                "parent_message_id": "prior-parent", "_request_message_id": "request-user",
+                "product_work": {"product_ref": "product-1", "step_ref": "copy"},
+                "messages": [{"role": "user", "content": "write copy"}],
+            })
+
+        self.assertEqual(result["content"], "read result")
+        self.assertEqual(result["parent_message_id"], "read-final")
+        self.assertEqual(len(FakeBackend.instances[0].get_calls), 2)
+        self.assertNotIn("deadline_monotonic", FakeBackend.instances[0].get_calls[0][1])
+        self.assertIn("deadline_monotonic", FakeBackend.instances[0].get_calls[1][1])
+        mark_used.assert_called_once_with("token-a")
+
+    def test_product_work_thinking_or_empty_stream_never_becomes_success(self) -> None:
+        def document_for(kind: str) -> dict:
+            if kind == "thinking":
+                message = {
+                    "id": "thinking", "author": {"role": "assistant"},
+                    "status": "in_progress", "end_turn": False, "channel": "analysis",
+                    "content": {"content_type": "thoughts", "parts": ["working"]},
+                }
+                node_id = "thinking"
+            else:
+                message = {
+                    "id": "empty-final", "author": {"role": "assistant"},
+                    "status": "finished_successfully", "end_turn": True, "channel": "final",
+                    "content": {"content_type": "text", "parts": [""]},
+                }
+                node_id = "empty-final"
+            return {
+                "conversation_id": "conversation-1", "current_node": node_id,
+                "mapping": {
+                    "request-user": {"parent": "prior-parent", "message": {
+                        "id": "request-user", "author": {"role": "user"},
+                    }},
+                    node_id: {"parent": "request-user", "message": message},
+                },
+            }
+
+        for kind in ("thinking", "empty"):
+            with self.subTest(kind=kind):
+                class FakeBackend:
+                    instances = []
+
+                    def __init__(self, access_token: str) -> None:
+                        self.access_token = access_token
+                        self.text_request_message_id = "request-user"
+                        self.text_request_parent_message_id = "prior-parent"
+                        # No final certificate exists for a thought or empty final.
+                        self.text_stream_terminal = None
+                        self.get_calls = []
+                        self.__class__.instances.append(self)
+
+                    def _get_conversation(self, conversation_id: str, **kwargs) -> dict:
+                        self.get_calls.append((conversation_id, kwargs))
+                        if "deadline_monotonic" not in kwargs:
+                            return {
+                                "conversation_id": "conversation-1", "current_node": "prior-parent",
+                                "is_archived": False,
+                            }
+                        return document_for(kind)
+
+                    def close(self) -> None:
+                        pass
+
+                with (
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity",
+                               return_value="account-opaque-a"),
+                    mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token",
+                               return_value="token-a"),
+                    mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock",
+                               return_value=nullcontext()),
+                    mock.patch("services.conversation_binding_service.account_service.mark_text_used") as mark_used,
+                    mock.patch("services.conversation_binding_service.OpenAIBackendAPI", FakeBackend),
+                    mock.patch("services.conversation_binding_service.conversation_events", return_value=iter([
+                        {"type": "conversation.delta", "conversation_id": "conversation-1", "delta": "stream text"},
+                    ])),
+                ):
+                    with self.assertRaises(ConversationBindingError) as captured:
+                        ConversationBindingService().complete_text({
+                            "provider_binding_id": "cb-account-a", "provider_account_identity": "account-opaque-a",
+                            "client_conversation_id": "product-conversation-1", "conversation_id": "conversation-1",
+                            "parent_message_id": "prior-parent", "_request_message_id": "request-user",
+                            "product_work": {"product_ref": "product-1", "step_ref": "copy"},
+                            "messages": [{"role": "user", "content": "write copy"}],
+                        })
+
+                self.assertEqual(captured.exception.code, "CONVERSATION_OUTCOME_UNKNOWN")
+                self.assertEqual(len(FakeBackend.instances[0].get_calls), 2)
+                mark_used.assert_not_called()
 
     def test_project_binding_can_create_independent_conversations_on_same_account(self) -> None:
         service = ConversationBindingService()
@@ -1522,6 +1969,11 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         self.assertEqual(captured.exception.code, "CONVERSATION_OUTCOME_UNKNOWN")
         self.assertEqual(backend.reads, 1)
         self.assertEqual(backend.parent_reads, 0)
+        proof = captured.exception._verified_sender_read
+        self.assertIs(proof[0], _VERIFIED_SENDER_READ)
+        self.assertEqual(proof[1], "request-user")
+        self.assertIsNone(proof[3])
+        self.assertIsInstance(proof[4], TimeoutError)
         events.assert_called_once()
         mark_used.assert_not_called()
 

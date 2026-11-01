@@ -18,6 +18,8 @@ on:
       - api/external_images.py
       - api/send_hold_control.py
       - api/task_results.py
+      - api/task_events.py
+      - test/test_task_events.py
       - api/generation_completion.py
       - services/generation_completion.py
       - test/test_generation_completion.py
@@ -212,4 +214,5 @@ jobs:
             test/test_reconcile_queued_successor.py \
             test/test_ci_fallback_workflow.py \
             test/test_ci_fallback_observer.py \
-            test/test_task_results.py
+            test/test_task_results.py \
+            test/test_task_events.py

@@ -14,6 +14,8 @@ from services.conversation_binding_service import (
     RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD,
     RECOVERY_CONVERSATION_SCAN_FIELD,
     TextRecoveryReason,
+    TURN_END_EVIDENCE_FIELD,
+    _VERIFIED_SENDER_READ,
 )
 from services.text_task_service import TextTaskService, ContinuationExecutor
 from services.request_context import AdmissionLost
@@ -352,6 +354,174 @@ class TextTaskTests(unittest.TestCase):
         self.assertEqual(restarted.submit("owner", self.body)["status"], "succeeded")
         self.assertEqual(len(self.queue.calls), 0)
         self.assertEqual(restarted.read("other-owner", "attempt-1")["status"], "not_found")
+
+    def test_first_sender_exact_terminal_empty_is_persisted_and_publicly_projected(self):
+        def runner(body, on_cursor):
+            on_cursor({
+                "provider_binding_id": "binding", "provider_account_identity": "account",
+                "conversation_id": "chat", "parent_message_id": "sent-parent",
+                "request_parent_message_id": "request-parent", "_submission_started": True,
+            })
+            request_message_id = body["_request_message_id"]
+            recovered = {
+                "status": "unknown", "binding_status": "unknown",
+                "provider_binding_id": "binding", "provider_account_identity": "account",
+                "client_conversation_id": body["client_conversation_id"],
+                "conversation_id": "chat", "parent_message_id": "empty-final",
+                "request_parent_message_id": "request-parent",
+                "recovery_reason": TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
+                TURN_END_EVIDENCE_FIELD: {
+                    "conversation_id": "chat", "request_message_id": request_message_id,
+                    "final_message_id": "empty-final", "observed_at": 1000.0,
+                },
+            }
+            error = ConversationBindingError(
+                "original final is empty", code="CONVERSATION_OUTCOME_UNKNOWN",
+                provider_binding_id="binding", provider_account_identity="account",
+                conversation_id="chat", original_failure_phase="cursor_read",
+            )
+            error._verified_sender_read = (
+                _VERIFIED_SENDER_READ, request_message_id, "request-parent", recovered, None,
+            )
+            raise error
+
+        service = TextTaskService(self.path, runner, self.queue)
+        service.submit("owner", {
+            **self.body, "_public_route": "chat", "_public_session_ref": "public-session",
+        })
+        self.queue.run()
+
+        with service.store.connect() as db:
+            stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        result = TextTaskService._public(stored)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["recovery_reason"], TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value)
+        self.assertEqual(result["recovery_error_code"], "UPSTREAM_OUTCOME_UNKNOWN")
+        self.assertEqual(result["terminal_empty"], {
+            "verified": True, "original_request_id": "attempt-1", "observed_at": 1000.0,
+            "same_conversation_continuation": True,
+        })
+        self.assertTrue(stored["_upstream_terminal"])
+        self.assertEqual(stored[TURN_END_EVIDENCE_FIELD]["final_message_id"], "empty-final")
+        from api.task_results import _text_projection
+        public, content, ready = _text_projection(stored)
+        self.assertEqual(public["execution"]["result_state"], "empty")
+        self.assertIsNone(content)
+        self.assertFalse(ready)
+
+    def test_first_sender_exact_read_timeout_is_not_terminal_empty(self):
+        def runner(body, on_cursor):
+            on_cursor({
+                "provider_binding_id": "binding", "provider_account_identity": "account",
+                "conversation_id": "chat", "parent_message_id": "sent-parent",
+                "request_parent_message_id": "request-parent", "_submission_started": True,
+            })
+            error = ConversationBindingError(
+                "original read timed out", code="CONVERSATION_OUTCOME_UNKNOWN",
+                provider_binding_id="binding", provider_account_identity="account",
+                conversation_id="chat", original_failure_phase="cursor_read",
+            )
+            error._verified_sender_read = (
+                _VERIFIED_SENDER_READ, body["_request_message_id"], "request-parent",
+                None, TimeoutError("private timeout detail"),
+            )
+            raise error
+
+        service = TextTaskService(self.path, runner, self.queue)
+        service.submit("owner", {
+            **self.body, "_public_route": "chat", "_public_session_ref": "public-session",
+        })
+        self.queue.run()
+
+        with service.store.connect() as db:
+            stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        result = TextTaskService._public(stored)
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["recovery_error_code"], "RECOVERY_READ_FAILED")
+        self.assertNotEqual(result.get("recovery_reason"), TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value)
+        self.assertNotIn("terminal_empty", result)
+        self.assertEqual(result["recovery_last_read_error"], {
+            "phase": "conversation_detail", "category": "timeout",
+            "http_status": None, "retry_after_seconds": None, "candidate_ref": None,
+        })
+        self.assertNotIn(b"private timeout detail", self.path.read_bytes())
+        from api.task_results import _text_projection
+        public, content, ready = _text_projection(stored)
+        self.assertEqual(public["execution"]["result_state"], "read_failed")
+        self.assertIsNone(content)
+        self.assertFalse(ready)
+
+    def test_forged_or_mismatched_sender_read_marker_is_not_persisted(self):
+        for kind in ("forged", "wrong-request", "wrong-parent"):
+            with self.subTest(kind=kind):
+                path = self.path.with_name(f"sender-marker-{kind}.sqlite3")
+
+                def runner(body, on_cursor, kind=kind):
+                    on_cursor({
+                        "provider_binding_id": "binding", "provider_account_identity": "account",
+                        "conversation_id": "chat", "parent_message_id": "sent-parent",
+                        "request_parent_message_id": "request-parent", "_submission_started": True,
+                    })
+                    marker = (_VERIFIED_SENDER_READ if kind != "forged" else object())
+                    request_id = "other-request" if kind == "wrong-request" else body["_request_message_id"]
+                    parent_id = "other-parent" if kind == "wrong-parent" else "request-parent"
+                    error = ConversationBindingError(
+                        "unverified sender observation", code="CONVERSATION_OUTCOME_UNKNOWN",
+                        provider_binding_id="binding", provider_account_identity="account",
+                        conversation_id="chat", original_failure_phase="cursor_read",
+                    )
+                    error._verified_sender_read = (marker, request_id, parent_id, {
+                        "status": "unknown", "recovery_reason": TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value,
+                    }, None)
+                    raise error
+
+                service = TextTaskService(path, runner, QueuedExecutor())
+                service.submit("owner", self.body)
+                service.executor.run()
+                with service.store.connect() as db:
+                    stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+                result = TextTaskService._public(stored)
+
+                self.assertEqual(result["status"], "unknown")
+                self.assertEqual(result["error_code"], "CONVERSATION_OUTCOME_UNKNOWN")
+                # Inspect the first saved result, without a legacy read()
+                # starting recovery and potentially masking an invalid write.
+                self.assertIsNone(result.get("recovery_error_code"))
+                self.assertIsNone(result.get("recovery_reason"))
+                self.assertNotIn(TURN_END_EVIDENCE_FIELD, stored)
+                self.assertNotIn("_upstream_terminal", stored)
+
+    def test_late_sender_read_error_cannot_overwrite_saved_success(self):
+        service = TextTaskService(
+            self.path,
+            runner=lambda _body, on_cursor: {
+                "content": "saved answer", "conversation_id": "chat", "parent_message_id": "final",
+            },
+            executor=self.queue,
+        )
+        service.submit("owner", self.body)
+        self.queue.run()
+        with service.store.connect() as db:
+            saved = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        error = ConversationBindingError(
+            "late read failed", code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="binding", provider_account_identity="account",
+            conversation_id="chat", original_failure_phase="cursor_read",
+        )
+        error._verified_sender_read = (
+            _VERIFIED_SENDER_READ, saved["request_message_id"], saved.get("request_parent_message_id", ""),
+            None, TimeoutError(),
+        )
+
+        service._update(
+            "owner", "attempt-1", sender_verified_incomplete=error,
+            status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+        )
+
+        result = service.read("owner", "attempt-1")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["content"], "saved answer")
+        self.assertIsNone(result["error_code"])
 
     def test_queued_unsent_read_bypasses_a_concurrent_sqlite_writer(self):
         recovery_reader = mock.Mock(side_effect=AssertionError("queued receipt must not recover"))
