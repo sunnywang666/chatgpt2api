@@ -2002,6 +2002,15 @@ class TextTaskService:
                 if error_code == "UPSTREAM_OUTCOME_UNKNOWN"
                 and recovery_reason == TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value else None)
             if successor_evidence is not None:
+                # `_safe_recovery_result` has just bound this evidence to the
+                # original submitted turn and its immutable account/binding
+                # identity.  The externally completed successor ends this
+                # original foreground wait, but does not terminalize it or
+                # authorize old-cursor continuation.  Persist that exact
+                # boundary so a later advanced-session request can require an
+                # explicit, verified False rather than treating legacy None
+                # as safe.
+                changes["upstream_unfinished"] = False
                 changes[COMPLETED_SUCCESSOR_EVIDENCE_FIELD] = successor_evidence
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
