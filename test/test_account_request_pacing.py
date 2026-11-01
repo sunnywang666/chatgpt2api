@@ -693,6 +693,116 @@ class ProductionOrdinaryReadEdgeTests(unittest.TestCase):
                                     ("GET", "original", 10061)])
         self.assertEqual(self.clock.ordinary_read_queue, [])
 
+    def test_archive_read_rechecks_when_waiting_ordinary_reader_finishes_early(self):
+        """A stale FIFO lease must not consume this archive GET's whole deadline."""
+        from services.request_context import guarding_archive
+        self.clock.last_read_was_archive = True
+        self.book(60)
+        # The preceding archive and this ordinary reader still have burst
+        # credit, so once the reader actually starts, the next archive GET is
+        # lawful immediately.  The old code slept for its 60-second lease and
+        # failed a five-second archive deadline before the reader could run.
+        self.clock.conversation_read_bucket = {
+            "credit": 2.0, "at": self.now[0], "interval": 60.0, "capacity": 3,
+        }
+        self.clock._save()
+
+        def yield_to_original(delay):
+            self.assertLessEqual(delay, 1.0)
+            errors = []
+            def run_original():
+                try:
+                    self.original()
+                except BaseException as exc:
+                    errors.append(exc)
+            worker = threading.Thread(target=run_original)
+            worker.start()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.advance(delay)
+
+        with guarding_archive(lambda: None, read_owner="archive-next"), \
+             patch.object(type(config), "account_conversation_read_burst", property(lambda _: 3)), \
+             patch("services.account_request_pacing.time.sleep", side_effect=yield_to_original):
+            self.clock.request(self.send, "GET", "https://provider/backend-api/conversation/archive-next",
+                               _account_request_deadline_monotonic=self.now[0] + 5)
+
+        self.assertEqual([(method, name) for method, name, _ in self.sent],
+                         [("GET", "original"), ("GET", "archive-next")])
+        self.assertLess(self.sent[-1][2], 10005)
+        self.assertEqual(self.clock.ordinary_read_queue, [])
+
+    def test_archive_waiter_reloads_another_clock_instances_early_ordinary_release(self):
+        """The ProcessMutex reload after a bounded wait observes another worker's release."""
+        from services.request_context import guarding_archive
+        holder = AccountRequestClock("holder", self.clock.state_path)
+        with holder.lock:
+            holder.last_read_was_archive = True
+            self.assertTrue(holder._ordinary_read_turn("original-reader", self.now[0], 60))
+            holder._save()
+        waiter = AccountRequestClock("waiter", self.clock.state_path)
+
+        def release_from_other_clock(delay):
+            self.assertLessEqual(delay, 1.0)
+            releaser = AccountRequestClock("releaser", self.clock.state_path)
+            with releaser.lock:
+                releaser._release_ordinary_read("original-reader")
+            self.advance(delay)
+
+        with guarding_archive(lambda: None, read_owner="archive-next"), \
+             patch("services.account_request_pacing.time.sleep", side_effect=release_from_other_clock):
+            waiter.request(self.send, "GET", "https://provider/backend-api/conversation/archive-next",
+                           _account_request_deadline_monotonic=self.now[0] + 5)
+
+        self.assertEqual(self.sent, [("GET", "archive-next", 10001.0)])
+        self.assertEqual(waiter.ordinary_read_queue, [])
+
+    def test_archive_read_rechecks_without_overtaking_other_archive_owner(self):
+        """A different archive ticket is dynamic, but its current owner goes first."""
+        from services.request_context import guarding_archive
+        self.clock.archive_read_owner = "archive-first"
+        self.clock.archive_read_until = self.now[0] + 60
+        self.clock._save()
+
+        def finish_first_archive(delay):
+            self.assertLessEqual(delay, 1.0)
+            self.advance(delay)
+            # The current owner completed its already-admitted read.  It must
+            # appear before this waiter gets its next bounded recheck.
+            self.sent.append(("GET", "archive-first", self.now[0]))
+            with self.clock.lock:
+                self.clock.archive_read_owner = None
+                self.clock.archive_read_until = 0.0
+                self.clock._save()
+
+        with guarding_archive(lambda: None, read_owner="archive-next"), \
+             patch("services.account_request_pacing.time.sleep", side_effect=finish_first_archive):
+            self.clock.request(self.send, "GET", "https://provider/backend-api/conversation/archive-next",
+                               _account_request_deadline_monotonic=self.now[0] + 5)
+
+        self.assertEqual([(method, name) for method, name, _ in self.sent],
+                         [("GET", "archive-first"), ("GET", "archive-next")])
+
+    def test_archive_reservation_recheck_never_credits_or_bypasses_real_read_cooldown(self):
+        """A dynamic reservation poll cannot turn a provider cooldown into local credit."""
+        from services.account_request_pacing import AccountRequestDeadlineExceeded
+        from services.request_context import guarding_archive
+        self.clock.archive_read_owner = "archive-first"
+        self.clock.archive_read_until = self.now[0] + 60
+        self.clock.conversation_read_rate_failures = 1
+        self.clock.last_conversation_read_rate_limit = self.now[0]
+        self.clock._save()
+        credited = []
+        with guarding_archive(lambda: None, read_owner="archive-next"), \
+             patch("services.account_request_pacing.time.sleep", side_effect=AssertionError("cooldown must not sleep/send")), \
+             self.assertRaises(AccountRequestDeadlineExceeded):
+            self.clock.request(self.send, "GET", "https://provider/backend-api/conversation/archive-next",
+                               _account_request_deadline_monotonic=self.now[0] + 5,
+                               _account_request_local_wait=credited.append)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(credited, [])
+
     def test_h10_m60_finite_competing_sequence(self):
         with patch.object(type(config), "account_request_interval_secs", property(lambda _: 10.0)), \
              patch.object(type(config), "account_message_interval_secs", property(lambda _: 60.0)), \
