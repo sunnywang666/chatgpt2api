@@ -8,6 +8,7 @@ import hashlib
 import re
 
 current_operation_deadline = ContextVar("provider_operation_deadline", default=None)
+current_manual_conversation_read_budget = ContextVar("provider_manual_conversation_read_budget", default=None)
 current_request = ContextVar("provider_original_request", default=None)
 current_archive_guard = ContextVar("provider_archive_guard", default=None)
 current_archive_read_owner = ContextVar("provider_archive_read_owner", default=None)
@@ -24,6 +25,95 @@ ARCHIVE_OPERATION_BUDGET_SECONDS = 240.0
 
 class AdmissionLost(RuntimeError):
     """The original claim is no longer allowed to send."""
+
+
+class ManualConversationReadBudget:
+    """A manual source read's finite local-pacing extension.
+
+    The normal operation budget still pays for locks, parsing and transport.
+    Only the account pacer's known local FIFO/pacing waits may advance this
+    deadline, and never beyond the single hard deadline.
+    """
+
+    def __init__(self, initial_deadline: float, hard_deadline: float, local_wait_credit: float):
+        self.initial_deadline = initial_deadline
+        self.deadline = initial_deadline
+        self.hard_deadline = hard_deadline
+        self.local_wait_credit_remaining = max(0.0, local_wait_credit)
+        self._admitted_local_wait_credit = 0.0
+        self._admitted_local_wait_ceiling = hard_deadline
+
+    def reserve_local_wait_credit(self) -> float:
+        # A read that has already exhausted its ordinary processing/network
+        # budget cannot turn a later lock/CPU delay into pacing credit.
+        if time.monotonic() >= self.deadline:
+            self._admitted_local_wait_credit = 0.0
+            return 0.0
+        nested_ceiling = current_operation_deadline.get()
+        ceiling = min(self.hard_deadline, nested_ceiling) if nested_ceiling is not None else self.hard_deadline
+        self._admitted_local_wait_ceiling = ceiling
+        self._admitted_local_wait_credit = max(
+            0.0, min(self.local_wait_credit_remaining, ceiling - self.deadline),
+        )
+        return self._admitted_local_wait_credit
+
+    def record_local_pacing_wait(self, elapsed: float) -> float:
+        """Consume and return only the eligible part of a pacer wait."""
+        if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed <= 0:
+            return 0.0
+        # The pacer called reserve_local_wait_credit before it slept.  Do not
+        # re-evaluate against time.monotonic here: a valid long FIFO wait can
+        # naturally finish after the initial 60-second processing deadline.
+        credited = min(float(elapsed), self._admitted_local_wait_credit,
+                       self.local_wait_credit_remaining,
+                       self._admitted_local_wait_ceiling - self.deadline)
+        credited = max(0.0, credited)
+        self._admitted_local_wait_credit = 0.0
+        self.local_wait_credit_remaining -= credited
+        self.deadline = min(self.hard_deadline, self.deadline + credited)
+        return credited
+
+    def reservation_deadline(self) -> float:
+        """Bound a durable FIFO ticket to the same hard/nested ceiling."""
+        nested = current_operation_deadline.get()
+        return min(self.hard_deadline, nested) if nested is not None else self.hard_deadline
+
+
+def operation_effective_deadline():
+    """Return the active deadline, including the narrow manual-read credit."""
+    budget = current_manual_conversation_read_budget.get()
+    if budget is not None:
+        nested = current_operation_deadline.get()
+        return min(budget.deadline, nested) if nested is not None else budget.deadline
+    return current_operation_deadline.get()
+
+
+@contextmanager
+def manual_conversation_read_budget(processing_seconds=60.0, local_wait_credit_seconds=180.0):
+    """Give one explicit manual two-GET read a bounded local-pacing allowance."""
+    if (type(processing_seconds) not in (int, float) or not math.isfinite(processing_seconds)
+            or processing_seconds <= 0 or type(local_wait_credit_seconds) not in (int, float)
+            or not math.isfinite(local_wait_credit_seconds) or local_wait_credit_seconds < 0):
+        raise ValueError("finite manual conversation read budget required")
+    now = time.monotonic()
+    inherited = current_operation_deadline.get()
+    hard_deadline = now + float(processing_seconds) + float(local_wait_credit_seconds)
+    if inherited is not None:
+        hard_deadline = min(hard_deadline, inherited)
+    initial_deadline = min(now + float(processing_seconds), hard_deadline)
+    budget = ManualConversationReadBudget(
+        initial_deadline, hard_deadline, min(float(local_wait_credit_seconds), hard_deadline - initial_deadline),
+    )
+    # Keep the context ceiling at the hard deadline so a nested operation
+    # deadline can still shorten this scope. operation_effective_deadline()
+    # supplies the initial 60-second processing limit to ordinary callers.
+    deadline_token = current_operation_deadline.set(hard_deadline)
+    budget_token = current_manual_conversation_read_budget.set(budget)
+    try:
+        yield budget
+    finally:
+        current_manual_conversation_read_budget.reset(budget_token)
+        current_operation_deadline.reset(deadline_token)
 
 
 @contextmanager
@@ -52,7 +142,7 @@ def operation_budget(seconds):
 
 
 def operation_remaining(maximum):
-    deadline = current_operation_deadline.get()
+    deadline = operation_effective_deadline()
     if deadline is None:
         return maximum
     remaining = deadline - time.monotonic()
@@ -64,7 +154,7 @@ def operation_remaining(maximum):
 
 def operation_request_options(maximum):
     options = {"timeout": operation_remaining(maximum)}
-    deadline = current_operation_deadline.get()
+    deadline = operation_effective_deadline()
     if deadline is not None:
         options["_account_request_deadline_monotonic"] = deadline
     return options
@@ -73,7 +163,7 @@ def operation_request_options(maximum):
 @contextmanager
 def bounded_lock(lock, deadline_monotonic=None):
     """Wait only within the caller's budget; never release another owner's lock."""
-    inherited = current_operation_deadline.get()
+    inherited = operation_effective_deadline()
     deadline = (inherited if deadline_monotonic is None else deadline_monotonic
                 if inherited is None else min(inherited, deadline_monotonic))
     if deadline is None or isinstance(lock, nullcontext):

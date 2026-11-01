@@ -2381,5 +2381,167 @@ def test_native_get_connect_cap_preserves_total_deadline(tmp_path, monkeypatch):
         server.server_close()
 
 
+def test_manual_read_budget_shares_credit_across_two_fifo_reads_without_extending_other_gets():
+    """One manual source observation may wait through two existing read floors."""
+    import services.account_request_pacing as pacing
+    import services.request_context as request_context
+    from services.request_context import manual_conversation_read_budget, operation_effective_deadline
+
+    now = [100.0]
+    sent = []
+    clock = AccountRequestClock("manual-budget-shared")
+
+    def send(*_args, **_kwargs):
+        sent.append(now[0])
+        return Response()
+
+    with patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+         patch.object(request_context.time, "monotonic", side_effect=lambda: now[0]), \
+         patch.object(pacing.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
+         patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 45.0)), \
+         patch.object(type(config), "account_conversation_read_burst", property(lambda _: 1)):
+        clock.request(send, "GET", "https://provider/backend-api/conversation/other")
+        now[0] = 102.0
+        with manual_conversation_read_budget(60.0, 180.0) as budget:
+            for suffix in ("manual-a", "manual-b"):
+                clock.request(send, "GET", f"https://provider/backend-api/conversation/{suffix}",
+                              _account_request_deadline_monotonic=operation_effective_deadline(),
+                              _account_request_local_wait=budget.record_local_pacing_wait,
+                              _account_request_local_wait_credit_remaining=budget.reserve_local_wait_credit,
+                              _account_request_local_wait_reservation_deadline=budget.reservation_deadline)
+                if suffix == "manual-a":
+                    assert operation_effective_deadline() == 205.0
+            assert operation_effective_deadline() == 250.0
+            assert budget.local_wait_credit_remaining == 92.0
+    assert sent == [100.0, 145.0, 190.0]
+
+
+def test_manual_read_budget_never_credits_backoff_or_outlives_nested_deadline():
+    import services.account_request_pacing as pacing
+    import services.request_context as request_context
+    from services.request_context import (manual_conversation_read_budget, operation_deadline,
+                                          operation_effective_deadline)
+
+    now = [100.0]
+    clock = AccountRequestClock("manual-budget-backoff")
+    clock.conversation_read_rate_failures = 1
+    clock.last_conversation_read_rate_limit = now[0]
+    sent = []
+    with patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+         patch.object(request_context.time, "monotonic", side_effect=lambda: now[0]), \
+         patch.object(pacing.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)), \
+         patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 45.0)):
+        with manual_conversation_read_budget(60.0, 180.0) as budget:
+            with unittest.TestCase().assertRaises(pacing.AccountRequestDeadlineExceeded):
+                clock.request(lambda *_args, **_kwargs: sent.append(now[0]) or Response(), "GET",
+                              "https://provider/backend-api/conversation/manual-backoff",
+                              _account_request_deadline_monotonic=operation_effective_deadline(),
+                              _account_request_local_wait=budget.record_local_pacing_wait,
+                              _account_request_local_wait_credit_remaining=budget.reserve_local_wait_credit,
+                              _account_request_local_wait_reservation_deadline=budget.reservation_deadline)
+            assert budget.deadline == 160.0
+            assert budget.local_wait_credit_remaining == 180.0
+            with operation_deadline(110.0):
+                assert operation_effective_deadline() == 110.0
+                assert budget.reserve_local_wait_credit() == 0.0
+                assert budget.record_local_pacing_wait(45.0) == 0.0
+                assert operation_effective_deadline() == 110.0
+        # Exercise the shorter inherited hard deadline through the pacer: the
+        # normal FIFO floor cannot turn an outer 30-second remainder into the
+        # manual path's nominal 180-second local-wait credit.
+        clock.conversation_read_rate_failures = 0
+        clock.next_conversation_read = 145.0
+        with operation_deadline(130.0):
+            with manual_conversation_read_budget(60.0, 180.0) as budget:
+                with unittest.TestCase().assertRaises(pacing.AccountRequestDeadlineExceeded):
+                    clock.request(lambda *_args, **_kwargs: sent.append(now[0]) or Response(), "GET",
+                                  "https://provider/backend-api/conversation/manual-inherited-hard",
+                                  _account_request_deadline_monotonic=operation_effective_deadline(),
+                                  _account_request_local_wait=budget.record_local_pacing_wait,
+                                  _account_request_local_wait_credit_remaining=budget.reserve_local_wait_credit,
+                                  _account_request_local_wait_reservation_deadline=budget.reservation_deadline)
+                assert budget.deadline == 130.0
+    assert sent == []
+
+
+def test_manual_read_network_time_is_shared_and_never_resets_for_the_second_get():
+    import services.account_request_pacing as pacing
+    import services.request_context as request_context
+    from services.request_context import manual_conversation_read_budget, operation_effective_deadline
+
+    now = [100.0]
+    clock = AccountRequestClock("manual-budget-network")
+    timeouts = []
+
+    def send(_method, _url, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        # The first transport consumes forty of the same 60-second budget;
+        # the second starts with only its remaining twenty seconds.
+        now[0] += 40.0 if len(timeouts) == 1 else 21.0
+        return Response()
+
+    with patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+         patch.object(request_context.time, "monotonic", side_effect=lambda: now[0]), \
+         patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0.0)):
+        with manual_conversation_read_budget(60.0, 180.0) as budget:
+            for suffix in ("network-first", "network-second"):
+                clock.request(send, "GET", f"https://provider/backend-api/conversation/{suffix}", timeout=60.0,
+                              _account_request_deadline_monotonic=operation_effective_deadline(),
+                              _account_request_local_wait=budget.record_local_pacing_wait,
+                              _account_request_local_wait_credit_remaining=budget.reserve_local_wait_credit,
+                              _account_request_local_wait_reservation_deadline=budget.reservation_deadline)
+            with unittest.TestCase().assertRaises(pacing.AccountRequestDeadlineExceeded):
+                clock.request(send, "GET", "https://provider/backend-api/conversation/network-expired", timeout=60.0,
+                              _account_request_deadline_monotonic=operation_effective_deadline(),
+                              _account_request_local_wait=budget.record_local_pacing_wait,
+                              _account_request_local_wait_credit_remaining=budget.reserve_local_wait_credit,
+                              _account_request_local_wait_reservation_deadline=budget.reservation_deadline)
+    assert timeouts == [60.0, 20.0]
+
+
+def test_manual_read_fifo_ticket_survives_credited_wait_and_hard_failure_cleans_up():
+    import services.account_request_pacing as pacing
+    import services.request_context as request_context
+    from services.request_context import manual_conversation_read_budget, operation_effective_deadline
+
+    now = [100.0]
+    clock = AccountRequestClock("manual-budget-fifo")
+    clock.next_conversation_read = 190.0
+    sent = []
+
+    def sleep(seconds):
+        now[0] = 161.0
+        with clock.lock:
+            owner = clock.ordinary_read_queue[0]["owner"]
+            clock._ordinary_read_turn("later-reader", now[0], 0.0, deadline=220.0)
+            assert clock.ordinary_read_queue[0]["owner"] == owner
+        now[0] = 100.0 + seconds
+
+    with patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+         patch.object(request_context.time, "monotonic", side_effect=lambda: now[0]), \
+         patch.object(pacing.time, "sleep", side_effect=sleep), \
+         patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 0.0)):
+        with manual_conversation_read_budget(60.0, 180.0) as budget:
+            clock.request(lambda *_args, **_kwargs: sent.append(now[0]) or Response(), "GET",
+                          "https://provider/backend-api/conversation/manual-fifo",
+                          _account_request_deadline_monotonic=operation_effective_deadline(),
+                          _account_request_local_wait=budget.record_local_pacing_wait,
+                          _account_request_local_wait_credit_remaining=budget.reserve_local_wait_credit,
+                          _account_request_local_wait_reservation_deadline=budget.reservation_deadline)
+        assert [entry["owner"] for entry in clock.ordinary_read_queue] == ["later-reader"]
+        clock._release_ordinary_read("later-reader")
+        clock.next_conversation_read = now[0] + 241.0
+        with manual_conversation_read_budget(60.0, 180.0) as budget:
+            with unittest.TestCase().assertRaises(pacing.AccountRequestDeadlineExceeded):
+                clock.request(lambda *_args, **_kwargs: sent.append(now[0]) or Response(), "GET",
+                              "https://provider/backend-api/conversation/manual-hard-stop",
+                              _account_request_deadline_monotonic=operation_effective_deadline(),
+                              _account_request_local_wait=budget.record_local_pacing_wait,
+                              _account_request_local_wait_credit_remaining=budget.reserve_local_wait_credit,
+                              _account_request_local_wait_reservation_deadline=budget.reservation_deadline)
+        assert clock.ordinary_read_queue == []
+    assert sent == [190.0]
+
+
 if __name__ == "__main__":
     unittest.main()

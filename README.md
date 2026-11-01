@@ -189,11 +189,11 @@ environment:
 
 携带 `product_work` 的文字任务在流结束后，使用原有的那次会话读取核实本次用户消息的唯一完成分支，正文和回复位置均取自该分支。后续对话推进不会改变原请求的结果；找不到原节点、分支不唯一或尚未完成时保留结果未知，继续按原请求查询，不重新生成。此核实不增加上游读取次数。
 
-对已保存为 `unknown` 的原文字请求，工作台内部管理员可用 `POST /api/conversation-bindings/text-requests/{request_id}/manual-recover` 显式采用同一物理会话中后续人工 user→非空 final 文本。入口仅允许可信 `internal:listing`、非公司/非外部的管理员；body 必须提供原回执的 `provider_binding_id`、`provider_account_identity`、`client_conversation_id`，可用 `source_request_message_id`/`source_message_id` 锁定人工 user/final。Provider 从原回执取得 conversation，不接受 conversation ID、正文、重试输入或新的生成授权；读取受同一有界账号读取预算和上游 429 `Retry-After` 约束。
+对已保存为 `unknown` 的原文字请求，工作台内部管理员可用 `POST /api/conversation-bindings/text-requests/{request_id}/manual-recover` 显式采用同一物理会话中后续人工 user→非空 final 文本。入口仅允许可信 `internal:listing`、非公司/非外部的管理员；body 必须提供原回执的 `provider_binding_id`、`provider_account_identity`、`client_conversation_id`，可用 `source_request_message_id`/`source_message_id` 锁定人工 user/final。Provider 从原回执取得 conversation，不接受 conversation ID、正文、重试输入或新的生成授权；读取有 60 秒处理/网络预算，并只为同一次两读中的本地账号 pacing/FIFO/并发等待共享最多 180 秒信用（总时限不超过 240 秒，继承更短 deadline 不延长）。429、上游回退、网络和锁等待不获得该信用；上游 429 仍保留其 `Retry-After` 语义。
 
 采用结果仅以 `manual_result` 同原回执持久化：它包含原 request、绑定/账号/会话、人工 source、后继 `parent_message_id`、content 与采用时间；原 `status`、原 `result`、UNKNOWN、原 user/parent/错误保持不变。原成功先落库则 POST 返回 `manual_result:null`；人工采用先落库时，迟到原 final 仍保存为原事实，但不回退已冻结且已被工作台采用的人工 cursor。普通 GET/回执投影不暴露 `manual_result`；可信内部管理员的 task-result/snapshot 才能读回它，且这些 GET 只读本地持久化、不会查询上游。工作台在自己的采用步骤保存该来源后，才可将该 cursor 作为同会话后继 text/image 的输入；Provider 仍在发送前核验当前会话，不能由此重发原 UNKNOWN。
 
-当前最新人工 turn 没有完整非空 final（包括仍在 thought/tool）时，POST 返回 `409 CHAT_MANUAL_RECOVERY_NO_COMPLETED_FOLLOWUP`，不保存采用；用户后来完成该 turn 后可用同一原请求再次显式 POST。传输/限流错误不属于该确定性未采用结论。ProductWork 仅在该人工 cursor 本身仍为当前可归档头，或同一物理会话的严格持久化后继链完整成功时收尾；它不把原 UNKNOWN 改写成成功。
+当前最新人工 turn 没有完整非空 final（包括仍在 thought/tool）时，POST 返回 `409 CHAT_MANUAL_RECOVERY_NO_COMPLETED_FOLLOWUP`，不保存采用；用户后来完成该 turn 后可用同一原请求再次显式 POST。尚未持久化采用时，如仅本地账号读取队列/预算耗尽，POST 返回 `409 CHAT_MANUAL_RECOVERY_READ_DEFERRED`，带 `adopted:false`、`retryable:true`、`next_poll_at`、`recovery_retry_after_seconds` 及同值整数 `Retry-After`；工作台必须在该时刻后重新显式 POST，而不是把原 UNKNOWN 当结果轮询。传输、上游 5xx 和直接 429 不属于此本地 deferred 结论。ProductWork 仅在该人工 cursor 本身仍为当前可归档头，或同一物理会话的严格持久化后继链完整成功时收尾；它不把原 UNKNOWN 改写成成功。
 
 已保存成功文字结果却残留旧恢复占用时，普通查询会在同一事务内核实属于普通 Chat 文本请求、结果已完成且完成时间有效、执行与预留均已结束、无未完成或恢复错误状态、无旧式恢复占用字段、恢复租约及仍存在的执行租约已过期，再清理该恢复标记；此处理不查询上游、不重发，并保留原结果。有效或无法核实的租约、暂停、结果未知、转发及图片恢复不会按此规则清理。调用方仍须采用并保存结果，按原工作流程完成关闭与归档，不能将恢复标记清理当作整项工作完成。
 

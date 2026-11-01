@@ -14,11 +14,15 @@ from curl_cffi import CurlInfo
 from curl_cffi.requests.exceptions import RequestException
 
 from services.account_service import account_service
-from services.account_request_pacing import AccountReadRetryBudgetInsufficient
+from services.account_request_pacing import (AccountReadRetryBudgetInsufficient,
+                                             AccountRequestDeadlineExceeded,
+                                             account_pacing_snapshot)
 from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI, explicit_final_channel
 from services.protocol.conversation import conversation_events, sanitize_output_text
 from services.request_context import (ARCHIVE_OPERATION_BUDGET_SECONDS, bounded_lock,
-                                      operation_budget, current_operation_deadline, current_request)
+                                      manual_conversation_read_budget, operation_budget,
+                                      operation_effective_deadline, current_operation_deadline,
+                                      current_request)
 from utils.helper import UpstreamHTTPError
 from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
 
@@ -832,6 +836,17 @@ class ConversationBindingError(RuntimeError):
             if is_stream_open_http else {}
         )
         self.no_final_guard = safe_no_final_guard_diagnostic(no_final_guard)
+
+
+class ManualTextFollowupReadDeferred(ConversationBindingError):
+    """The explicit manual source read consumed only local pacing/budget time."""
+
+    def __init__(self, request_id: str, next_poll_at: int, retry_after_seconds: int):
+        super().__init__("manual conversation read is locally deferred",
+                         code="CHAT_MANUAL_RECOVERY_READ_DEFERRED")
+        self.request_id = request_id
+        self.next_poll_at = next_poll_at
+        self.retry_after_seconds = retry_after_seconds
 
 
 class ConversationBindingService:
@@ -1828,14 +1843,12 @@ class ConversationBindingService:
             "content": text,
         }
 
-    @operation_budget(60.0)
     def read_manual_text_followup(
         self, receipt: dict[str, Any], *, provider_binding_id: str,
         provider_account_identity: str, client_conversation_id: str,
         source_request_message_id: str = "", source_message_id: str = "",
     ) -> dict[str, str]:
         """Read a stable, explicitly adopted later human text turn; never send."""
-        deadline = current_operation_deadline.get()
         supplied = (str(provider_binding_id).strip(), str(provider_account_identity).strip(),
                     str(client_conversation_id).strip())
         stored = tuple(str(receipt.get(key) or "").strip() for key in (
@@ -1847,29 +1860,68 @@ class ConversationBindingService:
         if not conversation_id:
             raise ConversationBindingError("original conversation identity is unavailable",
                                            code="CHAT_MANUAL_RECOVERY_ORIGINAL_UNAVAILABLE")
-        if account_service.get_bound_account_identity(supplied[0]) != supplied[1]:
-            raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
-        token = account_service.get_bound_text_access_token(supplied[0], model="auto")
-        with bounded_lock(account_service.conversation_binding_lock(supplied[0], supplied[2])):
-            backend = OpenAIBackendAPI(access_token=token)
+        # This budget begins before bound-account locks/token refresh/backend
+        # setup. Those are local processing, never a new 240-second allowance.
+        backend = None
+        with manual_conversation_read_budget(60.0, 180.0) as read_budget:
             try:
-                first = self._manual_followup_text_result(
-                    receipt, backend._get_conversation(conversation_id, deadline_monotonic=deadline,
-                                                       connect_timeout_secs=10.0, minimum_budget_secs=10.0),
-                    source_request_message_id=source_request_message_id, source_message_id=source_message_id,
+                if account_service.get_bound_account_identity(supplied[0]) != supplied[1]:
+                    raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
+                token = account_service.get_bound_text_access_token(supplied[0], model="auto")
+                backend = OpenAIBackendAPI(access_token=token)
+                with bounded_lock(account_service.conversation_binding_lock(supplied[0], supplied[2])):
+                    deadline = operation_effective_deadline()
+                    first = self._manual_followup_text_result(
+                        receipt, backend._get_conversation(
+                            conversation_id, deadline_monotonic=deadline, connect_timeout_secs=10.0,
+                            minimum_budget_secs=10.0,
+                            local_wait=read_budget.record_local_pacing_wait,
+                            local_wait_credit_remaining=read_budget.reserve_local_wait_credit,
+                            local_wait_reservation_deadline=read_budget.reservation_deadline,
+                        ),
+                        source_request_message_id=source_request_message_id, source_message_id=source_message_id,
+                    )
+                    # The first account pacing wait may legitimately extend
+                    # this one manual read's local deadline.  Re-read it for
+                    # the stability GET; never reuse the stale 60-second
+                    # deadline captured before the first wait.
+                    deadline = operation_effective_deadline()
+                    second = self._manual_followup_text_result(
+                        receipt, backend._get_conversation(
+                            conversation_id, deadline_monotonic=deadline, connect_timeout_secs=10.0,
+                            minimum_budget_secs=10.0,
+                            local_wait=read_budget.record_local_pacing_wait,
+                            local_wait_credit_remaining=read_budget.reserve_local_wait_credit,
+                            local_wait_reservation_deadline=read_budget.reservation_deadline,
+                        ),
+                        source_request_message_id=first["source_request_message_id"],
+                        source_message_id=first["source_message_id"],
+                    )
+                    if second != first:
+                        raise ConversationBindingError("conversation changed during manual recovery",
+                                                       code="CHAT_MANUAL_RECOVERY_CHANGED")
+                    return first
+            except AccountRequestDeadlineExceeded:
+                # This class is emitted before a GET enters transport.  It is
+                # a local manual-read deferral, never proof that an upstream
+                # response/transport failure can be replayed.
+                now = time.time()
+                pacing = account_pacing_snapshot(
+                    (getattr(backend, "account", None) if backend is not None else None)
+                    or {"provider_account_identity": supplied[1]},
+                    now, include_turn=False, include_conversation_read=True,
                 )
-                second = self._manual_followup_text_result(
-                    receipt, backend._get_conversation(conversation_id, deadline_monotonic=deadline,
-                                                       connect_timeout_secs=10.0, minimum_budget_secs=10.0),
-                    source_request_message_id=first["source_request_message_id"],
-                    source_message_id=first["source_message_id"],
-                )
-                if second != first:
-                    raise ConversationBindingError("conversation changed during manual recovery",
-                                                   code="CHAT_MANUAL_RECOVERY_CHANGED")
-                return first
+                next_at = pacing.get("next_at")
+                if not isinstance(next_at, (int, float)) or not math.isfinite(next_at):
+                    next_at = now + 1.0
+                next_poll_at = max(int(math.ceil(now + 1.0)), int(math.ceil(next_at)))
+                raise ManualTextFollowupReadDeferred(
+                    str(receipt.get("request_id") or ""), next_poll_at,
+                    max(1, int(math.ceil(next_poll_at - now))),
+                ) from None
             finally:
-                backend.close()
+                if backend is not None:
+                    backend.close()
 
     @staticmethod
     def _read_text_request_result(
