@@ -24,6 +24,7 @@ from utils.helper import UpstreamHTTPError, is_image_chat_request, has_response_
 from services.content_filter import check_request, request_shape, request_text
 from services.conversation_binding_service import (
     ConversationBindingError,
+    ManualTextFollowupReadDeferred,
     conversation_binding_service,
 )
 from services.editable_file_task_service import editable_file_task_service
@@ -660,6 +661,15 @@ def create_router() -> APIRouter:
                 raise HTTPException(status_code=429, detail={"code": "RECOVERY_RATE_LIMITED"},
                                     headers=headers) from None
             raise HTTPException(status_code=503, detail={"code": "CONVERSATION_READ_UNAVAILABLE"}) from None
+        except ManualTextFollowupReadDeferred as exc:
+            raise HTTPException(status_code=409, headers={"Retry-After": str(exc.retry_after_seconds)}, detail={
+                "code": exc.code,
+                "request_id": exc.request_id,
+                "adopted": False,
+                "retryable": True,
+                "next_poll_at": exc.next_poll_at,
+                "recovery_retry_after_seconds": exc.retry_after_seconds,
+            }) from None
         except ConversationBindingError as exc:
             raise HTTPException(status_code=409, detail={"code": exc.code}) from None
 

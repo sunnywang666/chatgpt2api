@@ -463,6 +463,8 @@ class AccountRequestClock:
         if type(minimum_budget) not in (int, float) or not math.isfinite(minimum_budget) or minimum_budget <= 0:
             minimum_budget = None
         local_wait = kwargs.pop("_account_request_local_wait", None)
+        local_wait_credit_remaining = kwargs.pop("_account_request_local_wait_credit_remaining", None)
+        local_wait_reservation_deadline = kwargs.pop("_account_request_local_wait_reservation_deadline", None)
         before_send = kwargs.pop("_account_request_before_send", None)
         preflight = kwargs.pop("_account_request_preflight", None)
         transport_model = kwargs.pop("_account_request_model", None)
@@ -513,7 +515,21 @@ class AccountRequestClock:
             # still bounded by the caller's deadline and is never shortened.
             provider_wait = max(self.cooldown_until, self._read_cooldown_until() if is_conversation_read else 0)
             credit = callable(local_wait) and provider_wait <= time.monotonic()
-            if remaining is not None and (remaining <= 0 or (not credit and delay >= remaining)):
+            credit_limit = None
+            if credit and callable(local_wait_credit_remaining):
+                try:
+                    available = local_wait_credit_remaining()
+                    credit_limit = (float(available) if isinstance(available, (int, float))
+                                    and not isinstance(available, bool) and math.isfinite(available) else 0.0)
+                    credit_limit = max(0.0, credit_limit)
+                except Exception:
+                    credit_limit = 0.0
+                # A manual read's extension starts only while its ordinary
+                # processing/network budget is still alive. Locks and CPU
+                # work never gain a second deadline through this hook.
+                credit = credit and remaining is not None and remaining > 0 and credit_limit > 0
+            if remaining is not None and (remaining <= 0 or (not credit and delay >= remaining)
+                                          or (credit_limit is not None and delay > remaining + credit_limit)):
                 raise AccountRequestDeadlineExceeded(message)
             started_wait = time.monotonic()
             if reason == "read_concurrency":
@@ -523,9 +539,12 @@ class AccountRequestClock:
             elapsed = max(0.0, time.monotonic() - started_wait)
             local_seconds["pace_wait_secs"] += elapsed
             if credit and elapsed:
-                local_wait(elapsed)
+                credited = local_wait(elapsed)
+                if not isinstance(credited, (int, float)) or isinstance(credited, bool) or not math.isfinite(credited):
+                    credited = elapsed
+                credited = max(0.0, min(elapsed, float(credited)))
                 if deadline_at is not None:
-                    deadline_at += elapsed
+                    deadline_at += credited
 
         request_target = str(url).split("#", 1)[0]
         parsed_url = urlparse(request_target)
@@ -774,7 +793,18 @@ class AccountRequestClock:
                     elif is_conversation_read:
                         if self.archive_read_owner and self.archive_read_until > now:
                             read_delay = max(read_delay, self.archive_read_until - now)
-                        ordinary_turn = self._ordinary_read_turn(ordinary_owner, now, read_delay, deadline=deadline_at)
+                        reservation_deadline = deadline_at
+                        if callable(local_wait_reservation_deadline):
+                            try:
+                                value = local_wait_reservation_deadline()
+                                if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                                        and math.isfinite(value)):
+                                    reservation_deadline = value
+                            except Exception:
+                                pass
+                        ordinary_turn = self._ordinary_read_turn(
+                            ordinary_owner, now, read_delay, deadline=reservation_deadline,
+                        )
                         ordinary_registered = True
                         if not ordinary_turn:
                             # Give the reserved reader time to wake. Do not
@@ -1500,6 +1530,8 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
             # account-clock wait. Consume our private option before requests.
             deadline = kwargs.pop("_account_request_deadline_monotonic", None)
             kwargs.pop("_account_request_local_wait", None)
+            kwargs.pop("_account_request_local_wait_credit_remaining", None)
+            kwargs.pop("_account_request_local_wait_reservation_deadline", None)
             kwargs.pop("_account_request_model", None)
             if isinstance(deadline, (int, float)) and not isinstance(deadline, bool):
                 remaining = deadline - time.monotonic()

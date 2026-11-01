@@ -1942,3 +1942,95 @@ def test_manual_text_recovery_no_final_is_not_adopted_and_later_explicit_post_su
     assert "manual_result" not in saved(service)
     second = client.post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
     assert second.status_code == 200 and second.json()["manual_result"]["source_message_id"] == "manual-final"
+
+
+def test_manual_text_recovery_local_read_deferral_is_retryable_without_adopting_then_idempotent(tmp_path, monkeypatch):
+    from services.conversation_binding_service import ManualTextFollowupReadDeferred
+
+    service, _, _, legacy = migration(tmp_path)
+    row = legacy[0]
+    before = copy.deepcopy(saved(service))
+    calls = []
+
+    def reader(*_args, **_kwargs):
+        calls.append(None)
+        if len(calls) == 1:
+            raise ManualTextFollowupReadDeferred(
+                request_id="old-0", next_poll_at=1_800_000_124, retry_after_seconds=23,
+            )
+        return manual_source(row)
+
+    monkeypatch.setattr(ai, "text_task_service", service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_args, **_kwargs: {"id": "owner", "role": "admin"})
+    monkeypatch.setattr(ai, "trusted_source", lambda *_args, **_kwargs: "internal:listing")
+    monkeypatch.setattr("services.text_task_service.conversation_binding_service.read_manual_text_followup", reader)
+    app = FastAPI(); app.include_router(ai.create_router())
+    client = TestClient(app)
+    payload = {key: row[key] for key in (
+        "provider_binding_id", "provider_account_identity", "client_conversation_id")}
+
+    deferred = client.post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert deferred.status_code == 409
+    assert deferred.json() == {"detail": {
+        "code": "CHAT_MANUAL_RECOVERY_READ_DEFERRED", "request_id": "old-0", "adopted": False,
+        "retryable": True, "next_poll_at": 1_800_000_124, "recovery_retry_after_seconds": 23,
+    }}
+    assert deferred.headers["retry-after"] == "23"
+    assert saved(service) == before
+
+    adopted = client.post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert adopted.status_code == 200 and adopted.json()["original_status"] == "unknown"
+    assert adopted.json()["manual_result"]["content"] == "manual approved content"
+    assert saved(service)["status"] == "unknown" and saved(service)["upstream_outcome"] == "unknown"
+
+    repeated = client.post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert repeated.status_code == 200 and repeated.json() == adopted.json() and len(calls) == 2
+
+
+@pytest.mark.parametrize(("failure", "expected_status", "expected_code"), [
+    (UpstreamHTTPError("manual-read", 503, {"error": "unavailable"}), 503, "CONVERSATION_READ_UNAVAILABLE"),
+    (ConversationBindingError("manual source changed", code="CHAT_MANUAL_RECOVERY_CHANGED"), 409,
+     "CHAT_MANUAL_RECOVERY_CHANGED"),
+])
+def test_manual_text_recovery_transport_or_source_change_never_masquerades_as_local_deferral(
+        tmp_path, monkeypatch, failure, expected_status, expected_code):
+    service, _, _, legacy = migration(tmp_path)
+    row = legacy[0]
+    before = copy.deepcopy(saved(service))
+    monkeypatch.setattr(ai, "text_task_service", service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_args, **_kwargs: {"id": "owner", "role": "admin"})
+    monkeypatch.setattr(ai, "trusted_source", lambda *_args, **_kwargs: "internal:listing")
+    monkeypatch.setattr("services.text_task_service.conversation_binding_service.read_manual_text_followup",
+                        Mock(side_effect=failure))
+    app = FastAPI(); app.include_router(ai.create_router())
+    payload = {key: row[key] for key in (
+        "provider_binding_id", "provider_account_identity", "client_conversation_id")}
+    response = TestClient(app).post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert response.status_code == expected_status and response.json()["detail"]["code"] == expected_code
+    assert response.json()["detail"]["code"] != "CHAT_MANUAL_RECOVERY_READ_DEFERRED"
+    assert "retry-after" not in response.headers
+    assert saved(service) == before
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "company", "external"])
+def test_manual_text_recovery_deferral_does_not_relax_trusted_internal_boundary(tmp_path, monkeypatch, mode):
+    service, _, _, legacy = migration(tmp_path)
+    row = legacy[0]
+    called = Mock()
+
+    def identity(*_args, request=None, **_kwargs):
+        if mode == "company":
+            request.state.company_identity = {"company": "fixture"}
+        return {"id": "owner", "role": "user" if mode == "ordinary" else "admin"}
+
+    monkeypatch.setattr(ai, "text_task_service", service)
+    monkeypatch.setattr(ai, "require_identity", identity)
+    monkeypatch.setattr(ai, "trusted_source", lambda *_args, **_kwargs: "internal:listing")
+    monkeypatch.setattr(ai, "is_external", lambda _request: mode == "external")
+    monkeypatch.setattr(service, "recover_manual_followup", called)
+    app = FastAPI(); app.include_router(ai.create_router())
+    payload = {key: row[key] for key in (
+        "provider_binding_id", "provider_account_identity", "client_conversation_id")}
+    response = TestClient(app).post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert response.status_code == 404 and response.json()["detail"]["code"] == "TASK_NOT_FOUND"
+    called.assert_not_called()
