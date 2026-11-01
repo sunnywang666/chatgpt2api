@@ -2936,6 +2936,50 @@ class TextTaskService:
                 self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_UNAVAILABLE")
             return self._public(receipt)
 
+    def observe_workbench_derived_acceptance(self, owner, request_id, payload, *, source):
+        """Read whether one frozen advanced successor was accepted at this instant.
+
+        This deliberately has no submit, admission, content-review, or wake path.
+        A final second local observation prevents an absent answer from masking an
+        exact child registered concurrently, while still making no claim about a
+        child that may be accepted after this call returns.
+        """
+        from services.advanced_session_successor import MODE
+
+        if payload.get("mode") != MODE:
+            raise ConversationBindingError(
+                "advanced successor acceptance requires advanced_new_session",
+                code="CHAT_ADVANCED_SESSION_INVALID",
+            )
+        existing = self.validate_workbench_derived_input(owner, request_id, payload, source=source)
+        if existing is not None:
+            return existing
+
+        # Rebuild from durable inputs after the first read.  This keeps the
+        # absent proof tied to the same immutable request/body identity without
+        # allocating a candidate receipt or reaching any upstream service.
+        body = self.prepare_workbench_derived_input(owner, request_id, payload, source=source)
+        child_id, child_hash = self._submission_identity(owner, body)
+        with self._db() as db:
+            row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                             (owner, child_id)).fetchone()
+            if row:
+                try:
+                    receipt = json.loads(row[1])
+                    stored = self.store.load_input(receipt["_input_ref"])
+                    if row[0] != child_hash or stored != body:
+                        raise ValueError
+                except (OSError, ValueError, TypeError, KeyError):
+                    self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_UNAVAILABLE")
+                return self._public(receipt)
+        return {
+            "state": "absent_at_observation",
+            "original_request_id": request_id,
+            "client_request_id": body["client_request_id"],
+            "original_input_hash": payload["original_input_hash"],
+            "child_input_hash": child_hash,
+        }
+
     def submit_workbench_derived_input(self, owner, request_id, payload, *, source):
         body = self.prepare_workbench_derived_input(owner, request_id, payload, source=source)
         if body.get("_advanced_session"):
@@ -2943,10 +2987,46 @@ class TextTaskService:
             with self._db() as db:
                 existing = self.store.read_receipt(db, "text", owner, body["client_request_id"])
                 original = self.store.read_receipt(db, "text", owner, request_id)
+            if existing is not None:
+                # A same-ID row may have appeared after prepare's snapshot.
+                # Revalidate its ID/hash/body/audit marker before returning it;
+                # a deferred FIFO read never proves a child is globally absent.
+                existing = self.validate_workbench_derived_input(
+                    owner, request_id, payload, source=source)
+                if existing is not None:
+                    return existing
             if existing is None:
                 # Exact-original network read is outside the write transaction;
-                # acceptance revalidates the unchanged durable proof afterwards.
-                check_fresh_read(self.recovery_reader(original), original, body["_advanced_session"])
+                # use the established original-result FIFO rather than joining
+                # the ordinary account-read queue.  A deferred FIFO read means
+                # only this call has not created a child row or started an
+                # upstream child send; another same-ID caller may accept it.
+                from services.account_request_pacing import AccountRequestDeadlineExceeded
+                from services.work_lifecycle import WorkLifecycleError
+
+                admit = getattr(self.admission, "read_original_if_ready", None)
+                if not callable(admit):
+                    raise WorkLifecycleError("CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED", 503)
+
+                def read_fresh_original(_owner, _request_id):
+                    # The admission arguments authorize only this durable root;
+                    # keep the already-loaded original receipt as the immutable
+                    # proof subject rather than accepting a replacement object.
+                    if _owner != owner or _request_id != request_id:
+                        raise RuntimeError("advanced original read admission changed")
+                    return self.recovery_reader(original)
+
+                try:
+                    fresh = admit(owner, request_id, read_fresh_original, original)
+                except AccountRequestDeadlineExceeded:
+                    # This occurred before this invocation reaches
+                    # _submit_prepared.  It is not evidence about a concurrent
+                    # same-ID invocation's durable child or upstream send.
+                    raise WorkLifecycleError("CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED", 503) from None
+                if fresh is False or fresh is NotImplemented:
+                    raise WorkLifecycleError("CHAT_ADVANCED_SESSION_PREACCEPT_READ_DEFERRED", 503)
+                # Acceptance revalidates the unchanged durable proof afterwards.
+                check_fresh_read(fresh, original, body["_advanced_session"])
         from services.product_work import locking_product_conversations
         with locking_product_conversations([body] if body.get("product_work") else []):
             return self._submit_prepared(owner, body, source=source)

@@ -802,6 +802,26 @@ def create_router() -> APIRouter:
             raise HTTPException(404 if exc.code == "CHAT_WORKBENCH_DERIVED_INPUT_NOT_FOUND" else 409,
                                 detail={"code": exc.code}) from None
 
+    @router.post("/api/conversation-bindings/text-requests/{request_id}/derived-successor/acceptance")
+    async def observe_workbench_derived_successor_acceptance(
+            request_id: str, body: WorkbenchDerivedSuccessorRequest,
+            request: Request, response: Response,
+            authorization: str | None = Header(default=None)):
+        """Read one advanced successor's durable acceptance without submitting it."""
+        identity, source = workbench_input_identity(request, authorization)
+        response.headers["Cache-Control"] = "private, no-store"
+        try:
+            # Do not filter/log business content here.  This reconciliation is
+            # a strictly local observation and must not itself become a send.
+            return await run_in_threadpool(
+                text_task_service.observe_workbench_derived_acceptance,
+                str(identity.get("id") or "anonymous"), request_id,
+                body.model_dump(mode="python"), source=source,
+            )
+        except ConversationBindingError as exc:
+            raise HTTPException(404 if exc.code == "CHAT_WORKBENCH_DERIVED_INPUT_NOT_FOUND" else 409,
+                                detail={"code": exc.code}) from None
+
     @router.post("/api/conversation-bindings/text-requests/{request_id}/reconcile-queued-successor")
     async def reconcile_queued_bound_successor(request_id: str, body: ReconcileQueuedSuccessorRequest,
                                                request: Request, response: Response,
