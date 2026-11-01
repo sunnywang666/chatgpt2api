@@ -549,6 +549,192 @@ class AdmissionTests(unittest.TestCase):
                                           "read_due_in_ms": 90000})
             self.assertEqual(len(AccountRequestClock(key[:12], path).ordinary_read_queue), 1)
 
+    def test_advanced_preaccept_waits_for_own_ticket_and_background_yields(self):
+        from services import account_request_pacing as pacing
+        from services.account_request_pacing import AccountRequestClock
+        from services.config import config
+
+        now = [1000.0]
+        account = self.rows[0]
+        key = hashlib.sha256(account["account_id"].encode()).hexdigest()
+        path = self.root / "account_request_clocks" / f"{key}.json"
+        receipt = {"provider_account_identity": account["provider_account_identity"],
+                   "provider_binding_id": "binding-0", "client_conversation_id": "same-original",
+                   "conversation_id": "same-original"}
+        recovered, background, concurrent = [], [], []
+        held_background_permit = [None]
+        observed_physical_overlap = []
+
+        def complete_background(*_args):
+            background.append(True)
+            current = AccountRequestClock(key[:12], path)
+            current.next_conversation_read = now[0] + 90
+            current._save()
+
+        class Stop:
+            dispatched = False
+
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                now[0] += seconds
+                if not concurrent:
+                    concurrent.append(self_admission.read_original_if_ready(
+                        "happy", "same", lambda *_args: "second-fresh", receipt,
+                        reservation_scope="advanced-preaccept", wait_for_ready_seconds=720,
+                    ))
+                if not self.dispatched and now[0] >= 1080:
+                    permit = self_admission._acquire_original_read(
+                        "text", "background", "same", receipt, require_text_reservation=True,
+                    )
+                    if not permit:
+                        raise AssertionError("background head did not acquire its due read")
+                    # Hold a real physical-read permit across the next renew.
+                    # The advanced caller must retain its private FIFO ticket
+                    # without taking this permit's slot or starting another GET.
+                    held_background_permit[0] = permit
+                    self.dispatched = True
+                elif held_background_permit[0] is not None and now[0] >= 1090:
+                    current = AccountRequestClock(key[:12], path)
+                    observed_physical_overlap.append(len(current.ordinary_read_queue))
+                    self_admission._run_original_read(
+                        held_background_permit[0], complete_background, "background", "same",
+                    )
+                    held_background_permit[0] = None
+                return False
+
+        with patch.object(pacing, "DATA_DIR", self.root), \
+             patch.object(pacing, "_clocks", {}), \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.pool_admission.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 90)):
+            clock = AccountRequestClock(key[:12], path)
+            clock.next_conversation_read = now[0] + 80
+            clock._save()
+            self.admission.pacing = None
+            self.admission._stop = Stop()
+            self_admission = self.admission
+
+            # A normal background reader already owns the only ordinary ticket.
+            # The advanced caller may queue exactly behind it; ordinary recovery
+            # sees that private ticket and cannot retake the next read edge.
+            self.assertFalse(self.admission._acquire_original_read(
+                "text", "background", "same", receipt, require_text_reservation=True,
+            ))
+            result = self.admission.read_original_if_ready(
+                "happy", "same", lambda *_args: recovered.append(True) or "fresh", receipt,
+                reservation_scope="advanced-preaccept", wait_for_ready_seconds=720,
+            )
+            self.assertEqual(result, "fresh")
+            self.assertEqual(recovered, [True])
+            self.assertEqual(background, [True])
+            self.assertEqual(concurrent, [False])
+            self.assertEqual(observed_physical_overlap, [2])
+            self.assertGreaterEqual(now[0], 1170)
+            self.assertEqual(AccountRequestClock(key[:12], path).ordinary_read_queue, [])
+
+    def test_advanced_preaccept_stop_releases_its_private_ticket(self):
+        from services import account_request_pacing as pacing
+        from services.account_request_pacing import AccountRequestClock
+        from services.config import config
+
+        now = [1000.0]
+        account = self.rows[0]
+        key = hashlib.sha256(account["account_id"].encode()).hexdigest()
+        path = self.root / "account_request_clocks" / f"{key}.json"
+        receipt = {"provider_account_identity": account["provider_account_identity"],
+                   "provider_binding_id": "binding-0", "client_conversation_id": "same-original",
+                   "conversation_id": "same-original"}
+
+        class Stop:
+            def is_set(self):
+                return False
+
+            def wait(self, _seconds):
+                return True
+
+        with patch.object(pacing, "DATA_DIR", self.root), \
+             patch.object(pacing, "_clocks", {}), \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.pool_admission.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 90)):
+            clock = AccountRequestClock(key[:12], path)
+            clock.next_conversation_read = now[0] + 1
+            clock._save()
+            self.admission.pacing = None
+            self.admission._stop = Stop()
+            diagnostic = {}
+
+            self.assertFalse(self.admission.read_original_if_ready(
+                "happy", "same", lambda *_args: "unexpected", receipt,
+                diagnostic=diagnostic, reservation_scope="advanced-preaccept", wait_for_ready_seconds=120,
+            ))
+            self.assertEqual(diagnostic["reason"], "stopped")
+            self.assertEqual(AccountRequestClock(key[:12], path).ordinary_read_queue, [])
+
+    def test_advanced_preaccept_renews_due_head_while_physical_read_finishes(self):
+        from services import account_request_pacing as pacing
+        from services.config import config
+        from services.pool_admission import physical_conversation_key
+
+        now = [1000.0]
+        account = self.rows[0]
+        key = hashlib.sha256(account["account_id"].encode()).hexdigest()
+        path = self.root / "account_request_clocks" / f"{key}.json"
+        receipt = {"provider_account_identity": account["provider_account_identity"],
+                   "provider_binding_id": "binding-0", "client_conversation_id": "same-original",
+                   "conversation_id": "same-original"}
+        physical_key = physical_conversation_key(receipt)
+        waits, fresh = [], []
+
+        class Stop:
+            calls = 0
+
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                waits.append(seconds)
+                now[0] += seconds
+                if self.calls == 0:
+                    self_admission._original_read_slots.acquire()
+                    with self_admission._original_read_lock:
+                        self_admission._original_reads.add(physical_key)
+                elif self.calls == 1:
+                    with self_admission._original_read_lock:
+                        self_admission._original_reads.discard(physical_key)
+                    self_admission._original_read_slots.release()
+                self.calls += 1
+                return False
+
+        with patch.object(pacing, "DATA_DIR", self.root), \
+             patch.object(pacing, "_clocks", {}), \
+             patch("services.account_request_pacing.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.pool_admission.time.monotonic", side_effect=lambda: now[0]), \
+             patch("services.account_request_pacing.time.time", side_effect=lambda: 1700000000 + now[0]), \
+             patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_conversation_read_interval_secs", property(lambda _: 90)):
+            clock = AccountRequestClock(key[:12], path)
+            clock.next_conversation_read = now[0] + 1
+            clock._save()
+            self.admission.pacing = None
+            self.admission._stop = Stop()
+            self_admission = self.admission
+
+            result = self.admission.read_original_if_ready(
+                "happy", "same", lambda *_args: fresh.append(True) or "fresh", receipt,
+                reservation_scope="advanced-preaccept", wait_for_ready_seconds=720,
+            )
+            self.assertEqual(result, "fresh")
+            self.assertEqual(fresh, [True])
+            self.assertEqual(waits, [1.0, 5.0])
+            self.assertEqual(AccountRequestClock(key[:12], path).ordinary_read_queue, [])
+
     def test_active_physical_read_does_not_leave_another_receipts_ticket(self):
         from services import account_request_pacing as pacing
         from services.account_request_pacing import AccountRequestClock

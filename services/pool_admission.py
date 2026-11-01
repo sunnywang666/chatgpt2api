@@ -40,6 +40,8 @@ _COMBINED_COPY_EFFORT = "high"
 _FIRSTSEND_TRIAL_MODEL = "gpt-5-6-instant"
 _FIRSTSEND_TRIAL_EFFORT = "none"
 _ORIGINAL_READ_CONTRIBUTOR_BURST = 3
+_ADVANCED_PREACCEPT_MAX_WAIT_SECONDS = 720.0
+_ADVANCED_PREACCEPT_RENEW_SECONDS = 5.0
 _COMBINED_COPY_SENT_STAGES = frozenset({
     "send_guard_passed", "send_call_started", "response_headers_received",
     "first_output", "artifact_saved", "task_finished",
@@ -918,6 +920,11 @@ class PoolAdmission:
         self._original_read_slots = threading.BoundedSemaphore(4)
         self._original_read_lock = threading.Lock()
         self._original_reads = set()
+        # In-process only: two simultaneous API calls for one original must
+        # not each queue a private advanced preaccept ticket and duplicate the
+        # fresh GET. Durable receipt idempotency remains the process-restart
+        # boundary; this set is never a recovery or persistence mechanism.
+        self._advanced_preaccept_waits = set()
         # A durable FIFO ticket belongs to one dispatcher instance.  The
         # original request identity remains part of its hash, while an expired
         # worker/restart falls back to the queue's existing short expiry.
@@ -1011,7 +1018,8 @@ class PoolAdmission:
                 return
 
     def _acquire_original_read(self, kind, owner, request_id, receipt, *, require_text_reservation=False,
-                               diagnostic=None):
+                               diagnostic=None, reservation_scope=None, max_ticket_wait_seconds=None,
+                               reservation_owner=None):
         def deferred(reason, **fields):
             # Optional advanced-preaccept diagnostics only observe this exact
             # branch. Background recovery leaves `diagnostic` unset and emits
@@ -1033,8 +1041,17 @@ class PoolAdmission:
             if isinstance(diagnostic, dict):
                 diagnostic["reason"] = ("configured_pacing" if self.pacing is not None else "account_unavailable")
             return NotImplemented
+        owner_material = self._original_read_ticket_nonce + "\0" + kind + "\0" + owner + "\0" + request_id
+        if reservation_scope == "advanced-preaccept":
+            if not isinstance(reservation_owner, str) or not reservation_owner:
+                return deferred("ticket_invalid")
+            # Keep the historical owner byte-for-byte for ordinary recovery.
+            # An advanced call owns a private ticket for its bounded lifetime,
+            # so concurrent calls cannot release each other's reservation.
+            owner_material = (self._original_read_ticket_nonce + "\0advanced-preaccept\0" + reservation_owner
+                              + "\0" + kind + "\0" + owner + "\0" + request_id)
         read_owner = "original-result:" + hashlib.sha256(
-            (self._original_read_ticket_nonce + "\0" + kind + "\0" + owner + "\0" + request_id).encode()
+            owner_material.encode()
         ).hexdigest()[:24]
         reserve_text_read = kind == "text" and account is not None and self.pacing is None
 
@@ -1053,6 +1070,29 @@ class PoolAdmission:
             # Check before booking: another receipt for this physical read
             # must not leave an unused FIFO head after the active GET starts.
             if key in self._original_reads:
+                if reservation_scope == "advanced-preaccept" and reserve_text_read:
+                    # This call already owns a private ticket.  Renew that
+                    # ticket while the earlier physical GET finishes, but do
+                    # not acquire a local slot or begin a concurrent read.
+                    # `allow_new=False` is important: a newly arriving caller
+                    # keeps the historical physical-read deferral behavior.
+                    from services.account_request_pacing import reserve_account_original_read
+                    retained = {}
+                    retained_turn = reserve_account_original_read(
+                        account, read_owner, allow_new=False, diagnostic=retained,
+                        max_ticket_wait_seconds=max_ticket_wait_seconds,
+                        allow_wait_behind=True,
+                    )
+                    if retained_turn:
+                        # A due head succeeds without a diagnostic projection;
+                        # preserve its private-ticket evidence for the bounded
+                        # physical-read wait below.
+                        retained.update(ticket_state="own", ticket_retained=True,
+                                        fifo_position=1, read_due_in_ms=0)
+                    if retained.get("ticket_state") == "own" and retained.get("ticket_retained") is True:
+                        return deferred("physical_read_inflight", **{
+                            key: value for key, value in retained.items() if key != "reason"
+                        })
                 return deferred("physical_read_inflight")
             if account is not None:
                 if account.get("managed_disabled") or account.get("status") in {"禁用", "异常"}:
@@ -1068,7 +1108,10 @@ class PoolAdmission:
                     if not reserve_account_original_read(
                             account, read_owner,
                             allow_new=scan_blocked is None or account_key not in scan_blocked,
-                            diagnostic=diagnostic):
+                            diagnostic=diagnostic,
+                            max_ticket_wait_seconds=(max_ticket_wait_seconds
+                                                     if reservation_scope == "advanced-preaccept" else None),
+                            allow_wait_behind=reservation_scope == "advanced-preaccept"):
                         if scan_blocked is not None:
                             scan_blocked.add(account_key)
                         return False
@@ -1106,21 +1149,103 @@ class PoolAdmission:
         finally:
             release()
 
-    def read_original_if_ready(self, owner, request_id, function, receipt, *, diagnostic=None):
+    def read_original_if_ready(self, owner, request_id, function, receipt, *, diagnostic=None,
+                               reservation_scope=None, wait_for_ready_seconds=None):
         """Explicit reads share background FIFO admission before claiming work.
 
         False means deferred without touching the receipt. NotImplemented
         retains the legacy recovery path for accounts/adapters this scheduler
-        cannot pre-admit. A dormant FIFO ticket belongs to the original, so a
-        deferred caller must leave it for the background dispatcher to adopt.
+        cannot pre-admit. Ordinary deferred callers leave their dormant FIFO
+        ticket for the background dispatcher to adopt. The advanced preaccept
+        scope instead owns a short-lived private ticket for this one bounded
+        call, so it can carry a fresh-read edge through account backoff.
         """
-        permit = self._acquire_original_read("text", owner, request_id, receipt, require_text_reservation=True,
-                                             diagnostic=diagnostic)
-        if permit is NotImplemented:
-            return NotImplemented
-        if not permit:
-            return False
-        return self._run_original_read(permit, function, owner, request_id)
+        bounded_wait = None
+        if reservation_scope == "advanced-preaccept":
+            if (type(wait_for_ready_seconds) not in (int, float)
+                    or isinstance(wait_for_ready_seconds, bool)
+                    or not math.isfinite(wait_for_ready_seconds)):
+                raise ValueError("advanced preaccept wait must be finite")
+            bounded_wait = min(_ADVANCED_PREACCEPT_MAX_WAIT_SECONDS,
+                               max(0.0, float(wait_for_ready_seconds)))
+        deadline = time.monotonic() + bounded_wait if bounded_wait is not None else None
+        # A stable ticket is private to this call, not to the fixed child.
+        # That lets its finally block release only its own unconsumed ticket
+        # when a concurrent same-child caller loses the race or is stopped.
+        reservation_owner = uuid.uuid4().hex if deadline is not None else None
+        wait_key = None
+        if deadline is not None:
+            wait_key = physical_conversation_key(receipt)
+            if wait_key is None:
+                account_key = receipt.get("provider_account_identity") or receipt.get("provider_binding_id")
+                client_conversation = receipt.get("client_conversation_id")
+                wait_key = ((account_key, client_conversation) if account_key and client_conversation
+                            else ("text", owner, request_id))
+            with self._original_read_lock:
+                if wait_key in self._advanced_preaccept_waits:
+                    if isinstance(diagnostic, dict):
+                        diagnostic.update(reason="physical_read_inflight", ticket_retained=False)
+                    return False
+                self._advanced_preaccept_waits.add(wait_key)
+        try:
+            while True:
+                observed = {}
+                permit = self._acquire_original_read(
+                    "text", owner, request_id, receipt, require_text_reservation=True,
+                    diagnostic=observed,
+                    reservation_scope=reservation_scope,
+                    max_ticket_wait_seconds=(max(0.0, deadline - time.monotonic())
+                                             if deadline is not None else None),
+                    reservation_owner=reservation_owner,
+                )
+                if permit is NotImplemented:
+                    if isinstance(diagnostic, dict):
+                        diagnostic.update(observed)
+                    return NotImplemented
+                if permit:
+                    return self._run_original_read(permit, function, owner, request_id)
+                due_ms = observed.get("read_due_in_ms")
+                remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000) if deadline is not None else 0
+                waitable = (deadline is not None and observed.get("ticket_state") == "own"
+                            and observed.get("ticket_retained") is True
+                            and observed.get("reason") in {"clock_not_due", "fifo_not_head", "physical_read_inflight"}
+                            and observed.get("fifo_position") in {1, 2}
+                            and type(due_ms) is int and 0 <= due_ms <= remaining_ms)
+                if not waitable:
+                    if isinstance(diagnostic, dict):
+                        diagnostic.update(observed)
+                    return False
+                # A ticket behind one existing reader must allow its bounded
+                # GET to release the head.  The grace is outside all reader
+                # slots and cannot exceed this call's bounded deadline.
+                wait_seconds = min(max(0.001, due_ms / 1000.0) +
+                                   (5.0 if observed.get("reason") in {"fifo_not_head", "physical_read_inflight"}
+                                    else 0.0),
+                                   _ADVANCED_PREACCEPT_RENEW_SECONDS,
+                                   max(0.0, deadline - time.monotonic()))
+                if wait_seconds <= 0 or self._stop.wait(wait_seconds):
+                    if isinstance(diagnostic, dict):
+                        diagnostic.update(reason="stopped", ticket_retained=True)
+                    return False
+        finally:
+            if deadline is not None:
+                # No physical/local slot exists until `_acquire` returns a
+                # permit.  Release only this call's private FIFO ticket on
+                # every non-send exit; `_run_original_read` also releases it
+                # after a real GET, making this idempotent there.
+                try:
+                    with self._account_guard():
+                        account = next((a for a in self._rows()
+                                        if a.get("provider_account_identity") == receipt.get("provider_account_identity")), None)
+                    if account is not None:
+                        owner_material = (self._original_read_ticket_nonce + "\0advanced-preaccept\0" + reservation_owner
+                                          + "\0text\0" + owner + "\0" + request_id)
+                        private_read_owner = "original-result:" + hashlib.sha256(owner_material.encode()).hexdigest()[:24]
+                        from services.account_request_pacing import release_account_original_read
+                        release_account_original_read(account, private_read_owner)
+                finally:
+                    with self._original_read_lock:
+                        self._advanced_preaccept_waits.discard(wait_key)
 
     def _dispatch_original_read(self, kind, owner, request_id, function, receipt):
         permit = self._acquire_original_read(kind, owner, request_id, receipt)

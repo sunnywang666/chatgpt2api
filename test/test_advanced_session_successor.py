@@ -171,7 +171,7 @@ def test_preaccept_deferred_logs_exact_fifo_reason_without_creating_child(advanc
     events = []
     calls = []
 
-    def admit(_owner, _request_id, _reader, _receipt, *, diagnostic=None):
+    def admit(_owner, _request_id, _reader, _receipt, *, diagnostic=None, **_kwargs):
         diagnostic.update(reason="fifo_not_head", account_clock_prefix="a" * 12,
                           ticket_state="own", ticket_retained=True, fifo_position=2)
         return False
@@ -197,8 +197,10 @@ def test_preaccept_admitted_fresh_proof_submits_once(advanced):
     h = advanced
     admissions, reads = [], []
 
-    def admit(owner, request_id, reader, receipt, **_kwargs):
+    def admit(owner, request_id, reader, receipt, **kwargs):
         admissions.append((owner, request_id, receipt["request_id"]))
+        assert kwargs["reservation_scope"] == "advanced-preaccept"
+        assert kwargs["wait_for_ready_seconds"] == 720.0
         return reader(owner, request_id)
 
     def fresh(original):
