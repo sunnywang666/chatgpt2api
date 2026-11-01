@@ -12,12 +12,49 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api import ai
-from services.conversation_binding_service import ConversationBindingService
+from api import task_results
+from services.conversation_binding_service import ConversationBindingError, ConversationBindingService
 from services.public_chat_service import project_public_chat_receipt
 from services.text_task_service import TextTaskService
+from utils.helper import UpstreamHTTPError
 from test.test_expired_execution_wait import saved, patch, waiter
 from test.test_pool_admission import build
 from test.test_unknown_turn_recovery import document, migration
+
+
+def manual_followup_document(receipt, *, active=False, fork=False):
+    """A completed human continuation after an unresolved original turn."""
+    doc = document(receipt)
+    original = receipt["request_message_id"]
+    original_final = "final-" + original
+    manual_user, manual_final = "manual-user", "manual-final"
+    doc["mapping"][original_final]["message"].update(end_turn=False, status="finished_successfully")
+    doc["mapping"][manual_user] = {"parent": original_final, "message": {
+        "id": manual_user, "author": {"role": "user"},
+    }}
+    doc["mapping"][manual_final] = {"parent": manual_user, "message": {
+        "id": manual_final, "author": {"role": "assistant"}, "status": "in_progress" if active else "finished_successfully",
+        "end_turn": False if active else True, "channel": "final",
+        "content": {"content_type": "thoughts" if active else "text", "thoughts": [] if active else None,
+                    "parts": [] if active else ["manual approved content"]},
+    }}
+    if active:
+        doc["mapping"][manual_final]["message"]["content"].pop("parts", None)
+    if fork:
+        doc["mapping"]["manual-sibling"] = {"parent": manual_user, "message": {
+            "id": "manual-sibling", "author": {"role": "assistant"}, "status": "in_progress",
+            "end_turn": False, "content": {"content_type": "text", "parts": []},
+        }}
+    doc["current_node"] = manual_final
+    return doc
+
+
+def manual_source(receipt):
+    return {
+        "conversation_id": receipt["conversation_id"], "source_request_message_id": "manual-user",
+        "source_message_id": "manual-final", "parent_message_id": "manual-final",
+        "content": "manual approved content",
+    }
 
 
 def test_explicit_recovery_reports_real_sqlite_writer_contention_without_claim(tmp_path, monkeypatch):
@@ -1677,3 +1714,231 @@ def test_capacity_marker_rejects_preflight_and_unknown_leases(tmp_path):
                    "recovery_lease_until": admission.clock.now + 60, "recovery_phase": "read_text_request"}
     assert TextTaskService._bounded_unreadable_result_capacity_boundary(exact_lease, admission.clock.now)
     assert before["request_message_id"] == released["request_message_id"]
+
+
+def test_manual_text_recovery_parser_requires_active_exact_human_final(tmp_path):
+    service, _, _, legacy = migration(tmp_path)
+    row = legacy[0]
+    parsed = ConversationBindingService._manual_followup_text_result(
+        row, manual_followup_document(row), source_request_message_id="manual-user",
+        source_message_id="manual-final",
+    )
+    assert parsed == manual_source(row)
+    for document_change in (
+        manual_followup_document(row, active=True),
+        manual_followup_document(row, fork=True),
+    ):
+        with pytest.raises(ConversationBindingError):
+            ConversationBindingService._manual_followup_text_result(row, document_change)
+
+
+def test_manual_text_recovery_parser_allows_completed_thought_tool_chain_but_never_old_final(tmp_path):
+    _, _, _, legacy = migration(tmp_path)
+    row = legacy[0]
+    complete = manual_followup_document(row)
+    final = complete["current_node"]
+    complete["mapping"]["manual-thought"] = {"parent": "manual-user", "message": {
+        "id": "manual-thought", "author": {"role": "assistant"}, "status": "finished_successfully",
+        "end_turn": False, "content": {"content_type": "thoughts", "thoughts": [{"finished": True}]},
+    }}
+    complete["mapping"]["manual-tool"] = {"parent": "manual-thought", "message": {
+        "id": "manual-tool", "author": {"role": "tool"}, "status": "finished_successfully",
+        "content": {"content_type": "text", "parts": ["finished tool output"]},
+    }}
+    complete["mapping"][final]["parent"] = "manual-tool"
+    assert ConversationBindingService._manual_followup_text_result(row, complete)["source_message_id"] == "manual-final"
+    active = complete
+    active["mapping"]["new-manual-user"] = {"parent": final, "message": {
+        "id": "new-manual-user", "author": {"role": "user"},
+    }}
+    active["mapping"]["new-manual-thought"] = {"parent": "new-manual-user", "message": {
+        "id": "new-manual-thought", "author": {"role": "assistant"}, "status": "in_progress",
+        "end_turn": False, "content": {"content_type": "thoughts", "thoughts": []},
+    }}
+    active["current_node"] = "new-manual-thought"
+    with pytest.raises(ConversationBindingError) as current:
+        ConversationBindingService._manual_followup_text_result(row, active)
+    assert current.value.code == "CHAT_MANUAL_RECOVERY_NO_COMPLETED_FOLLOWUP"
+    with pytest.raises(ConversationBindingError) as guarded:
+        ConversationBindingService._manual_followup_text_result(
+            row, active, source_request_message_id="manual-user", source_message_id="manual-final",
+        )
+    assert guarded.value.code == "CHAT_MANUAL_RECOVERY_SOURCE_MISMATCH"
+
+
+def test_manual_text_recovery_http_durable_get_restart_and_idempotency(tmp_path, monkeypatch):
+    service, _, _, legacy = migration(tmp_path)
+    row = legacy[0]
+    calls = []
+    def reader(receipt, **kwargs):
+        calls.append(kwargs)
+        assert receipt["request_message_id"] == row["request_message_id"]
+        return manual_source(receipt)
+    monkeypatch.setattr(ai, "text_task_service", service)
+    monkeypatch.setattr(task_results, "text_task_service", service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_args, **_kwargs: {"id": "owner", "role": "admin"})
+    monkeypatch.setattr(ai, "trusted_source", lambda *_args, **_kwargs: "internal:listing")
+    monkeypatch.setattr(task_results, "require_identity", lambda *_args, **_kwargs: {"id": "owner", "role": "user"})
+    monkeypatch.setattr(task_results, "require_chat_text_policy", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "services.text_task_service.conversation_binding_service.read_manual_text_followup", reader,
+    )
+    app = FastAPI()
+    app.include_router(ai.create_router())
+    app.include_router(task_results.create_router())
+    client = TestClient(app)
+    payload = {key: row[key] for key in (
+        "provider_binding_id", "provider_account_identity", "client_conversation_id",
+    )} | {"source_request_message_id": "manual-user", "source_message_id": "manual-final"}
+    response = client.post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert response.status_code == 200
+    adopted = response.json()
+    assert adopted["request_id"] == "old-0" and adopted["original_status"] == "unknown"
+    assert adopted["manual_result"]["content"] == "manual approved content"
+    # Same exact source is durable and does not reread or replace the original.
+    repeat = client.post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert repeat.status_code == 200 and len(calls) == 1
+    trusted_snapshot = client.get("/api/conversation-bindings/text-requests/old-0/snapshot")
+    assert trusted_snapshot.status_code == 200
+    assert trusted_snapshot.json()["manual_result"] == adopted["manual_result"]
+    monkeypatch.setattr(ai, "require_identity", lambda *_args, **_kwargs: {"id": "owner", "role": "user"})
+    ordinary_snapshot = client.get("/api/conversation-bindings/text-requests/old-0/snapshot")
+    assert ordinary_snapshot.status_code == 200 and "manual_result" not in ordinary_snapshot.json()
+    monkeypatch.setattr(ai, "require_identity", lambda *_args, **_kwargs: {"id": "owner", "role": "admin"})
+    result = client.get("/api/task-results/text/old-0")
+    assert result.status_code == 200
+    assert result.json()["status"] == "unknown" and result.json()["result"] is None
+    assert result.json()["manual_result"] is None
+    monkeypatch.setattr(task_results, "require_identity", lambda *_args, **_kwargs: {"id": "owner", "role": "admin"})
+    private_result = client.get("/api/task-results/text/old-0")
+    assert private_result.json()["manual_result"] == adopted["manual_result"]
+    restarted = TextTaskService(service.path, admission=service.admission, clock=service.clock)
+    assert "manual_result" not in restarted.read_snapshot("owner", "old-0")
+    assert restarted.read_snapshot("owner", "old-0", include_manual_result=True)["manual_result"] == adopted["manual_result"]
+
+
+def test_manual_text_recovery_refuses_other_owned_source_conflict_and_late_original(tmp_path, monkeypatch):
+    service, _, _, legacy = migration(tmp_path, count=2)
+    row = legacy[0]
+    source = manual_source(row)
+    monkeypatch.setattr("services.text_task_service.conversation_binding_service.read_manual_text_followup",
+                        lambda *_args, **_kwargs: source)
+    # An automatic/provider-owned child already owns this exact manual user.
+    with service.store.transaction() as db:
+        other = dict(legacy[1])
+        other.update(request_id="owned-child", request_message_id="manual-user",
+                     provider_binding_id="foreign-binding-alias",
+                     provider_account_identity=row["provider_account_identity"],
+                     conversation_id=row["conversation_id"], client_conversation_id="foreign-client-alias")
+        db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("foreign-owner", "owned-child", "owned-hash", json.dumps(other)))
+    with pytest.raises(ConversationBindingError, match="belongs to another"):
+        service.recover_manual_followup("owner", "old-0", **{key: row[key] for key in (
+            "provider_binding_id", "provider_account_identity", "client_conversation_id")})
+    with service.store.transaction() as db:
+        db.execute("DELETE FROM requests WHERE owner=? AND id=?", ("foreign-owner", "owned-child"))
+        image = {"id": "owned-image", "owner_id": "foreign-owner", "request_message_id": "manual-user",
+                 "provider_binding_id": "image-binding-alias",
+                 "provider_account_identity": row["provider_account_identity"],
+                 "client_conversation_id": "foreign-image-client", "conversation_id": row["conversation_id"],
+                 "parent_message_id": "manual-final"}
+        service.store.write_receipt(db, "image", "foreign-owner", "owned-image", image)
+    with pytest.raises(ConversationBindingError, match="belongs to another"):
+        service.recover_manual_followup("owner", "old-0", **{key: row[key] for key in (
+            "provider_binding_id", "provider_account_identity", "client_conversation_id")})
+    with service.store.transaction() as db:
+        db.execute("DELETE FROM image_requests WHERE task_key=?", ("foreign-owner:owned-image",))
+    # A late original final wins; manual adoption returns no synthetic result.
+    def late_original(_receipt, **_kwargs):
+        with service.store.transaction() as db:
+            current = service.store.read_receipt(db, "text", "owner", "old-0")
+            current.update(status="succeeded", content="real original", upstream_outcome="completed")
+            service.store.write_receipt(db, "text", "owner", "old-0", current)
+        return source
+    monkeypatch.setattr("services.text_task_service.conversation_binding_service.read_manual_text_followup", late_original)
+    result = service.recover_manual_followup("owner", "old-0", **{key: row[key] for key in (
+        "provider_binding_id", "provider_account_identity", "client_conversation_id")})
+    assert result == {"request_id": "old-0", "original_status": "succeeded", "manual_result": None}
+
+
+def test_manual_text_recovery_rolls_back_and_manual_cursor_releases_waiting_successor(tmp_path, monkeypatch):
+    service, _, _, legacy = migration(tmp_path)
+    row = legacy[0]
+    source = manual_source(row)
+    monkeypatch.setattr("services.text_task_service.conversation_binding_service.read_manual_text_followup",
+                        lambda *_args, **_kwargs: source)
+    original_write = service.store.write_receipt
+    def fail_manual(db, kind, owner, request_id, receipt):
+        if request_id == "old-0" and receipt.get("manual_result"):
+            raise OSError("synthetic disk failure")
+        return original_write(db, kind, owner, request_id, receipt)
+    monkeypatch.setattr(service.store, "write_receipt", fail_manual)
+    with pytest.raises(OSError):
+        service.recover_manual_followup("owner", "old-0", **{key: row[key] for key in (
+            "provider_binding_id", "provider_account_identity", "client_conversation_id")})
+    assert "manual_result" not in saved(service)
+    monkeypatch.setattr(service.store, "write_receipt", original_write)
+    adopted = service.recover_manual_followup("owner", "old-0", **{key: row[key] for key in (
+        "provider_binding_id", "provider_account_identity", "client_conversation_id")})["manual_result"]
+    # A late original final updates only original evidence.  Its later cursor
+    # may not revoke the manual cursor already adopted under the earlier CAS.
+    with service.store.transaction() as db:
+        current = service.store.read_receipt(db, "text", "owner", "old-0")
+        current.update(status="succeeded", content="late original final", upstream_outcome="completed",
+                       parent_message_id="original-late-final")
+        service.store.write_receipt(db, "text", "owner", "old-0", current)
+    queued = {"request_id": "next", "status": "queued", "_public_previous_waiting": True,
+              "_previous_request_id": "old-0", "client_conversation_id": row["client_conversation_id"]}
+    with service.store.transaction() as db:
+        db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("owner", "next", "next-hash", json.dumps(queued)))
+        receipts = list(service.store.receipts(db))
+        from services.text_task_service import bind_waiting_public_sessions
+        bind_waiting_public_sessions(service.store, db, receipts)
+        advanced = service.store.read_receipt(db, "text", "owner", "next")
+    assert advanced["parent_message_id"] == adopted["parent_message_id"]
+    assert saved(service)["status"] == "succeeded" and saved(service)["parent_message_id"] == "original-late-final"
+
+
+def test_manual_text_recovery_is_trusted_only_and_preserves_upstream_429(tmp_path, monkeypatch):
+    service, _, _, legacy = migration(tmp_path)
+    row = legacy[0]
+    monkeypatch.setattr(ai, "text_task_service", service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_args, **_kwargs: {"id": "owner", "role": "user"})
+    monkeypatch.setattr(ai, "trusted_source", lambda *_args, **_kwargs: "internal:listing")
+    app = FastAPI(); app.include_router(ai.create_router())
+    client = TestClient(app)
+    payload = {key: row[key] for key in (
+        "provider_binding_id", "provider_account_identity", "client_conversation_id")}
+    denied = client.post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert denied.status_code == 404
+    monkeypatch.setattr(ai, "require_identity", lambda *_args, **_kwargs: {"id": "owner", "role": "admin"})
+    monkeypatch.setattr(service, "recover_manual_followup", Mock(side_effect=UpstreamHTTPError(
+        "manual-read", 429, {"error": "slow down"}, retry_after=17,
+    )))
+    limited = client.post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert limited.status_code == 429
+    assert limited.json()["detail"]["code"] == "RECOVERY_RATE_LIMITED"
+    assert limited.headers["retry-after"] == "17"
+
+
+def test_manual_text_recovery_no_final_is_not_adopted_and_later_explicit_post_succeeds(tmp_path, monkeypatch):
+    service, _, _, legacy = migration(tmp_path)
+    row = legacy[0]
+    monkeypatch.setattr(ai, "text_task_service", service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_args, **_kwargs: {"id": "owner", "role": "admin"})
+    monkeypatch.setattr(ai, "trusted_source", lambda *_args, **_kwargs: "internal:listing")
+    responses = [ConversationBindingError("not final", code="CHAT_MANUAL_RECOVERY_NO_COMPLETED_FOLLOWUP"), manual_source(row)]
+    def reader(*_args, **_kwargs):
+        value = responses.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+    monkeypatch.setattr("services.text_task_service.conversation_binding_service.read_manual_text_followup", reader)
+    app = FastAPI(); app.include_router(ai.create_router())
+    client = TestClient(app)
+    payload = {key: row[key] for key in (
+        "provider_binding_id", "provider_account_identity", "client_conversation_id")}
+    first = client.post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert first.status_code == 409 and first.json()["detail"]["code"] == "CHAT_MANUAL_RECOVERY_NO_COMPLETED_FOLLOWUP"
+    assert "manual_result" not in saved(service)
+    second = client.post("/api/conversation-bindings/text-requests/old-0/manual-recover", json=payload)
+    assert second.status_code == 200 and second.json()["manual_result"]["source_message_id"] == "manual-final"

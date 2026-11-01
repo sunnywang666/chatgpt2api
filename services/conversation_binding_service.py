@@ -892,8 +892,25 @@ class ConversationBindingService:
                 # The backend checks the original turn and current cursor before
                 # PATCH, then verifies its readback. A second outer GET adds
                 # account read pressure without another mutation boundary.
+                validate_document = None
+                manual = body.get("manual_result")
+                if isinstance(manual, dict):
+                    def validate_document(document):
+                        observed = self._manual_followup_text_result(
+                            body, document,
+                            source_request_message_id=str(manual.get("source_request_message_id") or ""),
+                            source_message_id=str(manual.get("source_message_id") or ""),
+                            allow_archived=True,
+                        )
+                        if any(observed.get(key) != manual.get(key) for key in (
+                                "conversation_id", "source_request_message_id", "source_message_id",
+                                "parent_message_id", "content")):
+                            raise ConversationArchiveCursorMismatch()
                 try:
-                    result = backend.set_conversation_archived(body["conversation_id"], body["parent_message_id"], archived)
+                    result = backend.set_conversation_archived(
+                        body["conversation_id"], body["parent_message_id"], archived,
+                        **({"validate_document": validate_document} if validate_document else {}),
+                    )
                 except ConversationArchiveCursorMismatch:
                     if body.get("_public_session_ref") or body.get("_product_work_key"):
                         raise ConversationBindingError("original product conversation changed", code="CONVERSATION_BINDING_MISMATCH") from None
@@ -1677,6 +1694,182 @@ class ConversationBindingService:
         if not text:
             return {**result, "binding_status": "unknown", "status": "running"}
         return {**result, "binding_status": "bound", "status": "succeeded", "parent_message_id": current, "content": text}
+
+    @staticmethod
+    def _manual_followup_text_result(
+        receipt: dict[str, Any], document: dict[str, Any], *,
+        source_request_message_id: str = "", source_message_id: str = "",
+        allow_archived: bool = False,
+    ) -> dict[str, str]:
+        """Validate one explicit later human turn without redefining the original.
+
+        The ordinary original-result reader intentionally stops at a later user
+        node.  Manual recovery is the narrow, separately authorized exception:
+        it may use one later *active-branch* user -> final pair, but it never
+        turns that pair into an answer for the original user turn.
+        """
+        def reject(code="CHAT_MANUAL_RECOVERY_INVALID"):
+            raise ConversationBindingError("manual follow-up is not an exact completed text turn", code=code)
+
+        conversation_id = str(receipt.get("conversation_id") or "").strip()
+        original_id = str(receipt.get("request_message_id") or "").strip()
+        expected_user = str(source_request_message_id or "").strip()
+        expected_final = str(source_message_id or "").strip()
+        if not conversation_id or not original_id:
+            reject("CHAT_MANUAL_RECOVERY_ORIGINAL_UNAVAILABLE")
+        if not isinstance(document, dict) or document.get("conversation_id", conversation_id) != conversation_id:
+            reject("CONVERSATION_BINDING_MISMATCH")
+        # Adoption cannot silently restore a closed conversation. Archive
+        # confirmation, however, must recover a successful PATCH whose first
+        # readback was interrupted, still validating the exact saved source.
+        if document.get("is_archived") is True and not allow_archived:
+            reject("CHAT_MANUAL_RECOVERY_ARCHIVED")
+        mapping = document.get("mapping")
+        current = document.get("current_node")
+        if not isinstance(mapping, dict) or not isinstance(current, str) or not current:
+            reject()
+
+        children: dict[str, list[str]] = {}
+        for node_id, node in mapping.items():
+            if not isinstance(node_id, str) or not isinstance(node, dict):
+                reject()
+            parent = node.get("parent")
+            if parent is not None and not isinstance(parent, str):
+                reject()
+            if parent:
+                children.setdefault(parent, []).append(node_id)
+
+        # Walk the active leaf backwards, proving every edge and rejecting
+        # forks along this exact branch.  An unrelated mapping node cannot
+        # supply a manual answer.
+        reversed_path: list[str] = []
+        cursor = current
+        while cursor not in reversed_path and len(reversed_path) < 128:
+            node = mapping.get(cursor)
+            message = node.get("message") if isinstance(node, dict) else None
+            author = message.get("author") if isinstance(message, dict) else None
+            if (not isinstance(message, dict) or message.get("id") != cursor
+                    or not isinstance(author, dict) or author.get("role") not in {"user", "assistant", "tool"}):
+                reject()
+            following = children.get(cursor, [])
+            if reversed_path:
+                if following != [reversed_path[-1]]:
+                    reject("CHAT_MANUAL_RECOVERY_BRANCH_AMBIGUOUS")
+            elif following:
+                reject("CHAT_MANUAL_RECOVERY_BRANCH_AMBIGUOUS")
+            if "children" in node and node["children"] != following:
+                reject("CHAT_MANUAL_RECOVERY_BRANCH_AMBIGUOUS")
+            reversed_path.append(cursor)
+            if cursor == original_id:
+                break
+            cursor = node.get("parent")
+            if not cursor:
+                break
+        if not reversed_path or reversed_path[-1] != original_id:
+            reject("CHAT_MANUAL_RECOVERY_ORIGINAL_NOT_ACTIVE")
+        path = list(reversed(reversed_path))
+        original = mapping[original_id]
+        original_message = original.get("message")
+        if (not isinstance(original_message, dict)
+                or (original_message.get("author") or {}).get("role") != "user"
+                or not _request_parent_matches_receipt(receipt, str(original.get("parent") or ""), mapping)):
+            reject("CONVERSATION_BINDING_MISMATCH")
+
+        user_positions = [index for index, node_id in enumerate(path)
+                          if (mapping[node_id].get("message") or {}).get("author", {}).get("role") == "user"]
+        # The original user is an anchor, never an adoptable manual source.
+        candidates: list[tuple[str, str, str]] = []
+        # Only the newest human turn may be adopted.  An older completed turn
+        # becomes context once another manual user turn exists, even if the
+        # latter is still thinking.
+        if user_positions and path[user_positions[-1]] != original_id:
+            position = user_positions[-1]
+            user_id, segment = path[position], path[position:]
+            final_id = segment[-1]
+            final = mapping[final_id].get("message") or {}
+            intermediates_ok = True
+            for node_id in segment[1:-1]:
+                message = mapping[node_id].get("message") or {}
+                role = (message.get("author") or {}).get("role")
+                content = message.get("content") if isinstance(message, dict) else None
+                if (message.get("status") != "finished_successfully" or message.get("end_turn") is True
+                        or role not in {"assistant", "tool"}
+                        or role == "assistant" and (not isinstance(content, dict)
+                            or content.get("content_type") not in {"thoughts", "reasoning_recap", "code"})):
+                    intermediates_ok = False
+                    break
+            content = final.get("content") if isinstance(final, dict) else None
+            parts = content.get("parts") if isinstance(content, dict) else None
+            text = "".join(parts).strip() if (
+                intermediates_ok and isinstance(final, dict) and final_id == current and final.get("id") == final_id
+                and (final.get("author") or {}).get("role") == "assistant"
+                and final.get("status") == "finished_successfully" and final.get("end_turn") is True
+                and explicit_final_channel(final) is not False and isinstance(content, dict)
+                and content.get("content_type") == "text" and isinstance(parts, list) and parts
+                and all(isinstance(part, str) for part in parts)
+            ) else ""
+            if text:
+                candidates.append((user_id, final_id, text))
+        if expected_user:
+            candidates = [candidate for candidate in candidates if candidate[0] == expected_user]
+        if expected_final:
+            candidates = [candidate for candidate in candidates if candidate[1] == expected_final]
+        if not candidates:
+            reject("CHAT_MANUAL_RECOVERY_SOURCE_MISMATCH" if (expected_user or expected_final)
+                   else "CHAT_MANUAL_RECOVERY_NO_COMPLETED_FOLLOWUP")
+        if (expected_user or expected_final) and len(candidates) != 1:
+            reject("CHAT_MANUAL_RECOVERY_SOURCE_MISMATCH")
+        user_id, final_id, text = candidates[0]
+        return {
+            "conversation_id": conversation_id,
+            "source_request_message_id": user_id,
+            "source_message_id": final_id,
+            "parent_message_id": final_id,
+            "content": text,
+        }
+
+    @operation_budget(60.0)
+    def read_manual_text_followup(
+        self, receipt: dict[str, Any], *, provider_binding_id: str,
+        provider_account_identity: str, client_conversation_id: str,
+        source_request_message_id: str = "", source_message_id: str = "",
+    ) -> dict[str, str]:
+        """Read a stable, explicitly adopted later human text turn; never send."""
+        deadline = current_operation_deadline.get()
+        supplied = (str(provider_binding_id).strip(), str(provider_account_identity).strip(),
+                    str(client_conversation_id).strip())
+        stored = tuple(str(receipt.get(key) or "").strip() for key in (
+            "provider_binding_id", "provider_account_identity", "client_conversation_id"))
+        if not all(supplied) or supplied != stored:
+            raise ConversationBindingError("conversation authority does not match the original request",
+                                           code="CONVERSATION_BINDING_MISMATCH")
+        conversation_id = str(receipt.get("conversation_id") or "").strip()
+        if not conversation_id:
+            raise ConversationBindingError("original conversation identity is unavailable",
+                                           code="CHAT_MANUAL_RECOVERY_ORIGINAL_UNAVAILABLE")
+        if account_service.get_bound_account_identity(supplied[0]) != supplied[1]:
+            raise ConversationBindingError("provider account identity changed", code="CONVERSATION_BINDING_MISMATCH")
+        token = account_service.get_bound_text_access_token(supplied[0], model="auto")
+        with bounded_lock(account_service.conversation_binding_lock(supplied[0], supplied[2])):
+            backend = OpenAIBackendAPI(access_token=token)
+            try:
+                first = self._manual_followup_text_result(
+                    receipt, backend._get_conversation(conversation_id, deadline_monotonic=deadline,
+                                                       connect_timeout_secs=10.0, minimum_budget_secs=10.0),
+                    source_request_message_id=source_request_message_id, source_message_id=source_message_id,
+                )
+                second = self._manual_followup_text_result(
+                    receipt, backend._get_conversation(conversation_id, deadline_monotonic=deadline,
+                                                       connect_timeout_secs=10.0, minimum_budget_secs=10.0),
+                    source_request_message_id=first["source_request_message_id"],
+                    source_message_id=first["source_message_id"],
+                )
+                if second != first:
+                    raise ConversationBindingError("conversation changed during manual recovery",
+                                                   code="CHAT_MANUAL_RECOVERY_CHANGED")
+                return first
+            finally:
+                backend.close()
 
     @staticmethod
     def _read_text_request_result(

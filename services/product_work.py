@@ -782,6 +782,79 @@ def _unresolved(receipt, members):
     return _blocked(receipt, members=members)
 
 
+def _manual_followup_waivers(store, db, parent, members):
+    """Retire only an UNKNOWN root whose adopted cursor has a strict saved tail.
+
+    The original receipt remains UNKNOWN and is never rewritten.  This is a
+    product-close exception, analogous to the existing owned-successor
+    exceptions: it requires a stored, identity-checked manual cursor and one
+    later successful text/image chain whose immutable inputs name that cursor.
+    """
+    from services.text_task_service import TextTaskService
+    waived = set()
+    for member, original in members:
+        if member.get("kind") != "text" or original.get("_product_work_key") != parent.get("key"):
+            continue
+        manual = TextTaskService._manual_result(original)
+        if not manual or original.get("upstream_outcome") != "unknown" or _claims(original):
+            continue
+        later = []
+        conflicting_tail = False
+        for tail_member, tail in members:
+            if tail.get("_product_work_key") != parent.get("key") or tail_member.get("request_id") == member.get("request_id"):
+                continue
+            if (tail.get("provider_account_identity") != manual.get("provider_account_identity")
+                    or tail.get("conversation_id") != manual.get("conversation_id")
+                    or type(tail.get("_sequence")) is not int or tail["_sequence"] <= original.get("_sequence", 0)):
+                continue
+            # Logical client/binding aliases cannot make a same physical
+            # conversation tail disappear into the manual-only path.
+            if any(tail.get(key) != manual.get(key) for key in (
+                    "provider_binding_id", "client_conversation_id")):
+                conflicting_tail = True
+                break
+            later.append((tail["_sequence"], tail_member, tail))
+        later.sort(key=lambda item: item[0])
+        if conflicting_tail or any(left[0] == right[0] for left, right in zip(later, later[1:])):
+            continue
+        if not later:
+            # The explicit manual final is itself the adopted terminal cursor.
+            # Archive revalidates that exact current head; do not force an
+            # otherwise pointless generated successor merely to close work.
+            waived.add(original.get("request_id"))
+            continue
+        cursor = manual["parent_message_id"]
+        valid = True
+        for _sequence, tail_member, tail in later:
+            kind = tail_member.get("kind")
+            text_ok = (kind == "text" and tail.get("status") == "succeeded"
+                       and tail.get("upstream_outcome") == "completed"
+                       and isinstance(tail.get("content"), str) and tail["content"].strip())
+            image_ok = (kind == "image" and tail.get("status") == "success"
+                        and tail.get("upstream_outcome") == "generated" and tail.get("binding_status") == "bound"
+                        and isinstance(tail.get("data"), list) and bool(tail["data"]))
+            if (not (text_ok or image_ok) or _claims(tail) or tail.get("_executing") is True
+                    or tail.get("upstream_unfinished") is True or not isinstance(tail.get("parent_message_id"), str)
+                    or not tail["parent_message_id"]):
+                valid = False
+                break
+            try:
+                stored = store.load_input(tail["_input_ref"])
+                payload = stored["payload"] if kind == "image" else stored
+            except (OSError, ValueError, TypeError, KeyError):
+                valid = False
+                break
+            if (payload.get("parent_message_id") != cursor
+                    or any(payload.get(key) != manual.get(key) for key in (
+                        "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"))):
+                valid = False
+                break
+            cursor = tail["parent_message_id"]
+        if valid:
+            waived.add(original.get("request_id"))
+    return waived
+
+
 def _missing_node_chain(store, db, parent, receipt, members, now):
     """Return the one terminal R/P/C/A4 chain which can retire R and P.
 
@@ -1840,6 +1913,7 @@ class ProductWorkService:
         waived.update(self._no_final_successor_waivers(db, parent, owned))
         waived.update(self._codex_rejected_retry_waivers(db, parent, owned))
         waived.update(self._advanced_session_waivers(db, parent, owned))
+        waived.update(_manual_followup_waivers(self.store, db, parent, owned))
         for member, receipt in owned:
             if receipt.get(_CANCELLED_UNSENT_STEP) and not _cancelled_unsent_step(
                     self.store, db, parent, member, receipt):
@@ -1863,6 +1937,7 @@ class ProductWorkService:
         waived.update(self._no_final_successor_waivers(db, parent, members))
         waived.update(self._codex_rejected_retry_waivers(db, parent, members))
         waived.update(self._advanced_session_waivers(db, parent, members))
+        waived.update(_manual_followup_waivers(self.store, db, parent, members))
         from services.text_task_service import TextTaskService
         for member, receipt in members:
             cancelled_unsent = _cancelled_unsent_step(self.store, db, parent, member, receipt)

@@ -500,7 +500,8 @@ class TextTaskTests(unittest.TestCase):
         app.include_router(create_router())
         with (
             mock.patch("api.ai.text_task_service", service),
-            mock.patch("api.ai.require_identity", side_effect=lambda token: {"id": token, "role": "admin"}),
+            mock.patch("api.ai.require_identity", side_effect=lambda token, request=None: {
+                "id": token, "role": "admin"}),
             TestClient(app) as client,
         ):
             snapshot = client.get("/api/conversation-bindings/text-requests/attempt-1/snapshot",

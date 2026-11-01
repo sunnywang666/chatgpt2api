@@ -178,6 +178,9 @@ def create_router() -> APIRouter:
             # Temporary explicit compatibility bridge for existing consumers.
             # It is an existing public projection, never the raw receipt.
             "receipt": compatibility,
+            # A manual follow-up is deliberately supplementary: original
+            # status/result readiness remain the exact persisted original fact.
+            "manual_result": TextTaskService._manual_result(receipt) if kind == "text" and private_bound else None,
         }, headers={"Cache-Control": "private, no-store"})
 
     return router
