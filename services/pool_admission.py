@@ -2831,8 +2831,12 @@ class PoolAdmission:
             # not its old binding.  Reusing admission_binding here would turn
             # the fresh-session request into the human-discussion conversation
             # before ConversationBindingService can create its text binding.
-            binding = (None if advanced_session else r.get("provider_binding_id") or (
-                self.accounts.admission_binding(pick.account) if r.get("_route", "chat") == "chat" else None))
+            # After a known-unsent retry, preserve the child allocation already
+            # returned to its caller. Only the first claim has no child binding.
+            binding = r.get("provider_binding_id")
+            if not advanced_session and not binding:
+                binding = (self.accounts.admission_binding(pick.account)
+                           if r.get("_route", "chat") == "chat" else None)
             rows = {a["provider_account_identity"]: a for a in self._rows()}
             claim = uuid.uuid4().hex
             timeline = list(r.get("_execution_timeline") or [])

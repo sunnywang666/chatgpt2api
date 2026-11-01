@@ -2530,6 +2530,17 @@ class TextTaskService:
                 # original evidence. Only the exact-ID recovery path may adopt
                 # its subsequently verified upstream result.
                 return
+            if receipt.get("_advanced_session") is not None:
+                from services.advanced_session_successor import child_failure_cursor, validate_child_allocation_update
+                if sender_verified_incomplete is not None:
+                    # Check against the latest allocation in this transaction,
+                    # including progress callbacks after _run's entry snapshot.
+                    changes.update(child_failure_cursor(receipt, sender_verified_incomplete))
+                    if (sender_verified_incomplete.code == "CHAT_ADVANCED_SESSION_INVALID"
+                            and receipt.get("_submission_started") is True):
+                        changes.update(status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                                       upstream_outcome="unknown")
+                validate_child_allocation_update(receipt, changes)
             if sender_verified_incomplete is not None:
                 exc = sender_verified_incomplete
                 first_observation = (
@@ -5789,6 +5800,11 @@ class TextTaskService:
             from services.durable_forward import run
             return run(self, owner, request_id, body)
         try:
+            if receipt.get("_advanced_session"):
+                from services.advanced_session_successor import reuse_allocated_child_binding
+                # Validate outside the initial write transaction so a rejected
+                # execution copy follows the normal durable failure path.
+                body = reuse_allocated_child_binding(body, receipt)
             if receipt.get("_same_session_retry_of"):
                 from services.generation_completion import retry_evidence, same_session_retry
                 with self.store.connect() as db:
@@ -6000,6 +6016,10 @@ class TextTaskService:
                 context.record_stage("artifact_saved")
         except ConversationBindingError as exc:
             cursor = {k: getattr(exc, k) for k in ("provider_binding_id", "provider_account_identity", "conversation_id", "parent_message_id") if getattr(exc, k, "")}
+            if receipt.get("_advanced_session"):
+                # _update validates the exception tuple atomically against the
+                # current allocation; never merge an unverified cursor here.
+                cursor = {}
             if (missing_attempt and exc.code == "CHAT_SUPERSEDE_ORIGINAL_FOUND"):
                 # The original, already-submitted user node appeared during
                 # the final binding-locked check.  A replacement has not been

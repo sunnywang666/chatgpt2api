@@ -472,7 +472,10 @@ def test_claim_and_run_pass_isolated_guard_and_locked_account(advanced):
     seen = []
     def inspect(body, on_cursor):
         seen.append(deepcopy(body))
-        raise ConversationBindingError("stop before test transport", code="CHAT_ADVANCED_SESSION_INVALID")
+        raise ConversationBindingError("stop before test transport", code="CHAT_ADVANCED_SESSION_INVALID",
+                                       provider_binding_id="foreign-observed-binding",
+                                       provider_account_identity="foreign-account",
+                                       conversation_id="foreign-observed-conversation")
     h.service.runner = inspect
     h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
     context = h.admission.claim_next()
@@ -486,6 +489,139 @@ def test_claim_and_run_pass_isolated_guard_and_locked_account(advanced):
     assert "_supersedes_request_message_id" not in body
     assert not body.get("conversation_id")
     assert row(h.service) == h.old
+
+
+def test_pre_send_reentry_reuses_allocated_advanced_binding_only_in_execution_copy(advanced):
+    h = advanced
+    seen = []
+    h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+    h.service._update("owner", "isolated", provider_binding_id="allocated-child-binding",
+                      provider_account_identity=h.old["provider_account_identity"])
+
+    def inspect(body, on_cursor):
+        seen.append(deepcopy(body))
+        on_cursor({"provider_binding_id": "allocated-child-binding",
+                   "provider_account_identity": h.old["provider_account_identity"],
+                   "client_conversation_id": body["client_conversation_id"]})
+        raise ConversationBindingError("stop before test transport", code="CHAT_ADVANCED_SESSION_INVALID",
+                                       provider_binding_id="foreign-observed-binding",
+                                       provider_account_identity="foreign-account",
+                                       conversation_id="foreign-observed-conversation",
+                                       parent_message_id="foreign-observed-parent")
+
+    h.service.runner = inspect
+    with h.service.store.connect() as db:
+        durable = h.service.store.load_input(h.service.store.read_receipt(db, "text", "owner", "isolated")["_input_ref"])
+    assert "provider_binding_id" not in durable
+    h.service._run("owner", "isolated", durable)
+    assert seen and seen[0]["provider_binding_id"] == "allocated-child-binding"
+    assert seen[0]["provider_account_identity"] == h.old["provider_account_identity"]
+    with h.service.store.connect() as db:
+        saved = h.service.store.read_receipt(db, "text", "owner", "isolated")
+    assert saved["provider_binding_id"] == "allocated-child-binding"
+    assert not saved.get("conversation_id")
+    assert saved["status"] == "failed" and saved["error_code"] == "CHAT_ADVANCED_SESSION_INVALID"
+
+
+def test_initial_foreign_cursor_exception_does_not_allocate_advanced_child(advanced):
+    h = advanced
+    h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+
+    def foreign(_body, on_cursor):
+        raise ConversationBindingError("foreign cursor", code="CHAT_ADVANCED_SESSION_INVALID",
+                                       provider_binding_id="foreign-binding",
+                                       provider_account_identity="foreign-account",
+                                       conversation_id="foreign-conversation",
+                                       parent_message_id="foreign-parent")
+
+    h.service.runner = foreign
+    with h.service.store.connect() as db:
+        durable = h.service.store.load_input(h.service.store.read_receipt(db, "text", "owner", "isolated")["_input_ref"])
+    h.service._run("owner", "isolated", durable)
+    with h.service.store.connect() as db:
+        saved = h.service.store.read_receipt(db, "text", "owner", "isolated")
+    assert not saved.get("provider_binding_id") and not saved.get("conversation_id")
+    assert saved["status"] == "failed" and saved["error_code"] == "CHAT_ADVANCED_SESSION_INVALID"
+
+
+@pytest.mark.parametrize("change", [None, "binding", "account", "conversation", "before_send"])
+def test_failure_cursor_keeps_matching_post_send_identity_only(advanced, change):
+    h = advanced
+    h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+
+    def fail(body, on_cursor):
+        on_cursor({"provider_binding_id": "allocated-child-binding",
+                   "provider_account_identity": "original-account"})
+        if change != "before_send":
+            on_cursor({"_submission_started": True})
+        if change == "conversation":
+            on_cursor({"conversation_id": "already-saved-chat"})
+        raise ConversationBindingError("result read failed", code="CONVERSATION_OUTCOME_UNKNOWN",
+            provider_binding_id="other-binding" if change == "binding" else "allocated-child-binding",
+            provider_account_identity="other-account" if change == "account" else "original-account",
+            conversation_id="new-chat", parent_message_id="new-parent")
+
+    h.service.runner = fail
+    durable = h.service.store.load_input(row(h.service, "isolated")["_input_ref"])
+    h.service._run("owner", "isolated", durable)
+    saved = row(h.service, "isolated")
+    assert saved["status"] == "unknown"
+    assert saved["provider_binding_id"] == "allocated-child-binding"
+    assert saved["provider_account_identity"] == "original-account"
+    if change is None:
+        assert saved["conversation_id"] == "new-chat" and saved["parent_message_id"] == "new-parent"
+    else:
+        assert saved.get("conversation_id") == ("already-saved-chat" if change == "conversation" else None)
+        assert not saved.get("parent_message_id")
+
+
+def test_post_send_allocation_mismatch_preserves_unknown(advanced):
+    h = advanced
+    h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+
+    def fail(body, on_cursor):
+        on_cursor({"provider_binding_id": "allocated-child-binding", "_submission_started": True})
+        on_cursor({"provider_binding_id": "foreign-binding"})
+
+    h.service.runner = fail
+    h.service._run("owner", "isolated", h.service.store.load_input(row(h.service, "isolated")["_input_ref"]))
+    saved = row(h.service, "isolated")
+    assert saved["status"] == "unknown" and saved["upstream_outcome"] == "unknown"
+    assert saved["provider_binding_id"] == "allocated-child-binding"
+    assert saved["_submission_started"] is True
+
+
+def test_invalid_advanced_execution_copy_is_recorded_as_unsent_failure(advanced):
+    h = advanced
+    h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+    h.service._update("owner", "isolated", provider_binding_id="allocated-child-binding",
+                      provider_account_identity=h.old["provider_account_identity"],
+                      conversation_id="unexpected-pre-send-conversation")
+    with h.service.store.connect() as db:
+        durable = h.service.store.load_input(h.service.store.read_receipt(db, "text", "owner", "isolated")["_input_ref"])
+    h.service._run("owner", "isolated", durable)
+    with h.service.store.connect() as db:
+        saved = h.service.store.read_receipt(db, "text", "owner", "isolated")
+    assert saved["status"] == "failed" and saved["upstream_outcome"] == "not_sent"
+    assert saved["error_code"] == "CHAT_ADVANCED_SESSION_INVALID"
+
+
+@pytest.mark.parametrize(("field", "first", "second"), [
+    ("provider_binding_id", "allocated-child-binding", "reassigned-child-binding"),
+    ("conversation_id", "allocated-child-conversation", "reassigned-child-conversation"),
+])
+def test_advanced_child_allocated_cursor_is_monotonic(advanced, field, first, second):
+    h = advanced
+    h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+    h.service._update("owner", "isolated", provider_binding_id="allocated-child-binding",
+                      provider_account_identity=h.old["provider_account_identity"])
+    if field == "conversation_id":
+        h.service._update("owner", "isolated", conversation_id=first)
+    with pytest.raises(ConversationBindingError):
+        h.service._update("owner", "isolated", **{field: second})
+    with h.service.store.connect() as db:
+        saved = h.service.store.read_receipt(db, "text", "owner", "isolated")
+    assert saved[field] == (first if field == "conversation_id" else "allocated-child-binding")
 
 
 def test_registered_message_collision_is_not_external_discussion(advanced):

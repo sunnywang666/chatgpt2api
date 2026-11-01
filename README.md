@@ -327,6 +327,9 @@ request/提交父节点/final、`observed_at` 秒时间戳，可选 `tail_steps`
 
 同一 proof 内的 `provider_binding_id/conversation_id` 两个字段在 queued 时可为 null，执行后
 投影新回执身份；成功时必须非空、不同于原会话，且与回执相等。新账号必须仍等于原账号。
+已分配的 child binding 在发送前失败、重新领取及服务重开后保持不变；执行副本复用它，冻结输入不回写。
+binding 和物理会话只能从未分配变为已分配，不能用后续回调或异常替换已知身份。
+发送后身份校验失败保留 UNKNOWN，继续按原请求核对结果；不会借重试新建绑定或重复发送。
 工作台核验上述关系后采用新 `parent_message_id` 游标，不再要求它等于旧附图节点。
 内部纯读 `/api/task-results/text/{child_id}` 在 `receipt.advanced_session` 保留同一证明。
 
