@@ -229,6 +229,16 @@ class TaskStore:
                     db.execute("CREATE TABLE IF NOT EXISTS requests (owner TEXT, id TEXT, request_hash TEXT, receipt TEXT, PRIMARY KEY(owner,id))")
                     db.execute("CREATE TABLE IF NOT EXISTS image_requests (task_key TEXT PRIMARY KEY, receipt TEXT NOT NULL)")
                     db.execute("CREATE TABLE IF NOT EXISTS task_runtime (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                    # The send guard must find existing ProductWork owners,
+                    # including terminal/paused ones. Index its exact candidate
+                    # predicate so each send need not parse unrelated saved
+                    # image payloads while holding SQLite's writer lock.
+                    for table in ("requests", "image_requests"):
+                        db.execute(
+                            f"CREATE INDEX IF NOT EXISTS {table}_product_conversation "
+                            f"ON {table}(json_extract(receipt,'$.conversation_id')) "
+                            "WHERE json_type(receipt,'$._product_work_key') IS NOT NULL "
+                            "AND json_type(receipt,'$._product_work_key') != 'null'")
             finally:
                 db.close()
             self._ready = True
