@@ -306,6 +306,43 @@ def test_before_send_product_guard_does_not_decode_unrelated_terminal_payload(ru
         before_send(store, db, legacy)
 
 
+@pytest.mark.parametrize("kind", ["text", "image"])
+def test_existing_product_receipts_get_indexed_without_rewriting_state(tmp_path, kind):
+    path = tmp_path / "existing.sqlite3"
+    product = {"request_id": "product", "id": "product", "owner_id": "owner",
+               "status": "unknown", "_recovery_paused": True, "_send_hold": True,
+               "_product_work_key": "retained-product", "conversation_id": "shared",
+               "provider_account_identity": "account", "provider_binding_id": "binding"}
+    unrelated = {"request_id": "unrelated", "id": "unrelated", "owner_id": "owner",
+                 "status": "success", "data": [{"b64_json": "unrelated" * 10000}]}
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE requests (owner TEXT, id TEXT, request_hash TEXT, receipt TEXT, PRIMARY KEY(owner,id))")
+        db.execute("CREATE TABLE image_requests (task_key TEXT PRIMARY KEY, receipt TEXT NOT NULL)")
+        for receipt in (product, unrelated):
+            if kind == "text":
+                db.execute("INSERT INTO requests VALUES(?,?,?,?)",
+                           ("owner", receipt["id"], "retained-hash", json.dumps(receipt)))
+            else:
+                db.execute("INSERT INTO image_requests VALUES(?,?)", (receipt["id"], json.dumps(receipt)))
+        before = {table: db.execute("SELECT * FROM " + table).fetchall()
+                  for table in ("requests", "image_requests")}
+    store = TaskStore(path)
+    store.initialize()
+    TaskStore(path).initialize()  # Existing indexes survive an ordinary reopen.
+    with store.connect() as db:
+        assert {table: db.execute("SELECT * FROM " + table).fetchall() for table in before} == before
+        queries = []
+        db.set_trace_callback(queries.append)
+        rows = list(store.product_work_conversation_receipts(db, product))
+        db.set_trace_callback(None)
+        assert len(rows) == 1 and rows[0][0] == kind and rows[0][3] == product
+        selects = [query for query in queries if query.startswith("SELECT ")]
+        assert len(selects) == 2
+        for query in selects:
+            plan = " ".join(row[3] for row in db.execute("EXPLAIN QUERY PLAN " + query))
+            assert "SEARCH " in plan and "USING INDEX" in plan, plan
+
+
 def test_late_external_member_blocks_archive_after_close(runtime):
     service, lifecycle, store, _, calls, _, add = runtime
     add("text", conversation="shared")
