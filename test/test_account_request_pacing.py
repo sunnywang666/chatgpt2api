@@ -1084,6 +1084,119 @@ class AccountRequestPacingTests(unittest.TestCase):
                 self.assertFalse(worker.is_alive())
                 self.assertEqual(len(calls), 1)
 
+    def test_claimed_text_preparation_continues_during_another_tasks_io(self):
+        paths = (("/sentinel/chat-requirements/prepare", {"p": "own-proof"}),
+                 ("/sentinel/chat-requirements/finalize", {"prepare_token": "own-token",
+                                                         "proof_token": "", "turnstile_token": ""}),
+                 ("/conversation", None))
+        for path, body in paths:
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: .05)), \
+                 patch.object(type(config), "account_message_interval_secs", property(lambda _: .1)):
+                state = Path(tmp) / "clock.json"
+                first, second = Context("first"), Context("second")
+                first.native_text_turn = second.native_text_turn = True
+                entered, release = threading.Event(), threading.Event()
+                starts, errors = [], []
+                base = "https://chatgpt.com/backend-api"
+                def send(method, url, **kwargs):
+                    starts.append(time.monotonic())
+                    if url == base + path:
+                        entered.set()
+                        if not release.wait(3):
+                            raise TimeoutError("test transport still blocked")
+                    return Response()
+
+                def first_task():
+                    try:
+                        with executing(first):
+                            opts = {"json": body} if body else {"stream": True, "_account_request_model": "gpt"}
+                            result = AccountRequestClock("account", state).request(send, "POST", base + path, **opts)
+                            result.close()
+                    except BaseException as exc:
+                        errors.append(exc)
+                sender = threading.Thread(target=first_task)
+                sender.start()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    with executing(second):
+                        AccountRequestClock("account", state).request(send, "GET", "https://chatgpt.com/",
+                            _account_request_deadline_monotonic=time.monotonic() + 1)
+                    self.assertEqual(len(starts), 2)
+                    self.assertGreaterEqual(starts[1] - starts[0], .045)
+                    self.assertTrue(sender.is_alive())
+                    self.assertEqual(first.stages.count("before_send"), int(body is None))
+                    if body is None:
+                        self.assertGreaterEqual(AccountRequestClock("account", state).next_turn, starts[0] + .095)
+                finally:
+                    release.set()
+                    sender.join(4)
+                self.assertEqual(errors, [])
+
+    def test_next_text_turn_uses_actual_interval_while_previous_headers_are_pending(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from services import account_request_pacing as pacing
+        with (tempfile.TemporaryDirectory() as tmp,
+              patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)),
+              patch.object(type(config), "account_message_interval_secs", property(lambda _: .25))):
+            state = Path(tmp) / "clock.json"
+            first_sent, release_first = threading.Event(), threading.Event()
+            waiting, allow_second = threading.Event(), threading.Event()
+            starts = []
+            real_sleep = time.sleep
+            def pause_turn_wait(delay):
+                if threading.current_thread().name.startswith("next-turn") and delay > .05:
+                    waiting.set()
+                    if not allow_second.wait(2):
+                        raise TimeoutError("next-turn wait was not released")
+                real_sleep(delay)
+
+            def generate(first):
+                context = Context("first" if first else "next")
+                context.record_limit = context.stages.append
+                context.native_text_turn = True
+                def send(*_args, **_kwargs):
+                    starts.append(time.monotonic())
+                    response = Response()
+                    if first:
+                        first_sent.set()
+                        if not release_first.wait(3):
+                            raise TimeoutError("first headers were not released")
+                        response.status_code, response.headers = 429, {"Retry-After": "120"}
+                    return response
+                with executing(context):
+                    response = AccountRequestClock("account", state).request(
+                        send, "POST", "https://chatgpt.com/backend-api/conversation",
+                        stream=True, _account_request_model="gpt")
+                    response.close()
+                    return response.status_code
+
+            with (patch.object(pacing.time, "sleep", side_effect=pause_turn_wait),
+                  ThreadPoolExecutor(1) as first_worker,
+                  ThreadPoolExecutor(1, thread_name_prefix="next-turn") as second_worker):
+                first = first_worker.submit(generate, True)
+                try:
+                    self.assertTrue(first_sent.wait(1))
+                    second = second_worker.submit(generate, False)
+                    self.assertTrue(waiting.wait(1), "next turn waited for previous headers")
+                    # A turn-specific wait cannot reserve the account for all HTTP.
+                    AccountRequestClock("account", state).request(
+                        lambda *_a, **_kw: Response(), "GET", "https://chatgpt.com/",
+                        _account_request_deadline_monotonic=time.monotonic() + .3)
+                    allow_second.set()
+                    self.assertEqual(second.result(timeout=2), 200)
+                    second_turn = json.loads(state.read_text())["last_turn_started"]
+                    self.assertFalse(first.done())
+                finally:
+                    allow_second.set()
+                    release_first.set()
+                self.assertEqual(first.result(timeout=2), 429)
+            self.assertEqual(len(starts), 2)
+            self.assertGreaterEqual(starts[1] - starts[0], .245)
+            restarted = AccountRequestClock("account", state)
+            self.assertAlmostEqual(json.loads(state.read_text())["last_turn_started"], second_turn, places=5)
+            self.assertGreater(restarted.cooldown_until, time.monotonic() + 100)
+
     def test_noncanonical_root_and_requirements_post_retain_send_fence(self):
         from services.account_request_pacing import AccountRequestDeadlineExceeded
         cases = (
