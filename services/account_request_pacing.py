@@ -581,7 +581,17 @@ class AccountRequestClock:
                 and isinstance(body["timezone_offset_min"], (int, float))
                 and not isinstance(body["timezone_offset_min"], bool)):
             metadata_kind = "account_limits"
-        concurrent_io = is_conversation_read or metadata_kind is not None
+        # Only a claimed native text task has its own backend Session and
+        # prepare/finalize token. Neither step submits the conversation.
+        native_post = getattr(context, "native_text_turn", False) and str(method).upper() == "POST"
+        requirements_base = "https://chatgpt.com/backend-api/sentinel/chat-requirements/"
+        text_preparation = (native_post and not kwargs.get("stream") and isinstance(body, dict)
+                            and ((url == requirements_base + "prepare" and set(body) == {"p"})
+                                 or (url == requirements_base + "finalize"
+                                     and set(body) == {"prepare_token", "proof_token", "turnstile_token"})))
+        text_stream = (native_post and url == "https://chatgpt.com/backend-api/conversation"
+                       and bool(transport_model) and kwargs.get("stream") is True)
+        concurrent_io = is_conversation_read or metadata_kind is not None or text_preparation or text_stream
         archive_guard = current_archive_guard.get() if phase in {
             "conversation_read", "conversation_archive", "conversation_restore"} else None
         read_owner = current_archive_read_owner.get() if archive_guard is not None else None
@@ -767,7 +777,10 @@ class AccountRequestClock:
                             # Let it wake instead of sleeping across its edge
                             # while holding the clock needed by that reader.
                             yield_to_read = True
-                if not yield_to_read:
+                # A legal metadata/preparation request can run while this
+                # turn alone is waiting for its later message interval.
+                turn_only_wait = text_stream and self.next_turn > max(now, self.next_request, self.cooldown_until)
+                if not yield_to_read and not turn_only_wait:
                     if delay > 0:
                         wait_for_pace(delay, message)
                     return
@@ -841,7 +854,8 @@ class AccountRequestClock:
                               wait_reason)
             clock_held = True
             response = None
-            completed_buffered_read = False
+            clean_response = False
+            floor_durable = False
             marker_persisted = False
             post_guard_started = None
             try:
@@ -924,13 +938,18 @@ class AccountRequestClock:
                 self.next_request = now + min(60.0, config.account_request_interval_secs * factor)
                 read_correction_applied = False
 
-                def correct_read_start(sent_at):
+                def persist_actual_start(sent_at):
                     nonlocal read_correction_applied
+                    self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
+                    if is_turn:
+                        self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
+                        self.last_turn_started = sent_at
                     if is_conversation_read and not read_correction_applied:
                         delay = max(0.0, sent_at - now)
                         self.conversation_read_bucket["at"] += delay
                         self.next_conversation_read += delay
                         read_correction_applied = True
+                    self._save()
 
                 if is_conversation_read:
                     self._consume_read(now)
@@ -967,23 +986,22 @@ class AccountRequestClock:
                     local_seconds["post_guard_to_http_secs"] += max(0.0, sent_at - post_guard_started)
                 try:
                     if concurrent_io:
-                        # Keep the durable clock through the local transport-call
-                        # edge, not through the network response. Other original
-                        # conversations may read once their own start floor is due.
+                        # Publish the actual transport start before another task
+                        # can prepare or send on this account.
                         # The caller still joins this one timeout-limited request;
                         # no retry, detached task or new scheduling queue is added.
                         entered = threading.Event()
                         outcome = {}
-                        def read_started(at):
+                        def transport_started(at):
                             outcome["started_at"] = at
                             entered.set()
-                        def read_io():
+                        def run_transport():
                             try:
                                 # Thread scheduling consumes the same pre-send
                                 # budget; an expired caller must not send later.
                                 cap_timeout_before_send()
                                 outcome["response"] = observed_send(method, url, phase,
-                                    read_started=read_started, **kwargs)
+                                    read_started=transport_started, **kwargs)
                             except BaseException as exc:
                                 outcome["error"] = exc
                             finally:
@@ -995,19 +1013,16 @@ class AccountRequestClock:
                                                         "account": self.account_key})
                                 entered.set()
                         worker_context = copy_context()
-                        worker = threading.Thread(target=worker_context.run, args=(read_io,),
-                                                  name="account-metadata-read" if metadata_kind else "original-conversation-read")
+                        worker = threading.Thread(target=worker_context.run, args=(run_transport,),
+                                                  name="account-http-io")
                         worker.start()
                         reservation_error = None
-                        floor_durable = False
                         try:
                             entered.wait()
                             if "started_at" not in outcome:
                                 raise outcome["error"]
                             sent_at = outcome["started_at"]
-                            self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
-                            correct_read_start(sent_at)
-                            self._save()
+                            persist_actual_start(sent_at)
                             floor_durable = True
                         except BaseException as exc:
                             reservation_error = exc
@@ -1018,29 +1033,33 @@ class AccountRequestClock:
                         if floor_durable:
                             self.lock.release()
                             clock_held = False
+                            if text_stream:
+                                # The next turn may start at its persisted interval.
+                                # The physical slot still belongs to this stream.
+                                release_pacing()
                         try:
                             # Reap the transport even on caller interruption;
-                            # never leave a late GET running after this returns.
+                            # never leave an unobserved send running after return.
                             while worker.is_alive():
                                 try:
                                     worker.join()
                                 except BaseException as exc:
                                     reservation_error = reservation_error or exc
                         finally:
+                            # An interrupted entered.wait() may precede the worker's
+                            # actual call. Repair the floor from its joined result.
+                            sent_at = outcome.get("started_at", sent_at)
                             response = outcome.get("response")
-                            completed_buffered_read = (floor_durable and not kwargs.get("stream")
-                                                       and reservation_error is None and "error" not in outcome
-                                                       and getattr(response, "status_code", None) == 200)
+                            clean_response = (floor_durable and (not kwargs.get("stream") or text_stream)
+                                              and reservation_error is None and "error" not in outcome
+                                              and getattr(response, "status_code", None) == 200)
                             # This is result/cooldown reconciliation, not a new
                             # send admission. It can outlast the send budget;
                             # discarding a received 429 would lose its cooldown.
-                            # A buffered conversation/allowlisted metadata 200
-                            # has no outcome-specific pacing update: its send
-                            # floor is already durable. Return that result
-                            # without another clock wait or stale state save.
-                            # This branch is only entered by concurrent_io;
-                            # preparation/authentication writes stay serialized.
-                            if not clock_held and not completed_buffered_read:
+                            # For these 200s the actual start is already durable.
+                            # Text streams keep their turn slot through close and
+                            # still record explicit SSE limits in paced_lines.
+                            if not clock_held and not clean_response:
                                 self.lock.acquire()
                                 clock_held = True
                         if "error" in outcome:
@@ -1052,13 +1071,8 @@ class AccountRequestClock:
                 finally:
                     # Keep the pre-send durable reservation for crash safety,
                     # then account for its I/O delay even if transport fails.
-                    if clock_held:
-                        self.next_request = max(self.next_request, sent_at + min(60.0, config.account_request_interval_secs * factor))
-                        correct_read_start(sent_at)
-                        if is_turn:
-                            self.next_turn = max(self.next_turn, sent_at + min(300.0, config.account_message_interval_secs * factor))
-                            self.last_turn_started = sent_at
-                        self._save()
+                    if clock_held and not floor_durable:
+                        persist_actual_start(sent_at)
                 release_pacing()
                 response_headers = getattr(response, "headers", {}) or {}
                 upstream_id = response_headers.get("x-request-id") or response_headers.get("openai-request-id")
@@ -1072,7 +1086,7 @@ class AccountRequestClock:
                     response.close()
                     raise reservation_error
             finally:
-                if not clock_held and response is not None and not completed_buffered_read:
+                if not clock_held and response is not None and not clean_response:
                     response.close()
                 if clock_held:
                     self.lock.release()
@@ -1507,7 +1521,7 @@ def pace_account_session(session, account: dict, access_token: str) -> None:
     raw_send = session.request
 
     def close_read_transport():
-        # Buffered GETs run on a joined, short-lived I/O thread. Session.close
+        # Concurrent transport setup runs on a joined I/O thread. Session.close
         # on the caller cannot close this thread-local handle; retained errors
         # can otherwise keep it alive through a traceback cycle until GC.
         # Never close the Session or any other thread's stream/handle here.

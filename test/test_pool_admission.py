@@ -3554,6 +3554,81 @@ class AdmissionTests(unittest.TestCase):
         self.assertFalse(any(event["stage"] == "send_call_started"
                              for event in receipt["_execution_timeline"]))
 
+    def test_native_text_stream_preserves_peer_preparation_429_and_final_send_fence(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import urlsplit
+        from curl_cffi.requests import Session
+        from services import account_request_pacing as pacing
+
+        self.submit("stream")
+        first = self.admission.claim_next()
+        self.submit("peer")
+        second = self.admission.claim_next()
+        entered, release, received = threading.Event(), threading.Event(), []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                received.append(self.path)
+                if self.path == "/backend-api/conversation":
+                    entered.set()
+                    if not release.wait(3):
+                        return
+                    self.send_response(200)
+                    body = b"data: [DONE]\n\n"
+                else:
+                    self.send_response(429)
+                    self.send_header("Retry-After", "120")
+                    body = b"limited"
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = "https://chatgpt.com/backend-api"
+        def route_local(session):
+            raw = session.request
+            session.request = lambda method, target, **kw: raw(
+                method, f"http://127.0.0.1:{server.server_port}" + urlsplit(target).path, **kw)
+            pacing.pace_account_session(session, {"account_id": "test-only"}, "fixture")
+        def generate(session, context, timeout):
+            with executing(context):
+                return session.post(url + "/conversation", stream=True, _account_request_model="gpt",
+                                    timeout=2, _account_request_deadline_monotonic=time.monotonic() + timeout)
+        try:
+            with (Session(trust_env=False) as a, Session(trust_env=False) as b,
+                  patch.object(pacing, "_clocks", {}), patch.object(pacing, "DATA_DIR", self.root),
+                  patch.object(type(pacing.config), "account_request_interval_secs", property(lambda _: 0)),
+                  patch.object(type(pacing.config), "account_message_interval_secs", property(lambda _: 0)),
+                  ThreadPoolExecutor(1) as worker):
+                route_local(a)
+                route_local(b)
+                pending = worker.submit(generate, a, first, 3)
+                try:
+                    self.assertTrue(entered.wait(2))
+                    with executing(second):
+                        limited = b.post(url + "/sentinel/chat-requirements/prepare", json={"p": "peer"},
+                                         timeout=1, _account_request_deadline_monotonic=time.monotonic() + 1)
+                        self.assertEqual(limited.status_code, 429)
+                finally:
+                    release.set()
+                response = pending.result(timeout=3)
+                self.assertIn(b"data: [DONE]", list(response.iter_lines()))
+                response.close()
+                with self.assertRaises(pacing.AccountRequestDeadlineExceeded):
+                    generate(b, second, .1)
+                with self.assertRaises(AdmissionLost):
+                    first.before_send_with_marker()
+                self.assertEqual(received, ["/backend-api/conversation", "/backend-api/sentinel/chat-requirements/prepare"])
+                self.assertFalse(self.read("text", "happy", "stream")["_turn_reserved"])
+                self.assertFalse(self.read("text", "happy", "peer").get("_submission_started"))
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+
     def test_final_guard_commits_send_marker_in_its_single_receipt_write(self):
         original_write = self.store.write_receipt
 

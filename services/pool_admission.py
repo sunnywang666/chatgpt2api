@@ -2905,6 +2905,8 @@ class PoolAdmission:
             self.store.set_runtime(db, "fairness", {"source": pick.source, "account": pick.account,
                                                       "owners": owners, "groups": groups, "subgroups": subgroups})
             context = ExecutionContext(self, ref.kind, ref.owner, ref.request_id, claim, claimed_at=now)
+            context.native_text_turn = (ref.kind == "text" and r.get("_operation", "text") == "text"
+                                        and r.get("_route", "chat") == "chat" and not r.get("_forward_protocol"))
             if ref.kind == "text" and r.get("_product_work_key"):
                 chain = (product_work.advanced_session_chain(self.store, db, r, now)
                          if advanced_session else product_work.advanced_continuation_chain(self.store, db, r, now))
