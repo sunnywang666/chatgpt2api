@@ -2155,6 +2155,60 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn("saved-catalog-image", [rid for _, _, rid, _ in filtered[0]])
         self.assertEqual(self.read("image", "happy", "saved-catalog-image")["data"], data)
 
+    def test_claim_receipts_keeps_legacy_rowid_order_without_sql_temp_sort(self):
+        """The covering compact scans retain historical text-then-image order using scalar rowid sorting."""
+        from services import task_store as storage
+
+        with self.store.transaction() as db:
+            db.execute("INSERT INTO requests(owner,id,request_hash,receipt) VALUES(?,?,?,?)", (
+                "text-null", "text-first", "hash-text-first",
+                json.dumps({"request_id": "text-first", "status": None, "marker": "null-status"}),
+            ))
+            db.execute("INSERT INTO requests(owner,id,request_hash,receipt) VALUES(?,?,?,?)", (
+                "text-missing", "text-second", "hash-text-second",
+                json.dumps({"request_id": "text-second", "marker": "missing-status"}),
+            ))
+            db.execute("INSERT INTO requests(owner,id,request_hash,receipt) VALUES(?,?,?,?)", (
+                "text-queued", "text-third", "hash-text-third",
+                json.dumps({"request_id": "text-third", "status": "queued", "marker": "queued-status"}),
+            ))
+            db.execute("INSERT INTO image_requests(task_key,receipt) VALUES(?,?)", (
+                "image-success:image-first",
+                json.dumps({"id": "image-first", "owner_id": "image-success", "status": "success"}),
+            ))
+            db.execute("INSERT INTO image_requests(task_key,receipt) VALUES(?,?)", (
+                "image-missing:image-second",
+                json.dumps({"id": "image-second", "owner_id": "image-missing", "marker": "missing-status"}),
+            ))
+
+            rows = self.store.claim_receipts(db)
+            self.assertEqual([(kind, owner, request_id) for kind, owner, request_id, _ in rows], [
+                ("text", "text-null", "text-first"),
+                ("text", "text-missing", "text-second"),
+                ("text", "text-queued", "text-third"),
+                ("image", "image-success", "image-first"),
+                ("image", "image-missing", "image-second"),
+            ])
+            mapped = {(kind, owner, request_id): receipt for kind, owner, request_id, receipt in rows}
+            self.assertIn("status", mapped[("text", "text-null", "text-first")])
+            self.assertIsNone(mapped[("text", "text-null", "text-first")]["status"])
+            self.assertNotIn("status", mapped[("text", "text-missing", "text-second")])
+            self.assertNotIn("status", mapped[("image", "image-missing", "image-second")])
+            self.assertEqual(self.store.claim_receipts(db, statuses=[]), [])
+            self.assertEqual([(kind, owner, request_id) for kind, owner, request_id, _ in
+                              self.store.claim_receipts(db, statuses=("queued",))],
+                             [("text", "text-queued", "text-third")])
+
+            plans = []
+            for table, columns in (("requests", f"rowid,owner,id,{storage._CLAIM_METADATA},{storage._CONTENT_TYPE},{storage._DATA_TYPE}"),
+                                   ("image_requests", f"rowid,task_key,{storage._CLAIM_METADATA},{storage._CONTENT_TYPE},{storage._DATA_TYPE}")):
+                plan = [row[-1] for row in db.execute(
+                    f"EXPLAIN QUERY PLAN SELECT {columns} FROM {table} "
+                    f"INDEXED BY {table}_claim_receipt_projection")]
+                plans.extend(plan)
+                self.assertTrue(any("USING COVERING INDEX" in detail for detail in plan))
+            self.assertFalse(any("TEMP B-TREE" in detail for detail in plans))
+
     def test_unknown_originals_do_not_probe_catalog_but_keep_order_fence(self):
         from services.pool_admission import unfinished
         catalog_calls = []
