@@ -180,6 +180,43 @@ def test_missing_node_rejected_child_can_link_only_its_queued_unsent_image(task)
     assert error.value.code == "CHAT_SUPERSEDE_INVALID"
 
 
+def test_missing_node_completed_link_hydrates_its_body_but_not_unrelated_terminal_history(task):
+    """The completed C proof is the one claim-time result body that remains relevant to A4."""
+    envelope = missing_node_model_rejection_with_queued_image(task)
+    task.service.submit("owner", envelope, source="internal:content")
+    retry = task.admission.claim_next()
+    assert retry and retry.request_id == "missing-model-retry"
+    task.admission.execute(retry)
+
+    relevant_marker = "missing-node-completed-link-must-hydrate"
+    unrelated_marker = "missing-node-unrelated-terminal-must-stay-compact"
+    with task.service.store.transaction() as db:
+        completed = task.service.store.read_receipt(db, "text", "owner", "missing-model-retry")
+        completed["content"] = relevant_marker * 30000
+        task.service.store.write_receipt(db, "text", "owner", "missing-model-retry", completed)
+        task.service.store.write_receipt(db, "image", "other-owner", "unrelated-terminal", {
+            "id": "unrelated-terminal", "owner_id": "other-owner", "status": "success",
+            "upstream_unfinished": False, "data": [{"b64_json": unrelated_marker * 30000}],
+        })
+
+    decode, relevant = json.loads, []
+
+    def claim_decode(raw, *args, **kwargs):
+        assert unrelated_marker not in raw
+        if relevant_marker in raw:
+            relevant.append(raw)
+        return decode(raw, *args, **kwargs)
+
+    with patch("services.task_store.json.loads", side_effect=claim_decode):
+        image = task.admission.claim_next()
+
+    assert image and image.request_id == "queued-image"
+    assert relevant
+    with task.service.store.connect() as db:
+        saved = task.service.store.read_receipt(db, "image", "other-owner", "unrelated-terminal")
+    assert saved["data"] == [{"b64_json": unrelated_marker * 30000}]
+
+
 def test_missing_node_parent_cannot_use_three_fields_or_rebind_its_image(task):
     envelope = missing_node_model_rejection_with_queued_image(task)
     with pytest.raises(ConversationBindingError) as error:
