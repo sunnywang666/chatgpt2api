@@ -17,7 +17,7 @@ from services.account_service import AccountService
 from services.account_request_pacing import AccountRequestClock
 from services.model_service import ModelRoute
 from services.storage.json_storage import JSONStorageBackend
-from services.task_store import SendHoldRejected, TaskStore
+from services.task_store import ReceiptProjection, SendHoldRejected, TaskStore
 from services.pool_admission import PoolAdmission
 from services.request_context import current_request, AdmissionLost, executing
 from services.text_task_service import TextTaskService
@@ -2131,20 +2131,29 @@ class AdmissionTests(unittest.TestCase):
             self.store.write_receipt(db, "image", "happy", "saved-catalog-image", receipt)
         catalog_calls, reads = [], []
         self.admission.model_types = lambda model: catalog_calls.append(model) or {"Plus"}
-        original = self.store.receipts
+        original = self.store.claim_receipts
         def observed(db, **kwargs):
             rows = list(original(db, **kwargs))
             reads.append((kwargs, rows))
             return iter(rows)
-        with patch.object(self.store, "receipts", side_effect=observed):
+        with patch.object(self.store, "claim_receipts", side_effect=observed):
             self.admission.claim_next()
+        with self.store.connect() as db, \
+             patch.object(self.store, "read_receipt", wraps=self.store.read_receipt) as canonical_reads:
+            saved = next(receipt for kind, owner, request_id, receipt in self.store.claim_receipts(db)
+                         if (kind, owner, request_id) == ("image", "happy", "saved-catalog-image"))
+            self.assertIsInstance(saved, ReceiptProjection)
+            self.assertIn("data", saved)
+            self.assertNotIn(("image", "happy", "saved-catalog-image"),
+                             [call.args[-3:] for call in canonical_reads.call_args_list])
+            self.assertEqual(saved["data"], data)
+            self.assertIn(("image", "happy", "saved-catalog-image"),
+                          [call.args[-3:] for call in canonical_reads.call_args_list])
         self.assertTrue(expected_models <= set(catalog_calls))
         filtered = [rows for args, rows in reads if args.get("statuses") == ("queued", "running", "not_started")]
         self.assertEqual(len(filtered), 1)
         self.assertNotIn("saved-catalog-image", [rid for _, _, rid, _ in filtered[0]])
-        complete = [r for args, rows in reads if not args for _, _, rid, r in rows if rid == "saved-catalog-image"]
-        self.assertTrue(complete)
-        self.assertTrue(all(r["data"] == data for r in complete))
+        self.assertEqual(self.read("image", "happy", "saved-catalog-image")["data"], data)
 
     def test_unknown_originals_do_not_probe_catalog_but_keep_order_fence(self):
         from services.pool_admission import unfinished
@@ -2447,6 +2456,171 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(len({c.receipt()["provider_account_identity"] for c in claims}), 3)
         self.write_accounts(4)
         self.assertEqual(self.admission.claim_next().request_id, "many-6")
+
+    def test_claim_next_uses_compact_terminal_history_without_losing_six_slot_fairness(self):
+        """Unrelated saved bodies stay durable but never enter the six-slot planner."""
+        self.admission.settings = lambda: {
+            "chat_account_concurrency": 6,
+            "image_account_concurrency": 4,
+            "codex_max_concurrency": 4,
+        }
+        for index in range(7):
+            self.submit("ordinary-" + str(index))
+        text_marker = "terminal-text-must-not-cross-claim-decoder"
+        image_marker = "terminal-image-must-not-cross-claim-decoder"
+        self.submit("saved-text", owner="archived-text")
+        self.image("saved-image", owner="archived-image")
+        with self.store.transaction() as db:
+            text = self.store.read_receipt(db, "text", "archived-text", "saved-text")
+            text.update(status="succeeded", upstream_outcome="completed", content=text_marker * 30000)
+            self.store.write_receipt(db, "text", "archived-text", "saved-text", text)
+            image = self.store.read_receipt(db, "image", "archived-image", "saved-image")
+            image.update(status="success", upstream_unfinished=False,
+                         data=[{"b64_json": image_marker * 30000}])
+            self.store.write_receipt(db, "image", "archived-image", "saved-image", image)
+
+        decode = json.loads
+        decoded_payloads = []
+
+        def claim_decode(raw, *args, **kwargs):
+            if text_marker in raw or image_marker in raw:
+                decoded_payloads.append(raw)
+            return decode(raw, *args, **kwargs)
+
+        with patch("services.task_store.json.loads", side_effect=claim_decode):
+            claimed = [self.admission.claim_next() for _ in range(6)]
+            seventh = self.admission.claim_next()
+            self.admission.execute(claimed[0])
+            released_slot_claim = self.admission.claim_next()
+            no_duplicate_claim = self.admission.claim_next()
+
+        self.assertEqual(decoded_payloads, [])
+        self.assertEqual([context.request_id for context in claimed],
+                         ["ordinary-" + str(index) for index in range(6)])
+        self.assertIsNone(seventh)
+        self.assertEqual(self.read("text", "happy", "ordinary-0")["status"], "succeeded")
+        self.assertEqual(released_slot_claim.request_id, "ordinary-6")
+        self.assertIsNone(no_duplicate_claim)
+        self.assertEqual(self.read("text", "happy", "ordinary-6")["status"], "running")
+        snapshot = self.admission.resource_snapshot()
+        self.assertEqual(snapshot["execution"]["chat_workers_limit"], 6)
+        self.assertEqual([account["chat_turn"]["occupied"] for account in snapshot["accounts"]], [6])
+        with self.store.connect() as db:
+            claim_view = {(kind, owner, request_id): receipt
+                          for kind, owner, request_id, receipt in self.store.claim_receipts(db)}
+            self.assertIsInstance(claim_view[("text", "archived-text", "saved-text")], ReceiptProjection)
+            self.assertIn("content", claim_view[("text", "archived-text", "saved-text")])
+            self.assertIsInstance(claim_view[("image", "archived-image", "saved-image")], ReceiptProjection)
+            self.assertIn("data", claim_view[("image", "archived-image", "saved-image")])
+            self.assertEqual(claim_view[("text", "archived-text", "saved-text")]["content"], text_marker * 30000)
+            self.assertEqual(claim_view[("image", "archived-image", "saved-image")]["data"],
+                             [{"b64_json": image_marker * 30000}])
+        self.assertEqual(self.read("text", "archived-text", "saved-text")["content"], text_marker * 30000)
+        self.assertEqual(self.read("image", "archived-image", "saved-image")["data"],
+                         [{"b64_json": image_marker * 30000}])
+
+    def test_claim_next_uses_late_public_predecessor_metadata_without_body_hydration(self):
+        """A public successor needs its predecessor cursor, never the saved answer body."""
+        session = {
+            "client_conversation_id": "late-public-chain",
+            "_public_route": "chat",
+            "_public_session_ref": "late-public-chain",
+        }
+        self.submit("late-parent", **session)
+        self.submit("late-child", **session, _previous_request_id="late-parent")
+        marker = "late-predecessor-body-must-hydrate-for-dependent-child"
+        with self.store.transaction() as db:
+            parent = self.store.read_receipt(db, "text", "happy", "late-parent")
+            parent.update(status="succeeded", upstream_outcome="completed",
+                          provider_binding_id="binding-0", provider_account_identity="account-0",
+                          conversation_id="late-conversation", parent_message_id="late-final",
+                          content=marker * 30000)
+            self.store.write_receipt(db, "text", "happy", "late-parent", parent)
+        with self.store.connect() as db:
+            before = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?",
+                                ("happy", "late-parent")).fetchone()[0]
+
+        decode = json.loads
+        hydrated = []
+
+        def observe_hydration(raw, *args, **kwargs):
+            if marker in raw:
+                hydrated.append(raw)
+            return decode(raw, *args, **kwargs)
+
+        with patch("services.task_store.json.loads", side_effect=observe_hydration):
+            child = self.admission.claim_next()
+
+        self.assertIsNotNone(child)
+        self.assertEqual(child.request_id, "late-child")
+        self.assertEqual(hydrated, [])
+        with self.store.connect() as db:
+            after = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?",
+                               ("happy", "late-parent")).fetchone()[0]
+        self.assertEqual(after, before)
+        original = self.read("text", "happy", "late-parent")
+        self.assertEqual(original["content"], marker * 30000)
+        self.assertEqual(original["parent_message_id"], "late-final")
+        claimed = child.receipt()
+        self.assertEqual(claimed["provider_account_identity"], "account-0")
+        self.assertEqual(claimed["conversation_id"], "late-conversation")
+        self.assertEqual(claimed["_submission_parent_message_id"], "late-final")
+
+    def test_lazy_claim_projection_preserves_legacy_linked_image_and_nullable_status_on_write(self):
+        """Lazy payloads keep legacy linkage and missing/null status intact when a caller persists an update."""
+        image_marker = "legacy-linked-image-result-must-survive-lazy-write"
+        text_marker = "null-status-text-result-must-survive-lazy-write"
+        self.image("legacy-linked", owner="legacy-owner")
+        self.submit("null-status", owner="null-owner")
+        with self.store.transaction() as db:
+            legacy = self.store.read_receipt(db, "image", "legacy-owner", "legacy-linked")
+            legacy.pop("status")
+            legacy.update(
+                upstream_unfinished=False,
+                _product_work_key="product_work:legacy-linked",
+                _product_work={"product_ref": "legacy-product", "step_ref": "main-image"},
+                _image_thread={"protocol": "image-thread-v1", "previous_task_id": "earlier-image"},
+                data=[{"b64_json": image_marker * 30000}],
+            )
+            self.store.write_receipt(db, "image", "legacy-owner", "legacy-linked", legacy)
+            nullable = self.store.read_receipt(db, "text", "null-owner", "null-status")
+            nullable.update(status=None, content=text_marker * 30000)
+            self.store.write_receipt(db, "text", "null-owner", "null-status", nullable)
+
+        with self.store.transaction() as db:
+            rows = {(kind, owner, request_id): receipt
+                    for kind, owner, request_id, receipt in self.store.claim_receipts(db)}
+            legacy = rows[("image", "legacy-owner", "legacy-linked")]
+            nullable = rows[("text", "null-owner", "null-status")]
+            self.assertIsInstance(legacy, ReceiptProjection)
+            self.assertNotIn("status", legacy)
+            self.assertIn("data", legacy)
+            self.assertEqual(legacy["_product_work_key"], "product_work:legacy-linked")
+            self.assertEqual(legacy["_image_thread"]["previous_task_id"], "earlier-image")
+            # Nested compact scheduling state is already mutable. Hydrating an
+            # omitted result for a normal comparison must not replace it with
+            # the stale canonical nested object.
+            legacy["_image_thread"]["previous_task_id"] = "mutated-before-hydration"
+            self.assertNotEqual(legacy["data"], [{"b64_json": "different"}])
+            self.assertIn("status", nullable)
+            self.assertIsNone(nullable["status"])
+            self.assertIn("content", nullable)
+            legacy["waiting"] = {"reasons": ["legacy-observation"]}
+            nullable["waiting"] = {"reasons": ["null-status-observation"]}
+            self.store.write_receipt(db, "image", "legacy-owner", "legacy-linked", legacy)
+            self.store.write_receipt(db, "text", "null-owner", "null-status", nullable)
+
+        legacy = self.read("image", "legacy-owner", "legacy-linked")
+        self.assertNotIn("status", legacy)
+        self.assertEqual(legacy["data"], [{"b64_json": image_marker * 30000}])
+        self.assertEqual(legacy["_product_work_key"], "product_work:legacy-linked")
+        self.assertEqual(legacy["_image_thread"]["previous_task_id"], "mutated-before-hydration")
+        self.assertEqual(legacy["waiting"], {"reasons": ["legacy-observation"]})
+        nullable = self.read("text", "null-owner", "null-status")
+        self.assertIn("status", nullable)
+        self.assertIsNone(nullable["status"])
+        self.assertEqual(nullable["content"], text_marker * 30000)
+        self.assertEqual(nullable["waiting"], {"reasons": ["null-status-observation"]})
 
     def test_generated_image_save_releases_image_capacity_but_preserves_receipt_and_memory(self):
         self.admission.settings = lambda: {"chat_account_concurrency": 2, "image_account_concurrency": 1, "codex_max_concurrency": 4}

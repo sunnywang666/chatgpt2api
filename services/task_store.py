@@ -71,6 +71,147 @@ class SendHoldRejected(Exception):
         self.control = control
 
 
+class ReceiptProjection(dict):
+    """Detached receipt state that loads a large result only if it is used."""
+
+    _OMITTED = frozenset(("content", "data"))
+
+    def __init__(self, value, omitted_types, loader):
+        super().__init__(value)
+        self._omitted_types = dict(omitted_types)
+        self._loader = loader
+        self._hydrated = False
+
+    def _hydrate(self):
+        if self._hydrated:
+            return
+        full = self._loader()
+        if not isinstance(full, dict):
+            raise ValueError("canonical receipt is missing during projection hydration")
+        # Every compact field is already a detached exact value.  Do not
+        # replace it: callers can mutate nested scheduling/timeline state
+        # before a later payload access or write.  Hydration contributes only
+        # the two intentionally omitted result fields.
+        for key in self._OMITTED:
+            if key in full:
+                dict.__setitem__(self, key, full[key])
+            else:
+                dict.pop(self, key, None)
+        self._hydrated = True
+        self._omitted_types.clear()
+
+    def _needs_value(self, key):
+        return (key in self._OMITTED and self._omitted_types.get(key) not in (None, "null"))
+
+    def _omitted_null(self, key):
+        return key in self._OMITTED and self._omitted_types.get(key) == "null"
+
+    def __contains__(self, key):
+        if key in self._OMITTED and not dict.__contains__(self, key):
+            return self._omitted_types.get(key) is not None
+        return dict.__contains__(self, key)
+
+    def __getitem__(self, key):
+        if self._omitted_null(key):
+            return None
+        if self._needs_value(key):
+            self._hydrate()
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        if self._omitted_null(key):
+            return None
+        if self._needs_value(key):
+            self._hydrate()
+        return dict.get(self, key, default)
+
+    def __setitem__(self, key, value):
+        self._hydrate()
+        return dict.__setitem__(self, key, value)
+
+    def update(self, *args, **kwargs):
+        self._hydrate()
+        return dict.update(self, *args, **kwargs)
+
+    def pop(self, key, *args):
+        self._hydrate()
+        return dict.pop(self, key, *args)
+
+    def popitem(self):
+        self._hydrate()
+        return dict.popitem(self)
+
+    def clear(self):
+        self._hydrate()
+        return dict.clear(self)
+
+    def setdefault(self, key, default=None):
+        self._hydrate()
+        return dict.setdefault(self, key, default)
+
+    def __delitem__(self, key):
+        self._hydrate()
+        return dict.__delitem__(self, key)
+
+    def __iter__(self):
+        self._hydrate()
+        return dict.__iter__(self)
+
+    def __len__(self):
+        # Presence is indexed separately, so truth testing a receipt never
+        # needs to pull a result body into the claim transaction.
+        return dict.__len__(self) + sum(
+            1 for key, value_type in self._omitted_types.items()
+            if value_type is not None and not dict.__contains__(self, key))
+
+    def keys(self):
+        self._hydrate()
+        return dict.keys(self)
+
+    def items(self):
+        self._hydrate()
+        return dict.items(self)
+
+    def values(self):
+        self._hydrate()
+        return dict.values(self)
+
+    def copy(self):
+        self._hydrate()
+        return dict.copy(self)
+
+    def __eq__(self, other):
+        self._hydrate()
+        if isinstance(other, ReceiptProjection):
+            other._hydrate()
+        return dict.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __or__(self, other):
+        self._hydrate()
+        return dict.__or__(self, other)
+
+    def __ror__(self, other):
+        self._hydrate()
+        return dict.__ror__(self, other)
+
+    def __ior__(self, other):
+        self._hydrate()
+        return dict.__ior__(self, other)
+
+    def __repr__(self):
+        self._hydrate()
+        return dict.__repr__(self)
+
+
+_CLAIM_METADATA = "json_remove(receipt,'$.content','$.data')"
+_CLAIM_STATUS = "json_extract(receipt,'$.status')"
+_CONTENT_TYPE = "json_type(receipt,'$.content')"
+_DATA_TYPE = "json_type(receipt,'$.data')"
+
+
 def _has_send_evidence(receipt):
     timeline = receipt.get("_execution_timeline")
     nonzero_or_invalid = lambda value: value is not None and (type(value) is not int or value != 0)
@@ -239,6 +380,15 @@ class TaskStore:
                             f"ON {table}(json_extract(receipt,'$.conversation_id')) "
                             "WHERE json_type(receipt,'$._product_work_key') IS NOT NULL "
                             "AND json_type(receipt,'$._product_work_key') != 'null'")
+                    # An all-receipt covering expression index stores the
+                    # scheduling projection of every canonical receipt.  Raw
+                    # SQL writers stay lossless: SQLite updates this index as
+                    # part of their normal canonical-receipt write, with no
+                    # side table, status filter, or legacy-row backfill.
+                    db.execute("CREATE INDEX IF NOT EXISTS requests_claim_receipt_projection "
+                               f"ON requests({_CLAIM_STATUS},owner,id,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE})")
+                    db.execute("CREATE INDEX IF NOT EXISTS image_requests_claim_receipt_projection "
+                               f"ON image_requests({_CLAIM_STATUS},task_key,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE})")
             finally:
                 db.close()
             self._ready = True
@@ -355,6 +505,58 @@ class TaskStore:
             receipt = json.loads(raw)
             yield "image", receipt["owner_id"], receipt["id"], receipt
 
+    def claim_receipts(self, db, *, statuses=None):
+        """Return every receipt from its covering scheduling projection.
+
+        ``content`` and ``data`` retain their ordinary mapping behavior, but
+        their canonical values are loaded only when a caller actually reads or
+        mutates either field.  Other fields are exact compact copies, including
+        result IDs and recovery state.
+        """
+        rows = []
+        values = () if statuses is None else tuple(statuses)
+        if statuses is not None and not values:
+            return rows
+        where = (" WHERE " + _CLAIM_STATUS + " IN (" + ",".join("?" for _ in values) + ")"
+                 if values else "")
+
+        def load_canonical(kind, owner, request_id):
+            # Claim-time access stays on the current transaction.  A caller
+            # may also keep a detached projection after its read connection
+            # closes; reopen only in that case, never while the writer is live.
+            try:
+                return self.read_receipt(db, kind, owner, request_id)
+            except sqlite3.ProgrammingError:
+                with self.connect() as read_db:
+                    return self.read_receipt(read_db, kind, owner, request_id)
+
+        def projected(kind, owner, request_id, compact_receipt, content, data):
+            if content in (None, "null") and data in (None, "null"):
+                if content == "null":
+                    compact_receipt["content"] = None
+                if data == "null":
+                    compact_receipt["data"] = None
+                return kind, owner, request_id, compact_receipt
+            return (kind, owner, request_id, ReceiptProjection(
+                compact_receipt, {"content": content, "data": data},
+                lambda kind=kind, owner=owner, request_id=request_id:
+                load_canonical(kind, owner, request_id)))
+
+        # The legacy full-table scans happened to be rowid ordered. Preserve
+        # that incidental order without consulting canonical receipt bodies.
+        text_sql = (f"SELECT owner,id,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE}" +
+                    " FROM requests INDEXED BY requests_claim_receipt_projection" + where +
+                    " ORDER BY rowid")
+        for owner, request_id, raw, content, data in db.execute(text_sql, values):
+            rows.append(projected("text", owner, request_id, json.loads(raw), content, data))
+        image_sql = (f"SELECT task_key,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE}" +
+                     " FROM image_requests INDEXED BY image_requests_claim_receipt_projection" + where +
+                     " ORDER BY rowid")
+        for _task_key, raw, content, data in db.execute(image_sql, values):
+            compact_receipt = json.loads(raw)
+            rows.append(projected("image", compact_receipt["owner_id"], compact_receipt["id"], compact_receipt, content, data))
+        return rows
+
     @staticmethod
     def product_work_conversation_receipts(db, receipt):
         """Yield only ProductWork candidates that can share ``receipt``'s conversation.
@@ -409,6 +611,8 @@ class TaskStore:
 
     @staticmethod
     def write_receipt(db, kind, owner, request_id, receipt):
+        if isinstance(receipt, ReceiptProjection):
+            receipt._hydrate()
         raw = json.dumps(receipt, ensure_ascii=False, separators=(",", ":"))
         if kind == "text":
             db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?", (raw, owner, request_id))

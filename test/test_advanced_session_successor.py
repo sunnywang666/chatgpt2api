@@ -2,6 +2,7 @@
 from copy import deepcopy
 import hashlib
 import json
+from unittest.mock import patch
 
 import pytest
 
@@ -439,6 +440,34 @@ def test_frozen_evidence_refresh_allows_timestamp_only(advanced):
         h.service.store.write_receipt(db, "text", "owner", "old", original)
         with pytest.raises(ConversationBindingError):
             validate_successor(h.service.store, db, "owner", child, h.clock())
+
+
+def test_advanced_validation_keeps_unrelated_terminal_payload_compact(advanced):
+    """The existing successor proof may read its two roots, never another saved result body."""
+    h = advanced
+    body, child = prepared(h)
+    child["_workbench_derived_body"] = body
+    marker = "advanced-validation-must-not-read-unrelated-terminal-image"
+    with h.service.store.transaction() as db:
+        db.execute("INSERT INTO image_requests(task_key,receipt) VALUES(?,?)", (
+            "other-owner:unrelated-terminal",
+            json.dumps({"id": "unrelated-terminal", "owner_id": "other-owner", "status": "success",
+                        "upstream_unfinished": False, "data": [{"b64_json": marker * 30000}]}),
+        ))
+    decode = json.loads
+
+    def compact_only(raw, *args, **kwargs):
+        assert marker not in raw
+        return decode(raw, *args, **kwargs)
+
+    with h.service.store.connect() as db, \
+         patch("services.task_store.json.loads", side_effect=compact_only):
+        original = validate_successor(h.service.store, db, "owner", child, h.clock())
+
+    assert original["request_id"] == "old"
+    with h.service.store.connect() as db:
+        unrelated = h.service.store.read_receipt(db, "image", "other-owner", "unrelated-terminal")
+    assert unrelated["data"] == [{"b64_json": marker * 30000}]
 
 
 @pytest.mark.parametrize("field,value", [("provider_account_identity", "foreign"),

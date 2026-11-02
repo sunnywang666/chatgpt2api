@@ -1839,7 +1839,8 @@ class PoolAdmission:
                 # must not revive their UNKNOWN queue barrier.  This is the
                 # durable four-receipt proof, deliberately separate from live
                 # eligibility. Failed/cancelled C never releases A4.
-                completed_link = (receipt.get("status") == "succeeded"
+                completed_link = (isinstance(image_id, str) and bool(image_id)
+                                  and receipt.get("status") == "succeeded"
                                   and receipt.get("upstream_outcome") == "completed"
                                   and isinstance(receipt.get("content"), str) and bool(receipt["content"].strip())
                                   and TextTaskService._missing_node_model_rejection_retry_consumed(
@@ -2486,7 +2487,9 @@ class PoolAdmission:
         # a work projection retain their existing allocation behavior.
         works, _ = workflow_scheduling.state_snapshot(self.store, db)
         parents = product_work.state_snapshot(self.store, db)
-        for item in self.store.receipts(db, statuses=statuses):
+        # The claim projection's leading status expression avoids decoding
+        # completed bodies during bounded metadata discovery as well.
+        for item in self.store.claim_receipts(db, statuses=statuses):
             if item[3].get("_send_hold") is True:
                 continue
             work = works.get(item[3].get("_work_key")) or {}
@@ -2714,7 +2717,10 @@ class PoolAdmission:
                     self._codex_probe_index = (start + scanned) % len(candidates)
         with self._settings_guard(), self.store.transaction() as db, self._account_guard():
             now = float(self.clock())
-            receipts = list(self.store.receipts(db))
+            # Keep completed result bodies out of the writer-held claim path.
+            # claim_receipts rehydrates only active/linked dependencies; public
+            # reads and all writes still use canonical full receipts.
+            receipts = self.store.claim_receipts(db)
             workflow_scheduling.expire_unsent(self.store, db, receipts, now)
             self._recover_claims(db, receipts, now)
             product_work.reconcile_paused_admission_slots(self.store, db, receipts, now=now)

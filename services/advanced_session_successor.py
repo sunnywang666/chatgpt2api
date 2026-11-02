@@ -397,7 +397,7 @@ def validate_successor(store, db, owner, child, now, *, after_send=False):
         from services.pool_admission import unfinished
         external_users = {ev["successor_request_message_id"]} | {
             step["request_message_id"] for step in ev.get("tail_steps", [])}
-        for kind, other_owner, other_id, other in store.receipts(db):
+        for kind, other_owner, other_id, other in store.claim_receipts(db):
             if other_owner == owner and kind == "text" and other_id in {original_id, child_id}:
                 continue
             if other_owner == owner and (other.get("_supersedes_request_id") == original_id or other.get("_codex_fallback_of") == original_id):

@@ -399,7 +399,9 @@ def record_slot(store, db, receipt, held=True):
 def _check_physical(store, db, receipt, key):
     if not _has_physical(receipt):
         return
-    for _, _, _, other in store.receipts(db):
+    candidates = (store.product_work_conversation_receipts(db, receipt)
+                  if isinstance(receipt.get("conversation_id"), str) else store.claim_receipts(db))
+    for _, _, _, other in candidates:
         if (_same_conversation(receipt, other) and other.get("_product_work_key")
                 and other["_product_work_key"] != key):
             raise WorkLifecycleError("PRODUCT_WORK_CONVERSATION_CONFLICT")
@@ -1577,7 +1579,7 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
         if continuation is not None:
             chain_ids.add(("text", parent["owner"], continuation["request_id"]))
         registered = {(member["kind"], member["owner"], member["request_id"]) for member, _ in members}
-        all_rows = list(store.receipts(db))
+        all_rows = store.claim_receipts(db)
         all_receipts = [other for _, _, _, other in all_rows]
         controls = ("_executing", "_turn_reserved", "recovery_claim_id", "_recovery_claim_id",
                     "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of")
