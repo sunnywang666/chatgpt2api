@@ -1028,6 +1028,62 @@ class AccountRequestPacingTests(unittest.TestCase):
                     self.assertFalse(worker.is_alive() or follower.is_alive())
                     self.assertEqual(errors, [])
 
+    def test_buffered_metadata_success_returns_without_reacquiring_busy_clock(self):
+        cases = (
+            ("GET", "/", None),
+            ("GET", "/backend-api/me", None),
+            ("GET", "/backend-api/accounts/check/v4-2023-04-27", None),
+            ("POST", "/backend-api/conversation/init", {
+                "gizmo_id": None, "requested_default_model": None,
+                "conversation_id": None, "timezone_offset_min": -480,
+            }),
+        )
+        for method, suffix, body in cases:
+            with self.subTest(path=suffix), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)):
+                path = Path(tmp) / "clock.json"
+                first, other = AccountRequestClock("account", path), AccountRequestClock("account", path)
+                entered, release, delivered = threading.Event(), threading.Event(), threading.Event()
+                response, responses, errors, calls = Response(), [], [], []
+
+                def send(*args, **kwargs):
+                    calls.append(args)
+                    entered.set()
+                    if not release.wait(3):
+                        raise TimeoutError("metadata response was not released")
+                    return response
+
+                def read():
+                    try:
+                        responses.append(first.request(send, method, "https://provider" + suffix, json=body))
+                    except BaseException as exc:
+                        errors.append(exc)
+                    finally:
+                        delivered.set()
+
+                worker = threading.Thread(target=read)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(1))
+                    # A distinct instance owns the shared process lock after
+                    # the first request's actual-start floor is persisted.
+                    with other.lock:
+                        other.limited(120, retry_after_present=True)
+                        other.ordinary_read_queue = [{"owner": "later-original", "until": time.monotonic() + 150}]
+                        other._save()
+                        newer_state = path.read_bytes()
+                        release.set()
+                        self.assertTrue(delivered.wait(1), "received metadata 200 waited for an unrelated clock holder")
+                        self.assertEqual(errors, [])
+                        self.assertEqual(responses, [response])
+                        self.assertFalse(response.closed)
+                        self.assertEqual(path.read_bytes(), newer_state, "late 200 overwrote newer cooldown or FIFO")
+                finally:
+                    release.set()
+                    worker.join(3)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(calls), 1)
+
     def test_noncanonical_root_and_requirements_post_retain_send_fence(self):
         from services.account_request_pacing import AccountRequestDeadlineExceeded
         cases = (

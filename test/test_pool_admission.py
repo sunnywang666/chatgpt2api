@@ -866,6 +866,75 @@ class AdmissionTests(unittest.TestCase):
         self.assertTrue(self.read("text", "happy", "new-independent")["_submission_started"])
         self.assertEqual(self.read("image", "happy", "old-saved"), saved)
 
+    def test_physical_chat_send_guard_reads_active_receipts_once(self):
+        self.submit("single-snapshot")
+        context = self.admission.claim_next()
+        self.admission.update_claim(
+            context, conversation_id="single-snapshot-conversation",
+            provider_account_identity="account-0", provider_binding_id="binding-0",
+        )
+        original = self.store.receipts
+        calls = []
+
+        def tracked(*args, **kwargs):
+            calls.append((args, kwargs))
+            return original(*args, **kwargs)
+
+        with patch.object(self.store, "receipts", side_effect=tracked):
+            context.before_send()
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(self.read("text", "happy", "single-snapshot")["_submission_started"])
+
+    def test_chat_capacity_pending_completion_does_not_become_physical_occupancy(self):
+        self.submit("physical-current")
+        context = self.admission.claim_next()
+        self.admission.update_claim(
+            context, conversation_id="physical-capacity", provider_account_identity="account-0",
+            provider_binding_id="binding-0",
+        )
+        self.image("pending-completion-peer", owner="other")
+        with self.store.transaction() as db:
+            peer = self.store.read_receipt(db, "image", "other", "pending-completion-peer")
+            peer.update(status="success", provider_account_identity="account-0", provider_binding_id="binding-0",
+                        conversation_id="physical-capacity", upstream_unfinished=False, _sequence=0,
+                        _completion={"state": "needs_attention"})
+            self.store.write_receipt(db, "image", "other", "pending-completion-peer", peer)
+        original = __import__("services.pool_admission", fromlist=["physical_conversation_key"]).physical_conversation_key
+        checked = []
+
+        def tracked(receipt):
+            checked.append(receipt.get("request_id") or receipt.get("id"))
+            return original(receipt)
+
+        with patch("services.pool_admission.physical_conversation_key", side_effect=tracked):
+            context.before_send()
+        self.assertNotIn("pending-completion-peer", checked)
+
+    def test_succeeded_chat_transfer_does_not_reenter_physical_occupancy(self):
+        self.image("physical-current-image")
+        context = self.admission.claim_next()
+        self.admission.update_claim(
+            context, conversation_id="physical-transfer", provider_account_identity="account-0",
+            provider_binding_id="binding-0",
+        )
+        self.submit("succeeded-transfer-peer", owner="other")
+        with self.store.transaction() as db:
+            peer = self.store.read_receipt(db, "text", "other", "succeeded-transfer-peer")
+            peer.update(status="succeeded", provider_account_identity="account-0", provider_binding_id="binding-0",
+                        conversation_id="physical-transfer", upstream_unfinished=False, _sequence=0,
+                        _same_session_retry_of="original-transfer")
+            self.store.write_receipt(db, "text", "other", "succeeded-transfer-peer", peer)
+        original = __import__("services.pool_admission", fromlist=["physical_conversation_key"]).physical_conversation_key
+        checked = []
+
+        def tracked(receipt):
+            checked.append(receipt.get("request_id") or receipt.get("id"))
+            return original(receipt)
+
+        with patch("services.pool_admission.physical_conversation_key", side_effect=tracked):
+            context.before_send()
+        self.assertNotIn("succeeded-transfer-peer", checked)
+
     def test_send_guard_preserves_legacy_unfinished_image_capacity(self):
         self.image("new-image")
         context = self.admission.claim_next()
@@ -879,6 +948,26 @@ class AdmissionTests(unittest.TestCase):
             context.before_send()
         self.assertFalse(self.read("image", "happy", "new-image")["_submission_started"])
         self.assertEqual(self.read("image", "happy", "legacy"), legacy)
+
+    def test_send_guard_preserves_numeric_unfinished_receipt_selection(self):
+        self.image("new-image")
+        context = self.admission.claim_next()
+        current = self.read("image", "happy", "new-image")
+        self.admission.settings = lambda: {"image_account_concurrency": 1}
+        legacy = {"id": "legacy", "owner_id": "happy", "status": "success",
+                  "upstream_unfinished": 1.0, "_account_resource": current["_account_resource"]}
+        with self.store.transaction() as db:
+            self.store.write_receipt(db, "image", "happy", "legacy", legacy)
+        from services.pool_admission import image_generation_active
+
+        def selected_legacy(kind, receipt, active):
+            # This asserts only parity with TaskStore's SQL `=1` candidate
+            # selection. Real image-generation semantics remain strict bool.
+            return receipt.get("id") == "legacy" or image_generation_active(kind, receipt, active)
+
+        with patch("services.pool_admission.image_generation_active", side_effect=selected_legacy):
+            with self.assertRaisesRegex(AdmissionLost, "capacity decreased"):
+                context.before_send()
 
     def test_send_guard_preserves_cross_protocol_legacy_conversation_occupancy(self):
         self.submit("text-next")

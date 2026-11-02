@@ -3260,9 +3260,23 @@ class PoolAdmission:
             physical = physical_conversation_key(r)
             needs_image_capacity = (r.get("_route") != "codex"
                                     and (context.kind == "image" or r.get("_operation") == "image"))
-            occupancy = list(self.store.receipts(db,
-                statuses=("queued", "not_started", "running", "unknown", "failed", "error"),
-                include_upstream_unfinished=True)) if physical or needs_image_capacity else ()
+            active_statuses = ("queued", "not_started", "running", "unknown", "failed", "error")
+            # Chat capacity needs the active occupancy set plus pending
+            # completions.  Reuse that strict superset for the earlier
+            # physical/image checks, but retain their narrower predicate so a
+            # terminal pending completion never becomes a conversation fence.
+            capacity_receipts = (list(self.store.receipts(
+                db, statuses=active_statuses, include_pending_completion=True,
+                include_upstream_unfinished=True,
+            )) if r.get("_route", "chat") == "chat" else None)
+            if physical or needs_image_capacity:
+                occupancy = ([(kind, owner, request_id, other)
+                              for kind, owner, request_id, other in capacity_receipts
+                              if other.get("status") in active_statuses or other.get("upstream_unfinished") == 1]
+                             if capacity_receipts is not None else list(self.store.receipts(
+                                 db, statuses=active_statuses, include_upstream_unfinished=True)))
+            else:
+                occupancy = ()
             if physical:
                 for other_kind, other_owner, other_id, other in occupancy:
                     if (context.kind == "text" and other_kind == "image"
@@ -3332,10 +3346,7 @@ class PoolAdmission:
                 # Chat turn. The status/unfinished filter is the scheduler's
                 # existing active-occupancy set; completed text continuations
                 # still join it when they can transfer an original turn.
-                capacity_receipts = list(self.store.receipts(
-                    db, statuses=("queued", "not_started", "running", "unknown", "failed", "error"),
-                    include_pending_completion=True, include_upstream_unfinished=True,
-                ))
+                assert capacity_receipts is not None
                 seen = {(kind, owner, request_id) for kind, owner, request_id, _ in capacity_receipts}
                 for owner, request_id, raw in db.execute(
                         "SELECT owner,id,receipt FROM requests WHERE json_extract(receipt,'$.status')='succeeded' "

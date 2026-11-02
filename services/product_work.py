@@ -349,7 +349,7 @@ def _attached(store, db, receipt):
 def before_send(store, db, receipt):
     parent = _attached(store, db, receipt)
     if not parent and _has_physical(receipt):
-        for _, _, _, other in store.receipts(db):
+        for _, _, _, other in store.product_work_conversation_receipts(db, receipt):
             if other.get("_product_work_key") and _same_conversation(receipt, other):
                 raise WorkLifecycleError("PRODUCT_WORK_REQUIRED")
     if parent:

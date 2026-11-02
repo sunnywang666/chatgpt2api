@@ -346,6 +346,48 @@ class TaskStore:
             yield "image", receipt["owner_id"], receipt["id"], receipt
 
     @staticmethod
+    def product_work_conversation_receipts(db, receipt):
+        """Yield only ProductWork candidates that can share ``receipt``'s conversation.
+
+        The caller remains responsible for the authoritative
+        ``_same_conversation`` check.  SQL deliberately keeps malformed
+        identity values as candidates, so its prefilter cannot turn an
+        identity/binding edge case into a missed ProductWork fence.
+        """
+        conversation = receipt.get("conversation_id")
+        if not conversation:
+            return
+        conditions = [
+            "json_type(receipt,'$._product_work_key') IS NOT NULL",
+            "json_type(receipt,'$._product_work_key') != 'null'",
+            "json_extract(receipt,'$.conversation_id')=?",
+        ]
+        values = [conversation]
+        identity = receipt.get("provider_account_identity")
+        binding = receipt.get("provider_binding_id")
+        if isinstance(identity, str) and identity:
+            identity_filter = ["json_extract(receipt,'$.provider_account_identity')=?",
+                               "json_type(receipt,'$.provider_account_identity') IS NOT 'text'"]
+            identity_values = [identity]
+            if isinstance(binding, str) and binding:
+                identity_filter.append("(json_extract(receipt,'$.provider_account_identity')='' "
+                                       "AND json_extract(receipt,'$.provider_binding_id')=?)")
+                identity_values.append(binding)
+            conditions.append("(" + " OR ".join(identity_filter) + ")")
+            values.extend(identity_values)
+        elif not identity and isinstance(binding, str) and binding:
+            # With no usable identity on this receipt, _same_conversation
+            # falls back to the exact binding even if the candidate has one.
+            conditions.append("json_extract(receipt,'$.provider_binding_id')=?")
+            values.append(binding)
+        where = " WHERE " + " AND ".join(conditions)
+        for owner, request_id, raw in db.execute("SELECT owner,id,receipt FROM requests" + where, values):
+            yield "text", owner, request_id, json.loads(raw)
+        for _key, raw in db.execute("SELECT task_key,receipt FROM image_requests" + where, values):
+            candidate = json.loads(raw)
+            yield "image", candidate["owner_id"], candidate["id"], candidate
+
+    @staticmethod
     def read_receipt(db, kind, owner, request_id):
         if kind == "text":
             row = db.execute("SELECT receipt FROM requests WHERE owner=? AND id=?", (owner, request_id)).fetchone()

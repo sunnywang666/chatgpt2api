@@ -241,6 +241,71 @@ def test_legacy_receipt_cannot_bypass_product_after_binding(runtime):
             before_send(store, db, legacy)
 
 
+@pytest.mark.parametrize("product_identity,legacy_identity,product_binding,legacy_binding,blocked", [
+    ("account", "account", "product-binding", "legacy-binding", True),
+    (None, None, "shared-binding", "shared-binding", True),
+    (False, False, "shared-binding", "shared-binding", True),
+    (0, 0, "shared-binding", "shared-binding", True),
+    ("", "", "shared-binding", "shared-binding", True),
+    (1, 1, "product-binding", "legacy-binding", True),
+    (["account"], ["account"], "product-binding", "legacy-binding", True),
+    ("account-a", "account-b", "shared-binding", "shared-binding", False),
+])
+def test_before_send_product_guard_preserves_identity_then_binding_matching(
+        runtime, product_identity, legacy_identity, product_binding, legacy_binding, blocked):
+    _, _, store, _, _, _, add = runtime
+    product = add("product", kind="image", conversation="shared")
+    with store.transaction() as db:
+        current = store.read_receipt(db, "image", "owner", "product")
+        current.update(provider_account_identity=product_identity, provider_binding_id=product_binding)
+        store.write_receipt(db, "image", "owner", "product", current)
+        legacy = {"request_id": "legacy", "_source": "internal:listing",
+                  "provider_account_identity": legacy_identity, "provider_binding_id": legacy_binding,
+                  "conversation_id": "shared"}
+        if blocked:
+            with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_REQUIRED"):
+                before_send(store, db, legacy)
+        else:
+            assert before_send(store, db, legacy) is None
+
+
+@pytest.mark.parametrize("marker", [False, 0, ""])
+def test_before_send_product_guard_keeps_falsy_legacy_product_markers_nonblocking(runtime, marker):
+    _, _, store, _, _, _, _add = runtime
+    candidate = {"id": "falsy-product-marker", "owner_id": "owner", "status": "success",
+                 "_product_work_key": marker, "provider_account_identity": "account",
+                 "provider_binding_id": "binding", "conversation_id": "shared"}
+    legacy = {"request_id": "legacy", "_source": "internal:listing",
+              "provider_account_identity": "account", "provider_binding_id": "binding",
+              "conversation_id": "shared"}
+    with store.transaction() as db:
+        store.write_receipt(db, "image", "owner", "falsy-product-marker", candidate)
+        assert before_send(store, db, legacy) is None
+
+
+def test_before_send_product_guard_does_not_decode_unrelated_terminal_payload(runtime, monkeypatch):
+    _, _, store, _, _, _, add = runtime
+    marker = "unrelated-terminal-payload-must-not-be-decoded"
+    unrelated = {"id": "unrelated", "owner_id": "other", "status": "success",
+                 "provider_account_identity": "other-account", "provider_binding_id": "other-binding",
+                 "conversation_id": "other-conversation", "data": [{"b64_json": marker * 10000}]}
+    with store.transaction() as db:
+        store.write_receipt(db, "image", "other", "unrelated", unrelated)
+    add("product", kind="image", conversation="shared")
+    legacy = {"request_id": "legacy", "_source": "internal:listing",
+              "provider_account_identity": "account", "provider_binding_id": "binding",
+              "conversation_id": "shared"}
+    loads = json.loads
+
+    def guarded_decode(raw):
+        assert marker not in raw
+        return loads(raw)
+
+    monkeypatch.setattr("services.task_store.json.loads", guarded_decode)
+    with store.transaction() as db, pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_REQUIRED"):
+        before_send(store, db, legacy)
+
+
 def test_late_external_member_blocks_archive_after_close(runtime):
     service, lifecycle, store, _, calls, _, add = runtime
     add("text", conversation="shared")

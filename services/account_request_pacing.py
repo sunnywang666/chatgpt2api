@@ -841,7 +841,7 @@ class AccountRequestClock:
                               wait_reason)
             clock_held = True
             response = None
-            completed_read = False
+            completed_buffered_read = False
             marker_persisted = False
             post_guard_started = None
             try:
@@ -1028,18 +1028,19 @@ class AccountRequestClock:
                                     reservation_error = reservation_error or exc
                         finally:
                             response = outcome.get("response")
-                            completed_read = (floor_durable and is_conversation_read
-                                              and not kwargs.get("stream")
-                                              and reservation_error is None and "error" not in outcome
-                                              and getattr(response, "status_code", None) == 200)
+                            completed_buffered_read = (floor_durable and not kwargs.get("stream")
+                                                       and reservation_error is None and "error" not in outcome
+                                                       and getattr(response, "status_code", None) == 200)
                             # This is result/cooldown reconciliation, not a new
                             # send admission. It can outlast the send budget;
                             # discarding a received 429 would lose its cooldown.
-                            # A buffered 200 has no outcome-specific pacing
-                            # update: its send floor is already durable. Return
-                            # that original result without waiting for another
-                            # clock holder or saving a stale state snapshot.
-                            if not clock_held and not completed_read:
+                            # A buffered conversation/allowlisted metadata 200
+                            # has no outcome-specific pacing update: its send
+                            # floor is already durable. Return that result
+                            # without another clock wait or stale state save.
+                            # This branch is only entered by concurrent_io;
+                            # preparation/authentication writes stay serialized.
+                            if not clock_held and not completed_buffered_read:
                                 self.lock.acquire()
                                 clock_held = True
                         if "error" in outcome:
@@ -1071,7 +1072,7 @@ class AccountRequestClock:
                     response.close()
                     raise reservation_error
             finally:
-                if not clock_held and response is not None and not completed_read:
+                if not clock_held and response is not None and not completed_buffered_read:
                     response.close()
                 if clock_held:
                     self.lock.release()
