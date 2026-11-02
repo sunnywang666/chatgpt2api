@@ -208,7 +208,10 @@ class ReceiptProjection(dict):
         return dict.__repr__(self)
 
 
-_CLAIM_METADATA = "json_remove(receipt,'$.content','$.data')"
+# SQLite 3.45 does not substitute an indexed JSON-subtyped function result;
+# it rereads the canonical receipt to recompute json_remove.  These consumers
+# decode ordinary JSON text, so index and select the explicit TEXT expression.
+_CLAIM_METADATA = "CAST(json_remove(receipt,'$.content','$.data') AS TEXT)"
 _CLAIM_STATUS = "json_extract(receipt,'$.status')"
 _CONTENT_TYPE = "json_type(receipt,'$.content')"
 _DATA_TYPE = "json_type(receipt,'$.data')"
@@ -387,10 +390,18 @@ class TaskStore:
                     # SQL writers stay lossless: SQLite updates this index as
                     # part of their normal canonical-receipt write, with no
                     # side table, status filter, or legacy-row backfill.
-                    db.execute("CREATE INDEX IF NOT EXISTS requests_claim_receipt_projection "
-                               f"ON requests({_CLAIM_STATUS},owner,id,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE})")
-                    db.execute("CREATE INDEX IF NOT EXISTS image_requests_claim_receipt_projection "
-                               f"ON image_requests({_CLAIM_STATUS},task_key,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE})")
+                    for table, identity in (("requests", "owner,id"), ("image_requests", "task_key")):
+                        index = f"{table}_claim_receipt_projection"
+                        definition = (f"CREATE INDEX {index} ON {table}"
+                                      f"({_CLAIM_STATUS},{identity},{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE})")
+                        existing = db.execute("SELECT sql FROM sqlite_master WHERE name=?", (index,)).fetchone()
+                        if existing is not None and existing[0] != definition:
+                            # Upgrade both legacy expressions in this existing
+                            # schema transaction. Canonical rows stay untouched;
+                            # rollback restores the old indexes if either fails.
+                            db.execute(f"DROP INDEX {index}")
+                        if existing is None or existing[0] != definition:
+                            db.execute(definition)
             finally:
                 db.close()
             self._ready = True

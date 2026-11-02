@@ -2155,6 +2155,67 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn("saved-catalog-image", [rid for _, _, rid, _ in filtered[0]])
         self.assertEqual(self.read("image", "happy", "saved-catalog-image")["data"], data)
 
+    def test_claim_projection_upgrades_legacy_indexes_without_changing_receipts(self):
+        from services import task_store as storage
+
+        legacy_metadata = "json_remove(receipt,'$.content','$.data')"
+        with self.store.transaction() as db:
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)", (
+                "owner", "text", "original-hash", json.dumps({
+                    "status": "unknown", "content": "saved text" * 1000,
+                    "_recovery_paused": True, "nested": {"null": None, "empty": []}})))
+            db.execute("INSERT INTO image_requests VALUES(?,?)", (
+                "owner:image", json.dumps({"owner_id": "owner", "id": "image", "status": "success",
+                                          "data": [{"b64_json": "saved image" * 1000}]})))
+            before = {table: list(db.execute(f"SELECT * FROM {table}"))
+                      for table in ("requests", "image_requests")}
+            for table, identity in (("requests", "owner,id"), ("image_requests", "task_key")):
+                index = f"{table}_claim_receipt_projection"
+                db.execute(f"DROP INDEX {index}")
+                db.execute(f"CREATE INDEX {index} ON {table}"
+                           f"({storage._CLAIM_STATUS},{identity},{legacy_metadata},"
+                           f"{storage._CONTENT_TYPE},{storage._DATA_TYPE})")
+
+        # Failing the second rebuild must roll back the first one as well.
+        interrupted = TaskStore(self.store.path)
+        connection = interrupted._connect()
+        connection.set_authorizer(lambda action, name, *_:
+            storage.sqlite3.SQLITE_DENY if action == storage.sqlite3.SQLITE_CREATE_INDEX
+            and name == "image_requests_claim_receipt_projection" else storage.sqlite3.SQLITE_OK)
+        with patch.object(interrupted, "_connect", return_value=connection), \
+             self.assertRaises(storage.sqlite3.DatabaseError):
+            interrupted.initialize()
+        with self.store.connect() as db:
+            for table in before:
+                self.assertEqual(list(db.execute(f"SELECT * FROM {table}")), before[table])
+                definition = db.execute("SELECT sql FROM sqlite_master WHERE name=?",
+                                        (f"{table}_claim_receipt_projection",)).fetchone()[0]
+                self.assertNotIn("CAST(", definition)
+
+        upgraded = TaskStore(self.store.path)
+        with upgraded.connect() as db:
+            for table in before:
+                self.assertEqual(list(db.execute(f"SELECT * FROM {table}")), before[table])
+                definition = db.execute("SELECT sql FROM sqlite_master WHERE name=?",
+                                        (f"{table}_claim_receipt_projection",)).fetchone()[0]
+                self.assertIn(storage._CLAIM_METADATA, definition)
+            for kind, owner, request_id, projected in upgraded.claim_receipts(db):
+                self.assertEqual(dict(projected), upgraded.read_receipt(db, kind, owner, request_id))
+
+        # Another process/startup must reuse the migrated index, not rebuild it.
+        statements = []
+        reopened = TaskStore(self.store.path)
+        connect = reopened._connect
+        def traced_connect(*args, **kwargs):
+            db = connect(*args, **kwargs)
+            db.set_trace_callback(statements.append)
+            return db
+        with patch.object(reopened, "_connect", side_effect=traced_connect):
+            reopened.initialize()
+        self.assertFalse(any(sql.startswith(("DROP INDEX", "CREATE INDEX requests_claim_receipt_projection",
+                                             "CREATE INDEX image_requests_claim_receipt_projection"))
+                             for sql in statements))
+
     def test_claim_receipts_keeps_legacy_rowid_order_without_sql_temp_sort(self):
         """The covering compact scans retain historical text-then-image order using scalar rowid sorting."""
         from services import task_store as storage
@@ -2199,15 +2260,34 @@ class AdmissionTests(unittest.TestCase):
                               self.store.claim_receipts(db, statuses=("queued",))],
                              [("text", "text-queued", "text-third")])
 
-            plans = []
+            def assert_index_only_without_sort(query, index):
+                # Older SQLite versions omit "COVERING" for expression indexes
+                # even when the VM never reads the table. Check the actual
+                # column cursors instead of that version-dependent label.
+                root = db.execute("SELECT rootpage FROM sqlite_master WHERE name=?", (index,)).fetchone()[0]
+                program = list(db.execute("EXPLAIN " + query))
+                index_cursors = {op[2] for op in program if op[1] == "OpenRead" and op[3] == root}
+                self.assertTrue(index_cursors, program)
+                reads = [op for op in program if op[1] in {"Column", "RowData", "VColumn"}]
+                self.assertTrue(reads, program)
+                self.assertTrue(all(op[2] in index_cursors for op in reads), program)
+                self.assertFalse(any(op[1] in {"SorterOpen", "SorterInsert", "SorterSort", "Sort"}
+                                     for op in program), program)
+                plan = [row[-1] for row in db.execute("EXPLAIN QUERY PLAN " + query)]
+                self.assertFalse(any("TEMP B-TREE" in detail for detail in plan), plan)
+
             for table, columns in (("requests", f"rowid,owner,id,{storage._CLAIM_METADATA},{storage._CONTENT_TYPE},{storage._DATA_TYPE}"),
                                    ("image_requests", f"rowid,task_key,{storage._CLAIM_METADATA},{storage._CONTENT_TYPE},{storage._DATA_TYPE}")):
-                plan = [row[-1] for row in db.execute(
-                    f"EXPLAIN QUERY PLAN SELECT {columns} FROM {table} "
-                    f"INDEXED BY {table}_claim_receipt_projection")]
-                plans.extend(plan)
-                self.assertTrue(any("USING COVERING INDEX" in detail for detail in plan))
-            self.assertFalse(any("TEMP B-TREE" in detail for detail in plans))
+                index = f"{table}_claim_receipt_projection"
+                query = f"SELECT {columns} FROM {table} INDEXED BY {index}"
+                assert_index_only_without_sort(query, index)
+                assert_index_only_without_sort(query + f" WHERE {storage._CLAIM_STATUS} IN ('queued')", index)
+                # Both regressions must still fail: consulting the canonical
+                # large receipt, and restoring SQL sorting of compact JSON.
+                with self.assertRaises(AssertionError):
+                    assert_index_only_without_sort(query.replace("SELECT ", "SELECT receipt, ", 1), index)
+                with self.assertRaises(AssertionError):
+                    assert_index_only_without_sort(query + " ORDER BY rowid", index)
 
     def test_unknown_originals_do_not_probe_catalog_but_keep_order_fence(self):
         from services.pool_admission import unfinished
