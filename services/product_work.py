@@ -494,7 +494,7 @@ def _successor(store, db, owner, previous, receipt):
 
 def _advanced_session_child(store, db, parent, receipt, members, now, *, after_send=False,
                             require_binding=True, require_conversation=True,
-                            require_product_binding=True):
+                            require_product_binding=True, all_receipts=None):
     """Return the one proved replacement living in a fresh physical session.
 
     Unlike the ordinary no-final successor, this is not an inference from a
@@ -509,7 +509,8 @@ def _advanced_session_child(store, db, parent, receipt, members, now, *, after_s
     try:
         from services.conversation_binding_service import ConversationBindingError
         from services.advanced_session_successor import validate_successor, source_eligible
-        original = validate_successor(store, db, parent["owner"], receipt, now, after_send=after_send)
+        original = validate_successor(store, db, parent["owner"], receipt, now,
+                                      after_send=after_send, all_receipts=all_receipts)
     except (ConversationBindingError, OSError, ValueError, TypeError, KeyError, ImportError):
         # The helper raises a transport-contract error for a bad frozen proof;
         # malformed or unavailable evidence is never a ProductWork waiver.
@@ -1183,7 +1184,7 @@ def _advanced_session_original_live(receipt, now):
     return False
 
 
-def advanced_session_capacity_originals(store, db, product_key, now):
+def advanced_session_capacity_originals(store, db, product_key, now, *, all_receipts=None):
     """Project the old UNKNOWN turn onto its one proved fresh-session child.
 
     This is capacity accounting only.  A queued/running/UNKNOWN/succeeded child
@@ -1215,7 +1216,8 @@ def advanced_session_capacity_originals(store, db, product_key, now):
                                          else {"running", "unknown", "succeeded"})):
             continue
         chain = _advanced_session_child(store, db, parent, child, members, now, after_send=submitted,
-                                        require_binding=False, require_conversation=False)
+                                        require_binding=False, require_conversation=False,
+                                        all_receipts=all_receipts)
         if chain and not _advanced_session_original_live(chain["original"], now):
             released.add((parent["owner"], chain["original"]["request_id"]))
     return released

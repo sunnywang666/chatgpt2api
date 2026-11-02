@@ -1869,7 +1869,10 @@ class PoolAdmission:
                 advanced_released.update(product_work.advanced_capacity_originals(
                     self.store, db, product_key, now))
                 advanced_released.update(product_work.advanced_session_capacity_originals(
-                    self.store, db, product_key, now))
+                    self.store, db, product_key, now,
+                    # The final send guard supplies a filtered occupancy set.
+                    # Only a full claim snapshot can replace the conflict read.
+                    all_receipts=None if capacity_only else receipts))
             for kind, owner, request_id, candidate in receipts:
                 if (kind == "text" and candidate.get("_product_work_key") in advanced_products
                         and candidate.get("status") in {"queued", "running"}

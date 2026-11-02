@@ -1,8 +1,11 @@
 """Product lifecycle boundaries for an isolated ADVANCED replacement session."""
+import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
+from services import product_work
 from services.product_work import ProductWorkService, advanced_session_capacity_originals, state_snapshot
 from services.work_lifecycle import WorkLifecycleError
 from test.test_advanced_session_successor import advanced as advanced_fixture
@@ -114,6 +117,64 @@ def test_live_old_root_never_donates_capacity_to_advanced_child(advanced_fixture
         h.service.store.write_receipt(db, "text", "owner", "old", old)
         assert advanced_session_capacity_originals(h.service.store, db, old["_product_work_key"], h.clock()) == set()
 
+
+def test_advanced_capacity_reuses_full_claim_snapshot_but_filtered_capacity_reads_conflicts(advanced_fixture):
+    """The normal planner reuses its complete snapshot; final capacity checks must re-read every conflict."""
+    h = advanced_fixture
+    h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+    with h.service.store.transaction() as db:
+        old = h.service.store.read_receipt(db, "text", "owner", "old")
+        child = h.service.store.read_receipt(db, "text", "owner", "isolated")
+        parent = h.service.store.runtime(db, old["_product_work_key"])
+        parent.update(state="active", slot_held=True,
+                      admission_control={"state": "active", "version": 0, "slot_held": True})
+        h.service.store.set_runtime(db, parent["key"], parent)
+        # This terminal historical receipt collides with the frozen external
+        # discussion head. It is not occupancy, but it must still fence the
+        # advanced capacity waiver.
+        db.execute("INSERT INTO requests(owner,id,request_hash,receipt) VALUES(?,?,?,?)", (
+            "external-owner", "external-history", "external-hash",
+            json.dumps({
+                "request_id": "external-history", "status": "succeeded",
+                "provider_account_identity": old["provider_account_identity"],
+                "request_message_id": child["_advanced_session"]["completed_successor_evidence"]["successor_request_message_id"],
+                "content": "historical external result",
+            }),
+        ))
+        full_snapshot = h.service.store.claim_receipts(db)
+        assert child["_product_work_key"] == old["_product_work_key"]
+        with patch.object(h.service.store, "claim_receipts", side_effect=AssertionError("must reuse full claim snapshot")):
+            assert advanced_session_capacity_originals(
+                h.service.store, db, old["_product_work_key"], h.clock(), all_receipts=full_snapshot) == set()
+
+        # The final-send capacity path has only filtered occupancy rows, so it
+        # cannot reuse them as all_receipts. Its fallback full compact scan
+        # still sees this terminal external conflict.
+        with patch.object(h.service.store, "claim_receipts", wraps=h.service.store.claim_receipts) as reads:
+            assert advanced_session_capacity_originals(
+                h.service.store, db, old["_product_work_key"], h.clock(), all_receipts=None) == set()
+        assert reads.call_count == 1
+
+        filtered = [row for row in full_snapshot
+                    if (row[0], row[1], row[2]) in {
+                        ("text", "owner", "old"), ("text", "owner", "isolated")
+                    }]
+        real_capacity = product_work.advanced_session_capacity_originals
+        calls, results = [], []
+
+        def observed_capacity(*args, **kwargs):
+            calls.append(kwargs.get("all_receipts"))
+            result = real_capacity(*args, **kwargs)
+            results.append(result)
+            return result
+
+        with patch.object(product_work, "advanced_session_capacity_originals", side_effect=observed_capacity):
+            h.admission._snapshot(h.admission._rows(), full_snapshot, h.admission.settings(), {}, h.clock(), {},
+                                  db=db, capacity_only=False)
+            h.admission._snapshot(h.admission._rows(), filtered, h.admission.settings(), {}, h.clock(), {},
+                                  db=db, capacity_only=True)
+        assert calls == [full_snapshot, None]
+        assert results == [set(), set()]
 
 def test_failed_advanced_child_never_falls_back_to_archiving_old_discussion(advanced_fixture):
     h = advanced_fixture

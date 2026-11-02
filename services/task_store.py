@@ -78,7 +78,13 @@ class ReceiptProjection(dict):
 
     def __init__(self, value, omitted_types, loader):
         super().__init__(value)
-        self._omitted_types = dict(omitted_types)
+        # Keep only actual omitted members.  The overwhelmingly common
+        # metadata lookup now needs one cheap dict lookup, not two helper
+        # predicates and a set membership check.
+        self._omitted_types = {
+            key: value_type for key, value_type in omitted_types.items()
+            if value_type is not None
+        }
         self._loader = loader
         self._hydrated = False
 
@@ -100,28 +106,24 @@ class ReceiptProjection(dict):
         self._hydrated = True
         self._omitted_types.clear()
 
-    def _needs_value(self, key):
-        return (key in self._OMITTED and self._omitted_types.get(key) not in (None, "null"))
-
-    def _omitted_null(self, key):
-        return key in self._OMITTED and self._omitted_types.get(key) == "null"
-
     def __contains__(self, key):
-        if key in self._OMITTED and not dict.__contains__(self, key):
-            return self._omitted_types.get(key) is not None
+        if self._omitted_types.get(key) is not None and not dict.__contains__(self, key):
+            return True
         return dict.__contains__(self, key)
 
     def __getitem__(self, key):
-        if self._omitted_null(key):
+        value_type = self._omitted_types.get(key)
+        if value_type == "null":
             return None
-        if self._needs_value(key):
+        if value_type is not None:
             self._hydrate()
         return dict.__getitem__(self, key)
 
     def get(self, key, default=None):
-        if self._omitted_null(key):
+        value_type = self._omitted_types.get(key)
+        if value_type == "null":
             return None
-        if self._needs_value(key):
+        if value_type is not None:
             self._hydrate()
         return dict.get(self, key, default)
 
@@ -161,8 +163,8 @@ class ReceiptProjection(dict):
         # Presence is indexed separately, so truth testing a receipt never
         # needs to pull a result body into the claim transaction.
         return dict.__len__(self) + sum(
-            1 for key, value_type in self._omitted_types.items()
-            if value_type is not None and not dict.__contains__(self, key))
+            1 for key in self._omitted_types
+            if not dict.__contains__(self, key))
 
     def keys(self):
         self._hydrate()
@@ -206,7 +208,10 @@ class ReceiptProjection(dict):
         return dict.__repr__(self)
 
 
-_CLAIM_METADATA = "json_remove(receipt,'$.content','$.data')"
+# SQLite 3.45 does not substitute an indexed JSON-subtyped function result;
+# it rereads the canonical receipt to recompute json_remove.  These consumers
+# decode ordinary JSON text, so index and select the explicit TEXT expression.
+_CLAIM_METADATA = "CAST(json_remove(receipt,'$.content','$.data') AS TEXT)"
 _CLAIM_STATUS = "json_extract(receipt,'$.status')"
 _CONTENT_TYPE = "json_type(receipt,'$.content')"
 _DATA_TYPE = "json_type(receipt,'$.data')"
@@ -385,10 +390,18 @@ class TaskStore:
                     # SQL writers stay lossless: SQLite updates this index as
                     # part of their normal canonical-receipt write, with no
                     # side table, status filter, or legacy-row backfill.
-                    db.execute("CREATE INDEX IF NOT EXISTS requests_claim_receipt_projection "
-                               f"ON requests({_CLAIM_STATUS},owner,id,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE})")
-                    db.execute("CREATE INDEX IF NOT EXISTS image_requests_claim_receipt_projection "
-                               f"ON image_requests({_CLAIM_STATUS},task_key,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE})")
+                    for table, identity in (("requests", "owner,id"), ("image_requests", "task_key")):
+                        index = f"{table}_claim_receipt_projection"
+                        definition = (f"CREATE INDEX {index} ON {table}"
+                                      f"({_CLAIM_STATUS},{identity},{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE})")
+                        existing = db.execute("SELECT sql FROM sqlite_master WHERE name=?", (index,)).fetchone()
+                        if existing is not None and existing[0] != definition:
+                            # Upgrade both legacy expressions in this existing
+                            # schema transaction. Canonical rows stay untouched;
+                            # rollback restores the old indexes if either fails.
+                            db.execute(f"DROP INDEX {index}")
+                        if existing is None or existing[0] != definition:
+                            db.execute(definition)
             finally:
                 db.close()
             self._ready = True
@@ -542,17 +555,22 @@ class TaskStore:
                 lambda kind=kind, owner=owner, request_id=request_id:
                 load_canonical(kind, owner, request_id)))
 
-        # The legacy full-table scans happened to be rowid ordered. Preserve
-        # that incidental order without consulting canonical receipt bodies.
-        text_sql = (f"SELECT owner,id,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE}" +
-                    " FROM requests INDEXED BY requests_claim_receipt_projection" + where +
-                    " ORDER BY rowid")
-        for owner, request_id, raw, content, data in db.execute(text_sql, values):
+        # The former table scans were rowid ordered.  Asking SQLite to restore
+        # that order after an expression-index read makes it sort large compact
+        # JSON values.  Read rowid from the covering index and restore the same
+        # order in Python using only small scalar references.
+        text_sql = (f"SELECT rowid,owner,id,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE}" +
+                    " FROM requests INDEXED BY requests_claim_receipt_projection" + where)
+        text_rows = list(db.execute(text_sql, values))
+        text_rows.sort(key=lambda row: row[0])
+        for _rowid, owner, request_id, raw, content, data in text_rows:
             rows.append(projected("text", owner, request_id, json.loads(raw), content, data))
-        image_sql = (f"SELECT task_key,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE}" +
-                     " FROM image_requests INDEXED BY image_requests_claim_receipt_projection" + where +
-                     " ORDER BY rowid")
-        for _task_key, raw, content, data in db.execute(image_sql, values):
+        del text_rows
+        image_sql = (f"SELECT rowid,task_key,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE}" +
+                     " FROM image_requests INDEXED BY image_requests_claim_receipt_projection" + where)
+        image_rows = list(db.execute(image_sql, values))
+        image_rows.sort(key=lambda row: row[0])
+        for _rowid, _task_key, raw, content, data in image_rows:
             compact_receipt = json.loads(raw)
             rows.append(projected("image", compact_receipt["owner_id"], compact_receipt["id"], compact_receipt, content, data))
         return rows
