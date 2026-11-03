@@ -397,7 +397,8 @@ def validate_successor(store, db, owner, child, now, *, after_send=False, all_re
         from services.pool_admission import unfinished
         external_users = {ev["successor_request_message_id"]} | {
             step["request_message_id"] for step in ev.get("tail_steps", [])}
-        conflict_rows = store.claim_receipts(db) if all_receipts is None else all_receipts
+        conflict_rows = (store.successor_conflict_receipts(db, owner, original_id, original, external_users)
+                         if all_receipts is None else all_receipts)
         for kind, other_owner, other_id, other in conflict_rows:
             if other_owner == owner and kind == "text" and other_id in {original_id, child_id}:
                 continue

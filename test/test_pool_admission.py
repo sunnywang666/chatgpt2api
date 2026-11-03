@@ -873,17 +873,83 @@ class AdmissionTests(unittest.TestCase):
             context, conversation_id="single-snapshot-conversation",
             provider_account_identity="account-0", provider_binding_id="binding-0",
         )
-        original = self.store.receipts
+        original = self.store.claim_receipts
         calls = []
 
         def tracked(*args, **kwargs):
             calls.append((args, kwargs))
             return original(*args, **kwargs)
 
-        with patch.object(self.store, "receipts", side_effect=tracked):
+        with patch.object(self.store, "claim_receipts", side_effect=tracked):
             context.before_send()
         self.assertEqual(len(calls), 1)
         self.assertTrue(self.read("text", "happy", "single-snapshot")["_submission_started"])
+
+    def test_final_guard_does_not_decode_unrelated_active_result_payloads(self):
+        self.submit("ready-to-send")
+        context = self.admission.claim_next()
+        marker = "unrelated-active-result-must-not-enter-send-guard"
+        self.image("unrelated-active-image", owner="other-owner")
+        with self.store.transaction() as db:
+            other = self.store.read_receipt(db, "image", "other-owner", "unrelated-active-image")
+            other.update(status="failed", upstream_unfinished=False,
+                         error_code="INPUT_REJECTED", upstream_outcome="not_sent",
+                         data=[{"b64_json": marker * 30000}])
+            self.store.write_receipt(db, "image", "other-owner", "unrelated-active-image", other)
+        decode = json.loads
+
+        def no_payload(raw, *args, **kwargs):
+            self.assertNotIn(marker, raw)
+            return decode(raw, *args, **kwargs)
+
+        with patch("services.task_store.json.loads", side_effect=no_payload):
+            context.before_send_with_marker()
+        self.assertTrue(self.read("text", "happy", "ready-to-send")["_submission_started"])
+        self.assertEqual(self.read("image", "other-owner", "unrelated-active-image"), other)
+
+    def test_guard_projection_matches_full_occupancy_filter_and_stays_index_only(self):
+        variants = [
+            {"status": "queued"}, {"status": "unknown", "_recovery_paused": True},
+            {"status": "failed", "upstream_unfinished": True},
+            {"status": "succeeded", "_completion": {"state": "needs_attention"}},
+            {"status": "success", "_completion": {}},
+            {"status": None, "upstream_unfinished": 1},
+            {"upstream_unfinished": True}, {"status": "success"},
+            {"status": "succeeded", "_completion": {"state": "completed"}},
+            {"status": "succeeded", "_completion": {"state": "result_ready"}},
+            {"status": "succeeded", "_completion": None},
+        ]
+        with self.store.transaction() as db:
+            for i, variant in enumerate(variants):
+                receipt = {**variant, "request_id": str(i), "id": str(i), "owner_id": "owner",
+                           "content": "original body", "data": [{"b64_json": "original image"}]}
+                db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("owner", str(i), "hash", json.dumps(receipt)))
+                db.execute("INSERT INTO image_requests VALUES(?,?)", ("owner:" + str(i), json.dumps(receipt)))
+            for statuses in (None, (), ("queued", "failed", "unknown")):
+                for completion in (False, True):
+                    for unfinished in (False, True):
+                        kwargs = dict(statuses=statuses, include_pending_completion=completion,
+                                      include_upstream_unfinished=unfinished)
+                        expected = list(self.store.receipts(db, **kwargs))
+                        queries = []
+                        db.set_trace_callback(queries.append)
+                        actual = self.store.claim_receipts(db, **kwargs)
+                        db.set_trace_callback(None)
+                        self.assertEqual({(k, o, i): dict(r) for k, o, i, r in actual},
+                                         {(k, o, i): r for k, o, i, r in expected})
+                        for query in queries:
+                            if not query.startswith("SELECT rowid"):
+                                continue
+                            table = "image_requests" if " FROM image_requests " in query else "requests"
+                            root = db.execute("SELECT rootpage FROM sqlite_master WHERE name=?",
+                                              (table + "_claim_receipt_projection",)).fetchone()[0]
+                            program = list(db.execute("EXPLAIN " + query))
+                            indexes = {op[2] for op in program if op[1] == "OpenRead" and op[3] == root}
+                            # SQLite may materialize the scalar status IN-list;
+                            # that is not a read from the canonical receipt table.
+                            indexes.update(op[2] for op in program if op[1] == "OpenEphemeral")
+                            self.assertTrue(all(op[2] in indexes for op in program
+                                                if op[1] in {"Column", "RowData", "VColumn"}), program)
 
     def test_chat_capacity_pending_completion_does_not_become_physical_occupancy(self):
         self.submit("physical-current")

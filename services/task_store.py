@@ -518,7 +518,8 @@ class TaskStore:
             receipt = json.loads(raw)
             yield "image", receipt["owner_id"], receipt["id"], receipt
 
-    def claim_receipts(self, db, *, statuses=None):
+    def claim_receipts(self, db, *, statuses=None, include_pending_completion=False,
+                       include_upstream_unfinished=False):
         """Return every receipt from its covering scheduling projection.
 
         ``content`` and ``data`` retain their ordinary mapping behavior, but
@@ -526,12 +527,50 @@ class TaskStore:
         mutates either field.  Other fields are exact compact copies, including
         result IDs and recovery state.
         """
-        rows = []
         values = () if statuses is None else tuple(statuses)
-        if statuses is not None and not values:
-            return rows
-        where = (" WHERE " + _CLAIM_STATUS + " IN (" + ",".join("?" for _ in values) + ")"
-                 if values else "")
+        conditions = []
+        if values:
+            # SQLite 3.45 can recompute the JSON-subtyped status expression
+            # from the canonical row when IN is part of an OR scan. In that
+            # path, extract status from the indexed TEXT projection instead.
+            # Keep the direct status index seek for status-only selection.
+            status = (f"json_extract({_CLAIM_METADATA},'$.status')"
+                      if include_pending_completion or include_upstream_unfinished else _CLAIM_STATUS)
+            conditions.append(status + " IN (" + ",".join("?" for _ in values) + ")")
+        # Read exceptional occupancy from the existing covering projection too.
+        # Referring to canonical receipt here would parse every saved result
+        # while the final send guard holds the writer and account locks.
+        if include_pending_completion:
+            conditions.append(f"(json_type({_CLAIM_METADATA},'$._completion')='object' AND "
+                              f"coalesce(json_extract({_CLAIM_METADATA},'$._completion.state'),'') "
+                              "NOT IN ('completed','result_ready'))")
+        if include_upstream_unfinished:
+            conditions.append(f"json_extract({_CLAIM_METADATA},'$.upstream_unfinished')=1")
+        where = (" WHERE (" + " OR ".join(conditions) + ")" if conditions
+                 else " WHERE 0" if statuses is not None else "")
+        return self._projected_receipts(db, where, values)
+
+    def successor_conflict_receipts(self, db, owner, original_id, original, external_request_ids):
+        """Prefilter all conflict classes, including completed and foreign-owner rows.
+
+        validate_successor remains authoritative. No status filter is safe:
+        a completed duplicate child or registered external message still fences
+        a successor. Only unrelated metadata is excluded here.
+        """
+        external_request_ids = tuple(external_request_ids)
+        field = lambda name: f"json_extract({_CLAIM_METADATA},'$.{name}')"
+        where = (f" WHERE (({{owner}}=? AND ({field('_supersedes_request_id')}=? OR "
+                 f"{field('_codex_fallback_of')}=?)) OR {field('_product_work_key')}=? OR "
+                 f"({field('provider_account_identity')}=? AND "
+                 f"({field('conversation_id')}=? OR {field('request_message_id')} IN (" +
+                 ",".join("?" for _ in external_request_ids) + "))))")
+        values = (owner, original_id, original_id,
+                  original['_product_work_key'], original['provider_account_identity'],
+                  original['conversation_id'], *external_request_ids)
+        return self._projected_receipts(db, where, values)
+
+    def _projected_receipts(self, db, where, values):
+        rows = []
 
         def load_canonical(kind, owner, request_id):
             # Claim-time access stays on the current transaction.  A caller
@@ -560,14 +599,15 @@ class TaskStore:
         # JSON values.  Read rowid from the covering index and restore the same
         # order in Python using only small scalar references.
         text_sql = (f"SELECT rowid,owner,id,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE}" +
-                    " FROM requests INDEXED BY requests_claim_receipt_projection" + where)
+                    " FROM requests INDEXED BY requests_claim_receipt_projection" + where.format(owner="owner"))
         text_rows = list(db.execute(text_sql, values))
         text_rows.sort(key=lambda row: row[0])
         for _rowid, owner, request_id, raw, content, data in text_rows:
             rows.append(projected("text", owner, request_id, json.loads(raw), content, data))
         del text_rows
         image_sql = (f"SELECT rowid,task_key,{_CLAIM_METADATA},{_CONTENT_TYPE},{_DATA_TYPE}" +
-                     " FROM image_requests INDEXED BY image_requests_claim_receipt_projection" + where)
+                     " FROM image_requests INDEXED BY image_requests_claim_receipt_projection" +
+                     where.format(owner=f"json_extract({_CLAIM_METADATA},'$.owner_id')"))
         image_rows = list(db.execute(image_sql, values))
         image_rows.sort(key=lambda row: row[0])
         for _rowid, _task_key, raw, content, data in image_rows:
