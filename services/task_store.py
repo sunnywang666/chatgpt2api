@@ -530,7 +530,13 @@ class TaskStore:
         values = () if statuses is None else tuple(statuses)
         conditions = []
         if values:
-            conditions.append(_CLAIM_STATUS + " IN (" + ",".join("?" for _ in values) + ")")
+            # SQLite 3.45 can recompute the JSON-subtyped status expression
+            # from the canonical row when IN is part of an OR scan. In that
+            # path, extract status from the indexed TEXT projection instead.
+            # Keep the direct status index seek for status-only selection.
+            status = (f"json_extract({_CLAIM_METADATA},'$.status')"
+                      if include_pending_completion or include_upstream_unfinished else _CLAIM_STATUS)
+            conditions.append(status + " IN (" + ",".join("?" for _ in values) + ")")
         # Read exceptional occupancy from the existing covering projection too.
         # Referring to canonical receipt here would parse every saved result
         # while the final send guard holds the writer and account locks.

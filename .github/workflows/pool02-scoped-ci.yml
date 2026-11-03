@@ -154,6 +154,7 @@ jobs:
       - name: Test account admission and bounded recovery
         run: |
           .venv/bin/python -m compileall -q api services utils test
+          .venv/bin/python -c "import sqlite3, sys; print('Python:', sys.version); print('SQLite:', sqlite3.sqlite_version)"
           .venv/bin/python -m pytest -q \
             test/test_pool_admission.py \
             test/test_auth_tls_verification.py \
