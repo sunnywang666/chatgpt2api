@@ -264,6 +264,29 @@ class ResponseReceiptLockTests(unittest.TestCase):
             self.assertFalse(errors)
             self.assertIn("response_headers_received", context.stages)
 
+    def test_http_retry_after_starts_when_headers_arrive_before_clock_reacquisition(self):
+        from services import account_request_pacing as pacing
+
+        now = [10000.0]
+        response = Response()
+        response.status_code, response.headers = 429, {"Retry-After": "6"}
+
+        def transport_log(entry):
+            # The concurrent GET has received its headers. Its caller still
+            # needs to rejoin the worker and reconcile under the account clock.
+            if entry.get("event") == "account_http_attempt":
+                now[0] += 4
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(pacing.time, "monotonic", side_effect=lambda: now[0]), \
+             patch.object(pacing.time, "time", side_effect=lambda: now[0]), \
+             patch.object(pacing.logger, "info", side_effect=transport_log):
+            path = Path(directory) / "clock.json"
+            AccountRequestClock("late-429", path).request(
+                lambda *_args, **_kwargs: response, "GET", "https://provider/backend-api/models")
+            self.assertEqual(now[0], 10004.0)
+            self.assertEqual(AccountRequestClock("late-429", path).cooldown_until, 10006.0)
+
     def test_header_receipt_failure_closes_original_response_without_resending(self):
         for streaming in (False, True):
             with self.subTest(streaming=streaming):
@@ -430,7 +453,7 @@ class ReadBurstAndCapacityTests(unittest.TestCase):
                     "GET", "https://provider/backend-api/conversation/original")
         self.assertEqual(sent, [10000.0, 10045.0])
 
-    def test_retry_after_read_backoff_doubles_across_reload(self):
+    def test_explicit_retry_after_is_preserved_across_reload_without_local_minimum(self):
         from services import account_request_pacing as pacing
         now, sent = [10000.0], []
         with tempfile.TemporaryDirectory() as directory, \
@@ -448,11 +471,11 @@ class ReadBurstAndCapacityTests(unittest.TestCase):
                 return response
             AccountRequestClock("fixture", path).request(limited, "GET", "https://provider/backend-api/conversation/original")
             reloaded = AccountRequestClock("fixture", path)
-            self.assertEqual(reloaded.cooldown_until, 10060.0)
+            self.assertEqual(reloaded.cooldown_until, 10007.0)
             reloaded.request(limited, "GET", "https://provider/backend-api/conversation/original")
             final = AccountRequestClock("fixture", path)
-        self.assertEqual(sent, [10000.0, 10060.0])
-        self.assertEqual(final.cooldown_until, 10180.0)
+        self.assertEqual(sent, [10000.0, 10007.0])
+        self.assertEqual(final.cooldown_until, 10014.0)
         self.assertEqual(final.rate_failures, 2)
 
     def test_per_account_inflight_cap_releases_after_transport(self):
@@ -2421,20 +2444,91 @@ class ReadRateLimitIsolationTests(unittest.TestCase):
         self.assertEqual(credited, [])
         self.assertEqual(clock.ordinary_read_queue, [])
 
-    def test_present_zero_or_invalid_retry_after_preserves_global_protection(self):
-        for value in ("0", "invalid", ""):
-            with self.subTest(retry_after=value):
-                clock = AccountRequestClock()
+    def test_explicit_zero_retry_after_is_account_scoped_without_new_embargo(self):
+        clock = AccountRequestClock("account", self.path)
+        response = Response()
+        response.status_code, response.headers = 429, {"Retry-After": "0"}
+        at = self.now
+        with patch.object(type(config), "account_request_interval_secs", property(lambda _: 0)), \
+             patch.object(type(config), "account_message_interval_secs", property(lambda _: 0)):
+            clock.request(lambda *a, **k: response, "GET", "https://provider/conversation/original")
+            clock.request(self.send, "POST", "https://provider/conversation")
+        self.assertEqual(self.now, at)
+        self.assertEqual(self.sent[-1], ("POST", at))
+        self.assertEqual(clock.cooldown_until, at)
+        self.assertEqual(clock.rate_failures, 1)
+        self.assertEqual(clock.conversation_read_rate_failures, 0)
+        self.assertEqual(clock.last_rate_limit_evidence["scope"], "account")
+
+    def test_missing_or_malformed_retry_after_keeps_prior_fallback_and_scope(self):
+        for label, headers, expected_scope, global_failures, read_failures, cooldown in (
+            ("missing", {}, "conversation_read", 0, 1, 0),
+            ("malformed", {"Retry-After": "invalid"}, "account", 1, 0, 60),
+            ("empty", {"Retry-After": ""}, "account", 1, 0, 60),
+        ):
+            with self.subTest(retry_after=label):
+                clock = AccountRequestClock("account-" + label)
                 response = Response()
-                response.status_code = 429
-                response.headers = {"Retry-After": value}
-                at = self.now
+                response.status_code, response.headers = 429, headers
                 clock.request(lambda *a, **k: response, "GET", "https://provider/conversation/original")
-                clock.request(self.send, "POST", "https://provider/conversation")
-                self.assertEqual(self.sent[-1], ("POST", at + 60))
-                self.assertEqual(clock.rate_failures, 1)
-                self.assertEqual(clock.conversation_read_rate_failures, 0)
-                self.assertEqual(clock.last_rate_limit_evidence["scope"], "account")
+                self.assertEqual(clock.rate_failures, global_failures)
+                self.assertEqual(clock.conversation_read_rate_failures, read_failures)
+                self.assertEqual(clock.last_rate_limit_evidence["scope"], expected_scope)
+                if expected_scope == "account":
+                    self.assertEqual(clock.cooldown_until, self.now + cooldown)
+                else:
+                    self.assertEqual(clock.next_conversation_read, self.now + 60)
+
+    def test_http_date_retry_after_uses_its_exact_remaining_delay(self):
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+        from services import account_request_pacing as pacing
+
+        fixed_now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz else fixed_now.replace(tzinfo=None)
+
+        clock = AccountRequestClock("account", self.path)
+        response = Response()
+        response.status_code = 429
+        response.headers = {"Retry-After": format_datetime(fixed_now + timedelta(seconds=6), usegmt=True)}
+        with patch.object(pacing, "datetime", FixedDateTime):
+            clock.request(lambda *a, **k: response, "GET", "https://provider/conversation/original")
+        self.assertEqual(clock.cooldown_until, self.now + 6)
+        self.assertEqual(clock.last_rate_limit_evidence["retry_after_seconds"], 6)
+
+    def test_elapsed_http_date_is_account_scoped_without_new_embargo(self):
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+        from services import account_request_pacing as pacing
+
+        fixed_now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz else fixed_now.replace(tzinfo=None)
+
+        clock = AccountRequestClock("account", self.path)
+        response = Response()
+        response.status_code = 429
+        response.headers = {"Retry-After": format_datetime(fixed_now - timedelta(seconds=1), usegmt=True)}
+        with patch.object(pacing, "datetime", FixedDateTime):
+            clock.request(lambda *a, **k: response, "GET", "https://provider/conversation/original")
+        self.assertEqual(clock.cooldown_until, self.now)
+        self.assertEqual(clock.rate_failures, 1)
+        self.assertEqual(clock.conversation_read_rate_failures, 0)
+        self.assertEqual(clock.last_rate_limit_evidence["scope"], "account")
+
+    def test_short_explicit_retry_after_cannot_shorten_existing_embargo(self):
+        clock = AccountRequestClock("account", self.path)
+        with clock.lock:
+            clock.limited(20, retry_after_present=True)
+            clock.limited(6, retry_after_present=True)
+        self.assertEqual(clock.cooldown_until, self.now + 20)
 
     def test_read_and_global_limits_expire_independently(self):
         clock = AccountRequestClock("account", self.path)
