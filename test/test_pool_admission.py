@@ -1035,6 +1035,67 @@ class AdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(AdmissionLost, "capacity decreased"):
                 context.before_send()
 
+    def test_image_after_completed_replacement_rechecks_cursor_and_keeps_original_unknown(self):
+        self.admission.settings = lambda: {"chat_account_concurrency": 6, "image_account_concurrency": 4}
+        binding = dict(client_conversation_id="copy-session", provider_binding_id="binding-0",
+                       provider_account_identity="account-0", conversation_id="copy-thread")
+        self.submit("old-copy", source="internal:listing", **binding, parent_message_id="preceding",
+                    product_work={"product_ref": "product", "step_ref": "copy"})
+        with self.store.transaction() as db:
+            old = self.store.read_receipt(db, "text", "happy", "old-copy")
+            old.update(status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                       _submission_started=True, _turn_reserved=False, _executing=False,
+                       _result_wait_ended_at=self.clock(), request_message_id="old-message")
+            self.store.write_receipt(db, "text", "happy", "old-copy", old)
+            digest = db.execute("select request_hash from requests where owner=? and id=?",
+                                ("happy", "old-copy")).fetchone()[0]
+            child = dict(old, request_id="replacement", request_message_id="child-message",
+                         parent_message_id="child-final", status="succeeded", upstream_outcome="completed",
+                         _upstream_terminal=True, content="saved copy", _sequence=old["_sequence"] + 1,
+                         _supersedes_request_id="old-copy", _supersedes_request_message_id="old-message",
+                         _submission_parent_message_id="preceding", _supersedes_input_hash=digest,
+                         _supersedes_incomplete=True, _turn_end_evidence=dict(conversation_id="copy-thread",
+                         request_message_id="child-message", final_message_id="child-final"),
+                         _workbench_derived_input=TextTaskService._workbench_derived_marker(
+                             original_input_hash=digest, child_input_hash="child-hash",
+                             mode="incomplete", derivation_kind="fixture"))
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("happy", "replacement", "child-hash", json.dumps(child)))
+        identity = {"id": "happy", "role": "admin", "_trusted_source": "internal:listing"}
+        self.images.submit_generation(identity, client_task_id="primary", prompt="image", size=None,
+                                     model="gpt-image-2", **binding, parent_message_id="child-final",
+                                     product_work={"product_ref": "product", "step_ref": "primary"})
+        with self.store.transaction() as db:
+            image = self.store.read_receipt(db, "image", "happy", "primary")
+            image["_sequence"] = child["_sequence"] + 1
+            self.store.write_receipt(db, "image", "happy", "primary", image)
+        ctx = self.admission.claim_next()
+        self.assertIsNotNone(ctx, self.read("image", "happy", "primary").get("waiting"))
+        self.assertEqual(ctx.request_id, "primary")
+        # A changed cursor after claim must still lose send authority.
+        self.admission.update_claim(ctx, parent_message_id="different-turn")
+        with self.assertRaisesRegex(AdmissionLost, "physical conversation is occupied"):
+            ctx.before_send()
+        self.assertFalse(self.read("image", "happy", "primary")["_submission_started"])
+        self.clock.now += 2
+        ctx = self.admission.claim_next()
+        self.admission.update_claim(ctx, parent_message_id="child-final")
+        # A second registered child, even in another conversation, makes the
+        # predecessor ambiguous. Check the transaction before the real marker.
+        with self.store.transaction() as db:
+            fork = dict(child, request_id="fork", conversation_id="elsewhere")
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("happy", "fork", "fork-hash", json.dumps(fork)))
+        with self.assertRaisesRegex(AdmissionLost, "physical conversation is occupied"):
+            ctx.before_send()
+        with self.store.transaction() as db:
+            db.execute("DELETE FROM requests WHERE owner=? AND id=?", ("happy", "fork"))
+        self.clock.now += 2
+        ctx = self.admission.claim_next()
+        ctx.before_send_with_marker()
+        self.assertTrue(self.read("image", "happy", "primary")["_submission_started"])
+        self.assertEqual(self.read("text", "happy", "old-copy"), old)
+        with self.assertRaisesRegex(AdmissionLost, "already submitted"):
+            ctx.before_send()
+
     def test_send_guard_preserves_cross_protocol_legacy_conversation_occupancy(self):
         self.submit("text-next")
         context = self.admission.claim_next()

@@ -413,6 +413,52 @@ def _compact_queued_combined_copy(context, receipt, body, store, clock):
     return {**body, "messages": messages}
 
 
+def _image_follows_completed_text(store, db, owner, image, original, now):
+    """Allow this image to use its completed replacement's exact final cursor."""
+    from services.text_task_service import TextTaskService as Text
+
+    product = image.get("_product_work_key")
+    ended = original.get("_result_wait_ended_at")
+    if (not product or product != original.get("_product_work_key")
+            or original.get("status") != "unknown" or original.get("error_code") != "CONVERSATION_OUTCOME_UNKNOWN"
+            or type(ended) not in (int, float) or not 0 < ended <= now
+            or original.get("_executing") or original.get("_turn_reserved")
+            or original.get("_recovery_paused") or original.get("_send_hold")):
+        return False
+    expiry = original.get("_claim_until")
+    if ((expiry is not None and (type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry > now))
+            or (original.get("_claim_id") and expiry is None)):
+        return False
+    row = store.sole_text_successor(db, owner, original["request_id"])
+    if not row:
+        return False
+    child_id, child_hash, raw = row
+    child = json.loads(raw)
+    audit = Text._public_workbench_derived_audit(child.get(Text._WORKBENCH_DERIVED_MARKER))
+    if (not audit or audit["mode"] != "incomplete" or audit["child_input_hash"] != child_hash
+            or audit["original_input_hash"] != child.get("_supersedes_input_hash")
+            or child.get("request_id") != child_id or child.get("_supersedes_incomplete") is not True
+            or child.get("status") != "succeeded" or child.get("upstream_outcome") != "completed"
+            or child.get("_upstream_terminal") is not True or child.get("upstream_unfinished")
+            or not isinstance(child.get("content"), str) or not child["content"].strip()):
+        return False
+    end = child.get("_turn_end_evidence")
+    final = image.get("parent_message_id")
+    if (not isinstance(end, dict) or not isinstance(final, str) or not final.strip()
+            or end.get("final_message_id") != final or child.get("parent_message_id") != final
+            or not child.get("request_message_id") or child["request_message_id"] == final
+            or end.get("request_message_id") != child["request_message_id"]
+            or end.get("conversation_id") != image.get("conversation_id")):
+        return False
+    return (all(image.get(k) and image[k] == child.get(k) for k in (
+                "_source", "_product_work_key", "provider_account_identity", "provider_binding_id",
+                "client_conversation_id", "conversation_id"))
+            and original.get("_source") == child["_source"]
+            and original.get("_product_work") == child.get("_product_work")
+            and Text._strict_successor_sequence(original, child) and Text._strict_successor_sequence(child, image)
+            and product_work._successor(store, db, owner, original, child))
+
+
 def _missing_node_retry_image_parent(store, db, owner, image_id, now):
     """Return C's only safe terminal parent for its linked A4, if any.
 
@@ -464,7 +510,7 @@ def record_unsent_failure(context, receipt, at, error_type=None, reason=None):
     if error_type:
         entry["error_type"] = error_type
     if reason in {"claim_expired", "image_capacity_changed", "scheduling_changed",
-                  "work_not_active", "send_guard_rejected", "account_unavailable",
+                  "work_not_active", "send_guard_rejected", "conversation_occupied", "account_unavailable",
                   "image_capability_unavailable", "image_binding_changed"}:
         entry["reason"] = reason
     code = receipt.get("error_code")
@@ -3051,6 +3097,7 @@ class PoolAdmission:
                         from services.generation_completion import replacement_send_allowed
                         cancelled = not replacement_send_allowed(self.store, db, context.kind, context.owner, context.request_id, r)
                         diagnostic = {"original task claim expired": "claim_expired",
+                                      "original physical conversation is occupied before send": "conversation_occupied",
                                       "original image capacity decreased before send": "image_capacity_changed",
                                       "original Chat account capacity changed before send": "chat_capacity_changed",
                                       "original account is unavailable before send": "account_unavailable",
@@ -3300,6 +3347,9 @@ class PoolAdmission:
                             and unfinished(other_kind, other)
                             and (other.get("status") == "running" or unresolved_result(other_kind, other)
                                  or int(other.get("_sequence") or 0) < int(r.get("_sequence") or 0))):
+                        if (context.kind == "image" and other_kind == "text" and other_owner == context.owner
+                                and _image_follows_completed_text(self.store, db, context.owner, r, other, now)):
+                            continue
                         raise AdmissionLost("original physical conversation is occupied before send")
             sequence = int(r.get("_send_sequence") or 0)
             if r.get("_submission_started") and sequence <= int(r.get("_last_sent_sequence") or 0):

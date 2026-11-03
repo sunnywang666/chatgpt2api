@@ -550,6 +550,21 @@ class TaskStore:
                  else " WHERE 0" if statuses is not None else "")
         return self._projected_receipts(db, where, values)
 
+    @staticmethod
+    def sole_text_successor(db, owner, original_id):
+        # Check for competing children in the covering index. Fetch full text
+        # only for the one matching child, never for unrelated receipts.
+        metadata = _CLAIM_METADATA
+        rows = db.execute(
+            "SELECT id FROM requests INDEXED BY requests_claim_receipt_projection WHERE owner=? AND "
+            f"(json_extract({metadata},'$._supersedes_request_id')=? OR "
+            f"json_extract({metadata},'$._codex_fallback_of')=?) LIMIT 2",
+            (owner, original_id, original_id),
+        ).fetchall()
+        if len(rows) == 1:
+            return db.execute("SELECT id,request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                              (owner, rows[0][0])).fetchone()
+
     def successor_conflict_receipts(self, db, owner, original_id, original, external_request_ids):
         """Prefilter all conflict classes, including completed and foreign-owner rows.
 
