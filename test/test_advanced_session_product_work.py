@@ -148,9 +148,11 @@ def test_advanced_capacity_reuses_full_claim_snapshot_but_filtered_capacity_read
                 h.service.store, db, old["_product_work_key"], h.clock(), all_receipts=full_snapshot) == set()
 
         # The final-send capacity path has only filtered occupancy rows, so it
-        # cannot reuse them as all_receipts. Its fallback full compact scan
-        # still sees this terminal external conflict.
-        with patch.object(h.service.store, "claim_receipts", wraps=h.service.store.claim_receipts) as reads:
+        # cannot reuse them as all_receipts. Its targeted conflict read must
+        # still see this terminal external conflict without another full scan.
+        with patch.object(h.service.store, "claim_receipts", side_effect=AssertionError("no full conflict scan")), \
+             patch.object(h.service.store, "successor_conflict_receipts",
+                          wraps=h.service.store.successor_conflict_receipts) as reads:
             assert advanced_session_capacity_originals(
                 h.service.store, db, old["_product_work_key"], h.clock(), all_receipts=None) == set()
         assert reads.call_count == 1

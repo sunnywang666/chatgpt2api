@@ -452,7 +452,8 @@ def test_advanced_validation_keeps_unrelated_terminal_payload_compact(advanced):
         db.execute("INSERT INTO image_requests(task_key,receipt) VALUES(?,?)", (
             "other-owner:unrelated-terminal",
             json.dumps({"id": "unrelated-terminal", "owner_id": "other-owner", "status": "success",
-                        "upstream_unfinished": False, "data": [{"b64_json": marker * 30000}]}),
+                        "unrelated_metadata": marker, "upstream_unfinished": False,
+                        "data": [{"b64_json": marker * 30000}]}),
         ))
     decode = json.loads
 
@@ -462,12 +463,60 @@ def test_advanced_validation_keeps_unrelated_terminal_payload_compact(advanced):
 
     with h.service.store.connect() as db, \
          patch("services.task_store.json.loads", side_effect=compact_only):
+        queries = []
+        db.set_trace_callback(queries.append)
         original = validate_successor(h.service.store, db, "owner", child, h.clock())
+        db.set_trace_callback(None)
+        projected = [q for q in queries if q.startswith("SELECT rowid")]
+        assert len(projected) == 2
+        for query in projected:
+            table = "image_requests" if " FROM image_requests " in query else "requests"
+            root = db.execute("SELECT rootpage FROM sqlite_master WHERE name=?",
+                              (table + "_claim_receipt_projection",)).fetchone()[0]
+            program = list(db.execute("EXPLAIN " + query))
+            allowed = {op[2] for op in program if op[1] == "OpenRead" and op[3] == root}
+            allowed.update(op[2] for op in program if op[1] == "OpenEphemeral")
+            assert all(op[2] in allowed for op in program if op[1] in {"Column", "RowData", "VColumn"})
 
     assert original["request_id"] == "old"
     with h.service.store.connect() as db:
         unrelated = h.service.store.read_receipt(db, "image", "other-owner", "unrelated-terminal")
     assert unrelated["data"] == [{"b64_json": marker * 30000}]
+
+
+@pytest.mark.parametrize("kind", ["text", "image"])
+@pytest.mark.parametrize("conflict", ["completed_child", "completed_fallback", "external_message",
+                                     "same_product", "same_conversation"])
+def test_targeted_successor_conflicts_keep_all_original_fences(advanced, kind, conflict):
+    h = advanced
+    body, child = prepared(h)
+    child["_workbench_derived_body"] = body
+    owner = "owner" if conflict in {"completed_child", "completed_fallback"} else "foreign-owner"
+    other = {"id": "conflict", "request_id": "conflict", "owner_id": owner,
+             "status": "succeeded" if kind == "text" else "success", "upstream_unfinished": False}
+    if conflict == "completed_child":
+        other["_supersedes_request_id"] = "old"
+    elif conflict == "completed_fallback":
+        other["_codex_fallback_of"] = "old"
+    elif conflict == "external_message":
+        other.update(provider_account_identity=h.old["provider_account_identity"],
+                     request_message_id="external-user")
+    elif conflict == "same_product":
+        other.update(status="running", _recovery_paused=True, _product_work_key=h.old["_product_work_key"])
+    else:
+        other.update(status="running", _recovery_paused=True,
+                     provider_account_identity=h.old["provider_account_identity"],
+                     conversation_id=h.old["conversation_id"])
+    with h.service.store.transaction() as db:
+        if kind == "text":
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)", (owner, "conflict", "hash", json.dumps(other)))
+        else:
+            db.execute("INSERT INTO image_requests VALUES(?,?)", (owner + ":conflict", json.dumps(other)))
+        # The targeted read and the full claim snapshot must reach the same
+        # rejection, even for terminal rows and another owner's identities.
+        for receipts in (None, h.service.store.claim_receipts(db)):
+            with pytest.raises(ConversationBindingError):
+                validate_successor(h.service.store, db, "owner", child, h.clock(), all_receipts=receipts)
 
 
 @pytest.mark.parametrize("field,value", [("provider_account_identity", "foreign"),

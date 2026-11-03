@@ -3276,16 +3276,16 @@ class PoolAdmission:
             # completions.  Reuse that strict superset for the earlier
             # physical/image checks, but retain their narrower predicate so a
             # terminal pending completion never becomes a conversation fence.
-            capacity_receipts = (list(self.store.receipts(
+            capacity_receipts = (self.store.claim_receipts(
                 db, statuses=active_statuses, include_pending_completion=True,
                 include_upstream_unfinished=True,
-            )) if r.get("_route", "chat") == "chat" else None)
+            ) if r.get("_route", "chat") == "chat" else None)
             if physical or needs_image_capacity:
                 occupancy = ([(kind, owner, request_id, other)
                               for kind, owner, request_id, other in capacity_receipts
                               if other.get("status") in active_statuses or other.get("upstream_unfinished") == 1]
-                             if capacity_receipts is not None else list(self.store.receipts(
-                                 db, statuses=active_statuses, include_upstream_unfinished=True)))
+                             if capacity_receipts is not None else self.store.claim_receipts(
+                                 db, statuses=active_statuses, include_upstream_unfinished=True))
             else:
                 occupancy = ()
             if physical:
