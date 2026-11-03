@@ -408,13 +408,14 @@ class AccountRequestClock:
                 busy += 1
         return busy < limit
 
-    def limited(self, retry_after=0.0, *, evidence=None, retry_after_present=False, read_sent_at=None):
+    def limited(self, retry_after=None, *, evidence=None, retry_after_present=False,
+                read_sent_at=None, received_at=None):
         # A conversation GET limit without Retry-After backs off that read lane.
         # Explicit provider waits and limits from other/unknown phases retain
         # the account-wide protection. Successful unrelated HTTP never resets it.
         self._expire_backoff()
         read_only = ((evidence or {}).get("phase") == "conversation_read"
-                     and not retry_after_present and retry_after <= 0)
+                     and not retry_after_present and retry_after is None)
         now = time.monotonic()
         same_read_incident = (read_only and read_sent_at is not None
                               and self.conversation_read_rate_failures > 0
@@ -434,11 +435,16 @@ class AccountRequestClock:
             self.rate_failures += 1
             self.last_rate_limit = now
             failures = self.rate_failures
-            wait = max(_backoff_seconds(failures), retry_after)
-            self.cooldown_until = max(self.cooldown_until, now + wait)
+            # A valid upstream hint, including zero, supplies this incident's
+            # deadline. Reacquiring the clock must not restart that countdown
+            # or erase a longer deadline another response already established.
+            deadline = (now + _backoff_seconds(failures) if retry_after is None
+                        else (now if received_at is None else received_at) + retry_after)
+            self.cooldown_until = max(self.cooldown_until, deadline)
+            wait = max(0.0, self.cooldown_until - now)
         context = current_request.get()
         observed = {"layer": "upstream_chatgpt", "phase": "unknown", "origin": "http_429",
-                    **(evidence or {}), "retry_after_seconds": retry_after,
+                    **(evidence or {}), "retry_after_seconds": retry_after or 0.0,
                     "scope": "conversation_read" if read_only else "account",
                     "same_read_incident": same_read_incident,
                     "cooldown_seconds": wait,
@@ -454,7 +460,7 @@ class AccountRequestClock:
             context.record_limit(observed)
         logger.warning({"event": "account_rate_limited", "account": self.account_key,
                         "consecutive_limits": failures,
-                        "retry_after_secs": retry_after, "cooldown_secs": wait, **observed})
+                        "retry_after_secs": retry_after or 0.0, "cooldown_secs": wait, **observed})
 
     def request(self, send, method, url, **kwargs):
         io_cleanup = kwargs.pop("_account_request_io_cleanup", None)
@@ -645,7 +651,10 @@ class AccountRequestClock:
                     pass  # Optional diagnostics never alter transport behavior.
             return fields
 
+        retry_after = received_at = None
+
         def observed_send(send_method, send_url, send_phase, *, read_started=None, **send_kwargs):
+            nonlocal retry_after, received_at
             # Count actual transport attempts, including metadata/preflight GETs.
             # Never log URLs, request bodies/headers, response bodies or exception
             # messages: conversation URLs and signed downloads can contain secrets.
@@ -672,6 +681,9 @@ class AccountRequestClock:
                 if read_started is not None:
                     read_started(started)
                 response = send(send_method, send_url, **send_kwargs)
+                if getattr(response, "status_code", None) == 429:
+                    received_at = time.monotonic()
+                    retry_after = _parse_retry_after((getattr(response, "headers", None) or {}).get("Retry-After"))
                 return response
             except Exception as exc:
                 # This bit is intentionally transient: a direct original-result
@@ -907,7 +919,7 @@ class AccountRequestClock:
                         if response.status_code == 429:
                             request_id = (response.headers.get("x-request-id") or response.headers.get("openai-request-id"))
                             safe_id = request_id if isinstance(request_id, str) and len(request_id) <= 160 and request_id.isascii() and not any(c.isspace() for c in request_id) else None
-                            self.limited(retry_after_seconds(response.headers.get("Retry-After")),
+                            self.limited(retry_after, received_at=received_at,
                                          retry_after_present="Retry-After" in response.headers,
                                          evidence={"phase": "conversation_preflight", "model": model, "origin": "http_429", "upstream_request_id": safe_id})
                         return response
@@ -1078,7 +1090,7 @@ class AccountRequestClock:
                 upstream_id = response_headers.get("x-request-id") or response_headers.get("openai-request-id")
                 safe_id = upstream_id if isinstance(upstream_id, str) and len(upstream_id) <= 160 and upstream_id.isascii() and not any(c.isspace() for c in upstream_id) else None
                 if response.status_code == 429:
-                    self.limited(retry_after_seconds(response_headers.get("Retry-After")),
+                    self.limited(retry_after, received_at=received_at,
                                  retry_after_present="Retry-After" in response_headers,
                                  read_sent_at=sent_at if is_conversation_read else None,
                                  evidence={"phase": phase, "model": model, "origin": "http_429", "upstream_request_id": safe_id})
@@ -1116,13 +1128,17 @@ class AccountRequestClock:
                     first_output = False
                     try:
                         for line in lines(*args, **line_kwargs):
+                            is_limit = not limited and rate_limited_event(line)
+                            if is_limit:
+                                limit_received_at = time.monotonic()
+                                limit_delay = rate_limit_retry_after(line)
                             if not first_output and line:
                                 first_output = True
                                 if context is not None and hasattr(context, "record_stage"):
                                     context.record_stage("first_output")
-                            if not limited and rate_limited_event(line):
+                            if is_limit:
                                 with self.lock:
-                                    self.limited(rate_limit_retry_after(line), evidence={"phase": "conversation_stream", "model": model, "origin": "sse_rate_limit", "upstream_request_id": safe_id})
+                                    self.limited(limit_delay, received_at=limit_received_at, evidence={"phase": "conversation_stream", "model": model, "origin": "sse_rate_limit", "upstream_request_id": safe_id})
                                 limited = True
                             yield line
                     finally:
@@ -1215,12 +1231,12 @@ def rate_limited_event(line) -> bool:
     return code in {"rate_limit_exceeded", "rate_limit_error", "too_many_requests"} or "too many requests" in message
 
 
-def retry_after_seconds(value) -> float:
+def _parse_retry_after(value) -> float | None:
     if not isinstance(value, str):
-        return 0.0
+        return None
     try:
         seconds = float(value)
-        return seconds if math.isfinite(seconds) and seconds > 0 else 0.0
+        return seconds if math.isfinite(seconds) and seconds >= 0 else None
     except ValueError:
         try:
             target = parsedate_to_datetime(value)
@@ -1228,18 +1244,22 @@ def retry_after_seconds(value) -> float:
                 target = target.replace(tzinfo=timezone.utc)
             return max(0.0, (target - datetime.now(timezone.utc)).total_seconds())
         except (TypeError, ValueError, OverflowError):
-            return 0.0
+            return None
 
 
-def rate_limit_retry_after(line) -> float:
+def retry_after_seconds(value) -> float:
+    return _parse_retry_after(value) or 0.0
+
+
+def rate_limit_retry_after(line) -> float | None:
     if not rate_limited_event(line):
-        return 0.0
+        return None
     if isinstance(line, bytes):
         line = line.decode("utf-8", errors="replace")
     event = json.loads(line[5:].strip())
     error = event.get("error") or event
     value = error.get("retry_after_seconds", error.get("retry_after"))
-    return retry_after_seconds(str(value)) if value is not None else 0.0
+    return _parse_retry_after(str(value)) if value is not None else None
 
 
 def account_pacing_snapshot(account, now=None, *, include_turn=True, include_conversation_read=False):

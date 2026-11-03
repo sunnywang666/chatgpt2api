@@ -493,6 +493,47 @@ def test_chat_cooldown_still_queues_a_new_product(runtime):
     assert receipt(runtime, "text", "owner-a", "cooling")["status"] == "queued"
 
 
+def test_persisted_retry_after_blocks_normal_claim_until_exact_deadline(runtime, monkeypatch, tmp_path):
+    """The scheduler consumes the durable upstream deadline, not a local 60s floor."""
+    from services import account_request_pacing as pacing
+    from services.account_request_pacing import AccountRequestClock
+    from services.pool_admission import account_clock_key
+
+    clock, accounts, _, admission, _, _ = runtime
+    account = accounts.admission_accounts()[0]
+    key = account_clock_key(account)
+    path = tmp_path / "account_request_clocks" / f"{key}.json"
+    path.parent.mkdir()
+    monkeypatch.setattr(pacing, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pacing.time, "monotonic", clock)
+    monkeypatch.setattr(pacing.time, "time", clock)
+    monkeypatch.setattr(pacing.time, "sleep", lambda seconds: setattr(clock, "now", clock.now + seconds))
+
+    limited = type("RateLimited", (), {"status_code": 429, "headers": {"Retry-After": "6"}})()
+    AccountRequestClock(key[:12], path).request(
+        lambda *_args, **_kwargs: limited, "GET", "https://provider/backend-api/conversation/original")
+    persisted = AccountRequestClock(key[:12], path)
+    assert persisted.cooldown_until == 1006
+
+    admission.pacing = None
+    text_submit(runtime, "retry-after-six", product="cooldown-product")
+    update_receipt(runtime, "text", "owner-a", "retry-after-six",
+                   _requested_account_identity=account["provider_account_identity"],
+                   provider_account_identity=account["provider_account_identity"],
+                   provider_binding_id=account["conversation_binding_ids"][0])
+    # The unaffected account remains usable while the bound account honors
+    # its own upstream cooldown.
+    text_submit(runtime, "independent", owner="owner-b", source=SOURCE_B, product=None)
+    independent = admission.claim_next()
+    assert independent and independent.request_id == "independent"
+    assert independent.receipt()["provider_account_identity"] != account["provider_account_identity"]
+    clock.now = 1005.999
+    assert admission.claim_next() is None
+    clock.now = 1006
+    claimed = admission.claim_next()
+    assert claimed and claimed.request_id == "retry-after-six"
+
+
 def test_same_product_conversation_members_cannot_start_concurrently(runtime):
     admission = runtime[3]
     text_submit(runtime, "first", product="one-product", step="first", conversation="same-conversation")
