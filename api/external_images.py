@@ -110,7 +110,7 @@ async def external_image_boundary(request: Request, call_next):
         # cannot multiply the bounded body allocation with concurrent reads.
         legacy_control = (not is_external(request) and bool(re.fullmatch(
             r"/api/(?:image-tasks|conversation-bindings/text-requests)/[^/]+/(?:recovery-control|send-hold)"
-            r"|/api/image-tasks/[^/]+/completion", path)))
+            r"|/api/(?:chat-requests|image-tasks)/[^/]+/completion", path)))
         _, rejected = _ordinary_chat_identity(request, ordinary_only=not legacy_control)
         if rejected is not None:
             return rejected

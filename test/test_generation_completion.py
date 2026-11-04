@@ -703,7 +703,8 @@ def test_admin_image_completion_only_reads_its_legacy_original(failed_unsent_ima
 
     text_rejected = client.post("/api/chat-requests/old-0/completion", headers={"Authorization": "admin"},
                                 json={"action": "recover"})
-    assert text_rejected.status_code == 403
+    assert text_rejected.status_code == 404
+    assert text_rejected.json()["detail"]["code"] == "COMPLETION_REQUEST_NOT_FOUND"
 
 
 def test_full_app_legacy_admin_original_receipt_stays_read_only_and_can_offer_terminal_cursor(
