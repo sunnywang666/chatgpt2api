@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.generation_completion as api
+import api.external_images as external_images
 from test.test_generation_completion import failed_unsent_image, setup
 from test.test_no_final_successor import no_final, product_no_final
 from test.test_explicit_unknown_successor import task
@@ -32,10 +33,12 @@ def boundary(monkeypatch):
         return dict(identity)
 
     monkeypatch.setattr(api, "require_identity", authenticate)
+    monkeypatch.setattr(external_images, "require_identity", authenticate)
     monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
     monkeypatch.setattr(api, "require_chat_text_policy", lambda *a, **kw: None)
     monkeypatch.setattr(api, "require_image_policy", lambda *a, **kw: None)
     app = FastAPI()
+    app.middleware("http")(external_images.external_image_boundary)
     app.include_router(api.create_router("text"))
     app.include_router(api.create_router("image"))
     return TestClient(app), identity, company, service
@@ -68,8 +71,10 @@ def admin_attempt_client(service, monkeypatch, *, company=False):
         return dict(identity)
     monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
     monkeypatch.setattr(api, "require_identity", authenticate)
+    monkeypatch.setattr(external_images, "require_identity", authenticate)
     monkeypatch.setattr(api, "require_chat_text_policy", lambda *_a, **_kw: None)
     app = FastAPI()
+    app.middleware("http")(external_images.external_image_boundary)
     app.include_router(api.create_router("text"))
     return TestClient(app), identity
 
@@ -152,10 +157,13 @@ def test_admin_explicit_recover_can_read_late_original_after_automatic_reads_end
     assert reads == []
     monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
     monkeypatch.setattr(api, "require_identity", lambda *_a, **_kw: admin)
+    monkeypatch.setattr(external_images, "require_identity", lambda *_a, **_kw: admin)
     monkeypatch.setattr(api, "require_chat_text_policy", lambda *_a, **_kw: None)
     app = FastAPI()
+    app.middleware("http")(external_images.external_image_boundary)
     app.include_router(api.create_router("text"))
-    response = TestClient(app).post("/api/chat-requests/old-0/completion", json={})
+    client = TestClient(app)
+    response = client.post("/api/chat-requests/old-0/completion", json={"action": "recover"})
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "succeeded", (response.text, reads)
     assert response.json()["content"] == "original calculated stock review"
@@ -309,6 +317,7 @@ def test_image_retry_get_returns_only_same_id_bound_retry_and_never_replacement(
         db.execute("DELETE FROM image_requests WHERE task_key=?", ("owner:repair-image",))
     monkeypatch.setattr(api, "get_generation_completion_service", lambda: service)
     monkeypatch.setattr(api, "require_identity", lambda *_a, **_kw: admin)
+    monkeypatch.setattr(external_images, "require_identity", lambda *_a, **_kw: admin)
     monkeypatch.setattr(api, "require_image_policy", lambda *_a, **_kw: None)
     app = FastAPI(); app.include_router(api.create_router("image")); client = TestClient(app)
     assert client.post("/api/image-tasks/repair-image/completion", json={"action": "retry"}).status_code == 200
@@ -359,3 +368,23 @@ def test_late_original_cancels_only_a_proven_unsent_child(product_no_final, clai
     repeat = h.service.retry_bound_attempt("owner", "old")
     assert repeat["attempt"]["request_id"] == "old" and repeat["result_ready"]
     assert h.admission.claim_next() is None and h.sent == []
+
+
+@pytest.mark.parametrize("action", ["recover", "retry"])
+def test_public_ingress_rejects_admin_text_completion_before_service(boundary, action):
+    client, _identity, _company, service = boundary
+    response = client.post("/api/chat-requests/original/completion",
+                           headers={"X-Workbench-Image-Client": "1"}, json={"action": action})
+    assert response.status_code == 403
+    service._root.assert_not_called()
+    assert_no_attempt(service)
+
+
+def test_internal_text_completion_keeps_body_limit(boundary):
+    client, _identity, _company, service = boundary
+    response = client.post("/api/chat-requests/original/completion",
+                           json={"action": "recover", "padding": "x" * 1024})
+    assert response.status_code == 413
+    assert response.json()["detail"]["code"] == "COMPLETION_BODY_TOO_LARGE"
+    service._root.assert_not_called()
+    assert_no_attempt(service)
