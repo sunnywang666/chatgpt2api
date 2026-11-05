@@ -173,6 +173,128 @@ def raw_product_archive(product, identity, product_ref="product"):
         return product.store.runtime(db, keys[0])["archive"]
 
 
+@pytest.mark.parametrize("scope", ["product_work", "public_session"])
+@pytest.mark.parametrize("mode", ["credit_wait", "other_ticket", "ready", "http_429", "http_timeout"])
+def test_postsend_product_original_read_uses_same_fifo_for_background_recovery(
+        local_upstream, tmp_path, monkeypatch, mode, scope):
+    import services.account_request_pacing as pacing
+    from services.pool_admission import ExecutionContext
+    from test.test_pool_admission import build
+    from test.test_text_task_service import QueuedExecutor
+
+    state = local_upstream
+    state.accounts.mark_text_used = lambda *_: None
+    state.current_node = "root"
+    (tmp_path / "accounts.json").write_text(json.dumps([{
+        "access_token": "fixture-token", "account_id": "fixture-token",
+        "provider_account_identity": "account", "status": "正常", "type": "Plus",
+        "conversation_binding_ids": ["binding"], "source_type": "web"}]))
+    _, store, admission = build(tmp_path, time.time)
+    admission.pacing = None
+    service = ConversationBindingService()
+    if mode == "http_timeout":
+        service.RECOVERY_EXACT_READ_TIMEOUT_SECONDS = .15
+    text = TextTaskService(store.path, executor=QueuedExecutor(), clock=time.time,
+                           runner=service.complete_text, admission=admission,
+                           recovery_reader=service.read_text_request)
+    body = {"client_request_id": "postsend", "client_conversation_id": "client",
+            "provider_binding_id": "binding", "provider_account_identity": "account",
+            "conversation_id": "original", "parent_message_id": "root", "model": "fixture-text",
+            "messages": [{"role": "user", "content": "fixture"}],
+            "_request_message_id": "user"}
+    if scope == "product_work":
+        body["product_work"] = {"product_ref": "product", "step_ref": "copy"}
+    else:
+        body["_public_session_ref"] = "client"
+    text.submit("owner", body, source="internal:content")
+    with store.transaction() as db:
+        receipt = store.read_receipt(db, "text", "owner", "postsend")
+        receipt.update(status="running", _claim_id="claim", _claim_until=time.time() + 60, _submission_started=True,
+                       request_message_id="user", _executing=True, _turn_reserved=True)
+        store.write_receipt(db, "text", "owner", "postsend", receipt)
+    ctx = ExecutionContext(admission, "text", "owner", "postsend", "claim")
+    sends = []
+    def original_stream(backend, **_kwargs):
+        sends.append(backend.text_request_message_id)
+        backend.text_request_parent_message_id = "root"
+        state.calls.clear()  # Pre-send visibility check is not the result GET.
+        if mode in {"credit_wait", "other_ticket"}:
+            pacing.config.update({"account_conversation_read_interval_secs": 45,
+                                  "account_conversation_read_burst": 4})
+            with clock.lock:
+                clock.conversation_read_bucket = {"credit": 0.0, "at": time.monotonic(),
+                                                  "interval": 45.0, "capacity": 4}
+                clock.next_conversation_read = 0
+                if mode == "other_ticket":
+                    clock._ordinary_read_turn("original-result:other", time.monotonic(), 45)
+                clock._save()
+        elif mode == "http_429":
+            state.status = 429
+        elif mode == "http_timeout":
+            state.block = ("GET", "/backend-api/conversation/original")
+        yield {"type": "conversation.delta", "conversation_id": "original", "delta": "partial"}
+    monkeypatch.setattr("services.conversation_binding_service.conversation_events", original_stream)
+    state.backend("fixture-token")
+    clock = next(iter(pacing._clocks.values()))
+    with executing(ctx):
+        text._run("owner", "postsend", {**body, "_admission_claim": "claim"})
+    with store.connect() as db:
+        saved = store.read_receipt(db, "text", "owner", "postsend")
+    assert sends == ["user"]
+    if mode in {"http_429", "http_timeout"}:
+        assert saved["status"] == "unknown" and len(state.calls) == 1
+        assert saved["original_exception_category"] == ("http" if mode == "http_429" else "timeout")
+        assert (saved.get("waiting") or {}).get("reason") != "original_result_read_queued"
+        return
+    if mode == "ready":
+        assert saved["status"] == "succeeded" and saved["content"] == "original answer"
+        assert len(state.calls) == 1
+        return
+    assert saved["status"] == "unknown" and saved["waiting"]["reason"] == "original_result_read_queued"
+    assert saved.get("original_exception_category") != "timeout" and state.calls == []
+    assert len(clock.ordinary_read_queue) == 1
+    ticket = clock.ordinary_read_queue[0]["owner"]
+    assert (ticket == "original-result:other") == (mode == "other_ticket")
+    with store.transaction() as db:
+        saved = store.read_receipt(db, "text", "owner", "postsend")
+        saved["_executing"] = False
+        TextTaskService.retire_recovered_final_after_sender_exit(saved, "claim")
+        store.write_receipt(db, "text", "owner", "postsend", saved)
+    assert saved["_claim_id"] == "claim" and saved["_claim_until"] > time.time()
+    admission.recoveries["text"] = text.read
+    if mode == "other_ticket":
+        with clock.lock:
+            clock.conversation_read_bucket["at"] = time.monotonic() - 45
+            clock._save()
+        admission.recover_one(background=True)
+        with store.connect() as db:
+            deferred = store.read_receipt(db, "text", "owner", "postsend")
+        assert deferred["status"] == "unknown" and not deferred.get("recovery_claim_id")
+        assert [entry["owner"] for entry in clock.ordinary_read_queue] == ["original-result:other"]
+        assert not state.calls
+    with clock.lock:
+        if mode == "other_ticket":
+            assert clock.ordinary_read_queue[0]["owner"] == "original-result:other"
+            clock._release_ordinary_read("original-result:other")
+        clock.conversation_read_bucket["at"] = time.monotonic() - 45
+        clock._save()
+    if mode == "credit_wait":
+        assert clock.ordinary_read_queue[0]["owner"] == ticket
+    else:
+        assert not clock.ordinary_read_queue
+    admission.recover_one(background=True)
+    until = time.monotonic() + 3
+    while time.monotonic() < until:
+        with store.connect() as db:
+            saved = store.read_receipt(db, "text", "owner", "postsend")
+        if saved["status"] == "succeeded":
+            break
+        time.sleep(.01)
+    assert saved["status"] == "succeeded" and saved["content"] == "original answer"
+    assert saved.get("waiting") is None
+    assert sends == ["user"] and len(state.calls) == 1
+
+
 @pytest.mark.parametrize("wait_at", ["account_lock", "account_cooldown", "registered_cleanup_lock", "http"])
 def test_sent_bound_text_exact_read_has_one_budget_and_keeps_original_recovery(
         local_upstream, monkeypatch, wait_at):
