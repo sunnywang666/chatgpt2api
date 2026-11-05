@@ -1,10 +1,13 @@
 """API/receipt integration with no upstream calls or controller threads."""
+import asyncio
 import json
+import threading
 from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -323,6 +326,68 @@ def test_parent_api_strict_auth_and_durable_close(services, monkeypatch):
     assert cancel.status_code == 200, cancel.text
     assert cancel.json()["state"] == "cancelled"
     assert text.read("owner", "text-1")["status"] == "cancelled"
+
+
+def test_capabilities_held_admission_lock_does_not_freeze_unrelated_event_loop_response(monkeypatch):
+    """A capacity lock may wait, but it must not occupy the ASGI event loop."""
+    async def exercise():
+        capacity_lock = threading.Lock()
+        entered_capacity_read = threading.Event()
+        capacity_finished = threading.Event()
+        fallback_released = threading.Event()
+        gate_released = threading.Event()
+        capacity_lock.acquire()
+
+        class BlockingService:
+            def product_capacity_limit(self):
+                entered_capacity_read.set()
+                with capacity_lock:
+                    capacity_finished.set()
+                    return 7
+
+        monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
+        monkeypatch.setattr(product_works, "get_product_work_service", lambda: BlockingService())
+        app = FastAPI()
+
+        @app.get("/event-loop-alive")
+        async def event_loop_alive():
+            return {"alive": True}
+
+        app.include_router(product_works.create_router())
+
+        def emergency_release():
+            # A regression must fail instead of indefinitely wedging the test
+            # event loop while it waits in the synchronous capacity lock.
+            if not capacity_finished.is_set() and not gate_released.is_set():
+                fallback_released.set()
+                capacity_lock.release()
+                gate_released.set()
+
+        watchdog = threading.Timer(1.0, emergency_release)
+        watchdog.start()
+        try:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                capability = asyncio.create_task(client.get(
+                    "/api/product-works/capabilities", headers={"x-workbench-consumer": "wb-to-ozon"},
+                ))
+                assert await asyncio.to_thread(entered_capacity_read.wait, 0.5)
+                assert not fallback_released.is_set()
+                heartbeat = await asyncio.wait_for(client.get("/event-loop-alive"), timeout=0.25)
+                assert heartbeat.json() == {"alive": True}
+                assert not capacity_finished.is_set()
+                capacity_lock.release()
+                gate_released.set()
+                response = await asyncio.wait_for(capability, timeout=0.5)
+            assert response.status_code == 200
+            assert response.json()["product_count_limit"] == 7
+            assert not fallback_released.is_set()
+        finally:
+            watchdog.cancel()
+            if not gate_released.is_set() and not capacity_finished.is_set():
+                capacity_lock.release()
+
+    asyncio.run(exercise())
 
 
 def test_admission_control_route_uses_separate_zero_based_cas(services, monkeypatch):

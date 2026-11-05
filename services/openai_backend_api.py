@@ -29,7 +29,7 @@ from services.account_request_pacing import AccountRequestDeadlineExceeded, pace
 from services.config import config
 from services.request_context import (ARCHIVE_OPERATION_BUDGET_SECONDS, observing_archive_step,
                                       operation_budget, operation_remaining, operation_request_options,
-                                      current_operation_deadline)
+                                      current_operation_deadline, current_manual_conversation_read_budget)
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, is_supported_image_model, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -2002,6 +2002,14 @@ class OpenAIBackendAPI:
     ) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
+        read_budget = current_manual_conversation_read_budget.get()
+        if _send is None and read_budget is not None and local_wait is None:
+            # Only this exact result GET receives pacing credit. Other API
+            # calls, account locks, network and parsing still spend the normal
+            # processing budget; preflight raw sends keep their own ceiling.
+            local_wait = read_budget.record_local_pacing_wait
+            local_wait_credit_remaining = read_budget.reserve_local_wait_credit
+            local_wait_reservation_deadline = read_budget.reservation_deadline
         request = self.session.get if _send is None else lambda url, **kw: _send("GET", url, **kw)
         # Preflight already holds the account clock and caps its raw read.
         # Internal pacing arguments must never reach that raw HTTP transport.
