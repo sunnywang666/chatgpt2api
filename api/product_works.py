@@ -66,6 +66,25 @@ def get_product_work_service():
     return service
 
 
+def capability_payload(request, authorization):
+    """Build the capability response outside the event-loop thread.
+
+    The account/settings snapshots behind product_capacity_limit share the
+    admission locks with active work.  This endpoint is read-only, but its
+    synchronous identity, service lookup, and capacity read can wait on those
+    locks, so keep the entire synchronous chain together in the thread pool.
+    """
+    product_identity(require_identity(authorization, request=request), request)
+    service = get_product_work_service()
+    return {"protocol": "product-work-v1", "shared_capacity_scope": "provider",
+            "capacity_source": "eligible_chat_turn_total", "cross_kind": True,
+            "admission_scope": "product",
+            "product_count_limit": service.product_capacity_limit(),
+            "retained_products_consume_capacity": True,
+            "close_after_archive": True, "adoption": True, "resume": True,
+            "cancel_unsent_text_step": True, "admission_control": True}
+
+
 class CloseProductWork(BaseModel):
     model_config = ConfigDict(extra="forbid")
     product_ref: str = Field(strict=True, min_length=1, max_length=200)
@@ -137,17 +156,9 @@ def create_router():
     async def capabilities(request: Request, response: Response, authorization: str | None = Header(default=None)):
         response.headers["Cache-Control"] = "private, no-store"
         try:
-            product_identity(require_identity(authorization, request=request), request)
-            service = get_product_work_service()
+            return await run_in_threadpool(capability_payload, request, authorization)
         except WorkLifecycleError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
-        return {"protocol": "product-work-v1", "shared_capacity_scope": "provider",
-                "capacity_source": "eligible_chat_turn_total", "cross_kind": True,
-                "admission_scope": "product",
-                "product_count_limit": service.product_capacity_limit(),
-                "retained_products_consume_capacity": True,
-                "close_after_archive": True, "adoption": True, "resume": True,
-                "cancel_unsent_text_step": True, "admission_control": True}
 
     @router.get("/api/product-works")
     async def status(request: Request, response: Response,

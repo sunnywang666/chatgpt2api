@@ -32,6 +32,63 @@ OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
 OTHER_OWNER = {"id": "owner-2", "name": "Other", "role": "user"}
 
 
+def image_quota_failure_document(recap=True):
+    """Original image tool rejection, with the observed optional recap node."""
+    messages = [
+        ("request-1", {"author": {"role": "user"}}),
+        ("call-1", {"author": {"role": "assistant"}, "end_turn": False,
+                    "recipient": "image-tool", "content": {"content_type": "code"}}),
+        ("tool-1", {"author": {"role": "tool", "name": "image-tool"}, "recipient": "all",
+                    "content": {"content_type": "system_error",
+                                "name": "ChatGPTAgentToolRateLimitException",
+                                "text": "Unable to invoke image_gen.text2im: quota exhausted."}}),
+    ]
+    if recap:
+        messages.append(("recap-1", {"author": {"role": "assistant"}, "end_turn": False,
+                                     "content": {"content_type": "reasoning_recap"}}))
+    messages.append(("terminal-1", {"author": {"role": "assistant"}, "end_turn": True,
+        "content": {"content_type": "text", "parts": [
+            "你已达到 Pro 套餐的图像生成请求上限。上限将在 15小时 后重置。此次未能生成主图。"]}}))
+    mapping, parent = {}, "prior-turn"
+    for mid, message in messages:
+        message.update(id=mid, status="finished_successfully")
+        mapping[mid] = {"parent": parent, "message": message}
+        parent = mid
+    return {"current_node": "terminal-1", "mapping": mapping}
+
+
+class ImageQuotaReceiptTests(unittest.TestCase):
+    def test_typed_original_quota_failure_with_or_without_recap(self):
+        for recap in (True, False):
+            document = image_quota_failure_document(recap)
+            expected = document["mapping"]["terminal-1"]["message"]["content"]["parts"][0]
+            self.assertEqual(_authoritative_image_failure(document, "request-1"), expected)
+
+    def test_ambiguous_unfinished_or_non_image_quota_receipts_stay_unknown(self):
+        changes = [
+            ("tool-1", "content", {"content_type": "system_error", "name": "OtherError",
+                                     "text": "image_gen.text2im failed"}),
+            ("tool-1", "content", {"content_type": "system_error",
+                "name": "ChatGPTAgentToolRateLimitException", "text": "another tool failed"}),
+            ("tool-1", "status", "in_progress"),
+            ("call-1", "recipient", "unrelated-tool"),
+            ("terminal-1", "end_turn", False),
+            ("recap-1", "author", None),
+            ("recap-1", "author", {"role": "user"}),
+            ("recap-1", "status", "in_progress"),
+            ("tool-1", "metadata", {"asset_pointer": "file-service://generated-image"}),
+        ]
+        for node, field, value in changes:
+            with self.subTest(node=node, field=field, value=value):
+                document = image_quota_failure_document()
+                document["mapping"][node]["message"][field] = value
+                self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+        document = image_quota_failure_document()
+        document["mapping"]["fork"] = {"parent": "call-1", "message": {"author": {"role": "assistant"}}}
+        self.assertEqual(_authoritative_image_failure(document, "request-1"), "")
+        self.assertEqual(_authoritative_image_failure(image_quota_failure_document(), "other-request"), "")
+
+
 def bound_terminal_reply_document(conversation_id: str, parent_message_id: str) -> dict:
     return {
         "conversation_id": conversation_id,
@@ -3778,6 +3835,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             ("english", english_failure_document(), False),
             ("known_tool", known_generation_error_document(), True),
             ("localized_no_tool", localized_no_image_generated_document(), True),
+            ("typed_image_quota", image_quota_failure_document(), True),
         ):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp_dir:
                 error = RuntimeError("ChatGPT 生图超时")
@@ -3845,6 +3903,8 @@ class ImageTaskServiceTests(unittest.TestCase):
                     task = wait_for_task(service, OWNER, "terminal-no-image-task", "error")
 
                 self.assertEqual(task["error_code"], "NO_IMAGE_GENERATED", task)
+                self.assertEqual(task.get("failure_reason"),
+                    "image_generation_quota_exhausted" if name == "typed_image_quota" else None)
                 expected_terminal = "terminal-1" if refresh_old_unrecoverable else "assistant-1"
                 self.assertEqual(task["image_session_parent_id"], expected_terminal)
                 stored = service._tasks["owner-1:terminal-no-image-task"]

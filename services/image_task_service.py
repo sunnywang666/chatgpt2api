@@ -19,7 +19,7 @@ from services.task_store import TaskStore, recovery_control, pending_image_resul
 from services.pool_admission import image_result_stage
 from contextlib import contextmanager
 from services.request_context import (current_request, AdmissionLost, bounded_lock, operation_budget,
-                                      operation_deadline, operation_remaining)
+                                      operation_deadline, operation_remaining, manual_conversation_read_budget)
 from utils.log import logger
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
@@ -450,9 +450,10 @@ def _request_hash(mode: str, payload: dict[str, Any]) -> str:
 class AuthoritativeImageTaskFailure(RuntimeError):
     code = "NO_IMAGE_GENERATED"
 
-    def __init__(self, message: str, *, terminal_parent_message_id: str = ""):
+    def __init__(self, message: str, *, terminal_parent_message_id: str = "", failure_reason: str = ""):
         super().__init__(message)
         self.terminal_parent_message_id = terminal_parent_message_id
+        self.failure_reason = failure_reason
 
 
 _KNOWN_IMAGE_GENERATION_ERROR = (
@@ -587,25 +588,25 @@ def _similarity_failure_tail(document, receipt):
             "failure_reason": "third_party_similarity"}
 
 
-def _authoritative_image_failure(document: object, request_message_id: str) -> str:
+def _authoritative_image_failure_receipt(document: object, request_message_id: str) -> tuple[str, str]:
     if not isinstance(document, dict):
-        return ""
+        return "", ""
     current_node = _clean(document.get("current_node"))
     mapping = document.get("mapping")
     if not current_node or not request_message_id or not isinstance(mapping, dict):
-        return ""
+        return "", ""
     reversed_path: list[str] = []
     message_id = current_node
     while message_id and message_id not in reversed_path:
         node = mapping.get(message_id)
         if not isinstance(node, dict):
-            return ""
+            return "", ""
         reversed_path.append(message_id)
         if message_id == request_message_id:
             break
         message_id = _clean(node.get("parent"))
     if request_message_id not in reversed_path:
-        return ""
+        return "", ""
     path = list(reversed(reversed_path))
     request_index = path.index(request_message_id)
     for message_id in path[request_index + 1:]:
@@ -615,11 +616,11 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
         if not isinstance(author, dict):
             author = {}
         if _clean(author.get("role")).lower() == "user":
-            return ""
+            return "", ""
     node = mapping.get(current_node) if current_node and isinstance(mapping, dict) else None
     message = node.get("message") if isinstance(node, dict) else None
     if not isinstance(message, dict):
-        return ""
+        return "", ""
     author = message.get("author")
     content = message.get("content")
     if (
@@ -630,7 +631,7 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
         or not isinstance(content, dict)
         or _clean(content.get("content_type")) != "text"
     ):
-        return ""
+        return "", ""
     parts = content.get("parts")
     text = "\n".join(part for part in parts if isinstance(part, str)).strip() if isinstance(parts, list) else ""
     normalized = _normalized_text(parts)
@@ -639,7 +640,7 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
         "something went wrong while generating your image.",
     }
     if normalized in explicit_failures:
-        return text
+        return text, ""
 
     # The provider's localized assistant message does not name the failure
     # reliably.  Only promote it when its immediate tool predecessor is the
@@ -653,7 +654,7 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
     if (not isinstance(request_author, dict)
             or _clean(request_author.get("role")).lower() != "user"
             or (request_message.get("id") and request_message.get("id") != request_message_id)):
-        return ""
+        return "", ""
     children: dict[str, list[str]] = {}
     for node_id, candidate in mapping.items():
         if isinstance(candidate, dict):
@@ -668,23 +669,55 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
         if not isinstance(branch_author, dict):
             branch_author = {}
         if index and _clean(branch_author.get("role")).lower() not in {"assistant", "tool"}:
-            return ""
+            return "", ""
         if index and _has_image_asset_pointer({
             "content": branch_message.get("content"), "metadata": branch_message.get("metadata"),
         }):
-            return ""
+            return "", ""
         following = children.get(message_id, [])
         if index == len(request_path) - 1:
             if following:
-                return ""
+                return "", ""
         elif len(following) != 1 or following[0] != request_path[index + 1]:
-            return ""
+            return "", ""
     # This exact localized receipt was observed after an unambiguous original
     # request branch that ended without a generation tool node or image asset.
     # Keep this an exact sentence match: generic localized error text remains
     # unknown unless the provider supplies the known tool error receipt below.
     if text == _KNOWN_LOCALIZED_NO_IMAGE_GENERATED:
-        return text
+        return text, ""
+    # The image tool can end with a typed quota error, followed by one
+    # completed reasoning recap before the assistant's final explanation.
+    # Preserve the original failure; historical human-readable reset text is
+    # not a new account cooldown and never authorizes another generation.
+    quota_path = request_path[1:-1]
+    if len(quota_path) == 3:
+        recap = mapping[quota_path[-1]].get("message") or {}
+        recap_author = recap.get("author")
+        if (isinstance(recap_author, dict) and recap_author.get("role") == "assistant"
+                and recap.get("status") == "finished_successfully"
+                and recap.get("end_turn") is False
+                and isinstance(recap.get("content"), dict)
+                and recap["content"].get("content_type") == "reasoning_recap"):
+            quota_path = quota_path[:-1]
+    if len(quota_path) == 2:
+        call = mapping[quota_path[0]].get("message") or {}
+        tool = mapping[quota_path[1]].get("message") or {}
+        call_author, tool_author = call.get("author"), tool.get("author")
+        call_content, tool_content = call.get("content"), tool.get("content")
+        if (isinstance(call_author, dict) and call_author.get("role") == "assistant"
+                and call.get("status") == "finished_successfully" and call.get("end_turn") is False
+                and isinstance(call_content, dict) and call_content.get("content_type") == "code"
+                and isinstance(tool_author, dict) and tool_author.get("role") == "tool"
+                and isinstance(tool_author.get("name"), str) and tool_author["name"].strip()
+                and call.get("recipient") == tool_author["name"] and tool.get("recipient") == "all"
+                and tool.get("status") == "finished_successfully"
+                and (tool.get("end_turn") is None or tool.get("end_turn") is False)
+                and isinstance(tool_content, dict) and tool_content.get("content_type") == "system_error"
+                and tool_content.get("name") == "ChatGPTAgentToolRateLimitException"
+                and isinstance(tool_content.get("text"), str)
+                and "image_gen.text2im" in tool_content["text"] and text):
+            return text, "image_generation_quota_exhausted"
     parent = mapping.get(_clean(node.get("parent"))) if isinstance(node, dict) else None
     tool_message = parent.get("message") if isinstance(parent, dict) else None
     tool_author = tool_message.get("author") if isinstance(tool_message, dict) else None
@@ -700,8 +733,12 @@ def _authoritative_image_failure(document: object, request_message_id: str) -> s
         and _clean(tool_content.get("content_type")) == "text"
         and _normalized_text(tool_content.get("parts")) == _normalized_text([_KNOWN_IMAGE_GENERATION_ERROR])
     ):
-        return text
-    return ""
+        return text, ""
+    return "", ""
+
+
+def _authoritative_image_failure(document: object, request_message_id: str) -> str:
+    return _authoritative_image_failure_receipt(document, request_message_id)[0]
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -718,6 +755,9 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "created_at": task.get("created_at"),
         "updated_at": task.get("updated_at"),
     }
+    if (task.get("status") == TASK_STATUS_ERROR and task.get("error_code") == "NO_IMAGE_GENERATED"
+            and task.get("_authoritative_failure_reason") == "image_generation_quota_exhausted"):
+        item["failure_reason"] = "image_generation_quota_exhausted"
     if task.get("_scheduling") is not None:
         item["scheduling"] = task["_scheduling"]
     if task.get("_product_work"):
@@ -2698,7 +2738,15 @@ class ImageTaskService:
                          recovery_deadline=None):
         deadline = (time.monotonic() + max(0.0, float(extra_timeout_secs))
                     if recovery_deadline is None else recovery_deadline)
-        with operation_deadline(deadline):
+        remaining = deadline - time.monotonic()
+        # Keep the processing/transport budget (including dispatch and locks),
+        # but let exact-conversation GETs use the existing finite local-pacing
+        # allowance. A five-second read must not expire solely because our
+        # account read FIFO has a ninety-second interval. Never revive an
+        # already expired dispatch or override an inherited shorter deadline.
+        budget = (manual_conversation_read_budget(remaining) if remaining > 0
+                  else operation_deadline(deadline))
+        with budget:
             return self._run_resume_poll_bounded(
                 key, conversation_id, extra_timeout_secs, base_url, identity, mode, model,
                 allow_unrecoverable_retry, deadline_expired)
@@ -2892,11 +2940,11 @@ class ImageTaskService:
                 branch_state = _branch_read_state(document, request_message_id)
                 if branch_state in {"running", "terminal_without_result", "no_result"}:
                     self._update_task(key, _completion_read_at=time.time())
-                authoritative_failure = _authoritative_image_failure(document, request_message_id)
+                authoritative_failure, failure_reason = _authoritative_image_failure_receipt(document, request_message_id)
                 if authoritative_failure:
                     raise AuthoritativeImageTaskFailure(
                         authoritative_failure,
-                        terminal_parent_message_id=_clean(document.get("current_node")),
+                        terminal_parent_message_id=_clean(document.get("current_node")), failure_reason=failure_reason,
                     )
                 no_active_task = False
                 if allow_unrecoverable_retry or deadline_expired:
@@ -2994,11 +3042,11 @@ class ImageTaskService:
                             raise ImagePollTimeoutError("原会话结果仍待稳定确认，保留原请求继续读取。", conversation_id)
                         document = backend._get_conversation(conversation_id)
                         self._update_task(key, _retry_cursor=retry_cursor(document, task, kind="image"))
-                        authoritative_failure = _authoritative_image_failure(document, request_message_id)
+                        authoritative_failure, failure_reason = _authoritative_image_failure_receipt(document, request_message_id)
                         if authoritative_failure:
                             raise AuthoritativeImageTaskFailure(
                                 authoritative_failure,
-                                terminal_parent_message_id=_clean(document.get("current_node")),
+                                terminal_parent_message_id=_clean(document.get("current_node")), failure_reason=failure_reason,
                             )
                     pending_options = (
                         {"initial_file_ids": pending_ids.get("file_ids", []),
@@ -3146,6 +3194,7 @@ class ImageTaskService:
                 error=error_message,
                 error_code=final_error_code,
                 last_recovery_failure=_failure_details(exc, failure_phase),
+                _authoritative_failure_reason=(exc.failure_reason if isinstance(exc, AuthoritativeImageTaskFailure) else ""),
                 binding_status=("bound" if terminal
                                 else "unavailable" if unrecoverable and requires_new_conversation
                                 else "bound" if unrecoverable else "unknown"),
