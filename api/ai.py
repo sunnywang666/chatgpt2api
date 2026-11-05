@@ -867,7 +867,7 @@ def create_router() -> APIRouter:
             request_id: str, body: WorkbenchDerivedSuccessorRequest,
             request: Request, response: Response,
             authorization: str | None = Header(default=None)):
-        """Read one advanced successor's durable acceptance without submitting it."""
+        """Read one advanced or incomplete successor's durable acceptance without submitting it."""
         identity, source = workbench_input_identity(request, authorization)
         response.headers["Cache-Control"] = "private, no-store"
         try:
@@ -878,6 +878,8 @@ def create_router() -> APIRouter:
                 str(identity.get("id") or "anonymous"), request_id,
                 body.model_dump(mode="python"), source=source,
             )
+        except WorkLifecycleError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code}) from None
         except ConversationBindingError as exc:
             raise HTTPException(404 if exc.code == "CHAT_WORKBENCH_DERIVED_INPUT_NOT_FOUND" else 409,
                                 detail={"code": exc.code}) from None

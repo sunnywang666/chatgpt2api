@@ -1371,7 +1371,7 @@ class TextTaskService:
                     or not isinstance(node["id"], str) or not 1 <= len(node["id"]) <= 200
                     or node["id"] in ids or node["id"] == value["request_message_id"]
                     or node["role"] not in {"assistant", "tool"}
-                    or node["status"] not in {"in_progress", "running", "pending", "queued", "finished_successfully"}
+                    or node["status"] not in {"in_progress", "running", "pending", "queued", "finished_successfully", "finished_partial_completion"}
                     or type(node["end_turn"]) is not bool
                     or type(node["text_chars"]) is not int or not 0 <= node["text_chars"] <= 100_000_000
                     or not isinstance(node["content_type"], str) or node["content_type"] not in OBSERVED_CONTENT_TYPES
@@ -1405,6 +1405,25 @@ class TextTaskService:
                         or diagnostic["is_complete"] is not None and type(diagnostic["is_complete"]) is not bool
                         or diagnostic["finish_type"] not in (None, "stop", "max_tokens", "length", "interrupted", "other")):
                     return None
+        partials = [node for node in normalized if node["status"] == "finished_partial_completion"]
+        if partials:
+            if (len(partials) != 1 or partials[0] is not normalized[-1]
+                    or partials[0]["role"] != "assistant" or partials[0]["end_turn"] is not False
+                    or partials[0]["content_type"] != "text" or partials[0]["text_chars"] <= 0
+                    or "phase" not in value or value["phase"]["current_node_relation"] != "observed"
+                    or value["phase"]["current_node_id"] != partials[0]["id"]):
+                return None
+            tail_phase = value["phase"]["nodes"][-1]
+            if (tail_phase.get("channel") != "final" or tail_phase.get("recipient") != "all"
+                    or tail_phase.get("metadata_channel") not in (None, "final")):
+                return None
+            final_text = [node for node, diagnostic in zip(normalized, value["phase"]["nodes"])
+                          if node["role"] == "assistant" and node["content_type"] == "text"
+                          and diagnostic["channel"] == "final" and diagnostic["recipient"] == "all"]
+            if final_text != partials:
+                return None
+            if any(node["status"] != "finished_successfully" for node in normalized if node["role"] == "tool"):
+                return None
         return {**value, "nodes": normalized}
 
     @staticmethod
@@ -3170,7 +3189,7 @@ class TextTaskService:
             return self._public(receipt)
 
     def observe_workbench_derived_acceptance(self, owner, request_id, payload, *, source):
-        """Read whether one frozen advanced successor was accepted at this instant.
+        """Read whether one frozen advanced/incomplete successor was accepted at this instant.
 
         This deliberately has no submit, admission, content-review, or wake path.
         A final second local observation prevents an absent answer from masking an
@@ -3179,7 +3198,11 @@ class TextTaskService:
         """
         from services.advanced_session_successor import MODE
 
-        if payload.get("mode") != MODE:
+        # This endpoint is a local reconciliation surface, not a second
+        # derivation policy.  Keep its existing isolated-session mode and the
+        # one already-governed incomplete mode only; no-final and other paths
+        # remain intentionally unavailable here.
+        if payload.get("mode") not in {MODE, "incomplete"}:
             raise ConversationBindingError(
                 "advanced successor acceptance requires advanced_new_session",
                 code="CHAT_ADVANCED_SESSION_INVALID",

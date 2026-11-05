@@ -45,6 +45,7 @@ class TextRecoveryReason(str, Enum):
 
 
 _ACTIVE_TEXT_RESULT_STATUSES = frozenset({"in_progress", "running", "pending", "queued"})
+_PARTIAL_TEXT_RESULT_STATUS = "finished_partial_completion"
 NON_TEXT_RESULT_FIELD = "_non_text_result"
 TURN_END_EVIDENCE_FIELD = "_turn_end_evidence"
 COMPLETED_SUCCESSOR_EVIDENCE_FIELD = "_completed_successor_evidence"
@@ -122,6 +123,66 @@ def _result_phase_observation(mapping, nodes, request_message_id, current_node):
             "nodes": phases}
 
 
+def _strict_partial_text_final(message, node_id):
+    """Recognize the one nonterminal final-text shape that may be observed.
+
+    This is deliberately not a completion predicate.  It records the provider's
+    partial result as an incomplete branch only, so a later complete answer
+    still wins and a malformed/foreign partial tail cannot open a successor.
+    """
+    content = message.get("content") if isinstance(message, dict) else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    author = message.get("author") if isinstance(message, dict) else None
+    metadata = message.get("metadata") if isinstance(message, dict) else None
+    return bool(
+        isinstance(message, dict) and message.get("id") == node_id
+        and isinstance(author, dict) and author.get("role") == "assistant"
+        and message.get("status") == _PARTIAL_TEXT_RESULT_STATUS
+        and "end_turn" in message
+        and (message.get("end_turn") is None or message.get("end_turn") is False)
+        and message.get("channel") == "final" and message.get("recipient") == "all"
+        and (metadata is None or isinstance(metadata, dict) and metadata.get("channel") in (None, "final"))
+        and isinstance(content, dict) and content.get("content_type") == "text"
+        and isinstance(parts, list) and bool(parts)
+        and all(isinstance(part, str) for part in parts) and bool("".join(parts).strip())
+    )
+
+
+def _partial_result_observation(value):
+    """Return whether an already-unambiguous observation has the narrow partial tail."""
+    if not isinstance(value, dict):
+        return False
+    nodes, phase = value.get("nodes"), value.get("phase")
+    if not isinstance(nodes, list) or not nodes or not isinstance(phase, dict):
+        return False
+    partials = [node for node in nodes if isinstance(node, dict)
+                and node.get("status") == _PARTIAL_TEXT_RESULT_STATUS]
+    if len(partials) != 1 or partials[0] is not nodes[-1]:
+        return False
+    tail = partials[0]
+    diagnostics = phase.get("nodes")
+    if (tail.get("role") != "assistant" or tail.get("end_turn") is not False
+            or tail.get("content_type") != "text" or tail.get("text_chars", 0) <= 0
+            or phase.get("current_node_relation") != "observed"
+            or phase.get("current_node_id") != tail.get("id")
+            or not isinstance(diagnostics, list) or len(diagnostics) != len(nodes)):
+        return False
+    tail_phase = diagnostics[-1]
+    if not isinstance(tail_phase, dict) or tail_phase.get("id") != tail.get("id"):
+        return False
+    if (tail_phase.get("channel") != "final" or tail_phase.get("recipient") != "all"
+            or tail_phase.get("metadata_channel") not in (None, "final")):
+        return False
+    final_text = [node for node, diagnostic in zip(nodes, diagnostics)
+                  if isinstance(node, dict) and isinstance(diagnostic, dict)
+                  and node.get("role") == "assistant" and node.get("content_type") == "text"
+                  and diagnostic.get("channel") == "final" and diagnostic.get("recipient") == "all"]
+    if final_text != [tail]:
+        return False
+    return all(node.get("status") == "finished_successfully"
+               for node in nodes if isinstance(node, dict) and node.get("role") == "tool")
+
+
 def _result_observation(mapping, children, request_message_id, conversation_id, current_node=None):
     """Observe only this request's unambiguous branch, never message contents.
 
@@ -146,7 +207,10 @@ def _result_observation(mapping, children, request_message_id, conversation_id, 
         if role == "user":
             return None  # A later user turn cannot establish our progress.
         status = message.get("status")
-        if role not in {"assistant", "tool"} or status not in _ACTIVE_TEXT_RESULT_STATUSES | {"finished_successfully"}:
+        if role not in {"assistant", "tool"}:
+            return None
+        partial = _strict_partial_text_final(message, node_id)
+        if status not in _ACTIVE_TEXT_RESULT_STATUSES | {"finished_successfully"} and not partial:
             return None
         content = _content_observation(message.get("content"))
         if content is None:
@@ -158,11 +222,16 @@ def _result_observation(mapping, children, request_message_id, conversation_id, 
             updated_at = max(updated_at or value, value)
     if not nodes:
         return None
-    return {"conversation_id": conversation_id, "request_message_id": request_message_id,
+    observation = {"conversation_id": conversation_id, "request_message_id": request_message_id,
             "nodes": nodes, "upstream_updated_at": updated_at,
             # Keep diagnostics outside nodes: changes to these labels alone
             # must not manufacture progress or restart the stalled-turn clock.
             "phase": _result_phase_observation(mapping, nodes, request_message_id, current_node)}
+    # A partial final must be the current, sole leaf.  It may follow stale
+    # assistant state and completed tools, but never an active tool or fork.
+    if any(node["status"] == _PARTIAL_TEXT_RESULT_STATUS for node in nodes):
+        return observation if _partial_result_observation(observation) else None
+    return observation
 
 
 def _request_parent_matches_receipt(
@@ -2148,6 +2217,12 @@ class ConversationBindingService:
                     terminal_empty_seen = True
             pending.extend(children.get(node_id, []))
 
+        observation = _result_observation(
+            mapping, children, request_message_id, conversation_id, document.get("current_node"),
+        )
+        partial_result_seen = _partial_result_observation(observation)
+        incomplete_result_seen = active_result_seen or partial_result_seen
+
         if len(candidates) > 1:
             raise ConversationBindingError(
                 "multiple completed answers descend from the original request",
@@ -2158,7 +2233,7 @@ class ConversationBindingService:
         if not candidates:
             from services.generation_completion import retry_cursor
             continuation = retry_cursor(document, receipt)
-            non_text_result = None if active_result_seen else _completed_image_result(
+            non_text_result = None if incomplete_result_seen else _completed_image_result(
                 mapping, children, request_message_id, conversation_id,
             )
             if non_text_result:
@@ -2171,11 +2246,11 @@ class ConversationBindingService:
                     "parent_message_id": non_text_result["final_message_id"],
                     NON_TEXT_RESULT_FIELD: non_text_result,
                 }
-            advanced = active_result_seen and later_user_seen and _completed_external_successor(
+            advanced = incomplete_result_seen and later_user_seen and _completed_external_successor(
                 mapping, children, request_message_id, document.get("current_node"), conversation_id)
             if advanced:
                 recovery_reason = TextRecoveryReason.REQUEST_CONVERSATION_ADVANCED.value
-            elif active_result_seen:
+            elif incomplete_result_seen:
                 recovery_reason = TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value
             elif terminal_empty_seen:
                 recovery_reason = TextRecoveryReason.REQUEST_RESULT_TERMINAL_EMPTY.value
@@ -2186,17 +2261,15 @@ class ConversationBindingService:
             return {
                 **result,
                 "binding_status": "unknown",
-                "status": "running" if active_result_seen and not advanced else "unknown",
+                "status": "running" if incomplete_result_seen and not advanced else "unknown",
                 "recovery_reason": recovery_reason,
                 "_retry_cursor": continuation,
                 **({COMPLETED_SUCCESSOR_EVIDENCE_FIELD: successor_evidence}
                    if advanced and (successor_evidence := _completed_external_successor(
                        mapping, children, request_message_id, document.get("current_node"), conversation_id,
                        with_evidence=True)) else {}),
-                **({RESULT_OBSERVATION_FIELD: observation} if active_result_seen
-                   and (observation := _result_observation(mapping, children, request_message_id, conversation_id,
-                                                          document.get("current_node"))) else {}),
-                **({TURN_END_EVIDENCE_FIELD: ended} if not active_result_seen and terminal_empty_seen
+                **({RESULT_OBSERVATION_FIELD: observation} if incomplete_result_seen and observation else {}),
+                **({TURN_END_EVIDENCE_FIELD: ended} if not incomplete_result_seen and terminal_empty_seen
                    and (ended := _completed_request_turn(mapping, children, request_message_id, conversation_id)) else {}),
                 **({"_empty_reply_evidence": empty} if (empty := _empty_reply_evidence(
                     mapping, children, request_message_id, conversation_id, document.get("current_node"))) else {}),
@@ -2459,7 +2532,8 @@ class ConversationBindingService:
             and isinstance(content, dict) and content.get("content_type") == "thoughts"
             and isinstance(thoughts, list) and bool(thoughts)
             and all(isinstance(item, dict) and item.get("finished") is True for item in thoughts))
-        if (head != tail["id"] or not (tail["status"] in _ACTIVE_TEXT_RESULT_STATUSES or finished_thoughts)
+        partial_final = _strict_partial_text_final(message, head)
+        if (head != tail["id"] or not (tail["status"] in _ACTIVE_TEXT_RESULT_STATUSES or finished_thoughts or partial_final)
                 or tail["end_turn"] is not False or not isinstance(message, dict)
                 or message.get("id") != head or node.get("children")
                 or any(isinstance(item, dict) and item.get("parent") == head for item in mapping.values())):

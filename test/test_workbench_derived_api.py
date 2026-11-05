@@ -9,9 +9,11 @@ from fastapi.testclient import TestClient
 
 from api import ai, task_results
 from services.work_lifecycle import WorkLifecycleError
+from services.text_task_service import TextTaskService
 from test.test_category_directory_successor import install
 from test.test_explicit_unknown_successor import task, row, update
 from test.test_workbench_derived_input import payload
+from test.test_incomplete_compact_successor import install_incomplete
 from test.test_advanced_session_successor import advanced
 from test.test_no_final_successor import product_no_final
 
@@ -36,6 +38,22 @@ def advanced_http(advanced, monkeypatch):
         yield h, review, client
 
 
+@pytest.fixture
+def incomplete_http(task, monkeypatch):
+    h = install_incomplete(task)
+    h.payload = payload(h.service, h.old, request_id="successor", mode="incomplete")
+    monkeypatch.setattr(ai, "text_task_service", h.service)
+    identity = {"role": "admin", "id": "owner"}
+    monkeypatch.setattr(ai, "require_identity", lambda *_a, **_k: identity)
+    monkeypatch.setattr(ai, "trusted_source", lambda *_a: "internal:listing")
+    review = AsyncMock()
+    monkeypatch.setattr(ai, "filter_or_log", review)
+    app = FastAPI()
+    app.include_router(ai.create_router())
+    with TestClient(app) as client:
+        yield h, review, client, identity
+
+
 def test_advanced_wire_idempotency_and_saved_result_read(advanced_http):
     h, review, client = advanced_http
     before = deepcopy(row(h.service))
@@ -53,6 +71,66 @@ def test_advanced_wire_idempotency_and_saved_result_read(advanced_http):
     assert result["result_ready"] is False and result["receipt"]["advanced_session"] == proof
     assert row(h.service) == before and not h.sent
     review.assert_awaited_once()
+
+
+def test_incomplete_acceptance_is_local_and_returns_exact_existing_receipt(incomplete_http):
+    h, review, client, identity = incomplete_http
+    h.service.recovery_reader = lambda _original: pytest.fail("acceptance observation read upstream")
+    before = deepcopy(row(h.service))
+
+    absent = client.post(PREFIX + "/derived-successor/acceptance", json=h.payload)
+
+    body = h.service.prepare_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+    assert absent.status_code == 200, absent.text
+    assert absent.json() == {
+        "state": "absent_at_observation", "original_request_id": "old",
+        "client_request_id": "successor", "original_input_hash": h.payload["original_input_hash"],
+        "child_input_hash": TextTaskService._submission_identity("owner", body)[1],
+    }
+    assert row(h.service, "successor") is None and row(h.service) == before
+    assert getattr(h, "sent", []) == [] and not review.await_count
+
+    accepted = h.service.submit_workbench_derived_input("owner", "old", h.payload, source="internal:listing")
+    existing = client.post(PREFIX + "/derived-successor/acceptance", json=h.payload)
+    assert existing.status_code == 200 and existing.json() == accepted
+    assert getattr(h, "sent", []) == [] and not review.await_count
+
+    changed = {**h.payload, "thinking_effort": "standard"}
+    conflict = client.post(PREFIX + "/derived-successor/acceptance", json=changed)
+    assert conflict.status_code == 409 and conflict.json()["detail"]["code"] == "CONVERSATION_REQUEST_CONFLICT"
+
+    identity["id"] = "other-owner"
+    foreign = client.post(PREFIX + "/derived-successor/acceptance", json=h.payload)
+    assert foreign.status_code == 404
+    assert getattr(h, "sent", []) == [] and not review.await_count
+
+
+def test_incomplete_acceptance_rejects_unqualified_absent_child_locally(incomplete_http):
+    h, review, client, _identity = incomplete_http
+    before = deepcopy(row(h.service))
+    update(h.service, status="succeeded", content="late original")
+
+    response = client.post(PREFIX + "/derived-successor/acceptance", json=h.payload)
+
+    assert response.status_code == 409
+    assert row(h.service, "successor") is None
+    assert getattr(h, "sent", []) == [] and not review.await_count
+    assert row(h.service)["status"] == "succeeded" and before["request_id"] == "old"
+
+
+def test_incomplete_acceptance_preserves_work_lifecycle_http_status(incomplete_http, monkeypatch):
+    h, review, client, _identity = incomplete_http
+
+    def blocked(*_args, **_kwargs):
+        raise WorkLifecycleError("WORK_NOT_ACTIVE", status=423)
+
+    monkeypatch.setattr(h.service, "observe_workbench_derived_acceptance", blocked)
+    response = client.post(PREFIX + "/derived-successor/acceptance", json=h.payload)
+
+    assert response.status_code == 423
+    assert response.json() == {"detail": {"code": "WORK_NOT_ACTIVE"}}
+    assert row(h.service, "successor") is None and getattr(h, "sent", []) == []
+    assert not review.await_count
 
 
 @pytest.mark.parametrize("mutation", ["missing", "null", "foreign_field", "malformed_hash", "wrong_mode"])
