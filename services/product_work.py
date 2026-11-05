@@ -1048,6 +1048,42 @@ def _normal_product_tail(store, db, parent, member, tail, previous, used_steps, 
             and not _claims(tail) and not tail.get("_executing") and not tail.get("_turn_reserved"))
 
 
+def _image_product_tail(store, parent, member, tail, previous, used_steps, proof):
+    """Validate one saved image tail observed by the original-reader proof."""
+    from services.image_task_service import _request_hash
+    try:
+        stored = store.load_input(tail["_input_ref"])
+        payload, mode = stored["payload"], stored["mode"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    keys = ("provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id")
+    result_ids = [value for values in (tail.get("result_file_ids"), tail.get("result_sediment_ids"))
+                  if isinstance(values, list) for value in values]
+    metadata = _metadata(parent, member["step_ref"])
+    return bool(
+        member.get("kind") == "image" and member.get("owner") == parent.get("owner")
+        and tail.get("id") == member.get("request_id")
+        and tail.get("request_message_id") == proof["request_message_id"]
+        and tail.get("parent_message_id") == proof["final_message_id"]
+        and tail.get("_product_work_key") == parent.get("key") and _source(tail) == parent.get("source")
+        and tail.get("_source") == previous.get("_source")
+        and tail.get("_product_work") == metadata and payload.get("_product_work") == metadata
+        and member.get("step_ref") not in used_steps
+        and all(previous.get(key) and tail.get(key) == previous[key] and payload.get(key) == previous[key]
+                for key in keys)
+        and payload.get("parent_message_id") == previous.get("parent_message_id")
+        and mode in {"generate", "edit"} and tail.get("request_hash") == _request_hash(mode, payload)
+        and type(tail.get("_sequence")) is int and tail["_sequence"] > previous.get("_sequence", 0)
+        and tail.get("status") == "success" and tail.get("upstream_outcome") == "generated"
+        and tail.get("upstream_unfinished") is False and tail.get("binding_status") == "bound"
+        and tail.get("_submission_started") is True and isinstance(tail.get("data"), list) and bool(tail["data"])
+        and bool(result_ids) and all(isinstance(value, str) and value for value in result_ids)
+        and not _claims(tail) and not tail.get("_executing") and not tail.get("_turn_reserved")
+        and not any(tail.get(key) for key in ("_recovery_paused", "_recovery_suppressed",
+                                               "_completion", "_completion_of"))
+    )
+
+
 def advanced_continuation_required(store, db, receipt):
     """A normal later step cannot bypass an unresolved incomplete predecessor."""
     if receipt.get("_supersedes_request_id") or not receipt.get("_product_work_key"):
@@ -1540,7 +1576,7 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
     if advanced_by_own_successor and tail_steps:
         member_by_request = {}
         for member, row in members:
-            if member["kind"] == "text":
+            if member["kind"] in {"text", "image"}:
                 member_by_request.setdefault(row.get("request_message_id"), []).append((member, row))
         previous = receipt
         used_steps = {receipt["_product_work"]["step_ref"]}
@@ -1549,8 +1585,11 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
             if len(found) != 1:
                 return None
             member, tail = found[0]
+            tail_valid = (_normal_product_tail(store, db, parent, member, tail, previous, used_steps, now)
+                          if member["kind"] == "text" else _image_product_tail(
+                              store, parent, member, tail, previous, used_steps, proof))
             if (tail.get("parent_message_id") != proof["final_message_id"]
-                    or not _normal_product_tail(store, db, parent, member, tail, previous, used_steps, now)
+                    or not tail_valid
                     or _unresolved(tail, [row for _, row in members])):
                 return None
             tail_rows.append((member, tail))
@@ -1573,11 +1612,16 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
             return None
     chain_members.extend(row for _, row in tail_rows)
     member_ids = {(member["kind"], row.get("request_id") or row.get("id")) for member, row in members}
-    if not {("text", item["request_id"]) for item in chain_members} <= member_ids:
+    chain_member_ids = {("text", item["request_id"]) for item in [*ancestors, original, receipt]}
+    chain_member_ids.update((member["kind"], row.get("request_id") or row.get("id"))
+                            for member, row in tail_rows)
+    if not chain_member_ids <= member_ids:
         return None
     if advanced_by_own_successor:
         chain_ids = {("text", parent["owner"], item["request_id"])
-                     for item in chain_members}
+                     for item in [*ancestors, original, receipt]}
+        chain_ids.update((member["kind"], member["owner"], row.get("request_id") or row.get("id"))
+                         for member, row in tail_rows)
         if continuation is not None:
             chain_ids.add(("text", parent["owner"], continuation["request_id"]))
         registered = {(member["kind"], member["owner"], member["request_id"]) for member, _ in members}
@@ -1589,6 +1633,15 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
         # not a competing successor. Everything else in the same physical
         # conversation remains a conflict, including another owner's receipt.
         def safe_predecessor(kind, owner, request_id, other):
+            ended = other.get("_turn_end_evidence")
+            recovered_terminal = (isinstance(ended, dict)
+                and set(ended) == {"conversation_id", "request_message_id", "final_message_id", "observed_at"}
+                and ended.get("conversation_id") == other.get("conversation_id")
+                and ended.get("request_message_id") == other.get("request_message_id")
+                and ended.get("final_message_id") == other.get("parent_message_id")
+                and ended.get("final_message_id") != ended.get("request_message_id")
+                and type(ended.get("observed_at")) in {int, float}
+                and math.isfinite(ended["observed_at"]) and 0 < ended["observed_at"] <= now)
             return bool(
                 (kind, owner, request_id) in registered
                 and owner == parent["owner"]
@@ -1597,7 +1650,7 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
                 and other.get("status") in {"succeeded", "success"}
                 and other.get("upstream_outcome") == "completed"
                 and other.get("upstream_unfinished") is not True
-                and other.get("_upstream_terminal") is True
+                and (other.get("_upstream_terminal") is True or recovered_terminal)
                 and not _claims(other)
                 and not any(other.get(key) for key in controls)
                 and not _unresolved(other, all_receipts))
@@ -1624,11 +1677,12 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
                    for item in [*ancestors, original, receipt])):
         return None
     if ancestors:
+        text_chain = [*ancestors, original, receipt]
         if any(not TextTaskService._supersede_order_link(previous, successor)
-               for previous, successor in zip(chain_members, chain_members[1:])):
+               for previous, successor in zip(text_chain, text_chain[1:])):
             return None
         member_refs = {member["request_id"]: member for member, _ in members if member["kind"] == "text"}
-        for item in chain_members:
+        for item in text_chain:
             member = member_refs.get(item["request_id"])
             if not member:
                 return None
@@ -1636,6 +1690,7 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
             if item.get("_product_work") != metadata or original_body.get("product_work") != metadata:
                 return None
     return {"original": original, "successor": receipt, "tail": [row for _, row in tail_rows],
+            "tail_members": [member for member, _ in tail_rows],
             "archive": archive, "archive_member": archive_member,
             "resolved": [*ancestors, original], "advanced_by_own_successor": advanced_by_own_successor}
 
@@ -2246,8 +2301,12 @@ class ProductWorkService:
                 special_targets[canonical] = target
             for chain in advanced_chains.values():
                 archive_member, archive = chain["archive_member"], chain["archive"]
-                for item in (chain["original"], chain["successor"], *chain["tail"]):
+                for item in (chain["original"], chain["successor"]):
                     identity = ("text", item["request_id"])
+                    chain_member_ids.add(identity)
+                    advanced_chain_members[identity] = chain
+                for member, item in zip(chain.get("tail_members", []), chain["tail"]):
+                    identity = (member["kind"], item.get("request_id") or item.get("id"))
                     chain_member_ids.add(identity)
                     advanced_chain_members[identity] = chain
                 canonical = archive["provider_account_identity"], archive["conversation_id"]
