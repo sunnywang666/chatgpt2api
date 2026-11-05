@@ -118,6 +118,71 @@ def test_incomplete_acceptance_rejects_unqualified_absent_child_locally(incomple
     assert row(h.service)["status"] == "succeeded" and before["request_id"] == "old"
 
 
+@pytest.mark.parametrize("suffix", ["/derived-successor/acceptance", "/derived-successor"])
+@pytest.mark.parametrize("changes", [
+    {"_result_no_progress_reads": 1},
+    {"_result_last_progress_at": 999.0},
+    {"_result_wait_ended_at": None},
+    {"_result_observation_started_at": None, "_result_last_checked_at": None,
+     "_result_wait_ended_at": None, "_result_no_progress_reads": None,
+     "_original_result_observation": None},
+    {"recovery_claim_id": "reading-original", "recovery_claimed_at": 1000.0,
+     "recovery_lease_until": 1100.0, "recovery_phase": "read_text_request"},
+])
+def test_incomplete_waiting_qualification_is_busy_on_both_public_paths(incomplete_http, suffix, changes):
+    h, review, client, _identity = incomplete_http
+    update(h.service, **changes)
+    before = deepcopy(row(h.service))
+    h.service.recovery_reader = lambda *_a: pytest.fail("validation read upstream")
+    response = client.post(PREFIX + suffix, json=h.payload)
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "CHAT_SUPERSEDE_PREDECESSOR_BUSY"
+    assert row(h.service) == before and row(h.service, "successor") is None
+    assert not h.sent and not review.await_count
+
+
+@pytest.mark.parametrize("suffix", ["/derived-successor/acceptance", "/derived-successor"])
+@pytest.mark.parametrize("changes", [
+    {"_recovery_paused": True}, {"_recovery_suppressed": True},
+    {"_upstream_terminal": True}, {"upstream_outcome": None},
+    {"_original_result_observation": {"invalid": True}},
+    {"_result_no_progress_reads": "1"}, {"_result_last_checked_at": -1},
+    {"status": "succeeded", "content": "late original"},
+])
+def test_incomplete_permanent_ineligibility_stays_invalid(incomplete_http, suffix, changes):
+    h, review, client, _identity = incomplete_http
+    update(h.service, **changes)
+    before = deepcopy(row(h.service))
+    response = client.post(PREFIX + suffix, json=h.payload)
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "CHAT_WORKBENCH_DERIVED_INPUT_INVALID"
+    assert row(h.service) == before and row(h.service, "successor") is None
+    assert not h.sent and not review.await_count
+
+
+@pytest.mark.parametrize("suffix", ["/derived-successor/acceptance", "/derived-successor"])
+def test_incomplete_bad_input_is_not_masked_by_pending_observation(incomplete_http, suffix):
+    h, review, client, _identity = incomplete_http
+    update(h.service, _result_no_progress_reads=1)
+    response = client.post(PREFIX + suffix, json={**h.payload, "original_input_hash": "0" * 64})
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] != "CHAT_SUPERSEDE_PREDECESSOR_BUSY"
+    assert row(h.service, "successor") is None and not h.sent and not review.await_count
+
+
+def test_incomplete_new_progress_after_acceptance_keeps_child_retryable(incomplete_http):
+    from services.conversation_binding_service import ConversationBindingError
+    h, review, client, _identity = incomplete_http
+    accepted = client.post(PREFIX + "/derived-successor", json=h.payload)
+    assert accepted.status_code == 200, accepted.text
+    child = row(h.service, "successor")
+    update(h.service, _result_last_progress_at=999.0)
+    with h.service.store.connect() as db, pytest.raises(ConversationBindingError) as exc:
+        h.service._validate_supersede(h.service.store, db, "owner", child, h.clock())
+    assert exc.value.code == "CHAT_SUPERSEDE_PREDECESSOR_BUSY"
+    assert row(h.service, "successor") == child and not h.sent
+
+
 def test_incomplete_acceptance_preserves_work_lifecycle_http_status(incomplete_http, monkeypatch):
     h, review, client, _identity = incomplete_http
 

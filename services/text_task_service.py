@@ -4420,6 +4420,13 @@ class TextTaskService:
                 reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
         if previous.get("_executing") or previous.get("_turn_reserved"):
             reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
+        audit = successor.get(TextTaskService._WORKBENCH_DERIVED_MARKER)
+        if (not incomplete_retry and isinstance(audit, dict) and audit.get("mode") == "incomplete"
+                and audit.get("original_input_hash") == row[0]
+                and successor.get("_supersedes_input_hash") == row[0]
+                and TextTaskService._workbench_derived_ineligibility_code(previous, "incomplete", now)
+                    == "CHAT_SUPERSEDE_PREDECESSOR_BUSY"):
+            reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
         if (not rejected_model and not native_no_final_retry and not incomplete_retry and (previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
                 or previous.get("upstream_outcome") != "unknown"
                 or (not TextTaskService._no_final_successor_source(previous, now)
@@ -4465,7 +4472,7 @@ class TextTaskService:
                     or not isinstance(audit.get("child_input_hash"), str)):
                 reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
             if not TextTaskService._workbench_derived_mode_eligible(previous, audit["mode"], now):
-                reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
+                reject(TextTaskService._workbench_derived_ineligibility_code(previous, audit["mode"], now))
             try:
                 stored = successor.get("_workbench_derived_body")
                 if stored is None:
@@ -4757,6 +4764,19 @@ class TextTaskService:
         if (previous["_result_no_progress_reads"] < cls.UNRECOVERABLE_QUALIFIED_READS
                 or previous["_result_last_checked_at"] - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS):
             return False
+        if not cls._incomplete_compact_successor_context(previous):
+            return False
+        # The capacity predicate has already proved a historical sender claim
+        # is paired, finite, and expired.  Preserve that audit record instead
+        # of clearing it; recovery and internal claims remain active-work
+        # evidence and are never a continuation permission.
+        return not any(previous.get(key) is not None for key in (
+            "recovery_claim_id", "recovery_claimed_at",
+            "recovery_lease_until", "_recovery_claim_id", "_recovery_claim_until",
+        ))
+
+    @classmethod
+    def _incomplete_compact_successor_context(cls, previous):
         # Legacy sent Chat receipts can omit the outcome or retain an earlier
         # not_sent label. Reuse the original-result recovery proof for those
         # exact shapes; do not rewrite the original or accept an explicit null.
@@ -4778,14 +4798,36 @@ class TextTaskService:
                 or any(previous.get(key) for key in ("_completion", "_completion_of",
                                                      "_recovery_paused", "_recovery_suppressed"))):
             return False
-        # The capacity predicate has already proved a historical sender claim
-        # is paired, finite, and expired.  Preserve that audit record instead
-        # of clearing it; recovery and internal claims remain active-work
-        # evidence and are never a continuation permission.
-        return not any(previous.get(key) is not None for key in (
-            "recovery_claim_id", "recovery_claimed_at",
-            "recovery_lease_until", "_recovery_claim_id", "_recovery_claim_until",
-        ))
+        return True
+
+    @classmethod
+    def _workbench_derived_ineligibility_code(cls, original, mode, now):
+        """Distinguish a valid original still being observed from invalid input.
+
+        This classification never grants eligibility or changes saved evidence.
+        The same strict eligibility predicate remains the only send authority.
+        """
+        invalid = "CHAT_WORKBENCH_DERIVED_INPUT_INVALID"
+        if mode != "incomplete" or not cls._incomplete_compact_successor_context(original):
+            return invalid
+        observation = original.get("_original_result_observation")
+        if observation is not None and cls._safe_result_observation(observation, original) is None:
+            return invalid
+        times = [original.get(key) for key in (
+            "_result_observation_started_at", "_result_last_progress_at",
+            "_result_last_checked_at", "_result_wait_ended_at")]
+        if any(value is not None and (type(value) not in (int, float)
+                or not math.isfinite(value) or not 0 < value <= now) for value in times):
+            return invalid
+        reads = original.get("_result_no_progress_reads")
+        if reads is not None and (type(reads) is not int or reads < 0):
+            return invalid
+        started, progress, checked, ended = times
+        if (started is not None and any(value is not None and value < started
+                                       for value in (progress, checked, ended))
+                or progress is not None and checked is not None and progress > checked):
+            return invalid
+        return "CHAT_SUPERSEDE_PREDECESSOR_BUSY"
 
     def _prepare_supersede(self, db, owner, body, receipt):
         if "supersedes_request_id" not in body:
@@ -4838,11 +4880,12 @@ class TextTaskService:
                 expected = self._workbench_derived_body_from_stored(retained, previous_id, row[0], body)
                 child_id, child_hash = self._submission_identity(owner, expected)
                 marker = expected[self._WORKBENCH_DERIVED_MARKER]
-                if (expected != body or child_id != body.get("client_request_id")
-                        or not self._workbench_derived_mode_eligible(original, marker["mode"], self._now())):
+                if expected != body or child_id != body.get("client_request_id"):
                     raise ValueError
             except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
                 reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
+            if not self._workbench_derived_mode_eligible(original, marker["mode"], self._now()):
+                reject(self._workbench_derived_ineligibility_code(original, marker["mode"], self._now()))
             receipt[self._WORKBENCH_DERIVED_MARKER] = self._workbench_derived_marker(
                 original_input_hash=row[0], child_input_hash=child_hash,
                 mode=marker["mode"], derivation_kind=marker["derivation_kind"],
