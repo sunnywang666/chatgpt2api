@@ -332,16 +332,25 @@ def _completed_external_successor(mapping, children, request_message_id, current
     if not completed or active_tool or children.get(current_node):
         return None
     turns = []
-    for user_id in reversed(later_users):
+    for index, user_id in enumerate(reversed(later_users)):
         turn = _completed_request_turn(mapping, children, user_id, conversation_id,
                                        allow_completed_tool_call=True)
         if not turn:
             return None
         content = mapping[turn["final_message_id"]]["message"].get("content")
         parts = content.get("parts") if isinstance(content, dict) else None
-        if (not isinstance(content, dict) or content.get("content_type") != "text"
-                or not isinstance(parts, list) or not all(isinstance(part, str) for part in parts)
-                or not "".join(parts).strip()):
+        text_result = (isinstance(content, dict) and content.get("content_type") == "text"
+                       and isinstance(parts, list) and all(isinstance(part, str) for part in parts)
+                       and bool("".join(parts).strip()))
+        # The first later turn is the compact text child.  A later image turn
+        # may end with an intentionally empty assistant final, but only after
+        # this exact helper has verified its completed tool-result lineage.
+        image_result = (index > 0 and _completed_image_result(
+            mapping, children, user_id, conversation_id,
+        ))
+        if not text_result and not image_result:
+            return None
+        if image_result and image_result["final_message_id"] != turn["final_message_id"]:
             return None
         turns.append(turn)
     if any(mapping.get(turns[index + 1]["request_message_id"], {}).get("parent")

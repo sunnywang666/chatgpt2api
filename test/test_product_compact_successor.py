@@ -177,25 +177,29 @@ def test_invalid_advanced_successor_evidence_does_not_clear_unfinished(product_n
     assert saved["recovery_error_code"] == "RECOVERY_INVALID_RESULT"
 
 
-def add_finished_gallery(h):
+def add_finished_gallery(h, request_id="gallery", *, recovered=False):
     """Attach an already-finished earlier product step on the same Chat."""
     original = row(h.service)
     body = h.service.store.load_input(original["_input_ref"])
-    body.update(client_request_id="gallery", product_work={"product_ref": "fixture-product", "step_ref": "gallery"})
-    h.service.submit("owner", body, source="internal:content")
+    body.update(client_request_id=request_id, product_work={"product_ref": "fixture-product", "step_ref": request_id})
+    h.service.submit("owner", body, source=original["_source"])
     with h.service.store.transaction() as db:
-        gallery = h.service.store.read_receipt(db, "text", "owner", "gallery")
+        gallery = h.service.store.read_receipt(db, "text", "owner", request_id)
         old = h.service.store.read_receipt(db, "text", "owner", "old")
         successor = h.service.store.read_receipt(db, "text", "owner", "successor")
         gallery.update(status="succeeded", upstream_outcome="completed", content="saved gallery review",
-                       _upstream_terminal=True, _executing=False, _turn_reserved=False,
-                       _claim_id=None, _claim_until=None, _sequence=4746)
+                       _upstream_terminal=not recovered, _executing=False, _turn_reserved=False,
+                       _claim_id=None, _claim_until=None, _sequence=4746,
+                       **({"_turn_end_evidence": {"conversation_id": gallery["conversation_id"],
+                                                   "request_message_id": gallery["request_message_id"],
+                                                   "final_message_id": gallery["parent_message_id"],
+                                                   "observed_at": h.clock()}} if recovered else {}))
         old["_sequence"] = 5945
         successor["_sequence"] = 7122
-        h.service.store.write_receipt(db, "text", "owner", "gallery", gallery)
+        h.service.store.write_receipt(db, "text", "owner", request_id, gallery)
         h.service.store.write_receipt(db, "text", "owner", "old", old)
         h.service.store.write_receipt(db, "text", "owner", "successor", successor)
-    return row(h.service, "gallery")
+    return row(h.service, request_id)
 
 
 def add_later_product_member(h, request_id="later"):
@@ -289,6 +293,172 @@ def refresh_advanced_original(h, monkeypatch, document):
         None, receipt, document=document)
     h.service.recover('owner', 'old')
     return row(h.service)
+
+
+def add_completed_image_tail(h, successor, monkeypatch):
+    """Persist a bound generated image and reread its exact empty-final graph."""
+    from services.image_task_service import _request_hash
+
+    payload = {
+        "prompt": "render the approved product image", "model": "gpt-image-2", "size": "1024x1024",
+        "quality": "auto", "provider_binding_id": successor["provider_binding_id"],
+        "provider_account_identity": successor["provider_account_identity"],
+        "client_conversation_id": successor["client_conversation_id"],
+        "conversation_id": successor["conversation_id"], "parent_message_id": successor["parent_message_id"],
+        "retain_conversation": True, "_product_work": {**successor["_product_work"], "step_ref": "image-tail"},
+    }
+    with h.service.store.transaction() as db:
+        parent = h.service.store.runtime(db, successor["_product_work_key"])
+        image = {
+            "id": "image-tail", "owner_id": "owner", "status": "success", "mode": "generate",
+            "provider_binding_id": successor["provider_binding_id"],
+            "provider_account_identity": successor["provider_account_identity"],
+            "client_conversation_id": successor["client_conversation_id"],
+            "conversation_id": successor["conversation_id"], "parent_message_id": "image-final",
+            "request_message_id": "image-user", "binding_status": "bound", "request_hash": _request_hash("generate", payload),
+            "_input_ref": h.service.store.save_input({"payload": payload, "identity": {
+                "id": "owner", "role": "admin", "_trusted_source": successor["_source"]}, "mode": "generate"}),
+            "_product_work_key": successor["_product_work_key"], "_product_work": payload["_product_work"],
+            "_source": successor["_source"], "_scheduling_owner": successor["_source"],
+            "_sequence": successor["_sequence"] + 1, "_submission_started": True,
+            "upstream_outcome": "generated", "upstream_unfinished": False,
+            "result_file_ids": ["image-file"], "result_sediment_ids": [], "data": [{"b64_json": "AA=="}],
+            "_executing": False, "_turn_reserved": False, "_claim_id": None, "_claim_until": None,
+        }
+        parent["members"].append({"kind": "image", "owner": "owner", "request_id": "image-tail",
+                                  "step_ref": "image-tail"})
+        h.service.store.set_runtime(db, parent["key"], parent)
+        h.service.store.write_receipt(db, "image", "owner", "image-tail", image)
+    document = advanced_document_with_tail(h, successor)
+    text_final = successor["parent_message_id"]
+    document["mapping"][text_final]["children"] = ["image-user"]
+    document["mapping"].update({
+        "image-user": {"parent": text_final, "children": ["image-code"], "message": {
+            "id": "image-user", "author": {"role": "user"}, "status": "finished_successfully", "end_turn": True,
+            "content": {"content_type": "text", "parts": ["make the final image"]}}},
+        "image-code": {"parent": "image-user", "children": ["image-tool"], "message": {
+            "id": "image-code", "author": {"role": "assistant"}, "status": "finished_successfully", "end_turn": False,
+            "content": {"content_type": "code", "text": "generate"}}},
+        "image-tool": {"parent": "image-code", "children": ["image-final"], "message": {
+            "id": "image-tool", "author": {"role": "tool"}, "status": "finished_successfully",
+            "content": {"content_type": "multimodal_text", "parts": [{
+                "content_type": "image_asset_pointer", "asset_pointer": "file-service://image-file"}]}}},
+        "image-final": {"parent": "image-tool", "children": [], "message": {
+            "id": "image-final", "author": {"role": "assistant"}, "status": "finished_successfully",
+            "end_turn": True, "channel": "final", "content": {"content_type": "text", "parts": [""]}}},
+    })
+    document["current_node"] = "image-final"
+    original = refresh_advanced_original(h, monkeypatch, document)
+    assert original["_completed_successor_evidence"]["tail_steps"] == [{
+        "request_message_id": "image-user", "final_message_id": "image-final"}]
+    return original, row(h.service, "image-tail")
+
+
+def test_incomplete_advanced_successor_image_tail_closes_archives_and_restarts(product_no_final, monkeypatch):
+    from services.image_task_service import ImageTaskService
+    from services.work_lifecycle import WorkLifecycleService
+
+    h = product_no_final
+    images = ImageTaskService(h.root / "images.json", store=h.service.store, admission=h.admission)
+    _original, successor = advanced_to_own_successor(h, monkeypatch, workbench=True)
+    original, _image = add_completed_image_tail(h, successor, monkeypatch)
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    identity["_trusted_source"] = original["_source"]
+
+    def archive_image(owner, request_id, archived):
+        calls.append((owner, request_id, archived))
+        return {"request_id": request_id, "conversation_id": original["conversation_id"], "archived": archived}
+
+    monkeypatch.setattr(images, "archive_product_work", archive_image)
+    lifecycle = WorkLifecycleService(lifecycle.text, images, clock=h.clock)
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    with h.service.store.connect() as db:
+        parent = h.service.store.runtime(db, original["_product_work_key"])
+        child = h.service.store.runtime(db, parent["archive_keys"][0])
+        members = product._members(db, parent)
+        assert product.archive_turns_ready(db, child, [receipt for _, receipt in members])
+        assert child["target"]["conversation_id"] == original["conversation_id"]
+        assert child["archive"]["desired"] is True
+    assert lifecycle.process_one()
+    completed = product.get(identity, "fixture-product")
+    assert completed["state"] == "completed"
+    assert calls == [("owner", "image-tail", True)]
+    restarted = ProductWorkService(lifecycle.text, lifecycle.images, clock=h.clock)
+    assert restarted.resume(identity, "fixture-product", 1)["state"] == "active"
+    with h.service.store.connect() as db:
+        image_after = h.service.store.read_receipt(db, "image", "owner", "image-tail")
+    assert row(h.service) == original and image_after["request_hash"]
+
+
+@pytest.mark.parametrize("drift", ["wrong_parent", "wrong_result", "foreign", "active", "paused", "fork"])
+def test_incomplete_advanced_successor_image_tail_rejects_drift(product_no_final, monkeypatch, drift):
+    h = product_no_final
+    _original, successor = advanced_to_own_successor(h, monkeypatch, workbench=True)
+    original, _image = add_completed_image_tail(h, successor, monkeypatch)
+    with h.service.store.transaction() as db:
+        image = h.service.store.read_receipt(db, "image", "owner", "image-tail")
+        if drift == "wrong_parent":
+            image["parent_message_id"] = "wrong-final"
+        elif drift == "wrong_result":
+            image["data"] = []
+        elif drift == "foreign":
+            foreign = {**image, "owner_id": "foreign"}
+            h.service.store.write_receipt(db, "image", "foreign", "foreign-image", foreign)
+        elif drift == "active":
+            image["_executing"] = True
+        elif drift == "paused":
+            image["_recovery_paused"] = True
+        else:
+            original["_completed_successor_evidence"]["tail_steps"].append({
+                "request_message_id": "fork-user", "final_message_id": "fork-final"})
+            h.service.store.write_receipt(db, "text", "owner", "old", original)
+        h.service.store.write_receipt(db, "image", "owner", "image-tail", image)
+    product, _, calls, identity = product_lifecycle(h)
+    identity["_trusted_source"] = original["_source"]
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_"):
+        product.close(identity, "fixture-product", results_saved=True)
+    assert calls == []
+
+
+@pytest.mark.parametrize("step_ref", ["gallery", "attributes"])
+def test_incomplete_advanced_image_tail_accepts_recovered_completed_predecessor(
+        product_no_final, monkeypatch, step_ref):
+    h = product_no_final
+    _original, successor = advanced_to_own_successor(h, monkeypatch, workbench=True)
+    predecessor = add_finished_gallery(h, step_ref, recovered=True)
+    original, _image = add_completed_image_tail(h, row(h.service, "successor"), monkeypatch)
+    product, _, _, identity = product_lifecycle(h)
+    identity["_trusted_source"] = original["_source"]
+
+    assert predecessor.get("_upstream_terminal") is False
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    with h.service.store.connect() as db:
+        parent = h.service.store.runtime(db, original["_product_work_key"])
+        child = h.service.store.runtime(db, parent["archive_keys"][0])
+        product.load_archive_target(db, child)
+
+
+@pytest.mark.parametrize("proof_change", ["wrong_final", "wrong_request", "future_timestamp"])
+def test_incomplete_advanced_image_tail_rejects_invalid_recovered_predecessor(
+        product_no_final, monkeypatch, proof_change):
+    h = product_no_final
+    _original, successor = advanced_to_own_successor(h, monkeypatch, workbench=True)
+    predecessor = add_finished_gallery(h, recovered=True)
+    original, _image = add_completed_image_tail(h, row(h.service, "successor"), monkeypatch)
+    with h.service.store.transaction() as db:
+        gallery = h.service.store.read_receipt(db, "text", "owner", predecessor["request_id"])
+        if proof_change == "wrong_final":
+            gallery["_turn_end_evidence"]["final_message_id"] = "wrong-final"
+        elif proof_change == "wrong_request":
+            gallery["_turn_end_evidence"]["request_message_id"] = "wrong-request"
+        else:
+            gallery["_turn_end_evidence"]["observed_at"] = h.clock() + 1
+        h.service.store.write_receipt(db, "text", "owner", predecessor["request_id"], gallery)
+    product, _, calls, identity = product_lifecycle(h)
+    identity["_trusted_source"] = original["_source"]
+    with pytest.raises(WorkLifecycleError, match="PRODUCT_WORK_"):
+        product.close(identity, "fixture-product", results_saved=True)
+    assert calls == []
 
 
 def test_incomplete_advanced_own_successor_closes_archives_and_resumes(product_no_final, monkeypatch):
