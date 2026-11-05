@@ -1371,7 +1371,7 @@ class TextTaskService:
                     or not isinstance(node["id"], str) or not 1 <= len(node["id"]) <= 200
                     or node["id"] in ids or node["id"] == value["request_message_id"]
                     or node["role"] not in {"assistant", "tool"}
-                    or node["status"] not in {"in_progress", "running", "pending", "queued", "finished_successfully"}
+                    or node["status"] not in {"in_progress", "running", "pending", "queued", "finished_successfully", "finished_partial_completion"}
                     or type(node["end_turn"]) is not bool
                     or type(node["text_chars"]) is not int or not 0 <= node["text_chars"] <= 100_000_000
                     or not isinstance(node["content_type"], str) or node["content_type"] not in OBSERVED_CONTENT_TYPES
@@ -1405,6 +1405,25 @@ class TextTaskService:
                         or diagnostic["is_complete"] is not None and type(diagnostic["is_complete"]) is not bool
                         or diagnostic["finish_type"] not in (None, "stop", "max_tokens", "length", "interrupted", "other")):
                     return None
+        partials = [node for node in normalized if node["status"] == "finished_partial_completion"]
+        if partials:
+            if (len(partials) != 1 or partials[0] is not normalized[-1]
+                    or partials[0]["role"] != "assistant" or partials[0]["end_turn"] is not False
+                    or partials[0]["content_type"] != "text" or partials[0]["text_chars"] <= 0
+                    or "phase" not in value or value["phase"]["current_node_relation"] != "observed"
+                    or value["phase"]["current_node_id"] != partials[0]["id"]):
+                return None
+            tail_phase = value["phase"]["nodes"][-1]
+            if (tail_phase.get("channel") != "final" or tail_phase.get("recipient") != "all"
+                    or tail_phase.get("metadata_channel") not in (None, "final")):
+                return None
+            final_text = [node for node, diagnostic in zip(normalized, value["phase"]["nodes"])
+                          if node["role"] == "assistant" and node["content_type"] == "text"
+                          and diagnostic["channel"] == "final" and diagnostic["recipient"] == "all"]
+            if final_text != partials:
+                return None
+            if any(node["status"] != "finished_successfully" for node in normalized if node["role"] == "tool"):
+                return None
         return {**value, "nodes": normalized}
 
     @staticmethod
@@ -3170,7 +3189,7 @@ class TextTaskService:
             return self._public(receipt)
 
     def observe_workbench_derived_acceptance(self, owner, request_id, payload, *, source):
-        """Read whether one frozen advanced successor was accepted at this instant.
+        """Read whether one frozen advanced/incomplete successor was accepted at this instant.
 
         This deliberately has no submit, admission, content-review, or wake path.
         A final second local observation prevents an absent answer from masking an
@@ -3179,7 +3198,11 @@ class TextTaskService:
         """
         from services.advanced_session_successor import MODE
 
-        if payload.get("mode") != MODE:
+        # This endpoint is a local reconciliation surface, not a second
+        # derivation policy.  Keep its existing isolated-session mode and the
+        # one already-governed incomplete mode only; no-final and other paths
+        # remain intentionally unavailable here.
+        if payload.get("mode") not in {MODE, "incomplete"}:
             raise ConversationBindingError(
                 "advanced successor acceptance requires advanced_new_session",
                 code="CHAT_ADVANCED_SESSION_INVALID",
@@ -4397,6 +4420,13 @@ class TextTaskService:
                 reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
         if previous.get("_executing") or previous.get("_turn_reserved"):
             reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
+        audit = successor.get(TextTaskService._WORKBENCH_DERIVED_MARKER)
+        if (not incomplete_retry and isinstance(audit, dict) and audit.get("mode") == "incomplete"
+                and audit.get("original_input_hash") == row[0]
+                and successor.get("_supersedes_input_hash") == row[0]
+                and TextTaskService._workbench_derived_ineligibility_code(previous, "incomplete", now)
+                    == "CHAT_SUPERSEDE_PREDECESSOR_BUSY"):
+            reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
         if (not rejected_model and not native_no_final_retry and not incomplete_retry and (previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
                 or previous.get("upstream_outcome") != "unknown"
                 or (not TextTaskService._no_final_successor_source(previous, now)
@@ -4442,7 +4472,7 @@ class TextTaskService:
                     or not isinstance(audit.get("child_input_hash"), str)):
                 reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
             if not TextTaskService._workbench_derived_mode_eligible(previous, audit["mode"], now):
-                reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
+                reject(TextTaskService._workbench_derived_ineligibility_code(previous, audit["mode"], now))
             try:
                 stored = successor.get("_workbench_derived_body")
                 if stored is None:
@@ -4734,6 +4764,19 @@ class TextTaskService:
         if (previous["_result_no_progress_reads"] < cls.UNRECOVERABLE_QUALIFIED_READS
                 or previous["_result_last_checked_at"] - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS):
             return False
+        if not cls._incomplete_compact_successor_context(previous):
+            return False
+        # The capacity predicate has already proved a historical sender claim
+        # is paired, finite, and expired.  Preserve that audit record instead
+        # of clearing it; recovery and internal claims remain active-work
+        # evidence and are never a continuation permission.
+        return not any(previous.get(key) is not None for key in (
+            "recovery_claim_id", "recovery_claimed_at",
+            "recovery_lease_until", "_recovery_claim_id", "_recovery_claim_until",
+        ))
+
+    @classmethod
+    def _incomplete_compact_successor_context(cls, previous):
         # Legacy sent Chat receipts can omit the outcome or retain an earlier
         # not_sent label. Reuse the original-result recovery proof for those
         # exact shapes; do not rewrite the original or accept an explicit null.
@@ -4755,14 +4798,36 @@ class TextTaskService:
                 or any(previous.get(key) for key in ("_completion", "_completion_of",
                                                      "_recovery_paused", "_recovery_suppressed"))):
             return False
-        # The capacity predicate has already proved a historical sender claim
-        # is paired, finite, and expired.  Preserve that audit record instead
-        # of clearing it; recovery and internal claims remain active-work
-        # evidence and are never a continuation permission.
-        return not any(previous.get(key) is not None for key in (
-            "recovery_claim_id", "recovery_claimed_at",
-            "recovery_lease_until", "_recovery_claim_id", "_recovery_claim_until",
-        ))
+        return True
+
+    @classmethod
+    def _workbench_derived_ineligibility_code(cls, original, mode, now):
+        """Distinguish a valid original still being observed from invalid input.
+
+        This classification never grants eligibility or changes saved evidence.
+        The same strict eligibility predicate remains the only send authority.
+        """
+        invalid = "CHAT_WORKBENCH_DERIVED_INPUT_INVALID"
+        if mode != "incomplete" or not cls._incomplete_compact_successor_context(original):
+            return invalid
+        observation = original.get("_original_result_observation")
+        if observation is not None and cls._safe_result_observation(observation, original) is None:
+            return invalid
+        times = [original.get(key) for key in (
+            "_result_observation_started_at", "_result_last_progress_at",
+            "_result_last_checked_at", "_result_wait_ended_at")]
+        if any(value is not None and (type(value) not in (int, float)
+                or not math.isfinite(value) or not 0 < value <= now) for value in times):
+            return invalid
+        reads = original.get("_result_no_progress_reads")
+        if reads is not None and (type(reads) is not int or reads < 0):
+            return invalid
+        started, progress, checked, ended = times
+        if (started is not None and any(value is not None and value < started
+                                       for value in (progress, checked, ended))
+                or progress is not None and checked is not None and progress > checked):
+            return invalid
+        return "CHAT_SUPERSEDE_PREDECESSOR_BUSY"
 
     def _prepare_supersede(self, db, owner, body, receipt):
         if "supersedes_request_id" not in body:
@@ -4815,11 +4880,12 @@ class TextTaskService:
                 expected = self._workbench_derived_body_from_stored(retained, previous_id, row[0], body)
                 child_id, child_hash = self._submission_identity(owner, expected)
                 marker = expected[self._WORKBENCH_DERIVED_MARKER]
-                if (expected != body or child_id != body.get("client_request_id")
-                        or not self._workbench_derived_mode_eligible(original, marker["mode"], self._now())):
+                if expected != body or child_id != body.get("client_request_id"):
                     raise ValueError
             except (OSError, ValueError, TypeError, KeyError, ConversationBindingError):
                 reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
+            if not self._workbench_derived_mode_eligible(original, marker["mode"], self._now()):
+                reject(self._workbench_derived_ineligibility_code(original, marker["mode"], self._now()))
             receipt[self._WORKBENCH_DERIVED_MARKER] = self._workbench_derived_marker(
                 original_input_hash=row[0], child_input_hash=child_hash,
                 mode=marker["mode"], derivation_kind=marker["derivation_kind"],

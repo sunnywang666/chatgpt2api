@@ -48,7 +48,47 @@ def incomplete_document(original, *, change=None):
     return document
 
 
-def install_incomplete(h, *, prompt=None, input_body=None):
+def partial_document(original, *, change=None):
+    """Provider's exact incomplete text-final shape: no terminal success."""
+    document = incomplete_document(original)
+    document["mapping"]["active"]["children"] = ["code"]
+    document["mapping"]["code"] = {"parent": "active", "children": ["tool"], "message": {
+        "id": "code", "author": {"role": "assistant"}, "status": "finished_successfully",
+        "end_turn": False, "channel": "analysis", "recipient": "container.exec",
+        "content": {"content_type": "code", "text": "done"}}}
+    document["mapping"]["tool"] = {"parent": "code", "children": ["partial"], "message": {
+        "id": "tool", "author": {"role": "tool"}, "status": "finished_successfully",
+        "end_turn": False, "recipient": "all",
+        "content": {"content_type": "execution_output", "text": "ok"}}}
+    document["mapping"]["partial"] = {"parent": "tool", "children": [], "message": {
+        "id": "partial", "author": {"role": "assistant"}, "status": "finished_partial_completion",
+        "end_turn": None, "channel": "final", "recipient": "all",
+        "content": {"content_type": "text", "parts": ["partial business answer"]}}}
+    document["current_node"] = "partial"
+    if change == "late_final":
+        document["mapping"]["partial"]["message"].update(status="finished_successfully", end_turn=True)
+    elif change == "later_user":
+        document["mapping"]["partial"]["children"] = ["later"]
+        document["mapping"]["later"] = {"parent": "partial", "children": [], "message": {
+            "id": "later", "author": {"role": "user"}, "status": "finished_successfully",
+            "end_turn": True, "content": {"content_type": "text", "parts": ["later work"]}}}
+        document["current_node"] = "later"
+    elif change == "fork":
+        document["mapping"]["tool"]["children"] = ["partial", "other"]
+        document["mapping"]["other"] = {"parent": "tool", "children": [], "message": {
+            "id": "other", "author": {"role": "assistant"}, "status": "in_progress",
+            "end_turn": False, "content": {"content_type": "thoughts", "thoughts": [
+                {"summary": "other", "content": "", "finished": False, "chunks": []}]}}}
+    elif change == "active_tool":
+        document["mapping"]["tool"]["message"]["status"] = "in_progress"
+    elif change == "invalid_end_turn":
+        document["mapping"]["partial"]["message"]["end_turn"] = 1
+    elif change == "contradictory_metadata":
+        document["mapping"]["partial"]["message"]["metadata"] = {"channel": "analysis"}
+    return document
+
+
+def install_incomplete(h, *, prompt=None, input_body=None, document_factory=incomplete_document):
     if input_body is not None:
         h.body.update(deepcopy(input_body))
     else:
@@ -61,7 +101,7 @@ def install_incomplete(h, *, prompt=None, input_body=None):
     with h.service.store.transaction() as db:
         original = h.service.store.read_receipt(db, "text", "owner", "old")
         original.update(_input_ref=h.service.store.save_input(h.body), model=MODEL, thinking_effort=EFFORT)
-        document = incomplete_document(original)
+        document = document_factory(original)
         observed = ConversationBindingService._read_text_request_result(None, original, document=document)
         assert observed["recovery_reason"] == "REQUEST_RESULT_INCOMPLETE"
         original.update(status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN", upstream_outcome="unknown",
@@ -80,12 +120,56 @@ def install_incomplete(h, *, prompt=None, input_body=None):
     h.envelope.update(client_request_id="successor", supersedes_request_id="old",
                       derived_input={"kind": KIND}, continue_after_incomplete=True)
     h.document = document
+    h.document_factory = document_factory
+    return h
+
+
+def begin_partial_observation(h):
+    """Start the real reader cadence without preloading an observation proof."""
+    prompt = legacy_prompt([branch(0), branch(1)])
+    h.body.update(model=MODEL, thinking_effort=EFFORT, messages=[{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "text", "text": '{"image_ref":"source-a"}'},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}},
+    ]}])
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        original.update(_input_ref=h.service.store.save_input(h.body), model=MODEL, thinking_effort=EFFORT,
+                        status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",
+                        recovery_reason="REQUEST_RESULT_INCOMPLETE", _submission_started=True,
+                        _executing=False, _turn_reserved=False, _claim_id=None, _claim_until=None,
+                        recovery_claim_id=None, recovery_claimed_at=None, recovery_lease_until=None,
+                        recovery_next_at=h.clock.now)
+        # The live incident omitted this field.  Keep that compatibility form
+        # while proving observations only through the reader below.
+        original.pop("upstream_outcome", None)
+        for key in ("_original_result_observation", "_result_wait_ended_at", "_execution_wait_ended_at",
+                    "_result_observation_started_at", "_result_last_progress_at",
+                    "_result_last_checked_at", "_result_no_progress_reads"):
+            original.pop(key, None)
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+        db.execute("UPDATE requests SET request_hash=? WHERE owner='owner' AND id='old'",
+                   (TextTaskService._submission_identity("owner", h.body)[1],))
+    h.document = partial_document(original)
+    h.document_factory = partial_document
+    h.service.recovery_reader = lambda receipt: ConversationBindingService._read_text_request_result(
+        None, receipt, document=h.document)
+    for index in range(6):
+        if index:
+            h.clock.now += 301
+        h.service.read("owner", "old")
+    h.old = row(h.service)
     return h
 
 
 @pytest.fixture
 def incomplete(task):
     return install_incomplete(task)
+
+
+@pytest.fixture
+def partial(task):
+    return install_incomplete(task, document_factory=partial_document)
 
 
 def patch_bound_runner(monkeypatch, h, *, before_send_change=None, before_send_document=None, before_send_once=False):
@@ -120,7 +204,7 @@ def patch_bound_runner(monkeypatch, h, *, before_send_change=None, before_send_d
         if before_send_document is not None:
             h.document = deepcopy(before_send_document)
         elif pending_change[0]:
-            h.document = incomplete_document(h.old, change=pending_change[0])
+            h.document = h.document_factory(h.old, change=pending_change[0])
             if before_send_once:
                 pending_change[0] = None
         backend.text_pre_send_check(None)
@@ -152,6 +236,101 @@ def set_original_outcome(h, outcome):
             original["upstream_outcome"] = outcome
         h.service.store.write_receipt(db, "text", "owner", "old", original)
     h.old = row(h.service)
+
+
+def test_partial_text_final_is_incomplete_observation_not_success(partial):
+    h = partial
+    observed = ConversationBindingService._read_text_request_result(None, h.old, document=h.document)
+
+    assert observed["status"] == "running"
+    assert observed["recovery_reason"] == "REQUEST_RESULT_INCOMPLETE"
+    assert "content" not in observed
+    assert observed["parent_message_id"] == h.old["parent_message_id"]
+    observation = observed["_original_result_observation"]
+    assert observation["nodes"][-1]["status"] == "finished_partial_completion"
+    assert TextTaskService._safe_result_observation(observation, h.old) == observation
+
+
+def test_partial_text_final_qualified_child_reaches_send_edge(partial, monkeypatch):
+    h = partial
+    calls = patch_bound_runner(monkeypatch, h)
+
+    accepted = h.service.submit("owner", h.envelope)
+    h.admission.execute(h.admission.claim_next())
+
+    assert accepted["status"] == "queued"
+    assert row(h.service, "successor")["status"] == "succeeded"
+    assert calls == ["read", "read", "send", "read"]
+    assert row(h.service) == h.old
+
+
+def test_partial_text_final_later_terminal_answer_is_adopted(partial):
+    h = partial
+    observed = ConversationBindingService._read_text_request_result(
+        None, h.old, document=partial_document(h.old, change="late_final"))
+
+    assert observed["status"] == "succeeded"
+    assert observed["content"] == "partial business answer"
+    assert "_original_result_observation" not in observed
+
+
+def test_partial_reader_accumulates_then_workbench_acceptance_and_send(task, monkeypatch):
+    h = begin_partial_observation(task)
+    assert h.old.get("upstream_outcome") is None and "upstream_outcome" not in h.old
+    assert h.old["_result_no_progress_reads"] >= 3
+    assert h.old["_result_last_checked_at"] - h.old["_result_observation_started_at"] >= 900
+    assert h.old["_result_wait_ended_at"] >= h.old["_result_observation_started_at"]
+    assert TextTaskService._incomplete_compact_successor_source(h.old, h.clock.now)
+    execution = h.service.read("owner", "old")["execution"]
+    assert execution["result_state"] == "incomplete"
+    assert execution["upstream_status"] == "finished_partial_completion"
+    assert execution["observation_started_at"] == h.old["_result_observation_started_at"]
+    assert execution["last_checked_at"] == h.old["_result_last_checked_at"]
+    assert execution["unchanged_reads"] == h.old["_result_no_progress_reads"]
+    assert "available" not in execution.values() and "empty" not in execution.values()
+
+    retained = h.service.read_retained_input("owner", "old", source="internal:listing")
+    request = {
+        "client_request_id": "workbench-partial", "original_input_hash": retained["input_hash"],
+        "messages": deepcopy(retained["input"]["messages"]), "model": MODEL,
+        "thinking_effort": EFFORT, "mode": "incomplete", "derivation_kind": "wb-partial-v1",
+    }
+    absence = h.service.observe_workbench_derived_acceptance(
+        "owner", "old", request, source="internal:listing")
+    body = h.service.prepare_workbench_derived_input("owner", "old", request, source="internal:listing")
+    child_hash = TextTaskService._submission_identity("owner", body)[1]
+    assert absence == {
+        "state": "absent_at_observation", "original_request_id": "old",
+        "client_request_id": "workbench-partial", "original_input_hash": retained["input_hash"],
+        "child_input_hash": child_hash,
+    }
+    calls = patch_bound_runner(monkeypatch, h)
+    accepted = h.service.submit_workbench_derived_input(
+        "owner", "old", request, source="internal:listing")
+    saved = row(h.service, "workbench-partial")
+    assert saved["_workbench_derived_input"]["child_input_hash"] == absence["child_input_hash"]
+    assert h.service.observe_workbench_derived_acceptance(
+        "owner", "old", request, source="internal:listing") == accepted
+    assert row(h.service, "workbench-partial") == saved and calls == []
+
+    h.admission.execute(h.admission.claim_next())
+    assert row(h.service, "workbench-partial")["status"] == "succeeded"
+    assert calls == ["read", "read", "send", "read"]
+
+
+@pytest.mark.parametrize("change", ["late_final", "fork", "later_user", "active_tool",
+                                     "invalid_end_turn", "contradictory_metadata"])
+def test_partial_text_final_changed_tail_cannot_send(partial, monkeypatch, change):
+    h = partial
+    calls = patch_bound_runner(monkeypatch, h, before_send_change=change)
+
+    h.service.submit("owner", h.envelope)
+    h.admission.execute(h.admission.claim_next())
+
+    successor = row(h.service, "successor")
+    assert successor["status"] == "failed" and successor["upstream_outcome"] == "not_sent"
+    assert "send" not in calls
+    assert row(h.service) == h.old
 
 
 @pytest.mark.parametrize("outcome", ["unknown", "missing", "not_sent"])

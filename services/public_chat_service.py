@@ -175,7 +175,8 @@ EXECUTION_ENUMS = {
     "local_state": {"not_started", "active", "ended", "unknown"},
     "wait_state": {"waiting", "ended", "completed", "unknown"},
     "upstream_outcome": {"not_sent", "unknown", "completed", "rejected"},
-    "upstream_status": {"in_progress", "running", "pending", "queued", "finished_successfully"},
+    "upstream_status": {"in_progress", "running", "pending", "queued", "finished_successfully",
+                        "finished_partial_completion"},
     "stream_end": {"done", "eof", "hard_timeout", "transport_error", "consumer_closed"},
     "sse_error_category": {"rate_limit", "quota", "auth", "upstream", "unknown"},
 }
