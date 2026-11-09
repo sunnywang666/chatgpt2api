@@ -474,6 +474,10 @@ def _successor(store, db, owner, previous, receipt):
     from services.generation_completion import same_session_retry
     if same_session_retry(previous, receipt):
         return True
+    if previous.get("mode") in {"generate", "edit"} and receipt.get("mode") in {"generate", "edit"}:
+        from services.image_quota_successor import registration_successor
+        if registration_successor(previous, receipt):
+            return True
     rid = previous.get("request_id") or previous.get("id")
     if receipt.get("_terminal_empty_correction_of") == rid:
         from services.text_task_service import TextTaskService
@@ -490,6 +494,35 @@ def _successor(store, db, owner, previous, receipt):
     if _codex_bridge_successor(store, db, owner, previous, receipt):
         return True
     return False
+
+
+def _quota_failover_chain(store, db, parent, root, child, members):
+    """Recognize one saved, successful fresh-account image replacement."""
+    if root.get("mode") not in {"generate", "edit"} or child.get("mode") != root.get("mode"):
+        return None
+    try:
+        from services.image_quota_successor import is_successor, prepared_payload
+        root_body = store.load_input(root["_input_ref"])
+        child_body = store.load_input(child["_input_ref"])
+        expected = prepared_payload(root_body["payload"], root, child.get("request_id") or child.get("id"))
+    except (OSError, ValueError, TypeError, KeyError, ImportError):
+        return None
+    if (not is_successor(root, child, after_send=True)
+            or child_body.get("mode") != root.get("mode") or child_body.get("payload") != expected
+            or child.get("status") != "success" or child.get("upstream_outcome") != "generated"
+            or child.get("upstream_unfinished") is not False or not child.get("data")
+            or child.get("binding_status") != "bound" or _claims(child)
+            or _unresolved(child, [row for _, row in members])):
+        return None
+    root_member = next((member for member, row in members if row is root), None)
+    child_member = next((member for member, row in members if row is child), None)
+    if (not root_member or not child_member
+            or root_member.get("kind") != "image" or child_member.get("kind") != "image"
+            or root_member.get("step_ref") != child_member.get("step_ref")
+            or root.get("_product_work") != _metadata(parent, root_member["step_ref"])
+            or child.get("_product_work") != _metadata(parent, child_member["step_ref"])):
+        return None
+    return {"original": root, "successor": child}
 
 
 def _advanced_session_child(store, db, parent, receipt, members, now, *, after_send=False,
@@ -1997,8 +2030,18 @@ class ProductWorkService:
         waived.update(self._codex_rejected_retry_waivers(db, parent, members))
         waived.update(self._advanced_session_waivers(db, parent, members))
         waived.update(_manual_followup_waivers(self.store, db, parent, members))
+        # A strict quota terminal is retained for audit and old-session
+        # archive, but its one proved fresh-account child resolves that exact
+        # ProductWork step.  No generic error/UNKNOWN is waived here.
+        by_id = {(row.get("request_id") or row.get("id")): row for _member, row in members}
+        for _member, child in members:
+            original_id = child.get("_completion_of")
+            root = by_id.get(original_id)
+            if root and _quota_failover_chain(self.store, db, parent, root, child, members):
+                waived.add(original_id)
         from services.text_task_service import TextTaskService
         for member, receipt in members:
+            receipt_id = receipt.get("request_id") or receipt.get("id")
             cancelled_unsent = _cancelled_unsent_step(self.store, db, parent, member, receipt)
             if receipt.get(_CANCELLED_UNSENT_STEP) and not cancelled_unsent:
                 reasons.add("PRODUCT_WORK_TURN_UNFINISHED")
@@ -2011,14 +2054,14 @@ class ProductWorkService:
             # its R/P/A4 facts changes later, retain the product rather than
             # silently choosing the normal max-sequence archive target.
             if (receipt.get(TextTaskService.MISSING_NODE_RETRY_FIELD)
-                    and receipt.get("request_id") not in valid_continues):
+                    and receipt_id not in valid_continues):
                 reasons.add("PRODUCT_WORK_TURN_UNFINISHED")
             replaced = _rejected_chat_replaced(self.store, db, member["owner"], receipt, members)
-            if not replaced and receipt.get("request_id") not in waived and _unresolved(receipt, receipts):
+            if not replaced and receipt_id not in waived and _unresolved(receipt, receipts):
                 reasons.add("PRODUCT_WORK_TURN_UNFINISHED")
             status = receipt.get("status")
             if outcome == "completed" and status not in {"succeeded", "success"}:
-                if not (replaced or receipt.get("request_id") in waived
+                if not (replaced or receipt_id in waived
                         or status in {"unknown", "failed", "error"} and not _unresolved(receipt, receipts)
                         and (receipt.get("upstream_outcome") == "unknown" or receipt.get("upstream_unfinished"))):
                     reasons.add("PRODUCT_WORK_RESULT_REQUIRED")

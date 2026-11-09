@@ -17,7 +17,7 @@ from services.work_lifecycle import WorkLifecycleError
 
 class CompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    action: Literal["recover", "retry", "complete", "rework"] = "recover"
+    action: Literal["recover", "retry", "complete", "rework", "quota_failover"] = "recover"
     allow_unconfirmed_retry: bool = Field(default=False, strict=True)
     retry_not_sent_failure_at: float | None = Field(default=None, gt=0, allow_inf_nan=False, strict=True)
     selected_id: str | None = Field(default=None, min_length=1, max_length=200)
@@ -28,10 +28,10 @@ class CompletionRequest(BaseModel):
     def validate_action(self):
         if self.retry_not_sent_failure_at is not None and (self.action != "recover" or self.allow_unconfirmed_retry):
             raise ValueError("confirmed not-sent repair is a separate recovery action")
-        if self.action == "retry":
+        if self.action in {"retry", "quota_failover"}:
             if (self.selected_id or self.results_saved or self.reviewed or self.allow_unconfirmed_retry
                     or self.retry_not_sent_failure_at is not None):
-                raise ValueError("bound retry has no caller-supplied retry authority")
+                raise ValueError("named attempt has no caller-supplied retry authority")
         elif self.action == "complete":
             if not self.selected_id or not self.results_saved or not self.reviewed or self.allow_unconfirmed_retry:
                 raise ValueError("completion requires the selected result, saved and reviewed")
@@ -51,7 +51,7 @@ def create_router(kind):
                   admin_bound_action: str | None = None):
         identity = require_identity(authorization, request=request)
         if (identity.get("role") != "user"
-                and not (admin_bound_action in {"recover", "retry"} and identity.get("role") == "admin")):
+                and not (admin_bound_action in {"recover", "retry", "quota_failover"} and identity.get("role") == "admin")):
             raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
         service = get_generation_completion_service()
         try:
@@ -60,6 +60,7 @@ def create_router(kind):
                     db, kind, str(identity["id"]), request_id,
                     read_only_original=(admin_bound_action == "recover" and identity.get("role") == "admin"),
                     trusted_bound_retry=(admin_bound_action == "retry" and identity.get("role") == "admin"),
+                    trusted_quota_failover=(admin_bound_action == "quota_failover" and identity.get("role") == "admin"),
                 )
             if enforce_policy and kind == "text":
                 if row.get("_route") == "codex":
@@ -74,11 +75,14 @@ def create_router(kind):
 
     @router.get(path)
     async def read_completion(request_id: str, request: Request, authorization: str | None = Header(default=None),
-                              action: Literal["retry"] | None = Query(default=None)):
+                              action: Literal["retry", "quota_failover"] | None = Query(default=None)):
         internal_retry = action == "retry"
+        quota_failover = action == "quota_failover"
+        if quota_failover and (is_external(request) or getattr(request.state, "company_identity", None) is not None):
+            raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
         identity, service, _row = authorize(request, authorization, request_id,
-                                            enforce_policy=internal_retry,
-                                            admin_bound_action="retry" if internal_retry else None)
+                                            enforce_policy=internal_retry or quota_failover,
+                                            admin_bound_action=("retry" if internal_retry else "quota_failover" if quota_failover else None))
         if internal_retry:
             if (getattr(request.state, "company_identity", None) is not None
                     or identity.get("role") != "admin" or is_external(request)):
@@ -100,6 +104,14 @@ def create_router(kind):
                 }, headers={"Cache-Control": "private, no-store"})
             except WorkLifecycleError as exc:
                 raise HTTPException(exc.status, detail={"code": exc.code}) from None
+        if quota_failover:
+            if kind != "image" or identity.get("role") != "admin":
+                raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
+            try:
+                result = await run_in_threadpool(service.read_quota_attempt, identity, request_id)
+                return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
+            except WorkLifecycleError as exc:
+                raise HTTPException(exc.status, detail={"code": exc.code}) from None
         try:
             return await run_in_threadpool(service.read, kind, identity, request_id)
         except WorkLifecycleError as exc:
@@ -108,15 +120,22 @@ def create_router(kind):
     @router.post(path)
     async def update_completion(request_id: str, body: CompletionRequest, request: Request,
                                 authorization: str | None = Header(default=None)):
-        requested_admin_action = body.action if body.action in {"recover", "retry"} else None
+        if body.action == "quota_failover" and (is_external(request) or getattr(request.state, "company_identity", None) is not None):
+            raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
+        if body.action == "quota_failover" and kind != "image":
+            raise HTTPException(400, detail={"code": "COMPLETION_QUOTA_FAILOVER_IMAGE_REQUIRED"})
+        requested_admin_action = body.action if body.action in {"recover", "retry", "quota_failover"} else None
         identity, service, before = authorize(request, authorization, request_id, enforce_policy=True,
                                                admin_bound_action=requested_admin_action)
         company_original_only = getattr(request.state, "company_identity", None) is not None
         admin_original_only = identity.get("role") == "admin"
         if body.action == "retry" and not admin_original_only:
             raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
+        if body.action == "quota_failover" and not admin_original_only:
+            raise HTTPException(403, detail={"code": "ORDINARY_KEY_REQUIRED"})
         if admin_original_only:
-            allowed = {"recover": {"action", "allow_unconfirmed_retry"}, "retry": {"action"}}
+            allowed = {"recover": {"action", "allow_unconfirmed_retry"}, "retry": {"action"},
+                       "quota_failover": {"action"}}
             if body.action not in allowed or body.allow_unconfirmed_retry or body.model_fields_set - allowed[body.action]:
                 # Recovery remains original-only. Retry is a named command
                 # with no caller-provided retry authority or input.
@@ -134,6 +153,9 @@ def create_router(kind):
             if kind != "image" or body.allow_unconfirmed_retry or body.model_fields_set - fields:
                 raise HTTPException(403, detail={"code": "COMPANY_ORIGINAL_RECOVERY_REQUIRED"})
         try:
+            if body.action == "quota_failover":
+                result = await run_in_threadpool(service.quota_failover, identity, request_id)
+                return JSONResponse(result, headers={"Cache-Control": "private, no-store"})
             if body.action == "complete":
                 return await run_in_threadpool(service.complete, kind, identity, request_id, body.selected_id)
             if body.action == "rework":
