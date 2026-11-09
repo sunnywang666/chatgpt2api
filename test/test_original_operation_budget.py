@@ -128,6 +128,56 @@ def cursor(session="blocked"):
             "parent_message_id": "final", "request_message_id": "user", "request_parent_message_id": "root"}
 
 
+@pytest.mark.parametrize("case", ["paced", "lock_exhausted", "dispatch_expired", "shorter_caller"])
+def test_original_image_recovery_credits_only_local_read_pacing(local_upstream, monkeypatch, case):
+    """Real backend and account FIFO: five processing seconds survive a 90s floor."""
+    import services.account_request_pacing as pacing
+    from services.image_task_service import ImageTaskService
+    from services.request_context import operation_remaining
+    from contextlib import nullcontext
+
+    now = [1000.0]
+    monkeypatch.setattr(pacing.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(pacing.time, "time", lambda: now[0])
+    monkeypatch.setattr(pacing.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(type(pacing.config), "account_conversation_read_interval_secs", property(lambda _: 90.0))
+    monkeypatch.setattr(type(pacing.config), "account_conversation_read_burst", property(lambda _: 1))
+    backend = local_upstream.backend("fixture-token")
+    backend._get_conversation("original")
+    local_upstream.calls.clear()
+    local_upstream.transport_attempts.clear()
+    # Exercise the real resume budget wrapper without constructing a controller
+    # or changing durable tasks. Its body models time spent acquiring a lock.
+    service = ImageTaskService.__new__(ImageTaskService)
+    def bounded(*args):
+        if case == "lock_exhausted":
+            now[0] += 6.0
+        result = backend._get_conversation("original")
+        assert operation_remaining(60) <= 5.0
+        # Network/CPU time after the read is not credited or reset either.
+        now[0] += 6.0
+        with pytest.raises(pacing.AccountRequestDeadlineExceeded):
+            operation_remaining(60)
+        return result
+    service._run_resume_poll_bounded = bounded
+    deadline = 999.0 if case == "dispatch_expired" else 1005.0
+    ceiling = operation_deadline(1002.0) if case == "shorter_caller" else nullcontext()
+    with ceiling:
+        if case == "paced":
+            result = service._run_resume_poll("key", "original", 5, "", {}, "generate", "model", False, False,
+                                              recovery_deadline=deadline)
+            assert result["current_node"] == "final"
+            assert now[0] == 1096.0
+            assert local_upstream.calls == [("GET", "/backend-api/conversation/original")]
+            timeout = local_upstream.transport_attempts[0]["timeout"]
+            assert (sum(timeout) if isinstance(timeout, tuple) else timeout) <= 5.0
+        else:
+            with pytest.raises(pacing.AccountRequestDeadlineExceeded):
+                service._run_resume_poll("key", "original", 5, "", {}, "generate", "model", False, False,
+                                         recovery_deadline=deadline)
+            assert local_upstream.calls == []
+
+
 def product_archive_stack(tmp_path):
     """Build the real ProductWork archive branch, including its physical lock."""
     from services.product_work import ProductWorkService
