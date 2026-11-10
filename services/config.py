@@ -606,8 +606,11 @@ class ConfigStore:
     @contextmanager
     def resource_settings_guard(self):
         """Keep a claim/send check ordered with a settings revision change."""
+        # Shared readers must remain concurrent. The file lock prevents a
+        # revision change; the in-process lock belongs only to short reads/writes.
+        # Holding it across yield serializes unrelated claim/capability reads.
         self._resource_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._update_lock, self._resource_path.with_suffix(".lock").open("a+b") as lock:
+        with self._resource_path.with_suffix(".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_SH)
             try:
                 yield
@@ -630,40 +633,43 @@ class ConfigStore:
                     and not _valid_temporary_firstsend_model_trial(firstsend_trial_update))):
             raise ValueError("resource_settings_invalid")
         self._resource_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._update_lock, self._resource_path.with_suffix(".lock").open("a+b") as lock:
+        with self._resource_path.with_suffix(".lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
-                current = self.resource_settings()
-                if current["revision"] != expected_revision:
-                    raise ValueError("resource_settings_conflict")
-                chat_limit = current["chat_account_concurrency"] if chat_account_concurrency is None else chat_account_concurrency
-                trial = (current.get("temporary_chat_second_slot")
-                         if trial_update is _KEEP_CHAT_TRIAL else trial_update)
-                firstsend_trial = (current.get("temporary_firstsend_model_trial")
-                                   if firstsend_trial_update is _KEEP_FIRSTSEND_MODEL_TRIAL else firstsend_trial_update)
-                if trial is not None and chat_limit != 1:
-                    raise ValueError("temporary_chat_second_slot_requires_global_one")
-                result = {"revision": expected_revision + 1,
-                          "image_account_concurrency": image_account_concurrency,
-                          "codex_max_concurrency": codex_max_concurrency,
-                          "chat_account_concurrency": chat_limit}
-                if trial is not None:
-                    result["temporary_chat_second_slot"] = dict(trial)
-                if firstsend_trial is not None:
-                    result["temporary_firstsend_model_trial"] = dict(firstsend_trial)
-                if (len(result) == len(current)
-                        and all(result[key] == current[key] for key in result if key != "revision")):
-                    return current
-                # Reuse the pool's atomic JSON persistence; only technical
-                # settings live here. The bind-mounted credential/config file
-                # is never rewritten by this operation.
-                storage = JSONStorageBackend(self._resource_path)
-                try:
-                    storage.save_accounts([result])
-                except AccountCommitUncertain:
-                    if storage.confirm_accounts_commit() != [result]:
-                        raise
-                return result
+                # Acquire the file lock first: guarded readers may need the
+                # short in-process settings lock while this writer waits.
+                with self._update_lock:
+                    current = self.resource_settings()
+                    if current["revision"] != expected_revision:
+                        raise ValueError("resource_settings_conflict")
+                    chat_limit = current["chat_account_concurrency"] if chat_account_concurrency is None else chat_account_concurrency
+                    trial = (current.get("temporary_chat_second_slot")
+                             if trial_update is _KEEP_CHAT_TRIAL else trial_update)
+                    firstsend_trial = (current.get("temporary_firstsend_model_trial")
+                                       if firstsend_trial_update is _KEEP_FIRSTSEND_MODEL_TRIAL else firstsend_trial_update)
+                    if trial is not None and chat_limit != 1:
+                        raise ValueError("temporary_chat_second_slot_requires_global_one")
+                    result = {"revision": expected_revision + 1,
+                              "image_account_concurrency": image_account_concurrency,
+                              "codex_max_concurrency": codex_max_concurrency,
+                              "chat_account_concurrency": chat_limit}
+                    if trial is not None:
+                        result["temporary_chat_second_slot"] = dict(trial)
+                    if firstsend_trial is not None:
+                        result["temporary_firstsend_model_trial"] = dict(firstsend_trial)
+                    if (len(result) == len(current)
+                            and all(result[key] == current[key] for key in result if key != "revision")):
+                        return current
+                    # Reuse the pool's atomic JSON persistence; only technical
+                    # settings live here. The bind-mounted credential/config file
+                    # is never rewritten by this operation.
+                    storage = JSONStorageBackend(self._resource_path)
+                    try:
+                        storage.save_accounts([result])
+                    except AccountCommitUncertain:
+                        if storage.confirm_accounts_commit() != [result]:
+                            raise
+                    return result
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 

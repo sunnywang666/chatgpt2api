@@ -1,6 +1,11 @@
 import json
 from datetime import datetime, timezone
+import select
+import subprocess
+import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -20,6 +25,106 @@ class PoolResourceTests(unittest.TestCase):
         self.path = Path(self.tmp.name) / "config.json"
         self.path.write_text(json.dumps({"auth-key": "test-pool-management-secret"}))
         self.config = ConfigStore(self.path)
+
+    def test_shared_settings_read_finishes_while_another_claim_guard_is_held(self):
+        def read():
+            with self.config.resource_settings_guard():
+                return self.config.resource_settings()
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with self.config.resource_settings_guard():
+                future = executor.submit(read)
+                # The reader must finish before the unrelated claim releases
+                # its shared file lock; this is not a throughput benchmark.
+                result = future.result(timeout=2)
+                self.assertEqual(result["revision"], 0)
+
+    def test_waiting_settings_writer_does_not_block_guarded_reader_or_invert_locks(self):
+        import fcntl
+        import services.config as config_module
+        writer_waiting = threading.Event()
+        original_flock = fcntl.flock
+        mutex = threading.RLock()
+
+        class BoundedLock:
+            def __enter__(self):
+                if not mutex.acquire(timeout=3):
+                    raise TimeoutError("settings file/memory lock inversion")
+
+            def __exit__(self, *args):
+                mutex.release()
+
+        self.config._update_lock = BoundedLock()
+
+        def flock(fd, operation):
+            if operation == fcntl.LOCK_EX:
+                writer_waiting.set()
+            return original_flock(fd, operation)
+
+        def read():
+            with self.config.resource_settings_guard():
+                return self.config.resource_settings()
+
+        with patch.object(config_module.fcntl, "flock", side_effect=flock), ThreadPoolExecutor(max_workers=2) as executor:
+            with self.config.resource_settings_guard():
+                writer = executor.submit(self.config.update_resource_settings, 0, 2, 3)
+                self.assertTrue(writer_waiting.wait(2))
+                self.assertFalse(writer.done())
+                self.assertEqual(executor.submit(read).result(timeout=2)["revision"], 0)
+            self.assertEqual(writer.result(timeout=2)["revision"], 1)
+        self.assertEqual(ConfigStore(self.path).resource_settings()["revision"], 1)
+
+    def test_concurrent_settings_writers_keep_revision_compare_and_swap(self):
+        start = threading.Barrier(2)
+
+        def update(store, value):
+            start.wait(timeout=2)
+            try:
+                return store.update_resource_settings(0, value, 3)
+            except ValueError as error:
+                return str(error)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Separate instances cannot rely on one process-local mutex for CAS.
+            futures = [executor.submit(update, store, value) for store, value in
+                       ((self.config, 2), (ConfigStore(self.path), 4))]
+            results = [future.result(timeout=3) for future in futures]
+        self.assertEqual(sum(isinstance(result, dict) for result in results), 1)
+        self.assertEqual(results.count("resource_settings_conflict"), 1)
+        self.assertEqual(ConfigStore(self.path).resource_settings()["revision"], 1)
+
+    def test_other_process_cannot_update_resource_revision_during_guard(self):
+        script = '''
+import fcntl, json, sys
+from pathlib import Path
+from services.config import ConfigStore
+config = ConfigStore(Path(sys.argv[1]))
+original = fcntl.flock
+def flock(fd, operation):
+    if operation == fcntl.LOCK_EX:
+        print("writer_at_exclusive_lock", flush=True)
+    return original(fd, operation)
+fcntl.flock = flock
+print(json.dumps(config.update_resource_settings(0, 2, 3)), flush=True)
+'''
+        process = None
+        try:
+            with self.config.resource_settings_guard():
+                process = subprocess.Popen([sys.executable, "-c", script, str(self.path)],
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                ready, _, _ = select.select([process.stdout], [], [], 5)
+                self.assertTrue(ready, "writer process did not reach its file lock")
+                self.assertEqual(process.stdout.readline().strip(), "writer_at_exclusive_lock")
+                self.assertIsNone(process.poll())
+                self.assertEqual(self.config.resource_settings()["revision"], 0)
+            stdout, _ = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0)
+            self.assertEqual(json.loads(stdout)["revision"], 1)
+            self.assertEqual(ConfigStore(self.path).resource_settings()["revision"], 1)
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
 
     def test_settings_persist_compare_revision_and_do_not_overwrite_other_config(self):
         self.config.update_resource_settings(0, 2, 3)
