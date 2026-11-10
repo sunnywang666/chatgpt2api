@@ -27,7 +27,7 @@ def read(service, request_id):
 
 
 @pytest.fixture
-def retry(tmp_path):
+def retry(tmp_path, request):
     (tmp_path / "accounts.json").write_text(json.dumps([{
         "access_token": "fixture", "account_id": "fixture-account",
         "provider_account_identity": "account-0", "conversation_binding_ids": ["binding-0"],
@@ -49,7 +49,7 @@ def retry(tmp_path):
         "provider_binding_id": "binding-0", "provider_account_identity": "account-0",
         "conversation_id": "conversation-0", "parent_message_id": "A",
         "messages": [{"role": "user", "content": "retained private input"}],
-        "product_work": {"product_ref": "product-0", "step_ref": "direct-listing.content.copy:P"},
+        "product_work": {"product_ref": "product-0", "step_ref": getattr(request, "param", "direct-listing.content.copy:P")},
     }
     service.submit("owner", original, source=SOURCE)
     original_context = admission.claim_next()
@@ -337,3 +337,77 @@ def test_http_schema_is_internal_reference_only(retry, monkeypatch):
             assert public["retry_unsent_request_id"] == "P"
             assert not {"supersedes_request_id", "continue_after_no_final", "continue_after_incomplete", "derived_input"} & set(public)
         assert review.await_count == 1
+
+
+@pytest.mark.parametrize("retry", ["direct-listing.content.main-image-review:P", "opaque-review-step",
+                                   "direct-listing.content.copy:P"], indirect=True)
+@pytest.mark.parametrize("tamper", [None, "sent_original", "unknown_child", "changed_input", "second_child", "wrong_product", "after_close"])
+def test_bound_product_retry_closes_only_with_exact_successor(retry, monkeypatch, tamper):
+    from services.product_work import ProductWorkService
+    from services.work_lifecycle import WorkLifecycleService, WorkLifecycleError
+    from types import SimpleNamespace
+    import services.text_task_service as text_module
+
+    service, admission, store, clock, original, envelope, sent, before, _ = retry
+    monkeypatch.setattr(text_module.conversation_binding_service, "bound_unsent_retry_cursor",
+                        lambda _r: {k: v for k, v in envelope.items()
+                                    if k not in {"retry_unsent_request_id", "client_request_id"}})
+    calls = []
+    def archive(owner, rid, value):
+        calls.append(rid)
+        return {"request_id": rid, "conversation_id": "conversation-0", "archived": value}
+    service.archive_product_work = archive
+    images = SimpleNamespace(archive_product_work=archive)
+    lifecycle = WorkLifecycleService(service, images, clock=clock)
+    product = ProductWorkService(service, images, clock=clock)
+    identity = {"id": "owner", "role": "admin", "_trusted_source": SOURCE}
+    first = service.retry_bound_attempt("owner", "P")
+    child_id = first["attempt"]["request_id"]
+    assert service.retry_bound_attempt("owner", "P")["attempt"]["request_id"] == child_id
+    accepted = read(service, child_id)
+    metadata = original["product_work"]
+    expected_step = ("direct-listing.content.copy:" + child_id
+                     if metadata["step_ref"] == "direct-listing.content.copy:P" else metadata["step_ref"])
+    assert accepted["_product_work"] == {**metadata, "step_ref": expected_step}
+    ctx = admission.claim_next()
+    assert ctx and ctx.request_id == child_id
+    admission.execute(ctx)
+    admission.update_claim(ctx, _claim_id=None, _claim_until=0, _turn_reserved=False)
+    child = read(service, child_id)
+    assert child["status"] == "succeeded" and len(sent) == 1
+    with store.connect() as db:
+        assert db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?", ("owner", "P")).fetchone() == before
+    if tamper == "after_close":
+        assert product.close(identity, "product-0")["state"] == "closing"
+    with store.transaction() as db:
+        if tamper in {"sent_original", "after_close"}:
+            root = store.read_receipt(db, "text", "owner", "P")
+            root.update(_submission_started=True, send_count=1)
+            store.write_receipt(db, "text", "owner", "P", root)
+        elif tamper == "unknown_child":
+            child.update(status="unknown", upstream_outcome="unknown")
+            store.write_receipt(db, "text", "owner", child_id, child)
+        elif tamper == "changed_input":
+            body = store.load_input(child["_input_ref"])
+            child["_input_ref"] = store.save_input({**body, "messages": [{"role": "user", "content": "changed"}]})
+            store.write_receipt(db, "text", "owner", child_id, child)
+        elif tamper == "second_child":
+            db.execute("INSERT INTO requests VALUES(?,?,?,?)", ("owner", "extra", "hash", json.dumps({
+                "request_id": "extra", "_retry_unsent_of": "P", "status": "failed"})))
+        elif tamper == "wrong_product":
+            child["_product_work"] = {**child["_product_work"], "product_ref": "other"}
+            store.write_receipt(db, "text", "owner", child_id, child)
+    if tamper == "after_close":
+        lifecycle.process_one()
+        assert product.get(identity, "product-0")["state"] == "closing"
+        assert calls == []
+    elif tamper:
+        with pytest.raises(WorkLifecycleError):
+            product.close(identity, "product-0")
+        assert calls == []
+    else:
+        assert product.close(identity, "product-0")["state"] == "closing"
+        assert lifecycle.process_one()
+        assert product.get(identity, "product-0")["state"] == "completed"
+        assert calls == [child_id]
+        assert service.retry_bound_attempt("owner", "P")["attempt"]["request_id"] == child_id

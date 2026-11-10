@@ -1,6 +1,7 @@
 import copy
 import json
 from datetime import datetime, timezone
+import pytest
 
 from services.image_quota_successor import (
     FAILURE_REASON,
@@ -83,7 +84,8 @@ def test_image_receipt_id_is_accepted_as_the_durable_request_identity():
     assert is_successor(original, candidate, after_send=True)
 
 
-def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_closes_both_sessions(tmp_path, monkeypatch):
+@pytest.mark.parametrize("review_retry", [False, True])
+def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_closes_both_sessions(tmp_path, monkeypatch, review_retry):
     """API -> frozen edit bytes -> alternate-account admission -> close/archive."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -231,6 +233,8 @@ def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_clos
     assert repeated.status_code == 200 and repeated.json()["attempt_id"] == attempt_id
     assert repeated.json()["existing"] is True and repeated.json()["created"] is False
     assert repeated.json()["status"] == "succeeded"
+    archive_tail = (_complete_unsent_review_retry(client, text, admission, attempt_id, monkeypatch)
+                    if review_retry else attempt_id)
     product = ProductWorkService(text, images, clock=admission.clock)
     closed = product.close(admin, "P-2344")
     assert closed["archive"]["total"] == 2 and closed["state"] == "closing"
@@ -239,15 +243,17 @@ def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_clos
     archived = []
     def archive(owner, request_id, value):
         with text.store.connect() as db:
-            target = text.store.read_receipt(db, "image", owner, request_id)
+            target = (text.store.read_receipt(db, "image", owner, request_id)
+                      or text.store.read_receipt(db, "text", owner, request_id))
         archived.append((request_id, value))
         return {"request_id": request_id, "conversation_id": target["conversation_id"], "archived": value}
     images.archive_product_work = archive
+    text.archive_product_work = archive
     for _ in range(8):
         service.lifecycle.process_one()
         if product.get(admin, "P-2344")["state"] == "completed":
             break
-    assert {request_id for request_id, value in archived if value} == {"legacy-2344", attempt_id}
+    assert {request_id for request_id, value in archived if value} == {"legacy-2344", archive_tail}
     completed = product.get(admin, "P-2344")
     assert completed["state"] == "completed" and completed["archive"] == {"total": 2, "confirmed": 2, "pending": 0}
     final_repeat = client.post("/api/image-tasks/legacy-2344/completion", json={"action": "quota_failover"})
@@ -261,4 +267,52 @@ def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_clos
     with text.store.connect() as db:
         original = text.store.read_receipt(db, "image", "admin", "legacy-2344")
     assert original["status"] == "error" and original["error_code"] == "NO_IMAGE_GENERATED"
+
+
+def _complete_unsent_review_retry(client, text, admission, image_id, monkeypatch):
+    from services.conversation_binding_service import ConversationBindingError, conversation_binding_service
+    from services.request_context import current_request
+    with text.store.connect() as db:
+        image = text.store.read_receipt(db, "image", "admin", image_id)
+    metadata = {"product_ref": "P-2344", "step_ref": "direct-listing.content.main-image-review:review-Q"}
+    authority = {k: image[k] for k in ("provider_binding_id", "provider_account_identity",
+                                      "client_conversation_id", "conversation_id", "parent_message_id")}
+    body = {"client_request_id": "review-Q", "model": "fixture-text", **authority,
+            "messages": [{"role": "user", "content": "review the saved image"}], "product_work": metadata}
+    def fail_before_send(_body, on_cursor):
+        raise ConversationBindingError("fixture stale parent", code="CONVERSATION_BINDING_MISMATCH")
+    text.runner = fail_before_send
+    admission.register("text", lambda ctx, value: text._run(ctx.owner, ctx.request_id, value))
+    text.submit("admin", body, source="internal:listing")
+    ctx = admission.claim_next()
+    assert ctx and ctx.request_id == "review-Q"
+    admission.execute(ctx)
+    admission.clock.now += 1000  # Retire the historical lease, without clearing the failed original.
+    with text.store.connect() as db:
+        original = text.store.read_receipt(db, "text", "admin", "review-Q")
+    assert original["upstream_outcome"] == "not_sent" and original["_submission_started"] is False
+    monkeypatch.setattr(conversation_binding_service, "bound_unsent_retry_cursor", lambda _r: authority)
+    path = "/api/chat-requests/review-Q/completion"
+    missing = client.get(path + "?action=retry")
+    assert missing.status_code == 404 and missing.json()["detail"]["code"] == "TASK_ATTEMPT_NOT_FOUND"
+    response = client.post(path, json={"action": "retry"})
+    assert response.status_code == 200, response.text
+    retry_id = response.json()["attempt_id"]
+    assert client.post(path, json={"action": "retry"}).json()["attempt_id"] == retry_id
+    def finish_review(value, on_cursor):
+        assert value["product_work"] == metadata and value["messages"] == body["messages"]
+        current_request.get().before_send()
+        return {"content": "review saved", "parent_message_id": "review-final"}
+    text.runner = finish_review
+    ctx = admission.claim_next()
+    assert ctx and ctx.request_id == retry_id
+    admission.execute(ctx)
+    admission.update_claim(ctx, _claim_id=None, _claim_until=0, _turn_reserved=False)
+    with text.store.connect() as db:
+        assert text.store.read_receipt(db, "text", "admin", "review-Q") == original
+        saved = text.store.read_receipt(db, "text", "admin", retry_id)
+        assert saved["status"] == "succeeded" and saved["content"] == "review saved"
+    result = client.get(path + "?action=retry")
+    assert result.json()["attempt_id"] == retry_id and result.json()["result_ready"] is True
+    return retry_id
 

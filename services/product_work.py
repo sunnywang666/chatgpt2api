@@ -470,9 +470,50 @@ def _rejected_chat_replaced(store, db, owner, receipt, members):
     )
 
 
+def _unsent_retry_successor(store, db, owner, previous, receipt, now, *, registering=False):
+    """Prove a retained-input retry of an exact, never-sent bound request."""
+    from services.text_task_service import TextTaskService
+    from services.conversation_binding_service import ConversationBindingError
+    original_id, child_id = previous.get("request_id"), receipt.get("request_id")
+    if (not original_id or not child_id or original_id == child_id
+            or receipt.get("_retry_unsent_of") != original_id
+            or not previous.get("_source") or receipt.get("_source") != previous["_source"]
+            or any(not previous.get(k) or receipt.get(k) != previous[k] for k in (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"))
+            or type(previous.get("_sequence")) is not int
+            or type(receipt.get("_sequence")) is not int
+            or not 0 < previous["_sequence"] < receipt["_sequence"]):
+        return False
+    root_row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                          (owner, original_id)).fetchone()
+    child_row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                           (owner, child_id)).fetchone()
+    children = db.execute("SELECT id FROM requests WHERE owner=? AND "
+                          "(json_extract(receipt,'$._retry_unsent_of')=? OR "
+                          "json_extract(receipt,'$._supersedes_request_id')=?)",
+                          (owner, original_id, original_id)).fetchall()
+    if (not root_row or receipt.get("_retry_unsent_input_hash") != root_row[0]
+            or (children != [(child_id,)] and not (registering and not children))
+            or not registering and not child_row):
+        return False
+    try:
+        retained = store.load_input(previous["_input_ref"])
+        body = store.load_input(receipt["_input_ref"])
+        envelope = {key: body.get(key) for key in TextTaskService.RETRY_UNSENT_FIELDS}
+        expected = TextTaskService._unsent_retry_body_at(
+            owner, original_id, root_row[0], previous, retained, envelope, child_id, now=now)
+        return bool(body == expected
+                    and (child_row is None or TextTaskService._submission_identity(owner, body) == (child_id, child_row[0]))
+                    and (registering or receipt.get("_product_work") == body.get("product_work")))
+    except (OSError, ValueError, TypeError, KeyError, ConversationBindingError, WorkLifecycleError):
+        return False
+
+
 def _successor(store, db, owner, previous, receipt):
     from services.generation_completion import same_session_retry
     if same_session_retry(previous, receipt):
+        return True
+    if _unsent_retry_successor(store, db, owner, previous, receipt, time.time(), registering=True):
         return True
     if previous.get("mode") in {"generate", "edit"} and receipt.get("mode") in {"generate", "edit"}:
         from services.image_quota_successor import registration_successor
@@ -1911,6 +1952,26 @@ class ProductWorkService:
                 waived.update(item["request_id"] for item in chain["resolved"])
         return waived
 
+    def _unsent_retry_waivers(self, db, parent, members):
+        """A saved successful retry resolves only its proved unsent original."""
+        by_id = {m["request_id"]: (m, r) for m, r in members if m["kind"] == "text"}
+        waived = set()
+        for member, receipt in by_id.values():
+            original = by_id.get(receipt.get("_retry_unsent_of"))
+            if not original:
+                continue
+            original_member, previous = original
+            if (receipt.get("status") != "succeeded" or receipt.get("upstream_outcome") != "completed"
+                    or not isinstance(receipt.get("content"), str) or not receipt["content"].strip()
+                    or receipt.get("upstream_unfinished") or _claims(receipt)
+                    or any(row.get("_product_work_key") != parent["key"]
+                           or row.get("_product_work") != _metadata(parent, item["step_ref"])
+                           for item, row in ((member, receipt), (original_member, previous)))
+                    or not _unsent_retry_successor(self.store, db, parent["owner"], previous, receipt, float(self.clock()))):
+                continue
+            waived.add(previous["request_id"])
+        return waived
+
     def _owned_advanced_successor_chains(self, db, parent, members):
         """Return only compact children proven by the original-reader branch proof."""
         chains = {}
@@ -2003,6 +2064,7 @@ class ProductWorkService:
         owned = self._members(db, parent)
         waived = self._missing_node_waivers(db, parent, owned)
         waived.update(self._no_final_successor_waivers(db, parent, owned))
+        waived.update(self._unsent_retry_waivers(db, parent, owned))
         waived.update(self._codex_rejected_retry_waivers(db, parent, owned))
         waived.update(self._advanced_session_waivers(db, parent, owned))
         waived.update(_manual_followup_waivers(self.store, db, parent, owned))
@@ -2027,6 +2089,7 @@ class ProductWorkService:
             waived.update(chain[name]["request_id"] for name in ("original", "rejected"))
             valid_continues.add(chain["continue"]["request_id"])
         waived.update(self._no_final_successor_waivers(db, parent, members))
+        waived.update(self._unsent_retry_waivers(db, parent, members))
         waived.update(self._codex_rejected_retry_waivers(db, parent, members))
         waived.update(self._advanced_session_waivers(db, parent, members))
         waived.update(_manual_followup_waivers(self.store, db, parent, members))
