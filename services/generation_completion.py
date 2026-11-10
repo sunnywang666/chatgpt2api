@@ -62,6 +62,24 @@ def read_only_original_selected(state, request_id):
     )
 
 
+def original_image_read_blocked(receipt, now):
+    """Recheck under the image claim transaction as well as orchestration."""
+    if any(receipt.get(key) for key in (
+        "_recovery_paused", "_recovery_suppressed", "_send_hold", "_executing",
+    )) or receipt.get("status") == "running":
+        return True
+    for claim, until in (("_claim_id", "_claim_until"),
+                         ("recovery_claim_id", "recovery_lease_until"),
+                         ("_recovery_claim_id", "_recovery_claim_until")):
+        expiry = receipt.get(until)
+        if expiry is not None and (not isinstance(expiry, (int, float))
+                or isinstance(expiry, bool) or not math.isfinite(expiry) or expiry > now):
+            return True
+        if receipt.get(claim) and expiry is None:
+            return True
+    return False
+
+
 def successful(kind, receipt):
     return bool(receipt and receipt.get("status") == ("succeeded" if kind == "text" else "success")
                 and (receipt.get("content") if kind == "text" else receipt.get("data")))
@@ -564,7 +582,7 @@ class GenerationCompletionService:
                     self._queue_not_sent(root, state, now, kind)
                     state["retried_not_sent_failure_at"] = stamp
                     self.store.write_receipt(db, kind, owner, request_id, root)
-        self.advance(kind, owner, request_id)
+        self.advance(kind, owner, request_id, explicit_original_read=read_only_original)
         if not read_only_original:
             self.text.admission.wake()
         return self.read(kind, identity, request_id)
@@ -855,7 +873,7 @@ class GenerationCompletionService:
             work["slot_held"] = False
             self.store.set_runtime(db, work_key, work)
 
-    def advance(self, kind, owner, request_id):
+    def advance(self, kind, owner, request_id, *, explicit_original_read=False):
         now = float(self.clock())
         with self.store.transaction() as db:
             root = self._root(db, kind, owner, request_id)
@@ -870,14 +888,31 @@ class GenerationCompletionService:
             # the normal durable claim. Repeated API calls cannot bypass cooldown.
             if float(state.get("next_at") or 0) > now:
                 return
-            if state.get("state") == "needs_attention" and state.get("next_at") is None:
-                return
+            if state.get("state") == "needs_attention":
+                original_read = kind == "image" and read_only_original_state(state)
+                if original_read:
+                    # Only the explicit original-only command may revisit this
+                    # stopped UNKNOWN. Keep the same request and zero sends;
+                    # a GET, restart or scheduler tick is not read authority.
+                    if (not explicit_original_read
+                            or state.get("reason") != "COMPLETION_ORIGINAL_END_UNCONFIRMED"
+                            or root.get("status") != "error" or root.get("upstream_outcome") != "unknown"
+                            or root.get("error_code") not in {"RESULT_UNRECOVERABLE", "CONVERSATION_OUTCOME_UNKNOWN"}
+                            or root.get("_attempt_finished_at")
+                            or root.get("_image_thread") is not None
+                            or state.get("bound_retry") is not True or state.get("same_request_retry") is not True
+                            or original_image_read_blocked(root, now)):
+                        return
+                    state["state"] = "checking_original"
+                elif state.get("next_at") is None:
+                    return
             state["next_at"] = now + self.RECHECK_SECONDS
             self.store.write_receipt(db, kind, owner, request_id, root)
         # Existing exact-original readers preserve Retry-After/backoff and errors.
         if kind == "text":
             self.text.read(owner, request_id)
         elif (root.get("status") == "error" and unresolved(root)
+              and (not read_only_original_state(state) or explicit_original_read)
               and now - float(root.get("_completion_read_at") or 0) > self.INVESTIGATION_SECONDS):
             self.images.resume_poll({"id": owner}, request_id, extra_timeout_secs=5,
                                     allow_unrecoverable_retry=True, completion_recheck=True)
@@ -946,7 +981,12 @@ class GenerationCompletionService:
                         "COMPLETION_ORIGINAL_ACTIVE", "COMPLETION_INVESTIGATING_ORIGINAL"} else "checking_original", reason=exc.code)
                     if state["state"] == "needs_attention":
                         paused = exc.code in {"COMPLETION_WORK_NOT_ACTIVE", "COMPLETION_ORIGINAL_RECOVERY_PAUSED"}
-                        state["next_at"] = now + self.RECHECK_SECONDS if paused else None
+                        # Retain the existing read lease for repeated explicit
+                        # UNKNOWN reads, including transport failures that did
+                        # not produce a _completion_read_at observation.
+                        explicit_cooldown = (kind == "image" and read_only_original_state(state)
+                                             and exc.code == "COMPLETION_ORIGINAL_END_UNCONFIRMED")
+                        state["next_at"] = now + self.RECHECK_SECONDS if paused or explicit_cooldown else None
                         # End automatic investigation, not the upstream fact.
                         definitely_unsent = root.get("upstream_outcome") in {"not_sent", "not_submitted"} and root.get("_submission_started") is not True
                         if not active and (definitely_unsent or (state.get("allow_unconfirmed_retry") or state.get("automatic_failure_retry")) and unresolved(root)) and exc.code not in {
@@ -1022,6 +1062,8 @@ class GenerationCompletionService:
             candidates = [(kind, owner, rid, row) for kind, owner, rid, row in self.store.receipts(
                               db, statuses=(), include_pending_completion=True)
                           if row.get("_completion", {}).get("state") not in {None, "completed", "result_ready"}
+                          and not (read_only_original_state(row.get("_completion"))
+                                   and row["_completion"].get("state") == "needs_attention")
                           and not row.get("_recovery_paused") and not row.get("_recovery_suppressed")
                           and row.get("_completion", {}).get("next_at") is not None
                           and float(row["_completion"].get("next_at") or 0) <= float(self.clock())]

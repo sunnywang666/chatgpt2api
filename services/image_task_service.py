@@ -2320,6 +2320,10 @@ class ImageTaskService:
             task = self._tasks.get(key)
             if task is None:
                 raise ValueError("task not found")
+            from services.generation_completion import original_image_read_blocked, read_only_original_state
+            if (completion_recheck and read_only_original_state(task.get("_completion"))
+                    and original_image_read_blocked(task, self.admission.clock() if self.admission else time.time())):
+                return _public_task(task)
             saved_image = bool(task.get("result_file_ids") or task.get("result_sediment_ids"))
             # Pending evidence permits another original read, never direct download.
             saved_image = saved_image or bool(pending_image_result_ids(task))

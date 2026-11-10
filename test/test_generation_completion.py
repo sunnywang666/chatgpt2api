@@ -766,7 +766,11 @@ def test_full_app_legacy_admin_original_receipt_stays_read_only_and_can_offer_te
         service.images._tasks[f"{owner}:{request_id}"] = receipt
         return receipt
 
-    legacy_receipt("admin", "legacy-false")
+    legacy_receipt("admin", "legacy-false", _completion_read_at=1,
+                   _completion={"state": "needs_attention", "next_at": None,
+                                "reason": "COMPLETION_ORIGINAL_END_UNCONFIRMED",
+                                "allow_unconfirmed_retry": False, "max_extra_requests": 0,
+                                "bound_retry": True, "same_request_retry": True})
     legacy_receipt("admin", "legacy-missing", retain=None)
     legacy_receipt(user_key["id"], "ordinary-false")
     connector = "1f084f01-d4b2-4080-8bce-b926f31cc454"
@@ -1331,3 +1335,264 @@ def test_cancelled_replacement_pending_slot_cleanup_respects_submitted_member(se
         assert service.store.runtime(db, original["_work_key"])["slot_held"] is submitted_member
     assert row(service) == original and row(service, request_id=child_id) == child
     assert calls == []
+
+
+@pytest.fixture
+def stopped_original_image(failed_unsent_image):
+    """Same stopped, sent, no-child shape as the historical bound edit."""
+    service = failed_unsent_image
+    with service.store.transaction() as db:
+        original = copy.deepcopy(service.store.read_receipt(db, 'image', 'owner', 'repair-image'))
+        original.update(id='stopped-original', owner_id='admin', retain_receipt=False,
+                        mode='edit', status='error', error_code='RESULT_UNRECOVERABLE',
+                        upstream_outcome='unknown', _submission_started=True, upstream_submission_started=True,
+                        _attempt_finished_at=None, _executing=False, _turn_reserved=False, _image_thread=None,
+                        _claim_id=None, _claim_until=0, active_attempt_deadline_at=None,
+                        provider_binding_id='binding-legacy', provider_account_identity='account-legacy',
+                        client_conversation_id='client-legacy', conversation_id='conversation-legacy',
+                        request_message_id='request-1', _completion_read_at=1,
+                        recovery_no_result_reads=3,
+                        _completion={'state':'needs_attention', 'started_at':1,
+                                     'allow_unconfirmed_retry':False, 'max_extra_requests':0,
+                                     'next_at':None, 'bound_retry':True, 'same_request_retry':True,
+                                     'reason':'COMPLETION_ORIGINAL_END_UNCONFIRMED'})
+        service.store.write_receipt(db, 'image', 'admin', original['id'], original)
+    service.text.admission.wake = Mock()
+    service.images.generation_handler = Mock(side_effect=AssertionError('no generation'))
+    service.images.edit_handler = Mock(side_effect=AssertionError('no edit'))
+    return service, original
+
+
+def recover_stopped_original(service):
+    return service.start('image', {'id':'admin','role':'admin'}, 'stopped-original',
+                         original_only=True, read_only_original=True)
+
+
+def stopped_image_row(service):
+    with service.store.connect() as db:
+        return service.store.read_receipt(db, 'image', 'admin', 'stopped-original')
+
+
+@pytest.mark.parametrize('outcome', ['success', 'quota', 'unknown', 'transport_failure'])
+def test_explicit_stopped_original_rechecks_once_without_send(stopped_original_image, outcome):
+    service, original = stopped_original_image
+    def settle(identity, request_id, **kwargs):
+        assert identity == {'id':'admin'} and request_id == original['id']
+        assert kwargs == {'extra_timeout_secs':5, 'allow_unrecoverable_retry':True, 'completion_recheck':True}
+        changes = {}
+        if outcome != 'transport_failure':
+            changes['_completion_read_at'] = service.clock()
+        if outcome == 'success':
+            changes.update(status='success', data=[{'b64_json':'c2F2ZWQ='}], upstream_outcome='generated')
+        elif outcome == 'quota':
+            changes.update(error_code='NO_IMAGE_GENERATED', upstream_outcome='failed',
+                           _authoritative_failure_reason='image_generation_quota_exhausted')
+        service.images._update_task('admin:stopped-original', **changes)
+    service.images.resume_poll = Mock(side_effect=settle)
+    result = recover_stopped_original(service)
+    assert service.images.resume_poll.call_count == 1
+    saved = stopped_image_row(service)
+    for field in ('provider_binding_id', 'provider_account_identity', 'client_conversation_id',
+                  'conversation_id', 'request_message_id', '_input_ref', 'request_hash'):
+        assert saved.get(field) == original.get(field)
+    assert saved['_completion']['max_extra_requests'] == 0
+    assert saved['_completion']['allow_unconfirmed_retry'] is False
+    assert not saved['_completion'].get('replacement_id') and not saved['_completion'].get('prepared_input')
+    if outcome == 'success':
+        assert result['selected_id'] == original['id'] and result['state'] == 'result_ready'
+    elif outcome == 'quota':
+        from services.image_task_service import _public_task
+        assert _public_task(saved)['failure_reason'] == 'image_generation_quota_exhausted'
+    else:
+        from api.task_results import _status
+        assert _status('image', saved) == 'unknown'
+    recover_stopped_original(service)
+    assert service.images.resume_poll.call_count == 1
+    service.clock.now += service.RECHECK_SECONDS + 1
+    # Restart/background scanning never authorizes another stopped read.
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted.process_one()
+    assert service.images.resume_poll.call_count == 1
+    recover_stopped_original(restarted)
+    assert service.images.resume_poll.call_count == (2 if outcome == 'transport_failure' else 1)
+    service.text.admission.wake.assert_not_called()
+    service.images.generation_handler.assert_not_called()
+    service.images.edit_handler.assert_not_called()
+
+
+@pytest.mark.parametrize('changes', [
+    {'_recovery_paused':True}, {'_recovery_suppressed':True}, {'_send_hold':True},
+    {'_executing':True}, {'_claim_id':'active', '_claim_until':3100},
+    {'recovery_claim_id':'active', 'recovery_lease_until':3100},
+    {'_recovery_claim_id':'active', '_recovery_claim_until':3100},
+    {'recovery_claim_id':'missing-expiry'}, {'_claim_until':float('nan')},
+    {'_attempt_finished_at':2500},
+])
+def test_stopped_original_respects_protection_and_live_leases(stopped_original_image, changes):
+    service, original = stopped_original_image
+    service.images._update_task('admin:stopped-original', **changes)
+    service.images.resume_poll = Mock()
+    recover_stopped_original(service)
+    service.images.resume_poll.assert_not_called()
+    service.text.admission.wake.assert_not_called()
+    saved = stopped_image_row(service)
+    for field, value in changes.items():
+        if isinstance(value, float) and value != value:
+            assert saved[field] != saved[field]
+        else:
+            assert saved[field] == value
+
+
+def test_expired_original_read_lease_does_not_block_explicit_recheck(stopped_original_image):
+    service, _ = stopped_original_image
+    service.images._update_task('admin:stopped-original', _claim_id='expired', _claim_until=2999)
+    service.images.resume_poll = Mock()
+    recover_stopped_original(service)
+    service.images.resume_poll.assert_called_once()
+
+
+@pytest.mark.parametrize('reason', ['COMPLETION_ORIGINAL_ONLY', 'COMPLETION_WORK_NOT_ACTIVE', 'COMPLETION_ATTEMPT_EXHAUSTED'])
+def test_other_stopped_reasons_are_not_reopened(stopped_original_image, reason):
+    service, original = stopped_original_image
+    service.images._update_task('admin:stopped-original', _completion={**original['_completion'], 'reason':reason})
+    service.images.resume_poll = Mock()
+    recover_stopped_original(service)
+    service.images.resume_poll.assert_not_called()
+
+
+def test_stopped_original_uses_real_reader_and_persists_typed_quota(stopped_original_image, monkeypatch):
+    from test.test_image_task_service import image_quota_failure_document, wait_for_task
+    from api import task_results
+    service, original = stopped_original_image
+    service.clock.now = time.time()
+    # The actual image recovery thread/SQLite path runs; only upstream/account I/O is fake.
+    service.images.admission = None
+    reads = []
+    class Backend:
+        def __init__(self, **kwargs): pass
+        def _get_conversation(self, conversation_id):
+            reads.append(conversation_id)
+            return image_quota_failure_document()
+        def close(self): pass
+    monkeypatch.setattr('services.account_service.account_service.get_bound_account_identity', lambda *_: 'account-legacy')
+    monkeypatch.setattr('services.account_service.account_service.get_bound_text_access_token', lambda *a, **kw: 'fixture')
+    monkeypatch.setattr('services.account_service.account_service.conversation_binding_lock', lambda *a: nullcontext())
+    monkeypatch.setattr('services.openai_backend_api.OpenAIBackendAPI', Backend)
+    monkeypatch.setattr(task_results, 'image_task_service', service.images)
+    monkeypatch.setattr(task_results, 'require_identity', lambda *a, **kw: {'id':'admin','role':'admin'})
+    monkeypatch.setattr(task_results, 'require_image_policy', lambda *a, **kw: None)
+    result_app = FastAPI()
+    result_app.include_router(task_results.create_router())
+    client = TestClient(result_app)
+    before = client.get('/api/task-results/image/stopped-original')
+    assert before.status_code == 200 and before.json()['status'] == 'unknown'
+    assert reads == []
+    recover_stopped_original(service)
+    task = wait_for_task(service.images, {'id':'admin'}, original['id'], 'error')
+    assert reads == ['conversation-legacy']
+    assert task['error_code'] == 'NO_IMAGE_GENERATED'
+    after = client.get('/api/task-results/image/stopped-original')
+    assert after.status_code == 200
+    assert after.json()['status'] == 'failed'
+    assert after.json()['receipt']['failure_reason'] == 'image_generation_quota_exhausted'
+    recover_stopped_original(service)
+    assert reads == ['conversation-legacy']
+    service.text.admission.wake.assert_not_called()
+    service.images.generation_handler.assert_not_called()
+    service.images.edit_handler.assert_not_called()
+
+
+@pytest.mark.parametrize('barrier', ['pause_race', 'live_claim_race', 'retry_after'])
+def test_original_reader_checks_barriers_at_its_atomic_claim(stopped_original_image, monkeypatch, barrier):
+    service, _ = stopped_original_image
+    service.clock.now = time.time()
+    service.images.admission = None
+    real_resume = service.images.resume_poll
+    starts = Mock(side_effect=AssertionError('must not start recovery thread'))
+    monkeypatch.setattr('services.image_task_service.threading.Thread', starts)
+    def guarded_resume(*args, **kwargs):
+        if barrier == 'pause_race': changes = {'_recovery_paused':True}
+        elif barrier == 'live_claim_race': changes = {'_claim_id':'other-read', '_claim_until':time.time()+60}
+        else: changes = {'recovery_error_code':'RECOVERY_RATE_LIMITED',
+                         'recovery_retry_after_seconds':60, 'next_poll_at':time.time()+60}
+        service.images._update_task('admin:stopped-original', **changes)
+        return real_resume(*args, **kwargs)
+    service.images.resume_poll = guarded_resume
+    recover_stopped_original(service)
+    starts.assert_not_called()
+    service.text.admission.wake.assert_not_called()
+    assert not stopped_image_row(service)['_completion'].get('replacement_id')
+
+
+def test_concurrent_explicit_original_commands_share_existing_read_budget(stopped_original_image):
+    service, _ = stopped_original_image
+    service.images.resume_poll = Mock()
+    with ThreadPoolExecutor(max_workers=6) as workers:
+        results = list(workers.map(lambda _: recover_stopped_original(service), range(12)))
+    assert service.images.resume_poll.call_count == 1
+    assert all(result['state'] == 'needs_attention' for result in results)
+    saved = stopped_image_row(service)
+    assert saved['_completion']['next_at'] == service.clock() + service.RECHECK_SECONDS
+    assert saved['_completion']['max_extra_requests'] == 0
+    assert not saved['_completion'].get('replacement_id')
+    service.text.admission.wake.assert_not_called()
+
+
+@pytest.mark.parametrize('field,value', [('_image_thread', {}), ('bound_retry', False), ('same_request_retry', None)])
+def test_other_original_shapes_are_not_reopened(stopped_original_image, field, value):
+    service, original = stopped_original_image
+    if field == '_image_thread':
+        changes = {field:value}
+    else:
+        state = {**original['_completion'], field:value}
+        if value is None:
+            state.pop(field)
+        changes = {'_completion':state}
+    service.images._update_task('admin:stopped-original', **changes)
+    service.images.resume_poll = Mock()
+    recover_stopped_original(service)
+    service.images.resume_poll.assert_not_called()
+
+
+def test_async_original_transport_failure_does_not_restart_from_background(stopped_original_image, monkeypatch):
+    from test.test_image_task_service import wait_for_task
+    service, original = stopped_original_image
+    service.clock.now = time.time()
+    service.images.admission = None
+    entered, release = threading.Event(), threading.Event()
+    reads = []
+    class Backend:
+        def __init__(self, **kwargs): pass
+        def _get_conversation(self, conversation_id):
+            reads.append(conversation_id)
+            entered.set()
+            assert release.wait(2), 'test must release the original reader'
+            raise RuntimeError('fixture transport failure')
+        def close(self): pass
+    monkeypatch.setattr('services.account_service.account_service.get_bound_account_identity', lambda *_: 'account-legacy')
+    monkeypatch.setattr('services.account_service.account_service.get_bound_text_access_token', lambda *a, **kw: 'fixture')
+    monkeypatch.setattr('services.account_service.account_service.conversation_binding_lock', lambda *a: nullcontext())
+    monkeypatch.setattr('services.openai_backend_api.OpenAIBackendAPI', Backend)
+    try:
+        result = recover_stopped_original(service)
+        assert entered.wait(2)
+        assert result['state'] == 'checking_original'
+        assert stopped_image_row(service)['status'] == 'running'
+    finally:
+        release.set()
+    wait_for_task(service.images, {'id':'admin'}, original['id'], 'error')
+    assert stopped_image_row(service)['_completion']['state'] == 'checking_original'
+    service.clock.now += service.RECHECK_SECONDS + 1
+    restarted = GenerationCompletionService(service.text, service.images, service.lifecycle, clock=service.clock)
+    restarted.process_one()
+    assert reads == ['conversation-legacy']
+    saved = stopped_image_row(service)
+    assert saved['upstream_outcome'] == 'unknown'
+    assert saved['_completion']['state'] == 'needs_attention'
+    service.clock.now += service.INVESTIGATION_SECONDS + 1
+    restarted.process_one()
+    assert reads == ['conversation-legacy']
+    assert not saved['_completion'].get('replacement_id')
+    service.text.admission.wake.assert_not_called()
+    service.images.generation_handler.assert_not_called()
+    service.images.edit_handler.assert_not_called()
