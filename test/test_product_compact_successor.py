@@ -1039,3 +1039,169 @@ def test_capacity_transfer_preserves_active_claims_and_other_unknowns(product_no
         observations.append(h.admission.resource_snapshot()["chat_turn"]["inflight"])
     add_completed_tail(h, after_send=during_send)
     assert observations == [1, 3 if extra in {"foreign_same_conversation", "double_leaf"} else 2]
+
+
+def queued_image_after_completed_copy(h, monkeypatch):
+    """0309 relation: UNKNOWN attrs -> verified replacement -> copy -> image."""
+    from datetime import datetime, timezone
+    from services.image_task_service import ImageTaskService
+
+    advanced_to_own_successor(h, monkeypatch, workbench=True)
+    # Match 0309's saved successful replacement; the copy changes the final cursor.
+    update(h.service, 'successor', _upstream_terminal=True)
+    copy = add_completed_tail(h)
+    h.admission.settings = lambda: {'chat_account_concurrency': 6, 'image_account_concurrency': 4}
+    h.admission.accounts.update_account('fixture', {
+        'limits_progress': [{'feature_name': 'image_gen', 'remaining': 100}],
+        'capacity_observed_at': datetime.now(timezone.utc).isoformat(),
+    })
+    images = ImageTaskService(h.root / 'image_tasks.json', admission=h.admission, store=h.service.store)
+    binding = {key: copy[key] for key in ('provider_account_identity', 'provider_binding_id',
+                                         'client_conversation_id', 'conversation_id', 'parent_message_id')}
+    images.submit_generation({'id': 'owner', 'role': 'admin', '_trusted_source': 'internal:listing'},
+        client_task_id='original-image', prompt='original main image instruction', size=None,
+        model='gpt-image-2', **binding,
+        product_work={**copy['_product_work'], 'step_ref': 'image'})
+    context = h.admission.claim_next()
+    with h.service.store.connect() as db:
+        image = h.service.store.read_receipt(db, 'image', 'owner', 'original-image')
+    assert context and context.request_id == 'original-image', json.dumps(image)
+    return context
+
+
+@pytest.mark.parametrize('mode', ['terminal', 'recovered', 'restart'])
+def test_image_after_completed_copy_sends_once_preserving_original_unknown(product_no_final, monkeypatch, mode):
+    from services.request_context import AdmissionLost
+    h = product_no_final
+    context = queued_image_after_completed_copy(h, monkeypatch)
+    if mode == 'recovered':
+        update(h.service, 'successor', _upstream_terminal=False)
+    elif mode == 'restart':
+        from test.test_pool_admission import build
+        from services.pool_admission import ExecutionContext
+        _, _, restarted = build(h.root, h.clock)
+        restarted.settings = h.admission.settings
+        context = ExecutionContext(restarted, context.kind, context.owner, context.request_id, context.claim)
+    old = row(h.service)
+    copy = row(h.service, 'copy-1')
+    with h.service.store.connect() as db:
+        before = h.service.store.read_receipt(db, 'image', 'owner', 'original-image')
+    context.before_send_with_marker()
+    with h.service.store.connect() as db:
+        after = h.service.store.read_receipt(db, 'image', 'owner', 'original-image')
+    assert after['_submission_started'] is True
+    for key in ('id', 'parent_message_id', 'provider_account_identity', 'provider_binding_id',
+                'conversation_id', '_input_ref', 'request_hash'):
+        assert after[key] == before[key]
+    assert after['parent_message_id'] == copy['parent_message_id']
+    assert row(h.service) == old and old['status'] == 'unknown'
+    with pytest.raises(AdmissionLost, match='already submitted'):
+        context.before_send()
+
+
+@pytest.mark.parametrize('drift', [
+    'image-parent', 'image-work', 'image-input', 'image-owner', 'image-binding',
+    'image-account', 'image-conversation', 'copy-parent', 'copy-work', 'copy-binding',
+    'copy-account', 'copy-conversation', 'copy-unknown', 'copy-empty', 'copy-inflight',
+    'copy-lease', 'copy-hold', 'copy-terminal', 'copy-input', 'copy-sequence',
+    'child-missing', 'child-unknown', 'child-inflight', 'child-final', 'child-audit',
+    'old-inflight', 'old-upstream-inflight', 'old-recovery-lease', 'old-hold', 'parent-paused', 'foreign-member',
+    'duplicate-member', 'competing-copy',
+])
+def test_image_after_completed_copy_rejects_changed_chain(product_no_final, monkeypatch, drift):
+    from services.request_context import AdmissionLost
+    h = product_no_final
+    context = queued_image_after_completed_copy(h, monkeypatch)
+    store = h.service.store
+    with store.transaction() as db:
+        image = store.read_receipt(db, 'image', 'owner', 'original-image')
+        copy = store.read_receipt(db, 'text', 'owner', 'copy-1')
+        child = store.read_receipt(db, 'text', 'owner', 'successor')
+        old = store.read_receipt(db, 'text', 'owner', 'old')
+        parent = store.runtime(db, image['_product_work_key'])
+        fields = {'parent': 'parent_message_id', 'work': '_product_work_key',
+                  'binding': 'provider_binding_id', 'account': 'provider_account_identity',
+                  'conversation': 'conversation_id'}
+        target, change = drift.split('-', 1)
+        if target == 'image':
+            if change in fields:
+                image[fields[change]] = 'wrong'
+            elif change == 'input':
+                image['request_hash'] = 'wrong'
+            else:
+                member = next(m for m in parent['members'] if m['kind'] == 'image')
+                member['owner'] = 'other'
+        elif target == 'copy':
+            if change in fields:
+                copy[fields[change]] = 'wrong'
+            elif change == 'unknown':
+                copy['status'] = 'unknown'
+            elif change == 'empty':
+                copy['content'] = ''
+            elif change == 'inflight':
+                copy['_executing'] = True
+            elif change == 'lease':
+                copy['recovery_claim_id'] = 'live'
+                copy['recovery_lease_until'] = h.clock() + 60
+            elif change == 'hold':
+                copy['_send_hold'] = True
+            elif change == 'terminal':
+                copy['_upstream_terminal'] = False
+                copy.pop('_turn_end_evidence', None)
+            elif change == 'input':
+                body = store.load_input(copy['_input_ref'])
+                body['parent_message_id'] = 'different-branch'
+                copy['_input_ref'] = store.save_input(body)
+                db.execute('UPDATE requests SET request_hash=? WHERE owner=? AND id=?',
+                           (TextTaskService._submission_identity('owner', body)[1], 'owner', 'copy-1'))
+            else:
+                copy['_sequence'] = image['_sequence']
+        elif target == 'child':
+            if change == 'unknown':
+                child['status'] = 'unknown'
+            elif change == 'inflight':
+                child['_executing'] = True
+            elif change == 'final':
+                child['_turn_end_evidence']['final_message_id'] = 'wrong'
+            elif change == 'audit':
+                child['_workbench_derived_input']['child_input_hash'] = 'wrong'
+        elif target == 'old':
+            if change == 'inflight':
+                old['_executing'] = True
+            elif change == 'upstream-inflight':
+                old['upstream_unfinished'] = True
+            elif change == 'hold':
+                old['_send_hold'] = True
+            else:
+                old['recovery_claim_id'] = 'live'
+                old['recovery_lease_until'] = h.clock() + 60
+        elif target == 'parent':
+            parent['admission_control'] = {'state': 'paused', 'version': 1, 'slot_held': False}
+        elif target == 'foreign':
+            next(m for m in parent['members'] if m['request_id'] == 'copy-1')['owner'] = 'other'
+        elif target == 'duplicate':
+            parent['members'].append(deepcopy(next(m for m in parent['members'] if m['request_id'] == 'copy-1')))
+        elif target == 'competing':
+            extra = dict(copy, request_id='competing', _sequence=copy['_sequence'])
+            store.write_receipt(db, 'text', 'owner', 'competing', extra)
+            parent['members'].append({'kind': 'text', 'owner': 'owner', 'request_id': 'competing', 'step_ref': 'other'})
+        for kind, rid, value in [('image', 'original-image', image), ('text', 'copy-1', copy),
+                                 ('text', 'old', old), ('text', 'successor', child)]:
+            store.write_receipt(db, kind, 'owner', rid, value)
+        if drift == 'child-missing':
+            db.execute('DELETE FROM requests WHERE owner=? AND id=?', ('owner', 'successor'))
+        store.set_runtime(db, parent['key'], parent)
+    old_before = row(h.service)
+    from services.pool_admission import _image_follows_completed_text
+    with store.connect() as db:
+        assert not _image_follows_completed_text(store, db, 'owner', image, old_before, h.clock())
+    # A different physical conversation does not enter this occupancy guard.
+    # Its proof must still fail; independent binding validation owns that route.
+    if drift == 'image-conversation':
+        return
+    with pytest.raises(AdmissionLost):
+        context.before_send_with_marker()
+    with store.connect() as db:
+        image = store.read_receipt(db, 'image', 'owner', 'original-image')
+    assert image['_submission_started'] is False
+    assert row(h.service) == old_before
