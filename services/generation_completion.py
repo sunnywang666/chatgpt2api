@@ -631,7 +631,9 @@ class GenerationCompletionService:
                 raise CompletionError("COMPLETION_QUOTA_FAILOVER_WORK_REQUIRED")
             body = self._load_verified_input(db, "image", owner, request_id, root)
             payload = body.get("payload") or {}
-            if int(payload.get("n") or 1) != 1 or payload.get("upstream_model"):
+            # The verified original model override is portable with its image input.
+            # Preserve it when moving accounts; it does not change output count.
+            if int(payload.get("n") or 1) != 1:
                 raise CompletionError("COMPLETION_SINGLE_OUTPUT_REQUIRED")
             # ProductWork disallows conversation-thread inputs, but a regular
             # edit persists the accepted image/mask byte tuples in its frozen

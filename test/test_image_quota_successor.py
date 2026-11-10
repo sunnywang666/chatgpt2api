@@ -85,7 +85,8 @@ def test_image_receipt_id_is_accepted_as_the_durable_request_identity():
 
 
 @pytest.mark.parametrize("review_retry", [False, True])
-def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_closes_both_sessions(tmp_path, monkeypatch, review_retry):
+@pytest.mark.parametrize("upstream_model", ["", "gpt-5-5-extended"])
+def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_closes_both_sessions(tmp_path, monkeypatch, review_retry, upstream_model):
     """API -> frozen edit bytes -> alternate-account admission -> close/archive."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -111,7 +112,7 @@ def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_clos
     source = (b"\x89PNG\r\n\x1a\noriginal-main-image", "main.png", "image/png")
     mask = (b"\x89PNG\r\n\x1a\noriginal-mask", "mask.png", "image/png")
     images.submit_edit(admin, client_task_id="legacy-2344", prompt="keep this main product image",
-                       model="gpt-image-2", size=None, images=[source], masks=[mask],
+                       model="gpt-image-2", size=None, images=[source], masks=[mask], upstream_model=upstream_model,
                        product_work={"product_ref": "P-2344", "step_ref": "main-image"})
     with text.store.transaction() as db:
         root = text.store.read_receipt(db, "image", "admin", "legacy-2344")
@@ -162,6 +163,15 @@ def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_clos
     monkeypatch.setattr(api, "require_identity", require_identity)
     with text.store.transaction() as db:
         text.store.write_receipt(db, "image", "admin", "legacy-2344", baseline)
+    with text.store.connect() as db:
+        multi_input = text.store.load_input(baseline["_input_ref"])
+    multi_input["payload"]["n"] = 2
+    multi_ref = text.store.save_input(multi_input)
+    multiple = rejected(_input_ref=multi_ref)
+    assert multiple.status_code == 409
+    assert multiple.json()["detail"]["code"] == "COMPLETION_SINGLE_OUTPUT_REQUIRED"
+    with text.store.transaction() as db:
+        text.store.write_receipt(db, "image", "admin", "legacy-2344", baseline)
     assert rejected_submit == []
     monkeypatch.setattr(images, "_submit", real_submit)
     # A process loss after the durable prepared input, before child acceptance,
@@ -183,7 +193,7 @@ def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_clos
         frozen = text.store.load_input(child["_input_ref"])
     assert frozen["mode"] == "edit" and frozen["payload"]["images"] == [source]
     assert frozen["payload"]["mask"] == [mask] and frozen["payload"]["n"] == 1
-    assert not frozen["payload"].get("upstream_model")
+    assert frozen["payload"].get("upstream_model") == upstream_model
     assert not {"provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"} & frozen["payload"].keys()
     with text.store.connect() as db:
         queued_before = (copy.deepcopy(text.store.read_receipt(db, "image", "admin", "legacy-2344")),
@@ -203,6 +213,7 @@ def test_legacy_admin_edit_quota_api_reuses_saved_bytes_on_new_account_then_clos
         context.before_send()
         assert payload["provider_account_identity"] == "account-1"
         assert payload["prompt"] == "keep this main product image"
+        assert payload["upstream_model"] == upstream_model
         assert payload["images"] == [source] and payload["mask"] == [mask]
         assert not payload.get("conversation_id")
         assert not payload.get("parent_message_id")
