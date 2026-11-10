@@ -220,6 +220,18 @@ def attach_replacement(store, db, kind, owner, request_id, payload, receipt):
     if payload != expected or kind == "image" and prepared["mode"] != receipt.get("mode"):
         raise CompletionError("COMPLETION_REPLACEMENT_INPUT_CHANGED")
     receipt["_completion_of"] = root_id
+    if kind == "image" and payload.get("_image_quota_failover"):
+        from services.image_quota_successor import marker
+        # The task itself does not retain arbitrary input keys.  Persist this
+        # small relationship marker only after the frozen prepared input was
+        # checked above, so no caller can manufacture a cross-account child.
+        receipt["_image_quota_failover"] = copy.deepcopy(payload["_image_quota_failover"])
+        if not marker(root, receipt):
+            raise CompletionError("COMPLETION_QUOTA_FAILOVER_NOT_AUTHORIZED")
+        root.update(_attempt_finished_at=time.time(), _attempt_reason="ATTEMPT_REPLACED_NEW_ACCOUNT",
+                    _turn_reserved=False)
+        store.write_receipt(db, kind, owner, root_id, root)
+        return
     if payload.get("_continue_after_failed_attempt"):
         proof = retry_evidence(root)
         if kind == "image" and proof and receipt.get("_image_thread"):
@@ -250,6 +262,23 @@ def replacement_send_allowed(store, db, kind, owner, request_id, receipt):
         return True
     root = store.read_receipt(db, kind, owner, root_id)
     state = (root or {}).get("_completion") or {}
+    if kind == "image" and receipt.get("_image_quota_failover"):
+        from services.image_quota_successor import registration_successor
+        # A fresh account/session is intentional here.  It has already been
+        # admitted under an account-specific exclusion; never route it through
+        # the ordinary same-conversation retry proof.
+        if (not registration_successor(root, receipt)
+                or any(receipt.get(key) != (root or {}).get(key)
+                       for key in ("owner_id", "_product_work_key", "_source"))
+                or receipt.get("_product_work") != (root or {}).get("_product_work")):
+            return False
+        excluded = receipt["_image_quota_failover"]["excluded_account_identity"]
+        if receipt.get("provider_account_identity") == excluded:
+            return False
+        return bool(root and root.get("_recovery_paused") is not True
+                    and state.get("replacement_id") == request_id
+                    and not state.get("selected_id") and not successful(kind, root)
+                    and state.get("state") != "completed")
     if receipt.get("_same_session_retry_of") and not same_session_retry(root, receipt):
         return False
     if kind == "image" and root and (root.get("result_file_ids") or root.get("result_sediment_ids")
@@ -281,7 +310,8 @@ class GenerationCompletionService:
         self.text, self.images, self.lifecycle = text_service, image_service, lifecycle
         self.store, self.clock = text_service.store, clock
 
-    def _root(self, db, kind, owner, request_id, *, read_only_original=False, trusted_bound_retry=False):
+    def _root(self, db, kind, owner, request_id, *, read_only_original=False, trusted_bound_retry=False,
+              trusted_quota_failover=False):
         row = self.store.read_receipt(db, kind, owner, request_id)
         if not row:
             raise CompletionError("COMPLETION_REQUEST_NOT_FOUND", 404)
@@ -320,10 +350,11 @@ class GenerationCompletionService:
                 ))
             )
             persisted_bound_retry = bool((row.get("_completion") or {}).get("bound_retry"))
+            persisted_quota_failover = bool((row.get("_completion") or {}).get("quota_failover"))
             pure = pure or legacy_admin_original and (
                 (read_only_original and row.get("status") == "error"
                  and row.get("error_code") == "RESULT_UNRECOVERABLE")
-                or trusted_bound_retry or persisted_bound_retry
+                or trusted_bound_retry or trusted_quota_failover or persisted_bound_retry or persisted_quota_failover
                 or read_only_original_recovery(row.get("_completion"))
                 or (read_only_original_selected(row.get("_completion"), request_id)
                     and successful(kind, row))
@@ -537,6 +568,161 @@ class GenerationCompletionService:
         if not read_only_original:
             self.text.admission.wake()
         return self.read(kind, identity, request_id)
+
+    def quota_failover(self, identity, request_id):
+        """Create or resume the one durable alternate-account image attempt.
+
+        This path is intentionally separate from generic completion recovery:
+        it cannot infer a quota failure, read/replay UNKNOWN work, or turn an
+        ordinary no-image result into a successor.
+        """
+        owner, now = str(identity["id"]), float(self.clock())
+        if getattr(self.text, "admission", None) is None:
+            raise CompletionError("COMPLETION_SCHEDULER_REQUIRED", 503)
+        created = False
+        with self.store.transaction() as db:
+            root = self._root(db, "image", owner, request_id,
+                              trusted_quota_failover=identity.get("role") == "admin")
+            from services.product_work import require_product_source
+            require_product_source({**identity, "_trusted_source": root.get("_source")})
+            from services.image_quota_successor import eligible_original, prepared_payload
+            if not eligible_original(root):
+                raise CompletionError("COMPLETION_QUOTA_FAILOVER_NOT_ELIGIBLE")
+            state = root.get("_completion")
+            # A completed/closing ProductWork must not make a previously
+            # created attempt disappear from this idempotent command.  Only a
+            # real persisted child is replay-safe outside the active parent;
+            # an interrupted reservation still continues through the active
+            # work checks below.
+            if state and state.get("quota_failover") is True:
+                replacement_id = state.get("replacement_id")
+                if isinstance(replacement_id, str) and replacement_id:
+                    existing = self.store.read_receipt(db, "image", owner, replacement_id)
+                    if existing:
+                        from services.image_quota_successor import is_successor
+                        if not is_successor(root, existing, after_send=False):
+                            raise CompletionError("COMPLETION_QUOTA_FAILOVER_NOT_AUTHORIZED")
+                        return self._quota_attempt_projection(request_id, existing, created=False)
+            work = self.store.runtime(db, root.get("_product_work_key", ""))
+            if (not work or work.get("state") != "active" or work.get("owner") != owner
+                    or work.get("source") != root.get("_source")
+                    or not any(member.get("kind") == "image" and member.get("owner") == owner
+                               and member.get("request_id") == request_id
+                               and member.get("step_ref") == (root.get("_product_work") or {}).get("step_ref")
+                               for member in work.get("members", []))):
+                raise CompletionError("COMPLETION_QUOTA_FAILOVER_WORK_REQUIRED")
+            body = self._load_verified_input(db, "image", owner, request_id, root)
+            payload = body.get("payload") or {}
+            if int(payload.get("n") or 1) != 1 or payload.get("upstream_model"):
+                raise CompletionError("COMPLETION_SINGLE_OUTPUT_REQUIRED")
+            # ProductWork disallows conversation-thread inputs, but a regular
+            # edit persists the accepted image/mask byte tuples in its frozen
+            # input.  Reuse those exact bytes; do not look up the old account
+            # or reconstruct an image from a conversation cursor.
+            if body.get("mode") == "edit":
+                images = body.get("payload", {}).get("images")
+                if (not isinstance(images, list) or not images
+                        or any(not isinstance(item, tuple) or len(item) != 3
+                               or not isinstance(item[0], bytes) or not item[0]
+                               for item in images)):
+                    raise CompletionError("COMPLETION_QUOTA_FAILOVER_INPUT_NOT_PORTABLE")
+                if any(body["payload"].get(key) for key in ("image_thread_id", "edit_source_task_id", "edit_source_index")):
+                    raise CompletionError("COMPLETION_QUOTA_FAILOVER_INPUT_NOT_PORTABLE")
+            elif body.get("mode") != "generate" or body.get("payload", {}).get("image_thread_id"):
+                raise CompletionError("COMPLETION_QUOTA_FAILOVER_INPUT_NOT_PORTABLE")
+            if state:
+                if state.get("quota_failover") is True:
+                    if (not isinstance(state.get("replacement_id"), str)
+                            or not state.get("prepared_input")):
+                        raise CompletionError("COMPLETION_QUOTA_FAILOVER_ALREADY_STARTED")
+                    replacement_id = state["replacement_id"]
+                    if state.get("selected_id") not in {None, replacement_id}:
+                        raise CompletionError("COMPLETION_QUOTA_FAILOVER_ALREADY_STARTED")
+                    existing = self.store.read_receipt(db, "image", owner, replacement_id)
+                    created = existing is None
+                elif state.get("replacement_id") or state.get("selected_id"):
+                    raise CompletionError("COMPLETION_QUOTA_FAILOVER_ALREADY_STARTED")
+                else:
+                    # The generic local reader may have recorded an
+                    # unstarted, childless investigation first.  It carries
+                    # no send authority, so replace only that state with this
+                    # explicit typed-failure decision.
+                    state = None
+            if not state:
+                replacement_id = "completion-" + uuid.uuid4().hex
+                payload = prepared_payload(body["payload"], root, replacement_id)
+                prepared = {**body, "payload": payload}
+                root["_completion"] = {
+                    "state": "replacement_pending", "started_at": now,
+                    "allow_unconfirmed_retry": False, "max_extra_requests": 1,
+                    "next_at": now, "replacement_id": replacement_id,
+                    "prepared_input": self.store.save_input(prepared),
+                    "conversation_mode": "new_account", "quota_failover": True,
+                    "failure_reason": "image_generation_quota_exhausted",
+                }
+                state, existing, created = root["_completion"], None, True
+                self.store.write_receipt(db, "image", owner, request_id, root)
+            prepared_ref = state["prepared_input"]
+        if existing is None:
+            prepared = self.store.load_input(prepared_ref)
+            self.images._submit(prepared["identity"], client_task_id=replacement_id,
+                                mode=prepared["mode"], payload=prepared["payload"])
+            self.text.admission.wake()
+        with self.store.connect() as db:
+            attempt = self.store.read_receipt(db, "image", owner, replacement_id) or {}
+        return self._quota_attempt_projection(request_id, attempt, created=created)
+
+    @staticmethod
+    def _quota_attempt_projection(request_id, child, *, created=False):
+        status = {"success": "succeeded", "error": "failed"}.get(child.get("status"), child.get("status", "unknown"))
+        if child.get("upstream_outcome") == "unknown" and status == "failed":
+            status = "unknown"
+        return {
+            "protocol": "task-attempt-v1", "kind": "image", "original_id": request_id,
+            "attempt_id": child.get("id") or child.get("request_id"), "status": status,
+            "result_ready": successful("image", child), "existing": not created, "created": created,
+            "product_work": {"protocol": "product-work-v1", **child["_product_work"]},
+            "attempt_authority": {key: child.get(key) or None for key in (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id",
+                "conversation_id", "parent_message_id")},
+        }
+
+    def read_quota_attempt(self, identity, request_id):
+        """Read the one proved quota child without advancing any completion."""
+        owner = str(identity["id"])
+        with self.store.connect() as db:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN DEFERRED")
+            try:
+                root = self._root(db, "image", owner, request_id,
+                                  trusted_quota_failover=identity.get("role") == "admin")
+                from services.product_work import require_product_source
+                require_product_source({**identity, "_trusted_source": root.get("_source")})
+                state = root.get("_completion") or {}
+                attempt_id = state.get("replacement_id")
+                child = self.store.read_receipt(db, "image", owner, attempt_id) if isinstance(attempt_id, str) else None
+                from services.image_quota_successor import is_successor
+                if (state.get("quota_failover") is not True or not child
+                        or not is_successor(root, child, after_send=False)):
+                    raise CompletionError("COMPLETION_QUOTA_FAILOVER_NOT_AUTHORIZED")
+                parent = self.store.runtime(db, root.get("_product_work_key", ""))
+                members = (parent or {}).get("members") or []
+                root_id = root.get("request_id") or root.get("id")
+                child_id = child.get("request_id") or child.get("id")
+                root_member = next((m for m in members if m.get("kind") == "image" and m.get("owner") == owner
+                                    and m.get("request_id") == root_id), None)
+                child_member = next((m for m in members if m.get("kind") == "image" and m.get("owner") == owner
+                                     and m.get("request_id") == child_id), None)
+                metadata = root.get("_product_work")
+                if (not parent or parent.get("owner") != owner or parent.get("source") != root.get("_source")
+                        or not isinstance(metadata, dict) or not root_member or not child_member
+                        or root_member.get("step_ref") != child_member.get("step_ref")
+                        or metadata != child.get("_product_work") or metadata.get("step_ref") != root_member.get("step_ref")):
+                    raise CompletionError("COMPLETION_QUOTA_FAILOVER_NOT_AUTHORIZED")
+                return self._quota_attempt_projection(request_id, child)
+            finally:
+                if db.in_transaction:
+                    db.rollback()
 
     def _queue_not_sent(self, root, state, now, kind):
         root.setdefault("_execution_timeline", []).append({

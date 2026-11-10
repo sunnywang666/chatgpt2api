@@ -1945,6 +1945,11 @@ class PoolAdmission:
         active_images = 0
         live_turns = {}
         requests = []
+        # A failover is still an ordinary queued image request, but its offer
+        # key is scoped to the proved exhausted identity.  This lets the
+        # existing pure planner select any other fresh-capacity account without
+        # weakening its generic per-request matching or adding a second queue.
+        quota_failover_exclusions = {}
         thread_resources = []
         image_receipts = {}
         if not capacity_only:
@@ -2146,11 +2151,18 @@ class PoolAdmission:
                 fair_group = product_fair_root
             if r.get("_send_hold") is True:
                 continue
+            operation = "image" if kind == "image" else r.get("_operation", "text")
+            if operation == "image":
+                from services.image_quota_successor import excluded_account
+                excluded = excluded_account(r)
+                if excluded:
+                    operation = "image-quota-failover:" + hashlib.sha256(excluded.encode()).hexdigest()
+                    quota_failover_exclusions[operation] = excluded
             requests.append(WaitingRequest(
                 RequestRef(owner, kind, request_id), product_fair_source or r.get("_source") or "key:" + owner,
                 continuation_sequences.get((owner, request_id), int(r.get("_sequence") or 0)),
                 route, str(r.get("model") or "auto"),
-                "image" if kind == "image" else r.get("_operation", "text"),
+                operation,
                 bool(r.get("_input_ref")), state=state,
                 bound_account=str(r.get("_requested_account_identity") or r.get("provider_account_identity") or "") or None,
                 order_group=(None if (owner, request_id) in released_order_heads
@@ -2237,11 +2249,15 @@ class PoolAdmission:
             if capacity_only:
                 continue
             for route, model, operation in offer_variants:
+                image_operation = operation == "image" or operation.startswith("image-quota-failover:")
+                excluded = quota_failover_exclusions.get(operation)
                 if route == "codex":
-                    eligible = self.codex is not None and self.codex._eligible_account(account, "" if operation == "image" else model, allow_probe=False) is not None
-                    if operation == "image":
+                    eligible = self.codex is not None and self.codex._eligible_account(account, "" if image_operation else model, allow_probe=False) is not None
+                    if image_operation:
                         eligible = (eligible and account.get("source_type") == "codex"
                                     and image_capacity(account, settings, model) > 0)
+                    if excluded == identity:
+                        eligible = False
                     decision = self.codex.quota_decision(account, model) if eligible and hasattr(self.codex, "quota_decision") else {}
                     offers.append(Offer(identity, "codex", model, operation,
                                         (Need(codex_key), Need("codex_server")), enabled=bool(eligible),
@@ -2257,13 +2273,14 @@ class PoolAdmission:
                 if identity_counts.get(identity) != 1:
                     ineligible.append("identity_not_unique")
                 enabled = not disabled and chat_saved and paid and identity_counts.get(identity) == 1
-                if operation == "image":
+                if image_operation:
                     from utils.helper import is_codex_image_model, split_image_model
                     required_plan, _ = split_image_model(model)
                     model_plan_allowed = (not required_plan
                                           or plan == self.accounts._normalize_account_type(required_plan))
                     model_account_allowed = not is_codex_image_model(model)
-                    enabled = enabled and image_capacity(account, settings, model) > 0 and not is_codex_image_model(model)
+                    enabled = (enabled and image_capacity(account, settings, model) > 0
+                               and not is_codex_image_model(model) and excluded != identity)
                     if required_plan:
                         enabled = enabled and model_plan_allowed
                     if not model_plan_allowed:
@@ -2310,7 +2327,7 @@ class PoolAdmission:
         # but never allow slow downloads to create an unbounded thread backlog.
         # This is a local retained-work ceiling, separate from upstream slots.
         image_keys = {need.resource for offer in offers if offer.enabled
-                      for need in offer.needs if need.resource.startswith("image:") or (offer.operation == "image" and need.resource.startswith("codex_turn:"))}
+                      for need in offer.needs if need.resource.startswith("image:") or (offer.operation.startswith("image") and need.resource.startswith("codex_turn:"))}
         usable_chat_keys = {"image:" + account_clock_key(account) for account in rows
                             if account.get("provider_account_identity") and account.get("access_token")
                             and not account.get("managed_disabled") and account.get("status") not in {"禁用", "异常", "限流"}
@@ -3180,6 +3197,11 @@ class PoolAdmission:
             from services.generation_completion import replacement_send_allowed
             if not replacement_send_allowed(self.store, db, context.kind, context.owner, context.request_id, r):
                 raise AdmissionLost("completion original changed before send")
+            if context.kind == "image":
+                from services.image_quota_successor import excluded_account
+                excluded = excluded_account(r)
+                if excluded and r.get("provider_account_identity") == excluded:
+                    raise AdmissionLost("quota failover selected original image account")
             if r.get("_completion_of"):
                 original = self.store.read_receipt(db, context.kind, context.owner, r["_completion_of"]) or {}
                 original_work = self.store.runtime(db, original.get("_work_key", ""))

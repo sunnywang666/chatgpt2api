@@ -22,7 +22,9 @@ on:
       - test/test_task_events.py
       - api/generation_completion.py
       - services/generation_completion.py
+      - services/image_quota_successor.py
       - test/test_generation_completion.py
+      - test/test_image_quota_successor.py
       - test/test_bound_completion_api.py
       - test/test_bound_unsent_execution.py
       - test/test_workbench_derived_input.py
@@ -176,6 +178,7 @@ jobs:
             test/test_public_chat_sessions.py \
             test/test_work_lifecycle.py \
             test/test_generation_completion.py \
+            test/test_image_quota_successor.py \
             test/test_bound_completion_api.py \
             test/test_bound_unsent_execution.py \
             test/test_workbench_derived_input.py \
