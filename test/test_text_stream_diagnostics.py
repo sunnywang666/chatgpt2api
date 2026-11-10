@@ -10,6 +10,7 @@ from services.public_chat_service import project_text_execution, safe_public_exe
 from services.request_context import current_request
 from services.text_task_service import TextTaskService
 from test.test_reliable_pool_routes import runtime
+from test.test_bound_text_archive import bound_chat
 
 
 class Response:
@@ -380,3 +381,86 @@ def test_native_curl_silent_image_stream_does_not_hold_result_or_timeout(monkeyp
         session.close()
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize('kind', ['busy', 'locked', 'schema', 'value', 'unknown', 'cause'])
+def test_bound_text_failure_logs_safe_type_before_existing_unknown_wrapper(bound_chat, monkeypatch, kind):
+    import hashlib
+    import sqlite3
+    import services.conversation_binding_service as module
+
+    if kind in {'busy', 'locked', 'schema'}:
+        error = sqlite3.OperationalError('PRIVATE token URL and input')
+        code, name = {'busy': (sqlite3.SQLITE_BUSY, 'SQLITE_BUSY'),
+                      'locked': (sqlite3.SQLITE_LOCKED, 'SQLITE_LOCKED'),
+                      'schema': (sqlite3.SQLITE_ERROR, 'SQLITE_ERROR')}[kind]
+        error.sqlite_errorcode, error.sqlite_errorname = code, name
+    elif kind == 'value':
+        error = ValueError('PRIVATE request payload')
+    elif kind == 'unknown':
+        error = type('PRIVATE_CLASS', (Exception,), {})('PRIVATE input')
+    else:
+        inner = sqlite3.OperationalError('PRIVATE database path')
+        inner.sqlite_errorcode, inner.sqlite_errorname = sqlite3.SQLITE_BUSY, 'SQLITE_BUSY'
+        error = RuntimeError('PRIVATE outer')
+        error.__cause__ = inner
+    def events(*args, **kwargs):
+        raise error
+    logs = []
+    monkeypatch.setattr(module, 'conversation_events', events)
+    monkeypatch.setattr(module.logger, 'warning', logs.append)
+    context = SimpleNamespace(owner='PRIVATE_OWNER', request_id='PRIVATE_REQUEST')
+    token = current_request.set(context)
+    try:
+        with pytest.raises(ConversationBindingError) as caught:
+            bound_chat.service.complete_text(bound_chat.body)
+    finally:
+        current_request.reset(token)
+    assert caught.value.code == 'CONVERSATION_OUTCOME_UNKNOWN'
+    assert caught.value.__cause__ is error
+    assert len(logs) == 1
+    event = logs[0]
+    assert event['phase'] == 'stream_open'
+    assert event['request_ref'] == hashlib.sha256(b'PRIVATE_OWNER:PRIVATE_REQUEST').hexdigest()[:24]
+    assert event['error_type'] == ('UnhandledError' if kind == 'unknown' else type(error).__name__)
+    if kind in {'busy', 'locked', 'schema'}:
+        assert (event['sqlite_errorcode'], event['sqlite_errorname']) == (code, name)
+    if kind == 'cause':
+        assert event['causes'] == [{'error_type': 'OperationalError',
+            'sqlite_errorcode': sqlite3.SQLITE_BUSY, 'sqlite_errorname': 'SQLITE_BUSY'}]
+    assert 'PRIVATE' not in json.dumps(event)
+    assert 'send' not in bound_chat.calls
+
+
+def test_bound_text_failure_logging_failure_does_not_mask_original(bound_chat, monkeypatch):
+    import services.conversation_binding_service as module
+    error = RuntimeError('original private failure')
+    def events(*args, **kwargs):
+        raise error
+    def fail_log(*args, **kwargs):
+        raise OSError('logging unavailable')
+    monkeypatch.setattr(module, 'conversation_events', events)
+    monkeypatch.setattr(module.logger, 'warning', fail_log)
+    with pytest.raises(ConversationBindingError) as caught:
+        bound_chat.service.complete_text(bound_chat.body)
+    assert caught.value.code == 'CONVERSATION_OUTCOME_UNKNOWN'
+    assert caught.value.__cause__ is error
+
+
+def test_bound_text_failure_cause_chain_is_bounded_and_sqlite_name_allowlisted(monkeypatch):
+    import sqlite3
+    import services.conversation_binding_service as module
+    errors = [sqlite3.OperationalError('PRIVATE') for _ in range(5)]
+    for previous, following in zip(errors, errors[1:]):
+        previous.__cause__ = following
+    errors[-1].__cause__ = errors[0]
+    errors[0].sqlite_errorcode = sqlite3.SQLITE_BUSY
+    errors[0].sqlite_errorname = 'SQLITE_PRIVATE'
+    logs = []
+    monkeypatch.setattr(module.logger, 'warning', logs.append)
+    module._log_bound_text_failure(errors[0], 'PRIVATE_PHASE')
+    assert len(logs[0]['causes']) == 2
+    assert logs[0]['phase'] == 'unknown'
+    assert logs[0]['sqlite_errorcode'] == sqlite3.SQLITE_BUSY
+    assert 'sqlite_errorname' not in logs[0]
+    assert 'PRIVATE' not in json.dumps(logs)
