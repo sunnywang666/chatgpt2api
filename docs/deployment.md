@@ -57,6 +57,14 @@
 `slots_free` 分别表示商品 AI 容量、实际占用和剩余名额；`lifecycle_slots_held`
 单独统计保留原任务归属的记录。历史归属和 UNKNOWN 防重发证据本身不占活动名额。
 
+排查该 GET 的间歇慢读时，调用方可发送 `x-workbench-capability-probe`（带连字符的 UUID）。
+现有日志中的 `product_work_capability_probe` 按 `probe_id` 关联 `received` 和 `completed`，
+记录 `threadpool_wait_ms`、`identity_ms`、`service_lookup_ms`、`settings_lock_wait_ms`、
+`account_lock_wait_ms`、`capacity_read_ms` 和总 `duration_ms`。非法或缺失标记记录为 null，
+不回显原值；不记录鉴权、账号、请求正文或异常正文。`completed.status` 是处理函数的结果状态，
+不是客户端收到响应的证明；调用方超时后，已开始的线程仍会记录自己的完成情况。
+尚未进入或未完成的阶段没有耗时字段。此日志不改变超时、重试、锁或生成规则。
+
 `admission_control=true` 表示支持 `POST /api/product-works/admission-control`，
 输入为原 `product_ref`、布尔值 `paused` 和独立控制版本 `expected_version`。
 暂停时若原执行领取仍有效，控制状态为 `pausing` 并继续保留名额；领取结束后才为
