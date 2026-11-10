@@ -4153,9 +4153,15 @@ class TextTaskService:
             invalid()
         old_step = original_product["step_ref"]
         prefix = "direct-listing.content.copy:"
-        if not old_step.startswith(prefix) or old_step != prefix + original_id:
-            invalid()
-        new_product = {**original_product, "step_ref": prefix + request_id}
+        # Keep the established copy-attempt address for existing consumers.
+        # Other ProductWork callers retain their opaque logical step: a retry
+        # replaces an attempt, not the caller's business operation.
+        if old_step.startswith(prefix):
+            if old_step != prefix + original_id:
+                invalid()
+            new_product = {**original_product, "step_ref": prefix + request_id}
+        else:
+            new_product = dict(original_product)
         try:
             from services.product_work import normalize_product_work
             new_product = normalize_product_work(new_product)
