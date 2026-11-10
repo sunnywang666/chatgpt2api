@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
 import time
 from copy import deepcopy
 from contextlib import ExitStack
@@ -24,6 +25,7 @@ from services.request_context import (ARCHIVE_OPERATION_BUDGET_SECONDS, bounded_
                                       operation_effective_deadline, current_operation_deadline,
                                       current_request)
 from utils.helper import UpstreamHTTPError
+from utils.log import logger
 from utils.upstream_error import safe_upstream_error, safe_upstream_response_ids
 
 
@@ -790,6 +792,50 @@ def _text_failure_category(exc: Exception) -> str:
     if isinstance(exc, (ValueError, TypeError, KeyError)):
         return "parse"
     return "other"
+
+
+def _log_bound_text_failure(exc, phase):
+    """Log the actual failure before wrapping it, without messages or DB reads."""
+    try:
+        allowed_types = {
+            "OperationalError", "DatabaseError", "IntegrityError", "ProgrammingError",
+            "AdmissionLost", "AccountRequestDeadlineExceeded", "AccountReadRetryBudgetInsufficient",
+            "TimeoutError", "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
+            "ProxyError", "DNSError", "SSLError", "RequestException", "UpstreamHTTPError",
+            "ValueError", "TypeError", "KeyError", "AttributeError", "RuntimeError", "OSError",
+        }
+
+        def safe(error):
+            name = type(error).__name__
+            result = {"error_type": name if name in allowed_types else "UnhandledError"}
+            if isinstance(error, sqlite3.Error):
+                code = getattr(error, "sqlite_errorcode", None)
+                name = getattr(error, "sqlite_errorname", None)
+                if type(code) is int and 0 <= code <= 2147483647:
+                    result["sqlite_errorcode"] = code
+                    if (isinstance(name, str) and name.startswith("SQLITE_")
+                            and getattr(sqlite3, name, None) == code):
+                        result["sqlite_errorname"] = name
+            return result
+
+        context = current_request.get()
+        owner, request_id = getattr(context, "owner", None), getattr(context, "request_id", None)
+        entry = {"event": "bound_text_failure", "at": time.time(),
+                 "phase": phase if phase in _TEXT_FAILURE_PHASES else "unknown", **safe(exc)}
+        if isinstance(owner, str) and isinstance(request_id, str):
+            entry["request_ref"] = hashlib.sha256((owner + ":" + request_id).encode()).hexdigest()[:24]
+        causes, seen = [], {id(exc)}
+        cause = exc.__cause__ or exc.__context__
+        while cause is not None and id(cause) not in seen and len(causes) < 2:
+            seen.add(id(cause))
+            causes.append(safe(cause))
+            cause = cause.__cause__ or cause.__context__
+        if causes:
+            entry["causes"] = causes
+        logger.warning(entry)
+    except Exception:
+        # Diagnostics cannot mask the original failure or alter send authority.
+        pass
 
 
 # Only typed, bounded evidence is persisted. Exception text, response bodies,
@@ -3348,6 +3394,7 @@ class ConversationBindingService:
                     exc.original_exception_category = "provider_error"
                 raise
             except Exception as exc:
+                _log_bound_text_failure(exc, failure_phase)
                 if body.get("_supersedes_request_message_id"):
                     context = current_request.get()
                     if context is not None and not context.receipt().get("_submission_started"):
