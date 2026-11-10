@@ -2546,6 +2546,56 @@ class AdmissionTests(unittest.TestCase):
             context.before_send()
         self.assertFalse(self.read("text", "happy", "original")["_submission_started"])
 
+    def test_claim_maintenance_releases_account_lock_before_fresh_disabled_selection(self):
+        """Receipt-only maintenance must not block an unrelated capability read.
+
+        The account is disabled while that maintenance is paused.  Claiming must
+        acquire the account authority only afterwards, observe the new state,
+        and leave the request unsent.  The existing final-guard regression
+        above covers a later disable after a successful claim.
+        """
+        self.submit("maintenance-window")
+        entered, release, claimed, capacity_done = (threading.Event() for _ in range(4))
+        result, timings = {}, {}
+        original_expire = workflow_scheduling.expire_unsent
+
+        def paused_expire(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return original_expire(*args, **kwargs)
+
+        def read_capacity():
+            try:
+                result["capacity"] = self.admission.observe_product_capacity_limit(timings)
+            finally:
+                capacity_done.set()
+
+        with patch.object(workflow_scheduling, "expire_unsent", side_effect=paused_expire):
+            worker = threading.Thread(target=lambda: (result.setdefault("claim", self.admission.claim_next()),
+                                                       claimed.set()))
+            worker.start()
+            reader = None
+            try:
+                self.assertTrue(entered.wait(2))
+
+                reader = threading.Thread(target=read_capacity)
+                reader.start()
+                self.assertTrue(capacity_done.wait(.5))
+                self.assertEqual(result["capacity"], 1)
+
+                self.accounts.update_account("fixture-token-0", {"managed_disabled": True}, quiet=True)
+            finally:
+                release.set()
+                worker.join(2)
+                if reader is not None:
+                    reader.join(2)
+
+        self.assertTrue(claimed.is_set())
+        self.assertIsNone(result["claim"])
+        receipt = self.read("text", "happy", "maintenance-window")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertFalse(receipt["_submission_started"])
+
     def test_two_worker_processes_compete_for_one_original_slot(self):
         self.submit("one")
         self.submit("two", owner="wb")

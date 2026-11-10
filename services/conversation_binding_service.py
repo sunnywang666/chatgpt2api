@@ -803,6 +803,12 @@ def _log_bound_text_failure(exc, phase):
             "TimeoutError", "Timeout", "ReadTimeout", "ConnectTimeout", "ConnectionError",
             "ProxyError", "DNSError", "SSLError", "RequestException", "UpstreamHTTPError",
             "ValueError", "TypeError", "KeyError", "AttributeError", "RuntimeError", "OSError",
+            "NameError", "UnboundLocalError", "IndexError", "AssertionError",
+            "PermissionError", "FileNotFoundError", "IsADirectoryError", "NotADirectoryError",
+            "InvalidAccessTokenError", "StreamHardTimeoutError", "ConversationArchiveCursorMismatch",
+            "CurlError", "ImpersonateError", "HTTPError", "IncompleteRead", "SessionClosed",
+            "CertificateVerifyError", "InvalidURL", "InvalidHeader", "InvalidSchema", "MissingSchema",
+            "ChunkedEncodingError", "ContentDecodingError", "JSONDecodeError", "RetryError",
         }
 
         def safe(error):
@@ -816,6 +822,25 @@ def _log_bound_text_failure(exc, phase):
                     if (isinstance(name, str) and name.startswith("SQLITE_")
                             and getattr(sqlite3, name, None) == code):
                         result["sqlite_errorname"] = name
+            # Keep only a fixed repository file label and line, never frame
+            # locals, exception messages, arbitrary filenames or source text.
+            source_root = __file__.rsplit("/services/", 1)[0]
+            allowed_files = {
+                source_root + "/" + relative: relative for relative in (
+                    "services/conversation_binding_service.py", "services/openai_backend_api.py",
+                    "services/protocol/conversation.py", "services/pool_admission.py",
+                    "services/account_service.py", "services/account_request_pacing.py",
+                    "services/request_context.py", "services/task_store.py", "services/config.py",
+                    "utils/helper.py",
+                )
+            }
+            trace, depth = error.__traceback__, 0
+            while trace is not None and depth < 32:
+                relative = allowed_files.get(trace.tb_frame.f_code.co_filename)
+                if relative is not None:
+                    result["source_file"] = relative
+                    result["source_line"] = trace.tb_lineno
+                trace, depth = trace.tb_next, depth + 1
             return result
 
         context = current_request.get()

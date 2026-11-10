@@ -383,7 +383,7 @@ def test_native_curl_silent_image_stream_does_not_hold_result_or_timeout(monkeyp
         server.server_close()
 
 
-@pytest.mark.parametrize('kind', ['busy', 'locked', 'schema', 'value', 'unknown', 'cause'])
+@pytest.mark.parametrize('kind', ['busy', 'locked', 'schema', 'value', 'name', 'token', 'curl', 'unknown', 'cause'])
 def test_bound_text_failure_logs_safe_type_before_existing_unknown_wrapper(bound_chat, monkeypatch, kind):
     import hashlib
     import sqlite3
@@ -397,6 +397,14 @@ def test_bound_text_failure_logs_safe_type_before_existing_unknown_wrapper(bound
         error.sqlite_errorcode, error.sqlite_errorname = code, name
     elif kind == 'value':
         error = ValueError('PRIVATE request payload')
+    elif kind == 'name':
+        error = UnboundLocalError('PRIVATE variable name')
+    elif kind == 'token':
+        from services.openai_backend_api import InvalidAccessTokenError
+        error = InvalidAccessTokenError('PRIVATE token and URL')
+    elif kind == 'curl':
+        from curl_cffi.requests.exceptions import ImpersonateError
+        error = ImpersonateError('PRIVATE transport URL')
     elif kind == 'unknown':
         error = type('PRIVATE_CLASS', (Exception,), {})('PRIVATE input')
     else:
@@ -463,4 +471,29 @@ def test_bound_text_failure_cause_chain_is_bounded_and_sqlite_name_allowlisted(m
     assert logs[0]['phase'] == 'unknown'
     assert logs[0]['sqlite_errorcode'] == sqlite3.SQLITE_BUSY
     assert 'sqlite_errorname' not in logs[0]
+    assert 'PRIVATE' not in json.dumps(logs)
+
+
+def test_bound_failure_source_is_allowlisted_without_locals_or_messages(monkeypatch):
+    import services.conversation_binding_service as module
+    import services.openai_backend_api as backend
+    logs = []
+    monkeypatch.setattr(module.logger, 'warning', logs.append)
+    namespace = {}
+    exec(compile("def failure():\n    raise NameError('PRIVATE token and input')\n", backend.__file__, 'exec'), namespace)
+    try:
+        namespace['failure']()
+    except NameError as error:
+        module._log_bound_text_failure(error, 'stream_open')
+    assert logs[0]['source_file'] == 'services/openai_backend_api.py'
+    assert logs[0]['source_line'] == 2
+    assert logs[0]['error_type'] == 'NameError'
+    assert 'PRIVATE' not in json.dumps(logs)
+    logs.clear()
+    exec(compile("def failure():\n    raise ValueError('PRIVATE')\n", '/PRIVATE/openai_backend_api.py', 'exec'), namespace)
+    try:
+        namespace['failure']()
+    except ValueError as error:
+        module._log_bound_text_failure(error, 'stream_open')
+    assert 'source_file' not in logs[0] and 'source_line' not in logs[0]
     assert 'PRIVATE' not in json.dumps(logs)
