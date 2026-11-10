@@ -1,5 +1,7 @@
 """Opt-in Workbench product admission over the existing durable receipts."""
 from typing import Literal
+import re
+import time
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
@@ -8,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from api.support import require_identity
 from services.request_context import trusted_source
 from services.work_lifecycle import WorkLifecycleError
+from utils.log import logger
 
 
 class ProductFairnessInput(BaseModel):
@@ -66,7 +69,15 @@ def get_product_work_service():
     return service
 
 
-def capability_payload(request, authorization):
+def _capability_log(entry):
+    # Diagnostics must not change a capability response or expose request data.
+    try:
+        logger.info({"event": "product_work_capability_probe", **entry})
+    except Exception:
+        pass
+
+
+def capability_payload(request, authorization, observation=None):
     """Build the capability response outside the event-loop thread.
 
     The account/settings snapshots behind product_capacity_limit share the
@@ -74,15 +85,45 @@ def capability_payload(request, authorization):
     synchronous identity, service lookup, and capacity read can wait on those
     locks, so keep the entire synchronous chain together in the thread pool.
     """
-    product_identity(require_identity(authorization, request=request), request)
-    service = get_product_work_service()
-    return {"protocol": "product-work-v1", "shared_capacity_scope": "provider",
+    started = time.monotonic()
+    timing = {}
+    status = 200
+    error_type = None
+    try:
+        if observation is not None:
+            timing["threadpool_wait_ms"] = max(0.0, (started - observation["started"]) * 1000)
+        identity_started = time.monotonic()
+        try:
+            product_identity(require_identity(authorization, request=request), request)
+        finally:
+            timing["identity_ms"] = max(0.0, (time.monotonic() - identity_started) * 1000)
+        service_started = time.monotonic()
+        try:
+            service = get_product_work_service()
+        finally:
+            timing["service_lookup_ms"] = max(0.0, (time.monotonic() - service_started) * 1000)
+        observed_read = getattr(service, "observe_product_capacity_limit", None)
+        capacity = observed_read(timing) if callable(observed_read) else service.product_capacity_limit()
+        return {"protocol": "product-work-v1", "shared_capacity_scope": "provider",
             "capacity_source": "eligible_chat_turn_total", "cross_kind": True,
             "admission_scope": "product",
-            "product_count_limit": service.product_capacity_limit(),
+            "product_count_limit": capacity,
             "retained_products_consume_capacity": True,
             "close_after_archive": True, "adoption": True, "resume": True,
             "cancel_unsent_text_step": True, "admission_control": True}
+    except Exception as exc:
+        status = exc.status if isinstance(exc, WorkLifecycleError) else (
+            exc.status_code if isinstance(exc, HTTPException) else 500)
+        error_type = (type(exc).__name__ if isinstance(exc, (WorkLifecycleError, HTTPException))
+                      else "CapabilityReadError")
+        raise
+    finally:
+        if observation is not None:
+            # This executes in the worker even when the caller has timed out.
+            _capability_log({"stage": "completed", "probe_id": observation["probe_id"],
+                             "status": status, "error_type": error_type,
+                             "duration_ms": max(0.0, (time.monotonic() - observation["started"]) * 1000),
+                             **timing})
 
 
 class CloseProductWork(BaseModel):
@@ -155,8 +196,14 @@ def create_router():
     @router.get("/api/product-works/capabilities")
     async def capabilities(request: Request, response: Response, authorization: str | None = Header(default=None)):
         response.headers["Cache-Control"] = "private, no-store"
+        raw_probe = request.headers.get("x-workbench-capability-probe", "")
+        probe = raw_probe.lower() if re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", raw_probe,
+        ) else None
+        observation = {"started": time.monotonic(), "probe_id": probe}
+        _capability_log({"stage": "received", "probe_id": probe})
         try:
-            return await run_in_threadpool(capability_payload, request, authorization)
+            return await run_in_threadpool(capability_payload, request, authorization, observation)
         except WorkLifecycleError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None
 

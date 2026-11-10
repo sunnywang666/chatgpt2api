@@ -1695,6 +1695,28 @@ class PoolAdmission:
         with self._settings_guard(), self._account_guard():
             return self._product_capacity_limit(self._rows(), self._settings())
 
+    def observe_product_capacity_limit(self, timings):
+        @contextmanager
+        def observed_guard(guard, name):
+            started = time.monotonic()
+            acquired = False
+            try:
+                with guard:
+                    acquired = True
+                    timings[name] = max(0.0, (time.monotonic() - started) * 1000)
+                    yield
+            finally:
+                if not acquired:
+                    timings[name] = max(0.0, (time.monotonic() - started) * 1000)
+
+        with observed_guard(self._settings_guard(), "settings_lock_wait_ms"):
+            with observed_guard(self._account_guard(), "account_lock_wait_ms"):
+                started = time.monotonic()
+                try:
+                    return self._product_capacity_limit(self._rows(), self._settings())
+                finally:
+                    timings["capacity_read_ms"] = max(0.0, (time.monotonic() - started) * 1000)
+
     @staticmethod
     def _empty_turn_transfers(receipts):
         """Return proven empty roots whose local turn moved to one child."""

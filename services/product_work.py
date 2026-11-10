@@ -1841,6 +1841,11 @@ class ProductWorkService:
         # zero is safer than advertising an invented admission capacity.
         return int(read()) if callable(read) else 0
 
+    def observe_product_capacity_limit(self, timings):
+        admission = getattr(self.text, "admission", None)
+        read = getattr(admission, "observe_product_capacity_limit", None)
+        return int(read(timings)) if callable(read) else self.product_capacity_limit()
+
     def _load(self, db, identity, product_ref):
         source = require_product_source(identity)
         key = _key(source, str(identity["id"]), _ref(product_ref))

@@ -2,7 +2,7 @@
 import asyncio
 import json
 import threading
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -388,6 +388,194 @@ def test_capabilities_held_admission_lock_does_not_freeze_unrelated_event_loop_r
                 capacity_lock.release()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure", [None, "identity", "settings", "account", "read"])
+def test_capability_probe_separates_thread_identity_and_lock_waits(monkeypatch, failure):
+    from services import pool_admission
+
+    clock = [100.0]
+    logs = []
+    probe = "c9eb244a-c480-4b82-8d95-1676ea89151a"
+    secret = "authorization-and-provider-body-must-not-be-logged"
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    @contextmanager
+    def guard(name, seconds):
+        advance(seconds)
+        if failure == name:
+            raise RuntimeError(secret)
+        yield
+
+    admission = object.__new__(pool_admission.PoolAdmission)
+    admission._settings_guard = lambda: guard("settings", 0.011)
+    admission._account_guard = lambda: guard("account", 0.017)
+    admission._settings = lambda: {"chat_account_concurrency": 2}
+
+    def rows():
+        advance(0.023)
+        if failure == "read":
+            raise RuntimeError(secret)
+        return []
+
+    admission._rows = rows
+    service = ProductWorkService(SimpleNamespace(admission=admission, store=None), None)
+
+    def identity(*args, **kwargs):
+        advance(0.005)
+        if failure == "identity":
+            raise WorkLifecycleError("AUTH_REQUIRED", 403)
+        return IDENTITY
+
+    async def threadpool(fn, *args):
+        advance(0.003)
+        return fn(*args)
+
+    monkeypatch.setattr(product_works, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(pool_admission, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(product_works, "run_in_threadpool", threadpool)
+    monkeypatch.setattr(product_works, "require_identity", identity)
+    monkeypatch.setattr(product_works, "get_product_work_service", lambda: service)
+    monkeypatch.setattr(product_works.logger, "info", lambda entry: logs.append(deepcopy(entry)))
+    app = FastAPI(); app.include_router(product_works.create_router())
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/api/product-works/capabilities",
+        headers={"x-workbench-consumer": "wb-to-ozon", "x-workbench-capability-probe": probe,
+                 "Authorization": secret},
+    )
+    expected_status = 403 if failure == "identity" else 500 if failure else 200
+    assert response.status_code == expected_status
+    assert len(logs) == 2
+    assert [x["stage"] for x in logs] == ["received", "completed"]
+    assert all(x["probe_id"] == probe for x in logs)
+    complete = logs[1]
+    assert complete["status"] == expected_status
+    assert complete["threadpool_wait_ms"] == pytest.approx(3)
+    assert complete["identity_ms"] == pytest.approx(5)
+    if failure != "identity":
+        assert complete["settings_lock_wait_ms"] == pytest.approx(11)
+    if failure not in {"identity", "settings"}:
+        assert complete["account_lock_wait_ms"] == pytest.approx(17)
+    if failure not in {"identity", "settings", "account"}:
+        assert complete["capacity_read_ms"] == pytest.approx(23)
+    if not failure:
+        assert response.json()["product_count_limit"] == 0
+        assert complete["duration_ms"] == pytest.approx(59)
+    assert secret not in json.dumps(logs)
+    assert "Authorization" not in json.dumps(logs)
+
+
+@pytest.mark.parametrize("probe", [None, "private-token", " c9eb244a-c480-4b82-8d95-1676ea89151a",
+                                  "c9eb244ac4804b828d951676ea89151a"])
+def test_capability_probe_missing_or_invalid_is_not_reflected(services, monkeypatch, probe):
+    logs = []
+    monkeypatch.setattr(product_works.logger, "info", lambda entry: logs.append(deepcopy(entry)))
+    monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
+    monkeypatch.setattr(product_works, "get_product_work_service", lambda: services[2])
+    app = FastAPI(); app.include_router(product_works.create_router())
+    headers = {"x-workbench-consumer": "wb-to-ozon"}
+    if probe is not None:
+        headers["x-workbench-capability-probe"] = probe
+    response = TestClient(app).get("/api/product-works/capabilities", headers=headers)
+    assert response.status_code == 200
+    assert all(entry["probe_id"] is None for entry in logs)
+    assert "x-workbench-capability-probe" not in response.headers
+    if probe is not None:
+        assert probe not in json.dumps(logs)
+
+
+def test_capability_logging_failure_does_not_change_read(services, monkeypatch):
+    def broken_log(entry):
+        raise RuntimeError("logger unavailable")
+    monkeypatch.setattr(product_works.logger, "info", broken_log)
+    monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
+    monkeypatch.setattr(product_works, "get_product_work_service", lambda: services[2])
+    app = FastAPI(); app.include_router(product_works.create_router())
+    response = TestClient(app).get("/api/product-works/capabilities",
+                                  headers={"x-workbench-consumer": "wb-to-ozon"})
+    assert response.status_code == 200
+    assert response.json()["product_count_limit"] == 0
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_capability_probe_preserves_no_argument_legacy_capacity_reader(monkeypatch, wrapped):
+    calls = []
+    def read():
+        calls.append(True)
+        return 6
+    legacy = SimpleNamespace(product_capacity_limit=read)
+    service = ProductWorkService(SimpleNamespace(store=None, admission=legacy), None) if wrapped else legacy
+    logs = []
+    monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
+    monkeypatch.setattr(product_works, "get_product_work_service", lambda: service)
+    monkeypatch.setattr(product_works.logger, "info", lambda entry: logs.append(deepcopy(entry)))
+    app = FastAPI(); app.include_router(product_works.create_router())
+    response = TestClient(app).get("/api/product-works/capabilities", headers={
+        "x-workbench-consumer": "wb-to-ozon",
+        "x-workbench-capability-probe": "c9eb244a-c480-4b82-8d95-1676ea89151a",
+    })
+    assert response.status_code == 200
+    assert response.json()["product_count_limit"] == 6
+    assert len(calls) == 1
+    assert logs[-1]["stage"] == "completed"
+    assert "account_lock_wait_ms" not in logs[-1]
+
+
+def test_capability_probe_keeps_concurrent_and_late_completion_correlated(monkeypatch):
+    logs = []
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    count_lock = threading.Lock()
+    calls = [0]
+    probes = ["c9eb244a-c480-4b82-8d95-1676ea89151a", "bd743fa3-db84-43da-84a1-dbb81cfe5910"]
+
+    class Service:
+        def product_capacity_limit(self):
+            with count_lock:
+                calls[0] += 1
+                first = calls[0] == 1
+            if first:
+                entered.set()
+                assert release.wait(2), "test did not release first reader"
+            return 7
+
+    def log(entry):
+        logs.append(deepcopy(entry))
+        if entry.get("probe_id") == probes[0] and entry.get("stage") == "completed":
+            finished.set()
+
+    monkeypatch.setattr(product_works.logger, "info", log)
+    monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
+    monkeypatch.setattr(product_works, "get_product_work_service", lambda: Service())
+    app = FastAPI(); app.include_router(product_works.create_router())
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            def headers(probe):
+                return {"x-workbench-consumer": "wb-to-ozon", "x-workbench-capability-probe": probe}
+            first = asyncio.create_task(client.get("/api/product-works/capabilities", headers=headers(probes[0])))
+            try:
+                assert await asyncio.to_thread(entered.wait, 0.5)
+                second = await asyncio.wait_for(client.get("/api/product-works/capabilities",
+                                                           headers=headers(probes[1])), 0.5)
+                assert second.status_code == 200
+                assert not finished.is_set()
+                first.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await first
+            finally:
+                release.set()
+            assert await asyncio.to_thread(finished.wait, 0.5)
+
+    asyncio.run(exercise())
+    for probe in probes:
+        entries = [e for e in logs if e["probe_id"] == probe]
+        assert [e["stage"] for e in entries] == ["received", "completed"]
+        assert entries[-1]["status"] == 200
+        assert entries[-1]["duration_ms"] >= entries[-1]["threadpool_wait_ms"]
 
 
 def test_admission_control_route_uses_separate_zero_based_cas(services, monkeypatch):
