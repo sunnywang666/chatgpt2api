@@ -439,13 +439,13 @@ def _image_follows_completed_text(store, db, owner, image, original, now):
             or audit["original_input_hash"] != child.get("_supersedes_input_hash")
             or child.get("request_id") != child_id or child.get("_supersedes_incomplete") is not True
             or child.get("status") != "succeeded" or child.get("upstream_outcome") != "completed"
-            or child.get("_upstream_terminal") is not True or child.get("upstream_unfinished")
+            or not product_work._advanced_session_terminal(child, now) or child.get("upstream_unfinished")
             or not isinstance(child.get("content"), str) or not child["content"].strip()):
         return False
     end = child.get("_turn_end_evidence")
-    final = image.get("parent_message_id")
+    final = child.get("parent_message_id")
     if (not isinstance(end, dict) or not isinstance(final, str) or not final.strip()
-            or end.get("final_message_id") != final or child.get("parent_message_id") != final
+            or end.get("final_message_id") != final
             or not child.get("request_message_id") or child["request_message_id"] == final
             or end.get("request_message_id") != child["request_message_id"]
             or end.get("conversation_id") != image.get("conversation_id")):
@@ -456,7 +456,12 @@ def _image_follows_completed_text(store, db, owner, image, original, now):
             and original.get("_source") == child["_source"]
             and original.get("_product_work") == child.get("_product_work")
             and Text._strict_successor_sequence(original, child) and Text._strict_successor_sequence(child, image)
-            and product_work._successor(store, db, owner, original, child))
+            and product_work._successor(store, db, owner, original, child)
+            and (image.get("parent_message_id") == final
+                 or (original.get("upstream_unfinished") is not True
+                     and not product_work._advanced_session_original_live(original, now)
+                     and product_work.completed_text_image_continuation(
+                         store, db, owner, image, child, now))))
 
 
 def _missing_node_retry_image_parent(store, db, owner, image_id, now):

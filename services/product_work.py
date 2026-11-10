@@ -1181,6 +1181,70 @@ def advanced_continuation_required(store, db, receipt):
     return False
 
 
+def completed_text_image_continuation(store, db, owner, image, child, now):
+    """Prove normal completed text steps between an owned replacement and image.
+
+    Called only after the original/replacement relation has been verified.
+    This is send admission, not a rewrite or close of the UNKNOWN original.
+    Read only this ProductWork's registered members and their frozen inputs.
+    """
+    from services.image_task_service import _request_hash
+
+    parent = store.runtime(db, image.get("_product_work_key", ""))
+    if (not parent or parent.get("owner") != owner or parent.get("source") != child.get("_source")
+            or parent.get("state") != "active" or admission_control(parent)["state"] != "active"
+            or type(child.get("_sequence")) is not int or type(image.get("_sequence")) is not int
+            or _advanced_session_original_live(child, now)
+            or any(child.get(k) for k in ("_send_hold", "_recovery_paused", "_completion", "_completion_of"))):
+        return False
+    members = parent.get("members", [])
+    image_members = [m for m in members if m.get("kind") == "image" and m.get("request_id") == image.get("id")]
+    child_members = [m for m in members if m.get("kind") == "text" and m.get("request_id") == child.get("request_id")]
+    if (len(image_members) != 1 or len(child_members) != 1
+            or any(m.get("owner") != owner for m in (*image_members, *child_members))
+            or child.get("_product_work") != _metadata(parent, child_members[0]["step_ref"])
+            or image.get("_product_work") != _metadata(parent, image_members[0]["step_ref"])):
+        return False
+    try:
+        stored = store.load_input(image["_input_ref"])
+        payload = stored["payload"]
+        if (stored["mode"] != image.get("mode")
+                or _request_hash(stored["mode"], payload) != image.get("request_hash")
+                or str(stored["identity"]["id"]) != owner
+                or payload.get("_product_work") != image.get("_product_work")
+                or any(not image.get(k) or payload.get(k) != image[k] for k in (
+                    "provider_binding_id", "provider_account_identity", "client_conversation_id",
+                    "conversation_id", "parent_message_id"))):
+            return False
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    later = []
+    for member in members:
+        if member == image_members[0]:
+            continue
+        if member.get("owner") != owner:
+            return False
+        tail = store.read_receipt(db, member["kind"], owner, member["request_id"])
+        if not tail or type(tail.get("_sequence")) is not int:
+            return False
+        if tail["_sequence"] <= child["_sequence"]:
+            continue
+        if tail["_sequence"] >= image["_sequence"]:
+            return False
+        later.append((tail["_sequence"], member, tail))
+    later.sort(key=lambda item: item[0])
+    previous = child
+    used_steps = {child_members[0]["step_ref"]}
+    for _, member, tail in later:
+        if (any(tail.get(k) for k in ("_send_hold", "_completion", "_completion_of"))
+                or not _normal_product_tail(store, db, parent, member, tail, previous, used_steps, now)):
+            return False
+        previous = tail
+        used_steps.add(member["step_ref"])
+    return bool(later and image_members[0]["step_ref"] not in used_steps
+                and previous.get("parent_message_id") == image.get("parent_message_id"))
+
+
 def advanced_continuation_chain(store, db, receipt, now):
     """Read-only send proof for one new normal step after an owned completed chain."""
     parent = store.runtime(db, receipt.get("_product_work_key", ""))
