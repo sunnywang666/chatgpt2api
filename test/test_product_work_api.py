@@ -523,6 +523,35 @@ def test_capability_probe_preserves_no_argument_legacy_capacity_reader(monkeypat
     assert "account_lock_wait_ms" not in logs[-1]
 
 
+def test_capabilities_complete_while_unrelated_shared_settings_guard_is_held(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from services.config import ConfigStore
+    from services.pool_admission import PoolAdmission
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"auth-key": "fixture-only"}))
+    config = ConfigStore(path)
+    admission = object.__new__(PoolAdmission)
+    admission.settings = config.resource_settings
+    admission.accounts = SimpleNamespace(admission_transaction=nullcontext, admission_accounts=lambda: [])
+    service = ProductWorkService(SimpleNamespace(admission=admission, store=None), None)
+    logs = []
+    monkeypatch.setattr(product_works, "require_identity", lambda *a, **k: IDENTITY)
+    monkeypatch.setattr(product_works, "get_product_work_service", lambda: service)
+    monkeypatch.setattr(product_works.logger, "info", lambda entry: logs.append(deepcopy(entry)))
+    app = FastAPI(); app.include_router(product_works.create_router())
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as executor:
+        with config.resource_settings_guard():
+            future = executor.submit(client.get, "/api/product-works/capabilities", headers={
+                "x-workbench-consumer": "wb-to-ozon",
+                "x-workbench-capability-probe": "c9eb244a-c480-4b82-8d95-1676ea89151a",
+            })
+            response = future.result(timeout=2)
+            assert response.status_code == 200
+            assert response.json()["product_count_limit"] == 0
+            assert logs[-1]["stage"] == "completed"
+
+
 def test_capability_probe_keeps_concurrent_and_late_completion_correlated(monkeypatch):
     logs = []
     entered = threading.Event()
