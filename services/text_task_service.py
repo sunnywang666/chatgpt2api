@@ -609,6 +609,9 @@ class TextTaskService:
         from utils.upstream_error import safe_upstream_error
         result = {k: v for k, v in receipt.items() if k not in TextTaskService._INTERNAL_RECEIPT_FIELDS and not k.startswith("_")}
         result.pop("recovery_deferred", None)  # This is only a current-call projection.
+        # Only the validated acceptance read may attest the immutable input
+        # parent. Never echo a persisted public-looking proof on ordinary GET.
+        result.pop("workbench_derived_input_parent_message_id", None)
         if "recovery_next_at" in result:
             # The caller must see the same effective cadence as the dispatcher,
             # including legacy schedules. Preserve the original durable row.
@@ -3159,7 +3162,8 @@ class TextTaskService:
                 self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_UNAVAILABLE")
         return body
 
-    def validate_workbench_derived_input(self, owner, request_id, payload, *, source):
+    def validate_workbench_derived_input(self, owner, request_id, payload, *, source,
+                                       _include_input_parent=False):
         """Pure local idempotency check for the API before content review/send."""
         body = self.prepare_workbench_derived_input(owner, request_id, payload, source=source)
         child_id, child_hash = self._submission_identity(owner, body)
@@ -3186,7 +3190,28 @@ class TextTaskService:
                     raise ValueError
             except (OSError, ValueError, TypeError, KeyError):
                 self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_UNAVAILABLE")
+            if _include_input_parent:
+                return self._public_derived_acceptance(receipt, stored, child_hash)
             return self._public(receipt)
+
+    def _public_derived_acceptance(self, receipt, stored, child_hash):
+        """Project provenance only after owner/hash/full durable-body validation."""
+        result = self._public(receipt)
+        marker = stored.get(self._WORKBENCH_DERIVED_MARKER) or {}
+        if (marker.get("mode") == "incomplete"
+                and marker.get("derivation_kind") == "split_attributes_v1"):
+            expected = self._workbench_derived_marker(
+                original_input_hash=marker["original_input_hash"], child_input_hash=child_hash,
+                mode=marker["mode"], derivation_kind=marker["derivation_kind"],
+            )
+            parent = stored.get("parent_message_id")
+            if (receipt.get(self._WORKBENCH_DERIVED_MARKER) != expected
+                    or not isinstance(parent, str) or not parent or parent != parent.strip()):
+                self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_UNAVAILABLE")
+            # Actual request_parent and successful continuation cursor retain
+            # their existing meanings; neither is the frozen source parent.
+            result["workbench_derived_input_parent_message_id"] = parent
+        return result
 
     def observe_workbench_derived_acceptance(self, owner, request_id, payload, *, source):
         """Read whether one frozen advanced/incomplete successor was accepted at this instant.
@@ -3207,7 +3232,8 @@ class TextTaskService:
                 "advanced successor acceptance requires advanced_new_session",
                 code="CHAT_ADVANCED_SESSION_INVALID",
             )
-        existing = self.validate_workbench_derived_input(owner, request_id, payload, source=source)
+        existing = self.validate_workbench_derived_input(
+            owner, request_id, payload, source=source, _include_input_parent=True)
         if existing is not None:
             return existing
 
@@ -3227,7 +3253,7 @@ class TextTaskService:
                         raise ValueError
                 except (OSError, ValueError, TypeError, KeyError):
                     self._workbench_derived_error("CHAT_WORKBENCH_DERIVED_INPUT_UNAVAILABLE")
-                return self._public(receipt)
+                return self._public_derived_acceptance(receipt, stored, child_hash)
         return {
             "state": "absent_at_observation",
             "original_request_id": request_id,

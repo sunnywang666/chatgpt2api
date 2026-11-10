@@ -43,15 +43,123 @@ def incomplete_http(task, monkeypatch):
     h = install_incomplete(task)
     h.payload = payload(h.service, h.old, request_id="successor", mode="incomplete")
     monkeypatch.setattr(ai, "text_task_service", h.service)
+    monkeypatch.setattr(task_results, "text_task_service", h.service)
     identity = {"role": "admin", "id": "owner"}
     monkeypatch.setattr(ai, "require_identity", lambda *_a, **_k: identity)
+    monkeypatch.setattr(task_results, "require_identity", lambda *_a, **_k: identity)
     monkeypatch.setattr(ai, "trusted_source", lambda *_a: "internal:listing")
     review = AsyncMock()
     monkeypatch.setattr(ai, "filter_or_log", review)
     app = FastAPI()
     app.include_router(ai.create_router())
+    app.include_router(task_results.create_router())
     with TestClient(app) as client:
         yield h, review, client, identity
+
+
+INPUT_PARENT = "566459da-c92c-4d1c-9f8f-97991b2f8abf"
+SENT_PARENT = "94f12781-769f-4249-9719-4b1a72601a99"
+FINAL_CURSOR = "3b460b3e-ca3f-49c4-b6c6-8e975188112f"
+INPUT_PARENT_FIELD = "workbench_derived_input_parent_message_id"
+
+
+def split_attribute_result(h, client):
+    """Synthetic incident shape, with real durable acceptance and HTTP reads."""
+    h.body["parent_message_id"] = INPUT_PARENT
+    update(h.service, parent_message_id=INPUT_PARENT,
+           request_parent_message_id=INPUT_PARENT, _submission_parent_message_id=INPUT_PARENT)
+    install_incomplete(h)
+    h.payload = {**payload(h.service, h.old, request_id="successor", mode="incomplete"),
+                 "derivation_kind": "split_attributes_v1"}
+    submitted = client.post(PREFIX + "/derived-successor", json=h.payload)
+    assert submitted.status_code == 200, submitted.text
+    assert INPUT_PARENT_FIELD not in submitted.json()
+    update(h.service, "successor", status="succeeded", content="synthetic attribute result",
+           request_parent_message_id=SENT_PARENT, _submission_parent_message_id=INPUT_PARENT,
+           parent_message_id=FINAL_CURSOR, _submission_started=True, _executing=False,
+           _turn_reserved=False, _upstream_terminal=True)
+
+
+@pytest.mark.parametrize("second_observation", [False, True])
+def test_split_attributes_acceptance_attests_input_parent_without_changing_actual_cursor(
+        incomplete_http, monkeypatch, tmp_path, second_observation):
+    h, review, client, _identity = incomplete_http
+    split_attribute_result(h, client)
+    review.reset_mock()
+    h.service.recovery_reader = lambda *_a: pytest.fail("acceptance read upstream")
+    if second_observation:
+        # A child may appear after the initial local observation; the second
+        # owner/hash/full-body check must provide the same attestation.
+        monkeypatch.setattr(h.service, "validate_workbench_derived_input", lambda *_a, **_k: None)
+    before = [deepcopy(row(h.service, rid)) for rid in ("old", "successor")]
+    response = client.post(PREFIX + "/derived-successor/acceptance", json=h.payload)
+    assert response.status_code == 200, response.text
+    accepted = response.json()
+    assert accepted[INPUT_PARENT_FIELD] == INPUT_PARENT
+    assert accepted["request_parent_message_id"] == SENT_PARENT
+    assert accepted["parent_message_id"] == FINAL_CURSOR
+    assert accepted["status"] == "succeeded"
+    normal = client.get("/api/task-results/text/successor")
+    assert normal.status_code == 200 and normal.json()["result_ready"]
+    assert INPUT_PARENT_FIELD not in normal.json()["receipt"]
+    assert normal.json()["receipt"]["request_parent_message_id"] == SENT_PARENT
+    assert [row(h.service, rid) for rid in ("old", "successor")] == before
+    assert not h.sent and not review.await_count
+    # Complete synthetic HTTP wire responses for the paired Node parser test.
+    for name, value in (("split-attributes-acceptance", accepted),
+                        ("split-attributes-task-result", normal.json()),
+                        ("split-attributes-retained-input", h.service.read_retained_input(
+                            "owner", "old", source="internal:listing")),
+                        ("split-attributes-request", h.payload)):
+        (tmp_path / (name + ".json")).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+@pytest.mark.parametrize("corruption", ["owner", "original_hash", "child_hash", "body",
+                                       "missing_input", "missing_original_input", "audit"])
+def test_split_attributes_acceptance_requires_original_and_child_durable_proof(
+        incomplete_http, corruption):
+    h, review, client, identity = incomplete_http
+    split_attribute_result(h, client)
+    review.reset_mock()
+    if corruption == "owner":
+        identity["id"] = "foreign-owner"
+    elif corruption == "original_hash":
+        h.payload["original_input_hash"] = "0" * 64
+    else:
+        rid = "old" if corruption == "missing_original_input" else "successor"
+        with h.service.store.transaction() as db:
+            r = h.service.store.read_receipt(db, "text", "owner", rid)
+            if corruption == "child_hash":
+                db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id=?",
+                           ("0" * 64, "owner", rid))
+            elif corruption == "body":
+                body = h.service.store.load_input(r["_input_ref"])
+                body["parent_message_id"] = "different-source"
+                r["_input_ref"] = h.service.store.save_input(body)
+            elif corruption in {"missing_input", "missing_original_input"}:
+                r["_input_ref"] = "0" * 32 + ".json"
+            elif corruption == "audit":
+                r["_workbench_derived_input"]["child_input_hash"] = "0" * 64
+            r[INPUT_PARENT_FIELD] = INPUT_PARENT  # A stored forged proof cannot rescue invalid input.
+            h.service.store.write_receipt(db, "text", "owner", rid, r)
+    response = client.post(PREFIX + "/derived-successor/acceptance", json=h.payload)
+    assert response.status_code in {404, 409}, response.text
+    assert INPUT_PARENT_FIELD not in response.json()
+    assert not h.sent and not review.await_count
+
+
+def test_ordinary_get_discards_forged_input_parent_and_other_kind_gets_no_proof(incomplete_http):
+    h, review, client, _identity = incomplete_http
+    response = client.post(PREFIX + "/derived-successor", json=h.payload)
+    assert response.status_code == 200, response.text
+    update(h.service, "successor", **{INPUT_PARENT_FIELD: INPUT_PARENT})
+    review.reset_mock()
+    normal = client.get("/api/task-results/text/successor")
+    accepted = client.post(PREFIX + "/derived-successor/acceptance", json=h.payload)
+    assert normal.status_code == accepted.status_code == 200
+    assert INPUT_PARENT_FIELD not in normal.json()["receipt"]
+    assert INPUT_PARENT_FIELD not in accepted.json()
+    assert not h.sent and not review.await_count
 
 
 def test_advanced_wire_idempotency_and_saved_result_read(advanced_http):
