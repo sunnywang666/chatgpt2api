@@ -294,6 +294,8 @@ environment:
 
 POST 返回既有文本回执，并附 `workbench_derived_input`：`{protocol:"workbench-derived-input-v1", original_input_hash, child_input_hash, mode, derivation_kind}`。内部管理员的后续 `task-result-v1` 纯读保留该审计字段；它与旧 `derived_input` 分开。工作台保存自己的业务派生证明，并按原业务身份幂等采用结果。新的 no-final/incomplete child 仍须通过原 ProductWork 关联检查才可关闭与归档，不凭生成成功直接关闭业务。
 
+`POST /api/conversation-bindings/text-requests/{原请求 ID}/derived-successor/acceptance` 只观察已保存的受理结果，不发送或查询上游。对于 `mode:"incomplete"`、`derivation_kind:"split_attributes_v1"` 的既有 child，原/子请求身份、hash 和完整持久化输入校验通过后，额外返回 `workbench_derived_input_parent_message_id`，值取冻结的 child input `parent_message_id`。它证明派生资料的原始位置；`request_parent_message_id` 仍表示实际发送位置，`parent_message_id` 仍表示成功结果后的接续位置，两者都不改写。工作台应分别校验这些含义。普通结果 GET、发送接口和其他 mode/kind 不返回此来源证明；缺失或不匹配的输入不能通过持久化同名字段伪造证明。
+
 #### 原会话已进入其他讨论后的显式新会话后继
 
 `advanced_new_session` 只接受已发送、没有原最终答案、本地执行结束且无活动恢复租约的
