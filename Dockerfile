@@ -50,7 +50,11 @@ RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
 RUN pip install --no-cache-dir --upgrade 'pip==26.2.2' 'uv==0.13.4'
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+# Keep dependency downloads bounded on the shared build proxy.
+# Preserve locked URLs, versions and hashes; final failures stop the build.
+RUN UV_CONCURRENT_DOWNLOADS=4 UV_HTTP_CONNECT_TIMEOUT=15 \
+    UV_HTTP_TIMEOUT=60 UV_HTTP_RETRIES=3 \
+    uv sync --frozen --no-dev --no-install-project
 
 COPY main.py ./
 COPY config.json ./
