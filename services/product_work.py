@@ -509,6 +509,66 @@ def _unsent_retry_successor(store, db, owner, previous, receipt, now, *, registe
         return False
 
 
+def _invalid_image_input_chain(store, db, parent, receipt, members):
+    """One successful server-derived image omission can retire only its source."""
+    marker = receipt.get("_workbench_derived_input")
+    if not isinstance(marker, dict) or marker.get("mode") != "invalid_image_input":
+        return None
+    from services.conversation_binding_service import ConversationBindingError
+    from services.text_task_service import TextTaskService
+    child_id, original_id = receipt.get("request_id"), receipt.get("_supersedes_request_id")
+    if (not isinstance(child_id, str) or not isinstance(original_id, str) or child_id == original_id
+            or receipt.get("status") != "succeeded" or receipt.get("upstream_outcome") != "completed"
+            or not isinstance(receipt.get("content"), str) or not receipt["content"].strip()
+            or receipt.get("upstream_unfinished") or _claims(receipt)):
+        return None
+    original_row = db.execute("SELECT request_hash,receipt FROM requests WHERE owner=? AND id=?",
+                              (parent["owner"], original_id)).fetchone()
+    child_row = db.execute("SELECT request_hash FROM requests WHERE owner=? AND id=?",
+                           (parent["owner"], child_id)).fetchone()
+    if not original_row or not child_row or receipt.get("_supersedes_input_hash") != original_row[0]:
+        return None
+    try:
+        original = json.loads(original_row[1])
+        original_body = store.load_input(original["_input_ref"])
+        child_body = store.load_input(receipt["_input_ref"])
+        expected = TextTaskService._workbench_derived_body_from_stored(
+            original_body, original_id, original_row[0], child_body, verify_invalid_images=False)
+        marker = TextTaskService._workbench_derived_marker(
+            original_input_hash=original_row[0], child_input_hash=child_row[0],
+            mode="invalid_image_input", derivation_kind="omit_invalid_inline_image_v1",
+            omit_image_parts=expected[TextTaskService._WORKBENCH_DERIVED_MARKER]["omit_image_parts"],
+        )
+    except (ConversationBindingError, OSError, ValueError, TypeError, KeyError):
+        return None
+    if (child_body != expected or receipt.get(TextTaskService._WORKBENCH_DERIVED_MARKER) != marker
+            or not TextTaskService._invalid_image_input_successor_source(original)
+            or TextTaskService._submission_identity(parent["owner"], original_body) != (original_id, original_row[0])
+            or TextTaskService._submission_identity(parent["owner"], child_body) != (child_id, child_row[0])
+            or not TextTaskService._supersede_order_link(original, receipt)):
+        return None
+    keys = ("_product_work_key", "provider_binding_id", "provider_account_identity",
+            "client_conversation_id", "conversation_id")
+    if (any(not original.get(key) or original.get(key) != receipt.get(key) for key in keys)
+            or any(item.get("_product_work_key") != parent["key"] or _source(item) != parent["source"]
+                   for item in (original, receipt))):
+        return None
+    children = db.execute(
+        "SELECT id FROM requests WHERE owner=? AND json_extract(receipt,'$._supersedes_request_id')=?",
+        (parent["owner"], original_id),
+    ).fetchall()
+    if children != [(child_id,)]:
+        return None
+    original_member = next((member for member, row in members
+                            if member.get("kind") == "text" and row.get("request_id") == original_id), None)
+    child_member = next((member for member, row in members
+                         if member.get("kind") == "text" and row.get("request_id") == child_id), None)
+    if not original_member or not child_member:
+        return None
+    return {"original": original, "successor": receipt, "archive": receipt,
+            "archive_member": child_member, "members": [original, receipt]}
+
+
 def _successor(store, db, owner, previous, receipt):
     from services.generation_completion import same_session_retry
     if same_session_retry(previous, receipt):
@@ -2041,6 +2101,14 @@ class ProductWorkService:
             waived.add(previous["request_id"])
         return waived
 
+    def _invalid_image_input_chains(self, db, parent, members):
+        return {chain["original"]["request_id"]: chain
+                for _member, receipt in members
+                if (chain := _invalid_image_input_chain(self.store, db, parent, receipt, members))}
+
+    def _invalid_image_input_waivers(self, db, parent, members):
+        return set(self._invalid_image_input_chains(db, parent, members))
+
     def _owned_advanced_successor_chains(self, db, parent, members):
         """Return only compact children proven by the original-reader branch proof."""
         chains = {}
@@ -2134,6 +2202,7 @@ class ProductWorkService:
         waived = self._missing_node_waivers(db, parent, owned)
         waived.update(self._no_final_successor_waivers(db, parent, owned))
         waived.update(self._unsent_retry_waivers(db, parent, owned))
+        waived.update(self._invalid_image_input_waivers(db, parent, owned))
         waived.update(self._codex_rejected_retry_waivers(db, parent, owned))
         waived.update(self._advanced_session_waivers(db, parent, owned))
         waived.update(_manual_followup_waivers(self.store, db, parent, owned))
@@ -2159,6 +2228,7 @@ class ProductWorkService:
             valid_continues.add(chain["continue"]["request_id"])
         waived.update(self._no_final_successor_waivers(db, parent, members))
         waived.update(self._unsent_retry_waivers(db, parent, members))
+        waived.update(self._invalid_image_input_waivers(db, parent, members))
         waived.update(self._codex_rejected_retry_waivers(db, parent, members))
         waived.update(self._advanced_session_waivers(db, parent, members))
         waived.update(_manual_followup_waivers(self.store, db, parent, members))
@@ -2454,6 +2524,7 @@ class ProductWorkService:
                 raise WorkLifecycleError(reasons[0])
             targets = {}
             chains = self._missing_node_chains(db, parent, members)
+            invalid_image_chains = self._invalid_image_input_chains(db, parent, members)
             advanced_chains = self._owned_advanced_successor_chains(db, parent, members)
             advanced_session_chains = self._advanced_session_chains(db, parent, members)
             retired_advanced_session_originals = self._advanced_session_retired_originals(parent, members)
@@ -2474,6 +2545,11 @@ class ProductWorkService:
                 if canonical in special_targets and special_targets[canonical] != target:
                     raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
                 special_targets[canonical] = target
+            for chain in invalid_image_chains.values():
+                # Only replace the failed original in the ordinary latest-member
+                # selection. Later normal product steps on this conversation
+                # must still win their established sequence comparison.
+                chain_member_ids.add(("text", chain["original"]["request_id"]))
             for chain in advanced_chains.values():
                 archive_member, archive = chain["archive_member"], chain["archive"]
                 for item in (chain["original"], chain["successor"]):
@@ -2499,6 +2575,7 @@ class ProductWorkService:
                     raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
                 special_targets[canonical] = target
             chains.update(advanced_chains)
+            chains.update(invalid_image_chains)
             for member, receipt in members:
                 identity = member["kind"], member["request_id"]
                 session_chain = advanced_session_members.get(identity)
