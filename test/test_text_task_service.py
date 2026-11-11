@@ -2776,6 +2776,9 @@ class TextTaskTests(unittest.TestCase):
                               {"_executing": True}, {"_turn_reserved": True}, {"upstream_unfinished": True},
                               {"upstream_submission_started": True}, {"send_count": 1},
                               {"_last_sent_sequence": 1}, {"content": "saved answer"},
+                              {"original_failure_phase": None}, {"original_failure_phase": "stream_read"},
+                              {"original_exception_category": None}, {"original_exception_category": "transport"},
+                              {"recovery_requires_new_conversation": True},
                               {"_execution_timeline": [{"stage": "send_call_started"}]}):
             with self.subTest(contradiction=contradiction):
                 self.assertNotIn("upstream_submission_started", service._public({**stored, **contradiction}))

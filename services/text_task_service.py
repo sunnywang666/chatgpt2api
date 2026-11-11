@@ -598,6 +598,9 @@ class TextTaskService:
                 and receipt.get("_executing") is False and receipt.get("_turn_reserved") is False
                 and receipt.get("upstream_unfinished") is False
                 and receipt.get("recovery_retryable") is False
+                and receipt.get("recovery_requires_new_conversation") is False
+                and receipt.get("original_failure_phase") == "image_input_validation"
+                and receipt.get("original_exception_category") == "invalid_image_input"
                 and receipt.get("upstream_submission_started") in (None, False)
                 and receipt.get("_last_sent_sequence") is None
                 and type(receipt.get("send_count", 0)) is int and receipt.get("send_count", 0) == 0
