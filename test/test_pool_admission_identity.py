@@ -1,6 +1,7 @@
 """Real account JSON + native executor; no production accounts or requests."""
 import hashlib
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from services.account_service import AccountService
+from services.account_state_lock import AccountStateLock
 from services.codex_service import CodexService
 from services.durable_forward import envelope, raw_receipt
 from services.log_service import LogService
@@ -67,6 +69,132 @@ def response(rt, name="response-original"):
     session = FakeSession(post_response=FakeResponse(payload={"id": name, "output": []}))
     rt.factory.sessions.append(session)
     return session
+
+
+def test_account_state_lock_logs_bounded_outer_timing_and_reload(tmp_path, monkeypatch):
+    """The log contains only fixed category plus timing, after outer release."""
+    owner = SimpleNamespace(
+        _accounts={"old-token": {"identity": "same"}},
+        _token_aliases={},
+        _image_inflight={"old-token": 2},
+    )
+    owner._stable_account_identity = lambda account: account["identity"]
+    owner._load_accounts = lambda: {"new-token": {"identity": "same"}}
+    lock = AccountStateLock(owner, tmp_path / "accounts.pool-lock")
+    ticks = iter((0.0, 1.0, 2.0, 5.0, 7.0, 9.0))
+    events = []
+    def record(event):
+        assert not lock._is_owned()
+        assert not hasattr(lock.local, "fd")
+        events.append(event)
+    monkeypatch.setattr("services.account_state_lock.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("services.account_state_lock.logger.info", record)
+
+    def claim_next():
+        with lock:
+            assert owner._accounts == {"new-token": {"identity": "same"}}
+
+    claim_next()
+
+    assert owner._token_aliases == {"old-token": "new-token"}
+    assert owner._image_inflight == {"new-token": 2}
+    assert events == [{
+        "event": "account_state_lock_timing",
+        "caller": "claim_next",
+        "local_rlock_wait_ms": 1000.0,
+        "flock_wait_ms": 3000.0,
+        "reload_ms": 2000.0,
+        "held_ms": 8000.0,
+    }]
+
+
+def test_account_state_lock_reports_local_wait_after_holder_releases(monkeypatch):
+    """A barrier makes the local-RLock wait deterministic without sleeping."""
+    lock = AccountStateLock(SimpleNamespace())
+    entered, waiter_waiting, release, waiter_done = (threading.Event() for _ in range(4))
+    now, clock_guard = [0.0], threading.Lock()
+    events = []
+
+    class NotifyingRLock:
+        def __init__(self):
+            self.inner = threading.RLock()
+            self.owner = None
+
+        def acquire(self, *args, **kwargs):
+            current = threading.get_ident()
+            if self.owner is not None and self.owner != current:
+                waiter_waiting.set()
+            acquired = self.inner.acquire(*args, **kwargs)
+            if acquired:
+                self.owner = current
+            return acquired
+
+        def release(self):
+            self.inner.release()
+            if not self.inner._is_owned():
+                self.owner = None
+
+        def _is_owned(self):
+            return self.inner._is_owned()
+
+    lock.lock = NotifyingRLock()
+    monkeypatch.setattr("services.account_state_lock.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("services.account_state_lock.logger.info", events.append)
+
+    def holder():
+        with lock:
+            entered.set()
+            assert release.wait(2)
+
+    def waiter():
+        with lock:
+            waiter_done.set()
+
+    holding = threading.Thread(target=holder)
+    holding.start()
+    assert entered.wait(2)
+    waiting = threading.Thread(target=waiter)
+    waiting.start()
+    assert waiter_waiting.wait(2)
+    with clock_guard:
+        now[0] = 6.0
+    release.set()
+    holding.join(2)
+    waiting.join(2)
+
+    assert waiter_done.is_set()
+    assert any(event["local_rlock_wait_ms"] == 6000.0 for event in events)
+
+
+def test_account_state_lock_ignores_timing_and_log_failures_without_reentrant_spam(monkeypatch):
+    lock = AccountStateLock(SimpleNamespace())
+    events = []
+    monkeypatch.setattr("services.account_state_lock.time.monotonic", lambda: 0.0)
+    monkeypatch.setattr("services.account_state_lock.logger.info", events.append)
+    with lock:
+        with lock:
+            depth = lock._release_save()
+            assert depth == 2 and not lock._is_owned()
+            lock._acquire_restore(depth)
+            assert lock.local.depth == 2 and lock._is_owned()
+    assert events == []
+
+    ticks = iter((0.0, 2.0, 3.0))
+    monkeypatch.setattr("services.account_state_lock.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("services.account_state_lock.logger.info", lambda _event: (_ for _ in ()).throw(RuntimeError("log failed")))
+    with lock:
+        pass
+
+    monkeypatch.setattr("services.account_state_lock.time.monotonic", lambda: (_ for _ in ()).throw(RuntimeError("clock failed")))
+    with lock:
+        pass
+
+
+def test_account_state_lock_uses_fixed_mutation_category_without_callsite_output():
+    def mark_image_result():
+        return AccountStateLock._caller_category()
+
+    assert mark_image_result() == "account_mutation"
 
 
 @pytest.mark.parametrize("persisted_ref", [True, False])
