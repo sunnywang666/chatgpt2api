@@ -18,7 +18,7 @@ from services.account_service import account_service
 from services.account_request_pacing import (AccountReadRetryBudgetInsufficient,
                                              AccountRequestDeadlineExceeded,
                                              account_pacing_snapshot)
-from services.openai_backend_api import ConversationArchiveCursorMismatch, OpenAIBackendAPI, explicit_final_channel
+from services.openai_backend_api import ConversationArchiveCursorMismatch, InvalidImageInputError, OpenAIBackendAPI, explicit_final_channel
 from services.protocol.conversation import conversation_events, sanitize_output_text
 from services.request_context import (ARCHIVE_OPERATION_BUDGET_SECONDS, bounded_lock,
                                       manual_conversation_read_budget, operation_budget,
@@ -566,9 +566,9 @@ def _completed_image_result(mapping, children, request_message_id, conversation_
 
 RECOVERY_CONVERSATION_SCAN_FIELD = "_recovery_conversation_scan"
 RECOVERY_CONVERSATION_COVERAGE_VERSION_FIELD = "_recovery_conversation_coverage_version"
-_TEXT_FAILURE_PHASES = frozenset({"stream_open", "stream_event", "result_check", "cursor_read", "runner"})
+_TEXT_FAILURE_PHASES = frozenset({"stream_open", "stream_event", "result_check", "cursor_read", "runner", "image_input_validation"})
 _TEXT_FAILURE_CATEGORIES = frozenset({
-    "http", "timeout", "transport", "parse", "empty_result", "provider_error", "other",
+    "http", "timeout", "transport", "parse", "empty_result", "provider_error", "other", "invalid_image_input",
 })
 _TEXT_HTTP_REQUEST_STAGES = {
     "bootstrap": "bootstrap",
@@ -805,7 +805,8 @@ def _log_bound_text_failure(exc, phase):
             "ValueError", "TypeError", "KeyError", "AttributeError", "RuntimeError", "OSError",
             "NameError", "UnboundLocalError", "IndexError", "AssertionError",
             "PermissionError", "FileNotFoundError", "IsADirectoryError", "NotADirectoryError",
-            "InvalidAccessTokenError", "StreamHardTimeoutError", "ConversationArchiveCursorMismatch",
+            "InvalidAccessTokenError", "InvalidImageInputError", "UnidentifiedImageError",
+            "StreamHardTimeoutError", "ConversationArchiveCursorMismatch",
             "CurlError", "ImpersonateError", "HTTPError", "IncompleteRead", "SessionClosed",
             "CertificateVerifyError", "InvalidURL", "InvalidHeader", "InvalidSchema", "MissingSchema",
             "ChunkedEncodingError", "ContentDecodingError", "JSONDecodeError", "RetryError",
@@ -3420,6 +3421,16 @@ class ConversationBindingService:
                 raise
             except Exception as exc:
                 _log_bound_text_failure(exc, failure_phase)
+                context = current_request.get()
+                if (isinstance(exc, InvalidImageInputError) and failure_phase == "stream_open"
+                        and (context is None or context.receipt().get("_submission_started") is False)):
+                    raise ConversationBindingError(
+                        "message image is invalid or unsupported", code="INVALID_IMAGE_INPUT",
+                        provider_binding_id=binding_id, provider_account_identity=account_identity,
+                        conversation_id=conversation_id,
+                        original_failure_phase="image_input_validation",
+                        original_exception_category="invalid_image_input",
+                    ) from exc
                 if body.get("_supersedes_request_message_id"):
                     context = current_request.get()
                     if context is not None and not context.receipt().get("_submission_started"):

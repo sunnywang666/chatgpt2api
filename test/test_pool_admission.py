@@ -3570,6 +3570,30 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(failure["stage"], "pre_submit_failure")
         self.assertEqual(failure["error_code"], "IMAGE_RESOURCE_UNAVAILABLE")
 
+    def test_invalid_text_image_releases_slot_without_requeue_across_restart(self):
+        from services.conversation_binding_service import ConversationBindingError
+        def invalid(body, on_cursor):
+            raise ConversationBindingError("invalid attachment", code="INVALID_IMAGE_INPUT")
+        self.text.runner = invalid
+        self.submit("bad-image")
+        context = self.admission.claim_next()
+        before = context.receipt()
+        self.admission.execute(context)
+        failed = context.receipt()
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["upstream_outcome"], "not_sent")
+        self.assertFalse(failed["_submission_started"])
+        self.assertFalse(failed["_executing"])
+        self.assertFalse(failed["_turn_reserved"])
+        self.assertEqual(failed["_input_ref"], before["_input_ref"])
+        self.assertFalse(failed["recovery_retryable"])
+        self.clock.now += 1000
+        _, _, restarted = build(self.root, self.clock)
+        self.assertIsNone(restarted.claim_next())
+        self.submit("next-ready")
+        next_context = restarted.claim_next()
+        self.assertEqual(next_context.request_id, "next-ready")
+
     def test_unsent_binding_reason_is_preserved_in_timeline_on_requeue(self):
         self.image("binding-unavailable")
         context = self.admission.claim_next()
