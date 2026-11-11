@@ -590,6 +590,30 @@ class TextTaskService:
         failure that occurred before that guard may be published as known not
         submitted.
         """
+        if receipt.get("error_code") == "INVALID_IMAGE_INPUT":
+            timeline = receipt.get("_execution_timeline", [])
+            return (
+                receipt.get("status") == "failed" and receipt.get("upstream_outcome") == "not_sent"
+                and receipt.get("_submission_started") is False
+                and receipt.get("_executing") is False and receipt.get("_turn_reserved") is False
+                and receipt.get("upstream_unfinished") is False
+                and receipt.get("recovery_retryable") is False
+                and receipt.get("recovery_requires_new_conversation") is False
+                and receipt.get("original_failure_phase") == "image_input_validation"
+                and receipt.get("original_exception_category") == "invalid_image_input"
+                and receipt.get("upstream_submission_started") in (None, False)
+                and receipt.get("_last_sent_sequence") is None
+                and type(receipt.get("send_count", 0)) is int and receipt.get("send_count", 0) == 0
+                and not any(receipt.get(key) for key in ("content", "result", "data", "recovery_next_at"))
+                and isinstance(timeline, list)
+                and all(isinstance(event, dict) and event.get("stage") in {
+                    "accepted", "execution_claimed", "pre_submit_failure", "task_finished",
+                } for event in timeline)
+                and all(isinstance(receipt.get(key), str) and receipt[key].strip() for key in (
+                    "request_id", "request_message_id", "client_conversation_id",
+                    "provider_binding_id", "provider_account_identity",
+                ))
+            )
         required_identity = (
             "request_id", "client_conversation_id", "provider_binding_id",
             "provider_account_identity", "conversation_id", "parent_message_id",
@@ -6393,6 +6417,7 @@ class TextTaskService:
                 if (value := getattr(exc, key, None)) is not None and value != ""
             }
             model_not_found = exc.code == "MODEL_NOT_FOUND"
+            invalid_image_input = exc.code == "INVALID_IMAGE_INPUT"
             self._update(
                 owner, request_id, **cursor, **diagnostic,
                 sender_verified_incomplete=exc,
@@ -6411,7 +6436,15 @@ class TextTaskService:
                     "waiting": None,
                     "_turn_reserved": False,
                     "_executing": False,
-                } if model_not_found else {}),
+                } if model_not_found else {
+                    "upstream_unfinished": False,
+                    "recovery_retryable": False,
+                    "recovery_requires_new_conversation": False,
+                    "recovery_next_at": None,
+                    "waiting": None,
+                    "_turn_reserved": False,
+                    "_executing": False,
+                } if invalid_image_input else {}),
             )
         except Exception:
             self._update(owner, request_id, status="unknown", error_code="CONVERSATION_OUTCOME_UNKNOWN",

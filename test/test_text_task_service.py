@@ -2693,6 +2693,96 @@ class TextTaskTests(unittest.TestCase):
             self.assertEqual(rows[-1]["id"], "request-user-turn")
             self.assertEqual(len({row["id"] for row in rows}), 3)
 
+    def test_bad_last_image_is_rejected_before_any_attachment_upload(self):
+        from io import BytesIO
+        from PIL import Image
+        from services.openai_backend_api import InvalidImageInputError, OpenAIBackendAPI
+        buffer = BytesIO()
+        Image.new("RGB", (2, 2), "pink").save(buffer, format="WEBP")
+        good = {"type": "image", "data": buffer.getvalue(), "mime": "image/webp"}
+        jpeg = BytesIO()
+        Image.new("RGB", (32, 32), "pink").save(jpeg, format="JPEG")
+        truncated = jpeg.getvalue()[:-8]
+        # This regression must distinguish verification from actual decoding.
+        with Image.open(BytesIO(truncated)) as candidate:
+            candidate.verify()
+        with self.assertRaises(OSError), Image.open(BytesIO(truncated)) as candidate:
+            candidate.load()
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "fixture-token"
+        backend._upload_image = mock.Mock(return_value={"file_id": "file", "width": 2, "height": 2,
+                                                       "file_size": 10, "mime_type": "image/webp", "file_name": "original.webp"})
+        for bad in (b'<svg xmlns="http://www.w3.org/2000/svg"/>', b"PRIVATE_INVALID_IMAGE", truncated):
+            for separate_message in (False, True):
+                with self.subTest(bad=bad[:4], separate_message=separate_message):
+                    invalid = {"type": "image", "data": bad, "mime": "image/svg+xml"}
+                    messages = [{"role": "user", "content": [good] * 5}]
+                    if separate_message:
+                        messages.append({"role": "user", "content": [invalid]})
+                    else:
+                        messages[0]["content"].append(invalid)
+                    with self.assertRaises(InvalidImageInputError) as caught:
+                        backend._api_messages_to_conversation_messages(messages)
+                    self.assertNotIn("PRIVATE", str(caught.exception))
+                    backend._upload_image.assert_not_called()
+        rows = backend._api_messages_to_conversation_messages([
+            {"role": "user", "content": [good] * 5 + [{"type": "text", "text": "original prompt"}]}])
+        self.assertEqual(backend._upload_image.call_count, 5)
+        self.assertEqual(rows[0]["content"]["parts"][-1], "original prompt")
+
+    def test_invalid_image_is_terminal_unsent_and_does_not_query_upstream_result(self):
+        from contextlib import nullcontext
+        from services.openai_backend_api import OpenAIBackendAPI
+        recovery = mock.Mock(side_effect=AssertionError("no sent result exists"))
+        service = TextTaskService(self.path, ConversationBindingService().complete_text, self.queue,
+                                  recovery_reader=recovery)
+        body = {**self.body, "model": "fixture-text", "provider_binding_id": "binding-a",
+                "provider_account_identity": "account-a"}
+        validator = object.__new__(OpenAIBackendAPI)
+        validator._upload_image = mock.Mock()
+        def invalid_events(*args, **kwargs):
+            return validator._api_messages_to_conversation_messages([
+                {"role": "user", "content": [{"type": "image", "data": b"<svg/>", "mime": "image/svg+xml"}]}])
+        backend = mock.Mock()
+        with (
+            mock.patch("services.conversation_binding_service.account_service.get_bound_account_identity", return_value="account-a"),
+            mock.patch("services.conversation_binding_service.account_service.get_bound_text_access_token", return_value="fixture-token"),
+            mock.patch("services.conversation_binding_service.account_service.conversation_binding_lock", return_value=nullcontext()),
+            mock.patch("services.conversation_binding_service.OpenAIBackendAPI", return_value=backend),
+            mock.patch("services.conversation_binding_service.conversation_events", side_effect=invalid_events),
+        ):
+            service.submit("owner", body)
+            self.queue.run()
+        receipt = service.read("owner", "attempt-1")
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["error_code"], "INVALID_IMAGE_INPUT")
+        self.assertEqual(receipt["upstream_outcome"], "not_sent")
+        self.assertFalse(receipt["recovery_retryable"])
+        self.assertIsNone(receipt["recovery_next_at"])
+        self.assertEqual(receipt["original_failure_phase"], "image_input_validation")
+        self.assertIs(receipt["upstream_submission_started"], False)
+        self.assertIs(receipt["upstream_unfinished"], False)
+        backend.get_conversation_parent_message_id.assert_not_called()
+        validator._upload_image.assert_not_called()
+        restarted = TextTaskService(self.path, executor=self.queue, recovery_reader=recovery)
+        self.assertEqual(restarted.read("owner", "attempt-1")["error_code"], "INVALID_IMAGE_INPUT")
+        self.assertEqual(restarted.submit("owner", body)["status"], "failed")
+        self.assertEqual(self.queue.calls, [])
+        recovery.assert_not_called()
+
+        with service.store.connect() as db:
+            stored = service.store.read_receipt(db, "text", "owner", "attempt-1")
+        for contradiction in ({"_submission_started": True}, {"_submission_started": None},
+                              {"_executing": True}, {"_turn_reserved": True}, {"upstream_unfinished": True},
+                              {"upstream_submission_started": True}, {"send_count": 1},
+                              {"_last_sent_sequence": 1}, {"content": "saved answer"},
+                              {"original_failure_phase": None}, {"original_failure_phase": "stream_read"},
+                              {"original_exception_category": None}, {"original_exception_category": "transport"},
+                              {"recovery_requires_new_conversation": True},
+                              {"_execution_timeline": [{"stage": "send_call_started"}]}):
+            with self.subTest(contradiction=contradiction):
+                self.assertNotIn("upstream_submission_started", service._public({**stored, **contradiction}))
+
     def test_recovery_requires_this_requests_user_turn_not_previous_answer(self):
         from services.conversation_binding_service import ConversationBindingService
         from unittest import mock

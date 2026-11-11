@@ -455,6 +455,27 @@ def test_bound_text_failure_logging_failure_does_not_mask_original(bound_chat, m
     assert caught.value.__cause__ is error
 
 
+@pytest.mark.parametrize("submission_started", [False, True, None])
+def test_invalid_image_does_not_reclassify_sent_or_ambiguous_original(bound_chat, monkeypatch, submission_started):
+    import services.conversation_binding_service as module
+    from services.openai_backend_api import InvalidImageInputError
+    error = InvalidImageInputError()
+    def events(*args, **kwargs):
+        raise error
+    monkeypatch.setattr(module, "conversation_events", events)
+    context = SimpleNamespace(owner="owner", request_id="request",
+                              receipt=lambda: {"_submission_started": submission_started})
+    token = current_request.set(context)
+    try:
+        with pytest.raises(ConversationBindingError) as caught:
+            bound_chat.service.complete_text(bound_chat.body)
+    finally:
+        current_request.reset(token)
+    expected = "INVALID_IMAGE_INPUT" if submission_started is False else "CONVERSATION_OUTCOME_UNKNOWN"
+    assert caught.value.code == expected
+    assert "private input" not in str(caught.value)
+
+
 def test_bound_text_failure_cause_chain_is_bounded_and_sqlite_name_allowlisted(monkeypatch):
     import sqlite3
     import services.conversation_binding_service as module

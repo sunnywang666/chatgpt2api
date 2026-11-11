@@ -10,6 +10,7 @@ import select
 import threading
 import time
 import uuid
+import warnings
 
 import urllib.error
 import urllib.request
@@ -39,6 +40,13 @@ from utils.turnstile import solve_turnstile_token
 
 class InvalidAccessTokenError(RuntimeError):
     pass
+
+
+class InvalidImageInputError(ValueError):
+    """A message attachment cannot be decoded locally, before any upload/send."""
+
+    def __init__(self):
+        super().__init__("message image is invalid or unsupported")
 
 
 class ConversationArchiveCursorMismatch(RuntimeError):
@@ -1247,6 +1255,30 @@ class OpenAIBackendAPI:
 
     def _api_messages_to_conversation_messages(self, messages: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
         """把标准 chat messages 转成 web conversation 所需的 messages。"""
+        # Validate the entire request first: a bad final attachment must not
+        # repeatedly upload all earlier images, or be mistaken for a sent turn.
+        for item in messages:
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "image":
+                    continue
+                data = part.get("data")
+                if not isinstance(data, (bytes, bytearray)):
+                    continue
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", Image.DecompressionBombWarning)
+                        with Image.open(BytesIO(data)) as candidate:
+                            candidate.verify()
+                        # verify() checks structure; some raster formats only
+                        # expose truncated pixel data while decoding.
+                        with Image.open(BytesIO(data)) as candidate:
+                            candidate.load()
+                except (OSError, ValueError, SyntaxError, Image.DecompressionBombError,
+                        Image.DecompressionBombWarning) as exc:
+                    raise InvalidImageInputError() from exc
         conversation_messages = []
         for item in messages:
             role = item.get("role", "user")
