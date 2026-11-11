@@ -1,6 +1,8 @@
 """Real HTTP and durable-input boundaries; no external service calls."""
 from copy import deepcopy
 import json
+import os
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,12 +12,15 @@ from fastapi.testclient import TestClient
 from api import ai, task_results
 from services.work_lifecycle import WorkLifecycleError
 from services.text_task_service import TextTaskService
+from services.product_work import _key
 from test.test_category_directory_successor import install
 from test.test_explicit_unknown_successor import task, row, update
-from test.test_workbench_derived_input import payload
+from test.test_workbench_derived_input import payload, install_invalid_image, invalid_image_payload, valid_png
 from test.test_incomplete_compact_successor import install_incomplete
 from test.test_advanced_session_successor import advanced
 from test.test_no_final_successor import product_no_final
+from test.test_no_final_successor import product_lifecycle
+from test.test_pool_admission import build
 
 PREFIX = "/api/conversation-bindings/text-requests/old"
 
@@ -78,6 +83,142 @@ def split_attribute_result(h, client):
            request_parent_message_id=SENT_PARENT, _submission_parent_message_id=INPUT_PARENT,
            parent_message_id=FINAL_CURSOR, _submission_started=True, _executing=False,
            _turn_reserved=False, _upstream_terminal=True)
+
+
+def test_invalid_image_successor_http_never_reviews_or_accepts_caller_content(task, monkeypatch, tmp_path):
+    h = install_invalid_image(task)
+    monkeypatch.setattr(ai, "text_task_service", h.service)
+    monkeypatch.setattr(task_results, "text_task_service", h.service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_a, **_k: {"role": "admin", "id": "owner"})
+    monkeypatch.setattr(task_results, "require_identity", lambda *_a, **_k: {"role": "admin", "id": "owner"})
+    monkeypatch.setattr(ai, "trusted_source", lambda *_a: "internal:listing")
+    review = AsyncMock()
+    monkeypatch.setattr(ai, "filter_or_log", review)
+    request = invalid_image_payload(h.service)
+    app = FastAPI(); app.include_router(ai.create_router()); app.include_router(task_results.create_router())
+    with TestClient(app) as client:
+        malformed = client.post(PREFIX + "/derived-successor", json={
+            **request, "client_request_id": "bool-index", "omit_image_parts": [{"message_index": True, "part_index": 6}],
+        })
+        submitted = client.post(PREFIX + "/derived-successor", json=request)
+        accepted = client.post(PREFIX + "/derived-successor/acceptance", json=request)
+    assert submitted.status_code == accepted.status_code == 200
+    assert malformed.status_code == 422
+    assert review.await_count == 0
+    assert submitted.json()["workbench_derived_input"]["omit_image_parts"] == [{"message_index": 0, "part_index": 6}]
+    assert accepted.json()["request_id"] == "image-child"
+    output_dir = Path(os.environ.get("INVALID_IMAGE_SUCCESSOR_FIXTURE_DIR", tmp_path))
+    for name, value in (("invalid-image-successor-submit", submitted.json()),
+                        ("invalid-image-successor-acceptance", accepted.json()),
+                        ("invalid-image-request", request)):
+        (output_dir / (name + ".json")).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def listing_invalid_product(h):
+    """Turn the existing ProductWork fixture into a typed listing image failure."""
+    svg = "data:image/svg+xml;base64,PHN2Zy8+"
+    body = h.service.store.load_input(h.old["_input_ref"])
+    body["messages"] = [{"role": "user", "content": [
+        {"type": "text", "text": "frozen listing prompt"},
+        *[{"type": "image_url", "image_url": {"url": valid_png()}} for _ in range(5)],
+        {"type": "image_url", "image_url": {"url": svg}},
+    ]}]
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        old_key = original["_product_work_key"]
+        parent = h.service.store.runtime(db, old_key)
+        key = _key("internal:listing", "owner", parent["product_ref"])
+        parent.update(key=key, source="internal:listing")
+        h.service.store.set_runtime(db, key, parent)
+        db.execute("DELETE FROM task_runtime WHERE name=?", (old_key,))
+        original.update(_source="internal:listing", _product_work_key=key,
+                        _input_ref=h.service.store.save_input(body), status="failed",
+                        error_code="INVALID_IMAGE_INPUT", upstream_outcome="not_sent",
+                        _submission_started=False, _executing=False, _turn_reserved=False,
+                        upstream_unfinished=False, recovery_retryable=False,
+                        recovery_requires_new_conversation=False, recovery_next_at=None,
+                        original_failure_phase="image_input_validation",
+                        original_exception_category="invalid_image_input", _last_sent_sequence=None,
+                        send_count=0, _execution_timeline=[{"stage": "accepted"}, {"stage": "execution_claimed"},
+                                                           {"stage": "pre_submit_failure"}, {"stage": "task_finished"}])
+        original.pop("_scheduling_owner", None)
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+        request_hash = TextTaskService._submission_identity("owner", body)[1]
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id='old'", (request_hash, "owner"))
+    h.old = row(h.service)
+    return {"client_request_id": "image-product-child", "original_input_hash": request_hash,
+            "mode": "invalid_image_input", "derivation_kind": "omit_invalid_inline_image_v1",
+            "omit_image_parts": [{"message_index": 0, "part_index": 6}]}
+
+
+@pytest.mark.parametrize("product_no_final", [{"organization_id": "org", "subject_id": "subject", "root_workflow_id": "root"}], indirect=True)
+def test_invalid_image_product_http_acceptance_restart_and_result_fixture(product_no_final, monkeypatch, tmp_path):
+    h = product_no_final
+    request = listing_invalid_product(h)
+    raster_calls = []
+    raster_validator = TextTaskService._valid_inline_raster
+    def track_raster(_cls, part):
+        raster_calls.append(part)
+        return raster_validator(part)
+    monkeypatch.setattr(TextTaskService, "_valid_inline_raster", classmethod(track_raster))
+    monkeypatch.setattr(ai, "text_task_service", h.service)
+    monkeypatch.setattr(task_results, "text_task_service", h.service)
+    monkeypatch.setattr(ai, "require_identity", lambda *_a, **_k: {"role": "admin", "id": "owner"})
+    monkeypatch.setattr(task_results, "require_identity", lambda *_a, **_k: {"role": "admin", "id": "owner"})
+    monkeypatch.setattr(ai, "trusted_source", lambda *_a: "internal:listing")
+    review = AsyncMock(); monkeypatch.setattr(ai, "filter_or_log", review)
+    app = FastAPI(); app.include_router(ai.create_router()); app.include_router(task_results.create_router())
+    with TestClient(app) as client:
+        absent = client.post(PREFIX + "/derived-successor/acceptance", json=request)
+        bad_hash = client.post(PREFIX + "/derived-successor/acceptance", json={**request, "original_input_hash": "0" * 64})
+        bad_selector = client.post(PREFIX + "/derived-successor", json={**request, "client_request_id": "bad-selector",
+                                                                            "omit_image_parts": [{"message_index": 0, "part_index": 5}]})
+        submitted = client.post(PREFIX + "/derived-successor", json=request)
+        lost_response_replay = client.post(PREFIX + "/derived-successor", json=request)
+    assert absent.status_code == 200 and absent.json()["state"] == "absent_at_observation"
+    assert bad_hash.status_code == bad_selector.status_code == 409
+    assert submitted.status_code == lost_response_replay.status_code == 200
+    assert submitted.json() == lost_response_replay.json() and review.await_count == 0
+    assert submitted.json()["product_work"] == {
+        "protocol": "product-work-v1", "product_ref": "fixture-product", "step_ref": "title",
+        "fairness": {"organization_id": "org", "subject_id": "subject", "root_workflow_id": "root"},
+    }
+    child = row(h.service, "image-product-child")
+    assert child["_product_work"]["fairness"] == {"organization_id": "org", "subject_id": "subject", "root_workflow_id": "root"}
+    assert child["_product_work"]["step_ref"] == "title"
+    _unused, _store, restarted_admission = build(h.root, h.clock)
+    restarted = TextTaskService(h.service.store.path, runner=h.service.runner, clock=h.clock, admission=restarted_admission)
+    restarted_admission.register("text", lambda ctx, body: restarted._run(ctx.owner, ctx.request_id, body))
+    monkeypatch.setattr(ai, "text_task_service", restarted)
+    monkeypatch.setattr(task_results, "text_task_service", restarted)
+    before = deepcopy(row(restarted, "image-product-child"))
+    with TestClient(app) as client:
+        restarted_acceptance = client.post(PREFIX + "/derived-successor/acceptance", json=request)
+    assert restarted_acceptance.status_code == 200 and restarted_acceptance.json() == submitted.json()
+    assert row(restarted, "image-product-child") == before
+    context = restarted_admission.claim_next()
+    assert context and context.request_id == "image-product-child"
+    decoded_before_execute = len(raster_calls)
+    restarted_admission.execute(context)
+    assert len(raster_calls) == decoded_before_execute
+    with TestClient(app) as client:
+        successful = client.post(PREFIX + "/derived-successor/acceptance", json=request)
+        result = client.get("/api/task-results/text/image-product-child")
+    assert successful.status_code == result.status_code == 200
+    assert successful.json()["status"] == "succeeded" and result.json()["result_ready"] is True
+    decoded_before_close = len(raster_calls)
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    identity["_trusted_source"] = "internal:listing"
+    assert product.close(identity, "fixture-product", results_saved=True)["state"] == "closing"
+    assert lifecycle.process_one() and calls == [("owner", "image-product-child", True)]
+    assert len(raster_calls) == decoded_before_close
+    output_dir = Path(os.environ.get("INVALID_IMAGE_SUCCESSOR_FIXTURE_DIR", tmp_path))
+    for name, value in (("invalid-image-successor-product-absent", absent.json()),
+                        ("invalid-image-successor-product-submit", submitted.json()),
+                        ("invalid-image-successor-product-restart-acceptance", restarted_acceptance.json()),
+                        ("invalid-image-successor-product-success-acceptance", successful.json()),
+                        ("invalid-image-successor-product-task-result", result.json())):
+        (output_dir / (name + ".json")).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
 @pytest.mark.parametrize("second_observation", [False, True])

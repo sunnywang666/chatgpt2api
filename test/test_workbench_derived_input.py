@@ -1,6 +1,8 @@
 """Trusted Workbench-built successors keep Provider ownership and send guards."""
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+import base64
 
 import pytest
 
@@ -14,6 +16,13 @@ from test.test_incomplete_compact_successor import incomplete
 from test.test_no_final_successor import product_lifecycle, product_no_final
 from test.test_pool_admission import build
 from test.test_required_attributes_successor import install as install_no_final
+
+
+def valid_png():
+    from PIL import Image
+    output = BytesIO()
+    Image.new("RGB", (1, 1), "white").save(output, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode()
 
 
 def payload(service, original, *, request_id="workbench-child", mode="413_request_missing"):
@@ -32,6 +41,43 @@ def payload(service, original, *, request_id="workbench-child", mode="413_reques
         "mode": mode,
         "derivation_kind": "wb-business-rule-v1",
     }
+
+
+def invalid_image_payload(service, *, request_id="image-child", part_index=6):
+    return {
+        "client_request_id": request_id,
+        "original_input_hash": service.read_retained_input("owner", "old", source="internal:listing")["input_hash"],
+        "mode": "invalid_image_input",
+        "derivation_kind": "omit_invalid_inline_image_v1",
+        "omit_image_parts": [{"message_index": 0, "part_index": part_index}],
+    }
+
+
+def install_invalid_image(task):
+    h = install(task, images=False)
+    png = valid_png()
+    svg = "data:image/svg+xml;base64," + base64.b64encode(b"<svg xmlns='http://www.w3.org/2000/svg'/>").decode()
+    h.body["messages"] = [{"role": "user", "content": [
+        {"type": "text", "text": "keep this exact"},
+        *[{"type": "image_url", "image_url": {"url": png}} for _ in range(5)],
+        {"type": "image_url", "image_url": {"url": svg}},
+    ]}]
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        original.update(
+            _input_ref=h.service.store.save_input(h.body), status="failed", error_code="INVALID_IMAGE_INPUT",
+            upstream_outcome="not_sent", _submission_started=False, _executing=False, _turn_reserved=False,
+            upstream_unfinished=False, recovery_retryable=False, recovery_requires_new_conversation=False,
+            recovery_next_at=None, original_failure_phase="image_input_validation",
+            original_exception_category="invalid_image_input", _last_sent_sequence=None, send_count=0,
+            _execution_timeline=[{"stage": "accepted"}, {"stage": "execution_claimed"},
+                                 {"stage": "pre_submit_failure"}, {"stage": "task_finished"}],
+        )
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+        db.execute("UPDATE requests SET request_hash=? WHERE owner='owner' AND id='old'",
+                   (TextTaskService._submission_identity("owner", h.body)[1],))
+    h.old = row(h.service)
+    return h
 
 
 def test_retained_input_is_exact_owner_scoped_and_workbench_child_runs_once(task):
@@ -68,6 +114,85 @@ def test_retained_input_is_exact_owner_scoped_and_workbench_child_runs_once(task
     assert h.service.submit_workbench_derived_input("owner", "old", payload(h.service, h.old),
                                                      source="internal:listing")["status"] == "succeeded"
     assert len(h.sent) == 1 and row(h.service) == h.old
+
+
+def test_invalid_image_selector_omits_only_bad_nonprimary_part_and_derives_copy_step(task):
+    h = install_invalid_image(task)
+    request = invalid_image_payload(h.service)
+    accepted = h.service.submit_workbench_derived_input("owner", "old", request, source="internal:listing")
+    child = row(h.service, "image-child")
+    body = h.service.store.load_input(child["_input_ref"])
+    assert accepted["status"] == "queued"
+    assert body["messages"][0]["content"] == h.body["messages"][0]["content"][:-1]
+    assert child["_workbench_derived_input"]["omit_image_parts"] == [{"message_index": 0, "part_index": 6}]
+    assert row(h.service) == h.old
+    assert h.service.submit_workbench_derived_input("owner", "old", request, source="internal:listing") == accepted
+
+
+@pytest.mark.parametrize("selector", [
+    {"message_index": 0, "part_index": 1}, {"message_index": 0, "part_index": 99},
+    {"message_index": -1, "part_index": 6}, {"message_index": True, "part_index": 6},
+])
+def test_invalid_image_selector_rejects_primary_and_malformed_indexes(task, selector):
+    h = install_invalid_image(task)
+    request = invalid_image_payload(h.service)
+    request["omit_image_parts"] = [selector]
+    with pytest.raises(ConversationBindingError) as exc:
+        h.service.submit_workbench_derived_input("owner", "old", request, source="internal:listing")
+    assert exc.value.code in {"CHAT_SUPERSEDE_INVALID", "CHAT_WORKBENCH_DERIVED_INPUT_INVALID"}
+    assert row(h.service, "image-child") is None
+
+
+@pytest.mark.parametrize("bad_part", [
+    {"type": "image_url", "image_url": {"url": "https://example.invalid/broken.svg"}},
+    {"type": "image_url", "image_url": {"url": "data:image/svg+xml;base64,PHN2Zy8+"}, "extra": "no"},
+])
+def test_invalid_image_selector_rejects_remote_or_unknown_image_shape(task, bad_part):
+    h = install_invalid_image(task)
+    h.body["messages"][0]["content"][6] = bad_part
+    with h.service.store.transaction() as db:
+        original = h.service.store.read_receipt(db, "text", "owner", "old")
+        original["_input_ref"] = h.service.store.save_input(h.body)
+        h.service.store.write_receipt(db, "text", "owner", "old", original)
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id='old'",
+                   (TextTaskService._submission_identity("owner", h.body)[1], "owner"))
+    with pytest.raises(ConversationBindingError) as exc:
+        h.service.submit_workbench_derived_input(
+            "owner", "old", invalid_image_payload(h.service), source="internal:listing")
+    assert exc.value.code == "CHAT_WORKBENCH_DERIVED_INPUT_INVALID"
+
+
+def test_invalid_image_child_send_guard_rechecks_original_and_one_child(task):
+    h = install_invalid_image(task)
+    request = invalid_image_payload(h.service)
+    h.service.submit_workbench_derived_input("owner", "old", request, source="internal:listing")
+    with pytest.raises(ConversationBindingError) as exc:
+        h.service.submit_workbench_derived_input(
+            "owner", "old", invalid_image_payload(h.service, request_id="other-image-child"), source="internal:listing")
+    assert exc.value.code == "CHAT_SUPERSEDE_CONFLICT"
+    update(h.service, status="succeeded", content="late original", upstream_outcome="completed")
+    context = h.admission.claim_next()
+    assert context and context.request_id == "image-child"
+    h.admission.execute(context)
+    assert not h.sent and row(h.service, "image-child")["status"] != "succeeded"
+
+
+def test_normal_submit_cannot_inject_marker_to_remove_a_valid_image(task):
+    h = install_invalid_image(task)
+    forged = deepcopy(h.body)
+    forged["client_request_id"] = "forged-child"
+    forged["supersedes_request_id"] = "old"
+    forged["messages"][0]["content"].pop(1)
+    forged["_workbench_derived_input"] = {
+        "protocol": "workbench-derived-input-v1",
+        "original_input_hash": TextTaskService._submission_identity("owner", h.body)[1],
+        "mode": "invalid_image_input", "derivation_kind": "omit_invalid_inline_image_v1",
+        "omit_image_parts": [{"message_index": 0, "part_index": 1}],
+    }
+    with pytest.raises(ConversationBindingError) as exc:
+        h.service.submit("owner", forged, source="internal:listing")
+    assert exc.value.code in {"CHAT_SUPERSEDE_INVALID", "CHAT_WORKBENCH_DERIVED_INPUT_INVALID"}
+    assert row(h.service, "forged-child") is None
 
 
 @pytest.mark.parametrize("field,value", [
