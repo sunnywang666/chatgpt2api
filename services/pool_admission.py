@@ -9,7 +9,7 @@ from __future__ import annotations
 from services.image_thread import bind_waiting_threads, predecessor_state
 
 from collections import deque
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
 import json
 import math
@@ -2808,7 +2808,7 @@ class PoolAdmission:
                         break
                 if candidates:
                     self._codex_probe_index = (start + scanned) % len(candidates)
-        with self._settings_guard(), self.store.transaction() as db, self._account_guard():
+        with self._settings_guard(), self.store.transaction() as db, ExitStack() as account_guard:
             now = float(self.clock())
             # Keep completed result bodies out of the writer-held claim path.
             # claim_receipts rehydrates only active/linked dependencies; public
@@ -2821,6 +2821,11 @@ class PoolAdmission:
             from services.text_task_service import bind_waiting_public_sessions
             bind_waiting_public_sessions(self.store, db, receipts)
             product_work.release_rejected_product_slots(self.store, db, receipts)
+            # Receipt-only maintenance stays in this same SQLite writer
+            # transaction, but it neither reads nor changes account authority.
+            # Take the account lock only for the fresh-row-dependent planner,
+            # binding and claim commit below.
+            account_guard.enter_context(self._account_guard())
             if self.codex is not None:
                 rows = self._rows()
                 for kind, owner, request_id, r in receipts:
