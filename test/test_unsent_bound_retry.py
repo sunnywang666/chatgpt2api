@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from contextlib import nullcontext
+import base64
 import json
 from unittest.mock import AsyncMock
 
@@ -16,6 +17,8 @@ from services.conversation_binding_service import ConversationBindingService
 from services.request_context import current_request
 from services.text_task_service import TextTaskService
 from test.test_pool_admission import Clock, build
+from test.test_no_final_successor import product_lifecycle
+from test.test_workbench_derived_input import valid_png
 
 
 SOURCE = "internal:listing"
@@ -95,6 +98,92 @@ def test_retry_retains_p_byte_for_byte_and_derives_fresh_product_step(retry):
                                                                read(service, "N").get("upstream_outcome"))
     assert len(sent) == 1 and sent[0]["parent_message_id"] == "B"
     assert service.submit("owner", envelope, source=SOURCE)["status"] == "succeeded"
+
+
+def test_invalid_image_successor_closes_and_archives_successful_child_only(retry):
+    service, admission, store, clock, original, _envelope, sent, _before, _root = retry
+    png = valid_png()
+    svg = "data:image/svg+xml;base64," + base64.b64encode(b"<svg xmlns='http://www.w3.org/2000/svg'/>").decode()
+    body = {**original, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "fixed retained text"},
+        *[{"type": "image_url", "image_url": {"url": png}} for _ in range(5)],
+        {"type": "image_url", "image_url": {"url": svg}},
+    ]}]}
+    with store.transaction() as db:
+        previous = store.read_receipt(db, "text", "owner", "P")
+        previous.update(_input_ref=store.save_input(body), status="failed", error_code="INVALID_IMAGE_INPUT",
+                        upstream_outcome="not_sent", _submission_started=False, _executing=False,
+                        _turn_reserved=False, upstream_unfinished=False, recovery_retryable=False,
+                        recovery_requires_new_conversation=False, recovery_next_at=None,
+                        original_failure_phase="image_input_validation",
+                        original_exception_category="invalid_image_input", _last_sent_sequence=None,
+                        send_count=0, _execution_timeline=[{"stage": "accepted"}, {"stage": "execution_claimed"},
+                                                           {"stage": "pre_submit_failure"}, {"stage": "task_finished"}])
+        store.write_receipt(db, "text", "owner", "P", previous)
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id='P'",
+                   (TextTaskService._submission_identity("owner", body)[1], "owner"))
+    request = {"client_request_id": "image-child",
+               "original_input_hash": TextTaskService._submission_identity("owner", body)[1],
+               "mode": "invalid_image_input", "derivation_kind": "omit_invalid_inline_image_v1",
+               "omit_image_parts": [{"message_index": 0, "part_index": 6}]}
+    assert service.submit_workbench_derived_input("owner", "P", request, source=SOURCE)["status"] == "queued"
+    child = read(service, "image-child")
+    assert service.store.load_input(child["_input_ref"])["product_work"]["step_ref"] == "direct-listing.content.copy:image-child"
+    context = admission.claim_next()
+    assert context and context.request_id == "image-child"
+    admission.execute(context)
+    assert read(service, "image-child")["status"] == "succeeded" and len(sent) == 1
+    from types import SimpleNamespace
+    h = SimpleNamespace(service=service, clock=clock)
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    identity["_trusted_source"] = SOURCE
+    assert product.close(identity, "product-0", results_saved=True)["state"] == "closing"
+    assert lifecycle.process_one()
+    assert calls == [("owner", "image-child", True)]
+
+
+def test_invalid_image_waiver_keeps_later_normal_member_as_archive_target(retry):
+    service, admission, store, clock, original, _envelope, _sent, _before, _root = retry
+    png = valid_png()
+    svg = "data:image/svg+xml;base64," + base64.b64encode(b"<svg xmlns='http://www.w3.org/2000/svg'/>").decode()
+    body = {**original, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "fixed retained text"},
+        *[{"type": "image_url", "image_url": {"url": png}} for _ in range(5)],
+        {"type": "image_url", "image_url": {"url": svg}},
+    ]}]}
+    with store.transaction() as db:
+        previous = store.read_receipt(db, "text", "owner", "P")
+        previous.update(_input_ref=store.save_input(body), status="failed", error_code="INVALID_IMAGE_INPUT",
+                        upstream_outcome="not_sent", _submission_started=False, _executing=False,
+                        _turn_reserved=False, upstream_unfinished=False, recovery_retryable=False,
+                        recovery_requires_new_conversation=False, recovery_next_at=None,
+                        original_failure_phase="image_input_validation",
+                        original_exception_category="invalid_image_input", _last_sent_sequence=None,
+                        send_count=0, _execution_timeline=[{"stage": "accepted"}, {"stage": "execution_claimed"},
+                                                           {"stage": "pre_submit_failure"}, {"stage": "task_finished"}])
+        store.write_receipt(db, "text", "owner", "P", previous)
+        db.execute("UPDATE requests SET request_hash=? WHERE owner=? AND id='P'",
+                   (TextTaskService._submission_identity("owner", body)[1], "owner"))
+    request = {"client_request_id": "image-child",
+               "original_input_hash": TextTaskService._submission_identity("owner", body)[1],
+               "mode": "invalid_image_input", "derivation_kind": "omit_invalid_inline_image_v1",
+               "omit_image_parts": [{"message_index": 0, "part_index": 6}]}
+    service.submit_workbench_derived_input("owner", "P", request, source=SOURCE)
+    admission.execute(admission.claim_next())
+    later = {**original, "client_request_id": "later", "parent_message_id": "C-final",
+             "messages": [{"role": "user", "content": "later normal step"}],
+             "product_work": {"product_ref": "product-0", "step_ref": "later"}}
+    service.submit("owner", later, source=SOURCE)
+    context = admission.claim_next()
+    assert context and context.request_id == "later"
+    admission.execute(context)
+    from types import SimpleNamespace
+    h = SimpleNamespace(service=service, clock=clock)
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    identity["_trusted_source"] = SOURCE
+    assert product.close(identity, "product-0", results_saved=True)["state"] == "closing"
+    assert lifecycle.process_one()
+    assert calls == [("owner", "later", True)]
 
 
 def test_same_id_is_frozen_after_original_changes_and_second_id_is_rejected(retry):

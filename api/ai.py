@@ -180,15 +180,31 @@ class WorkbenchDerivedSuccessorRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     client_request_id: str = Field(min_length=1, max_length=200)
     original_input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
-    messages: list[dict[str, object]] = Field(min_length=1)
-    model: str = Field(min_length=1, max_length=200)
-    thinking_effort: str = Field(min_length=1, max_length=100)
-    mode: Literal["413_request_missing", "no_final", "incomplete", "advanced_new_session"]
+    messages: list[dict[str, object]] | None = Field(default=None, min_length=1)
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    thinking_effort: str | None = Field(default=None, min_length=1, max_length=100)
+    mode: Literal["413_request_missing", "no_final", "incomplete", "advanced_new_session", "invalid_image_input"]
     derivation_kind: str = Field(min_length=1, max_length=128)
     context_ref: WorkbenchContextReference | None = Field(default=None, exclude_if=lambda value: value is None)
+    omit_image_parts: list[dict[str, int]] | None = Field(default=None, min_length=1, max_length=1)
 
     @model_validator(mode="after")
     def context_for_new_session_only(self):
+        selector_mode = self.mode == "invalid_image_input"
+        ordinary = {"messages", "model", "thinking_effort"}
+        if selector_mode:
+            if (any(field in self.model_fields_set for field in ordinary | {"context_ref"})
+                    or self.omit_image_parts is None
+                    or self.derivation_kind != "omit_invalid_inline_image_v1"):
+                raise ValueError("invalid image successor accepts only one image selector")
+            selector = self.omit_image_parts[0]
+            if (set(selector) != {"message_index", "part_index"}
+                    or any(type(selector.get(field)) is not int or selector[field] < 0
+                           for field in ("message_index", "part_index"))):
+                raise ValueError("image selector must contain non-negative integer indexes")
+            return self
+        if self.omit_image_parts is not None or any(getattr(self, field) is None for field in ordinary):
+            raise ValueError("derived business successor requires its complete input")
         if self.mode == "advanced_new_session":
             if self.context_ref is None:
                 raise ValueError("advanced new session requires a saved context reference")
@@ -843,16 +859,17 @@ def create_router() -> APIRouter:
         identity, source = workbench_input_identity(request, authorization)
         response.headers["Cache-Control"] = "private, no-store"
         owner = str(identity.get("id") or "anonymous")
-        payload = body.model_dump(mode="python")
+        payload = body.model_dump(mode="python", exclude_none=True)
         try:
             existing = await run_in_threadpool(text_task_service.validate_workbench_derived_input,
                 owner, request_id, payload, source=source)
             if existing is not None:
                 return existing
-            preview = request_text(payload["messages"])
-            await filter_or_log(LoggedCall(identity,
-                "/api/conversation-bindings/text-requests/derived-successor", payload["model"],
-                "绑定会话文本", request_text=preview), preview)
+            if body.mode != "invalid_image_input":
+                preview = request_text(payload["messages"])
+                await filter_or_log(LoggedCall(identity,
+                    "/api/conversation-bindings/text-requests/derived-successor", payload["model"],
+                    "绑定会话文本", request_text=preview), preview)
             # Submission repeats original/child checks after optional review.
             return await run_in_threadpool(text_task_service.submit_workbench_derived_input,
                 owner, request_id, payload, source=source)
@@ -876,7 +893,7 @@ def create_router() -> APIRouter:
             return await run_in_threadpool(
                 text_task_service.observe_workbench_derived_acceptance,
                 str(identity.get("id") or "anonymous"), request_id,
-                body.model_dump(mode="python"), source=source,
+                body.model_dump(mode="python", exclude_none=True), source=source,
             )
         except WorkLifecycleError as exc:
             raise HTTPException(exc.status, detail={"code": exc.code}) from None

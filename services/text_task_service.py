@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import base64
 import threading
+import warnings
 from copy import deepcopy
 import hashlib
 import json
@@ -2916,7 +2918,7 @@ class TextTaskService:
     MISSING_NODE_RETRY_FIELDS = REJECTED_SUPERSEDE_FIELDS | frozenset({MISSING_NODE_RETRY_FIELD})
     _WORKBENCH_DERIVED_PROTOCOL = "workbench-derived-input-v1"
     _WORKBENCH_DERIVED_MARKER = "_workbench_derived_input"
-    _WORKBENCH_DERIVED_MODES = frozenset({"413_request_missing", "no_final", "incomplete", "advanced_new_session"})
+    _WORKBENCH_DERIVED_MODES = frozenset({"413_request_missing", "no_final", "incomplete", "advanced_new_session", "invalid_image_input"})
     _WORKBENCH_DERIVED_SOURCE = "internal:listing"
 
     @classmethod
@@ -3024,6 +3026,8 @@ class TextTaskService:
             return cls._no_final_successor_source(original, now)
         if mode == "incomplete":
             return cls._incomplete_compact_successor_source(original, now)
+        if mode == "invalid_image_input":
+            return cls._invalid_image_input_successor_source(original)
         return bool(
             original.get("original_http_status") == 413
             and original.get("original_failure_phase") == "stream_open"
@@ -3033,34 +3037,113 @@ class TextTaskService:
         )
 
     @classmethod
-    def _workbench_derived_marker(cls, *, original_input_hash, child_input_hash, mode, derivation_kind):
-        return {
+    def _workbench_derived_marker(cls, *, original_input_hash, child_input_hash, mode, derivation_kind,
+                                  omit_image_parts=None):
+        marker = {
             "protocol": cls._WORKBENCH_DERIVED_PROTOCOL,
             "original_input_hash": original_input_hash,
             "child_input_hash": child_input_hash,
             "mode": mode,
             "derivation_kind": derivation_kind,
         }
+        if mode == "invalid_image_input":
+            marker["omit_image_parts"] = deepcopy(omit_image_parts)
+        return marker
+
+    @staticmethod
+    def _invalid_image_input_successor_source(receipt):
+        """One locally terminal, never-sent bad-image attempt may be corrected."""
+        if not TextTaskService._public_not_submitted(receipt):
+            return False
+        timeline = receipt.get("_execution_timeline")
+        return bool(
+            receipt.get("error_code") == "INVALID_IMAGE_INPUT"
+            and receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
+            and not receipt.get("_upstream_terminal")
+            and not receipt.get("_recovery_paused") and not receipt.get("_recovery_suppressed")
+            and not any(receipt.get(field) for field in (
+                "_work_key", "_completion", "_completion_of", "recovery_claim_id", "_recovery_claim_id",
+                "recovery_lease_until", "_recovery_claim_until", "_turn_reserved", "_executing",
+            ))
+            and isinstance(timeline, list)
+            and all(isinstance(event, dict) and event.get("stage") in {
+                "accepted", "execution_claimed", "pre_submit_failure", "task_finished",
+            } for event in timeline)
+        )
+
+    @staticmethod
+    def _inline_image_shape(part):
+        """Validate the frozen inline representation without decoding its payload."""
+        if not isinstance(part, dict) or part.get("type") not in {"image", "image_url", "input_image"}:
+            raise ValueError
+        if part.get("type") == "image":
+            if set(part) != {"type", "data", "mime"}:
+                raise ValueError
+            value, mime = part.get("data"), part.get("mime")
+            if not isinstance(value, (bytes, bytearray)) or not isinstance(mime, str):
+                raise ValueError
+            return "bytes", value, mime
+        if set(part) != {"type", "image_url"}:
+            raise ValueError
+        source = part.get("image_url")
+        if isinstance(source, dict):
+            if set(source) != {"url"}:
+                raise ValueError
+            source = source.get("url")
+        if not isinstance(source, str) or not source.startswith("data:image/"):
+            raise ValueError
+        header, comma, encoded = source.partition(",")
+        if not comma or ";base64" not in header.lower():
+            raise ValueError
+        return "base64", encoded, header[5:].split(";", 1)[0].lower()
+
+    @classmethod
+    def _inline_image_bytes(cls, part):
+        """Decode one already shape-validated retained inline image."""
+        kind, value, mime = cls._inline_image_shape(part)
+        return (bytes(value) if kind == "bytes" else base64.b64decode(value, validate=True)), mime
+
+    @classmethod
+    def _valid_inline_raster(cls, part):
+        """Match the ingress raster verifier: only known decode failures are invalid."""
+        try:
+            from PIL import Image
+            data, _mime = cls._inline_image_bytes(part)
+            from io import BytesIO
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(BytesIO(data)) as image:
+                    image.verify()
+                with Image.open(BytesIO(data)) as image:
+                    image.load()
+                    return image.width > 0 and image.height > 0
+        except (OSError, SyntaxError, ValueError, Image.DecompressionBombError,
+                Image.DecompressionBombWarning):
+            return False
 
     @classmethod
     def _public_workbench_derived_audit(cls, marker):
         """Project only the fixed Workbench provenance record from a receipt."""
         fields = {"protocol", "original_input_hash", "child_input_hash", "mode", "derivation_kind"}
+        if isinstance(marker, dict) and marker.get("mode") == "invalid_image_input":
+            fields.add("omit_image_parts")
         if (not isinstance(marker, dict) or set(marker) != fields
                 or marker.get("protocol") != cls._WORKBENCH_DERIVED_PROTOCOL
                 or marker.get("mode") not in cls._WORKBENCH_DERIVED_MODES
                 or not all(isinstance(marker.get(field), str) and marker[field].strip()
                            for field in ("original_input_hash", "child_input_hash", "derivation_kind"))):
             return None
-        return {field: marker[field] for field in (
-            "protocol", "original_input_hash", "child_input_hash", "mode", "derivation_kind"
-        )}
+        return {field: marker[field] for field in fields}
 
     @classmethod
-    def _workbench_derived_body(cls, original, original_id, original_hash, payload):
+    def _workbench_derived_body(cls, original, original_id, original_hash, payload, *, verify_invalid_images=True):
         if isinstance(payload, dict) and payload.get("mode") == "advanced_new_session":
             # The isolated mode requires its context and transaction-scoped proof.
             cls._workbench_derived_error()
+        invalid_image = isinstance(payload, dict) and payload.get("mode") == "invalid_image_input"
+        if invalid_image:
+            return cls._invalid_image_input_body(
+                original, original_id, original_hash, payload, verify_rasters=verify_invalid_images)
         required = {"client_request_id", "original_input_hash", "messages", "model", "thinking_effort",
                     "mode", "derivation_kind"}
         if (not isinstance(payload, dict) or set(payload) != required
@@ -3107,20 +3190,86 @@ class TextTaskService:
         return body
 
     @classmethod
-    def _workbench_derived_body_from_stored(cls, original, original_id, original_hash, stored):
+    def _invalid_image_input_body(cls, original, original_id, original_hash, payload, *, verify_rasters=True):
+        required = {"client_request_id", "original_input_hash", "mode", "derivation_kind", "omit_image_parts"}
+        selectors = payload.get("omit_image_parts") if isinstance(payload, dict) else None
+        if (not isinstance(payload, dict) or set(payload) != required
+                or not isinstance(payload.get("client_request_id"), str) or not payload["client_request_id"].strip()
+                or len(payload["client_request_id"]) > 200 or payload["client_request_id"] != payload["client_request_id"].strip()
+                or payload["client_request_id"] == original_id or payload.get("original_input_hash") != original_hash
+                or payload.get("mode") != "invalid_image_input"
+                or payload.get("derivation_kind") != "omit_invalid_inline_image_v1"
+                or not isinstance(selectors, list) or len(selectors) != 1 or not isinstance(selectors[0], dict)
+                or set(selectors[0]) != {"message_index", "part_index"}
+                or any(type(selectors[0].get(field)) is not int or selectors[0][field] < 0
+                       for field in ("message_index", "part_index"))
+                or any(original.get(field) is not None for field in (
+                    "supersedes_request_id", "retry_unsent_request_id", "derived_input",
+                    "continue_after_no_final", "continue_after_incomplete", cls._WORKBENCH_DERIVED_MARKER,
+                ))):
+            cls._workbench_derived_error()
+        if not all(isinstance(original.get(field), str) and original[field] for field in (
+                "provider_binding_id", "provider_account_identity", "client_conversation_id",
+                "conversation_id", "parent_message_id")) or not isinstance(original.get("messages"), list):
+            cls._workbench_derived_error()
+        selector = selectors[0]
+        try:
+            content = original["messages"][selector["message_index"]]["content"]
+            target = content[selector["part_index"]]
+        except (IndexError, KeyError, TypeError):
+            cls._workbench_derived_error()
+        images = [part for message in original["messages"] if isinstance(message, dict)
+                  and isinstance(message.get("content"), list) for part in message["content"]
+                  if isinstance(part, dict) and part.get("type") in {"image", "image_url", "input_image"}]
+        try:
+            cls._inline_image_shape(target)
+        except (TypeError, ValueError, UnicodeError):
+            cls._workbench_derived_error()
+        invalid_target = not cls._valid_inline_raster(target) if verify_rasters else True
+        retained_raster = any(part is not target and cls._valid_inline_raster(part) for part in images) if verify_rasters else True
+        if (not isinstance(content, list) or target not in images or target is images[0]
+                or not invalid_target or not retained_raster):
+            cls._workbench_derived_error()
+        body = deepcopy(original)
+        body["messages"][selector["message_index"]]["content"].pop(selector["part_index"])
+        product = body.get("product_work")
+        if isinstance(product, dict) and product.get("step_ref") == "direct-listing.content.copy:" + original_id:
+            body["product_work"] = {**product, "step_ref": "direct-listing.content.copy:" + payload["client_request_id"]}
+        body.update(client_request_id=payload["client_request_id"], supersedes_request_id=original_id,
+                    **{cls._WORKBENCH_DERIVED_MARKER: {
+                        "protocol": cls._WORKBENCH_DERIVED_PROTOCOL,
+                        "original_input_hash": original_hash,
+                        "mode": "invalid_image_input",
+                        "derivation_kind": "omit_invalid_inline_image_v1",
+                        "omit_image_parts": deepcopy(selectors),
+                    }})
+        return body
+
+    @classmethod
+    def _workbench_derived_body_from_stored(cls, original, original_id, original_hash, stored, *, verify_invalid_images=True):
         marker = stored.get(cls._WORKBENCH_DERIVED_MARKER) if isinstance(stored, dict) else None
         if not isinstance(marker, dict):
             cls._workbench_derived_error()
-        payload = {
-            "client_request_id": stored.get("client_request_id"),
-            "original_input_hash": marker.get("original_input_hash"),
-            "messages": stored.get("messages"),
-            "model": stored.get("model"),
-            "thinking_effort": stored.get("thinking_effort"),
-            "mode": marker.get("mode"),
-            "derivation_kind": marker.get("derivation_kind"),
-        }
-        expected = cls._workbench_derived_body(original, original_id, original_hash, payload)
+        if marker.get("mode") == "invalid_image_input":
+            payload = {
+                "client_request_id": stored.get("client_request_id"),
+                "original_input_hash": marker.get("original_input_hash"),
+                "mode": marker.get("mode"),
+                "derivation_kind": marker.get("derivation_kind"),
+                "omit_image_parts": marker.get("omit_image_parts"),
+            }
+        else:
+            payload = {
+                "client_request_id": stored.get("client_request_id"),
+                "original_input_hash": marker.get("original_input_hash"),
+                "messages": stored.get("messages"),
+                "model": stored.get("model"),
+                "thinking_effort": stored.get("thinking_effort"),
+                "mode": marker.get("mode"),
+                "derivation_kind": marker.get("derivation_kind"),
+            }
+        expected = cls._workbench_derived_body(
+            original, original_id, original_hash, payload, verify_invalid_images=verify_invalid_images)
         if stored != expected:
             cls._workbench_derived_error()
         return expected
@@ -3177,6 +3326,7 @@ class TextTaskService:
                     expected_marker = self._workbench_derived_marker(
                         original_input_hash=row[0], child_input_hash=child_hash,
                         mode=payload["mode"], derivation_kind=payload["derivation_kind"],
+                        omit_image_parts=body.get(self._WORKBENCH_DERIVED_MARKER, {}).get("omit_image_parts"),
                     )
                     if saved.get(self._WORKBENCH_DERIVED_MARKER) != expected_marker:
                         self._workbench_derived_error()
@@ -3248,10 +3398,9 @@ class TextTaskService:
         from services.advanced_session_successor import MODE
 
         # This endpoint is a local reconciliation surface, not a second
-        # derivation policy.  Keep its existing isolated-session mode and the
-        # one already-governed incomplete mode only; no-final and other paths
-        # remain intentionally unavailable here.
-        if payload.get("mode") not in {MODE, "incomplete"}:
+        # derivation policy. The image branch has no caller content and uses
+        # the same frozen-input reconstruction as submission.
+        if payload.get("mode") not in {MODE, "incomplete", "invalid_image_input"}:
             raise ConversationBindingError(
                 "advanced successor acceptance requires advanced_new_session",
                 code="CHAT_ADVANCED_SESSION_INVALID",
@@ -4442,7 +4591,10 @@ class TextTaskService:
         if not row:
             reject("CHAT_SUPERSEDE_INVALID")
         previous = json.loads(row[1])
-        if previous.get("status") == "succeeded" or previous.get("_upstream_terminal"):
+        audit = successor.get(TextTaskService._WORKBENCH_DERIVED_MARKER)
+        invalid_image_successor = isinstance(audit, dict) and audit.get("mode") == "invalid_image_input"
+        if (previous.get("status") == "succeeded"
+                or previous.get("_upstream_terminal") and not invalid_image_successor):
             reject("CHAT_SUPERSEDE_ORIGINAL_FOUND")
         direct_rejected_model = TextTaskService._rejected_chat_successor_source(previous)
         model_rejection_retry = (not direct_rejected_model
@@ -4467,7 +4619,7 @@ class TextTaskService:
             # A terminal typed rejection retains the scheduler claim audit
             # fields until admission cleanup. It is retired once neither
             # execution nor a turn is reserved; recovery leases remain live.
-            retired_terminal_claim = (rejected_model and claim_key == "_claim_id"
+            retired_terminal_claim = ((rejected_model or invalid_image_successor) and claim_key == "_claim_id"
                                       and previous.get("status") == "failed"
                                       and previous.get("_executing") is False
                                       and previous.get("_turn_reserved") is False)
@@ -4476,14 +4628,13 @@ class TextTaskService:
                 reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
         if previous.get("_executing") or previous.get("_turn_reserved"):
             reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
-        audit = successor.get(TextTaskService._WORKBENCH_DERIVED_MARKER)
         if (not incomplete_retry and isinstance(audit, dict) and audit.get("mode") == "incomplete"
                 and audit.get("original_input_hash") == row[0]
                 and successor.get("_supersedes_input_hash") == row[0]
                 and TextTaskService._workbench_derived_ineligibility_code(previous, "incomplete", now)
                     == "CHAT_SUPERSEDE_PREDECESSOR_BUSY"):
             reject("CHAT_SUPERSEDE_PREDECESSOR_BUSY")
-        if (not rejected_model and not native_no_final_retry and not incomplete_retry and (previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
+        if (not rejected_model and not native_no_final_retry and not incomplete_retry and not invalid_image_successor and (previous.get("status") != "failed" or previous.get("error_code") != "RESULT_UNRECOVERABLE"
                 or previous.get("upstream_outcome") != "unknown"
                 or (not TextTaskService._no_final_successor_source(previous, now)
                     if successor.get("_supersedes_no_final") else previous.get("recovery_reason") != "REQUEST_MESSAGE_NOT_FOUND")
@@ -4519,8 +4670,10 @@ class TextTaskService:
             reject("CHAT_SUPERSEDE_INVALID")
         if successor.get(TextTaskService._WORKBENCH_DERIVED_MARKER):
             audit = successor[TextTaskService._WORKBENCH_DERIVED_MARKER]
-            if (not isinstance(audit, dict) or set(audit) != {
-                    "protocol", "original_input_hash", "child_input_hash", "mode", "derivation_kind"}
+            fields = {"protocol", "original_input_hash", "child_input_hash", "mode", "derivation_kind"}
+            if isinstance(audit, dict) and audit.get("mode") == "invalid_image_input":
+                fields.add("omit_image_parts")
+            if (not isinstance(audit, dict) or set(audit) != fields
                     or audit.get("protocol") != TextTaskService._WORKBENCH_DERIVED_PROTOCOL
                     or audit.get("original_input_hash") != row[0]
                     or audit.get("mode") not in TextTaskService._WORKBENCH_DERIVED_MODES
@@ -4534,7 +4687,7 @@ class TextTaskService:
                 if stored is None:
                     stored = store.load_input(successor["_input_ref"])
                 expected = TextTaskService._workbench_derived_body_from_stored(
-                    original_body, previous_id, row[0], stored,
+                    original_body, previous_id, row[0], stored, verify_invalid_images=False,
                 )
                 child_id, child_hash = TextTaskService._submission_identity(owner, expected)
                 if (child_id != successor.get("request_id") or child_hash != audit["child_input_hash"]
@@ -4933,7 +5086,8 @@ class TextTaskService:
         if workbench_derived:
             try:
                 retained = self.store.load_input(original["_input_ref"])
-                expected = self._workbench_derived_body_from_stored(retained, previous_id, row[0], body)
+                expected = self._workbench_derived_body_from_stored(
+                    retained, previous_id, row[0], body, verify_invalid_images=False)
                 child_id, child_hash = self._submission_identity(owner, expected)
                 marker = expected[self._WORKBENCH_DERIVED_MARKER]
                 if expected != body or child_id != body.get("client_request_id"):
@@ -4942,9 +5096,17 @@ class TextTaskService:
                 reject("CHAT_WORKBENCH_DERIVED_INPUT_INVALID")
             if not self._workbench_derived_mode_eligible(original, marker["mode"], self._now()):
                 reject(self._workbench_derived_ineligibility_code(original, marker["mode"], self._now()))
+            if marker["mode"] == "invalid_image_input":
+                children = db.execute(
+                    "SELECT id FROM requests WHERE owner=? AND json_extract(receipt,'$._supersedes_request_id')=?",
+                    (owner, previous_id),
+                ).fetchall()
+                if children:
+                    reject("CHAT_SUPERSEDE_CONFLICT")
             receipt[self._WORKBENCH_DERIVED_MARKER] = self._workbench_derived_marker(
                 original_input_hash=row[0], child_input_hash=child_hash,
                 mode=marker["mode"], derivation_kind=marker["derivation_kind"],
+                omit_image_parts=marker.get("omit_image_parts"),
             )
         elif rejected_model:
             try:
@@ -5549,13 +5711,19 @@ class TextTaskService:
                 if original and original.get("_product_work"):
                     from services.work_lifecycle import WorkLifecycleError
                     if product is not None and product != original["_product_work"]:
+                        invalid_image_product = bool(
+                            receipt.get(self._WORKBENCH_DERIVED_MARKER, {}).get("mode") == "invalid_image_input"
+                            and product.get("product_ref") == original["_product_work"].get("product_ref")
+                            and (product.get("step_ref") == original["_product_work"].get("step_ref")
+                                 or product.get("step_ref") == "direct-listing.content.copy:" + request_id)
+                        )
                         unsent_retry_product = bool(
                             receipt.get("_retry_unsent_of")
                             and product.get("product_ref") == original["_product_work"].get("product_ref")
                             and product.get("step_ref")
                             == "direct-listing.content.copy:" + request_id
                         )
-                        if (not unsent_retry_product and (not codex_product_bridge
+                        if (not unsent_retry_product and not invalid_image_product and (not codex_product_bridge
                                 or product.get("product_ref") != original["_product_work"].get("product_ref"))):
                             raise WorkLifecycleError("PRODUCT_WORK_BINDING_CONFLICT")
                     else:
