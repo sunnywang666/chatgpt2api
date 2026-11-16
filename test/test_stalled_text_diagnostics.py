@@ -664,6 +664,203 @@ def stalled(service, admission, backend):
     return result
 
 
+def legacy_stalled(service, admission, backend):
+    """Construct a pre-change generic-work continued-observation receipt.
+
+    These diagnostics predate the bounded stop and intentionally exercise the
+    separate generic-work contract, which must keep its original recovery
+    ownership instead of taking the new automatic-stop transition.
+    """
+    patch(service, _work_key="legacy-diagnostic-work")
+    return stalled(service, admission, backend)
+
+
+def test_qualified_incomplete_observation_stops_automatic_reads_but_preserves_explicit_paths(tmp_path):
+    service, admission, backend, legacy = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    before = saved(service)
+    result = stalled(service, admission, backend)
+    stopped = saved(service)
+
+    assert stopped["_attempt_reason"] == "ORIGINAL_RESULT_INCOMPLETE"
+    assert stopped["recovery_next_at"] is None
+    assert stopped["status"] == "unknown" and stopped["upstream_outcome"] == "unknown"
+    assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(stopped, admission.clock.now)
+    assert TextTaskService._incomplete_compact_successor_source(stopped, admission.clock.now)
+    assert result["recovery_automatic_stopped"] is True
+    assert result["recovery_stop_reason"] == "ORIGINAL_RESULT_INCOMPLETE"
+    assert result["recovery_control"] == {"state": "stopped", "in_flight": False,
+                                           "operator_stopped": False, "version": 0}
+    assert result["execution"]["resources"] == {
+        "local_worker": "idle", "account_turn": "released", "conversation": "protected",
+    }
+    for key in ("request_id", "request_message_id", "provider_binding_id", "provider_account_identity",
+                "client_conversation_id", "conversation_id"):
+        assert stopped[key] == before[key]
+    assert stopped["_turn_reserved"] is False
+
+    # Restart and normal reads stay local; only the explicit endpoint may
+    # make one original-result GET after the automatic observation budget.
+    reader = Mock(side_effect=AssertionError("automatic read after stop"))
+    restarted = TextTaskService(service.path, admission=admission, clock=admission.clock,
+                                recovery_reader=reader)
+    assert restarted.read("owner", "old-0")["recovery_automatic_stopped"] is True
+    reader.assert_not_called()
+    callback = Mock()
+    admission.recoveries["text"] = callback
+    admission.recover_one()
+    callback.assert_not_called()
+    waiter(restarted, "same-conversation-next", "client-0")
+    restarted.submit("owner", {
+        "client_request_id": "independent-turn-next", "client_conversation_id": "independent-turn",
+        "provider_binding_id": "binding-0", "provider_account_identity": "account-0",
+        "model": "fixture-text", "messages": [{"role": "user", "content": "new work"}],
+    })
+    claimed = admission.claim_next()
+    assert claimed and claimed.request_id == "independent-turn-next"
+
+    # The stop never turns a chained original into a compact-source authority.
+    patch(restarted, _supersedes_request_id="older-original")
+    assert not TextTaskService._incomplete_compact_successor_source(saved(restarted), admission.clock.now)
+
+
+def test_explicit_unchanged_incomplete_read_preserves_existing_compact_eligibility(tmp_path):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+    service.recovery_reader = Mock(side_effect=incomplete_reader(backend))
+    result = service.recover("owner", "old-0", explicit_ended_recheck=True)
+    assert service.recovery_reader.call_count == 1
+    assert result["recovery_stop_reason"] == "ORIGINAL_RESULT_INCOMPLETE"
+    assert saved(service)["recovery_next_at"] is None
+    assert TextTaskService._incomplete_compact_successor_source(saved(service), admission.clock.now)
+    service.read("owner", "old-0")
+    assert service.recovery_reader.call_count == 1
+
+
+@pytest.mark.parametrize("failure", [
+    lambda: ConnectionError("controlled exact read failure"),
+    lambda: type("RateLimitError", (RuntimeError,), {"status_code": 429})("controlled rate limit"),
+])
+def test_stopped_incomplete_explicit_read_can_finish_late_or_remain_stopped_on_error(tmp_path, failure):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+
+    failed = Mock(side_effect=failure())
+    service.recovery_reader = failed
+    result = service.recover("owner", "old-0", explicit_ended_recheck=True)
+    assert result["recovery_automatic_stopped"] is True
+    assert failed.call_count == 1
+    stopped = saved(service)
+    assert stopped["_attempt_reason"] == "ORIGINAL_RESULT_INCOMPLETE"
+    assert stopped["recovery_next_at"] > admission.clock.now
+    service.read("owner", "old-0")
+    service.recover("owner", "old-0", explicit_ended_recheck=True)
+    assert failed.call_count == 1
+
+    def late_final(receipt):
+        doc = document(receipt)
+        doc["mapping"]["final-user-0"]["message"].update(status="finished_successfully", end_turn=True)
+        doc["mapping"]["final-user-0"]["message"]["content"]["parts"] = ["late original result"]
+        return ConversationBindingService._read_text_request_result(backend, receipt, document=doc)
+
+    admission.clock.now = stopped["recovery_next_at"] + 1
+    service.recovery_reader = late_final
+    result = service.recover("owner", "old-0", explicit_ended_recheck=True)
+    assert result["status"] == "succeeded" and result["content"] == "late original result"
+    assert "recovery_automatic_stopped" not in result
+
+
+@pytest.mark.parametrize("case", [
+    "live_sender", "live_reader", "recent_progress", "reads_two", "missing_request",
+    "paused", "generic_work", "completion", "completion_of", "missing_successor",
+    "malformed_observation", "observation_account_mismatch",
+])
+def test_incomplete_auto_stop_rejects_live_progress_and_nonoriginal_guards(tmp_path, case):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
+    stalled(service, admission, backend)
+    receipt = saved(service)
+    receipt.pop("_attempt_finished_at", None)
+    receipt.pop("_attempt_reason", None)
+    receipt["recovery_next_at"] = admission.clock.now + 1
+    pristine = copy.deepcopy(receipt)
+    assert TextTaskService._end_stalled_incomplete_recovery(pristine, admission.clock.now)
+    assert pristine["_attempt_reason"] == "ORIGINAL_RESULT_INCOMPLETE"
+    now = admission.clock.now
+    if case == "live_sender":
+        receipt.update(_executing=True, _claim_id="live", _claim_until=now + 60)
+    elif case == "live_reader":
+        receipt.update(recovery_claim_id="reader", recovery_claimed_at=now,
+                       recovery_lease_until=now + 60, recovery_phase="read_text_request")
+    elif case == "recent_progress":
+        receipt.update(_result_last_progress_at=now - 1, _result_last_checked_at=now,
+                       _result_no_progress_reads=0)
+    elif case == "reads_two":
+        receipt["_result_no_progress_reads"] = 2
+    elif case == "missing_request":
+        receipt["request_message_id"] = ""
+    elif case == "paused":
+        receipt["_recovery_paused"] = True
+    elif case == "generic_work":
+        receipt["_work_key"] = "generic-work"
+    elif case == "completion":
+        receipt["_completion"] = {"state": "checking_original"}
+    elif case == "completion_of":
+        receipt["_completion_of"] = "other"
+    elif case == "missing_successor":
+        receipt["_missing_successor_resume"] = {}
+    elif case == "malformed_observation":
+        receipt["_original_result_observation"] = {"nodes": []}
+    else:
+        receipt["_original_result_observation"] = {
+            **receipt["_original_result_observation"], "conversation_id": "other-conversation",
+        }
+    assert not TextTaskService._end_stalled_incomplete_recovery(receipt, admission.clock.now)
+    assert receipt.get("_attempt_reason") is None
+
+
+@pytest.mark.parametrize("role", ["admin", "user"])
+def test_stopped_incomplete_child_task_result_keeps_lineage_and_public_stop_contract(tmp_path, monkeypatch, role):
+    service, admission, backend, _ = migration(tmp_path)
+    patch(service, _submission_started=True, _turn_reserved=False, _executing=False,
+          _supersedes_request_id="older-original", _product_work_key="original-product",
+          _claim_id="expired-sender", _claim_until=admission.clock.now - 1)
+    stalled(service, admission, backend)
+    before = saved(service)
+    assert before["_attempt_reason"] == "ORIGINAL_RESULT_INCOMPLETE"
+    assert not TextTaskService._incomplete_compact_successor_source(before, admission.clock.now)
+    reader = Mock(side_effect=AssertionError("task-result must not query upstream"))
+    service.recovery_reader = reader
+    monkeypatch.setattr(task_results, "text_task_service", service)
+    monkeypatch.setattr(task_results, "require_identity", lambda *_a, **_k: {"id": "owner", "role": role})
+    monkeypatch.setattr(task_results, "require_chat_text_policy", lambda *_a, **_k: None)
+    app = FastAPI()
+    app.include_router(task_results.create_router())
+    body = TestClient(app).get("/api/task-results/text/old-0").json()
+    assert body["protocol"] == "task-result-v1"
+    assert body["status"] == "unknown" and body["result_ready"] is False and body["result"] is None
+    receipt = body["receipt"]
+    assert receipt["execution"]["phase"] == "stalled"
+    assert receipt["execution"]["attempt_state"] == "ended"
+    assert receipt["execution"]["result_state"] == "incomplete"
+    assert receipt["execution"]["wait_state"] == "ended"
+    if role == "admin":
+        assert receipt["supersedes_request_id"] == "older-original"
+        assert receipt["recovery_automatic_stopped"] is True
+        assert receipt["recovery_stop_reason"] == "ORIGINAL_RESULT_INCOMPLETE"
+        control = receipt["recovery_control"]
+    else:
+        assert "supersedes_request_id" not in receipt and "provider_binding_id" not in receipt
+        assert receipt["recovery"]["automatic_stopped"] is True
+        assert receipt["recovery"]["stop_reason"] == "ORIGINAL_RESULT_INCOMPLETE"
+        control = receipt["recovery"]["control"]
+    assert control == {"state": "stopped", "in_flight": False, "operator_stopped": False, "version": 0}
+    assert saved(service) == before
+    reader.assert_not_called()
+
+
 def remove_legacy_outcome(service, stored_outcome):
     if not stored_outcome:
         with service.store.transaction() as db:
@@ -718,7 +915,7 @@ def test_stalled_original_releases_local_capacity_without_losing_late_original_r
           _execution_timeline=[{"stage": "send_call_started", "at": 3},
                                {"stage": "response_headers_received", "at": 4},
                                {"stage": "first_output", "at": 5}, {"stage": "task_finished", "at": 20}])
-    result = stalled(service, admission, backend)
+    result = legacy_stalled(service, admission, backend)
     # Match the admission clock while projecting an expired persisted send
     # lease; production uses the same wall-clock domain for both paths.
     patch(service, _claim_id="expired-send", _claim_until=admission.clock.now - 1)
@@ -858,7 +1055,7 @@ def test_stalled_original_keeps_same_conversation_blocked_but_claims_independent
     service, admission, backend, _ = migration(tmp_path)
     remove_legacy_outcome(service, stored_outcome)
     patch(service, _submission_started=True, _turn_reserved=turn_reserved, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     assert saved(service)["_turn_reserved"] is turn_reserved
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
     # The physical conversation/order resource remains occupied independently
@@ -874,7 +1071,7 @@ def test_stalled_original_progress_keeps_capacity_released_before_an_independent
     service, admission, backend, _ = migration(tmp_path)
     remove_legacy_outcome(service, stored_outcome)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     waiter(service, "independent-next", "independent")
     context = admission.claim_next()
     assert context and context.request_id == "independent-next"
@@ -896,7 +1093,7 @@ def test_stalled_original_allows_an_independent_claim_to_send_while_capacity_sta
     service, admission, backend, _ = migration(tmp_path)
     remove_legacy_outcome(service, stored_outcome)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     waiter(service, "independent-next", "independent")
     context = admission.claim_next()
     assert context and context.request_id == "independent-next"
@@ -910,7 +1107,7 @@ def test_stalled_original_allows_an_independent_claim_to_send_while_capacity_sta
 def test_stalled_original_read_lease_releases_capacity_but_keeps_conversation_protected(tmp_path, progress):
     service, admission, backend, original = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     admission.clock.now = saved(service)["recovery_next_at"] + 1
     entered, release = Event(), Event()
 
@@ -963,7 +1160,7 @@ def test_stalled_original_read_lease_releases_capacity_but_keeps_conversation_pr
 def test_stalled_read_lease_requires_complete_current_idle_evidence(tmp_path, changes):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     now = admission.clock.now
     patch(service, recovery_claim_id="read-claim", recovery_claimed_at=now,
           recovery_lease_until=now + 10, recovery_phase="read_text_request")
@@ -976,7 +1173,7 @@ def test_stalled_read_lease_requires_complete_current_idle_evidence(tmp_path, ch
 def test_stalled_successor_read_lease_cannot_use_original_read_exception(tmp_path, marker):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     now = admission.clock.now
     original_id = saved(service)["request_message_id"]
     successor = {"version": 1, "attempt": 1, "state": marker,
@@ -994,7 +1191,7 @@ def test_stalled_successor_read_lease_cannot_use_original_read_exception(tmp_pat
 def test_stalled_read_claim_cannot_predate_last_observation(tmp_path):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     wait_ended = saved(service)["_result_wait_ended_at"]
     admission.clock.now += 10
     patch(service, _result_last_checked_at=admission.clock.now,
@@ -1007,7 +1204,7 @@ def test_stalled_read_claim_cannot_predate_last_observation(tmp_path):
 def test_stalled_expired_original_read_lease_keeps_only_capacity_released(tmp_path):
     service, admission, backend, original = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     now = admission.clock.now
     patch(service, recovery_claim_id="expired-original-read", recovery_claimed_at=now - 20,
           recovery_lease_until=now - 1, recovery_phase="read_text_request")
@@ -1030,7 +1227,7 @@ def test_stalled_expired_original_read_lease_keeps_only_capacity_released(tmp_pa
 def test_stalled_expired_recovery_lease_keeps_original_read_guards(tmp_path, changes):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     now = admission.clock.now
     patch(service, **{
         "recovery_claim_id": "expired-original-read",
@@ -1050,7 +1247,7 @@ def test_stalled_legacy_compatibility_does_not_override_explicit_outcomes(tmp_pa
     service, admission, backend, _ = migration(tmp_path)
     remove_legacy_outcome(service, False)
     patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
     patch(service, upstream_outcome=conflict)
     before = saved(service)
@@ -1064,7 +1261,7 @@ def test_stalled_missing_outcome_requires_the_original_unknown_error(tmp_path, e
     service, admission, backend, _ = migration(tmp_path)
     remove_legacy_outcome(service, False)
     patch(service, _submission_started=True, _turn_reserved=False, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     patch(service, error_code=error_code)
     assert not TextTaskService._qualified_stalled_incomplete_capacity_boundary(saved(service), admission.clock.now)
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1
@@ -1083,7 +1280,7 @@ def test_stalled_local_capacity_boundary_fails_closed_without_complete_idle_evid
     service, admission, backend, _ = migration(tmp_path)
     remove_legacy_outcome(service, stored_outcome)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     baseline = saved(service)
     assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(baseline, admission.clock.now)
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
@@ -1145,7 +1342,7 @@ def test_stalled_capacity_boundary_survives_verified_progress_and_late_success_a
     # Migration data predates the explicit idle markers; this capacity scenario
     # supplies the stored flags required by the strict production predicate.
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
     wait_ended = saved(service)["_result_wait_ended_at"]
     admission.clock.now = saved(service)["recovery_next_at"] + 1
@@ -1361,7 +1558,7 @@ def test_stalled_capacity_boundary_survives_later_transient_original_read_failur
         tmp_path, failure, expected_code):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     before = saved(service)
     assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(before, admission.clock.now)
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0
@@ -1386,7 +1583,7 @@ def test_stalled_capacity_boundary_survives_later_transient_original_read_failur
 def test_stalled_recovery_fences_expired_execution_after_fresh_original_observation(tmp_path):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     before = saved(service)
     assert TextTaskService._qualified_stalled_incomplete_capacity_boundary(before, admission.clock.now)
 
@@ -1411,7 +1608,7 @@ def test_stalled_recovery_fences_expired_execution_after_fresh_original_observat
 def test_stalled_recovery_failure_does_not_fence_expired_sender_without_observation(tmp_path):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     before = saved(service)
     patch(service, _executing=True, _claim_id="expired-original-send",
           _claim_until=admission.clock.now - 1)
@@ -1440,7 +1637,7 @@ def test_stalled_recovery_does_not_fence_live_or_malformed_sender_lease(
         tmp_path, claim_id, claim_until):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     before = saved(service)
     if claim_until is not None:
         claim_until = admission.clock.now + 1_000
@@ -1460,7 +1657,7 @@ def test_stalled_recovery_does_not_fence_live_or_malformed_sender_lease(
 def test_read_failure_does_not_restore_missing_stalled_reason_or_release_capacity(tmp_path):
     service, admission, backend, _ = migration(tmp_path)
     patch(service, _submission_started=True, _turn_reserved=True, _executing=False)
-    stalled(service, admission, backend)
+    legacy_stalled(service, admission, backend)
     before = saved(service)
     patch(service, recovery_reason=None)
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 1

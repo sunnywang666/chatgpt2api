@@ -77,7 +77,7 @@ def ended_original(h, monkeypatch):
     monkeypatch.setattr("services.conversation_binding_service.time.time", h.clock)
     h.service.recovery_reader = lambda receipt: ConversationBindingService._read_text_request_result(
         None, receipt, document=document)
-    h.service.recover("owner", "old")
+    h.service.recover("owner", "old", explicit_ended_recheck=True)
     original = row(h.service)
     assert original.get("_upstream_terminal") is True, {k: original.get(k) for k in ("status", "recovery_reason", "recovery_error_code", "recovery_next_at", "recovery_last_read_error", "_attempt_finished_at")}
     assert original["recovery_reason"] == "REQUEST_RESULT_TERMINAL_EMPTY"
@@ -123,7 +123,9 @@ def advanced_to_own_successor(h, monkeypatch, *, workbench=False):
         h.service.store.write_receipt(db, "text", "owner", "successor", successor)
     h.service.recovery_reader = lambda receipt: ConversationBindingService._read_text_request_result(
         None, receipt, document=document)
-    h.service.recover("owner", "old")
+    # This helper deliberately models the explicit original-result recheck
+    # after the bounded incomplete observation stopped automatic polling.
+    h.service.recover("owner", "old", explicit_ended_recheck=True)
     original = row(h.service)
     assert original["upstream_unfinished"] is False
     assert original["status"] == "unknown"
@@ -169,7 +171,7 @@ def test_invalid_advanced_successor_evidence_does_not_clear_unfinished(product_n
             "observed_at": h.clock(),
         },
     }
-    h.service.recover("owner", "old")
+    h.service.recover("owner", "old", explicit_ended_recheck=True)
 
     saved = row(h.service)
     assert saved.get("upstream_unfinished") is None
@@ -291,7 +293,7 @@ def refresh_advanced_original(h, monkeypatch, document):
     monkeypatch.setattr('services.conversation_binding_service.time.time', h.clock)
     h.service.recovery_reader = lambda receipt: ConversationBindingService._read_text_request_result(
         None, receipt, document=document)
-    h.service.recover('owner', 'old')
+    h.service.recover('owner', 'old', explicit_ended_recheck=True)
     return row(h.service)
 
 
@@ -490,6 +492,9 @@ def test_incomplete_advanced_successor_then_normal_tail_rechecks_and_archives_ta
     h = product_no_final
     original, successor = advanced_to_own_successor(h, monkeypatch, workbench=workbench)
     retained = h.service.store.load_input(original["_input_ref"])
+    # The explicit read established safe successor evidence, so it consumes
+    # the automatic-stall marker rather than leaving it to suppress this
+    # now-proven chain.
     assert not original.get("_attempt_finished_at")
     tails = []
     for index in range(tail_count):
@@ -508,7 +513,8 @@ def test_incomplete_advanced_successor_then_normal_tail_rechecks_and_archives_ta
         assert h.service.submit("owner", h.tail_body, source=original["_source"])["status"] == "succeeded"
         assert h.service.read("owner", tail["request_id"])["status"] == "succeeded"
     assert len(h.sent) == tail_count + 1
-    assert original["status"] == "unknown" and not original.get("_attempt_finished_at")
+    assert original["status"] == "unknown"
+    assert not original.get("_attempt_finished_at")
     assert original["recovery_reason"] == "REQUEST_CONVERSATION_ADVANCED"
     assert h.service.store.load_input(original["_input_ref"]) == retained
     product, lifecycle, calls, identity = product_lifecycle(h)
@@ -866,7 +872,13 @@ def test_fresh_original_read_replaces_and_invalidates_tail_proof(product_no_fina
     else: document["mapping"][final]["message"]["content"]["parts"] = [""]
     original = refresh_advanced_original(h, monkeypatch, document)
     assert "_completed_successor_evidence" not in original
-    assert original["status"] == "unknown" and not original.get("_attempt_finished_at")
+    assert original["status"] == "unknown"
+    if drift == "empty":
+        # An explicit empty terminal result also consumes the stop marker.
+        assert not original.get("_attempt_finished_at")
+    else:
+        # A still-incomplete, invalid branch remains automatically stopped.
+        assert original["_attempt_reason"] == "ORIGINAL_RESULT_INCOMPLETE"
     product, _, calls, identity = product_lifecycle(h)
     identity["_trusted_source"] = "internal:listing"
     with pytest.raises(WorkLifecycleError): product.close(identity, "fixture-product", results_saved=True)

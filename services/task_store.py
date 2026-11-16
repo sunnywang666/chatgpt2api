@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -35,8 +36,13 @@ def recovery_control(receipt):
     in_flight = bool(receipt.get("recovery_claim_id") or receipt.get("_executing")
                      or receipt.get("status") == "running")
     stopped = receipt.get("_recovery_suppressed") is True
+    ended = receipt.get("_attempt_finished_at")
+    automatic_stop = (receipt.get("_attempt_reason") == "ORIGINAL_RESULT_INCOMPLETE"
+                      and type(ended) in (int, float) and math.isfinite(ended)
+                      and receipt.get("status") == "unknown"
+                      and receipt.get("upstream_outcome") == "unknown")
     version = receipt.get("_recovery_control_version", 0)
-    return {"state": "pausing" if paused and in_flight else "paused" if paused else "stopped" if stopped else "active",
+    return {"state": "pausing" if paused and in_flight else "paused" if paused else "stopped" if stopped or automatic_stop else "active",
             "in_flight": in_flight,
             "operator_stopped": stopped,
             "version": version if type(version) is int and version >= 0 else None}
