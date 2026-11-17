@@ -84,7 +84,8 @@ def test_pause_keeps_proven_capacity_released_without_recovery_or_same_chat_send
     waiter(restarted, "independent", "independent")
     assert restarted_admission.claim_next().request_id == "independent"
     assert restarted.store.set_recovery_paused("text", "owner", "old-0", False,
-                                               expected_version=control["version"])["state"] == "active"
+                                               expected_version=control["version"])["state"] == (
+                                                   "stopped" if proof == "stalled" else "active")
 
 
 @pytest.mark.parametrize("progress", [False, True])
@@ -100,7 +101,9 @@ def test_pause_during_stalled_read_preserves_ended_capacity_window_even_with_pro
 
     service.recovery_reader = read_and_pause
     admission.clock.now += 301
-    assert service.read("owner", "old-0")["status"] == "unknown"
+    # The stalled proof is automatically stopped; this deliberately models
+    # the one explicit original-result recheck that can race a pause command.
+    assert service.recover("owner", "old-0", explicit_ended_recheck=True)["status"] == "unknown"
     paused = raw(service)
     assert paused["_recovery_paused"] is True
     assert admission.resource_snapshot()["chat_turn"]["inflight"] == 0

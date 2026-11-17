@@ -223,6 +223,7 @@ class TextTaskService:
     _BOUNDED_RECOVERY_STOPS = {
         TextRecoveryReason.REQUEST_RESULT_NOT_FOUND.value: "ORIGINAL_RESULT_NO_FINAL",
         TextRecoveryReason.REQUEST_MESSAGE_NOT_FOUND.value: "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND",
+        TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value: "ORIGINAL_RESULT_INCOMPLETE",
     }
     _UNRECOVERABLE_REASONS = frozenset({
         TextRecoveryReason.CONVERSATION_NOT_FOUND.value,
@@ -693,11 +694,20 @@ class TextTaskService:
             result["codex_fallback"] = fallback
         result.pop("recovery_automatic_stopped", None)
         result.pop("recovery_stop_reason", None)
-        if (receipt.get("_attempt_finished_at")
-                and receipt.get("_attempt_reason") in TextTaskService._BOUNDED_RECOVERY_STOPS.values()
-                and receipt.get("status") == "failed"
-                and receipt.get("upstream_outcome") == "unknown"
-                and not receipt.get("_completion")):
+        no_final_stop = (receipt.get("_attempt_finished_at")
+                         and receipt.get("_attempt_reason") in {
+                             "ORIGINAL_RESULT_NO_FINAL", "ORIGINAL_REQUEST_MESSAGE_NOT_FOUND",
+                         }
+                         and receipt.get("status") == "failed"
+                         and receipt.get("upstream_outcome") == "unknown"
+                         and not receipt.get("_completion"))
+        incomplete_stop = (receipt.get("_attempt_reason") == "ORIGINAL_RESULT_INCOMPLETE"
+                           and type(receipt.get("_attempt_finished_at")) in (int, float)
+                           and math.isfinite(receipt["_attempt_finished_at"])
+                           and receipt.get("status") == "unknown"
+                           and receipt.get("upstream_outcome") == "unknown"
+                           and not receipt.get("_completion"))
+        if no_final_stop or incomplete_stop:
             result.update(recovery_automatic_stopped=True, recovery_stop_reason=receipt["_attempt_reason"])
         if (receipt.get("_route", "chat") == "chat" and receipt.get("_operation", "text") == "text"
                 and not receipt.get("_forward_protocol")):
@@ -1822,7 +1832,8 @@ class TextTaskService:
         The existing explicit recovery endpoint may still make one fresh read.
         """
         reason = receipt.get("recovery_reason")
-        stop_reason = cls._BOUNDED_RECOVERY_STOPS.get(reason)
+        stop_reason = (cls._BOUNDED_RECOVERY_STOPS.get(reason)
+                       if reason != TextRecoveryReason.REQUEST_RESULT_INCOMPLETE.value else None)
         if (not cls._bounded_chat_wait(receipt)
                 or not receipt.get("_execution_wait_ended_at")
                 or receipt.get("_attempt_finished_at")
@@ -1850,6 +1861,41 @@ class TextTaskService:
         # not an active completion owner. Preserve it without polling forever.
         receipt.update(_attempt_finished_at=now, _attempt_reason=stop_reason,
                        recovery_next_at=None, updated_at=now)
+        return True
+
+    @classmethod
+    def _end_stalled_incomplete_recovery(cls, receipt, now):
+        """Stop automatic reads only after a qualified unchanged incomplete result.
+
+        This is a local observation budget, not an upstream terminal result:
+        preserve the original UNKNOWN receipt, its physical conversation, and
+        every work/result identity. An explicit ended recheck can still make
+        one exact original-result read later.
+        """
+        if (receipt.get("upstream_outcome") != "unknown"
+                or any(receipt.get(key) for key in (
+                "_completion", "_completion_of", "_work_key", "_missing_successor_resume",
+                "_recovery_paused", "_recovery_suppressed"))
+                or "_missing_successor_resume" in receipt
+                or not cls._qualified_stalled_incomplete_capacity_boundary(receipt, now)):
+            return False
+        recovery_id = receipt.get("recovery_claim_id")
+        recovery_at = receipt.get("recovery_claimed_at")
+        recovery_until = receipt.get("recovery_lease_until")
+        if any(value is not None for value in (recovery_id, recovery_at, recovery_until)):
+            if (not isinstance(recovery_id, str) or not recovery_id
+                    or type(recovery_at) not in (int, float) or not math.isfinite(recovery_at)
+                    or type(recovery_until) not in (int, float) or not math.isfinite(recovery_until)
+                    or recovery_at > recovery_until or recovery_until > now):
+                return False
+        progress = receipt.get("_result_last_progress_at") or receipt["_result_observation_started_at"]
+        if (receipt["_result_no_progress_reads"] < cls.UNRECOVERABLE_QUALIFIED_READS
+                or receipt["_result_last_checked_at"] - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS):
+            return False
+        receipt.update(_attempt_finished_at=now,
+                       _attempt_reason="ORIGINAL_RESULT_INCOMPLETE",
+                       recovery_next_at=None,
+                       updated_at=now)
         return True
 
     def _finish_recovery(
@@ -2146,6 +2192,17 @@ class TextTaskService:
             updated = {**current, **changes, "recovery_claim_id": None,
                        "recovery_claimed_at": None, "recovery_lease_until": None,
                        "updated_at": now}
+            if (current.get("_attempt_reason") == "ORIGINAL_RESULT_INCOMPLETE"
+                    and (successor_evidence is not None
+                         or (recovered or {}).get("_upstream_terminal") is True
+                         or not error_code and updated.get("status") in {"succeeded", "failed"})):
+                # An explicit read has proved a different branch outcome.
+                # The old incomplete budget must not bypass the existing
+                # terminal/owned-successor capacity and closure predicates.
+                # Unavailable reads and still-incomplete observations retain
+                # the stop, including their ordinary retry-after evidence.
+                updated.pop("_attempt_finished_at", None)
+                updated.pop("_attempt_reason", None)
             if successor_evidence is None:
                 updated.pop(COMPLETED_SUCCESSOR_EVIDENCE_FIELD, None)
             if bounded_read_failure:
@@ -2198,8 +2255,10 @@ class TextTaskService:
                     updated["_recovered_final_sender"] = marker
             self._end_execution_wait(updated, now, observed=observed)
             self._end_no_final_recovery(updated, now)
+            self._end_stalled_incomplete_recovery(updated, now)
             if (error_code and updated.get("_attempt_reason") in self._BOUNDED_RECOVERY_STOPS.values()
-                    and recovery_reason in self._BOUNDED_RECOVERY_STOPS):
+                    and recovery_reason in self._BOUNDED_RECOVERY_STOPS
+                    and (updated.get("_attempt_reason") != "ORIGINAL_RESULT_INCOMPLETE" or observed)):
                 updated["recovery_next_at"] = None
             # Empty-response recovery is part of the original logical task.
             # Reserve at most one child, and never auto-retry that child again.
@@ -2459,7 +2518,8 @@ class TextTaskService:
                 if not corrected:
                     corrected = self._correct_historical_codex_request_rejection(previous, now)
                 ended_wait = False if corrected else self._end_execution_wait(previous, now)
-                if corrected or self._end_no_final_recovery(previous, now) or ended_wait:
+                stopped_incomplete = self._end_stalled_incomplete_recovery(previous, now)
+                if corrected or self._end_no_final_recovery(previous, now) or stopped_incomplete or ended_wait:
                     db.execute("UPDATE requests SET receipt=? WHERE owner=? AND id=?",
                                (json.dumps(previous), owner, request_id))
                     row = (json.dumps(previous),)
@@ -4963,26 +5023,45 @@ class TextTaskService:
         The unchanged observation opens one compact child only.  The binding
         runner still reads the original branch before and at the send edge.
         """
-        if not cls._qualified_stalled_incomplete_capacity_boundary(previous, now):
+        candidate = cls._stopped_incomplete_compact_candidate(previous, now) or previous
+        if not cls._qualified_stalled_incomplete_capacity_boundary(candidate, now):
             return False
         # Ending local generation occupancy is not permission to send a child.
         # Explicit continuation still requires three unchanged exact reads and
         # a full stagnant window proved by the latest read. The capacity marker
         # can now predate later progress, so it cannot supply that separate proof.
-        progress = previous.get("_result_last_progress_at") or previous["_result_observation_started_at"]
-        if (previous["_result_no_progress_reads"] < cls.UNRECOVERABLE_QUALIFIED_READS
-                or previous["_result_last_checked_at"] - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS):
+        progress = candidate.get("_result_last_progress_at") or candidate["_result_observation_started_at"]
+        if (candidate["_result_no_progress_reads"] < cls.UNRECOVERABLE_QUALIFIED_READS
+                or candidate["_result_last_checked_at"] - progress < cls.UNRECOVERABLE_MIN_AGE_SECONDS):
             return False
-        if not cls._incomplete_compact_successor_context(previous):
+        if not cls._incomplete_compact_successor_context(candidate):
             return False
         # The capacity predicate has already proved a historical sender claim
         # is paired, finite, and expired.  Preserve that audit record instead
         # of clearing it; recovery and internal claims remain active-work
         # evidence and are never a continuation permission.
-        return not any(previous.get(key) is not None for key in (
+        return not any(candidate.get(key) is not None for key in (
             "recovery_claim_id", "recovery_claimed_at",
             "recovery_lease_until", "_recovery_claim_id", "_recovery_claim_until",
         ))
+
+    @classmethod
+    def _stopped_incomplete_compact_candidate(cls, receipt, now):
+        """Recover the exact pre-stop proof for an already eligible compact child.
+
+        The planner continues to reject ended attempts. This narrow copy is
+        only for the explicit compact-successor validator, and removes no
+        state other than the verified automatic incomplete marker.
+        """
+        ended = receipt.get("_attempt_finished_at")
+        if (receipt.get("_attempt_reason") != "ORIGINAL_RESULT_INCOMPLETE"
+                or type(ended) not in (int, float) or not math.isfinite(ended)
+                or not 0 < ended <= now or receipt.get("recovery_next_at") is not None):
+            return None
+        candidate = dict(receipt)
+        candidate.pop("_attempt_finished_at", None)
+        candidate.pop("_attempt_reason", None)
+        return candidate
 
     @classmethod
     def _incomplete_compact_successor_context(cls, previous):
@@ -5017,18 +5096,19 @@ class TextTaskService:
         The same strict eligibility predicate remains the only send authority.
         """
         invalid = "CHAT_WORKBENCH_DERIVED_INPUT_INVALID"
-        if mode != "incomplete" or not cls._incomplete_compact_successor_context(original):
+        candidate = cls._stopped_incomplete_compact_candidate(original, now) or original
+        if mode != "incomplete" or not cls._incomplete_compact_successor_context(candidate):
             return invalid
-        observation = original.get("_original_result_observation")
-        if observation is not None and cls._safe_result_observation(observation, original) is None:
+        observation = candidate.get("_original_result_observation")
+        if observation is not None and cls._safe_result_observation(observation, candidate) is None:
             return invalid
-        times = [original.get(key) for key in (
+        times = [candidate.get(key) for key in (
             "_result_observation_started_at", "_result_last_progress_at",
             "_result_last_checked_at", "_result_wait_ended_at")]
         if any(value is not None and (type(value) not in (int, float)
                 or not math.isfinite(value) or not 0 < value <= now) for value in times):
             return invalid
-        reads = original.get("_result_no_progress_reads")
+        reads = candidate.get("_result_no_progress_reads")
         if reads is not None and (type(reads) is not int or reads < 0):
             return invalid
         started, progress, checked, ended = times
