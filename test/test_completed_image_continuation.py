@@ -1,12 +1,16 @@
 """Existing images resume the original review through normal claim/send/close."""
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
 
 import pytest
 
 from services.product_work import advanced_continuation_chain
+from services.image_task_service import ImageTaskService
 from services.image_task_service import _request_hash
 from services.image_quota_successor import prepared_payload
+from services.request_context import AdmissionLost
+from services.pool_admission import ExecutionContext
 from test.test_no_final_successor import product_no_final, product_lifecycle
 from test.test_product_compact_successor import (advanced_to_own_successor,
     add_completed_image_tail, add_completed_tail)
@@ -73,6 +77,147 @@ def image_chain(h, monkeypatch, *, quota):
                          'conversation_binding_ids':['second-binding']})
         (h.root/'accounts.json').write_text(json.dumps(accounts))
     return original,child
+
+
+def queued_image_correction_after_reviews(h, monkeypatch, *, retired=True):
+    """Model 0310: retired image -> saved image -> reviews -> final image."""
+    if retired:
+        original, image = image_chain(h, monkeypatch, quota=False)
+    else:
+        original, image = image_chain(h, monkeypatch, quota=False)
+    review = add_completed_tail(h, 'review', previous_image=image)
+    review = add_completed_tail(h, 'review-2', previous_id=review['request_id'])
+    if not retired:
+        # Keep the completed image and reviews but remove the registered
+        # retired member: a later correction may follow an ordinary saved
+        # image just as safely as the narrow 0310 bridge.
+        with h.service.store.transaction() as db:
+            parent = h.service.store.runtime(db, image['_product_work_key'])
+            parent['members'] = [member for member in parent['members']
+                                 if member['request_id'] != 'old-unsent-image']
+            h.service.store.set_runtime(db, parent['key'], parent)
+    h.admission.settings = lambda: {'chat_account_concurrency': 6, 'image_account_concurrency': 4}
+    h.admission.accounts.update_account('fixture', {'limits_progress': [
+        {'feature_name': 'image_gen', 'remaining': 100}],
+        'capacity_observed_at': datetime.now(timezone.utc).isoformat(),
+    })
+    images = ImageTaskService(h.root / 'correction-images.json', admission=h.admission,
+                              store=h.service.store)
+    saved = h.service.store.load_input(image['_input_ref'])
+    binding = {key: review[key] for key in (
+        'provider_binding_id', 'provider_account_identity', 'client_conversation_id',
+        'conversation_id', 'parent_message_id')}
+    images.submit_generation(
+        {'id': 'owner', 'role': 'admin', '_trusted_source': original['_source']},
+        client_task_id='final-image-correction', prompt=saved['payload']['prompt'],
+        model='gpt-image-2', size=saved['payload'].get('size'), quality=saved['payload'].get('quality', 'auto'),
+        **binding, product_work={**review['_product_work'], 'step_ref': 'final-image-correction'},
+    )
+    # The production regression had already reached `before_send`; the
+    # fixture's scheduler retains the unresolved original and is deliberately
+    # not the behavior this send-edge test changes.  Install the durable
+    # running state claim_next would have written, then exercise final
+    # admission below.
+    claim = 'final-image-correction-claim'
+    with h.service.store.transaction() as db:
+        correction = h.service.store.read_receipt(db, 'image', 'owner', 'final-image-correction')
+        correction.update(status='running', _claim_id=claim, _claim_until=h.clock() + 30,
+                          _executing=True, _turn_reserved=True, upstream_unfinished=True)
+        h.service.store.write_receipt(db, 'image', 'owner', 'final-image-correction', correction)
+    context = ExecutionContext(h.admission, 'image', 'owner', 'final-image-correction', claim,
+                               claimed_at=h.clock())
+    return original, image, context
+
+
+def test_saved_image_and_reviews_allow_one_final_image_correction(product_no_final, monkeypatch):
+    h = product_no_final
+    original, _image, context = queued_image_correction_after_reviews(h, monkeypatch)
+
+    context.before_send_with_marker()
+
+    correction = image_row(h, 'final-image-correction')
+    assert correction['_submission_started'] is True
+    assert correction['parent_message_id'] == row(h.service, 'review-2')['parent_message_id']
+    assert row(h.service) == original
+
+
+def test_completed_image_and_reviews_allow_final_image_correction(product_no_final, monkeypatch):
+    h = product_no_final
+    _original, _image, context = queued_image_correction_after_reviews(h, monkeypatch, retired=False)
+
+    context.before_send_with_marker()
+
+    assert image_row(h, 'final-image-correction')['_submission_started'] is True
+
+
+@pytest.mark.parametrize('drift', ['stored_identity', 'stored_mode'])
+def test_normal_completed_image_requires_frozen_identity_and_mode(product_no_final, monkeypatch, drift):
+    h = product_no_final
+    _original, image, context = queued_image_correction_after_reviews(h, monkeypatch, retired=False)
+    with h.service.store.transaction() as db:
+        saved = h.service.store.read_receipt(db, 'image', 'owner', image['id'])
+        stored = h.service.store.load_input(saved['_input_ref'])
+        if drift == 'stored_identity':
+            stored['identity']['id'] = 'other-owner'
+        else:
+            stored['mode'] = 'edit'
+            saved['request_hash'] = _request_hash('edit', stored['payload'])
+        saved['_input_ref'] = h.service.store.save_input(stored)
+        h.service.store.write_receipt(db, 'image', 'owner', image['id'], saved)
+
+    with pytest.raises(AdmissionLost, match='conversation is occupied'):
+        context.before_send_with_marker()
+
+
+def test_final_image_correction_cannot_send_twice(product_no_final, monkeypatch):
+    h = product_no_final
+    _original, _image, context = queued_image_correction_after_reviews(h, monkeypatch)
+    context.before_send_with_marker()
+
+    with pytest.raises(AdmissionLost, match='already submitted'):
+        context.before_send_with_marker()
+
+
+@pytest.mark.parametrize('drift', ['changed_input', 'active_old', 'mismatched_cursor', 'image_hold', 'unrelated_unknown'])
+def test_final_image_correction_keeps_unproved_image_history_blocked(product_no_final, monkeypatch, drift):
+    h = product_no_final
+    _original, image, context = queued_image_correction_after_reviews(h, monkeypatch)
+    with h.service.store.transaction() as db:
+        old = h.service.store.read_receipt(db, 'image', 'owner', 'old-unsent-image')
+        saved = h.service.store.read_receipt(db, 'image', 'owner', image['id'])
+        if drift == 'changed_input':
+            body = h.service.store.load_input(old['_input_ref'])
+            body['payload']['prompt'] = 'changed frozen image input'
+            old['_input_ref'] = h.service.store.save_input(body)
+            old['request_hash'] = _request_hash(body['mode'], body['payload'])
+        elif drift == 'active_old':
+            old['_executing'] = True
+        elif drift == 'mismatched_cursor':
+            saved['parent_message_id'] = 'changed-image-result-cursor'
+        elif drift == 'image_hold':
+            saved['_send_hold'] = True
+        else:
+            correction = h.service.store.read_receipt(db, 'image', 'owner', 'final-image-correction')
+            foreign = deepcopy(row(h.service))
+            foreign.update(id='foreign-unknown', request_id='foreign-unknown', status='unknown',
+                           _product_work_key='foreign-product',
+                           _product_work={'product_ref': 'foreign', 'step_ref': 'foreign'},
+                           _claim_id=None, _claim_until=None, _executing=False, _turn_reserved=False,
+                           _recovery_suppressed=False, _sequence=correction['_sequence'] - 1)
+            assert (foreign['conversation_id'] == correction['conversation_id']
+                    and foreign['provider_account_identity'] == correction['provider_account_identity']
+                    and foreign['_sequence'] < correction['_sequence'])
+            h.service.store.write_receipt(db, 'text', 'owner', 'foreign-unknown', foreign)
+            parent = h.service.store.runtime(db, old['_product_work_key'])
+            parent['members'].append({'kind': 'text', 'owner': 'owner',
+                                      'request_id': 'foreign-unknown', 'step_ref': 'foreign'})
+            h.service.store.set_runtime(db, parent['key'], parent)
+        h.service.store.write_receipt(db, 'image', 'owner', 'old-unsent-image', old)
+        h.service.store.write_receipt(db, 'image', 'owner', image['id'], saved)
+
+    with pytest.raises(AdmissionLost, match='conversation is occupied'):
+        context.before_send_with_marker()
+    assert image_row(h, 'final-image-correction')['_submission_started'] is False
 
 
 @pytest.mark.parametrize('quota',[False,True])

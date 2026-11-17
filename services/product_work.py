@@ -1280,6 +1280,47 @@ def _completed_image_replaces_unsent(store, parent, member, old, candidate_membe
     return inputs[0] == inputs[1]
 
 
+def _completed_image_history_tail(store, parent, member, old, candidate_member, candidate,
+                                  previous, used_steps):
+    """Prove a saved image is the exact terminal successor of retired image input.
+
+    The older image must be an explicit never-sent terminal attempt.  The
+    saved image then has to be a normal next product turn from ``previous``;
+    this keeps the historical exception from becoming a general image-tail
+    waiver when a cursor, frozen input, session, or result changes.
+    """
+    if (member.get("step_ref") in used_steps or candidate_member.get("step_ref") in used_steps
+            or type(old.get("_sequence")) is not int or type(candidate.get("_sequence")) is not int
+            or old["_sequence"] <= previous.get("_sequence", 0)
+            or candidate["_sequence"] <= old["_sequence"]
+            or not _completed_image_replaces_unsent(
+                store, parent, member, old, candidate_member, candidate)):
+        return False
+    return _normal_image_history_tail(store, parent, candidate_member, candidate,
+                                      previous, used_steps)
+
+
+def _normal_image_history_tail(store, parent, member, tail, previous, used_steps):
+    """Validate a completed image that needs no retired-attempt bridge."""
+    try:
+        stored = store.load_input(tail["_input_ref"])
+        if (stored["mode"] != tail.get("mode")
+                or str(stored["identity"]["id"]) != parent.get("owner")):
+            return False
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    if tail.get("_send_hold"):
+        return False
+    proof = {
+        "request_message_id": tail.get("request_message_id"),
+        "final_message_id": tail.get("parent_message_id"),
+    }
+    if (not all(isinstance(value, str) and value for value in proof.values())
+            or proof["request_message_id"] == proof["final_message_id"]):
+        return False
+    return _image_product_tail(store, parent, member, tail, previous, used_steps, proof)
+
+
 def _completed_quota_image_tail(store, db, parent, member, root, previous, used_steps, proof, members):
     """Bridge an observed quota terminal to its one saved fresh-account result."""
     from services.image_task_service import _request_hash
@@ -1391,12 +1432,59 @@ def completed_text_image_continuation(store, db, owner, image, child, now):
     later.sort(key=lambda item: item[0])
     previous = child
     used_steps = {child_members[0]["step_ref"]}
-    for _, member, tail in later:
-        if (any(tail.get(k) for k in ("_send_hold", "_completion", "_completion_of"))
-                or not _normal_product_tail(store, db, parent, member, tail, previous, used_steps, now)):
+    index = 0
+    while index < len(later):
+        _, member, tail = later[index]
+        if member.get("kind") == "text":
+            if (any(tail.get(k) for k in ("_send_hold", "_completion", "_completion_of"))
+                    or not _normal_product_tail(store, db, parent, member, tail, previous, used_steps, now)):
+                return False
+            previous = tail
+            used_steps.add(member["step_ref"])
+            index += 1
+            continue
+
+        if member.get("kind") == "image" and _normal_image_history_tail(
+                store, parent, member, tail, previous, used_steps):
+            previous = tail
+            used_steps.add(member["step_ref"])
+            index += 1
+            continue
+
+        # A historical never-sent image may precede its one saved identical
+        # result.  Consume only a consecutive registered image segment: a
+        # text step, a second saved image, or any unproved member still blocks
+        # the final correction image at the physical-conversation guard.
+        candidate_index = None
+        for candidate_index in range(index + 1, len(later)):
+            _, candidate_member, candidate = later[candidate_index]
+            retired = later[index:candidate_index]
+            if (candidate_member.get("kind") != "image"
+                    or any(retired_member.get("kind") != "image"
+                           for _, retired_member, _ in retired)):
+                candidate_index = None
+                break
+            retired_steps = [retired_member.get("step_ref") for _, retired_member, _ in retired]
+            if (any(not isinstance(step, str) or not step for step in retired_steps)
+                    or len(set(retired_steps)) != len(retired_steps)
+                    or candidate_member.get("step_ref") in retired_steps):
+                candidate_index = None
+                break
+            if all(_completed_image_history_tail(
+                    store, parent, retired_member, retired_tail,
+                    candidate_member, candidate, previous, used_steps)
+                   for _, retired_member, retired_tail in retired):
+                break
+        else:
+            candidate_index = None
+        if candidate_index is None:
             return False
-        previous = tail
-        used_steps.add(member["step_ref"])
+        _, candidate_member, candidate = later[candidate_index]
+        for _, retired_member, retired_tail in later[index:candidate_index]:
+            used_steps.add(retired_member["step_ref"])
+        used_steps.add(candidate_member["step_ref"])
+        previous = candidate
+        index = candidate_index + 1
     return bool(later and image_members[0]["step_ref"] not in used_steps
                 and previous.get("parent_message_id") == image.get("parent_message_id"))
 
