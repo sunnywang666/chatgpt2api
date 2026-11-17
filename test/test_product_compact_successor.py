@@ -220,10 +220,12 @@ def add_later_product_member(h, request_id="later"):
     return row(h.service, request_id)
 
 
-def add_completed_tail(h, request_id="copy-1", *, previous_id="successor", before_send=None, expect_sent=True, before_claim=None, expect_claim=True, lose_response=False, after_send=None):
+def add_completed_tail(h, request_id="copy-1", *, previous_id="successor", previous_image=None, before_send=None, expect_sent=True, before_claim=None, expect_claim=True, lose_response=False, after_send=None):
     """Use the normal registered submit path after the owned derived child."""
-    successor = row(h.service, previous_id)
+    successor = previous_image if previous_image is not None else row(h.service, previous_id)
     body = h.service.store.load_input(row(h.service)['_input_ref'])
+    body.update({key: successor[key] for key in ('provider_binding_id', 'provider_account_identity',
+                'client_conversation_id', 'conversation_id')})
     body.update(client_request_id=request_id, parent_message_id=successor['parent_message_id'],
                 messages=[{'role': 'user', 'content': 'normal copy after category'}],
                 product_work={**successor['_product_work'], 'step_ref': request_id})
