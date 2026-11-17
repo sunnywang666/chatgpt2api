@@ -10,6 +10,7 @@ from services.image_thread import bind_waiting_threads, predecessor_state
 
 from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
+import copy
 import hashlib
 import json
 import math
@@ -1674,6 +1675,52 @@ class PoolAdmission:
         read = getattr(self.accounts, "admission_accounts", None)
         return read() if read else self.accounts.list_accounts()
 
+    def _reconcile_queued_codex_bindings(self, rows, receipts, *, db=None):
+        """Apply deterministic queued-Codex affinity outcomes to a receipt view.
+
+        ``claim_next`` first uses this against a private receipt/account
+        snapshot for planning.  It repeats the same operation only after the
+        final account-snapshot comparison, so a changed account cannot leave
+        behind a stale affinity or make an otherwise invalid dispatch appear
+        claimable.
+        """
+        for kind, owner, request_id, receipt in receipts:
+            if receipt.get("_route") != "codex" or receipt.get("status") != "queued":
+                continue
+            if db is not None:
+                # Preserve waiting diagnostics written after the planning copy.
+                receipt = self.store.read_receipt(db, kind, owner, request_id)
+            bound = [account for account in rows
+                     if receipt.get("client_conversation_id") in (account.get("codex_affinities") or {})]
+            previous = receipt.get("_previous_response_id")
+            if previous:
+                digest = hashlib.sha256(previous.encode()).hexdigest()
+                prior = [account for account in rows
+                         if (account.get("codex_response_ids", {}).get(digest) or {}).get("owner")
+                         == hashlib.sha256(owner.encode()).hexdigest()]
+                if (len(prior) != 1
+                        or (bound and bound[0]["provider_account_identity"]
+                            != prior[0]["provider_account_identity"])):
+                    receipt.update(status="failed", error_code="codex_response_owner_unknown")
+                else:
+                    bound = prior
+            if len(bound) > 1:
+                receipt.update(status="failed", error_code="codex_binding_conflict")
+            elif bound:
+                if (receipt.get("_requested_account_identity")
+                        and receipt["_requested_account_identity"]
+                        != bound[0]["provider_account_identity"]):
+                    receipt.update(
+                        status="failed",
+                        error_code=("IMAGE_ACCOUNT_SELECTION_CONFLICT"
+                                    if kind == "image" or receipt.get("_operation") == "image"
+                                    else "CHAT_ACCOUNT_SELECTION_CONFLICT"),
+                    )
+                else:
+                    receipt["provider_account_identity"] = bound[0]["provider_account_identity"]
+            if db is not None:
+                self.store.write_receipt(db, kind, owner, request_id, receipt)
+
     def _product_capacity_limit(self, rows, settings):
         """Capacity of existing unique physical Chat turns, excluding trials."""
         identities = {}
@@ -2808,7 +2855,7 @@ class PoolAdmission:
                         break
                 if candidates:
                     self._codex_probe_index = (start + scanned) % len(candidates)
-        with self._settings_guard(), self.store.transaction() as db, ExitStack() as account_guard:
+        with self._settings_guard(), ExitStack() as final_account_guard, self.store.transaction() as db:
             now = float(self.clock())
             # Keep completed result bodies out of the writer-held claim path.
             # claim_receipts rehydrates only active/linked dependencies; public
@@ -2821,41 +2868,32 @@ class PoolAdmission:
             from services.text_task_service import bind_waiting_public_sessions
             bind_waiting_public_sessions(self.store, db, receipts)
             product_work.release_rejected_product_slots(self.store, db, receipts)
-            # Receipt-only maintenance stays in this same SQLite writer
-            # transaction, but it neither reads nor changes account authority.
-            # Take the account lock only for the fresh-row-dependent planner,
-            # binding and claim commit below.
-            account_guard.enter_context(self._account_guard())
+            # Keep the existing writer/settings transaction across selection
+            # and commit, but release account authority during the expensive
+            # receipt/history planner.  Account rows are deep-copied while
+            # locked: neither nested dictionaries nor list values may drift
+            # under the planner after the lock is released.
+            with self._account_guard():
+                planning_rows = copy.deepcopy(self._rows())
+            # ReceiptProjection lazily loads completed bodies on mutation/copy.
+            # Only queued Codex rows are changed by affinity planning; keep
+            # every other detached projection intact and lazy.
+            planning_receipts = [
+                (kind, owner, request_id,
+                 copy.deepcopy(dict(receipt))
+                 if receipt.get("_route") == "codex" and receipt.get("status") == "queued"
+                 else receipt)
+                for kind, owner, request_id, receipt in receipts
+            ]
             if self.codex is not None:
-                rows = self._rows()
-                for kind, owner, request_id, r in receipts:
-                    if r.get("_route") != "codex" or r.get("status") != "queued":
-                        continue
-                    bound = [a for a in rows if r.get("client_conversation_id") in (a.get("codex_affinities") or {})]
-                    previous = r.get("_previous_response_id")
-                    if previous:
-                        digest = hashlib.sha256(previous.encode()).hexdigest()
-                        prior = [a for a in rows if (a.get("codex_response_ids", {}).get(digest) or {}).get("owner") == hashlib.sha256(owner.encode()).hexdigest()]
-                        if len(prior) != 1 or (bound and bound[0]["provider_account_identity"] != prior[0]["provider_account_identity"]):
-                            r.update(status="failed", error_code="codex_response_owner_unknown")
-                        else:
-                            bound = prior
-                    if len(bound) > 1:
-                        r.update(status="failed", error_code="codex_binding_conflict")
-                    elif bound:
-                        if (r.get("_requested_account_identity")
-                                and r["_requested_account_identity"] != bound[0]["provider_account_identity"]):
-                            r.update(status="failed", error_code="IMAGE_ACCOUNT_SELECTION_CONFLICT" if kind == "image" or r.get("_operation") == "image" else "CHAT_ACCOUNT_SELECTION_CONFLICT")
-                        else:
-                            r["provider_account_identity"] = bound[0]["provider_account_identity"]
-                    self.store.write_receipt(db, kind, owner, request_id, r)
+                self._reconcile_queued_codex_bindings(planning_rows, planning_receipts)
             settings = self._settings()
             workflow_state = workflow_scheduling.state_snapshot(self.store, db)
             product_state = product_work.state_snapshot(self.store, db)
-            snapshot = self._snapshot(self._rows(), receipts, settings, types, now,
+            snapshot = self._snapshot(planning_rows, planning_receipts, settings, types, now,
                                       self.store.runtime(db, "fairness", {}), workflow_state, product_state, db=db)
             selection = choose_next(snapshot, now)
-            waiting_active_work_counts = workflow_scheduling.active_work_counts(receipts)
+            waiting_active_work_counts = workflow_scheduling.active_work_counts(planning_receipts)
             for deferred in selection.deferred:
                 r = self.store.read_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id)
                 dependency_reason = r.get("_image_thread_waiting_reason") or r.get("_public_previous_waiting_reason")
@@ -2872,7 +2910,7 @@ class PoolAdmission:
                         reasons = list(dict.fromkeys([*reasons, "work_not_active"]))
                 if ((deferred.ref.kind == "image" or r.get("_operation") == "image")
                         and r.get("_requested_account_identity")):
-                    selected = [a for a in self._rows() if a.get("provider_account_identity") == r["_requested_account_identity"]]
+                    selected = [a for a in planning_rows if a.get("provider_account_identity") == r["_requested_account_identity"]]
                     if len(selected) == 1 and image_capacity(selected[0], settings, r.get("model", "gpt-image-2")) <= 0:
                         from services.owned_accounts import image_capability_projection
                         reason = image_capability_projection(selected[0]).get("reason") or "capability_unknown"
@@ -2896,6 +2934,21 @@ class PoolAdmission:
                 if not _same_waiting_projection(r.get("waiting"), waiting):
                     r["waiting"] = waiting
                     self.store.write_receipt(db, deferred.ref.kind, deferred.ref.owner, deferred.ref.request_id, r)
+            # Deferred diagnostics never reserve an account or a slot.  They
+            # may use the planning snapshot, while the dispatch below must
+            # revalidate the complete account snapshot before any durable
+            # affinity/claim write.
+            final_account_guard.enter_context(self._account_guard())
+            final_rows = copy.deepcopy(self._rows())
+            # Legacy account rows without created_at synthesize it on reload.
+            # It is display metadata, never admission authority. Compare every
+            # other field (including nested quotas, identity and affinities).
+            authority = lambda rows: [{k: v for k, v in row.items() if k != "created_at"}
+                                      for row in rows]
+            if authority(final_rows) != authority(planning_rows):
+                return None
+            if self.codex is not None:
+                self._reconcile_queued_codex_bindings(final_rows, receipts, db=db)
             if selection.dispatch is None:
                 return None
             pick = selection.dispatch
@@ -2947,7 +3000,7 @@ class PoolAdmission:
             if not advanced_session and not binding:
                 binding = (self.accounts.admission_binding(pick.account)
                            if r.get("_route", "chat") == "chat" else None)
-            rows = {a["provider_account_identity"]: a for a in self._rows()}
+            rows = {a["provider_account_identity"]: a for a in final_rows}
             claim = uuid.uuid4().hex
             timeline = list(r.get("_execution_timeline") or [])
             timeline.append({"stage": "execution_claimed", "at": now})

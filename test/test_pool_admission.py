@@ -2210,6 +2210,115 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(result["context"].request_id, "second")
 
+    def test_slow_planning_snapshot_releases_account_lock_for_capacity_read(self):
+        """The expensive planner must not serialize a read-only capacity view."""
+        self.submit("slow-planner")
+        snapshot_entered, release_snapshot, capacity_done = (threading.Event() for _ in range(3))
+        result, errors = {}, []
+        original_snapshot = self.admission._snapshot
+
+        def paused_snapshot(*args, **kwargs):
+            if threading.current_thread().name == "slow-planning-claimer":
+                snapshot_entered.set()
+                if not release_snapshot.wait(2):
+                    raise TimeoutError("test did not release planner")
+            return original_snapshot(*args, **kwargs)
+
+        def claim():
+            try:
+                result["context"] = self.admission.claim_next()
+            except BaseException as exc:
+                errors.append(exc)
+
+        def read_capacity():
+            try:
+                result["capacity"] = self.admission.resource_snapshot()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                capacity_done.set()
+
+        with patch.object(self.admission, "_snapshot", side_effect=paused_snapshot):
+            claimer = threading.Thread(target=claim, name="slow-planning-claimer")
+            claimer.start()
+            self.assertTrue(snapshot_entered.wait(2))
+            reader = threading.Thread(target=read_capacity)
+            reader.start()
+            self.assertTrue(capacity_done.wait(.5))
+            release_snapshot.set()
+            claimer.join(2)
+            reader.join(2)
+        self.assertFalse(claimer.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result["capacity"]["accounts"][0]["chat_turn"]["capacity"], 1)
+        self.assertEqual(result["context"].request_id, "slow-planner")
+
+    def test_account_drift_during_planning_leaves_no_claim_or_affinity(self):
+        """A changed full account snapshot cancels rather than replans in place."""
+        self.submit("drifted-planner")
+        snapshot_entered, release_snapshot = threading.Event(), threading.Event()
+        result, errors = {}, []
+        original_snapshot = self.admission._snapshot
+
+        def paused_snapshot(*args, **kwargs):
+            snapshot_entered.set()
+            if not release_snapshot.wait(2):
+                raise TimeoutError("test did not release planner")
+            return original_snapshot(*args, **kwargs)
+
+        def claim():
+            try:
+                result["context"] = self.admission.claim_next()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(self.admission, "_snapshot", side_effect=paused_snapshot):
+            worker = threading.Thread(target=claim)
+            worker.start()
+            self.assertTrue(snapshot_entered.wait(2))
+            self.accounts.update_account("fixture-token-0", {"managed_disabled": True}, quiet=True)
+            release_snapshot.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIsNone(result["context"])
+        receipt = self.read("text", "happy", "drifted-planner")
+        self.assertEqual(receipt["status"], "queued")
+        self.assertIsNone(receipt.get("_claim_id"))
+        self.assertFalse(receipt.get("_turn_reserved"))
+        self.assertFalse(receipt.get("_executing"))
+        self.assertIsNone(receipt.get("provider_binding_id"))
+        with self.store.connect() as db:
+            self.assertEqual(self.store.runtime(db, "fairness", {}), {})
+
+    def test_account_created_timestamp_refresh_does_not_cancel_claim(self):
+        self.submit("timestamp-refresh")
+        original_snapshot = self.admission._snapshot
+
+        def refreshed_snapshot(*args, **kwargs):
+            result = original_snapshot(*args, **kwargs)
+            self.accounts.update_account("fixture-token-0", {"created_at": "2020-01-01 00:00:00"}, quiet=True)
+            return result
+
+        with patch.object(self.admission, "_snapshot", side_effect=refreshed_snapshot):
+            self.assertEqual(self.admission.claim_next().request_id, "timestamp-refresh")
+
+    def test_final_account_guard_covers_claim_transaction_commit(self):
+        self.submit("commit-guard")
+        original_transaction = self.store.transaction
+        observed = []
+
+        @contextmanager
+        def checked_transaction(**kwargs):
+            with original_transaction(**kwargs) as db:
+                yield db
+                observed.append(self.accounts._lock._is_owned())
+
+        with patch.object(self.store, "transaction", side_effect=checked_transaction):
+            self.assertEqual(self.admission.claim_next().request_id, "commit-guard")
+        self.assertEqual(observed, [True])
+
     def test_restart_loads_actual_multimodal_input_and_claims_once(self):
         self.submit("original", messages=[{"role": "user", "content": [(b"original image", "image.png", "image/png")]}])
         _, _, restarted = build(self.root, self.clock)
