@@ -1182,7 +1182,7 @@ def _normal_product_tail(store, db, parent, member, tail, previous, used_steps, 
             and not _claims(tail) and not tail.get("_executing") and not tail.get("_turn_reserved"))
 
 
-def _image_product_tail(store, parent, member, tail, previous, used_steps, proof):
+def _image_product_tail(store, parent, member, tail, previous, used_steps, proof, *, quota_terminal=False):
     """Validate one saved image tail observed by the original-reader proof."""
     from services.image_task_service import _request_hash
     try:
@@ -1194,6 +1194,13 @@ def _image_product_tail(store, parent, member, tail, previous, used_steps, proof
     result_ids = [value for values in (tail.get("result_file_ids"), tail.get("result_sediment_ids"))
                   if isinstance(values, list) for value in values]
     metadata = _metadata(parent, member["step_ref"])
+    if quota_terminal:
+        from services.image_quota_successor import eligible_original
+        result_ready = eligible_original(tail)
+    else:
+        result_ready = (tail.get("status") == "success" and tail.get("upstream_outcome") == "generated"
+                        and isinstance(tail.get("data"), list) and bool(tail["data"])
+                        and bool(result_ids) and all(isinstance(value, str) and value for value in result_ids))
     return bool(
         member.get("kind") == "image" and member.get("owner") == parent.get("owner")
         and tail.get("id") == member.get("request_id")
@@ -1208,14 +1215,103 @@ def _image_product_tail(store, parent, member, tail, previous, used_steps, proof
         and payload.get("parent_message_id") == previous.get("parent_message_id")
         and mode in {"generate", "edit"} and tail.get("request_hash") == _request_hash(mode, payload)
         and type(tail.get("_sequence")) is int and tail["_sequence"] > previous.get("_sequence", 0)
-        and tail.get("status") == "success" and tail.get("upstream_outcome") == "generated"
+        and result_ready
         and tail.get("upstream_unfinished") is False and tail.get("binding_status") == "bound"
-        and tail.get("_submission_started") is True and isinstance(tail.get("data"), list) and bool(tail["data"])
-        and bool(result_ids) and all(isinstance(value, str) and value for value in result_ids)
+        and tail.get("_submission_started") is True
         and not _claims(tail) and not tail.get("_executing") and not tail.get("_turn_reserved")
         and not any(tail.get(key) for key in ("_recovery_paused", "_recovery_suppressed",
-                                               "_completion", "_completion_of"))
+                                               "_completion_of"))
+        and (quota_terminal or not tail.get("_completion"))
     )
+
+
+def _completed_image_replaces_unsent(store, parent, member, old, candidate_member, candidate):
+    """A saved identical image resolves one terminal attempt that never sent.
+
+    Compare the frozen image input, allowing only the registered attempt step
+    to differ. UNKNOWN, pending completion work and foreign history stay held.
+    """
+    from services.image_task_service import _request_hash
+    completion = old.get("_completion")
+    if completion and not (isinstance(completion, dict)
+            and completion.get("state") == "needs_attention" and completion.get("next_at") is None
+            and completion.get("same_request_retry") is True and completion.get("bound_retry") is True
+            and completion.get("allow_unconfirmed_retry") is False and completion.get("max_extra_requests") == 0
+            and completion.get("reason") == "COMPLETION_ORIGINAL_NOT_RETRYABLE"
+            and not completion.get("replacement_id") and not completion.get("selected_id")):
+        return False
+    if (member.get("kind") != "image" or candidate_member.get("kind") != "image"
+            or old.get("status") != "error" or old.get("upstream_outcome") != "not_submitted"
+            or old.get("_submission_started") is not False or old.get("upstream_submission_started") is not False
+            or old.get("upstream_unfinished") is not False
+            or _claims(old) or _claims(candidate)
+            or any(old.get(k) or candidate.get(k) for k in (
+                "_send_hold", "_recovery_paused", "_recovery_suppressed", "_executing", "_turn_reserved"))
+            or any(old.get(k) for k in ("data", "result_file_ids", "result_sediment_ids",
+                "_pending_image_result_ids", "_pending_image_output", "_completion_of"))
+            or candidate.get("_completion") or candidate.get("_completion_of")
+            or candidate.get("status") != "success" or candidate.get("upstream_outcome") != "generated"
+            or candidate.get("upstream_unfinished") is not False
+            or candidate.get("_submission_started") is not True or candidate.get("binding_status") != "bound"
+            or not isinstance(candidate.get("data"), list) or not candidate["data"]
+            or not (candidate.get("result_file_ids") or candidate.get("result_sediment_ids"))
+            or type(old.get("_sequence")) is not int or type(candidate.get("_sequence")) is not int
+            or old["_sequence"] >= candidate["_sequence"]):
+        return False
+    inputs = []
+    for ref, item in ((member, old), (candidate_member, candidate)):
+        try:
+            saved = store.load_input(item["_input_ref"])
+            payload, mode = saved["payload"], saved["mode"]
+            metadata = _metadata(parent, ref["step_ref"])
+            if (ref.get("owner") != parent["owner"] or item.get("owner_id") != parent["owner"]
+                    or ref.get("request_id") != item.get("id")
+                    or str(saved["identity"]["id"]) != parent["owner"]
+                    or item.get("_product_work_key") != parent["key"] or _source(item) != parent["source"]
+                    or item.get("_product_work") != metadata or payload.get("_product_work") != metadata
+                    or mode not in {"generate", "edit"} or item.get("mode") != mode
+                    or item.get("request_hash") != _request_hash(mode, payload)
+                    or any(not item.get(k) or item[k] != payload.get(k) for k in (
+                        "provider_binding_id", "provider_account_identity", "client_conversation_id", "conversation_id"))):
+                return False
+            inputs.append((mode, {k:v for k,v in payload.items() if k != "_product_work"}))
+        except (KeyError, TypeError, ValueError, OSError):
+            return False
+    return inputs[0] == inputs[1]
+
+
+def _completed_quota_image_tail(store, db, parent, member, root, previous, used_steps, proof, members):
+    """Bridge an observed quota terminal to its one saved fresh-account result."""
+    from services.image_task_service import _request_hash
+    if not _image_product_tail(store, parent, member, root, previous, used_steps, proof,
+                               quota_terminal=True):
+        return None
+    children = [(m, r) for m, r in members if r.get("_completion_of") == root.get("id")]
+    if len(children) != 1:
+        return None
+    child_member, child = children[0]
+    completion = root.get("_completion") or {}
+    if (completion.get("state") not in {"result_ready", "completed"}
+            or completion.get("selected_id") != child.get("id")
+            or not _quota_failover_chain(store, db, parent, root, child, members)):
+        return None
+    try:
+        stored = store.load_input(child["_input_ref"])
+        valid_input = (str(stored["identity"]["id"]) == parent["owner"]
+                       and child.get("request_hash") == _request_hash(stored["mode"], stored["payload"]))
+    except (KeyError, ValueError, TypeError, OSError):
+        return None
+    result_ids = [value for values in (child.get("result_file_ids"), child.get("result_sediment_ids"))
+                  if isinstance(values, list) for value in values]
+    if (not valid_input or not result_ids or not all(isinstance(value, str) and value for value in result_ids)
+            or not all(isinstance(child.get(key), str) and child[key] for key in (
+                "request_message_id", "parent_message_id"))
+            or child["request_message_id"] == child["parent_message_id"]
+            or type(child.get("_sequence")) is not int or child["_sequence"] <= root["_sequence"]
+            or any(child.get(key) for key in ("_send_hold", "_recovery_paused", "_recovery_suppressed",
+                                               "_completion", "recovery_claim_id", "_recovery_claim_id"))):
+        return None
+    return child_member, child
 
 
 def advanced_continuation_required(store, db, receipt):
@@ -1778,7 +1874,7 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
                 member_by_request.setdefault(row.get("request_message_id"), []).append((member, row))
         previous = receipt
         used_steps = {receipt["_product_work"]["step_ref"]}
-        for proof in tail_steps:
+        for proof_index, proof in enumerate(tail_steps):
             found = member_by_request.get(proof["request_message_id"], [])
             if len(found) != 1:
                 return None
@@ -1786,14 +1882,36 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
             tail_valid = (_normal_product_tail(store, db, parent, member, tail, previous, used_steps, now)
                           if member["kind"] == "text" else _image_product_tail(
                               store, parent, member, tail, previous, used_steps, proof))
+            quota_tail = None
+            if not tail_valid and member["kind"] == "image" and proof_index == len(tail_steps) - 1:
+                quota_tail = _completed_quota_image_tail(
+                    store, db, parent, member, tail, previous, used_steps, proof, members)
             if (tail.get("parent_message_id") != proof["final_message_id"]
-                    or not tail_valid
+                    or not (tail_valid or quota_tail)
                     or _unresolved(tail, [row for _, row in members])):
                 return None
             tail_rows.append((member, tail))
             used_steps.add(member["step_ref"])
             previous = tail
+            if quota_tail:
+                tail_rows.append(quota_tail)
+                previous = quota_tail[1]
         archive_member, archive = tail_rows[-1]
+    if tail_rows and archive_member["kind"] == "image":
+        # A saved review is authoritative without another read of the old
+        # text turn (which cannot observe a quota child's new account).
+        observed_ids = {m["request_id"] for m, _ in tail_rows}
+        later = [(member, tail) for member, tail in members
+                 if member["kind"] == "text" and _same_conversation(tail, archive)
+                 and member["request_id"] not in observed_ids
+                 and type(tail.get("_sequence")) is int and tail["_sequence"] > archive["_sequence"]
+                 and (continuation is None or tail.get("request_id") != continuation.get("request_id"))]
+        for member, tail in sorted(later, key=lambda item: item[1].get("_sequence") or 0):
+            if not _normal_product_tail(store, db, parent, member, tail, archive, used_steps, now):
+                return None
+            tail_rows.append((member, tail))
+            used_steps.add(member["step_ref"])
+            archive_member, archive = member, tail
     if not isinstance(archive_member, dict):
         return None
     if continuation is not None:
@@ -1852,9 +1970,15 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
                 and not _claims(other)
                 and not any(other.get(key) for key in controls)
                 and not _unresolved(other, all_receipts))
-        if any(_same_conversation(other, receipt)
+        def safe_unsent_image(kind, owner, request_id, other):
+            member = next((m for m, _ in members if (m["kind"], m["owner"], m["request_id"])
+                           == (kind, owner, request_id)), None)
+            return bool(member and any(_completed_image_replaces_unsent(
+                store, parent, member, other, m, r) for m, r in tail_rows if m["kind"] == "image"))
+        if any(any(_same_conversation(other, linked) for linked in [receipt, *(r for _, r in tail_rows)])
                and (kind, owner, request_id) not in chain_ids
                and not safe_predecessor(kind, owner, request_id, other)
+               and not safe_unsent_image(kind, owner, request_id, other)
                for kind, owner, request_id, other in all_rows):
             return None
     member_refs = {member["request_id"]: member for member, _ in members if member["kind"] == "text"}
@@ -1891,6 +2015,20 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
             "tail_members": [member for member, _ in tail_rows],
             "archive": archive, "archive_member": archive_member,
             "resolved": [*ancestors, original], "advanced_by_own_successor": advanced_by_own_successor}
+
+
+def _advanced_archive_tails(chain, members):
+    """Keep a distinct last proved member for each physical account/session."""
+    ids = {(m["kind"], m["request_id"]) for m in chain.get("tail_members", [])}
+    ids.add(("text", chain["successor"]["request_id"]))
+    targets = {}
+    for member, receipt in members:
+        if (member["kind"], member["request_id"]) in ids:
+            key = receipt["provider_account_identity"], receipt["conversation_id"]
+            previous = targets.get(key)
+            if previous is None or receipt["_sequence"] > previous[1]["_sequence"]:
+                targets[key] = member, receipt
+    return targets
 
 
 def _codex_rejected_retry_chain(store, db, parent, receipt, members):
@@ -2241,6 +2379,10 @@ class ProductWorkService:
             root = by_id.get(original_id)
             if root and _quota_failover_chain(self.store, db, parent, root, child, members):
                 waived.add(original_id)
+        for member, old in members:
+            if member["kind"] == "image" and any(_completed_image_replaces_unsent(
+                    self.store, parent, member, old, cm, child) for cm, child in members if cm["kind"] == "image"):
+                waived.add(member["request_id"])
         from services.text_task_service import TextTaskService
         for member, receipt in members:
             receipt_id = receipt.get("request_id") or receipt.get("id")
@@ -2560,11 +2702,11 @@ class ProductWorkService:
                     identity = (member["kind"], item.get("request_id") or item.get("id"))
                     chain_member_ids.add(identity)
                     advanced_chain_members[identity] = chain
-                canonical = archive["provider_account_identity"], archive["conversation_id"]
-                target = archive_member["kind"], archive_member["request_id"]
-                if canonical in special_targets and special_targets[canonical] != target:
-                    raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
-                special_targets[canonical] = target
+                for canonical, (archive_member, archive) in _advanced_archive_tails(chain, members).items():
+                    target = archive_member["kind"], archive_member["request_id"]
+                    if canonical in special_targets and special_targets[canonical] != target:
+                        raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
+                    special_targets[canonical] = target
             for chain in advanced_session_chains.values():
                 archive_member, archive = chain["archive_member"], chain["archive"]
                 for item in chain["members"]:
@@ -2596,7 +2738,8 @@ class ProductWorkService:
                     if not chain:
                         continue
                     if chain.get("advanced_by_own_successor"):
-                        member, receipt = chain["archive_member"], chain["archive"]
+                        physical = receipt["provider_account_identity"], receipt["conversation_id"]
+                        member, receipt = _advanced_archive_tails(chain, members)[physical]
                     else:
                         member, receipt = members_by_identity[(chain["archive_member"]["kind"],
                                                                chain["archive_member"]["request_id"])]
@@ -2723,10 +2866,9 @@ class ProductWorkService:
                     and (child["kind"], child["last_request_id"]) != (archive_member["kind"], archive_member["request_id"])):
                 raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
         for chain in self._owned_advanced_successor_chains(db, parent, members).values():
-            archive_member, archive = chain["archive_member"], chain["archive"]
-            if (child["target"].get("provider_account_identity") == archive["provider_account_identity"]
-                    and child["target"].get("conversation_id") == archive["conversation_id"]
-                    and (child["kind"], child["last_request_id"]) != (archive_member["kind"], archive_member["request_id"])):
+            physical = child["target"].get("provider_account_identity"), child["target"].get("conversation_id")
+            target = _advanced_archive_tails(chain, members).get(physical)
+            if target and (child["kind"], child["last_request_id"]) != (target[0]["kind"], target[0]["request_id"]):
                 raise WorkLifecycleError("PRODUCT_WORK_ARCHIVE_BINDING_CHANGED")
         receipt = self.store.read_receipt(db, child["kind"], child["owner"], child["last_request_id"])
         if not receipt or any(receipt.get(k) != v for k, v in child["target"].items()):
