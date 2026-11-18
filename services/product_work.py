@@ -1231,7 +1231,6 @@ def _completed_image_replaces_unsent(store, parent, member, old, candidate_membe
     Compare the frozen image input, allowing only the registered attempt step
     to differ. UNKNOWN, pending completion work and foreign history stay held.
     """
-    from services.image_task_service import _request_hash
     completion = old.get("_completion")
     if completion and not (isinstance(completion, dict)
             and completion.get("state") == "needs_attention" and completion.get("next_at") is None
@@ -1258,6 +1257,13 @@ def _completed_image_replaces_unsent(store, parent, member, old, candidate_membe
             or type(old.get("_sequence")) is not int or type(candidate.get("_sequence")) is not int
             or old["_sequence"] >= candidate["_sequence"]):
         return False
+    return _same_frozen_image_attempt_input(store, parent, member, old, candidate_member, candidate)
+
+
+def _same_frozen_image_attempt_input(store, parent, member, old, candidate_member, candidate):
+    """Compare registered image inputs, ignoring only their distinct step refs."""
+    from services.image_task_service import _request_hash
+
     inputs = []
     for ref, item in ((member, old), (candidate_member, candidate)):
         try:
@@ -1278,6 +1284,54 @@ def _completed_image_replaces_unsent(store, parent, member, old, candidate_membe
         except (KeyError, TypeError, ValueError, OSError):
             return False
     return inputs[0] == inputs[1]
+
+
+def _unsent_image_history_before_correction(store, parent, member, old,
+                                           current_member, current, previous, used_steps, now):
+    """An expired, explicitly unsent attempt cannot advance the proven cursor.
+
+    Keep its receipt and stale reservation untouched. Only the identical bound
+    correction may pass it; UNKNOWN, results and live/recovery claims still block.
+    """
+    until = old.get("_claim_until")
+    completion = current.get("_completion")
+    if (not isinstance(completion, dict) or completion.get("state") != "checking_original"
+            or completion.get("bound_retry") is not True or completion.get("same_request_retry") is not True
+            or completion.get("allow_unconfirmed_retry") is not False
+            or type(completion.get("max_extra_requests")) is not int or completion["max_extra_requests"] != 0
+            or completion.get("replacement_id") or completion.get("selected_id")
+            or current.get("status") != "running" or current.get("_executing") is not True
+            or any(current.get(k) for k in ("_completion_of", "data", "result_file_ids",
+                "result_sediment_ids", "_pending_image_result_ids", "_pending_image_output"))):
+        return False
+    for key in ("recovery_lease_until", "_recovery_claim_until"):
+        lease = old.get(key)
+        if lease is not None and (type(lease) not in (int, float)
+                                 or not math.isfinite(lease) or not 0 <= lease <= now):
+            return False
+    if (member.get("kind") != "image" or current_member.get("kind") != "image"
+            or not member.get("step_ref") or member["step_ref"] in used_steps
+            or member["step_ref"] == current_member.get("step_ref")
+            or type(old.get("_sequence")) is not int
+            or not previous.get("_sequence", 0) < old["_sequence"] < current["_sequence"]
+            or old.get("status") != "error" or old.get("error_code") != "RESULT_UNRECOVERABLE"
+            or old.get("upstream_outcome") != "not_submitted"
+            or old.get("_submission_started") is not False
+            or old.get("upstream_submission_started") is not False
+            or old.get("upstream_unfinished") is not False or old.get("_executing") is not False
+            or type(until) not in (int, float) or not math.isfinite(until) or not 0 <= until <= now
+            or old.get("_turn_reserved") is not True
+            or not isinstance(old.get("_claim_id"), str) or not old["_claim_id"].strip()
+            or any(old.get(k) for k in ("recovery_claim_id", "_recovery_claim_id", "_send_hold",
+                "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of",
+                "data", "result_file_ids", "result_sediment_ids", "_pending_image_result_ids",
+                "_pending_image_output"))
+            or current.get("_submission_started") is not False
+            or current.get("upstream_submission_started") is not False
+            or previous.get("parent_message_id") != current.get("parent_message_id")
+            or old.get("parent_message_id") != current.get("parent_message_id")):
+        return False
+    return _same_frozen_image_attempt_input(store, parent, member, old, current_member, current)
 
 
 def _completed_image_history_tail(store, parent, member, old, candidate_member, candidate,
@@ -1478,7 +1532,16 @@ def completed_text_image_continuation(store, db, owner, image, child, now):
         else:
             candidate_index = None
         if candidate_index is None:
-            return False
+            # There may be terminal never-sent attempts after the last saved
+            # review, before this correction. They have no answer to consume
+            # and must all prove the same frozen input/cursor as this request.
+            suffix_steps = [m.get("step_ref") for _, m, _ in later[index:]]
+            return bool(image_members[0]["step_ref"] not in used_steps
+                        and all(isinstance(step, str) and step for step in suffix_steps)
+                        and len(set(suffix_steps)) == len(suffix_steps)
+                        and all(_unsent_image_history_before_correction(
+                            store, parent, m, old, image_members[0], image,
+                            previous, used_steps, now) for _, m, old in later[index:]))
         _, candidate_member, candidate = later[candidate_index]
         for _, retired_member, retired_tail in later[index:candidate_index]:
             used_steps.add(retired_member["step_ref"])
