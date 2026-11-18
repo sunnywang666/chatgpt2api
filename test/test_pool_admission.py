@@ -1853,6 +1853,103 @@ class AdmissionTests(unittest.TestCase):
     def test_resource_read_and_original_claim_do_not_deadlock(self):
         self.assert_capacity_read_does_not_deadlock_claim(self.admission.resource_snapshot)
 
+    def test_slow_resource_history_does_not_block_capacity_claim_or_send(self):
+        self.assert_slow_resource_read_releases_guards("history")
+
+    def test_slow_resource_planner_does_not_block_capacity_claim_or_send(self):
+        self.assert_slow_resource_read_releases_guards("planner")
+
+    def assert_slow_resource_read_releases_guards(self, phase):
+        self.submit("original")
+        before = self.read("text", "happy", "original")
+        # Exercise both shared locks, not just the account-only fixture path.
+        settings_lock = threading.RLock()
+        self.admission._settings_guard = lambda: settings_lock
+        entered, release, writer_done = (threading.Event() for _ in range(3))
+        result, errors = {}, []
+        original_receipts, original_snapshot = self.store.receipts, self.admission._snapshot
+
+        def pause_reader():
+            if threading.current_thread().name == "slow-resource-reader":
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("test did not release resource reader")
+
+        def receipts(db):
+            saved = list(original_receipts(db))
+            if phase == "history":
+                pause_reader()
+            return iter(saved)
+
+        def snapshot(*args, **kwargs):
+            if phase == "planner":
+                pause_reader()
+            return original_snapshot(*args, **kwargs)
+
+        def observe():
+            try:
+                result["snapshot"] = self.admission.resource_snapshot()
+            except BaseException as exc:
+                errors.append(exc)
+
+        def dispatch():
+            try:
+                result["capacity"] = self.admission.observe_product_capacity_limit({})
+                result["context"] = self.admission.claim_next()
+                result["context"].before_send()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                writer_done.set()
+
+        with patch.object(self.store, "receipts", side_effect=receipts), \
+                patch.object(self.admission, "_snapshot", side_effect=snapshot):
+            reader = threading.Thread(target=observe, name="slow-resource-reader")
+            writer = threading.Thread(target=dispatch)
+            reader.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                writer.start()
+                self.assertTrue(writer_done.wait(2), "resource observation blocked dispatch")
+            finally:
+                release.set()
+                reader.join(5)
+                if writer.ident is not None:
+                    writer.join(5)
+        self.assertFalse(reader.is_alive())
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result["context"].request_id, "original")
+        self.assertGreater(result["capacity"], 0)
+        self.assertEqual(result["snapshot"]["chat_turn"]["inflight"], 0)
+        after = self.read("text", "happy", "original")
+        self.assertEqual(after["request_message_id"], before["request_message_id"])
+        fresh = self.admission.resource_snapshot()
+        self.assertEqual(fresh["chat_turn"]["inflight"], 1)
+        self.assertEqual(self.calls, [])
+
+    def test_resource_observation_detaches_nested_account_and_settings_values(self):
+        with self.admission._account_guard():
+            rows = self.admission._rows()
+        settings = {**self.admission._settings(), "chat_account_concurrency": 1}
+        original_snapshot = self.admission._snapshot
+
+        def changed_while_planning(*args, **kwargs):
+            rows[0]["limits_progress"][0]["remaining"] = 0
+            settings["chat_account_concurrency"] = 6
+            return original_snapshot(*args, **kwargs)
+
+        with patch.object(self.admission, "_rows", return_value=rows), \
+                patch.object(self.admission, "_settings", return_value=settings):
+            before = self.admission.resource_snapshot()
+            with patch.object(self.admission, "_snapshot", side_effect=changed_while_planning):
+                during = self.admission.resource_snapshot()
+            after = self.admission.resource_snapshot()
+        self.assertEqual(during, before)
+        self.assertEqual(after["settings"]["chat_account_concurrency"], 6)
+        self.assertEqual(after["image"]["slots_total"], 0)
+        self.assertGreater(before["image"]["slots_total"], 0)
+
     def test_model_resource_read_and_original_claim_do_not_deadlock(self):
         self.assert_capacity_read_does_not_deadlock_claim(lambda: self.admission.model_resources([]))
 
