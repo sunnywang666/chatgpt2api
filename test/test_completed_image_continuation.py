@@ -322,3 +322,122 @@ def test_multiple_retired_unsent_attempts_are_history_but_unknown_is_not(product
         h.service.store.write_receipt(db,'image','owner','another-unsent',clone)
     review=add_completed_tail(h,'review',previous_image=image,expect_claim=not ambiguous)
     assert review['_submission_started'] is (not ambiguous)
+
+
+def correction_with_unsent_suffix(h, monkeypatch):
+    original, _, context = queued_image_correction_after_reviews(h, monkeypatch)
+    with h.service.store.transaction() as db:
+        current = h.service.store.read_receipt(db, 'image', 'owner', context.request_id)
+        parent = h.service.store.runtime(db, current['_product_work_key'])
+        old_rows = []
+        for i in range(2):
+            old = deepcopy(current)
+            stored = h.service.store.load_input(current['_input_ref'])
+            name = f'unsent-correction-{i}'
+            stored['payload']['_product_work']['step_ref'] = name
+            old.update(id=name, status='error', error_code='RESULT_UNRECOVERABLE',
+                upstream_outcome='not_submitted', upstream_unfinished=False,
+                _submission_started=False, upstream_submission_started=False,
+                _executing=False, _turn_reserved=True, _claim_id=f'expired-{i}',
+                _claim_until=h.clock()-1, _completion=None,
+                _sequence=current['_sequence'] if i == 0 else h.service.store.next_sequence(db),
+                _product_work=stored['payload']['_product_work'], request_message_id=f'unsent-user-{i}',
+                _input_ref=h.service.store.save_input(stored),
+                request_hash=_request_hash(stored['mode'], stored['payload']))
+            parent['members'].append({'kind':'image','owner':'owner','request_id':name,'step_ref':name})
+            h.service.store.write_receipt(db, 'image', 'owner', name, old)
+            old_rows.append(old)
+        current['_sequence'] = h.service.store.next_sequence(db)
+        current['upstream_submission_started'] = False
+        current['_completion'] = {'state':'checking_original','bound_retry':True,
+            'same_request_retry':True,'max_extra_requests':0,'allow_unconfirmed_retry':False}
+        h.service.store.write_receipt(db, 'image', 'owner', current['id'], current)
+        h.service.store.set_runtime(db, parent['key'], parent)
+    return original, old_rows, context
+
+
+def test_bound_correction_passes_identical_unsent_suffix_without_rewriting_history(product_no_final, monkeypatch):
+    h = product_no_final
+    original, old_rows, context = correction_with_unsent_suffix(h, monkeypatch)
+    context.before_send_with_marker()
+    assert image_row(h, context.request_id)['_submission_started'] is True
+    assert row(h.service) == original
+    assert [image_row(h, old['id']) for old in old_rows] == old_rows
+    with pytest.raises(AdmissionLost):
+        context.before_send_with_marker()
+    stages = image_row(h, context.request_id).get('_execution_timeline', [])
+    assert sum(event.get('stage') == 'send_call_started' for event in stages) == 1
+
+
+@pytest.mark.parametrize('drift', [
+    'unknown', 'sent', 'unfinished', 'live_claim', 'invalid_claim', 'missing_claim',
+    'executing', 'recovery_claim', 'held', 'paused', 'result', 'pending_output',
+    'completion', 'hash', 'input', 'cursor', 'foreign', 'duplicate_step',
+    'not_reserved', 'invalid_claim_id', 'recovery_lease', 'recovery_lease_invalid',
+])
+def test_unsent_suffix_requires_exact_retired_input_and_preserves_guards(product_no_final, monkeypatch, drift):
+    h = product_no_final
+    original, old_rows, context = correction_with_unsent_suffix(h, monkeypatch)
+    with h.service.store.transaction() as db:
+        old = h.service.store.read_receipt(db, 'image', 'owner', old_rows[0]['id'])
+        if drift == 'unknown': old['upstream_outcome'] = 'unknown'
+        elif drift == 'sent': old['upstream_submission_started'] = True
+        elif drift == 'unfinished': old['upstream_unfinished'] = True
+        elif drift == 'live_claim': old['_claim_until'] = h.clock()+60
+        elif drift == 'invalid_claim': old['_claim_until'] = 'expired'
+        elif drift == 'missing_claim': old['_claim_id'] = None
+        elif drift == 'not_reserved': old['_turn_reserved'] = False
+        elif drift == 'invalid_claim_id': old['_claim_id'] = 42
+        elif drift == 'recovery_lease': old['recovery_lease_until'] = h.clock()+60
+        elif drift == 'recovery_lease_invalid': old['_recovery_claim_until'] = 'unknown'
+        elif drift == 'executing': old['_executing'] = True
+        elif drift == 'recovery_claim': old['recovery_claim_id'] = 'active-recovery'
+        elif drift == 'held': old['_send_hold'] = True
+        elif drift == 'paused': old['_recovery_paused'] = True
+        elif drift == 'result': old['result_file_ids'] = ['saved-result']
+        elif drift == 'pending_output': old['_pending_image_output'] = {'output_ref':'saved-output'}
+        elif drift == 'completion': old['_completion'] = {'state':'checking_original'}
+        elif drift == 'hash': old['request_hash'] = 'changed'
+        elif drift == 'input':
+            stored = h.service.store.load_input(old['_input_ref'])
+            stored['payload']['prompt'] += ' changed'
+            old.update(_input_ref=h.service.store.save_input(stored),
+                       request_hash=_request_hash(stored['mode'], stored['payload']))
+        elif drift == 'cursor': old['parent_message_id'] = 'different-parent'
+        elif drift == 'foreign': old['_product_work_key'] = 'other-product'
+        elif drift == 'duplicate_step':
+            parent = h.service.store.runtime(db, old['_product_work_key'])
+            member = next(m for m in parent['members'] if m['request_id'] == old['id'])
+            parent['members'].append(deepcopy(member))
+            h.service.store.set_runtime(db, parent['key'], parent)
+        h.service.store.write_receipt(db, 'image', 'owner', old['id'], old)
+    with pytest.raises(AdmissionLost):
+        context.before_send_with_marker()
+    assert image_row(h, context.request_id)['_submission_started'] is False
+    assert row(h.service) == original
+
+
+@pytest.mark.parametrize('drift', ['missing', 'state', 'bound', 'same_request', 'unconfirmed',
+    'extra', 'selected', 'replacement', 'completion_of', 'result', 'pending'])
+def test_unsent_suffix_only_allows_current_bound_same_request_retry(product_no_final, monkeypatch, drift):
+    h = product_no_final
+    original, _, context = correction_with_unsent_suffix(h, monkeypatch)
+    with h.service.store.transaction() as db:
+        current = h.service.store.read_receipt(db, 'image', 'owner', context.request_id)
+        marker = current['_completion']
+        if drift == 'missing': current.pop('_completion')
+        elif drift == 'state': marker['state'] = 'result_ready'
+        elif drift == 'bound': marker['bound_retry'] = False
+        elif drift == 'same_request': marker['same_request_retry'] = False
+        elif drift == 'unconfirmed': marker['allow_unconfirmed_retry'] = True
+        elif drift == 'extra': marker['max_extra_requests'] = 1
+        elif drift == 'selected': marker['selected_id'] = 'another-task'
+        elif drift == 'replacement': marker['replacement_id'] = 'another-task'
+        elif drift == 'completion_of': current['_completion_of'] = 'another-task'
+        elif drift == 'result': current['result_file_ids'] = ['saved-result']
+        elif drift == 'pending': current['_pending_image_output'] = {'output_ref':'pending'}
+        h.service.store.write_receipt(db, 'image', 'owner', current['id'], current)
+    with pytest.raises(AdmissionLost):
+        context.before_send_with_marker()
+    assert image_row(h, context.request_id)['_submission_started'] is False
+    assert row(h.service) == original
