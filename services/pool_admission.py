@@ -2464,12 +2464,15 @@ class PoolAdmission:
         Session counts are intentionally absent from execution capacity.
         """
         now = float(self.clock())
-        # Match claim/send lock order: a read holding the account lock must
-        # never wait for settings while admission holds settings for accounts.
-        with self._settings_guard(), self.store.connect() as db, self._account_guard():
-            rows = self._rows()
+        # Freeze nested account/config values in the same order as admission,
+        # then release both locks before reading history or running the planner.
+        # This is an observation, not authority to claim or send; those paths
+        # still revalidate current state in their own transactions.
+        with self._settings_guard(), self._account_guard():
+            rows = copy.deepcopy(self._rows())
+            settings = copy.deepcopy(self._settings())
+        with self.store.connect() as db:
             receipts = list(self.store.receipts(db))
-            settings = self._settings()
             workflow_state = workflow_scheduling.state_snapshot(self.store, db)
             product_state = product_work.state_snapshot(self.store, db)
             snapshot = self._snapshot(rows, receipts, settings, {}, now, {}, workflow_state, product_state, db=db)
