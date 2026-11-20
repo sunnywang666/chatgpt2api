@@ -1182,7 +1182,8 @@ def _normal_product_tail(store, db, parent, member, tail, previous, used_steps, 
             and not _claims(tail) and not tail.get("_executing") and not tail.get("_turn_reserved"))
 
 
-def _image_product_tail(store, parent, member, tail, previous, used_steps, proof, *, quota_terminal=False):
+def _image_product_tail(store, parent, member, tail, previous, used_steps, proof, *, quota_terminal=False,
+                        selected_completion=False):
     """Validate one saved image tail observed by the original-reader proof."""
     from services.image_task_service import _request_hash
     try:
@@ -1221,7 +1222,7 @@ def _image_product_tail(store, parent, member, tail, previous, used_steps, proof
         and not _claims(tail) and not tail.get("_executing") and not tail.get("_turn_reserved")
         and not any(tail.get(key) for key in ("_recovery_paused", "_recovery_suppressed",
                                                "_completion_of"))
-        and (quota_terminal or not tail.get("_completion"))
+        and (quota_terminal or selected_completion or not tail.get("_completion"))
     )
 
 
@@ -1373,6 +1374,163 @@ def _normal_image_history_tail(store, parent, member, tail, previous, used_steps
             or proof["request_message_id"] == proof["final_message_id"]):
         return False
     return _image_product_tail(store, parent, member, tail, previous, used_steps, proof)
+
+
+def _saved_bound_image_correction_tail(store, parent, member, tail, previous, used_steps, now):
+    """Recognize one saved, self-selected bound retry as a finished image tail.
+
+    This is narrower than a general completion result: the already-saved image
+    selected itself after its one same-request bound retry.  It cannot select a
+    replacement, schedule another request, or carry live recovery controls.
+    """
+    completion = tail.get("_completion")
+    allowed = {"state", "started_at", "allow_unconfirmed_retry", "max_extra_requests", "next_at",
+               "bound_retry", "same_request_retry", "selected_id", "selected_at"}
+    request_id = tail.get("request_id") or tail.get("id")
+    if (not isinstance(completion, dict) or set(completion) - allowed
+            or completion.get("state") != "result_ready"
+            or completion.get("bound_retry") is not True or completion.get("same_request_retry") is not True
+            or completion.get("allow_unconfirmed_retry") is not False
+            or type(completion.get("max_extra_requests")) is not int
+            or completion["max_extra_requests"] != 0 or completion.get("next_at") is not None
+            or completion.get("selected_id") != request_id
+            or any(type(completion.get(key)) not in {int, float}
+                   or not math.isfinite(completion[key]) or completion[key] <= 0
+                   for key in ("started_at", "selected_at"))
+            or completion["started_at"] > completion["selected_at"]
+            or completion["selected_at"] > now
+            or tail.get("_completion_of") or tail.get("upstream_submission_started") is not True
+            or tail.get("binding_status") != "bound"
+            or tail.get("parent_message_id") == previous.get("parent_message_id")
+            or any(tail.get(key) for key in ("_send_hold", "_recovery_paused", "_recovery_suppressed"))):
+        return False
+    try:
+        stored = store.load_input(tail["_input_ref"])
+        if (stored["mode"] != tail.get("mode")
+                or str(stored["identity"]["id"]) != parent.get("owner")):
+            return False
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    proof = {"request_message_id": tail.get("request_message_id"),
+             "final_message_id": tail.get("parent_message_id")}
+    if (not all(isinstance(value, str) and value for value in proof.values())
+            or proof["request_message_id"] == proof["final_message_id"]):
+        return False
+    return _image_product_tail(store, parent, member, tail, previous, used_steps, proof,
+                               selected_completion=True)
+
+
+def _expired_unsent_image_before_saved_correction(store, parent, member, old,
+                                                   candidate_member, candidate, previous,
+                                                   used_steps, now):
+    """Allow only a proved never-sent image attempt before its saved correction."""
+    from services.task_store import _SEND_EVIDENCE_STAGES
+
+    until = old.get("_claim_until")
+    timeline = old.get("_execution_timeline")
+    if (member.get("kind") != "image" or candidate_member.get("kind") != "image"
+            or not member.get("step_ref") or member["step_ref"] in used_steps
+            or member["step_ref"] == candidate_member.get("step_ref")
+            or type(old.get("_sequence")) is not int
+            or not previous.get("_sequence", 0) < old["_sequence"] < candidate.get("_sequence", 0)
+            or old.get("status") != "error" or old.get("error_code") != "RESULT_UNRECOVERABLE"
+            or old.get("upstream_outcome") != "not_submitted"
+            or old.get("_submission_started") is not False
+            or old.get("upstream_submission_started") is not False
+            or old.get("upstream_unfinished") is not False or old.get("_executing") is not False
+            or old.get("recovery_retryable") is not True
+            or old.get("_turn_reserved") is not True
+            or old.get("parent_message_id") != previous.get("parent_message_id")
+            or not isinstance(old.get("_claim_id"), str) or not old["_claim_id"].strip()
+            or type(until) not in {int, float} or not math.isfinite(until) or not 0 <= until <= now
+            or old.get("binding_status") != "bound"
+            or old.get("_last_sent_sequence") is not None
+            or (old.get("send_count") is not None
+                and (type(old["send_count"]) is not int or old["send_count"] != 0))
+            or (timeline is not None and (not isinstance(timeline, list)
+                # Finishing a local, explicitly unsent failure is not a send.
+                # Unknown/successful finishes or any output remain barriers.
+                or any(not isinstance(item, dict) or (
+                    item.get("stage") in _SEND_EVIDENCE_STAGES and not (
+                        item.get("stage") == "task_finished"
+                        and item.get("task_status") in {"failed", "error"}
+                        and (item.get("image_count") is None
+                             or type(item["image_count"]) is int and item["image_count"] == 0)))
+                       for item in timeline)))
+            or any(old.get(key) for key in ("recovery_claim_id", "_recovery_claim_id", "_send_hold",
+                "_recovery_paused", "_recovery_suppressed", "_completion", "_completion_of", "data",
+                "result_file_ids", "result_sediment_ids", "_pending_image_result_ids",
+                "_pending_image_output"))):
+        return False
+    for key in ("recovery_lease_until", "_recovery_claim_until"):
+        lease = old.get(key)
+        if lease is not None and (type(lease) not in {int, float}
+                                  or not math.isfinite(lease) or not 0 <= lease <= now):
+            return False
+    return _same_frozen_image_attempt_input(store, parent, member, old, candidate_member, candidate)
+
+
+def _advanced_image_tail_rows(store, db, parent, later, previous, used_steps, now):
+    """Extend an observed image tail using only completed local ProductWork history."""
+    rows, retired = [], []
+    index = 0
+    while index < len(later):
+        _, member, tail = later[index]
+        if member.get("kind") == "text":
+            if not _normal_product_tail(store, db, parent, member, tail, previous, used_steps, now):
+                return None
+            rows.append((member, tail))
+            used_steps.add(member["step_ref"])
+            previous = tail
+            index += 1
+            continue
+        if member.get("kind") == "image" and _normal_image_history_tail(
+                store, parent, member, tail, previous, used_steps):
+            rows.append((member, tail))
+            used_steps.add(member["step_ref"])
+            previous = tail
+            index += 1
+            continue
+        if member.get("kind") == "image" and _saved_bound_image_correction_tail(
+                store, parent, member, tail, previous, used_steps, now):
+            rows.append((member, tail))
+            used_steps.add(member["step_ref"])
+            previous = tail
+            index += 1
+            continue
+        candidate_index = None
+        for candidate_index in range(index + 1, len(later)):
+            _, candidate_member, candidate = later[candidate_index]
+            retired_rows = later[index:candidate_index]
+            if (candidate_member.get("kind") != "image"
+                    or any(retired_member.get("kind") != "image"
+                           for _, retired_member, _ in retired_rows)):
+                candidate_index = None
+                break
+            steps = [retired_member.get("step_ref") for _, retired_member, _ in retired_rows]
+            if (any(not isinstance(step, str) or not step for step in steps)
+                    or len(set(steps)) != len(steps)
+                    or candidate_member.get("step_ref") in steps
+                    or not _saved_bound_image_correction_tail(
+                        store, parent, candidate_member, candidate, previous, used_steps, now)
+                    or not all(_expired_unsent_image_before_saved_correction(
+                        store, parent, retired_member, retired_tail, candidate_member, candidate,
+                        previous, used_steps, now) for _, retired_member, retired_tail in retired_rows)):
+                candidate_index = None
+                continue
+            break
+        if candidate_index is None:
+            return None
+        for _, retired_member, retired_tail in later[index:candidate_index]:
+            rows.append((retired_member, retired_tail))
+            retired.append(retired_tail)
+            used_steps.add(retired_member["step_ref"])
+        _, candidate_member, candidate = later[candidate_index]
+        rows.append((candidate_member, candidate))
+        used_steps.add(candidate_member["step_ref"])
+        previous = candidate
+        index = candidate_index + 1
+    return rows, retired
 
 
 def _completed_quota_image_tail(store, db, parent, member, root, previous, used_steps, proof, members):
@@ -2011,6 +2169,7 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
         if descendants:
             return None
     tail_rows = []
+    retired_image_rows = []
     archive_member = next((member for member, row in members
                            if member["kind"] == "text" and row.get("request_id") == successor_id), None)
     archive = receipt
@@ -2053,16 +2212,20 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
         # text turn (which cannot observe a quota child's new account).
         observed_ids = {m["request_id"] for m, _ in tail_rows}
         later = [(member, tail) for member, tail in members
-                 if member["kind"] == "text" and _same_conversation(tail, archive)
+                 if member["kind"] in {"text", "image"} and _same_conversation(tail, archive)
                  and member["request_id"] not in observed_ids
                  and type(tail.get("_sequence")) is int and tail["_sequence"] > archive["_sequence"]
                  and (continuation is None or tail.get("request_id") != continuation.get("request_id"))]
-        for member, tail in sorted(later, key=lambda item: item[1].get("_sequence") or 0):
-            if not _normal_product_tail(store, db, parent, member, tail, archive, used_steps, now):
-                return None
-            tail_rows.append((member, tail))
-            used_steps.add(member["step_ref"])
-            archive_member, archive = member, tail
+        extended = _advanced_image_tail_rows(
+            store, db, parent, sorted(
+                ((tail.get("_sequence") or 0, member, tail) for member, tail in later),
+                key=lambda item: item[0]), archive, used_steps, now)
+        if extended is None:
+            return None
+        added, retired_image_rows = extended
+        tail_rows.extend(added)
+        if added:
+            archive_member, archive = added[-1]
     if not isinstance(archive_member, dict):
         return None
     if continuation is not None:
@@ -2165,7 +2328,8 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
     return {"original": original, "successor": receipt, "tail": [row for _, row in tail_rows],
             "tail_members": [member for member, _ in tail_rows],
             "archive": archive, "archive_member": archive_member,
-            "resolved": [*ancestors, original], "advanced_by_own_successor": advanced_by_own_successor}
+            "resolved": [*ancestors, original, *retired_image_rows],
+            "advanced_by_own_successor": advanced_by_own_successor}
 
 
 def _advanced_archive_tails(chain, members):
@@ -2367,7 +2531,8 @@ class ProductWorkService:
         for _, receipt in members:
             chain = _no_final_successor_chain(self.store, db, parent, receipt, members, now)
             if chain:
-                waived.update(item["request_id"] for item in chain["resolved"])
+                waived.update(item.get("request_id") or item.get("id") for item in chain["resolved"]
+                              if isinstance(item.get("request_id") or item.get("id"), str))
         return waived
 
     def _unsent_retry_waivers(self, db, parent, members):
@@ -2499,7 +2664,8 @@ class ProductWorkService:
             if receipt.get(_CANCELLED_UNSENT_STEP) and not _cancelled_unsent_step(
                     self.store, db, parent, member, receipt):
                 return False
-        return not any(_blocked(receipt, members=members) and receipt.get("request_id") not in waived
+        return not any(_blocked(receipt, members=members)
+                       and (receipt.get("request_id") or receipt.get("id")) not in waived
                        for receipt in members)
 
     def _reasons(self, db, parent, members, outcome=None):

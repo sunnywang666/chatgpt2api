@@ -10,6 +10,7 @@ from services.image_task_service import ImageTaskService
 from services.image_task_service import _request_hash
 from services.image_quota_successor import prepared_payload
 from services.request_context import AdmissionLost
+from services.work_lifecycle import WorkLifecycleError
 from services.pool_admission import ExecutionContext
 from test.test_no_final_successor import product_no_final, product_lifecycle
 from test.test_product_compact_successor import (advanced_to_own_successor,
@@ -327,6 +328,13 @@ def test_multiple_retired_unsent_attempts_are_history_but_unknown_is_not(product
 def correction_with_unsent_suffix(h, monkeypatch):
     original, _, context = queued_image_correction_after_reviews(h, monkeypatch)
     with h.service.store.transaction() as db:
+        # The ordinary runner fixture leaves this durable submission cursor as
+        # ``None``. Real sent receipts retain their frozen request parent, and
+        # the continuation validator deliberately requires that exact value.
+        for request_id in ('review', 'review-2'):
+            review = h.service.store.read_receipt(db, 'text', 'owner', request_id)
+            review['_submission_parent_message_id'] = review['request_parent_message_id']
+            h.service.store.write_receipt(db, 'text', 'owner', request_id, review)
         current = h.service.store.read_receipt(db, 'image', 'owner', context.request_id)
         parent = h.service.store.runtime(db, current['_product_work_key'])
         old_rows = []
@@ -338,7 +346,11 @@ def correction_with_unsent_suffix(h, monkeypatch):
             old.update(id=name, status='error', error_code='RESULT_UNRECOVERABLE',
                 upstream_outcome='not_submitted', upstream_unfinished=False,
                 _submission_started=False, upstream_submission_started=False,
-                _executing=False, _turn_reserved=True, _claim_id=f'expired-{i}',
+                recovery_retryable=True,
+                binding_status='bound', _executing=False, _turn_reserved=True, _claim_id=f'expired-{i}',
+                # A local failure finishes even when no upstream send happened.
+                _execution_timeline=[{'stage': 'task_finished', 'task_status': 'failed',
+                                      'image_count': None, 'at': h.clock()-1}],
                 _claim_until=h.clock()-1, _completion=None,
                 _sequence=current['_sequence'] if i == 0 else h.service.store.next_sequence(db),
                 _product_work=stored['payload']['_product_work'], request_message_id=f'unsent-user-{i}',
@@ -354,6 +366,174 @@ def correction_with_unsent_suffix(h, monkeypatch):
         h.service.store.write_receipt(db, 'image', 'owner', current['id'], current)
         h.service.store.set_runtime(db, parent['key'], parent)
     return original, old_rows, context
+
+
+def save_bound_correction(h, context):
+    """Persist the already-admitted same-request correction as its result."""
+    with h.service.store.transaction() as db:
+        correction = h.service.store.read_receipt(db, 'image', 'owner', context.request_id)
+        correction.update(status='success', upstream_outcome='generated', upstream_unfinished=False,
+                          upstream_submission_started=True,
+                          binding_status='bound', _executing=False, _turn_reserved=False,
+                          request_message_id='saved-correction-user',
+                          parent_message_id='saved-correction-final',
+                          _claim_until=h.clock() - 1,
+                          data=[{'b64_json': 'AA=='}], result_file_ids=['saved-correction'],
+                          result_sediment_ids=[])
+        correction['_completion'] = {
+            'state': 'result_ready', 'started_at': h.clock() - 1,
+            'allow_unconfirmed_retry': False, 'max_extra_requests': 0,
+            'next_at': None, 'bound_retry': True, 'same_request_retry': True,
+            'selected_id': correction['id'], 'selected_at': h.clock(),
+        }
+        h.service.store.write_receipt(db, 'image', 'owner', context.request_id, correction)
+    return image_row(h, context.request_id)
+
+
+@pytest.mark.parametrize('send_count', ['absent', None, 0])
+def test_saved_bound_correction_allows_review_then_close_and_archive(product_no_final, monkeypatch, send_count):
+    """A saved correction, not the UNKNOWN root, is the next review's parent."""
+    h = product_no_final
+    original, retired, context = correction_with_unsent_suffix(h, monkeypatch)
+    if send_count != 'absent':
+        with h.service.store.transaction() as db:
+            for item in retired:
+                item['send_count'] = send_count
+                h.service.store.write_receipt(db, 'image', 'owner', item['id'], item)
+    context.before_send_with_marker()
+    correction = save_bound_correction(h, context)
+    settings = h.admission.settings
+    h.admission.settings = lambda: {**settings(), 'codex_max_concurrency': 0}
+
+    product, lifecycle, calls, identity = product_lifecycle(h)
+    identity['_trusted_source'] = original['_source']
+    def close_while_review_is_queued():
+        with pytest.raises(WorkLifecycleError, match='PRODUCT_WORK_'):
+            product.close(identity, 'fixture-product', results_saved=True)
+
+    review = add_completed_tail(h, 'review-after-saved-correction', previous_image=correction,
+                                before_claim=close_while_review_is_queued)
+    assert review['status'] == 'succeeded'
+
+    lifecycle.images.archive_product_work = lambda owner, rid, archived: (
+        calls.append((owner, rid, archived)) or {
+            'request_id': rid, 'conversation_id': image_row(h, rid)['conversation_id'], 'archived': archived})
+    assert product.close(identity, 'fixture-product', results_saved=True)['state'] == 'closing'
+    assert lifecycle.process_one()
+    assert product.get(identity, 'fixture-product')['state'] == 'completed'
+    assert calls == [('owner', review['request_id'], True)]
+    assert row(h.service) == original
+    assert all(image_row(h, item['id']) == item for item in retired)
+    restarted = product.__class__(h.service, lifecycle.images, clock=h.clock)
+    assert restarted.get(identity, 'fixture-product')['state'] == 'completed'
+
+
+@pytest.mark.parametrize('drift', [
+    'old_receipt_cursor', 'saved_input_identity', 'saved_input_mode',
+    'saved_selected_other', 'saved_checking_original', 'saved_extra_request',
+    'saved_unconfirmed_retry', 'old_live_claim', 'old_unknown', 'old_result',
+    'old_recovery_retryable', 'old_recovery_claim', 'old_hold', 'old_paused', 'old_last_sent_sequence',
+    'old_send_count', 'old_send_timeline', 'old_artifact_timeline',
+    'old_finished_success', 'old_finished_image', 'foreign_same_conversation',
+])
+def test_saved_bound_correction_rejects_changed_history_or_input(product_no_final, monkeypatch, drift):
+    h = product_no_final
+    original, retired, context = correction_with_unsent_suffix(h, monkeypatch)
+    context.before_send_with_marker()
+    correction = save_bound_correction(h, context)
+    with h.service.store.transaction() as db:
+        if drift == 'old_receipt_cursor':
+            old = h.service.store.read_receipt(db, 'image', 'owner', retired[0]['id'])
+            old['parent_message_id'] = 'changed-retired-cursor'
+            h.service.store.write_receipt(db, 'image', 'owner', old['id'], old)
+        elif drift in {'saved_input_identity', 'saved_input_mode'}:
+            stored = h.service.store.load_input(correction['_input_ref'])
+            if drift == 'saved_input_identity':
+                stored['identity']['id'] = 'other-owner'
+            else:
+                stored['mode'] = 'edit' if correction['mode'] == 'generate' else 'generate'
+            correction['_input_ref'] = h.service.store.save_input(stored)
+            h.service.store.write_receipt(db, 'image', 'owner', correction['id'], correction)
+        elif drift == 'saved_selected_other':
+            correction['_completion']['selected_id'] = 'other-image'
+            h.service.store.write_receipt(db, 'image', 'owner', correction['id'], correction)
+        elif drift == 'saved_checking_original':
+            correction['_completion']['state'] = 'checking_original'
+            h.service.store.write_receipt(db, 'image', 'owner', correction['id'], correction)
+        elif drift == 'saved_extra_request':
+            correction['_completion']['max_extra_requests'] = 1
+            h.service.store.write_receipt(db, 'image', 'owner', correction['id'], correction)
+        elif drift == 'saved_unconfirmed_retry':
+            correction['_completion']['allow_unconfirmed_retry'] = True
+            h.service.store.write_receipt(db, 'image', 'owner', correction['id'], correction)
+        elif drift == 'foreign_same_conversation':
+            h.service.store.write_receipt(db, 'image', 'foreign-owner', 'foreign-same-conversation', {
+                **correction, 'id': 'foreign-same-conversation', 'owner_id': 'foreign-owner',
+                '_product_work_key': 'foreign-product',
+                '_product_work': {'product_ref': 'foreign', 'step_ref': 'foreign'},
+            })
+        else:
+            old = h.service.store.read_receipt(db, 'image', 'owner', retired[0]['id'])
+            if drift == 'old_live_claim':
+                old['_claim_until'] = h.clock() + 60
+            elif drift == 'old_unknown':
+                old.update(status='unknown', upstream_outcome='unknown', upstream_submission_started=True)
+            elif drift == 'old_result':
+                old['result_file_ids'] = ['unexpected-image-result']
+            elif drift == 'old_recovery_retryable':
+                old['recovery_retryable'] = False
+            elif drift == 'old_recovery_claim':
+                old['recovery_claim_id'] = 'active-recovery'
+            elif drift == 'old_hold':
+                old['_send_hold'] = True
+            elif drift == 'old_paused':
+                old['_recovery_paused'] = True
+            elif drift == 'old_last_sent_sequence':
+                old['_last_sent_sequence'] = 0
+            elif drift == 'old_send_count':
+                old['send_count'] = 1
+            elif drift == 'old_artifact_timeline':
+                old['_execution_timeline'] = [{'stage': 'artifact_saved', 'at': h.clock() - 1}]
+            elif drift == 'old_finished_success':
+                old['_execution_timeline'][0]['task_status'] = 'succeeded'
+            elif drift == 'old_finished_image':
+                old['_execution_timeline'][0]['image_count'] = 1
+            else:
+                old['_execution_timeline'] = [{'stage': 'send_call_started', 'at': h.clock() - 1}]
+            h.service.store.write_receipt(db, 'image', 'owner', old['id'], old)
+    settings = h.admission.settings
+    h.admission.settings = lambda: {**settings(), 'codex_max_concurrency': 0}
+    if drift == 'foreign_same_conversation':
+        with pytest.raises(WorkLifecycleError, match='PRODUCT_WORK_CONVERSATION_CONFLICT'):
+            add_completed_tail(h, 'blocked-review-' + drift, previous_image=correction,
+                               expect_claim=False)
+        assert row(h.service) == original
+        return
+    review = add_completed_tail(h, 'blocked-review-' + drift, previous_image=correction,
+                                expect_claim=False)
+    assert review['_submission_started'] is False
+    assert row(h.service) == original
+
+
+def test_saved_bound_correction_revalidates_before_send(product_no_final, monkeypatch):
+    h = product_no_final
+    original, _retired, context = correction_with_unsent_suffix(h, monkeypatch)
+    context.before_send_with_marker()
+    correction = save_bound_correction(h, context)
+    settings = h.admission.settings
+    h.admission.settings = lambda: {**settings(), 'codex_max_concurrency': 0}
+
+    def drift_after_claim():
+        with h.service.store.transaction() as db:
+            saved = h.service.store.read_receipt(db, 'image', 'owner', correction['id'])
+            saved['_completion']['selected_id'] = 'a-different-image'
+            h.service.store.write_receipt(db, 'image', 'owner', saved['id'], saved)
+
+    review = add_completed_tail(h, 'blocked-after-claim', previous_image=correction,
+                                before_send=drift_after_claim, expect_sent=False)
+    assert review['_submission_started'] is False
+    assert not any(sent.get('client_request_id') == 'blocked-after-claim' for sent in h.sent)
+    assert row(h.service) == original
 
 
 def test_bound_correction_passes_identical_unsent_suffix_without_rewriting_history(product_no_final, monkeypatch):

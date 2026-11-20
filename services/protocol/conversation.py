@@ -487,6 +487,39 @@ def _validate_image_download_count(items, file_ids, sediment_ids):
         raise ValueError("original image downloads are incomplete")
 
 
+def _nonthread_bound_image_stage_started(request: ConversationRequest) -> float | None:
+    try:
+        if (not request._defer_image_publication
+                or bool(getattr(request.progress_callback, "image_thread", None))):
+            return None
+        return time.monotonic()
+    except Exception:
+        return None
+
+
+def _observe_nonthread_bound_image_stage(request: ConversationRequest, stage: str,
+                                          started: float | None, outcome: str) -> None:
+    """Best-effort local boundary timing; it must never alter image handling."""
+    try:
+        if started is None or not request._defer_image_publication:
+            return
+        callback = request.progress_callback
+        if bool(getattr(callback, "image_thread", None)):
+            return
+        entry = {
+            "event": "bound_image_post_download_stage",
+            "stage": stage,
+            "duration_ms": int(max(0.0, time.monotonic() - started) * 1000),
+            "outcome": outcome,
+        }
+        request_message_id = str(getattr(callback, "request_message_id", "") or "").strip()
+        if request_message_id:
+            entry["request_message_id"] = request_message_id
+        logger.info(entry)
+    except Exception:
+        pass
+
+
 def _downloaded_image_output(request, items, *, conversation_id, request_message_id,
                              file_ids, sediment_ids, index, total):
     output = ImageOutput(kind="result", model=request.model, index=index, total=total,
@@ -494,9 +527,17 @@ def _downloaded_image_output(request, items, *, conversation_id, request_message
     if request._defer_image_publication:
         callback = getattr(request.progress_callback, "record_downloaded_image_items", None)
         if callable(callback):
-            callback({"conversation_id": conversation_id, "request_message_id": request_message_id,
-                      "file_ids": list(dict.fromkeys(file_ids)),
-                      "sediment_ids": list(dict.fromkeys(sediment_ids))}, items)
+            started = _nonthread_bound_image_stage_started(request)
+            try:
+                callback({"conversation_id": conversation_id, "request_message_id": request_message_id,
+                          "file_ids": list(dict.fromkeys(file_ids)),
+                          "sediment_ids": list(dict.fromkeys(sediment_ids))}, items)
+            except Exception:
+                _observe_nonthread_bound_image_stage(
+                    request, "record_downloaded_image_items", started, "error")
+                raise
+            _observe_nonthread_bound_image_stage(
+                request, "record_downloaded_image_items", started, "success")
         _validate_image_download_count(items, file_ids, sediment_ids)
         # Bound generation collects this internally and verifies the exact turn
         # before formatting it. Neither to_chunk nor collection exposes this field.
@@ -1802,11 +1843,27 @@ def _generate_bound_single_image(
                             predecessor_result_ids=getattr(request.progress_callback, "image_thread_predecessor_result_ids", None))
                     _observe_image_terminal()
                 else:
-                    next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
+                    started = _nonthread_bound_image_stage_started(request)
+                    try:
+                        next_parent_message_id = backend.get_conversation_parent_message_id(last_conversation_id)
+                    except Exception:
+                        _observe_nonthread_bound_image_stage(
+                            request, "post_download_parent_read", started, "error")
+                        raise
+                    _observe_nonthread_bound_image_stage(
+                        request, "post_download_parent_read", started, "success")
                 for output in outputs:
                     if output._pending_image_items:
-                        output.data = format_image_result(output._pending_image_items, request.prompt,
-                            request.response_format, request.base_url, output.created)["data"]
+                        started = _nonthread_bound_image_stage_started(request)
+                        try:
+                            output.data = format_image_result(output._pending_image_items, request.prompt,
+                                request.response_format, request.base_url, output.created)["data"]
+                        except Exception:
+                            _observe_nonthread_bound_image_stage(
+                                request, "format_image_result", started, "error")
+                            raise
+                        _observe_nonthread_bound_image_stage(
+                            request, "format_image_result", started, "success")
                         output._pending_image_items = []
                     output.provider_binding_id = binding_id
                     output.provider_account_identity = account_identity
