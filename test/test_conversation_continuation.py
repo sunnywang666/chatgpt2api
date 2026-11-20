@@ -27,6 +27,7 @@ from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
     ImageOutput,
+    _downloaded_image_output,
     _generate_bound_single_image,
 )
 
@@ -715,6 +716,7 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         request = ConversationRequest(
             model="gpt-image-2",
             prompt="continue",
+            progress_callback=SimpleNamespace(request_message_id="request-1"),
             provider_binding_id="cb-account-a",
             provider_account_identity="account-opaque-a",
             client_conversation_id="workbench-conversation-1",
@@ -764,7 +766,7 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
         FakeBackend.test_case = self
         output = ImageOutput(
             kind="result", model="gpt-image-2", index=1, total=1,
-            data=[{"url": "image.png"}], conversation_id="conversation-1",
+            _pending_image_items=[{"b64_json": "aW1hZ2U="}], conversation_id="conversation-1",
         )
 
         def stream(backend, sent_request, *_args):
@@ -793,10 +795,124 @@ class ConversationContinuationPayloadTests(unittest.TestCase):
             mock.patch("services.protocol.conversation.account_service.release_image_slot"),
             mock.patch("services.protocol.conversation.OpenAIBackendAPI", FakeBackend),
             mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=stream),
+            mock.patch("services.protocol.conversation.format_image_result",
+                       return_value={"data": [{"url": "image.png"}]}),
+            mock.patch("services.protocol.conversation.logger.info") as logged,
         ):
             result = _generate_bound_single_image(request, 1, 1)
 
         self.assertEqual(result[0].parent_message_id, "next-parent")
+        stages = [call.args[0] for call in logged.call_args_list
+                  if call.args and call.args[0].get("event") == "bound_image_post_download_stage"]
+        self.assertEqual(
+            [(entry["stage"], entry["outcome"]) for entry in stages],
+            [("post_download_parent_read", "success"), ("format_image_result", "success")],
+        )
+        self.assertTrue(all(isinstance(entry["duration_ms"], int) and entry["duration_ms"] >= 0
+                            for entry in stages))
+        self.assertTrue(all(entry["request_message_id"] == "request-1" for entry in stages))
+
+    def test_nonthread_downloaded_image_callback_logs_failure_and_preserves_exception(self) -> None:
+        callback = mock.Mock(side_effect=RuntimeError("artifact write failed"))
+        request = ConversationRequest(
+            model="gpt-image-2",
+            progress_callback=SimpleNamespace(
+                record_downloaded_image_items=callback, request_message_id="request-1"),
+        )
+        request._defer_image_publication = True
+        with mock.patch("services.protocol.conversation.logger.info") as logged:
+            with self.assertRaisesRegex(RuntimeError, "artifact write failed"):
+                _downloaded_image_output(
+                    request, [{"b64_json": "aW1hZ2U="}],
+                    conversation_id="conversation-1", request_message_id="request-1",
+                    file_ids=["file-1"], sediment_ids=[], index=1, total=1,
+                )
+
+        callback.assert_called_once()
+        self.assertEqual(logged.call_args.args[0]["stage"], "record_downloaded_image_items")
+        self.assertEqual(logged.call_args.args[0]["outcome"], "error")
+
+    def test_nonthread_downloaded_image_logging_failure_preserves_output(self) -> None:
+        callback = mock.Mock()
+        request = ConversationRequest(
+            model="gpt-image-2",
+            progress_callback=SimpleNamespace(record_downloaded_image_items=callback),
+        )
+        request._defer_image_publication = True
+        with mock.patch("services.protocol.conversation.logger.info", side_effect=RuntimeError("log unavailable")):
+            output = _downloaded_image_output(
+                request, [{"b64_json": "aW1hZ2U="}],
+                conversation_id="conversation-1", request_message_id="request-1",
+                file_ids=["file-1"], sediment_ids=[], index=1, total=1,
+            )
+
+        self.assertEqual(output._pending_image_items, [{"b64_json": "aW1hZ2U="}])
+        callback.assert_called_once()
+
+    def test_nonthread_downloaded_image_callback_logs_safe_request_id(self) -> None:
+        callback = mock.Mock()
+        request = ConversationRequest(
+            model="gpt-image-2",
+            progress_callback=SimpleNamespace(
+                record_downloaded_image_items=callback, request_message_id="request-1"),
+        )
+        request._defer_image_publication = True
+        with mock.patch("services.protocol.conversation.logger.info") as logged:
+            output = _downloaded_image_output(
+                request, [{"b64_json": "aW1hZ2U="}],
+                conversation_id="conversation-1", request_message_id="request-1",
+                file_ids=["file-1"], sediment_ids=[], index=1, total=1,
+            )
+
+        self.assertEqual(output._pending_image_items, [{"b64_json": "aW1hZ2U="}])
+        callback.assert_called_once()
+        entry = logged.call_args.args[0]
+        self.assertEqual(entry, {
+            "event": "bound_image_post_download_stage",
+            "stage": "record_downloaded_image_items",
+            "duration_ms": mock.ANY,
+            "outcome": "success",
+            "request_message_id": "request-1",
+        })
+
+    def test_nonthread_downloaded_image_callback_ignores_monotonic_failure(self) -> None:
+        callback = mock.Mock()
+        request = ConversationRequest(
+            model="gpt-image-2",
+            progress_callback=SimpleNamespace(record_downloaded_image_items=callback),
+        )
+        request._defer_image_publication = True
+        with mock.patch("services.protocol.conversation.time.monotonic", side_effect=RuntimeError("clock unavailable")):
+            output = _downloaded_image_output(
+                request, [{"b64_json": "aW1hZ2U="}],
+                conversation_id="conversation-1", request_message_id="request-1",
+                file_ids=["file-1"], sediment_ids=[], index=1, total=1,
+            )
+
+        self.assertEqual(output._pending_image_items, [{"b64_json": "aW1hZ2U="}])
+        callback.assert_called_once()
+
+    def test_nonthread_downloaded_image_callback_ignores_observation_attribute_failure(self) -> None:
+        callback = mock.Mock()
+
+        class Progress:
+            image_thread = None
+            record_downloaded_image_items = callback
+
+            @property
+            def request_message_id(self):
+                raise RuntimeError("request id unavailable")
+
+        request = ConversationRequest(model="gpt-image-2", progress_callback=Progress())
+        request._defer_image_publication = True
+        output = _downloaded_image_output(
+            request, [{"b64_json": "aW1hZ2U="}],
+            conversation_id="conversation-1", request_message_id="request-1",
+            file_ids=["file-1"], sediment_ids=[], index=1, total=1,
+        )
+
+        self.assertEqual(output._pending_image_items, [{"b64_json": "aW1hZ2U="}])
+        callback.assert_called_once()
 
     def test_bound_image_without_thread_rejects_missing_or_unfinished_reply_before_submit(self) -> None:
         request = ConversationRequest(

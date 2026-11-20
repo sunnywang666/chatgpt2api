@@ -1526,12 +1526,26 @@ def test_original_reader_checks_barriers_at_its_atomic_claim(stopped_original_im
 
 def test_concurrent_explicit_original_commands_share_existing_read_budget(stopped_original_image):
     service, _ = stopped_original_image
-    service.images.resume_poll = Mock()
+    read_started, release_read = threading.Event(), threading.Event()
+    def held_original_read(*args, **kwargs):
+        read_started.set()
+        assert release_read.wait(10)
+    service.images.resume_poll = Mock(side_effect=held_original_read)
     with ThreadPoolExecutor(max_workers=6) as workers:
-        results = list(workers.map(lambda _: recover_stopped_original(service), range(12)))
+        first = workers.submit(recover_stopped_original, service)
+        try:
+            assert read_started.wait(10)
+            # Other callers can observe the leased read before its final transaction.
+            results = list(workers.map(lambda _: recover_stopped_original(service), range(11)))
+            assert all(result['state'] == 'checking_original' for result in results)
+            assert all(result['max_extra_requests'] == 0 and not result.get('replacement_id')
+                       for result in results)
+        finally:
+            release_read.set()
+        assert first.result()['state'] == 'needs_attention'
     assert service.images.resume_poll.call_count == 1
-    assert all(result['state'] == 'needs_attention' for result in results)
     saved = stopped_image_row(service)
+    assert saved['_completion']['state'] == 'needs_attention'
     assert saved['_completion']['next_at'] == service.clock() + service.RECHECK_SECONDS
     assert saved['_completion']['max_extra_requests'] == 0
     assert not saved['_completion'].get('replacement_id')
