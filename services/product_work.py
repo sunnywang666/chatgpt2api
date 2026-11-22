@@ -1470,6 +1470,38 @@ def _expired_unsent_image_before_saved_correction(store, parent, member, old,
     return _same_frozen_image_attempt_input(store, parent, member, old, candidate_member, candidate)
 
 
+def _retired_unsent_images_before_saved_correction(store, parent, members, previous,
+                                                   candidate_member, candidate, used_steps, now):
+    """Return the exact local never-sent segment immediately before a saved tail.
+
+    Reader evidence contains only physical Chat turns. A never-sent image has
+    no such turn, so retain it only when its registered ProductWork receipt is
+    strictly bounded between the previous observed cursor and the saved image.
+    """
+    if type(previous.get("_sequence")) is not int or type(candidate.get("_sequence")) is not int:
+        return None
+    rows = []
+    for member, receipt in members:
+        sequence = receipt.get("_sequence")
+        if (not _same_conversation(receipt, candidate)
+                or type(sequence) is not int
+                or not previous["_sequence"] < sequence < candidate["_sequence"]):
+            continue
+        rows.append((sequence, member, receipt))
+    rows.sort(key=lambda item: item[0])
+    steps = [member.get("step_ref") for _, member, _ in rows]
+    if (any(left[0] == right[0] for left, right in zip(rows, rows[1:]))
+            or any(member.get("kind") != "image" for _, member, _ in rows)
+            or any(not isinstance(step, str) or not step for step in steps)
+            or len(set(steps)) != len(steps)
+            or candidate_member.get("step_ref") in steps
+            or not all(_expired_unsent_image_before_saved_correction(
+                store, parent, member, receipt, candidate_member, candidate,
+                previous, used_steps, now) for _, member, receipt in rows)):
+        return None
+    return [(member, receipt) for _, member, receipt in rows]
+
+
 def _advanced_image_tail_rows(store, db, parent, later, previous, used_steps, now):
     """Extend an observed image tail using only completed local ProductWork history."""
     rows, retired = [], []
@@ -2193,13 +2225,23 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
                           if member["kind"] == "text" else _image_product_tail(
                               store, parent, member, tail, previous, used_steps, proof))
             quota_tail = None
-            if not tail_valid and member["kind"] == "image" and proof_index == len(tail_steps) - 1:
-                quota_tail = _completed_quota_image_tail(
-                    store, db, parent, member, tail, previous, used_steps, proof, members)
+            retired_before_saved = None
+            if not tail_valid and member["kind"] == "image":
+                if _saved_bound_image_correction_tail(
+                        store, parent, member, tail, previous, used_steps, now):
+                    retired_before_saved = _retired_unsent_images_before_saved_correction(
+                        store, parent, members, previous, member, tail, used_steps, now)
+                elif proof_index == len(tail_steps) - 1:
+                    quota_tail = _completed_quota_image_tail(
+                        store, db, parent, member, tail, previous, used_steps, proof, members)
             if (tail.get("parent_message_id") != proof["final_message_id"]
-                    or not (tail_valid or quota_tail)
+                    or not (tail_valid or quota_tail or retired_before_saved is not None)
                     or _unresolved(tail, [row for _, row in members])):
                 return None
+            if retired_before_saved is not None:
+                tail_rows.extend(retired_before_saved)
+                retired_image_rows.extend(row for _, row in retired_before_saved)
+                used_steps.update(member["step_ref"] for member, _ in retired_before_saved)
             tail_rows.append((member, tail))
             used_steps.add(member["step_ref"])
             previous = tail
@@ -2222,7 +2264,8 @@ def _no_final_successor_chain(store, db, parent, receipt, members, now, *, pendi
                 key=lambda item: item[0]), archive, used_steps, now)
         if extended is None:
             return None
-        added, retired_image_rows = extended
+        added, retired = extended
+        retired_image_rows.extend(retired)
         tail_rows.extend(added)
         if added:
             archive_member, archive = added[-1]
