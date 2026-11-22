@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from services.product_work import advanced_continuation_chain
+from services.product_work import advanced_continuation_chain, _no_final_successor_chain
 from services.image_task_service import ImageTaskService
 from services.image_task_service import _request_hash
 from services.image_quota_successor import prepared_payload
@@ -14,7 +14,8 @@ from services.work_lifecycle import WorkLifecycleError
 from services.pool_admission import ExecutionContext
 from test.test_no_final_successor import product_no_final, product_lifecycle
 from test.test_product_compact_successor import (advanced_to_own_successor,
-    add_completed_image_tail, add_completed_tail)
+    add_completed_image_tail, add_completed_tail, advanced_document_with_tail,
+    refresh_advanced_original)
 from test.test_explicit_unknown_successor import row
 
 
@@ -390,8 +391,30 @@ def save_bound_correction(h, context):
     return image_row(h, context.request_id)
 
 
+def refresh_saved_correction_proof(h, monkeypatch, correction, *later_tails):
+    """Use the actual reader to persist the full image/review/correction tail."""
+    successor = row(h.service, 'successor')
+    image = image_row(h, 'image-tail')
+    turns = []
+    for receipt in (image, row(h.service, 'review'), row(h.service, 'review-2'), correction, *later_tails):
+        turn = deepcopy(receipt)
+        # The graph reader verifies turn identity and shape, rather than the
+        # local image receipt's data field. Give image finals displayable text
+        # while retaining every persisted request/final ID.
+        turn.setdefault('content', 'saved image result')
+        turns.append(turn)
+    original = refresh_advanced_original(
+        h, monkeypatch, advanced_document_with_tail(h, successor, *turns))
+    assert original['_completed_successor_evidence']['tail_steps'] == [
+        {'request_message_id': turn['request_message_id'], 'final_message_id': turn['parent_message_id']}
+        for turn in turns]
+    return original
+
+
 @pytest.mark.parametrize('send_count', ['absent', None, 0])
-def test_saved_bound_correction_allows_review_then_close_and_archive(product_no_final, monkeypatch, send_count):
+@pytest.mark.parametrize('observed_saved_proof', [False, True])
+def test_saved_bound_correction_allows_review_then_close_and_archive(
+        product_no_final, monkeypatch, send_count, observed_saved_proof):
     """A saved correction, not the UNKNOWN root, is the next review's parent."""
     h = product_no_final
     original, retired, context = correction_with_unsent_suffix(h, monkeypatch)
@@ -404,16 +427,38 @@ def test_saved_bound_correction_allows_review_then_close_and_archive(product_no_
     correction = save_bound_correction(h, context)
     settings = h.admission.settings
     h.admission.settings = lambda: {**settings(), 'codex_max_concurrency': 0}
+    if observed_saved_proof:
+        proof_review = add_completed_tail(h, 'proof-review-after-saved-correction',
+                                          previous_image=correction)
+        original = refresh_saved_correction_proof(h, monkeypatch, correction, proof_review)
+        review = proof_review
+    else:
+        proof_review = None
 
     product, lifecycle, calls, identity = product_lifecycle(h)
     identity['_trusted_source'] = original['_source']
-    def close_while_review_is_queued():
-        with pytest.raises(WorkLifecycleError, match='PRODUCT_WORK_'):
-            product.close(identity, 'fixture-product', results_saved=True)
+    if not observed_saved_proof:
+        def close_while_review_is_queued():
+            with pytest.raises(WorkLifecycleError, match='PRODUCT_WORK_'):
+                product.close(identity, 'fixture-product', results_saved=True)
 
-    review = add_completed_tail(h, 'review-after-saved-correction', previous_image=correction,
-                                before_claim=close_while_review_is_queued)
-    assert review['status'] == 'succeeded'
+        review = add_completed_tail(h, 'review-after-saved-correction', previous_image=correction,
+                                    before_claim=close_while_review_is_queued)
+        assert review['status'] == 'succeeded'
+    with h.service.store.connect() as db:
+        parent = h.service.store.runtime(db, original['_product_work_key'])
+        members = product._members(db, parent)
+        chain = _no_final_successor_chain(h.service.store, db, parent, row(h.service, 'successor'),
+                                          members, h.clock())
+        assert chain, [(member['request_id'], receipt.get('status'), receipt.get('_completion'))
+                       for member, receipt in members]
+        resolved_ids = {item.get('request_id') or item.get('id') for item in chain['resolved']}
+        assert resolved_ids >= {item['id'] for item in retired}, {
+            'resolved': resolved_ids,
+            'tail': [tail.get('request_id') or tail.get('id') for tail in chain['tail']],
+            'retired': [(item['id'], item['_sequence'], item['conversation_id'],
+                         item['provider_account_identity']) for item in retired],
+        }
 
     lifecycle.images.archive_product_work = lambda owner, rid, archived: (
         calls.append((owner, rid, archived)) or {
@@ -426,6 +471,21 @@ def test_saved_bound_correction_allows_review_then_close_and_archive(product_no_
     assert all(image_row(h, item['id']) == item for item in retired)
     restarted = product.__class__(h.service, lifecycle.images, clock=h.clock)
     assert restarted.get(identity, 'fixture-product')['state'] == 'completed'
+
+
+def test_observed_saved_correction_admits_the_original_next_review(product_no_final, monkeypatch):
+    h = product_no_final
+    _, retired, context = correction_with_unsent_suffix(h, monkeypatch)
+    context.before_send_with_marker()
+    correction = save_bound_correction(h, context)
+    original = refresh_saved_correction_proof(h, monkeypatch, correction)
+    settings = h.admission.settings
+    h.admission.settings = lambda: {**settings(), 'codex_max_concurrency': 0}
+    review = add_completed_tail(h, 'observed-correction-next-review', previous_image=correction)
+    assert review['status'] == 'succeeded'
+    assert review['_submission_started'] is True
+    assert row(h.service) == original
+    assert all(image_row(h, item['id']) == item for item in retired)
 
 
 @pytest.mark.parametrize('drift', [
@@ -534,6 +594,66 @@ def test_saved_bound_correction_revalidates_before_send(product_no_final, monkey
     assert review['_submission_started'] is False
     assert not any(sent.get('client_request_id') == 'blocked-after-claim' for sent in h.sent)
     assert row(h.service) == original
+
+
+@pytest.mark.parametrize('drift', [
+    'old_unknown', 'old_sent', 'old_result', 'old_live_claim', 'old_send_evidence',
+    'old_duplicate_step', 'old_candidate_step', 'saved_selected_other', 'saved_unconfirmed_retry',
+])
+def test_observed_saved_correction_tail_keeps_unproved_history_blocked(
+        product_no_final, monkeypatch, drift):
+    """The reader-proven tail must retain every saved-correction guard."""
+    h = product_no_final
+    original, retired, context = correction_with_unsent_suffix(h, monkeypatch)
+    context.before_send_with_marker()
+    correction = save_bound_correction(h, context)
+    if drift.startswith('old_'):
+        with h.service.store.transaction() as db:
+            old_id = retired[1]['id'] if drift in {'old_duplicate_step', 'old_candidate_step'} else retired[0]['id']
+            old = h.service.store.read_receipt(db, 'image', 'owner', old_id)
+            if drift == 'old_unknown':
+                old.update(status='unknown', upstream_outcome='unknown', upstream_submission_started=True)
+            elif drift == 'old_sent':
+                old['upstream_submission_started'] = True
+            elif drift == 'old_result':
+                old['result_file_ids'] = ['unexpected-image-result']
+            elif drift == 'old_live_claim':
+                # The reader refresh below advances the fixture clock by 60 seconds.
+                old['_claim_until'] = h.clock() + 600
+            elif drift == 'old_send_evidence':
+                old['_execution_timeline'] = [{'stage': 'send_call_started', 'at': h.clock() - 1}]
+            else:
+                parent = h.service.store.runtime(db, old['_product_work_key'])
+                member = next(item for item in parent['members'] if item['request_id'] == old_id)
+                if drift == 'old_duplicate_step':
+                    other = next(item for item in parent['members'] if item['request_id'] == retired[0]['id'])
+                    member['step_ref'] = other['step_ref']
+                else:
+                    member['step_ref'] = 'final-image-correction'
+                stored = h.service.store.load_input(old['_input_ref'])
+                old['_product_work'] = {**old['_product_work'], 'step_ref': member['step_ref']}
+                stored['payload']['_product_work'] = old['_product_work']
+                old['_input_ref'] = h.service.store.save_input(stored)
+                old['request_hash'] = _request_hash(stored['mode'], stored['payload'])
+                h.service.store.set_runtime(db, parent['key'], parent)
+            h.service.store.write_receipt(db, 'image', 'owner', old['id'], old)
+    if drift.startswith('saved_'):
+        with h.service.store.transaction() as db:
+            saved = h.service.store.read_receipt(db, 'image', 'owner', correction['id'])
+            if drift == 'saved_selected_other':
+                saved['_completion']['selected_id'] = 'another-image'
+            else:
+                saved['_completion']['allow_unconfirmed_retry'] = True
+            h.service.store.write_receipt(db, 'image', 'owner', saved['id'], saved)
+            correction = saved
+    original = refresh_saved_correction_proof(h, monkeypatch, correction)
+    product, _, calls, identity = product_lifecycle(h)
+    identity['_trusted_source'] = original['_source']
+    with pytest.raises(WorkLifecycleError, match='PRODUCT_WORK_'):
+        product.close(identity, 'fixture-product', results_saved=True)
+    assert calls == []
+    assert row(h.service)['status'] == 'unknown'
+    assert row(h.service)['recovery_reason'] == 'REQUEST_CONVERSATION_ADVANCED'
 
 
 def test_bound_correction_passes_identical_unsent_suffix_without_rewriting_history(product_no_final, monkeypatch):
